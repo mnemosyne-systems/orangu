@@ -39,6 +39,7 @@
 
 use orangu::format::format_bytes;
 use orangu::hardware::{self as system, CpuInfo, GpuInfo, MemoryKind};
+use orangu::npu::NpuInfo;
 use orangu::os::OsInfo;
 
 /// Fixed CUDA/runtime overhead added on top of model weights — matches
@@ -336,8 +337,13 @@ fn push_suggestion_block(out: &mut String, label: &str, budget: u64, source: Opt
 /// prints, followed by two model-size suggestions — one sized against
 /// dedicated GPU VRAM alone (the fast path), one against the largest memory
 /// pool on the machine, GPU or system RAM (see [`total_budget_bytes`]).
-pub fn format_suggestion(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo]) -> String {
-    let mut out = system::format_report(os, cpu, gpus, &system::detect_power());
+pub fn format_suggestion(
+    os: &OsInfo,
+    cpu: &CpuInfo,
+    gpus: &[GpuInfo],
+    npu: Option<&NpuInfo>,
+) -> String {
+    let mut out = system::format_report(os, cpu, gpus, npu, &system::detect_power());
 
     // A "Dedicated" budget of 0 (no GPU with real, hard-ceiling VRAM at
     // all) would just print an estimated budget of 0 B and a table of
@@ -395,11 +401,7 @@ mod tests {
             frequency_mhz: 0,
             total_memory_bytes,
             available_memory_bytes: total_memory_bytes,
-            features: system::CpuFeatures {
-                sse4_2: false,
-                avx2: false,
-                avx512f: false,
-            },
+            features: system::CpuFeatures::default(),
         }
     }
 
@@ -474,7 +476,7 @@ mod tests {
             named_gpu("Big Card", MemoryKind::Dedicated, Some(24 * GIB)),
             named_gpu("iGPU", MemoryKind::Shared, Some(64 * GIB)),
         ];
-        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus, None);
         assert!(report.contains("24.00 GiB (Big Card)"), "{report}");
         // The `Total` block's winner here is system RAM, tied with the
         // iGPU's shared pool — and a tie must not be reported as the GPU,
@@ -487,7 +489,7 @@ mod tests {
     #[test]
     fn the_total_budget_names_a_gpu_when_the_gpu_is_the_largest_pool() {
         let gpus = vec![named_gpu("Big Card", MemoryKind::Dedicated, Some(80 * GIB))];
-        let report = format_suggestion(&orangu::os::detect(), &cpu(32 * GIB), &gpus);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(32 * GIB), &gpus, None);
         assert!(report.contains("80.00 GiB (Big Card)"), "{report}");
     }
 
@@ -664,7 +666,7 @@ mod tests {
             gpu(MemoryKind::Dedicated, Some(4 * GIB)),
             gpu(MemoryKind::Shared, Some(64 * GIB)),
         ];
-        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus, None);
         assert!(report.contains("CPU"));
         assert!(report.contains("GPU"));
         assert!(report.contains("Suggested model size (Dedicated)"));
@@ -698,7 +700,7 @@ mod tests {
             ("shared-only", vec![gpu(MemoryKind::Shared, Some(64 * GIB))]),
             ("no gpus", Vec::new()),
         ] {
-            let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus);
+            let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus, None);
             assert!(
                 !report.contains("Suggested model size (Dedicated)"),
                 "unexpected Dedicated table for case: {case}"
@@ -712,7 +714,7 @@ mod tests {
     /// with its own blank line, so the report doesn't run together.
     #[test]
     fn format_suggestion_has_no_gpu_section_without_a_gpu() {
-        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &[]);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &[], None);
         assert!(!report.contains("GPU"), "unexpected GPU section:\n{report}");
         assert!(
             report.contains("\n\nSuggested model size (Total)\n"),

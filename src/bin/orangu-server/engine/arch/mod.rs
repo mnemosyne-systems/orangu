@@ -53,6 +53,7 @@ pub mod dflash;
 pub mod gemma;
 pub mod glm;
 pub mod glm5;
+pub mod granite;
 pub mod hyper;
 pub mod indexer;
 pub mod inkling;
@@ -1453,6 +1454,75 @@ pub(crate) struct SwigluSharedExpert<'a> {
 /// The routing decision — which experts, with what weight, under whatever
 /// grouping the file declares — is entirely [`ExpertRouting::route`]'s, so
 /// an architecture that only differs there differs nowhere here.
+/// `ORANGU_MOE_TIME=1`: how long each branch of a mixture-of-experts FFN
+/// takes, summed over the run and reported every 256 layer-calls.
+fn moe_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ORANGU_MOE_TIME").is_ok_and(|v| v != "0"))
+}
+
+/// Times one branch of a mixture-of-experts FFN, from construction to drop.
+///
+/// The two branches run under `rayon::join`, so each one's own span is the
+/// only meaningful figure — wall time across both would just be the slower.
+struct MoeSpan {
+    at: std::time::Instant,
+    routed: bool,
+}
+
+impl MoeSpan {
+    fn routed() -> Option<Self> {
+        moe_timing().then(|| Self {
+            at: std::time::Instant::now(),
+            routed: true,
+        })
+    }
+
+    fn shared() -> Option<Self> {
+        moe_timing().then(|| Self {
+            at: std::time::Instant::now(),
+            routed: false,
+        })
+    }
+}
+
+impl Drop for MoeSpan {
+    fn drop(&mut self) {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static ROUTED_NS: AtomicU64 = AtomicU64::new(0);
+        static SHARED_NS: AtomicU64 = AtomicU64::new(0);
+        static CALLS: AtomicU64 = AtomicU64::new(0);
+        let ns = self.at.elapsed().as_nanos() as u64;
+        if self.routed {
+            ROUTED_NS.fetch_add(ns, Relaxed);
+            let n = CALLS.fetch_add(1, Relaxed) + 1;
+            if n.is_multiple_of(256) {
+                let ms = |v: u64| v as f64 / (n as f64 * 1e6);
+                eprintln!(
+                    "orangu-server: [moe] {n} layer-calls: routed {:.1} ms, shared {:.1} ms each",
+                    ms(ROUTED_NS.load(Relaxed)),
+                    ms(SHARED_NS.load(Relaxed))
+                );
+            }
+        } else {
+            SHARED_NS.fetch_add(ns, Relaxed);
+        }
+    }
+}
+
+/// Whether a mixture-of-experts layer's shared expert may run on the NPU —
+/// `ORANGU_NPU_MOE=0` says no.
+///
+/// It exists to be measured against: the alternative is comparing two
+/// builds, and two builds differ by more than the thing under test. One
+/// binary answering both ways is the only comparison that holds on a board
+/// that drifts.
+pub(crate) fn moe_shared_on_npu() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("ORANGU_NPU_MOE").is_ok_and(|v| v == "0"))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn swiglu_moe_ffn(
     backend: &dyn crate::engine::backend::Backend,
     routing: &ExpertRouting,
@@ -1460,7 +1530,13 @@ pub(crate) fn swiglu_moe_ffn(
     n_tokens: usize,
     n_embd: usize,
     moe: &SwigluMoe<'_>,
+    il: usize,
 ) -> Vec<f32> {
+    // The shared expert's input, for the NPU compiler to calibrate on. It
+    // is the same `normed` a dense block would capture, and the shared
+    // expert is the only part of this FFN a static graph can take: the
+    // routed experts are chosen per token.
+    super::dump_ffn_input(il, n_tokens, normed);
     let mut out = vec![0f32; n_tokens * n_embd];
     let mut experts = crate::engine::moe_stats::LayerRecorder::for_tensors(&[
         moe.gate_exps,
@@ -1486,6 +1562,7 @@ pub(crate) fn swiglu_moe_ffn(
     // The GPU expert path batches the three projections across experts —
     // see `evaluate_routed_experts_batched`.
     let routed_branch = || {
+        let _span = MoeSpan::routed();
         if gpu_experts() && backend.as_wgpu().is_some() {
             evaluate_routed_experts_batched(
                 backend,
@@ -1548,13 +1625,46 @@ pub(crate) fn swiglu_moe_ffn(
     // exempt from the backend's up-front type check (see
     // `matmul_host_fallback`), so they must not go straight to the device.
     let shared_branch = || {
+        let _span = MoeSpan::shared();
         moe.shared.as_ref().map(|shared| {
+            // On the NPU when this layer's shared expert has been compiled
+            // for this width. It is a plain gated feed-forward block, so it
+            // needs nothing the dense path does not already have — and it
+            // is the branch with the most to gain, because the routed
+            // experts beside it are already using the host and the GPU.
+            // Declining leaves the two host matmuls below, unchanged.
+            // Only plain SwiGLU: the compiled graph has the activation
+            // baked in, and a file that asks for a clamp is asking for
+            // different arithmetic than the artifact computes.
+            if moe_shared_on_npu()
+                && matches!(moe.clamp_shexp, SwigluLimit::None)
+                && let Some(npu) = orangu::npu_ffn::service()
+                && npu.has(il, n_tokens)
+            {
+                let mut out = Vec::new();
+                if npu.forward_into(il, n_tokens, normed, &mut out) {
+                    return out;
+                }
+            }
             let gate = matmul_host_fallback(backend, normed, n_tokens, shared.gate);
             let up = matmul_host_fallback(backend, normed, n_tokens, shared.up);
             let h = swiglu_limited(&gate, &up, moe.clamp_shexp);
             matmul_host_fallback(backend, &h, n_tokens, shared.down)
         })
     };
+
+    // What the two branches cost, under `ORANGU_MOE_TIME=1`.
+    //
+    // The question it exists to answer is whether the routed experts are
+    // worth moving to the device at all. They cannot be moved the way the
+    // shared expert was — a graph has one static shape and cannot select an
+    // expert per token, so each expert needs its own — and the price of
+    // that is one dispatch per expert per layer. This board charges 2.24 ms
+    // for a dispatch at width 16, which is the width a routed expert would
+    // want (a token picks 8 of 128 experts, so an expert sees about a
+    // sixteenth of a 128-token chunk), and there are 44.2 experts per
+    // layer-call. That is 99 ms of dispatch per layer, 2.3 s per chunk —
+    // worth paying only if the routed branch costs more than that today.
 
     // Nothing in one branch depends on the other — they read the same
     // `normed` and are summed below — and they use *different processors*:
@@ -3270,5 +3380,151 @@ mod tests {
             ExpertGating::SqrtSoftplus
         );
         assert!(ExpertGating::from_gguf(1).is_err());
+    }
+}
+
+/// What one gated feed-forward block costs on this machine's CPU, for
+/// comparison against the same block on the NPU.
+///
+/// `#[ignore]`d and pointed at a real model through `ORANGU_GGUF`, in the
+/// `_scratch_*` style `backend::vulkan::tests` already uses for tuning
+/// measurements: it needs a multi-gigabyte file that is not part of the
+/// suite, and it asserts nothing.
+///
+/// It exists because the NPU question is a comparison, not an absolute.
+/// `orangu-server npu-run` reports what a block achieves on the device, and
+/// that number means nothing on its own — the device is only worth using if
+/// it beats the CPU path this would otherwise take, on the same block, at
+/// the same token count, reading the same weights. This measures that other
+/// half. Run it as:
+///
+/// ```text
+/// ORANGU_GGUF=/path/to/model.gguf ORANGU_FFN_BLOCK=blk.0 ORANGU_FFN_TOKENS=1 \
+///   cargo test --release --bin orangu-server _scratch_cpu_ffn_block -- --ignored --nocapture
+/// ```
+///
+/// `--release` is not optional: a debug build measures the absence of
+/// optimization, not the CPU.
+#[cfg(test)]
+mod scratch_ffn_cost {
+    use crate::engine::backend::CpuBackend;
+    use crate::engine::loader::probe_quant_matrix;
+
+    /// The raw quantized bytes of `name`, exactly as they sit in the file.
+    ///
+    /// Deliberately *not* `GgufFile::read_tensor`, which dequantizes to
+    /// `f32`: the CPU path being measured reads the quantized form directly,
+    /// and handing it widened weights would measure a matmul this engine
+    /// never performs.
+    fn raw_tensor(
+        path: &std::path::Path,
+        gguf: &orangu::gguf::GgufFile,
+        name: &str,
+    ) -> anyhow::Result<(Vec<u8>, u32, usize, usize)> {
+        use std::io::{Read, Seek, SeekFrom};
+        let info = gguf
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow::anyhow!("{name} is not in {}", path.display()))?;
+        let (block_bytes, block_elems) = crate::engine::quant::block_layout(info.ggml_type)
+            .ok_or_else(|| anyhow::anyhow!("{name} has a type this cannot size"))?;
+        let in_dim = info.dims[0] as usize;
+        let out_dim = info.dims[1] as usize;
+        let len = (info.element_count() as usize / block_elems) * block_bytes;
+        let mut file = std::fs::File::open(path)?;
+        file.seek(SeekFrom::Start(gguf.data_offset + info.offset))?;
+        let mut bytes = vec![0u8; len];
+        file.read_exact(&mut bytes)?;
+        Ok((bytes, info.ggml_type, in_dim, out_dim))
+    }
+
+    #[test]
+    #[ignore]
+    fn _scratch_cpu_ffn_block() -> anyhow::Result<()> {
+        let Some(path) = std::env::var_os("ORANGU_GGUF").map(std::path::PathBuf::from) else {
+            eprintln!("set ORANGU_GGUF to a .gguf to run this");
+            return Ok(());
+        };
+        let block = std::env::var("ORANGU_FFN_BLOCK").unwrap_or_else(|_| "blk.0".into());
+        let n_tokens: usize = std::env::var("ORANGU_FFN_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        let repeats: usize = std::env::var("ORANGU_FFN_REPEATS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+
+        let gguf = orangu::gguf::GgufFile::open(&path)?;
+        let load = |suffix: &str| -> anyhow::Result<_> {
+            let (bytes, ty, in_dim, out_dim) =
+                raw_tensor(&path, &gguf, &format!("{block}.ffn_{suffix}.weight"))?;
+            Ok(probe_quant_matrix(bytes, ty, in_dim, out_dim))
+        };
+        let gate = load("gate")?;
+        let up = load("up")?;
+        let down = load("down")?;
+        let (d_model, d_ff) = (gate.in_dim, gate.out_dim);
+
+        // The same uniform spread `npu_tool::synthetic_calibration` feeds the
+        // device, so both halves of the comparison see the same input
+        // distribution.
+        let mut state = 0x51ed_1234u64;
+        let x: Vec<f32> = (0..n_tokens * d_model)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        let mut scratch = super::FfnScratch::default();
+        // One untimed pass: the first touch of an mmap'd weight is a page
+        // fault, and paging 78 MB in is not what this measures.
+        super::swiglu_ffn_limited_into(
+            &CpuBackend,
+            &mut out,
+            &mut scratch,
+            &x,
+            n_tokens,
+            &gate,
+            &up,
+            &down,
+            super::SwigluLimit::None,
+        );
+
+        let mut samples = Vec::with_capacity(repeats);
+        for _ in 0..repeats {
+            let started = std::time::Instant::now();
+            super::swiglu_ffn_limited_into(
+                &CpuBackend,
+                &mut out,
+                &mut scratch,
+                &x,
+                n_tokens,
+                &gate,
+                &up,
+                &down,
+                super::SwigluLimit::None,
+            );
+            samples.push(started.elapsed().as_secs_f64());
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let per = samples[samples.len() / 2];
+        let flops = 3.0 * 2.0 * n_tokens as f64 * d_model as f64 * d_ff as f64;
+        eprintln!(
+            "cpu ffn  {block}  {d_model} -> {d_ff}  tokens={n_tokens}  \
+             {:.3} ms/run  {:.1} GF/s  ({} type {})",
+            per * 1000.0,
+            flops / per / 1e9,
+            orangu::format::format_bytes(
+                (gate.raw_bytes().len() + up.raw_bytes().len() + down.raw_bytes().len()) as u64
+            ),
+            gate.ggml_type(),
+        );
+        Ok(())
     }
 }

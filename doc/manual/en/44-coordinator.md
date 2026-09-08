@@ -117,7 +117,7 @@ only.
 | `model` | profile | Yes | A model spec — local `.gguf` path, `NR`/`MODEL` label, or `<user>/<model>[:quant]` Hugging Face repo — the same shape `orangu-server`'s own positional `MODEL` argument accepts |
 | `host` | profile | No | Host this profile's `orangu-server` listens on — written straight into its generated config, so it takes the same `all`/`*`/address spellings. Defaults to `all` |
 | `port` | profile | No | Port this profile's `orangu-server` listens on. Defaults to `8100` — the same default `orangu-server` itself uses |
-| `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`) when set |
+| `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`metal`/`cuda`/`opencl`/`rocm`/`npu`) when set |
 | `slots` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].slots` when set |
 | `web` | profile | No | Forwarded to this profile's `orangu-server` as `[web].port` when set, exposing that profile's own web console while it's active |
 

@@ -38,6 +38,8 @@
 //! So this module refuses to measure anything it has not proved it started:
 //!
 //! - the port must be **free before** a child is launched, or the run stops;
+//! - no *accelerator* may be held by a process this sweep did not start, or
+//!   the run stops — see [`Baseline`];
 //! - the pid the server reports through `/props` must be the pid of **this
 //!   process's own child**, or the run stops;
 //! - the child is killed and reaped through a [`Server`] guard whose `Drop`
@@ -212,6 +214,7 @@ pub fn start(
     port: u16,
     log: &std::path::Path,
     timeout: Duration,
+    baseline: &Baseline,
 ) -> anyhow::Result<Server> {
     // Before anything is spawned. A port already in use means either a server
     // left over from a previous run or one somebody else is using; measuring
@@ -221,6 +224,26 @@ pub fn start(
             "port {port} is already in use before this sweep started a server — stop whatever \
              owns it, or the sweep would measure that process and attribute its numbers to \
              every configuration in turn"
+        );
+    }
+    // A free port is not a free machine. The previous point's server may have
+    // orphaned an `npu-compile` child, which holds the NPU for minutes and
+    // never had a port at all — so it passes the check above and then shares
+    // this machine with the server about to start, and the sharing is
+    // reported as the swept variable being slower. Compare against the
+    // baseline rather than demanding an idle GPU, so a machine with a
+    // compositor on it is still usable; see [`Baseline`].
+    let busy = wait_for_idle_accelerators(baseline, timeout);
+    if let Some(holder) = busy.first() {
+        anyhow::bail!(
+            "pid {} still holds an accelerator after {}s and this sweep did not start it — \
+             most likely an `npu-compile` child orphaned by an earlier server, which keeps \
+             compiling for minutes after its parent is gone. Measuring alongside it would \
+             attribute its contention to the configuration under test. Wait for it or stop \
+             it: {}",
+            holder.pid,
+            timeout.as_secs(),
+            holder.cmd
         );
     }
     // `sh -c "exec …"` is the whole supervision mechanism: it is what makes
@@ -350,6 +373,200 @@ fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     }
 }
 
+/// The accelerator holders that were already on this machine before the sweep.
+///
+/// # Why a free port is not a free machine
+///
+/// The server's own teardown is *not* the problem, and it is worth writing
+/// down that it was measured rather than assumed: killing a server with a
+/// 10.8 GB resident set released its port and reaped the process in the same
+/// 0.57 s, and a smaller one in 0.35 s. `Drop`'s `wait()` already covers that
+/// entirely, and there is no window there to close.
+///
+/// The problem is the **child**. `npu-compile` runs as a separate process —
+/// it has to, because the NPU runtime and the GPU runtime cannot share an
+/// address space — and the server blocks in `status()` while it works. Kill
+/// the server during a compile and the compiler is reparented to init and
+/// keeps going. Measured on this project's own hardware: an orphaned
+/// `npu-compile` was still running **eleven minutes** after its parent was
+/// killed — uninterruptible, holding `/dev/aipu` and every NPU core, and
+/// still going when it was finally killed by hand.
+///
+/// Nothing that looks for a leftover *server* can see that process. It never
+/// bound a port, so the pre-flight port check passes; it answers no `/health`
+/// and reports no pid, so the `/props` identity check never gets a chance.
+/// What it does is make the next point of the sweep share the NPU with the
+/// last point's compiler, which reads as the swept variable being slower. No
+/// error is produced and the number is entirely plausible — the failure this
+/// whole module exists to refuse.
+///
+/// The server side of this is fixed too (`compile_child` now arms
+/// `PR_SET_PDEATHSIG`), so a current server orphans nothing. This check is
+/// what makes that verifiable rather than assumed, and it still catches the
+/// case that fix cannot reach: a server from an *older* build, or one started
+/// by hand outside the sweep.
+///
+/// So the check cannot simply be "no process holds an accelerator": on any
+/// machine with a display, the compositor holds one permanently and always
+/// will, and a tuning tool that refuses to run on a desktop is a tool nobody
+/// runs. What matters is *change* — a holder that appeared during the sweep is
+/// one of the sweep's own leftovers, and a holder that was there at the start
+/// is part of the furniture. This records the furniture, once, before the
+/// first point.
+///
+/// Pids rather than pid-and-start-time: a recycled pid would have to be
+/// recycled onto a process that also holds an accelerator, within one sweep,
+/// to matter, and the cost of that miss is one point measured the way every
+/// point was measured before this existed.
+#[derive(Debug, Default, Clone)]
+pub struct Baseline {
+    pids: Vec<u32>,
+}
+
+/// The accelerators in use right now, as the furniture this sweep runs
+/// against. Take it **once**, before the first server is started.
+pub fn accelerator_baseline() -> Baseline {
+    Baseline {
+        pids: accelerator_holders().into_iter().map(|h| h.pid).collect(),
+    }
+}
+
+/// A process holding an accelerator device open.
+#[derive(Debug, Clone)]
+struct Holder {
+    pid: u32,
+    /// The command line, for the error message. A pid alone tells the
+    /// operator nothing they can act on, and by the time they read it the
+    /// process may be gone.
+    cmd: String,
+}
+
+/// The device-node prefixes that mean "an accelerator is in use".
+///
+/// Prefixes, so `/dev/mali0`, `/dev/dri/renderD128` and `/dev/nvidia0` all
+/// match without this having to enumerate minor numbers. Not exhaustive and
+/// not trying to be: an accelerator this misses costs the check, not
+/// correctness, because the port check and the `/props` pid check are both
+/// still in front of it.
+// Only the `/proc` walk consults this, and that is Linux-only; `cfg(test)`
+// keeps it present for the test that pins the matching on every platform.
+#[cfg(any(target_os = "linux", test))]
+const ACCELERATOR_NODES: &[&str] = &[
+    // Arm Mali, through the vendor kbase driver rather than DRM.
+    "/dev/mali",
+    // Arm Zhouyi NPU, which is what `npu-compile` opens.
+    "/dev/aipu",
+    // Any DRM render node — Mesa, and the GPU half of most other stacks.
+    "/dev/dri/render",
+    "/dev/nvidia",
+];
+
+/// Whether `target` is one of the device nodes [`ACCELERATOR_NODES`] names.
+#[cfg(any(target_os = "linux", test))]
+fn is_accelerator_node(target: &str) -> bool {
+    ACCELERATOR_NODES.iter().any(|p| target.starts_with(p))
+}
+
+/// Every process other than this one that holds an accelerator device open.
+#[cfg(target_os = "linux")]
+fn accelerator_holders() -> Vec<Holder> {
+    holders_of(is_accelerator_node)
+}
+
+/// Every process other than this one holding open a file `matches` accepts.
+///
+/// By walking `/proc/<pid>/fd`, which sees only processes this user owns.
+/// Another user's server is therefore invisible here — but it is not
+/// invisible to the port check, which is a connect and does not care who owns
+/// what, so the case that actually corrupts a sweep is still caught.
+///
+/// The predicate is a parameter so the walk can be tested against an ordinary
+/// file. The alternative — a test that holds a real accelerator open — would
+/// mean the suite opening `/dev/aipu` on every run, which is the NPU this
+/// project is trying to keep free.
+#[cfg(target_os = "linux")]
+fn holders_of(matches: impl Fn(&str) -> bool) -> Vec<Holder> {
+    let me = std::process::id();
+    let mut held = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return held;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            // Gone between the listing and the read, or another user's.
+            continue;
+        };
+        let holds = fds.flatten().any(|fd| {
+            std::fs::read_link(fd.path())
+                .ok()
+                .and_then(|t| t.to_str().map(&matches))
+                .unwrap_or(false)
+        });
+        if holds {
+            held.push(Holder {
+                pid,
+                cmd: process_command(pid),
+            });
+        }
+    }
+    held
+}
+
+/// Nothing to report where there is no `/proc` to read it from, which leaves
+/// the sweep behaving exactly as it did before this check existed.
+#[cfg(not(target_os = "linux"))]
+fn accelerator_holders() -> Vec<Holder> {
+    Vec::new()
+}
+
+/// `pid`'s command line, space-separated, or a placeholder.
+#[cfg(target_os = "linux")]
+fn process_command(pid: u32) -> String {
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(raw) if !raw.is_empty() => String::from_utf8_lossy(&raw)
+            .replace('\0', " ")
+            .trim()
+            .to_string(),
+        // A kernel thread, or one that exited underneath the read.
+        _ => "<unknown>".to_string(),
+    }
+}
+
+/// Wait for every accelerator holder outside `baseline` to go away.
+///
+/// Returns the ones still there when `timeout` runs out, so the caller can
+/// name them. An empty result is the machine being as free as it was when the
+/// sweep started.
+fn wait_for_idle_accelerators(baseline: &Baseline, timeout: Duration) -> Vec<Holder> {
+    let mut remaining = Vec::new();
+    let idle = wait_for(timeout, || {
+        remaining = holders_outside(baseline, accelerator_holders());
+        remaining.is_empty()
+    });
+    if idle { Vec::new() } else { remaining }
+}
+
+/// The holders in `holders` that are not part of `baseline`.
+///
+/// Separated from the polling above so the policy — *which* holders stop a
+/// sweep — can be checked without a GPU to hold.
+fn holders_outside(baseline: &Baseline, holders: Vec<Holder>) -> Vec<Holder> {
+    holders
+        .into_iter()
+        .filter(|h| !baseline.pids.contains(&h.pid))
+        .collect()
+}
+
 /// Whether anything is listening on `port`.
 ///
 /// By connecting, not by reading `/proc`: this has to work on macOS, which is
@@ -468,11 +685,159 @@ mod tests {
             port,
             &log,
             Duration::from_secs(1),
+            &accelerator_baseline(),
         )
         .expect_err("an occupied port must be refused");
         assert!(err.to_string().contains("already in use"), "{err}");
         assert!(!canary.exists(), "the command must not have been spawned");
         let _ = std::fs::remove_file(&log);
+    }
+
+    /// The node list matches by prefix so it covers a whole driver's minor
+    /// numbers, and it must not match its way onto the rest of `/dev` — a
+    /// check that fires on `/dev/null` would stop every sweep on every
+    /// machine.
+    #[test]
+    fn accelerator_nodes_match_by_prefix_and_nothing_else() {
+        for held in [
+            "/dev/mali0",
+            "/dev/aipu",
+            "/dev/dri/renderD128",
+            "/dev/dri/renderD129",
+            "/dev/nvidia0",
+        ] {
+            assert!(is_accelerator_node(held), "{held} should count as held");
+        }
+        for other in [
+            "/dev/null",
+            "/dev/zero",
+            "/dev/dri/card0",
+            "/home/someone/model.gguf",
+            "socket:[12345]",
+        ] {
+            assert!(!is_accelerator_node(other), "{other} must not count");
+        }
+    }
+
+    /// **The baseline is what makes this check usable on a real machine.**
+    /// Anything already holding an accelerator when the sweep started is
+    /// furniture — a compositor, another user's long-running job — and must
+    /// not stop a single point. Only a holder that *appeared* is a leftover
+    /// of the previous point, and that one has to stop the run.
+    #[test]
+    fn only_holders_that_appeared_after_the_baseline_stop_a_sweep() {
+        let holder = |pid: u32| Holder {
+            pid,
+            cmd: format!("proc-{pid}"),
+        };
+        let baseline = Baseline { pids: vec![10, 20] };
+        // Exactly the furniture: nothing to wait for.
+        assert!(
+            holders_outside(&baseline, vec![holder(10), holder(20)]).is_empty(),
+            "a holder present before the sweep must not stop it"
+        );
+        // The previous point's server, still unwinding its GPU memory.
+        let new = holders_outside(&baseline, vec![holder(10), holder(30), holder(20)]);
+        assert_eq!(new.len(), 1);
+        assert_eq!(new[0].pid, 30);
+        // The command line travels with it — a bare pid is not something an
+        // operator can act on, least of all after the process has gone.
+        assert_eq!(new[0].cmd, "proc-30");
+    }
+
+    /// A machine that has not changed since the baseline was taken must clear
+    /// the wait immediately, however many accelerators are in use on it. This
+    /// is the case every well-behaved sweep is in at every point, so a
+    /// mistake here would cost the whole timeout on each one.
+    #[test]
+    fn an_unchanged_machine_clears_the_wait_at_once() {
+        let baseline = accelerator_baseline();
+        let start = Instant::now();
+        let busy = wait_for_idle_accelerators(&baseline, Duration::from_secs(30));
+        assert!(
+            busy.is_empty(),
+            "nothing new can be holding an accelerator between two adjacent \
+             calls, but {busy:?} was reported"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "an unchanged machine must not spend the timeout"
+        );
+    }
+
+    /// **The walk has to actually find a holder.** Everything above this is
+    /// policy — which holders matter — and none of it is worth anything if
+    /// the `/proc` scan that feeds it comes back empty on a machine that has
+    /// a leftover on it. That is the failure mode with no symptom: the check
+    /// passes every time and protects nothing.
+    ///
+    /// Driven against an ordinary file rather than a device, through the same
+    /// code path, so it neither needs an accelerator nor opens the NPU this
+    /// project is trying to keep free.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_proc_walk_finds_a_process_holding_a_file_open() {
+        let path = std::env::temp_dir().join(format!(
+            "orangu-sweep-held-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"held").unwrap();
+        let target = path.to_str().unwrap().to_string();
+
+        // Holds the file open on fd 3 and does nothing else.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(format!("exec 3<{target}; sleep 30"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawning the holder must work");
+
+        // The `exec` replaces the shell, so the open happens in `child`'s own
+        // pid — but the scan can still run before the redirect has. Poll.
+        let wanted = target.clone();
+        let mut found = Vec::new();
+        let seen = wait_for(Duration::from_secs(10), || {
+            found = holders_of(|t| t == wanted);
+            found.iter().any(|h| h.pid == child.id())
+        });
+
+        let holder = found.iter().find(|h| h.pid == child.id()).cloned();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            seen,
+            "the /proc walk must find the process holding {target} open; it \
+             reported {found:?}"
+        );
+        // The command line travels with the pid, or the error a sweep prints
+        // names a number and nothing an operator can act on.
+        let holder = holder.expect("checked by the assertion above");
+        assert!(
+            holder.cmd.contains("sleep 30"),
+            "the holder's command line must come back with it, got {:?}",
+            holder.cmd
+        );
+    }
+
+    /// A file nobody has open must not read as held — a walk that matched
+    /// too eagerly would refuse to start every point of every sweep.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_no_one_holds_open_has_no_holders() {
+        let path = std::env::temp_dir().join(format!("orangu-sweep-unheld-{}", std::process::id()));
+        let target = path.to_str().unwrap().to_string();
+        assert!(
+            holders_of(|t| t == target).is_empty(),
+            "nothing should hold {target} open"
+        );
     }
 
     /// Whether a pid is still running, via POSIX `kill -0`.

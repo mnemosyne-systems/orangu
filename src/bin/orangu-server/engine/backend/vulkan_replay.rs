@@ -1273,6 +1273,7 @@ mod tests {
     /// descriptor layout/pool/set, command recording, submit, and fence.
     #[test]
     fn raw_compute_doubles_input() {
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -1444,6 +1445,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// identically off the raw submit path.
     #[test]
     fn raw_path_runs_orangu_rmsnorm_on_wgpu_buffers() {
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -1684,6 +1686,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// the per-token decode pattern (same command buffer, only uniforms change).
     #[test]
     fn replay_graph_reuses_command_buffer_across_tokens() {
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -1848,6 +1851,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// the seam that scales to the whole per-layer chain.
     #[test]
     fn replay_captures_real_attn_norm_dispatch() {
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -1979,6 +1983,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// into the raw path and computes correctly**.
     #[test]
     fn replay_captures_real_matmul_dispatch() {
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -2160,6 +2165,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     fn replay_captures_real_split_attention() {
         use crate::engine::kv_cache::KvCache;
 
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -2476,6 +2482,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// Checked against a CPU reference each token.
     #[test]
     fn replay_orchestrates_ffn_chain_across_tokens() {
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -2705,6 +2712,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// ffn_normed→gate/up), so the graph must record and reuse them.
     #[test]
     fn replay_graph_copy_step_feeds_dispatch() {
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -2842,6 +2850,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// is built from.
     #[test]
     fn replay_captures_attn_norm_copy_projection_chain() {
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -3030,6 +3039,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     fn decode_capture_from_real_recording_replays_q_projection() {
         use super::super::vulkan::{FusedAttnProjection, FusedLayerInput, GpuInput};
 
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;
@@ -3098,6 +3108,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Capture the real recording of one layer.
         backend.begin_decode_capture();
         let _ = backend.fused_layer(FusedLayerInput {
+            stop_at_ffn_norm: false,
             yarn: crate::engine::backend::vulkan::RopeYarn::IDENTITY,
             normalize_v: true,
             q_bias: None,
@@ -3385,6 +3396,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 .collect();
             let mut ref_cache = crate::engine::kv_cache::KvCache::new_with_dims(64, &[kv_dim]);
             let reference = backend.fused_layer(FusedLayerInput {
+                stop_at_ffn_norm: false,
                 yarn: crate::engine::backend::vulkan::RopeYarn::IDENTITY,
                 normalize_v: true,
                 q_bias: None,
@@ -3465,6 +3477,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// / attention get their per-token position without any wgpu submit.
     #[test]
     fn per_token_uniform_updates_across_tokens() {
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(backend) = shared_backend() else {
             eprintln!("skipping: no Vulkan adapter");
             return;

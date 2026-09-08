@@ -524,6 +524,107 @@ const REMOVED_GGML_TYPES: &[u32] = &[4, 5];
 /// Whether `ggml_type` is one ggml has removed *and* this build cannot read
 /// — see [`REMOVED_GGML_TYPES`] for why that is a narrower set than the
 /// retired ids.
+/// `GGML_TYPE_F32`, `_F16` and `_Q8_0` — the types [`GgufFile::read_tensor`]
+/// can materialize as `f32`.
+const TYPE_F32: u32 = 0;
+const TYPE_F16: u32 = 1;
+const TYPE_Q8_0: u32 = 8;
+
+/// A `Q8_0` block: one `f16` scale followed by 32 `int8` weights.
+const Q8_0_BLOCK: usize = 32;
+const Q8_0_BYTES: usize = 2 + Q8_0_BLOCK;
+
+impl GgufFile {
+    /// Reads one tensor out of `path` and returns it as `f32`.
+    ///
+    /// Seeks straight to the tensor rather than reading the file, so pulling
+    /// a single projection out of an eight-gigabyte model costs its own size
+    /// and nothing more.
+    ///
+    /// Only `F32`, `F16` and `Q8_0` are handled. That is deliberately narrow:
+    /// this exists to hand real weights to something that needs plain floats
+    /// — [`crate::npu_ort`] compiling a layer, a test checking a kernel — not
+    /// to become a second dequantizer beside the engine's own. An unsupported
+    /// type is an error naming itself, never a silent zero.
+    pub fn read_tensor(&self, path: &Path, name: &str) -> Result<Vec<f32>> {
+        self.read_tensor_at(path, name, 0)
+    }
+
+    /// [`Self::read_tensor`] for a GGUF that begins `base` bytes into `path`.
+    pub fn read_tensor_at(&self, path: &Path, name: &str, base: u64) -> Result<Vec<f32>> {
+        let info = self
+            .tensors
+            .iter()
+            .find(|t| t.name == name)
+            .ok_or_else(|| anyhow!("no tensor named `{name}` in {}", path.display()))?;
+
+        let count = info.element_count() as usize;
+        let bytes = match info.ggml_type {
+            TYPE_F32 => count * 4,
+            TYPE_F16 => count * 2,
+            TYPE_Q8_0 => {
+                if !count.is_multiple_of(Q8_0_BLOCK) {
+                    bail!(
+                        "`{name}` has {count} elements, not a whole number of {Q8_0_BLOCK}-element Q8_0 blocks"
+                    );
+                }
+                count / Q8_0_BLOCK * Q8_0_BYTES
+            }
+            other => bail!(
+                "`{name}` is {}, which this reader cannot dequantize (F32, F16 and Q8_0 only)",
+                ggml_type_name(other)
+            ),
+        };
+
+        let mut file =
+            File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        file.seek(SeekFrom::Start(base + self.data_offset + info.offset))
+            .with_context(|| format!("failed to seek to `{name}`"))?;
+        let mut raw = vec![0u8; bytes];
+        file.read_exact(&mut raw)
+            .with_context(|| format!("failed to read {bytes} bytes of `{name}`"))?;
+
+        let mut out = vec![0.0f32; count];
+        match info.ggml_type {
+            TYPE_F32 => {
+                for (value, chunk) in out.iter_mut().zip(raw.as_chunks::<4>().0) {
+                    *value = f32::from_le_bytes(*chunk);
+                }
+            }
+            TYPE_F16 => {
+                for (value, chunk) in out.iter_mut().zip(raw.as_chunks::<2>().0) {
+                    *value = half::f16::from_bits(u16::from_le_bytes(*chunk)).to_f32();
+                }
+            }
+            TYPE_Q8_0 => {
+                for (block, dst) in raw
+                    .as_chunks::<Q8_0_BYTES>()
+                    .0
+                    .iter()
+                    .zip(out.as_chunks_mut::<Q8_0_BLOCK>().0)
+                {
+                    let scale =
+                        half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
+                    for (value, quantized) in dst.iter_mut().zip(&block[2..]) {
+                        *value = *quantized as i8 as f32 * scale;
+                    }
+                }
+            }
+            _ => unreachable!("guarded by the match above"),
+        }
+        Ok(out)
+    }
+
+    /// The `f32` scalar stored under `name`, if there is one.
+    ///
+    /// Some projectors ship an activation range beside each weight —
+    /// `<layer>.input_min`, `<layer>.output_max` and so on — which is exactly
+    /// the calibration a static quantizer would otherwise have to measure.
+    pub fn read_scalar(&self, path: &Path, name: &str) -> Option<f32> {
+        self.read_tensor(path, name).ok()?.first().copied()
+    }
+}
+
 pub fn is_removed_ggml_type(ggml_type: u32) -> bool {
     REMOVED_GGML_TYPES.contains(&ggml_type)
 }
@@ -576,6 +677,121 @@ mod tests {
     fn write_string(buf: &mut Vec<u8>, s: &str) {
         buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
         buf.extend_from_slice(s.as_bytes());
+    }
+
+    /// Builds a complete GGUF — header *and* data section — in a temp file,
+    /// so the seek-and-dequantize path is exercised the way it runs.
+    fn write_gguf_with_tensor(
+        dir: &std::path::Path,
+        name: &str,
+        dims: &[u64],
+        ggml_type: u32,
+        data: &[u8],
+    ) -> std::path::PathBuf {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&1u64.to_le_bytes()); // one tensor
+        buf.extend_from_slice(&0u64.to_le_bytes()); // no metadata
+
+        write_string(&mut buf, name);
+        buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for d in dims {
+            buf.extend_from_slice(&d.to_le_bytes());
+        }
+        buf.extend_from_slice(&ggml_type.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes()); // offset within the data
+
+        // The data section starts at the next multiple of the alignment.
+        while !buf.len().is_multiple_of(32) {
+            buf.push(0);
+        }
+        buf.extend_from_slice(data);
+
+        let path = dir.join(format!("{name}.gguf"));
+        std::fs::write(&path, &buf).expect("writing the fixture");
+        path
+    }
+
+    /// `Q8_0` is a scale per 32 weights; dequantizing is that scale times
+    /// each `int8`, and this checks it against values computed by hand.
+    #[test]
+    fn reads_a_q8_0_tensor_back_as_f32() {
+        let dir = std::env::temp_dir().join("orangu-gguf-q8-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let scale = half::f16::from_f32(0.25);
+        let mut data = scale.to_bits().to_le_bytes().to_vec();
+        let quantized: Vec<i8> = (0..32).map(|i| (i as i8) - 16).collect();
+        data.extend(quantized.iter().map(|q| *q as u8));
+
+        let path = write_gguf_with_tensor(&dir, "w", &[32], 8, &data);
+        let gguf = GgufFile::open(&path).expect("open");
+        let values = gguf.read_tensor(&path, "w").expect("read");
+
+        assert_eq!(values.len(), 32);
+        for (value, q) in values.iter().zip(&quantized) {
+            assert_eq!(*value, *q as f32 * 0.25);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `F32` and `F16` come back unchanged and rounded respectively, and a
+    /// scalar reads as one value — which is how a projector's calibration
+    /// ranges are stored.
+    #[test]
+    fn reads_float_tensors_and_scalars() {
+        let dir = std::env::temp_dir().join("orangu-gguf-float-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let wanted = [1.5f32, -2.25, 0.0, 1024.0];
+        let mut data = Vec::new();
+        for v in wanted {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let path = write_gguf_with_tensor(&dir, "f32s", &[4], 0, &data);
+        let gguf = GgufFile::open(&path).expect("open");
+        assert_eq!(gguf.read_tensor(&path, "f32s").expect("read"), wanted);
+
+        let mut halves = Vec::new();
+        for v in wanted {
+            halves.extend_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+        }
+        let path = write_gguf_with_tensor(&dir, "f16s", &[4], 1, &halves);
+        let gguf = GgufFile::open(&path).expect("open");
+        assert_eq!(gguf.read_tensor(&path, "f16s").expect("read"), wanted);
+
+        let path = write_gguf_with_tensor(&dir, "scalar", &[1], 0, &7.5f32.to_le_bytes());
+        let gguf = GgufFile::open(&path).expect("open");
+        assert_eq!(gguf.read_scalar(&path, "scalar"), Some(7.5));
+        assert_eq!(gguf.read_scalar(&path, "absent"), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A type this reader cannot dequantize is an error naming itself, and a
+    /// missing tensor is an error rather than an empty vector — either one
+    /// silently returning zeros would be indistinguishable from real weights
+    /// that happen to be zero.
+    #[test]
+    fn an_unreadable_tensor_is_an_error() {
+        let dir = std::env::temp_dir().join("orangu-gguf-error-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // Q4_K (12), which this reader does not handle.
+        let path = write_gguf_with_tensor(&dir, "q4k", &[256], 12, &[0u8; 144]);
+        let gguf = GgufFile::open(&path).expect("open");
+        let err = gguf.read_tensor(&path, "q4k").expect_err("should refuse");
+        assert!(err.to_string().contains("Q4_K"), "{err}");
+
+        assert!(gguf.read_tensor(&path, "nope").is_err());
+
+        // A Q8_0 tensor whose length is not a whole number of blocks.
+        let path = write_gguf_with_tensor(&dir, "ragged", &[20], 8, &[0u8; 34]);
+        let gguf = GgufFile::open(&path).expect("open");
+        assert!(gguf.read_tensor(&path, "ragged").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

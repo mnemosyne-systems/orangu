@@ -1821,11 +1821,73 @@ fn prefill_in_chunks(
         drafter.catch_up(part, pos)?;
         Ok(logits)
     };
+    // **The width the NPU has graphs for**, when there is one. A compiled
+    // graph has one static shape, so a chunk of any other size is not
+    // offered the device — and left to itself this sizer issues almost
+    // anything but that shape. Measured on a 980-token prompt with blocks
+    // compiled at 16: `[16, 16, 25, 16, 25, 19, 16, 24, 17, 16, 24, ...]`,
+    // 52 submissions of which about half matched, so well over half the
+    // prompt never reached the device. The sizer is not wrong — it is
+    // pricing submissions against a time budget and knows nothing about a
+    // graph's shape — so the shape is told to it here.
+    let npu_width = crate::engine::npu_ffn_service().and_then(|npu| npu.prefill_width());
+    // Snapped to the device's width, up as well as down.
+    //
+    // Down is obviously safe. Up needs an argument, because the sizer's
+    // width is a bound set by a time budget and by what this backend can
+    // submit without being reset. The argument is that the bound is being
+    // applied to the wrong thing: with the feed-forward on the device it is
+    // about 82% of a layer's GPU time that is no longer submitted at all
+    // (`ORANGU_GPU_TIMESTAMPS` puts ffn-side at 186.7 ms of a 260 ms step),
+    // so a chunk of `npu` tokens is a *smaller* GPU submission than the
+    // sizer's own choice was before the device took the network. The sizer
+    // measures wall time, which now includes work that is not on the GPU,
+    // and prices the submission far above what it is.
+    //
+    // Bounded by the probe's candidates, so this can never ask for more
+    // than 128 tokens at once — see `npu_tool::probe_prefill_width`.
+    //
+    // Worth 2.8x on a prompt that reaches this loop at all. llama 3.2 3B
+    // `Q8_0`, prefill rate with the device off, on, and on with the widths
+    // snapped:
+    //
+    // | prompt | off | on, unsnapped | snapped to 16 | snapped to 64 |
+    // |---|---|---|---|---|
+    // | 631 tokens | 3.71 tok/s | - | 10.56 | |
+    // | 980 tokens | 3.65 | 5.52 | 10.35 | **23.46** |
+    // | 2080 tokens | 3.53 | - | 10.09 | |
+    //
+    // The last column is the same prompt once the device was asked what
+    // width it wanted rather than told: 62 submissions became 17.
+    let snap = |width: usize| npu_width.unwrap_or(width);
     // The one shape that needs no bounding: a prompt that fits in a single
     // chunk *and* starts at position zero is the least work a prefill can be.
     // `batch == 0` is an explicit opt-out — see [`prefill_batch`].
+    //
+    // **Kept even when the device holds blocks**, which was worth measuring
+    // because the device only ever sees a chunk of exactly `npu_width` and
+    // this path issues one wide chunk instead. Declining it so that a short
+    // prompt is chopped into device-width pieces makes short prompts
+    // slower, not faster — llama 3.2 3B `Q8_0`, prefill rate, one pass
+    // against snapped 16s:
+    //
+    // | prompt | one pass | chopped to 16 |
+    // |---|---|---|
+    // | 75 tokens | **10.72 tok/s** | 7.35 |
+    // | 193 tokens | **19.81** | 10.80 |
+    //
+    // A prompt this size is one efficient batched submission, and the
+    // per-chunk cost of twelve of them is more than the device gives back.
+    // Past one batch the comparison inverts — see the table on `snap` —
+    // because the sizer is no longer choosing between one pass and many but
+    // between many narrow ones that miss the device and many that hit it.
     if batch == 0 || (tokens.len() <= batch && start_pos == 0) {
+        // `chunk` rather than a bare `forward`: it is the one that also
+        // feeds the drafter its state rows. The pass still has to be
+        // counted — `forward_passes` is what the NPU work measures chunking
+        // against.
         let logits = chunk(model, cache, tokens, start_pos)?;
+        crate::engine::note_forward_pass();
         on_chunk(tokens.len());
         return Ok(logits);
     }
@@ -1843,12 +1905,12 @@ fn prefill_in_chunks(
     // exists to price a submission against a driver limit this backend does
     // not have, and pricing a streamed model by the clock is what shrinks the
     // chunk into a read spiral. Start at the full width and stay there.
-    let mut width = match policy {
+    let mut width = snap(match policy {
         ChunkPolicy::Adaptive => cost
             .opening_width(start_pos, budget, batch)
             .unwrap_or(PREFILL_PROBE_TOKENS.min(batch)),
         ChunkPolicy::Flat => batch,
-    };
+    });
     // One line per prefill, not one per submission — which is the whole point.
     // `ORANGU_PREFILL_TRACE` answers a different question and answers it by
     // writing to stderr inside the submission loop, so it changes the cost it
@@ -1862,6 +1924,7 @@ fn prefill_in_chunks(
         let n = width.min(tokens.len() - done);
         let started = Instant::now();
         logits = chunk(model, cache, &tokens[done..done + n], pos)?;
+        crate::engine::note_forward_pass();
         let elapsed = started.elapsed();
         pos += n;
         done += n;
@@ -1872,7 +1935,7 @@ fn prefill_in_chunks(
         }
         if policy == ChunkPolicy::Adaptive {
             cost.observe(n, elapsed);
-            width = cost.next_width(budget, batch);
+            width = snap(cost.next_width(budget, batch));
         }
     }
     if chunks_report {

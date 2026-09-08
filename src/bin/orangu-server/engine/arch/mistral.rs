@@ -381,6 +381,7 @@ impl MistralModel {
             let out = vulkan.record_fused_layer(
                 &mut encoder,
                 FusedLayerInput {
+                    stop_at_ffn_norm: false,
                     x: x_input,
                     // `mistral3` sits in upstream's NORM arm.
                     pairing: self.rope.layout,

@@ -457,6 +457,7 @@ impl PhiModel {
             let out = vulkan.record_fused_layer(
                 &mut encoder,
                 FusedLayerInput {
+                    stop_at_ffn_norm: false,
                     x: x_input,
                     // Partial NEOX RoPE: only the leading `rope_dim` of each
                     // head rotates, which the chain takes as a parameter.
@@ -780,6 +781,11 @@ impl PhiModel {
                 // This layer's card — see `Backend::as_wgpu_on`.
                 .as_wgpu_on(layer.wo.device())
                 .filter(|_| !crate::engine::arch::llama::no_fused_post_attention())
+                // The fused chain never forms `normed2` on the host, and
+                // `normed2` is exactly what the NPU compiler calibrates on.
+                // While capturing, take the branch below — one prompt of a
+                // slower path buys every later one the device.
+                .filter(|_| crate::engine::dump_ffn_dir().is_none())
                 .and_then(|vulkan| {
                     vulkan.fused_post_attention_prefill(
                         crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out),
@@ -813,6 +819,20 @@ impl PhiModel {
                 n_embd,
                 cfg.rms_eps,
             );
+            crate::engine::dump_ffn_input(layer_idx, n_tokens, &normed2);
+            // On the NPU when this block has been compiled for this width.
+            // The device holds gate and up as separate matrices — the same
+            // halves `ffn_gate_up` names — so it needs the fused tensor
+            // split at compile time, not here.
+            if orangu::npu_ffn::service().is_some_and(|npu| npu.has(layer_idx, n_tokens)) {
+                let mut out = Vec::new();
+                if orangu::npu_ffn::service()
+                    .is_some_and(|npu| npu.forward_into(layer_idx, n_tokens, &normed2, &mut out))
+                {
+                    tensor::add_inplace(&mut x, &out);
+                    continue;
+                }
+            }
             // One `[n_embd, 2*n_ff]` projection, then SwiGLU over the two
             // halves of each row: `silu(first) * second`.
             self.backend

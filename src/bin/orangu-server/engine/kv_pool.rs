@@ -2310,6 +2310,7 @@ mod tests {
     #[test]
     fn device_pages_do_not_overlap() {
         use crate::engine::backend::vulkan_shaders::KvStorage;
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(vulkan) = crate::engine::backend::vulkan::shared_test_backend() else {
             eprintln!("no GPU adapter; skipping");
             return;
@@ -2357,6 +2358,7 @@ mod tests {
     #[should_panic(expected = "block table overflow")]
     fn a_table_that_does_not_fit_is_refused() {
         use crate::engine::backend::vulkan_shaders::KvStorage;
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(vulkan) = crate::engine::backend::vulkan::shared_test_backend() else {
             // The assertion cannot be reached without a device, and a test that
             // silently passes for that reason is worse than one that is loud.

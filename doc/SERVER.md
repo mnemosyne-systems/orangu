@@ -1144,8 +1144,10 @@ reexec = yes
   default memory mapping leaves request size to the kernel's readahead, so on
   a default deployment this key changes nothing.
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `cuda`,
-  `opencl`, or
-  `rocm`. `auto` tries every GPU backend compiled into this build, in order
+  `opencl`,
+  `rocm`, or `npu` (recognized but not yet runnable — orangu detects and
+  reports an NPU as inventory only; see **NPU** in the manual).
+  `auto` tries every GPU backend compiled into this build, in order
   (Vulkan, CUDA, OpenCL, then ROCm if built with `--features rocm`),
   falling back to the CPU backend silently if none is found. **On macOS the
   order starts with Metal**, which is the only GPU API Apple ships — Vulkan

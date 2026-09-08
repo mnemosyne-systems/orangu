@@ -344,7 +344,7 @@ download ... | tee log`), there's no cursor movement or redraws: a plain
 line per file as it finishes, plus one whenever a download stalls into a
 retry, so a slow run still says why.
 
-**`system`** detects the machine's operating system, CPU and GPU(s) — the
+**`system`** detects the machine's operating system, CPU, GPU(s) and NPU — the
 same report printed at the top of every attached `orangu-server` startup
 (see **Quick start** above):
 
@@ -446,17 +446,286 @@ them on every supported platform; the power source does not, because
 The section is omitted entirely on a machine that reports neither a source
 nor a sensor, which is the normal state inside a container.
 
+The `CPU` section's instruction-set rows are the ones that exist on the
+architecture the binary was built for, and nothing else: `SSE4.2`, `AVX2`
+and `AVX512` on x86, `NEON`, `SVE`, `SVE2`, `DotProd`, `I8MM`, `FP16` and
+`BF16` on AArch64. Three `No` rows for AVX on an ARM board are not an
+inventory — they describe instruction sets that CPU could never have had —
+so they are omitted rather than answered. These rows report what the
+*hardware* offers, which is a wider question than what orangu's own kernels
+will use: `engine::vecdot` has x86 paths and no AArch64 ones, so an ARM
+machine can honestly report `SVE2` here and still run the scalar matmul,
+and the startup banner's own instruction-set field (which reports
+*dispatch*, not capability) will say `scalar` there.
+
 GPU detection has no single cross-platform API, so it layers several
 best-effort sources: `nvidia-smi` for NVIDIA (Linux and Windows), Linux's
 `/sys/class/drm` for everything else on Linux (AMD, Intel, and any other
 PCI display device), and native OS tools (`system_profiler`/PowerShell's
-`Win32_VideoController`) on macOS and Windows. A machine where none of
-them finds anything gets no `GPU` section at all — the CPU inventory is the
-whole report — rather than a heading over a "none detected" line. `Memory type` tells apart a
+`Win32_VideoController`) on macOS and Windows. When none of those finds
+anything, the Vulkan loader is asked directly, as a last resort — every
+source above it reads an *OS* description of a PCI device, and an SoC has
+neither. On a CIX P1 board the `/sys/class/drm/cardN` nodes are ACPI
+display controllers with no `vendor` file and the Mali GPU has no DRM node
+at all, so the machine reported no GPU whatsoever and then ran the model on
+it through Vulkan anyway; the driver doing the work is the one source
+guaranteed to know the device exists. It fills a hole rather than merging
+with the others, because the two name the same card differently
+(`Advanced Micro Devices, Inc. [AMD/ATI] Navi 14` against `AMD Radeon RX
+5500M (RADV NAVI14)`) and there is no reliable key to join them on. A
+machine where nothing at all answers gets no `GPU` section — the CPU
+inventory is the whole report — rather than a heading over a "none
+detected" line. `Memory type` tells apart a
 genuine dedicated card from an integrated GPU/APU sharing the CPU's system
 RAM — a `Shared` GPU's `VRAM total` is always reported as the machine's
 total system RAM regardless of what its own platform query said, since
 that's the real ceiling on how much it can actually draw on.
+
+### NPU
+
+### The GPU is checked before it is trusted
+
+A driver can compile correct code incorrectly, and when it does the result is
+not a crash — it is quietly wrong numbers. So at startup each tuned decode
+kernel and the cooperative attention kernel are given a known answer and
+compared against the CPU. Any that disagree are dropped, and the reference
+kernel — which computes the same thing more slowly — is used instead:
+
+```
+orangu-server: [vulkan] this device computes the tuned Q4_K decode kernels incorrectly; falling back to the reference kernel for Q4_K
+orangu-server: [vulkan] this device computes the cooperative attention kernel incorrectly; rebuilding without it
+```
+
+This is not hypothetical or vendor-specific. On the Mali-G720 this was
+written against, the block-unroll kernels for `Q4_K`/`Q5_K`/`Q6_K` return
+wrong products at decode shapes — `Q6_K` drops a whole super-block's
+contribution, `Q4_K` comes back with the wrong sign — and prefill attention
+was off by up to 160%. The generated WGSL was read line by line against the
+reference decoder and is correct, so there is nothing to fix in the shader.
+Without the check, a `Q4_K_M` model, the most common quantization anyone
+runs, produced quietly degraded output on that board with no error anywhere.
+
+The check costs a few milliseconds and runs on **every** device, not just
+ones already known to be broken — a check that only ran where a problem was
+expected would not have found this one. If a type still disagrees with every
+tuned kernel disabled, that is said loudly, because then the fallback is not
+a fallback and `backend = cpu` is the only correct answer.
+
+A machine with a neural processing unit gets an `NPU` section too:
+
+```
+NPU
+  Model            : Arm China X2_1204MP3
+  Cores            : 3
+  Clusters         : 1
+  Partitions       : 1
+  Runtime          : /usr/share/cix/lib/libnoe.so.0
+  Inference        : precompiled graphs (not GGUF models)
+```
+
+One family is detected today: an Arm China Zhouyi AIPU reached through
+CIX's NOE user-mode driver, which is the stack shipped on CIX P1/CD8180
+boards (kernel-side `aipu.ko` behind `/dev/aipu`). `libnoe` is opened at
+*runtime* rather than linked — it ships with a board BSP, lives off the
+default loader path, and exists on approximately no other machine — so its
+absence is an ordinary "no NPU" answer and not an error. `ORANGU_NPU_LIB`
+points the probe at a specific library when a BSP is installed somewhere
+it does not guess. Other vendors' NPUs (Rockchip's RKNN, Intel's,
+Qualcomm's Hexagon) have entirely separate userspace stacks and are not
+detected: such a machine reports no NPU rather than a wrong one.
+
+**The last line is the important one, and it is precise.** orangu *can*
+run work on the NPU, in two ways.
+
+`orangu::npu::NpuRuntime` loads a compiled graph, binds inputs, executes and
+reads the outputs back — verified on real hardware against the vendor's own
+demo graphs, including a 968 MiB Stable Diffusion UNet at ~2.2 s/inference
+and an int8 face-embedding model at ~6.5 ms steady state. It accepts either
+a `.cix` container (`load_graph`) or a bare AIPU executable already in
+memory (`load_graph_bytes`).
+
+`orangu::npu_ort` *produces* such an executable. It emits a small ONNX model
+for a linear projection — or a chain of them — compiles it through ONNX
+Runtime's Zhouyi execution provider, and extracts the compiled binary from
+the EPContext node the provider writes. Measured end to end, including the
+`f32` to `uint8` conversion on both sides: a 256-token by 1024x1024
+projection compiles in ~194 ms and then runs in **2.2 ms (247 GFLOP/s)**.
+
+Two things matter more than the headline number.
+
+**Convert with SIMD.** The conversion between the host's row-major `f32` and
+the channels-major `uint8` the device reads is a transpose, and done naively
+it cost more than the inference it fed. Tiled 16x16 and done in NEON
+registers — quantize four lanes at a time, transpose in four `trn` stages,
+never touching memory in between — it took 128x512x512 from 1.43 ms to
+0.69 ms, against 0.29 ms for the device alone.
+
+**Fuse consecutive layers.** `compile_stack` puts a whole chain in one graph,
+so intermediates never leave the device. Three 512x512 layers over 128
+tokens: **0.68 ms fused against 1.87 ms as separate graphs, a 2.75x
+difference**, at 295 GFLOP/s — and roughly half the artifact bytes, since
+each separate graph carries its own scaffolding. The lesson generalizes: this
+device wants subgraphs, not single operations, which is precisely why
+orangu's per-matmul `Backend` seam is the wrong shape for it.
+
+There is no `Relu` node in a fused stack, and none is needed. A hidden
+layer's output is quantized over `[0, bound]`, which puts its zero point at
+zero, and `QuantizeLinear` into `uint8` clamps at zero — so the rectifier
+*is* the quantization. That is also the only form that compiles: an explicit
+`Relu` between a convolution and its `QuantizeLinear` makes the provider
+reject the convolution, because its QDQ node group no longer ends where the
+builder expects.
+
+Both halves of a Gemma 4 pair have been run this way, from their own GGUF
+weights rather than synthetic ones — `orangu::gguf::GgufFile::read_tensor`
+dequantizes `Q8_0` straight out of the file:
+
+| work | shape | time | rate |
+| --- | --- | --- | --- |
+| `v.blk.0` FFN, fused (the projector) | 196 patches x 768 x 3072 | 3.53 ms | **~790 GFLOP/s** |
+| `blk.0.attn_output.weight` (the model) | 128 tok x 2048 x 2560 | 2.14 ms | ~625 GFLOP/s |
+| `v.blk.0.ffn_down.weight` (the projector) | 196 patches x 3072 x 768 | 2.79 ms | ~330 GFLOP/s |
+
+The projector is the better-shaped work of the two, for a reason worth
+stating: a vision encoder runs a **fixed** 196 patches every time, so one
+compiled graph serves forever, where a language model needs one graph per
+token count. It also ships an activation range beside every weight —
+`v.blk.0.ffn_down.input_min` and friends — which is exactly the calibration a
+static quantizer would otherwise have to guess at.
+
+A whole **feed-forward block** fuses into one graph — `compile_gated_ffn`
+emits `down(gelu(gate(x)) * up(x))`, the shape both Gemma 4 models use. That
+is a diamond, not a chain: `gate` and `up` read the same input and a
+multiply joins them, which is why it has its own builder. Measured on the
+projector's first vision block, 196 patches through 768 -> 3072 -> 768:
+**3.5 ms, ~790 GFLOP/s**, from an 11.5 MB artifact that took 2.6 s to
+compile. That is the largest share of a transformer layer's arithmetic
+running as a single graph invocation.
+
+Two things had to be discovered rather than assumed, and both are recorded
+here because neither is guessable from the vendor's headers.
+
+**The provider registers no `Gelu` builder.** The string is in the library,
+but the registration table maps 77 op types and `Gelu` is not among them —
+`Erf`, `Add` and `Mul` are, so GELU is spelled out as
+`0.5 * x * (1 + erf(x / sqrt(2)))`. The `* 0.5` folds exactly into the
+`down` weights, which are quantized anyway, costing nothing.
+
+**A QDQ tensor carries exactly one quantization.** Reading one tensor at two
+scales looks like a way to fold a constant multiply in for free, and it
+compiles — and then computes something else: 91% wrong against a CPU
+reference, against 0.5% once the two multiplies were made real operations.
+A graph that compiles is not a graph that is right.
+
+### Preparation happens at startup, not by hand
+
+None of this is something to run. When a model is served and a multimodal
+projector sits beside it, the server checks whether that projector's vision
+blocks are compiled for this machine's NPU and compiles the ones that are
+not — before the weights are mapped, and only ever once:
+
+```
+orangu-server: [npu] compiling 16 vision block(s) of mmproj-gemma-4-E4B-it-Q8_0.gguf at 196 tokens — one time, a few seconds each
+orangu-server: [npu] 16 block(s) compiled in 41s, cached in /home/pgmoneta/.orangu/npu
+```
+
+Every start after that is silent and free: the check is a cache lookup, and
+a machine with no NPU pays only a probe that fails immediately. `npu_precompile
+= off` in `[orangu-server]` turns it off.
+
+The compiling runs in a **child process**, which is not an implementation
+detail. The compiler loads the vendor's ONNX Runtime provider and the runtime
+loads NOE; each carries its own copy of the same user-mode driver, and
+whichever loads first captures the other's symbol bindings — in one process
+that yields wrong answers rather than errors. So the server re-runs its own
+executable to compile and only ever reads the cache itself. That is what the
+hidden `npu-compile` and `npu-run` subcommands are for: they are how this
+talks to itself across a process boundary, not a workflow anyone follows.
+
+Only a projector is prepared, and the reason is worth stating. A compiled
+graph has exactly one static shape, and a vision encoder's shape never
+varies — 224x224 at patch 16 is always 196 patches — so one compile serves
+every image forever. A language model's token count is a property of each
+request, so nothing is precompiled for one.
+
+The cache lives in `~/.orangu/npu`, keyed by a fingerprint of the model's
+tensor table and by token count. A rebuilt or different GGUF misses rather
+than silently running another model's weights.
+
+The whole vision tower of the Gemma 4 projector, all 16 blocks, measured
+through the same path:
+
+```
+16 block(s): 53.37 ms total, 831.8 GFLOP/s aggregate
+```
+
+That is 180 MB of cache, about 40 seconds to compile once, and a few
+milliseconds to load each block.
+
+**What this cannot do is calibrate honestly.** Static quantization wants
+activations from real inputs; with none to hand it synthesizes them uniformly
+across each layer's range, which is the worst case for quantization error
+rather than a typical one. That is enough to compile a block and measure it,
+and not enough to deploy one — see below.
+
+**The accuracy cost is real and should be measured before it is relied on.**
+The device carries one scale per tensor where `Q8_0` carries one per 32
+weights, and that shows: against an `f32` reference, worst-case error was
+~10% of the largest output on a single projection, and ~11% through a whole
+fused feed-forward block — so the eight quantized stages a block needs cost
+little more than one projection does. Those runs drive the layer with
+activations spread uniformly across the whole calibrated range, which is the
+worst case rather than the typical one — real activations concentrate — but
+per-tensor `uint8` is inherently coarser than the quantization the GGUF
+already carries, and no amount of engineering changes that.
+
+One tuning result is worth keeping, because it points the opposite way to
+intuition. Activation ranges are measured on the host and widened by a
+margin for values the calibration did not reach. Narrowing that margin looks
+like free precision; measured on the real block it went the other way — 1.25
+gave 10% error, 1.10 gave 18%, 1.02 gave 24%. Saturation costs far more than
+coarseness, so the rule is to calibrate on enough data that the range is
+real, then leave room for the tail.
+
+Chained layers need **calibration**, not a derived bound. A single layer can
+assume its own worst case; chained, each layer's worst case becomes the
+next's assumed input and the bound compounds until the real activations
+quantize to nothing — a two-layer stack built that way returned all zeros.
+`compile_stack` therefore runs the layers on the host in `f32` over
+representative input and quantizes each activation to the range observed.
+
+What orangu does not do is serve a **GGUF** model there, for reasons that
+are about the engine rather than the device.
+
+A compiled graph has one fixed shape. Every distinct (weight matrix, token
+count) pair needs its own compile, at roughly 100-250 ms each, and a 4B
+model has hundreds of projections — so serving needs an ahead-of-time
+compile pass whose artifacts are cached, not a backend that compiles on
+demand. That pass does not exist yet.
+
+Compiling and executing also cannot share a process. `libnoe.so.0` carries
+its own copy of the vendor user-mode driver, and 342 of its symbols collide
+with the `libaipu_driver.so` the execution provider loads; whichever is
+loaded first with `RTLD_GLOBAL` captures those bindings for both. The
+failures this produces are shape-dependent and not always errors, which is
+what makes the rule strict: compile in one process, serve in another.
+
+And the device is an integer engine. Each tensor a graph declares carries a
+single `scale` and `zero_point` for the whole tensor, where GGUF's K-quants
+carry a scale per 32-256 element block. NPU-resident weights would have to
+be requantized, losing the K-quant scheme.
+
+`backend = npu` is therefore recognized but always fails at startup, with
+that explanation rather than `invalid value` — someone who has just seen the
+device listed here should not be left wondering whether it was a typo. It is
+also not in the `auto` order, so nothing selects it by accident.
+
+One more thing is worth knowing before the payoff is assumed. The NPU shares
+system DDR with the CPU and the GPU, so it has no bandwidth advantage for
+*decode*, which is bandwidth-bound; only prefill is compute-bound enough to
+have headroom. The measurements agree: at a decode-sized projection (8
+tokens, 64x32) the NPU takes 0.111 ms against 0.034 ms for a naive scalar
+CPU loop, and only becomes worth the trip at prefill shapes.
 
 **`suggest`** estimates a GGUF model *size* (parameter count, not a
 specific model yet) likely to run comfortably on this machine, printed as a
@@ -1177,8 +1446,9 @@ reexec = yes
   changes nothing.
 
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `dx12`,
-  `cuda`, `opencl`, or
-  `rocm`. `auto` tries every GPU backend compiled into this build, in order
+  `cuda`, `opencl`,
+  `rocm`, or `npu` (recognized but not yet runnable — see **NPU** below).
+  `auto` tries every GPU backend compiled into this build, in order
   (Vulkan, CUDA, OpenCL, then ROCm if built with the `rocm` feature),
   falling back to the CPU backend silently if none is found. **On macOS the
   order starts with Metal**, which is the only GPU API Apple ships — Vulkan
@@ -1232,7 +1502,7 @@ shown.
 | `read_size` | `8192` | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening |
 | `draft_model` | — | a second, smaller model whose guesses the served model verifies |
 | `draft_tokens` | `4` | tokens the draft proposes per verification |
-| `backend` | `auto` | `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm` |
+| `backend` | `auto` | `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm`, `npu` |
 | `device` | `auto` | which card: an index, part of a name, or `auto` |
 | `device_split` | `off` | spread one model across several devices |
 | `threads` | rayon's choice | CPU worker threads |

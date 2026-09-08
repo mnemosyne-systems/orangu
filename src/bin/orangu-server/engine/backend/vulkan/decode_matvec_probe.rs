@@ -94,6 +94,7 @@ fn fit(points: &[(f64, f64)]) -> (f64, f64) {
 #[test]
 #[ignore]
 fn decode_matvec_fixed_cost_gpu_versus_cpu() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(gpu) = shared_test_backend() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -329,5 +330,229 @@ fn decode_matvec_fixed_cost_gpu_versus_cpu() {
         "  forty layers a token: {:.2} ms as stored, {:.2} ms at the ceiling",
         40.0 * as_stored / 1000.0,
         40.0 * ceiling / 1000.0
+    );
+}
+
+/// **Does the device's bandwidth actually win at the top end?**
+/// [`host_matmul_threshold_bytes`](crate::engine::backend::host_matmul_threshold_bytes)
+/// assumes it does — that host and device costs are two lines which cross
+/// once, so above the crossing the device is the right place forever. That
+/// holds only if the device reads a weight faster than the host does, and
+/// whether it *does* turns out to depend on the format the weight is stored
+/// in.
+///
+/// So: one shape, every format a real file uses, both engines. The shape is
+/// the vocabulary projection of Llama-3.2-1B (`2048 -> 128256`), which is the
+/// largest single matmul in a decode step and the one with the most to lose.
+///
+/// `cargo test --release --bin orangu-server decode_matvec_format -- --ignored --nocapture`
+/// The formats [`decode_matvec_format_sweep_gpu_versus_cpu`] compares, named
+/// once so the measuring loop and the reporting loop cannot drift apart.
+///
+/// `F16`, `Q4_K` and `Q6_K` are controls: the first has no block structure
+/// to get wrong, the other two have their own tuned kernels and never reach
+/// `block_hoisted_suffix`. A change to the block-hoisted family should move
+/// the middle of this list and leave the ends alone.
+const SWEEP_FORMATS: &[(&str, u32)] = &[
+    ("F16", crate::engine::quant::GGML_TYPE_F16),
+    ("Q4_0", crate::engine::quant::GGML_TYPE_Q4_0),
+    ("Q4_1", crate::engine::quant::GGML_TYPE_Q4_1),
+    ("Q5_0", crate::engine::quant::GGML_TYPE_Q5_0),
+    ("Q5_1", crate::engine::quant::GGML_TYPE_Q5_1),
+    ("Q8_0", crate::engine::quant::GGML_TYPE_Q8_0),
+    ("Q6_K", crate::engine::quant::GGML_TYPE_Q6_K),
+    ("Q4_K", GGML_TYPE_Q4_K),
+];
+
+#[test]
+#[ignore]
+fn decode_matvec_format_sweep_gpu_versus_cpu() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(gpu) = shared_test_backend() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let cpu = CpuBackend;
+    // Twenty-one, not five. Capping the shape (above) put a single
+    // measurement at a few milliseconds, and five of those leave a median
+    // that still swings by 3x run to run — `F16` read 4.2 and 13.8 GB/s in
+    // consecutive runs of the *same* binary, which is wider than any kernel
+    // difference worth reporting. The whole sweep is ~5 s at five reps, so
+    // there is room to spend here, and the invariant formats are how the
+    // noise floor is checked: if they disagree between arms, the comparison
+    // is void.
+    let reps = 21;
+    // `32768`, not a real vocabulary's `128256`. Eight formats at the full
+    // width is 1.77 GiB of device memory across the run, and this board
+    // charges ~0.35 s per MiB of *cumulative* allocation at process exit
+    // (`teardown_probe_holds_gpu_memory`) — the full-width version of this
+    // test finished its work in 13 s and then sat in `Z` state for 620 s,
+    // holding a Vulkan context that slowed the next run to a crawl. A
+    // quarter of the width is ~440 MiB for the whole sweep, under the point
+    // where the stall begins, and every weight here is still far larger than
+    // any cache, which is all a bandwidth measurement needs.
+    let (in_dim, out_dim) = (2048usize, 32768usize);
+    let x = vec![0.05f32; in_dim];
+
+    println!("\n== one shape [1 x {in_dim}] x [{in_dim} x {out_dim}], every format ==");
+    println!(
+        "{:>8} {:>9} {:>11} {:>11} {:>9} {:>9}",
+        "type", "MiB", "GPU us", "CPU us", "GPU GB/s", "CPU GB/s"
+    );
+    // Two passes over the whole list, each format keeping its better pass.
+    // Within a format `median_us` already defends against a single hiccup,
+    // but the formats are measured in sequence and the board drifts *across*
+    // that sequence — whoever runs last is charged for the heat of everyone
+    // before it. One pass had `Q4_K` at half its own rate purely for being
+    // at the end of the list, which reads exactly like a kernel regression
+    // and is not one.
+    // `ORANGU_SWEEP_ONLY=Q4_0` measures one format and nothing else.
+    //
+    // Comparing two builds of a *kernel* through the full list does not work
+    // on this board: the unchanged formats, which ought to be identical
+    // between the two, swing by 0.65-1.63x between runs, because each
+    // measurement is now a couple of milliseconds and whatever the GPU is
+    // doing across a run moves more than any kernel change does. One format
+    // per process removes that entirely — every run measures the same thing
+    // from the same starting state.
+    let only = std::env::var("ORANGU_SWEEP_ONLY").ok();
+    let mut best: std::collections::HashMap<&str, (f64, f64)> = std::collections::HashMap::new();
+    for _ in 0..2 {
+        for &(label, ggml_type) in SWEEP_FORMATS {
+            if only.as_deref().is_some_and(|want| want != label) {
+                continue;
+            }
+            let Some((bytes_per_block, block)) = crate::engine::quant::block_layout(ggml_type)
+            else {
+                continue;
+            };
+            let bytes = in_dim * out_dim / block * bytes_per_block;
+            let w = crate::engine::loader::test_quant_matrix(
+                &vec![0x42u8; bytes],
+                ggml_type,
+                in_dim,
+                out_dim,
+            );
+            let gpu_us = median_us(reps, || {
+                let _ = gpu.matmul(&x, 1, &w);
+            });
+            let cpu_us = median_us(reps, || {
+                let _ = cpu.matmul(&x, 1, &w);
+            });
+            let seen = best.entry(label).or_insert((f64::MAX, f64::MAX));
+            seen.0 = seen.0.min(gpu_us);
+            seen.1 = seen.1.min(cpu_us);
+        }
+    }
+    for &(label, ggml_type) in SWEEP_FORMATS {
+        let Some((bytes_per_block, block)) = crate::engine::quant::block_layout(ggml_type) else {
+            continue;
+        };
+        let Some(&(gpu_us, cpu_us)) = best.get(label) else {
+            continue;
+        };
+        let bytes = in_dim * out_dim / block * bytes_per_block;
+        let gbs = |us: f64| bytes as f64 / (us * 1e3);
+        println!(
+            "{label:>8} {:>9.1} {gpu_us:>11.0} {cpu_us:>11.0} {:>9.1} {:>9.1}",
+            bytes as f64 / (1024.0 * 1024.0),
+            gbs(gpu_us),
+            gbs(cpu_us)
+        );
+    }
+}
+
+/// **How long does this device take to release GPU memory?** Allocates
+/// `ORANGU_TD_MIB` megabytes of weights, touches them once, and exits.
+///
+/// Not a benchmark — a controlled input for measuring *teardown*. A process
+/// that has allocated GPU memory on this board finishes its work, exits, and
+/// then sits in `Z` state for minutes while a Mali kernel thread
+/// (`mali-mem-purge`, `mali-event-hand`, both blocked at `blk_mq_get_tag`)
+/// releases it. It is not reachable from here: the process has already run
+/// to completion and the memory goes back when the kernel closes the
+/// `/dev/mali` fd, so no shutdown path of ours executes. What this probe is
+/// for is knowing *when* it happens, which turns out to be a sharp line.
+///
+/// **One allocation, varying its size** (`ORANGU_TD_MIB`):
+///
+/// | held | teardown |
+/// | --: | --: |
+/// | 64 MiB | 0 s |
+/// | 256 MiB | 0 s |
+/// | 384 MiB | 0 s |
+/// | 512 MiB | 0 s |
+/// | 768 MiB | minutes |
+/// | 1024 MiB | 364 s |
+///
+/// **Peak fixed, total varied** (`ORANGU_TD_REPS`), which is the experiment
+/// that matters, because the first table alone would have produced the wrong
+/// rule: four 256 MiB allocations with the cache released between them —
+/// 256 MiB ever live, 1 GiB asked for — takes **449 s**, like the single
+/// gigabyte and unlike the single 256 MiB.
+///
+/// So the cost tracks the memory a process has **ever asked the driver for**,
+/// not what it holds at exit. That is why
+/// `decode_matvec_format_sweep_gpu_versus_cpu` stalls for 620 s while
+/// peaking at 501 MiB: it allocates 1.9 GiB across its run. And it is why
+/// `VulkanBackend::release_weight_cache` does not help — `wgpu`
+/// suballocates, so releasing returns memory to `wgpu`, never to the driver.
+///
+/// **The practical rule for a GPU test: keep the total under half a
+/// gigabyte, or accept that the process will hang for minutes after it
+/// passes** — and note that a test binary is one process, so it is the whole
+/// suite's total that counts, not one test's.
+///
+/// Two other explanations were measured and rejected: freeing the buffers
+/// during the run (above), and a 3.1 GB dirty-page backlog on the
+/// USB-attached root disk — removing it entirely, to `Dirty: 184 kB` and
+/// zero I/O pressure, left teardown at 620 s.
+///
+/// `ORANGU_TD_MIB=512 cargo test --release --bin orangu-server teardown_probe -- --ignored`
+#[test]
+#[ignore]
+fn teardown_probe_holds_gpu_memory() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(gpu) = shared_test_backend() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let mib: usize = std::env::var("ORANGU_TD_MIB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(256);
+    // Q4_K rows of a fixed width, as many as it takes to reach `mib`.
+    let in_dim = 4096usize;
+    let row_bytes = in_dim / Q4_K_BLOCK * Q4_K_BYTES;
+    let out_dim = (mib * 1024 * 1024).div_ceil(row_bytes);
+    // `ORANGU_TD_REPS` distinct weights of that size, one after another,
+    // with the cache released between them. Peak residency stays at one
+    // weight while the *total* the process has asked the driver for grows —
+    // which is the question a single allocation cannot answer: 512 MiB in
+    // one piece tears down instantly, yet the format sweep peaks at 501 MiB
+    // and hangs for 620 s after allocating 1.9 GiB across its run.
+    let reps: usize = std::env::var("ORANGU_TD_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let x = vec![0.05f32; in_dim];
+    let at = std::time::Instant::now();
+    let mut first = 0.0f32;
+    for rep in 0..reps {
+        // A different byte per rep, so `weight_buffer`'s cache key differs
+        // and each one is a fresh device allocation rather than a hit.
+        let bytes = vec![0x42u8.wrapping_add(rep as u8); out_dim * row_bytes];
+        let w = crate::engine::loader::test_quant_matrix(&bytes, GGML_TYPE_Q4_K, in_dim, out_dim);
+        let y = gpu.matmul(&x, 1, &w);
+        first = y.first().copied().unwrap_or(0.0);
+        if reps > 1 {
+            gpu.release_weight_cache();
+        }
+    }
+    println!(
+        "held {:.0} MiB x {reps} ({:.0} MiB total) in {:.0} ms, first output {first:.3}",
+        (out_dim * row_bytes) as f64 / (1024.0 * 1024.0),
+        (out_dim * row_bytes * reps) as f64 / (1024.0 * 1024.0),
+        at.elapsed().as_secs_f64() * 1e3,
     );
 }

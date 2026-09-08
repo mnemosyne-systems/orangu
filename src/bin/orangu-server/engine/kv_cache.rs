@@ -1002,6 +1002,24 @@ impl LayerCache {
     /// `write_buffer`; every call after that uploads at most the one new
     /// position a decode step just pushed. Returns the mirror's key/value/
     /// softmax-scratch buffers for `VulkanBackend::gpu_attention` to bind.
+    /// Whether this layer's keys and values live in the shared page pool
+    /// rather than in its own mirror.
+    ///
+    /// A caller that intends to read the mirror has to ask: once
+    /// [`Self::pool_scratch`] has run, the mirror is deliberately left at
+    /// one row and never uploaded to, so reading it answers from zeros and
+    /// [`Self::sync_gpu`] refuses outright. `attention::gpu_split_decode`
+    /// asks for exactly that reason.
+    ///
+    /// Also a white-box assertion for the tests, for the same reason
+    /// `device_synced_pages` is one: a test that only compares outputs
+    /// cannot tell the paged path from the mirrored fallback, because the
+    /// fallback is materialized from the very pages the paged path reads
+    /// and is therefore correct either way.
+    pub fn is_pool_backed(&self) -> bool {
+        self.pool_backed
+    }
+
     pub fn sync_gpu(
         &mut self,
         device: &wgpu::Device,
@@ -1566,17 +1584,6 @@ impl LayerCache {
         if let Some(gpu) = &mut self.gpu {
             gpu.synced_len = self.len;
         }
-    }
-
-    /// Whether this layer's device keys and values are the pool's.
-    ///
-    /// A white-box assertion, for the same reason `device_synced_pages` is one:
-    /// a test that only compares outputs cannot tell the paged path from the
-    /// mirrored fallback, because the fallback is materialized from the very
-    /// pages the paged path reads and is therefore correct either way.
-    #[cfg(test)]
-    pub fn is_pool_backed(&self) -> bool {
-        self.pool_backed
     }
 
     /// The mirror's softmax scratch, once one exists.
@@ -3631,6 +3638,7 @@ mod tests {
         use crate::engine::backend::vulkan_shaders::KvStorage;
         use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
         use std::sync::Arc;
+        let _gpu_lock = crate::engine::backend::vulkan::gpu_test_lock();
         let Some(vulkan) = crate::engine::backend::vulkan::shared_test_backend() else {
             eprintln!("no GPU adapter; skipping");
             return;

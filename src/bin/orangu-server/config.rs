@@ -174,6 +174,12 @@ pub fn bundled_configuration(
         .unwrap_or_else(|| BUNDLED_HOST.to_string());
     ServerConfiguration {
         models,
+        // A bundle carries one model and no companion projector, so there is
+        // nothing for the NPU precompile step to find; leaving it on costs a
+        // probe that fails immediately.
+        npu_precompile: default_npu_precompile(),
+        npu_cache_gb: default_npu_cache_gb(),
+        mlp_unroll: None,
         // The console follows the API's address, baked-in or default —
         // `bundle --host all` means "expose this bundle", not "expose half
         // of it". `--web 0` at build time, or at run time, is how a bundle
@@ -292,6 +298,15 @@ impl Role {
             // (each token already streams the whole weight set), they only add
             // KV-cache memory. A multi-user deployment can still set `slots` in
             // the config file.
+            //
+            // **That reasoning is about one device.** On a machine with an
+            // NPU the feed-forward moves off the GPU for decode, the two
+            // slots stop queueing for the same weights, and a second slot
+            // is worth 1.62x rather than 1.09x — see
+            // `npu_tool::decode_enabled`, which switches the decode width
+            // on precisely when `slots` is more than one. Still not the
+            // default here: it is KV-cache memory spent on concurrency a
+            // single user does not have.
             Role::All | Role::Code | Role::Review | Role::Explorer => 1,
         }
     }
@@ -419,6 +434,19 @@ pub enum BackendPreference {
     /// also fails loudly if this binary wasn't compiled with the `rocm`
     /// Cargo feature.
     Rocm,
+    /// The machine's NPU — **recognized but not yet runnable**.
+    ///
+    /// Accepted here so that asking for it is answered with an explanation
+    /// of what is missing rather than `invalid value`, which would suggest
+    /// a typo. `orangu::npu` detects the device and `orangu-server system`
+    /// reports it, but no `engine::backend::Backend` runs on it: the vendor
+    /// runtime executes whole graphs compiled ahead of time and exposes no
+    /// per-operation entry point for `matmul` to call. See that module.
+    ///
+    /// Fails at startup like every other named backend, and for the same
+    /// reason — someone who asked for the NPU should not silently get the
+    /// CPU.
+    Npu,
 }
 
 pub fn default_backend() -> BackendPreference {
@@ -443,6 +471,64 @@ pub fn default_device_split() -> SplitMode {
 /// trusted with deleting models, and changing which one is served is the
 /// less destructive of the two.
 pub fn default_reexec() -> bool {
+    true
+}
+
+/// Whether NPU precompilation runs at startup — see
+/// [`Config::npu_precompile`].
+/// [`Config::npu_cache_gb`].
+///
+/// 3 GiB: enough for every block of a model the size of Gemma 4 E4B (42 x
+/// 55 MiB is 2.3 GiB) and a ceiling on anything larger, so a big model
+/// degrades to a partial speedup instead of quietly claiming another ten
+/// gigabytes of a shared-memory machine.
+pub fn default_npu_cache_gb() -> f64 {
+    /// The share of system memory compiled blocks may occupy.
+    ///
+    /// A quarter leaves the model's own weights, the KV cache and the rest
+    /// of the machine three quarters, which held on every checkpoint in
+    /// this project's sweep: an 8B `Q8_0` is 8.5 GiB of weights and 5.6 GiB
+    /// of blocks on a 31 GiB machine.
+    const SHARE: f64 = 0.25;
+    /// Floors and ceilings the share, so a very small machine still gets a
+    /// usable cache and a very large one does not reserve absurd amounts
+    /// for a model that cannot use it.
+    const RANGE: std::ops::RangeInclusive<f64> = 1.0..=16.0;
+
+    static GB: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *GB.get_or_init(|| {
+        let total = orangu::hardware::detect_cpu().total_memory_bytes as f64;
+        let gb = total / (1u64 << 30) as f64 * SHARE;
+        gb.clamp(*RANGE.start(), *RANGE.end())
+    })
+}
+
+pub fn default_npu_precompile() -> bool {
+    // **On**, and it took two fixes to get here. Blocks were being compiled
+    // against a synthetic activation distribution whose tail is a ninth of
+    // a real one's, which saturated the input quantizer and had them
+    // returning output with no signal in it; they are now calibrated on the
+    // model's own activations, captured from its first prompt. And each
+    // activation tensor was held at one `uint8` scale that a handful of
+    // outlier channels set for all of them; that range is now moved into
+    // the weights, where a per-tensor scale can carry it
+    // (`npu_ort::smoothing_scales`).
+    //
+    // Both models put through the whole path end to end, device off against
+    // device on, a 720-token prompt, same history:
+    //
+    //   gemma 4 E2B Q8_0   4.44 -> 12.30 tok/s of prefill, correct answer
+    //   gemma 4 E4B Q8_0   2.43 ->  7.00 tok/s of prefill, correct answer
+    //
+    // The output is not token-identical to the reference and will not be —
+    // requantizing a matrix changes which token wins a close decision. What
+    // it is now is an equally good answer rather than a worse one, which is
+    // the bar this default is set against.
+    //
+    // A model that does not clear the accuracy gate is refused rather than
+    // served badly (`npu_tool::MAX_BLOCK_ERROR`), and the
+    // first prompt of a fresh model pays for the capture — measured at 4.49
+    // tok/s against 4.44 with the device off, which is inside the noise.
     true
 }
 
@@ -503,6 +589,64 @@ pub struct ServerConfiguration {
     /// (the default) whichever GPU this platform finds first, falling back
     /// to CPU.
     pub backend: BackendPreference,
+    /// `[orangu-server].mlp_unroll` — whether the GPU's block-unroll decode
+    /// kernels are used.
+    ///
+    /// **`None` means decide at runtime**, which is the default and what
+    /// almost everyone should leave it at: the backend cross-checks each
+    /// quantized type against the CPU at startup and drops the tuned kernels
+    /// for any type this device computes wrong (see
+    /// `engine::backend::vulkan::VulkanBackend::disable_miscompiled_decode_kernels`).
+    /// `Some(v)` overrides that decision for the unroll family and is
+    /// obeyed — an operator who has measured their own hardware outranks a
+    /// probe.
+    pub mlp_unroll: Option<bool>,
+    /// `[orangu-server].npu_precompile` — whether this model may use the
+    /// NPU at all.
+    ///
+    /// On by default, and on a machine without an NPU it costs nothing to
+    /// leave on: the check is a probe that fails immediately. Off is the
+    /// operator's off switch for the device — no blocks are compiled *and*
+    /// none are bound, including blocks a previous run already cached.
+    ///
+    /// The name says `precompile` and the switch does more than that, which
+    /// is deliberate: an operator turning this off wants the device out of
+    /// the picture, and a build that kept serving from a warm cache after
+    /// they turned it off would be answering a question they did not ask.
+    /// To keep the device but stop it growing the cache, set
+    /// [`Config::npu_cache_gb`] to 0 instead.
+    pub npu_precompile: bool,
+    /// `[orangu-server].npu_cache_gb` — how much compiled-block cache the
+    /// NPU precompile may spend on one model.
+    ///
+    /// Every block compiled is that block's weights again in `uint8`
+    /// alongside the model's own, about 55 MiB each for Gemma 4 E4B, and all
+    /// of it is resident once bound. So this is a real memory budget and not
+    /// a disk quota. A model that does not fit gets its first N layers on
+    /// the device and the rest on the CPU or GPU, which is a partial
+    /// speedup: 12 of 42 blocks measured 18.5 tok/s of prefill against 15.0
+    /// with none, and all 42 measured 40.9.
+    ///
+    /// **Scaled to the machine, not a constant.** It was a flat 3 GiB, and
+    /// that number quietly halved every model above about 4B: a sweep of 33
+    /// checkpoints on a 31 GiB machine left 20 of granite 8B's 40 blocks
+    /// off the device, 14 of 32 on Meta-Llama 3.1 8B, 14 of 32 on Mistral
+    /// 7B, 15 of 36 on Qwen3 8B. Raising it so the whole model fits is
+    /// worth more than anything else measured here — Meta-Llama 3.1 8B
+    /// `Q8_0`, a 980-token prompt:
+    ///
+    /// | blocks on the device | prefill |
+    /// |---|---|
+    /// | 18 of 32 (3 GiB) | 2.52 tok/s |
+    /// | 32 of 32 (8 GiB) | **5.36 tok/s** |
+    ///
+    /// A machine's memory is the thing that decides, so the default reads
+    /// it rather than guessing. An operator who wants a different figure
+    /// still sets `npu_cache_gb` and is obeyed.
+    ///
+    /// `0` disables precompiling without turning off
+    /// [`Config::npu_precompile`], so blocks already cached still load.
+    pub npu_cache_gb: f64,
     /// How the GPU-side KV mirror is stored — see [`KvCache`]. Overridden by
     /// `ORANGU_KV_CACHE`, so a sweep can vary it without editing the file.
     pub kv_cache: KvCache,
@@ -907,6 +1051,22 @@ pub fn load_server_configuration(
         .get("reasoning_effort")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let mlp_unroll = match section.get("mlp_unroll") {
+        Some(value) => Some(parse_bool(SERVER_SECTION, "mlp_unroll", value)?),
+        None => None,
+    };
+    let npu_cache_gb = match section.get("npu_cache_gb") {
+        Some(value) => value.parse::<f64>().ok().filter(|v| *v >= 0.0).ok_or_else(|| {
+            anyhow::anyhow!(
+                "[{SERVER_SECTION}].npu_cache_gb must be a non-negative number of GiB, got '{value}'"
+            )
+        })?,
+        None => default_npu_cache_gb(),
+    };
+    let npu_precompile = match section.get("npu_precompile") {
+        Some(value) => parse_bool(SERVER_SECTION, "npu_precompile", value)?,
+        None => default_npu_precompile(),
+    };
 
     let backend = match section.get("backend") {
         Some(value) => match value.trim().to_lowercase().as_str() {
@@ -918,10 +1078,11 @@ pub fn load_server_configuration(
             "cuda" => BackendPreference::Cuda,
             "opencl" => BackendPreference::OpenCl,
             "rocm" => BackendPreference::Rocm,
+            "npu" => BackendPreference::Npu,
             other => {
                 return Err(anyhow!(
                     "invalid value for [{SERVER_SECTION}].backend: '{other}' \
-                     (expected auto, cpu, vulkan, metal, dx12, cuda, opencl, or rocm)"
+                     (expected auto, cpu, vulkan, metal, dx12, cuda, opencl, rocm, or npu)"
                 ));
             }
         },
@@ -986,6 +1147,9 @@ pub fn load_server_configuration(
         web_host,
         web_host_explicit,
         backend,
+        mlp_unroll,
+        npu_cache_gb,
+        npu_precompile,
         kv_cache,
         read_size,
         queue_limit,
@@ -1118,6 +1282,47 @@ mod tests {
             let conf = load_server_configuration(file.path(), None, false).unwrap();
             assert_eq!(conf.reexec, expected, "reexec = {value}");
         }
+    }
+
+    /// NPU precompilation is on unless it is turned off, and a start with
+    /// no opinion about it gets the default rather than nothing.
+    ///
+    /// This default has moved twice: off when the device was first measured
+    /// against a real prompt rather than a sixteen-token one, and back on
+    /// once the calibration and the per-channel smoothing made a real
+    /// prompt come back with a real answer — see [`default_npu_precompile`].
+    #[test]
+    fn npu_precompile_defaults_on_and_can_be_turned_off() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert!(conf.npu_precompile, "unset should mean on");
+
+        for (value, expected) in [("off", false), ("no", false), ("on", true), ("1", true)] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu-server]\nmodels = /srv/models\nnpu_precompile = {value}\n"
+            )
+            .unwrap();
+            let conf = load_server_configuration(file.path(), None, false).unwrap();
+            assert_eq!(conf.npu_precompile, expected, "npu_precompile = {value}");
+        }
+    }
+
+    /// A misspelling is an error rather than a silent "off" — the same
+    /// reason `reexec` refuses one.
+    #[test]
+    fn rejects_an_invalid_npu_precompile_value() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nnpu_precompile = sometimes\n"
+        )
+        .unwrap();
+        let err = load_server_configuration(file.path(), None, false).unwrap_err();
+        assert!(err.to_string().contains("npu_precompile"), "{err}");
+        assert!(err.to_string().contains("sometimes"), "{err}");
     }
 
     /// A misspelling must not quietly read as "off" — that would silently
@@ -1358,6 +1563,8 @@ mod tests {
             ("CUDA", BackendPreference::Cuda),
             ("opencl", BackendPreference::OpenCl),
             ("rocm", BackendPreference::Rocm),
+            ("npu", BackendPreference::Npu),
+            ("NPU", BackendPreference::Npu),
             ("auto", BackendPreference::Auto),
         ] {
             let mut file = tempfile::NamedTempFile::new().unwrap();

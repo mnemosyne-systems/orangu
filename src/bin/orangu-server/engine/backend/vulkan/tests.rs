@@ -122,6 +122,43 @@ fn shared_vulkan() -> Option<&'static VulkanBackend> {
     super::shared_test_backend()
 }
 
+/// What one GPU submit-and-wait round trip costs on this device.
+///
+/// The number that decides whether a decode step can be split at the FFN
+/// boundary. Decode records all 42 layers into **one** submission today;
+/// handing the FFN to the NPU means breaking the encoder at every layer, so
+/// the split trades 41 extra round trips for the difference between the
+/// GPU's 7.1 ms a layer and the NPU's 3.36. If a round trip costs much more
+/// than 3.6 ms the trade is a loss before it starts.
+///
+/// Deliberately trivial work — a one-element copy — so what it measures is
+/// the submit/fence/map path and not a kernel.
+#[test]
+#[ignore = "diagnostic; prints a measurement"]
+fn _scratch_measure_submit_roundtrip() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let src = vulkan.upload_for_test(&[1.0f32; 4]);
+    let mut samples = Vec::new();
+    for _ in 0..50 {
+        let started = std::time::Instant::now();
+        let encoder = vulkan.new_encoder("roundtrip probe");
+        let out = vulkan.submit_and_readback_for_test(encoder, &src, 4);
+        std::hint::black_box(&out);
+        samples.push(started.elapsed().as_secs_f64());
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    eprintln!(
+        "  submit+readback round trip: median {:.3} ms, min {:.3} ms, max {:.3} ms",
+        samples[samples.len() / 2] * 1000.0,
+        samples[0] * 1000.0,
+        samples[samples.len() - 1] * 1000.0,
+    );
+}
+
 /// What streaming bandwidth this device actually delivers to a compute
 /// shader — the number every "why is the GEMV only at N GB/s" question is
 /// implicitly compared against, and which had been taken from the card's
@@ -134,6 +171,7 @@ fn shared_vulkan() -> Option<&'static VulkanBackend> {
 #[test]
 #[ignore]
 fn _scratch_measure_streaming_bandwidth() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -419,6 +457,7 @@ fn isa_compile_one_shader() {
 #[test]
 #[ignore]
 fn _scratch_measure_attention_dispatch_cost() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -604,6 +643,7 @@ fn _scratch_measure_attention_dispatch_cost() {
 #[test]
 #[ignore]
 fn _scratch_measure_ffn_elementwise_dispatch_cost() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -888,6 +928,7 @@ fn measure_split_k_dispatch_ms(vulkan: &VulkanBackend, k_num: u32) -> f64 {
 #[test]
 #[ignore]
 fn _scratch_sweep_attn_split_k() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -1023,6 +1064,7 @@ fn measure_rmsnorm_variant_ms(vulkan: &VulkanBackend, source: String) -> f64 {
 #[test]
 #[ignore]
 fn _scratch_measure_rmsnorm_workgroup_size_and_subgroup() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -1405,6 +1447,7 @@ fn measure_one_pass_ms(vulkan: &VulkanBackend, record: impl Fn(&mut wgpu::Comput
 #[test]
 #[ignore]
 fn _scratch_measure_argmax_dispatch_cost() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -1418,180 +1461,9 @@ fn _scratch_measure_argmax_dispatch_cost() {
     );
 }
 
-fn next_byte(seed: &mut u64) -> u8 {
-    *seed = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    (*seed >> 33) as u8
-}
-
-fn next_bytes(seed: &mut u64, n: usize) -> Vec<u8> {
-    (0..n).map(|_| next_byte(seed)).collect()
-}
-
-/// A small positive value, bounded well away from zero, infinity, and
-/// subnormals — safe to use for every type's `d`/`dmin` scale field
-/// (and the whole value, for `F32`/`F16`/`BF16`) without risking a NaN
-/// or Inf poisoning the dot product on either backend.
-fn next_bounded_f32(seed: &mut u64) -> f32 {
-    0.05 + (next_byte(seed) as f32 / 255.0) * 1.95
-}
-
-fn f16_bytes(v: f32) -> [u8; 2] {
-    half::f16::from_f32(v).to_le_bytes()
-}
-
-/// Builds one block's raw bytes for `ggml_type`, matching the exact
-/// layout `engine::quant::dequantize` reads. Scale/whole-value float
-/// fields are bounded (see `next_bounded_f32`); every other field
-/// (quant nibbles, high-bit packs, K-quant scale bytes) is safe with
-/// arbitrary bits since it's read back as a plain integer, never
-/// reinterpreted as a float.
-fn build_block(ggml_type: u32, seed: &mut u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    match ggml_type {
-        t if t == GGML_TYPE_F32 => {
-            out.extend_from_slice(&next_bounded_f32(seed).to_le_bytes());
-        }
-        t if t == GGML_TYPE_F16 => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-        }
-        t if t == GGML_TYPE_BF16 => {
-            let bits = (next_bounded_f32(seed).to_bits() >> 16) as u16;
-            out.extend_from_slice(&bits.to_le_bytes());
-        }
-        t if t == GGML_TYPE_Q4_0 => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 16));
-        }
-        // `Q4_0`'s 16 `qs` bytes behind a one-byte `e8m0` exponent instead of
-        // an `f16` scale. The exponent is **bounded** where the nibbles are
-        // not: it is the only field here read as a float, and an unbounded
-        // byte spans 2^-127..2^127, which overflows a dot product to `inf` on
-        // both paths and would compare equal while testing nothing. `128`
-        // decodes to exactly 1.0 (`(128-1) << 23` is f32 exponent 127), so
-        // this is a symmetric 2^-4..2^4 around unity.
-        t if t == GGML_TYPE_MXFP4 => {
-            out.push(124 + (next_byte(seed) % 9));
-            out.extend(next_bytes(seed, 16));
-        }
-        t if t == GGML_TYPE_Q4_1 => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 16));
-        }
-        t if t == GGML_TYPE_Q5_0 => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 4));
-            out.extend(next_bytes(seed, 16));
-        }
-        t if t == GGML_TYPE_Q5_1 => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 4));
-            out.extend(next_bytes(seed, 16));
-        }
-        t if t == GGML_TYPE_Q8_0 => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 32));
-        }
-        t if t == GGML_TYPE_Q4_K => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 12));
-            out.extend(next_bytes(seed, 128));
-        }
-        t if t == GGML_TYPE_Q5_K => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 12));
-            out.extend(next_bytes(seed, 32));
-            out.extend(next_bytes(seed, 128));
-        }
-        t if t == GGML_TYPE_Q6_K => {
-            out.extend(next_bytes(seed, 128));
-            out.extend(next_bytes(seed, 64));
-            out.extend(next_bytes(seed, 16));
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-        }
-        t if t == GGML_TYPE_Q2_K => {
-            out.extend(next_bytes(seed, 16));
-            out.extend(next_bytes(seed, 64));
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-        }
-        t if t == GGML_TYPE_Q3_K => {
-            out.extend(next_bytes(seed, 32));
-            out.extend(next_bytes(seed, 64));
-            out.extend(next_bytes(seed, 12));
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-        }
-        // Every `IQ*` field below is a codebook index, a sign pattern or
-        // a packed scale, all of which are valid for any bit pattern —
-        // no field needs constraining to keep the block well formed, so
-        // random bytes reach the whole encoding space.
-        t if t == GGML_TYPE_IQ2_XS => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 64));
-            out.extend(next_bytes(seed, 8));
-        }
-        t if t == GGML_TYPE_IQ2_S => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 64));
-            out.extend(next_bytes(seed, 8));
-            out.extend(next_bytes(seed, 8));
-        }
-        t if t == GGML_TYPE_IQ3_XXS => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 96));
-        }
-        t if t == GGML_TYPE_IQ3_S => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 64));
-            out.extend(next_bytes(seed, 8));
-            out.extend(next_bytes(seed, 32));
-            out.extend(next_bytes(seed, 4));
-        }
-        t if t == GGML_TYPE_IQ4_XS => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 2));
-            out.extend(next_bytes(seed, 4));
-            out.extend(next_bytes(seed, 128));
-        }
-        t if t == GGML_TYPE_IQ4_NL => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 16));
-        }
-        t if t == GGML_TYPE_IQ2_XXS => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 64));
-        }
-        t if t == GGML_TYPE_IQ1_S => {
-            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
-            out.extend(next_bytes(seed, 32));
-            out.extend(next_bytes(seed, 16));
-        }
-        // The one type with no `d` field at all: its `f16` block scale is
-        // four nibbles scattered across the top of the four `scales`
-        // `u16`s, so random bytes there *are* a random `f16` — exponent
-        // included, where every other arm draws its scale through
-        // `next_bounded_f32`. The top nibble of the last `u16` (byte 7's
-        // high half) is the `f16`'s own top nibble, so pinning it to
-        // `0x3` keeps the block scale a positive normal of order 1
-        // instead of an occasional `inf`/`NaN`, which would make the
-        // comparison below vacuous rather than strict. Every other bit,
-        // including the rest of the exponent, stays random.
-        t if t == GGML_TYPE_IQ1_M => {
-            out.extend(next_bytes(seed, 32));
-            out.extend(next_bytes(seed, 16));
-            let mut scales = next_bytes(seed, 8);
-            scales[7] = (scales[7] & 0x0F) | 0x30;
-            out.extend(scales);
-        }
-        other => panic!("build_block: unhandled ggml_type {other}"),
-    }
-    out
-}
+// The weight fixture is `engine::backend::probe_blocks` — shared with
+// the other backends' cross-checks. See that module's doc comment.
+use crate::engine::backend::probe_blocks::{build_block, next_byte};
 
 /// `IQ4_NL` is in the 32 arm, not the 256 default: it is the one `IQ*`
 /// type that blocks at 32, so the otherwise-safe "`IQ*` means `QK_K`"
@@ -1660,6 +1532,7 @@ fn measure_matmul_gflops(
 #[test]
 #[ignore]
 fn _scratch_measure_prefill_gemm() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -1801,6 +1674,7 @@ fn run_probe_kernel(vulkan: &VulkanBackend, wgsl: &str, threads: u32, out_len: u
 /// someone measures the switch.
 #[test]
 fn coop_tiles_are_vec4_only_where_component_stores_work() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -1879,6 +1753,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 /// rather than a user finding it mid-generation.
 #[test]
 fn tuning_report_names_the_kernel_the_dispatch_would_use() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -1943,6 +1818,7 @@ fn tuning_report_names_the_kernel_the_dispatch_would_use() {
 /// per run. Hence the scalar tile rather than a restructured fill.
 #[test]
 fn shared_vec4_whole_stores_survive_a_barrier() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -1988,6 +1864,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
 /// merely "not NaN" — a clamp that was too tight would fail here too.
 #[test]
 fn gelu_kernel_stays_finite_at_large_inputs() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -2035,6 +1912,7 @@ fn cross_check(ggml_type: u32, in_dim: usize, out_dim: usize) {
 /// shader_source_coop`), which `cross_check`'s fixed `n_tokens = 3`
 /// never reaches.
 fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens: usize) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -2304,6 +2182,7 @@ fn streamed_expert_fixture(
 /// nothing about it to notice.
 #[test]
 fn a_second_streamed_weight_of_one_shape_reuses_the_entry_and_still_computes_its_own() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -2380,6 +2259,7 @@ fn a_second_streamed_weight_of_one_shape_reuses_the_entry_and_still_computes_its
 /// silently becomes the other's.
 #[test]
 fn two_streamed_experts_of_one_shape_in_a_batch_keep_their_own_outputs() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -2664,6 +2544,7 @@ fn matmul_matches_cpu_backend_for_mxfp4() {
 /// is what such a code means in the format.
 #[test]
 fn mxfp4_scale_decode_matches_the_host_over_every_exponent_code() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -2709,14 +2590,20 @@ fn mxfp4_scale_decode_matches_the_host_over_every_exponent_code() {
         let cpu = CpuBackend.matmul_dequant(&x, 1, &w);
         for (e, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
             if e < 2 {
-                // The subnormal pair. Asserted rather than skipped, so that a
-                // device which *does* keep subnormals fails here and the
-                // comment above gets revisited instead of quietly becoming
-                // untrue on other hardware.
-                assert_eq!(
-                    *g, 0.0,
-                    "exponent code {e} is subnormal and was expected to flush to \
-                     zero on the device, but element {k} came back as {g:e}"
+                // The subnormal pair. This used to assert flush-to-zero
+                // outright, so that a device which *does* keep subnormals
+                // would fail here and the claim get revisited rather than
+                // quietly become untrue. That happened: a Mali-G720 returns
+                // the subnormal. Vulkan leaves denormal handling to the
+                // implementation unless `shaderDenormFlushToZeroFloat32` or
+                // `shaderDenormPreserveFloat32` is requested, and this
+                // backend requests neither — so *both* answers are correct
+                // and the test now accepts either. What it still refuses is
+                // a third answer: some other number entirely.
+                assert!(
+                    *g == 0.0 || (g - c).abs() <= 1e-30,
+                    "exponent code {e} is subnormal, so element {k} must come back either \
+                     flushed to zero or equal to the host's {c:e} — got {g:e}"
                 );
                 // Element 1's codebook entry is exactly 1, so the host value
                 // there *is* the scale — the one place to check that the
@@ -2903,6 +2790,7 @@ fn matmul_matches_cpu_backend_cooperative_path_multi_row_tile() {
 #[test]
 #[ignore = "needs a real GGUF; run with --ignored"]
 fn real_gguf_weights_match_the_cpu_backend() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         return;
     };
@@ -2991,6 +2879,7 @@ fn real_gguf_weights_match_the_cpu_backend() {
 #[test]
 #[ignore = "needs a real MoE GGUF; run with --ignored"]
 fn real_gguf_expert_weights_match_the_cpu_backend() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         return;
     };
@@ -3079,6 +2968,7 @@ fn real_gguf_expert_weights_match_the_cpu_backend() {
 #[test]
 #[ignore = "needs a real GGUF; run with --ignored"]
 fn matmul_batch_matches_per_op_matmul_on_real_weights() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         return;
     };
@@ -3168,6 +3058,7 @@ fn matmul_batch_matches_per_op_matmul_on_real_weights() {
 /// The token counts deliberately straddle `COOP_MIN_TOKENS` (64), since the
 /// two paths only disagree above it.
 fn cross_check_recorded_matmul(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens: usize) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -3267,6 +3158,7 @@ fn recorded_matmul_matches_backend_matmul_decode_width() {
 /// rounds on several threads. Verified to fail with the guard removed.
 #[test]
 fn concurrent_prefill_matmuls_on_same_shaped_weights_do_not_corrupt_each_other() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -3388,6 +3280,7 @@ fn concurrency_vec(n: usize, seed: &mut u64) -> Vec<f32> {
 /// [`VulkanBackend::prefill_region_guard`].
 #[test]
 fn concurrent_fused_ffn_prefills_do_not_corrupt_each_other() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -3429,6 +3322,7 @@ fn concurrent_fused_ffn_prefills_do_not_corrupt_each_other() {
 /// two thirds of prefill, and the one with the most pooled ops (four).
 #[test]
 fn concurrent_fused_post_attention_prefills_do_not_corrupt_each_other() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -3504,6 +3398,7 @@ fn concurrent_fused_post_attention_prefills_do_not_corrupt_each_other() {
 /// how it is actually used rather than sharing one between threads.
 #[test]
 fn concurrent_fused_attention_prefills_do_not_corrupt_each_other() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -3601,6 +3496,7 @@ fn concurrent_fused_attention_prefills_do_not_corrupt_each_other() {
 /// not the pool.
 #[test]
 fn concurrent_fused_ple_prefills_do_not_corrupt_each_other() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -3687,6 +3583,7 @@ fn concurrent_fused_ple_prefills_do_not_corrupt_each_other() {
 /// overlap" is decidable and fails every time.
 #[test]
 fn a_decode_width_and_a_prefill_width_never_share_an_activation_region() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -3822,9 +3719,110 @@ fn matmul_matches_cpu_backend_cooperative_path_multi_row_tile_q4_k() {
 /// The reference is `CpuBackend`, which shares no code with the kernel;
 /// `recorded_matmul_matches_backend_matmul_model_shaped` cannot serve here
 /// because both of its sides run this same shader.
+
 #[test]
 fn tiled_dequant_run_matches_cpu_backend_q4_k() {
     cross_check_n_tokens(GGML_TYPE_Q4_K, 1536, 100, 130);
+}
+
+/// Whether the tuned `Q4_K` kernel cares where in the weight arena its
+/// tensor happens to land.
+///
+/// A `Q4_K` block is 144 bytes, which is not a multiple of 16, so a tensor
+/// that follows another in the arena starts at an offset the shader has to
+/// handle rather than assume away. The startup probe measures a matrix that
+/// is the *first* thing uploaded, and passes; a real model's tensors are
+/// packed behind others, and that model answers in word salad. This asks
+/// the question directly.
+#[test]
+#[ignore = "reports on the local device"]
+fn does_arena_offset_change_the_q4_k_answer() {
+    use crate::engine::backend::Backend;
+    let Some(gpu) = crate::engine::backend::vulkan::VulkanBackend::try_init() else {
+        println!("  no GPU");
+        return;
+    };
+    let ty = crate::engine::quant::GGML_TYPE_Q4_K;
+    let (in_dim, out_dim) = (2048usize, 256usize);
+    let build = |seed: &mut u64| {
+        let bytes: Vec<u8> = (0..in_dim * out_dim / 256)
+            .flat_map(|_| crate::engine::backend::probe_blocks::build_block(ty, seed))
+            .collect();
+        crate::engine::loader::probe_quant_matrix(bytes, ty, in_dim, out_dim)
+    };
+    let x: Vec<f32> = (0..in_dim)
+        .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+        .collect();
+    let worst = |a: &[f32], b: &[f32]| {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs() / a.abs().max(1.0))
+            .fold(0.0f32, f32::max)
+            * 100.0
+    };
+    println!(
+        "  kernel selected: {}",
+        gpu.selected_kernel_name(ty, in_dim, 1)
+    );
+    for fillers in [0usize, 1, 2, 3] {
+        // Push the tensor under test further into the arena, one uploaded
+        // matrix at a time.
+        let mut seed = 0xF11E_2222u64;
+        for _ in 0..fillers {
+            let filler = build(&mut seed);
+            let _ = gpu.matmul(&x, 1, &filler);
+        }
+        let mut seed = 0x51ed_1234u64;
+        let weights = build(&mut seed);
+        let exact = crate::engine::backend::CpuBackend.matmul_dequant(&x, 1, &weights);
+        let mine = gpu.matmul(&x, 1, &weights);
+        println!(
+            "  after {fillers} filler tensor(s): gpu vs exact {:>9.1}%",
+            worst(&exact, &mine)
+        );
+    }
+}
+
+/// How much of the self-check's reported disagreement is the *check*.
+#[test]
+fn how_far_is_the_cpus_own_matmul_from_its_dequant_reference() {
+    use crate::engine::backend::Backend;
+    use crate::engine::quant::block_layout;
+    for (name, ty) in [
+        ("Q4_K", crate::engine::quant::GGML_TYPE_Q4_K),
+        ("Q5_1", crate::engine::quant::GGML_TYPE_Q5_1),
+        ("Q2_K", crate::engine::quant::GGML_TYPE_Q2_K),
+        ("Q8_0", crate::engine::quant::GGML_TYPE_Q8_0),
+        ("Q6_K", crate::engine::quant::GGML_TYPE_Q6_K),
+    ] {
+        const IN_DIM: usize = 512;
+        const OUT_DIM: usize = 4;
+        let Some((_, block_elems)) = block_layout(ty) else {
+            continue;
+        };
+        if !IN_DIM.is_multiple_of(block_elems) {
+            continue;
+        }
+        let mut seed = 0x51ed_1234u64;
+        let bytes: Vec<u8> = (0..IN_DIM * OUT_DIM / block_elems)
+            .flat_map(|_| crate::engine::backend::probe_blocks::build_block(ty, &mut seed))
+            .collect();
+        let weights = crate::engine::loader::probe_quant_matrix(bytes, ty, IN_DIM, OUT_DIM);
+        let x: Vec<f32> = (0..IN_DIM)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+            .collect();
+        let reference = crate::engine::backend::CpuBackend.matmul_dequant(&x, 1, &weights);
+        let mine = crate::engine::backend::CpuBackend.matmul(&x, 1, &weights);
+        let worst = reference
+            .iter()
+            .zip(&mine)
+            .map(|(a, b)| (a - b).abs() / a.abs().max(1.0))
+            .fold(0.0f32, f32::max);
+        println!(
+            "  {name:<5} cpu matmul vs cpu matmul_dequant: {:.1}%",
+            worst * 100.0
+        );
+    }
 }
 
 #[test]
@@ -3858,6 +3856,7 @@ fn tiled_dequant_run_handles_a_partial_k_chunk() {
 /// individually-correct result in the same order.
 #[test]
 fn matmul_batch_matches_sequential_cpu_matmuls() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -3953,6 +3952,7 @@ fn matmul_batch_matches_sequential_cpu_matmuls() {
 /// `x` and one `n_tokens` — the shape this feature exists for.
 #[test]
 fn matmul_batch_matches_cpu_backend_across_multiple_token_stripes() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4030,6 +4030,7 @@ fn matmul_batch_matches_cpu_backend_across_multiple_token_stripes() {
 /// standing guard against a regression there.
 #[test]
 fn stress_single_backend_concurrent_threads() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4090,6 +4091,7 @@ fn stress_single_backend_concurrent_threads() {
 /// including the PLE branch, which the real E2B model actually has.
 #[test]
 fn fused_post_attention_matches_cpu_reference_with_ple() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4172,6 +4174,7 @@ fn fused_post_attention_matches_cpu_reference_with_ple() {
     let expected = x;
 
     let got = vulkan.fused_post_attention(FusedPostAttentionInput {
+        stop_at_ffn_norm: false,
         activation: FfnActivation::Geglu,
         attn_out: GpuInput::Cpu(&attn_out),
         residual: GpuInput::Cpu(&residual),
@@ -4210,6 +4213,7 @@ fn fused_post_attention_matches_cpu_reference_with_ple() {
 /// just `Some`.
 #[test]
 fn fused_post_attention_matches_cpu_reference_without_ple() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4269,6 +4273,7 @@ fn fused_post_attention_matches_cpu_reference_without_ple() {
     let expected = x;
 
     let got = vulkan.fused_post_attention(FusedPostAttentionInput {
+        stop_at_ffn_norm: false,
         activation: FfnActivation::Geglu,
         attn_out: GpuInput::Cpu(&attn_out),
         residual: GpuInput::Cpu(&residual),
@@ -4308,6 +4313,7 @@ fn fused_post_attention_matches_cpu_reference_without_ple() {
 /// call's expected output (or some stale mix) rather than its own.
 #[test]
 fn fused_post_attention_repeated_calls_use_fresh_data_not_cached_data() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4393,6 +4399,7 @@ fn fused_post_attention_repeated_calls_use_fresh_data_not_cached_data() {
 
         let expected = cpu_reference(&attn_out, &residual, &per_layer_slice);
         let got = vulkan.fused_post_attention(FusedPostAttentionInput {
+            stop_at_ffn_norm: false,
             activation: FfnActivation::Geglu,
             attn_out: GpuInput::Cpu(&attn_out),
             residual: GpuInput::Cpu(&residual),
@@ -4443,6 +4450,7 @@ fn fused_post_attention_repeated_calls_use_fresh_data_not_cached_data() {
 /// CPU result.
 #[test]
 fn gpu_attention_matches_cpu_reference_kv_dim_32() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4523,6 +4531,7 @@ fn gpu_attention_matches_cpu_reference_kv_dim_32() {
 /// already pushed, and full (non-windowed) attention.
 #[test]
 fn gpu_attention_matches_cpu_reference_full_window() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4604,6 +4613,7 @@ fn gpu_attention_matches_cpu_reference_full_window() {
 /// several calls, not just a single one.
 #[test]
 fn gpu_attention_matches_cpu_reference_sliding_window_across_multiple_steps() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4690,6 +4700,7 @@ fn gpu_attention_matches_cpu_reference_sliding_window_across_multiple_steps() {
 /// case where every position happens to fit in one tile.
 #[test]
 fn gpu_attention_matches_cpu_reference_many_positions_multi_tile() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4816,6 +4827,7 @@ fn paged_prefill_agrees_at(page: usize, pages: usize) {
 fn paged_prefill_agrees_at_len(page: usize, pages: usize, positions: usize) {
     use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
 
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -4971,6 +4983,7 @@ fn paged_prefill_agrees_at_len(page: usize, pages: usize, positions: usize) {
 fn paged_attention_matches_the_contiguous_kernel_through_a_shuffled_table() {
     use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
 
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5101,6 +5114,7 @@ fn gpu_attention_split_coop_matches_cpu_reference_head_dim_512() {
 }
 
 fn cross_check_gpu_attention_split(n_head: usize, n_head_kv: usize, head_dim: usize) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5179,6 +5193,7 @@ fn cross_check_gpu_attention_split(n_head: usize, n_head_kv: usize, head_dim: us
 /// with e.g. uninitialized-buffer garbage or a `NaN` from `0/0`.
 #[test]
 fn gpu_attention_split_matches_cpu_reference_fewer_positions_than_splits() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5257,6 +5272,7 @@ fn gpu_attention_split_matches_cpu_reference_fewer_positions_than_splits() {
 /// in models without Gemma4's proportional-RoPE tensor).
 #[test]
 fn gpu_rope_matches_cpu_reference_without_freq_factors() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5317,6 +5333,7 @@ fn gpu_rope_matches_cpu_reference_without_freq_factors() {
 /// the shader.
 #[test]
 fn gpu_rope_matches_cpu_reference_with_norm_pairing() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5417,6 +5434,7 @@ fn ministral_yarn_params() -> crate::engine::tensor::RopeParams {
 /// characteristic, not to pin a specific adapter's `sin` implementation.
 #[test]
 fn gpu_rope_argument_reduction_diverges_with_position() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5432,7 +5450,14 @@ fn gpu_rope_argument_reduction_diverges_with_position() {
         .map(|i| ((i % 17) as f32 / 17.0) - 0.5)
         .collect();
     // Position, and the error budget it justifies.
-    for (pos, bound) in [(8usize, 1e-6f32), (1_000, 1e-4), (20_000, 4e-3)] {
+    // The bound at each position. The first was 1e-6, which measured fine on
+    // the adapter it was written against and pins that adapter's `sin` —
+    // exactly what the comment above says this test is not for. A Mali-G720
+    // lands at 1.1e-5 for `pos = 8`, well inside what Vulkan guarantees for
+    // a transcendental (it guarantees very little), so the budget is the
+    // measured value with room, and the divergence this test is named for is
+    // still visible across the three.
+    for (pos, bound) in [(8usize, 5e-5f32), (1_000, 1e-4), (20_000, 4e-3)] {
         let mut expected = x.clone();
         crate::engine::tensor::rope_apply_params_inplace(
             &mut expected,
@@ -5464,6 +5489,7 @@ fn gpu_rope_argument_reduction_diverges_with_position() {
 
 #[test]
 fn gpu_rope_matches_cpu_reference_with_yarn_scaling() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5546,6 +5572,7 @@ fn gpu_rope_matches_cpu_reference_with_yarn_scaling() {
 
 #[test]
 fn gpu_fused_norm_rope_matches_cpu_reference_with_yarn_scaling() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5627,6 +5654,7 @@ fn gpu_fused_norm_rope_matches_cpu_reference_with_yarn_scaling() {
 
 #[test]
 fn gpu_rope_matches_cpu_reference_with_freq_factors_and_partial_rope() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5685,6 +5713,7 @@ fn gpu_rope_matches_cpu_reference_with_freq_factors_and_partial_rope() {
 /// `GemmaModel::forward` calls it today.
 #[test]
 fn gpu_perhead_rmsnorm_matches_cpu_reference() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5727,6 +5756,7 @@ fn gpu_perhead_rmsnorm_matches_cpu_reference() {
 /// RoPE).
 #[test]
 fn gpu_fused_norm_rope_matches_cpu_reference_without_freq_factors() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5791,6 +5821,7 @@ fn gpu_fused_norm_rope_matches_cpu_reference_without_freq_factors() {
 /// attention` dispatches for E2B's full-attention layers.
 #[test]
 fn gpu_fused_norm_rope_matches_cpu_reference_with_freq_factors_and_partial_rope() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5872,6 +5903,7 @@ fn gpu_fused_norm_rope_matches_cpu_reference_with_freq_factors_and_partial_rope(
 /// path that matters silently NEOX — which is how this was nearly shipped.
 #[test]
 fn gpu_fused_norm_rope_matches_cpu_reference_with_norm_pairing() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -5943,6 +5975,7 @@ fn gpu_fused_norm_rope_matches_cpu_reference_with_norm_pairing() {
 
 #[test]
 fn gpu_fused_norm_rope_matches_cpu_reference_over_a_token_batch() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -6025,6 +6058,7 @@ fn gpu_fused_norm_rope_matches_cpu_reference_over_a_token_batch() {
 /// ever uses.
 #[test]
 fn record_ple_projection_matches_cpu_reference() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -6109,6 +6143,7 @@ fn record_ple_projection_matches_cpu_reference() {
 /// make ties a real test hazard, not just a theoretical one.
 #[test]
 fn record_argmax_sample_matches_cpu_reference() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -6205,6 +6240,7 @@ fn record_argmax_sample_matches_cpu_reference() {
 /// the split and merge phases.
 #[test]
 fn record_argmax_sample_matches_cpu_reference_at_a_large_uneven_vocab() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -6255,6 +6291,7 @@ fn record_argmax_sample_matches_cpu_reference_at_a_large_uneven_vocab() {
 /// scale) — replicated inline here since that helper isn't `pub`.
 #[test]
 fn gpu_perhead_rmsnorm_weightless_matches_cpu_reference() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -6300,6 +6337,7 @@ fn gpu_perhead_rmsnorm_weightless_matches_cpu_reference() {
 /// directly into the GPU cache rather than going through `push`.
 #[test]
 fn fused_attention_matches_cpu_reference_owns_v() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -6477,6 +6515,7 @@ fn fused_attention_matches_cpu_reference_owns_v() {
 /// same reasoning as `gpu_attention_matches_cpu_reference_kv_dim_32`.
 #[test]
 fn fused_attention_matches_cpu_reference_kv_dim_32() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -6637,6 +6676,7 @@ fn fused_attention_matches_cpu_reference_kv_dim_32() {
 /// branches the first test doesn't reach.
 #[test]
 fn fused_attention_matches_cpu_reference_shared_v_with_freq_factors() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -6801,6 +6841,7 @@ fn fused_attention_matches_cpu_reference_shared_v_with_freq_factors() {
 /// results independently.
 #[test]
 fn fused_attention_two_layers_sharing_one_kv_cache_stay_independent() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -7019,6 +7060,7 @@ fn fused_attention_two_layers_sharing_one_kv_cache_stay_independent() {
 /// is verified where the arithmetic is well-conditioned instead, by
 /// `padding_a_stripe_leaves_its_real_rows_unchanged`.
 fn cross_check_fused_ffn_prefill(n_tokens: usize) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -7079,6 +7121,7 @@ fn cross_check_fused_ffn_prefill(n_tokens: usize) {
 /// block is uploaded and indexed per token the same way the unfused
 /// per-token `mul_inplace` loop reads it.
 fn cross_check_fused_ple_prefill(n_tokens: usize) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -7177,6 +7220,7 @@ fn cross_check_fused_attention_prefill_paged(
     start_pos: usize,
     paged: bool,
 ) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -7428,6 +7472,7 @@ fn cross_check_fused_attention_prefill_no_norms(n_tokens: usize, start_pos: usiz
 /// none, `"qkv"` for Qwen2's shape. Split per-projection because that is
 /// how the bug was found: Q and K agree with the reference and V does not.
 fn cross_check_fused_attention_prefill_shaped(n_tokens: usize, start_pos: usize, biases: &str) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -7713,6 +7758,7 @@ fn fused_attention_prefill_matches_the_unfused_sequence_striped() {
 /// must leave the cache's length untouched.
 #[test]
 fn fused_attention_prefill_matches_the_unfused_sequence_kv_donor() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -7843,6 +7889,7 @@ fn fused_attention_prefill_matches_the_unfused_sequence_kv_donor() {
 /// wrong.
 #[test]
 fn fused_post_attention_prefill_gpu_source_matches_the_host_source() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -7995,6 +8042,7 @@ fn cross_check_fused_post_attention_shaped(
     ffn_len: usize,
     gemma_shaped: bool,
 ) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -8133,6 +8181,7 @@ fn fused_post_attention_prefill_swiglu_matches_at_model_shaped_dims() {
 /// matters; the fused chains' own cross-checks cover the rest.
 #[test]
 fn padding_a_stripe_leaves_its_real_rows_unchanged() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -8204,6 +8253,7 @@ fn cross_check_gpu_attention_prefill_sized(
     head_dim: usize,
     n_tokens: usize,
 ) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -8409,6 +8459,7 @@ fn fused_ffn_prefill_matches_the_unfused_sequence_multi_chunk() {
 /// the first caller of these arms produced token soup, and this is the test
 /// that should have existed before it.
 fn cross_check_fused_layer_llama_shaped(biases: &str) {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -8540,6 +8591,7 @@ fn cross_check_fused_layer_llama_shaped(biases: &str) {
         let expected = xr;
 
         let got = vulkan.fused_layer(FusedLayerInput {
+            stop_at_ffn_norm: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: false, // llama does not normalize V
             q_bias: q_bias.as_deref(),
@@ -8624,6 +8676,7 @@ fn cross_check_fused_layer_llama_shaped(biases: &str) {
 /// decode step always follows a prefill — so it is filed, not urgent.
 #[test]
 fn fused_attention_decode_matches_cpu_on_the_llama_shape() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -8746,6 +8799,7 @@ fn fused_attention_decode_matches_cpu_on_the_llama_shape() {
 /// attention, no RoPE and no KV cache in the way.
 #[test]
 fn fused_post_attention_decode_matches_prefill_on_the_llama_shape() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -8794,6 +8848,7 @@ fn fused_post_attention_decode_matches_prefill_on_the_llama_shape() {
         .expect("the prefill chain handles this shape");
 
     let got = vulkan.fused_post_attention(FusedPostAttentionInput {
+        stop_at_ffn_norm: false,
         activation: FfnActivation::Swiglu,
         attn_out: GpuInput::Cpu(&attn_out),
         residual: GpuInput::Cpu(&residual),
@@ -8864,6 +8919,7 @@ fn fused_layer_llama_shaped_with_qkv_biases_matches_cpu_reference() {
 
 #[test]
 fn fused_layer_matches_cpu_reference_full_layer_with_ple() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -9025,6 +9081,7 @@ fn fused_layer_matches_cpu_reference_full_layer_with_ple() {
         let expected = xr;
 
         let got = vulkan.fused_layer(FusedLayerInput {
+            stop_at_ffn_norm: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: true,
             q_bias: None,
@@ -9098,6 +9155,7 @@ fn fused_layer_matches_cpu_reference_full_layer_with_ple() {
 /// HTTP round trip per bisection step.
 #[test]
 fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -9309,6 +9367,7 @@ fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
         );
 
         let got0 = vulkan.fused_layer(FusedLayerInput {
+            stop_at_ffn_norm: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: true,
             q_bias: None,
@@ -9359,6 +9418,7 @@ fn fused_layer_kv_donor_matches_cpu_reference_many_steps() {
         }
 
         let got1 = vulkan.fused_layer(FusedLayerInput {
+            stop_at_ffn_norm: false,
             yarn: RopeYarn::IDENTITY,
             normalize_v: true,
             q_bias: None,
@@ -9507,6 +9567,7 @@ fn a_zero_row_width_does_not_clamp() {
 #[test]
 fn paged_fused_decode_matches_cpu_reference() {
     use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};
+    let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
         return;
@@ -9707,4 +9768,102 @@ fn paged_fused_prefill_matches_unfused_reference() {
     cross_check_fused_attention_prefill_paged(21, false, 5, true);
     // Starting exactly on a page boundary — no leading partial run.
     cross_check_fused_attention_prefill_paged(17, true, 8, true);
+}
+
+/// **Evidence that the matmul kernels are not where this device goes wrong.**
+///
+/// `VulkanBackend::decode_kernel_agrees` is the startup probe that decides
+/// whether the tuned decode kernels can be trusted. On this machine it says
+/// yes while the served model produces word salad, so the obvious reading is
+/// that the probe is too narrow. This sweeps every dimension it could be too
+/// narrow in — type, `in_dim`, `out_dim`, `n_tokens`, `matmul` against
+/// `matmul_batch` — against `matmul_dequant`, the full-precision reference
+/// (`matmul` rounds activations to `int8`, so it cannot referee this).
+///
+/// Everything agrees, to 1.2e-3 at worst. That is the finding: the fault is
+/// not reachable through `Backend::matmul`/`matmul_batch` at any shape, so no
+/// amount of widening the probe would have caught it, and a kernel-level
+/// check is the wrong shape of check. See `disable_miscompiled_decode_kernels`.
+#[test]
+#[ignore = "diagnostic; prints a table"]
+fn _scratch_decode_probe_shape_sweep() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    // Which kernel this backend actually selects, so a sweep that quietly
+    // ran on the reference path cannot be mistaken for evidence.
+    for (label, ty) in [
+        ("q4_k", GGML_TYPE_Q4_K),
+        ("q5_k", GGML_TYPE_Q5_K),
+        ("q6_k", GGML_TYPE_Q6_K),
+    ] {
+        eprintln!(
+            "  selected for {label}: {} (wide_unroll={})",
+            vulkan.selected_kernel_name(ty, 2048, 1),
+            vulkan.wide_unroll_on(),
+        );
+    }
+    eprintln!("  type    in_dim out_dim   fixture     max rel err");
+    for (label, ty) in [
+        ("q4_k", GGML_TYPE_Q4_K),
+        ("q5_k", GGML_TYPE_Q5_K),
+        ("q6_k", GGML_TYPE_Q6_K),
+    ] {
+        let elems = block_elems(ty);
+        for &(in_dim, out_dim) in &[(512usize, 512usize), (2048, 2048)] {
+            for spacers in [0usize, 1, 2, 3] {
+                // Push the probe weight off offset 0 in its chunk buffer. A single
+                // uploaded tensor lands at the start of a fresh chunk; in a served
+                // model every weight but the first sits at some arbitrary offset,
+                // and the wide-load kernels bind `array<vec4<u32>>` views of it.
+                for spacer in 0..spacers {
+                    let n_blocks = 512 / elems * (3 + spacer);
+                    let mut seed = 0xD00D_u64 + spacer as u64;
+                    let bytes: Vec<u8> = (0..n_blocks)
+                        .flat_map(|_| build_block(ty, &mut seed))
+                        .collect();
+                    let sw = crate::engine::loader::probe_quant_matrix(bytes, ty, 512, 3 + spacer);
+                    let sx: Vec<f32> = (0..512).map(|i| (i % 7) as f32 * 0.01).collect();
+                    let _ = vulkan.matmul(&sx, 1, &sw);
+                }
+                for n_tokens in [1usize, 8] {
+                    let n_blocks = in_dim / elems * out_dim;
+                    let mut seed = 0xC0FFEE_u64;
+                    let bytes: Vec<u8> = (0..n_blocks)
+                        .flat_map(|_| build_block(ty, &mut seed))
+                        .collect();
+                    let w = crate::engine::loader::probe_quant_matrix(bytes, ty, in_dim, out_dim);
+                    let x: Vec<f32> = (0..n_tokens * in_dim)
+                        .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+                        .collect();
+                    let want = CpuBackend.matmul_dequant(&x, n_tokens, &w);
+                    // Two ops in one batch — `matmul_batch`, not `matmul`. The
+                    // gate/up pair of every FFN is issued exactly this way.
+                    let ops = [
+                        crate::engine::backend::MatmulOp {
+                            x: &x,
+                            n_tokens,
+                            w: &w,
+                        },
+                        crate::engine::backend::MatmulOp {
+                            x: &x,
+                            n_tokens,
+                            w: &w,
+                        },
+                    ];
+                    let got = vulkan.matmul_batch(&ops).swap_remove(0);
+                    let err = want
+                        .iter()
+                        .zip(&got)
+                        .map(|(a, b)| (a - b).abs() / a.abs().max(1.0))
+                        .fold(0.0f32, f32::max);
+                    eprintln!(
+                        "  {label:6}  {in_dim:6} {out_dim:7}  tok {n_tokens:3}  spacers {spacers}   {err:.6}"
+                    );
+                }
+            }
+        }
+    }
 }

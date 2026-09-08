@@ -386,7 +386,7 @@ impl BailingMoeModel {
         let mut kda_scratch = super::kda::KdaScratch::default();
         let mut mla_scratch = super::kda::MlaScratch::default();
 
-        for layer in &self.layers {
+        for (il, layer) in self.layers.iter().enumerate() {
             tensor::rmsnorm_into(
                 &mut cur,
                 &x,
@@ -427,16 +427,24 @@ impl BailingMoeModel {
                 self.config.rms_eps,
             );
             match &layer.ffn {
-                Ffn::Dense { gate, up, down } => super::swiglu_ffn_into(
-                    self.backend.as_ref(),
-                    &mut ffn_out,
-                    &mut ffn_scratch,
-                    &cur,
-                    n_tokens,
-                    gate,
-                    up,
-                    down,
-                ),
+                // The leading dense layers capture too. This model's
+                // `leading_dense_block_count` is 1, so without this the
+                // capture is one layer short of the model's depth for ever
+                // and the NPU concludes the architecture never offers its
+                // feed-forward input at all.
+                Ffn::Dense { gate, up, down } => {
+                    crate::engine::dump_ffn_input(il, n_tokens, &cur);
+                    super::swiglu_ffn_into(
+                        self.backend.as_ref(),
+                        &mut ffn_out,
+                        &mut ffn_scratch,
+                        &cur,
+                        n_tokens,
+                        gate,
+                        up,
+                        down,
+                    );
+                }
                 Ffn::Moe(moe) => {
                     ffn_out = super::swiglu_moe_ffn(
                         self.backend.as_ref(),
@@ -458,6 +466,7 @@ impl BailingMoeModel {
                             clamp_exp: moe.clamp_exp,
                             clamp_shexp: moe.clamp_shexp,
                         },
+                        il,
                     )
                 }
             }

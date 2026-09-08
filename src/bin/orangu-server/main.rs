@@ -36,6 +36,7 @@ mod device_lost;
 mod engine;
 mod http;
 mod init;
+mod npu_tool;
 mod panic_capture;
 mod prune;
 mod reexec;
@@ -308,7 +309,7 @@ struct Args {
 /// [`crate::bundle`].
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Detect the machine's CPU and GPU(s) and print their statistics.
+    /// Detect the machine's CPU, GPU(s) and NPU and print their statistics.
     System,
     /// Suggest a GGUF model size (not yet a specific model) likely to run
     /// comfortably on this machine's detected hardware.
@@ -346,6 +347,112 @@ enum Command {
         /// Also list each tensor's name, shape, type, and offset.
         #[arg(long)]
         tensors: bool,
+    },
+    /// Compile a model's feed-forward blocks for the NPU into a cache.
+    ///
+    /// Hidden, and run by the server on itself rather than by anyone: NPU
+    /// preparation runs on a background thread
+    /// (`npu_tool::prepare_in_background`) and needs no decision from the
+    /// operator. It exists as a subcommand
+    /// only because compiling and executing cannot share a process — the two
+    /// vendor stacks corrupt each other's symbol bindings — so the work has
+    /// to be reachable in a child.
+    #[command(hide = true)]
+    NpuCompile {
+        /// A path to a .gguf file, a bare name resolved against the
+        /// configured models directory, an NR from `list`, or a MODEL name.
+        file: Option<String>,
+        /// Token count to compile for. A graph has one static shape, so this
+        /// is part of a block's identity; 196 is a 224x224 image at patch 16.
+        #[arg(long, default_value_t = 196, value_name = "N")]
+        tokens: usize,
+        /// Only blocks whose name contains this, e.g. `v.blk` for the vision
+        /// tower alone.
+        #[arg(long, value_name = "SUBSTRING")]
+        blocks: Option<String>,
+        /// Compile at most this many blocks, in file order. What
+        /// `precompile_at_startup` uses to keep a cache budget.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// Recompile blocks that are already cached.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run a model's cached NPU blocks and report what they achieve.
+    ///
+    /// Hidden for the same reason, and kept because it is how the NPU path
+    /// is measured on a real model without a test harness.
+    #[command(hide = true)]
+    NpuRun {
+        /// The same model whose blocks were compiled.
+        file: Option<String>,
+        /// Token count to run. Must match what was compiled.
+        #[arg(long, default_value_t = 196, value_name = "N")]
+        tokens: usize,
+        /// Only blocks whose name contains this.
+        #[arg(long, value_name = "SUBSTRING")]
+        blocks: Option<String>,
+        /// Inferences per block; the reported figure is the median.
+        #[arg(long, default_value_t = 20, value_name = "N")]
+        repeats: usize,
+        /// Bind at most this many blocks, in file order. How many graphs
+        /// are resident is itself a variable on this device — see
+        /// `npu_tool::run`.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+    },
+    /// Measure this model's attention projections on the NPU.
+    ///
+    /// Hidden, and a measurement rather than a feature: compiling and
+    /// executing cannot share a process, so this is run twice — once to
+    /// compile `Q`/`K`/`V` against the captured `attn_norm(x)`, once with
+    /// `--run` to bind them and report how far the device lands from `f32`.
+    /// It answers whether offloading them is worth building before any of it
+    /// is built.
+    #[command(hide = true)]
+    NpuAttn {
+        /// The model whose attention projections to measure.
+        file: Option<String>,
+        /// Token width to compile and run.
+        #[arg(long, default_value_t = 128, value_name = "N")]
+        tokens: usize,
+        /// Which layer.
+        #[arg(long, default_value_t = 0, value_name = "N")]
+        layer: usize,
+        /// Bind and measure the artifact instead of compiling it.
+        #[arg(long)]
+        run: bool,
+        /// Where the compiled artifact is written and read.
+        #[arg(
+            long,
+            default_value = "/tmp/orangu-attn-probe.bin",
+            value_name = "PATH"
+        )]
+        artifact: String,
+    },
+    /// Measure the vocabulary projection on the NPU.
+    ///
+    /// Hidden, and a measurement rather than a feature, exactly as
+    /// [`Command::NpuAttn`] is: run once to compile `output.weight`, once
+    /// with `--run` to time it and report how far it lands from `f32`.
+    #[command(hide = true)]
+    NpuHead {
+        /// The model whose vocabulary projection to measure.
+        file: Option<String>,
+        /// Token width to compile and run. One is a decode step, which is
+        /// where this projection's cost actually falls.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        tokens: usize,
+        /// Bind and measure the artifact instead of compiling it.
+        #[arg(long)]
+        run: bool,
+        /// Where the compiled artifact is written and read.
+        #[arg(
+            long,
+            default_value = "/tmp/orangu-head-probe.bin",
+            value_name = "PATH"
+        )]
+        artifact: String,
     },
     /// Download a GGUF model from Hugging Face into the configured models
     /// directory, planning it against this machine first.
@@ -448,6 +555,10 @@ impl Command {
             Command::List { .. } => "list",
             Command::Plan { .. } => "plan",
             Command::Show { .. } => "show",
+            Command::NpuCompile { .. } => "npu-compile",
+            Command::NpuRun { .. } => "npu-run",
+            Command::NpuAttn { .. } => "npu-attn",
+            Command::NpuHead { .. } => "npu-head",
             Command::Download { .. } => "download",
             Command::Delete { .. } => "delete",
             Command::Refresh { .. } => "refresh",
@@ -940,6 +1051,33 @@ fn prepare(args: Args) -> Result<Prepared> {
     let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf).context("building tokenizer")?);
     let chat_template_source = metadata_string(&gguf, "tokenizer.chat_template");
 
+    // Before the weights are mapped, so the compile step's child process
+    // does not run alongside this one holding several gigabytes. It is a
+    // no-op without an NPU, without a companion projector, or once the cache
+    // is warm — which is every start after the first.
+    // Returns at once: compiling a block takes seconds and a model has
+    // dozens, so the whole of it happens on its own thread and the device
+    // joins in when it is ready. See `npu_tool::prepare_in_background`.
+    // **Probed before preparation starts**, not where it is printed.
+    // `prepare_in_background` opens the vendor driver on its own thread, and
+    // `detect_npu` opens it too; asking both to `dlopen` and initialise a
+    // context at once is a race with a C library that has one global of
+    // everything. Detecting here keeps it to the main thread before any of
+    // that begins, and the line is held until the device report.
+    let npu_line = npu_inventory(if conf.npu_precompile {
+        "— preparing feed-forward blocks"
+    } else {
+        "— not used (npu_precompile = off)"
+    });
+    // Told before it prepares, because the slot count decides whether the
+    // decode width is worth compiling at all — see `npu_tool::decode_enabled`.
+    npu_tool::set_slots(conf.slots);
+    npu_tool::prepare_in_background(
+        source.path(),
+        conf.npu_precompile,
+        (conf.npu_cache_gb * (1u64 << 30) as f64) as u64,
+    );
+
     // Before anything parallel runs — the loader itself reaches for rayon,
     // and `build_global` can only be called once.
     let threads = configure_cpu_threads(threads_flag.as_deref(), conf.threads)?;
@@ -951,6 +1089,10 @@ fn prepare(args: Args) -> Result<Prepared> {
     // attention shaders against whichever storage this names — the choice
     // cannot be revisited afterwards without rebuilding them.
     engine::backend::vulkan::set_kv_cache_preference(conf.kv_cache);
+    // Same reason, and the same window: `mlp_unroll` decides which decode
+    // kernels get *built*. Unset leaves the choice to the startup
+    // cross-check against the CPU.
+    engine::backend::vulkan::set_mlp_unroll_override(conf.mlp_unroll);
     let (backend, backend_label): (Arc<dyn Backend>, String) = select_backend(
         conf.backend,
         &requested_device(device_flag.as_deref(), &conf.device),
@@ -1106,6 +1248,13 @@ fn prepare(args: Args) -> Result<Prepared> {
             threads
         )
     );
+    // Beside the CPU and the GPU, because it is one of the machine's
+    // processors and a reader counting them should find it here rather than
+    // inferring it from a line that may arrive minutes later. Detected well
+    // above, before the background preparation opened the same driver.
+    if let Some(line) = &npu_line {
+        eprintln!("{line}");
+    }
     // Before the model is built: `LoadedModel::matrix` is what stamps each
     // tensor's device, and every architecture calls it during construction.
     if let Some(split) = &split {
@@ -1225,6 +1374,13 @@ fn prepare(args: Args) -> Result<Prepared> {
     });
     if let (Some(footprint), Some(wgpu)) = (&footprint, backend.as_wgpu()) {
         for line in footprint.report(wgpu.api_tag(), wgpu.device_in_use()) {
+            eprintln!("{line}");
+        }
+        // Here rather than during the self-check that found them: the check
+        // runs before a model is chosen, so it can only say what is wrong
+        // with the *device*, and what an operator needs is what is wrong
+        // with the model they just loaded.
+        for line in wgpu.quantization_notes_for(&loaded.quantization_types()) {
             eprintln!("{line}");
         }
         // Beside the tuning report rather than in it: `tuning_report` is a
@@ -2020,6 +2176,13 @@ fn build_model(
         ArchFamily::Mistral3 => Arc::new(
             MistralModel::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),
+        // `arch::granite` returns a `LlamaModel` — Granite's block *is*
+        // llama's, and the module is the four multipliers that make it
+        // Granite rather than a second forward pass.
+        ArchFamily::Granite => Arc::new(
+            crate::engine::arch::granite::load_with_backend(loaded, backend.clone())
+                .context("building model")?,
+        ),
         ArchFamily::Muse => Arc::new(
             MuseModel::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),
@@ -2126,10 +2289,11 @@ async fn serve(prepared: Prepared) -> Result<()> {
         let os = orangu::os::detect();
         let cpu = orangu::hardware::detect_cpu();
         let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
+        let npu = orangu::npu::detect_npu();
         let power = orangu::hardware::detect_power();
         print!(
             "{}",
-            orangu::hardware::format_report(&os, &cpu, &gpus, &power)
+            orangu::hardware::format_report(&os, &cpu, &gpus, npu.as_ref(), &power)
         );
         println!();
         println!(
@@ -2334,6 +2498,24 @@ async fn serve(prepared: Prepared) -> Result<()> {
         }
     }
 
+    // **Before anything else on the way out**, and in this order.
+    //
+    // Two different things can be inside the vendor library when a Ctrl+C
+    // arrives, and leaving either there while `main` returns runs the
+    // library's static destructors underneath it — `pure virtual method
+    // called`, then `terminate called without an active exception`.
+    //
+    // The preparation thread comes first because it is the one that can
+    // still be *building* a service: probing widths, compiling, binding
+    // graphs. During a first run there is no service yet, so the call below
+    // would find nothing and return, which is exactly how that abort
+    // survived having a shutdown at all. See `npu_tool::stop_preparation`.
+    npu_tool::stop_preparation();
+    // Then the service itself, whose device thread owns vendor C++ objects
+    // and lives in a `OnceLock` static that Rust never drops. See
+    // `orangu::npu_ffn::shutdown`.
+    orangu::npu_ffn::shutdown();
+
     // Written on the way out rather than after every turn: a snapshot is a
     // whole `KvCache` per entry, and paying that on each request would cost
     // more than the re-prefill it saves on any model small enough to hold.
@@ -2489,10 +2671,11 @@ fn run_command(
                 .and_then(|conf| orangu::os::detect_model_storage(&conf.models));
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
+            let npu = orangu::npu::detect_npu();
             let power = orangu::hardware::detect_power();
             print!(
                 "{}",
-                orangu::hardware::format_report(&os, &cpu, &gpus, &power)
+                orangu::hardware::format_report(&os, &cpu, &gpus, npu.as_ref(), &power)
             );
             Ok(())
         }
@@ -2508,7 +2691,11 @@ fn run_command(
                 .and_then(|conf| orangu::os::detect_model_storage(&conf.models));
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-            print!("{}", suggest::format_suggestion(&os, &cpu, &gpus));
+            let npu = orangu::npu::detect_npu();
+            print!(
+                "{}",
+                suggest::format_suggestion(&os, &cpu, &gpus, npu.as_ref())
+            );
             Ok(())
         }
         Command::List { sort } => {
@@ -2596,6 +2783,61 @@ fn run_command(
             let gguf = GgufFile::open(&path)?;
             print!("{}", format_show(&gguf, full, tensors));
             Ok(())
+        }
+        Command::NpuCompile {
+            file,
+            tokens,
+            blocks,
+            limit,
+            force,
+        } => {
+            let conf = load_config(config_arg, None, false)?;
+            let path = match file {
+                Some(spec) => orangu::model_spec::resolve_show_target(&conf.models, &spec)?,
+                None => select_model_for_show(&conf.models)?,
+            };
+            npu_tool::compile(&path, tokens, blocks.as_deref(), force, limit)
+        }
+        Command::NpuRun {
+            file,
+            tokens,
+            blocks,
+            repeats,
+            limit,
+        } => {
+            let conf = load_config(config_arg, None, false)?;
+            let path = match file {
+                Some(spec) => orangu::model_spec::resolve_show_target(&conf.models, &spec)?,
+                None => select_model_for_show(&conf.models)?,
+            };
+            npu_tool::run(&path, tokens, blocks.as_deref(), repeats, limit)
+        }
+        Command::NpuAttn {
+            file,
+            tokens,
+            layer,
+            run,
+            artifact,
+        } => {
+            let conf = load_config(config_arg, None, false)?;
+            let path = match file {
+                Some(spec) => orangu::model_spec::resolve_show_target(&conf.models, &spec)?,
+                None => select_model_for_show(&conf.models)?,
+            };
+            npu_tool::attn_probe(&path, tokens, layer, run, Path::new(&artifact))
+        }
+        Command::NpuHead {
+            file,
+            tokens,
+            run,
+            artifact,
+        } => {
+            let conf = load_config(config_arg, None, false)?;
+            let path = match file {
+                Some(spec) => orangu::model_spec::resolve_show_target(&conf.models, &spec)?,
+                None => select_model_for_show(&conf.models)?,
+            };
+            npu_tool::head_probe(&path, tokens, run, Path::new(&artifact))
         }
         Command::Download { repo, yes } => {
             let conf = load_config(config_arg, None, false)?;
@@ -3196,6 +3438,33 @@ fn cpu_inventory(role: &str, threads: Option<usize>) -> String {
         cpu_label(),
         detail.join(", ")
     )
+}
+
+/// One line for the NPU, or `None` on a machine that has none.
+///
+/// **Reported at startup, next to the CPU and GPU**, which it was not: the
+/// device's only mention was `npu_ffn`'s own line, and that one cannot
+/// appear until the background preparation has captured activations and
+/// compiled blocks — minutes on a cold cache, and never at all on a model
+/// whose blocks the accuracy gate refuses. An operator watching a server
+/// come up therefore saw a CPU and a GPU and no NPU, with nothing to say
+/// whether the machine had one, whether it had been switched off, or
+/// whether it was still working.
+///
+/// So this says what is *present* and what is about to be attempted; the
+/// later line says what came of it. `role` carries the second half, since
+/// whether the device will be asked at all is the caller's configuration
+/// rather than anything the probe can see.
+fn npu_inventory(role: &str) -> Option<String> {
+    let npu = orangu::npu::detect_npu()?;
+    let cores = match npu.cores {
+        1 => "1 core".to_string(),
+        cores => format!("{cores} cores"),
+    };
+    Some(format!(
+        "orangu-server: [npu] {} {} [{cores}] {role}",
+        npu.vendor, npu.target
+    ))
 }
 
 /// Sizes the worker pool every CPU path in this process shares.
@@ -4130,6 +4399,19 @@ fn select_backend(
                 ))
             }
         }
+        // Recognized, detected, and still not runnable — so the error says
+        // which of those three it is. "No NPU backend" and "no NPU on this
+        // machine" are very different problems, and an operator who has
+        // just seen the device listed in `orangu-server system` deserves
+        // the first answer rather than being left to suspect the second.
+        BackendPreference::Npu => Err(anyhow!(
+            "[{}].backend = npu, but orangu-server has no NPU backend. The NPU is \
+             detected and reported by `orangu-server system` as inventory only: the \
+             vendor runtime runs whole graphs compiled ahead of time and offers no \
+             per-operation entry point for the forward pass to call. Use backend = \
+             auto, vulkan, or cpu.",
+            config::SERVER_SECTION
+        )),
         BackendPreference::Auto => {
             // An explicitly requested device that an API in this chain
             // *has* devices for but doesn't offer. Remembered rather than
@@ -4523,8 +4805,14 @@ mod tests {
             }
             .mode(),
         ];
+        // Hidden subcommands are excluded, here and in the completion test
+        // below, and for the same reason: both are about the surface an
+        // operator sees. `npu-compile`/`npu-run` are how the server re-runs
+        // itself across a process boundary the NPU stack forces on it — they
+        // have no terminal title to name and no business in a Tab menu.
         let parsed: Vec<String> = Args::command()
             .get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
             .map(|sub| sub.get_name().to_string())
             .collect();
 
@@ -4597,6 +4885,7 @@ mod tests {
 
         let parsed: Vec<String> = Args::command()
             .get_subcommands()
+            .filter(|sub| !sub.is_hide_set())
             .map(|sub| sub.get_name().to_string())
             .collect();
 

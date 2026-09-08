@@ -18,15 +18,36 @@
 //! doc comment for what's implemented ([`Backend::matmul`] only, a direct
 //! port of `vulkan_shaders`'s `MAIN_REDUCE_SUFFIX` reduction kernel) and
 //! what isn't (`VulkanBackend`'s much larger fused/GPU-resident surface).
-//! Not verified on real OpenCL-capable hardware — this project's dev
-//! machine has the ICD loader installed (`ocl-icd`) but no vendor ICD
-//! registered, so [`OpenClBackend::try_init`] finds zero platforms here and
-//! gracefully returns `None`, the same as every other machine with no
-//! OpenCL device — this module's cross-check tests skip in exactly that
-//! case, per the same convention `vulkan.rs`/`cuda.rs` use. Apple targets
-//! are the one exception: their OpenCL ICD does report a device, but
-//! segfaults on the first real matmul call, so `try_init` refuses to
-//! initialize there at all rather than crash.
+//! Verified against real OpenCL hardware: an `ARM Platform` /
+//! `Mali-G720-Immortalis` device reporting OpenCL 3.0, bound through
+//! `/opt/cixgpu-pro/lib/aarch64-linux-gnu/libOpenCL.so` — the vendor
+//! library itself, which is why there is no `/etc/OpenCL/vendors` ICD
+//! registration to find. On a machine with no OpenCL device
+//! [`OpenClBackend::try_init`] finds zero platforms and gracefully returns
+//! `None`, and this module's cross-check tests skip in exactly that case,
+//! per the same convention `vulkan.rs`/`cuda.rs` use.
+//!
+//! That distinction is not bookkeeping. This module was written and
+//! reviewed while its cross-checks were skipping, and the first run on a
+//! real device failed all 24 of them, on three defects that no amount of
+//! reading had caught. `matmul` bound its weight argument as
+//! `&Arc<Buffer<u8>>` rather than `&*weights`, and since
+//! `ExecuteKernel::set_arg<T>` copies `size_of::<T>()` bytes straight from
+//! the reference it handed the driver the `Arc`'s heap address in place of
+//! the `cl_mem` handle — a `CL_INVALID_MEM_OBJECT` at launch, on every
+//! single-op call, in production and not only under test. `matmul_batch`
+//! had always derefed correctly, which is why the two paths disagreed.
+//! And once launches succeeded, the cross-check below turned out not to be
+//! checking much: it referenced `CpuBackend::matmul`, whose `int8`
+//! activation rounding these kernels do not perform (see
+//! `CpuBackend::matmul_dequant`, which says so, and which `vulkan.rs` and
+//! `cuda.rs` already used), and it built weights from uniformly random
+//! bytes rather than valid blocks (see `engine::backend::probe_blocks`).
+//! All three are fixed; the 26 tests here now pass on this device.
+//!
+//! Apple targets are the one exception: their OpenCL ICD does report a
+//! device, but segfaults on the first real matmul call, so `try_init`
+//! refuses to initialize there at all rather than crash.
 //!
 //! **Always compiled in**, like `cudarc`/`wgpu` — no Cargo feature needed.
 //! The `opencl3` version resolved here defaults to its `dynamic` feature
@@ -285,7 +306,7 @@ impl Backend for OpenClBackend {
         });
         let kernel_event = unsafe {
             ExecuteKernel::new(kernel)
-                .set_arg(&weights)
+                .set_arg(&*weights)
                 .set_arg(&x_buf)
                 .set_arg(&y_buf)
                 .set_arg(&in_dim)
@@ -446,6 +467,7 @@ impl Backend for OpenClBackend {
 mod tests {
     use super::*;
     use crate::engine::backend::CpuBackend;
+    use crate::engine::backend::probe_blocks::build_block;
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{
         GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
@@ -457,23 +479,13 @@ mod tests {
 
     /// One `OpenClBackend`, lazily built and shared across every test in
     /// this module — see `cuda::tests::shared_cuda`'s doc comment for the
-    /// identical rationale. On this project's dev machine (ICD loader
-    /// present, no vendor ICD registered — see this module's own doc
-    /// comment) `try_init()` returns `None` and every test below skips.
+    /// identical rationale. Where no OpenCL device is present `try_init()`
+    /// returns `None` and every test below skips; on this project's dev
+    /// machine it binds the Mali device named in this module's own doc
+    /// comment and they all run.
     fn shared_opencl() -> Option<&'static OpenClBackend> {
         static OPENCL: std::sync::OnceLock<Option<OpenClBackend>> = std::sync::OnceLock::new();
         OPENCL.get_or_init(OpenClBackend::try_init).as_ref()
-    }
-
-    fn next_byte(seed: &mut u64) -> u8 {
-        *seed ^= *seed << 13;
-        *seed ^= *seed >> 7;
-        *seed ^= *seed << 17;
-        (*seed & 0xFF) as u8
-    }
-
-    fn next_bytes(seed: &mut u64, n: usize) -> Vec<u8> {
-        (0..n).map(|_| next_byte(seed)).collect()
     }
 
     /// Straight from `engine::quant`, which is where a block layout is
@@ -481,12 +493,6 @@ mod tests {
     /// the other two vendor backends, and a type added to `quant` and to
     /// `vendor_shaders` but not to all three copies would fail here as
     /// `unreachable!()` rather than as a missing kernel.
-    fn block_bytes_for(ggml_type: u32) -> usize {
-        crate::engine::quant::block_layout(ggml_type)
-            .expect("a type under cross-check has a block layout")
-            .0
-    }
-
     fn block_elems_for(ggml_type: u32) -> usize {
         crate::engine::quant::block_layout(ggml_type)
             .expect("a type under cross-check has a block layout")
@@ -501,21 +507,21 @@ mod tests {
         let Some(opencl) = shared_opencl() else {
             return;
         };
-        let block_bytes = block_bytes_for(ggml_type);
         let block_elems = block_elems_for(ggml_type);
         assert!(in_dim.is_multiple_of(block_elems));
-        let row_bytes = (in_dim / block_elems) * block_bytes;
         let mut seed = 0x1234_5678_9abc_def0u64
             ^ (ggml_type as u64) << 32
             ^ (in_dim as u64) << 16
             ^ out_dim as u64;
-        let bytes = next_bytes(&mut seed, row_bytes * out_dim);
+        let bytes: Vec<u8> = (0..out_dim * (in_dim / block_elems))
+            .flat_map(|_| build_block(ggml_type, &mut seed))
+            .collect();
         let w = test_quant_matrix(&bytes, ggml_type, in_dim, out_dim);
         let x: Vec<f32> = (0..n_tokens * in_dim)
             .map(|i| ((i % 13) as f32 - 6.0) * 0.1)
             .collect();
 
-        let expected = CpuBackend.matmul(&x, n_tokens, &w);
+        let expected = CpuBackend.matmul_dequant(&x, n_tokens, &w);
         let actual = opencl.matmul(&x, n_tokens, &w);
         assert_eq!(expected.len(), actual.len());
         for (i, (e, a)) in expected.iter().zip(actual.iter()).enumerate() {
@@ -640,9 +646,16 @@ mod tests {
             return;
         };
         let mut seed = 42u64;
-        let bytes_a = next_bytes(&mut seed, 144 * 8);
+        // Valid blocks, not random bytes — see `probe_blocks`. This test
+        // compares the device against *itself*, so a `NaN` weight would
+        // fail it just as surely: `assert_eq!` on two `NaN`s is false.
+        let bytes_a: Vec<u8> = (0..8)
+            .flat_map(|_| build_block(GGML_TYPE_Q4_K, &mut seed))
+            .collect();
         let wa = test_quant_matrix(&bytes_a, GGML_TYPE_Q4_K, 256, 8);
-        let bytes_b = next_bytes(&mut seed, 4 * 5);
+        let bytes_b: Vec<u8> = (0..5)
+            .flat_map(|_| build_block(GGML_TYPE_F32, &mut seed))
+            .collect();
         let wb = test_quant_matrix(&bytes_b, GGML_TYPE_F32, 5, 1);
         let xa: Vec<f32> = (0..256).map(|i| (i % 7) as f32 * 0.05).collect();
         let xb: Vec<f32> = (0..5).map(|i| (i % 3) as f32 * 0.2).collect();

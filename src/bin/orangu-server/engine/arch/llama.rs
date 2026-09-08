@@ -35,6 +35,7 @@ use crate::engine::backend::{Backend, MatmulOp};
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::{LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::tensor;
+use crate::npu_tool;
 
 struct LlamaLayer {
     attn_norm: Vec<f32>,
@@ -62,6 +63,58 @@ struct LlamaLayer {
     w_gate: QuantMatrix,
     w_up: QuantMatrix,
     w_down: QuantMatrix,
+}
+
+/// The scalar multipliers an IBM Granite checkpoint sprinkles through an
+/// otherwise ordinary Llama block.
+///
+/// Granite 3.x *is* `arch::llama` node for node — RMSNorm, GQA with RoPE, a
+/// separate-gate SwiGLU FFN, an optionally-tied output projection — and
+/// then multiplies four things by constants the GGUF carries. They are
+/// stored here rather than in `arch::granite` because they are the only
+/// difference, and duplicating a thousand lines of forward pass to change
+/// four numbers would leave two copies to keep in step.
+///
+/// [`Multipliers::NONE`] is what every other architecture routed here gets:
+/// every field the identity, so the arithmetic is exactly what it was.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Multipliers {
+    /// `granite.embedding_scale` (12 for 3.1-2B) — multiplies the token
+    /// embeddings once, before the first layer.
+    pub embedding: f32,
+    /// `granite.residual_scale` (0.22) — multiplies each sub-layer's output
+    /// *before* it is added to the residual stream, on both the attention
+    /// and the FFN branch.
+    ///
+    /// Not the same thing as gemma's `layer_output_scale`, which the fused
+    /// chain already carries: that scales `x` once after both adds, where
+    /// this scales each branch before its own add. `x*(1 + a + f)` and
+    /// `x + s*a + s*f` are different functions.
+    pub residual: f32,
+    /// `granite.logit_scale` (8) — the final logits are *divided* by this.
+    pub logit: f32,
+    /// `granite.attention.scale` (0.015625) — the softmax scale, replacing
+    /// `1/sqrt(head_dim)`. `None` means derive it as everything else does.
+    ///
+    /// Granite does not merely rename the default: 3.1-2B has `head_dim =
+    /// 64`, so the derived scale would be 0.125 and the checkpoint asks for
+    /// 0.015625 — eight times smaller.
+    pub attention: Option<f32>,
+}
+
+impl Multipliers {
+    /// Every multiplier the identity — plain Llama, Qwen, Mistral.
+    pub const NONE: Self = Self {
+        embedding: 1.0,
+        residual: 1.0,
+        logit: 1.0,
+        attention: None,
+    };
+
+    /// Whether these change anything at all.
+    fn is_identity(&self) -> bool {
+        *self == Self::NONE
+    }
 }
 
 pub struct LlamaModel {
@@ -95,6 +148,9 @@ pub struct LlamaModel {
     /// take nine positional arguments. `arch::mistral` builds a richer one
     /// of these for YaRN; nothing this module serves needs that.
     rope: tensor::RopeParams,
+    /// [`Multipliers::NONE`] for everything but Granite — see
+    /// `engine::arch::granite`.
+    mul: Multipliers,
 }
 
 /// `llama_model_rope_type`'s answer (`llama.cpp/src/llama-model.cpp`) for
@@ -114,13 +170,46 @@ pub struct LlamaModel {
 /// behavior everything here already had.
 fn rope_layout_for(architecture: &str) -> tensor::RopeLayout {
     match architecture {
-        "llama" | "mistral" => tensor::RopeLayout::Norm,
+        "llama" | "mistral" | "granite" => tensor::RopeLayout::Norm,
         _ => tensor::RopeLayout::Neox,
     }
 }
 
+/// What [`LlamaModel::record_decode_run`] puts at the end of a run.
+///
+/// This was a `bool` — "append the tail" — and the two branches inside the
+/// run disagreed about what the other value meant: without the NPU it left
+/// the last layer's hidden state in the buffer, with the NPU it left
+/// `output_norm` of it. Nothing caught that, because the only caller that
+/// asked for no tail was the split path and the only machine with an NPU
+/// here has one device. Three named states, so a branch cannot answer a
+/// question it was not asked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tail {
+    /// `output_norm` and the vocabulary projection: the buffer is logits.
+    Device,
+    /// `output_norm` only: the buffer is `[n_embd]`, for a caller that will
+    /// read it back and project it on the host. See
+    /// [`crate::engine::backend::tail_prefers_host`].
+    Host,
+    /// Neither: the buffer is this run's own hidden state, for the next
+    /// device in a split to carry on from.
+    None,
+}
+
 impl LlamaModel {
     pub fn load_with_backend(loaded: &LoadedModel, backend: Arc<dyn Backend>) -> Result<Self> {
+        Self::load_with_multipliers(loaded, backend, Multipliers::NONE)
+    }
+
+    /// [`Self::load_with_backend`] for an architecture that scales parts of
+    /// the block by constants — `engine::arch::granite`, and nothing else so
+    /// far.
+    pub fn load_with_multipliers(
+        loaded: &LoadedModel,
+        backend: Arc<dyn Backend>,
+        mul: Multipliers,
+    ) -> Result<Self> {
         let config = loaded.config.clone();
         let tok_embeddings = loaded
             .matrix("token_embd.weight")
@@ -215,7 +304,26 @@ impl LlamaModel {
             layers,
             rope_freq_factors,
             rope,
+            mul,
         })
+    }
+
+    /// The softmax scale this checkpoint wants — its own, or the usual
+    /// `1/sqrt(head_dim)`.
+    fn attn_scale(&self) -> f32 {
+        self.mul
+            .attention
+            .unwrap_or_else(|| 1.0 / (self.head_dim() as f32).sqrt())
+    }
+
+    /// Multiplies one sub-layer's output before its residual add. A no-op
+    /// for every architecture but Granite — see [`Multipliers::residual`].
+    fn scale_residual(&self, branch: &mut [f32]) {
+        if self.mul.residual != 1.0 {
+            for v in branch.iter_mut() {
+                *v *= self.mul.residual;
+            }
+        }
     }
 
     fn head_dim(&self) -> usize {
@@ -276,6 +384,154 @@ pub fn no_fused_post_attention() -> bool {
     *CACHED.get_or_init(|| crate::engine::env::flag_on("ORANGU_NO_FUSED_POST_ATTN"))
 }
 
+/// Where a decode step's wall clock goes across the seam, under
+/// `ORANGU_NPU_TIME=1`.
+///
+/// The two halves that matter and that nothing else measures: bringing the
+/// post-attention residual back from the GPU, and running the network on
+/// the device. `record_decode_run` breaks the fused per-layer chain to make
+/// the seam possible, so the readback is paid once per **layer** rather
+/// than once per token, and whether that is affordable is the whole
+/// question of whether decode belongs on the NPU at all.
+fn seam_clock() -> Option<std::time::Instant> {
+    seam_timing().then(std::time::Instant::now)
+}
+
+fn seam_elapsed(at: Option<std::time::Instant>) -> u64 {
+    at.map_or(0, |t| t.elapsed().as_nanos() as u64)
+}
+
+fn seam_timing() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_NPU_TIME"))
+}
+
+/// Accumulates [`seam_clock`] and reports once per decode step.
+fn record_seam_timing(read_ns: u64, device_ns: u64, n_layer: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static READ: AtomicU64 = AtomicU64::new(0);
+    static DEVICE: AtomicU64 = AtomicU64::new(0);
+    static LAYERS: AtomicU64 = AtomicU64::new(0);
+    if !seam_timing() {
+        return;
+    }
+    READ.fetch_add(read_ns, Relaxed);
+    DEVICE.fetch_add(device_ns, Relaxed);
+    let seen = LAYERS.fetch_add(1, Relaxed) + 1;
+    // Once per step, and only every eighth step so a long generation does
+    // not drown the log it is being read out of.
+    if !seen.is_multiple_of(n_layer as u64 * 8) {
+        return;
+    }
+    let per_step = |v: u64| v as f64 / (seen as f64 / n_layer as f64) / 1e6;
+    eprintln!(
+        "orangu-server: [npu] seam over {} step(s): {:.1} ms/step reading back, \
+         {:.1} ms/step on the device",
+        seen / n_layer as u64,
+        per_step(READ.load(Relaxed)),
+        per_step(DEVICE.load(Relaxed))
+    );
+}
+
+/// How much of a model the device must hold at width 1 before the decode
+/// seam is worth breaking the fused GPU chain for.
+///
+/// Every layer pays the seam's submit-and-read whether or not the device
+/// holds it, so the fraction that *is* held is what decides. Set so that a
+/// checkpoint losing its massive-activation layer — one of 16 on llama 3.2
+/// 1B — still uses the device, while one that lost half of itself does not.
+///
+/// With 15 of 16 layers held, llama 3.2 1B `Q8_0` decodes at 7.11 tok/s
+/// against 7.44 with the device off, so the seam is close to free at that
+/// coverage and the feature is at least *reachable* on the family. It was
+/// `100` first, which meant one unrepresentable block took decode off the
+/// device for every llama checkpoint there is.
+const DECODE_SEAM_COVERAGE_PERCENT: usize = 80;
+
+/// Diagnostic: take the decode seam, but run the network on the host.
+///
+/// `ORANGU_NPU_DECODE_HOST_FFN=1` keeps every other part of the seam — the
+/// fused layer stopping at `ffn_norm`, the per-layer submit-and-read, the
+/// host norm and the host residual add — and computes the feed-forward
+/// network the way the backend would. It bisects a broken decode in one
+/// run: wrong with this on is a seam that is wired wrong, wrong only with
+/// it off is the device's arithmetic. Nothing but a measurement should set
+/// it, and it is slower than either.
+pub fn decode_seam_host_ffn() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| crate::engine::env::flag_on("ORANGU_NPU_DECODE_HOST_FFN"))
+}
+
+/// Diagnostic: measure the device against the backend on every layer's
+/// **real** input, in prefill and in decode alike.
+///
+/// `ORANGU_NPU_CHECK=1` runs the network both ways at each layer,
+/// reports what they disagree by, and keeps the backend's answer — so the
+/// trajectory stays on the path the model would actually have taken and
+/// every layer is measured on a correct input. That separates a block that
+/// is wrong from a block that is merely being fed a hidden state some
+/// earlier block already ruined.
+///
+/// The number to compare it against is the one the compiler recorded from
+/// captured activations. A block that measures well there and badly here is
+/// being asked for something its calibration never saw.
+pub fn npu_block_check() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| crate::engine::env::flag_on("ORANGU_NPU_CHECK"))
+}
+
+/// One layer's device-against-backend disagreement, with the peak magnitude
+/// of the input that produced it.
+///
+/// `|x| peak` is the diagnostic half: a projection on this device holds one
+/// `uint8` activation scale chosen when the block was compiled, so an input
+/// that runs past the calibrated range saturates rather than rounds, and
+/// saturation is the failure that destroys a result instead of blunting it.
+fn report_npu_block_error(
+    layer: usize,
+    tokens: usize,
+    x: &[f32],
+    device: &[f32],
+    reference: &[f32],
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static REPORTED: AtomicUsize = AtomicUsize::new(0);
+    // A few decode steps' worth: enough to see whether the device is off on
+    // the very first generated token or only once the trajectory has moved.
+    if REPORTED.fetch_add(1, Ordering::Relaxed) >= 256 {
+        return;
+    }
+    let (mut num, mut den, mut dev_sq, mut dot) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    for (d, r) in device.iter().zip(reference) {
+        num += f64::from(d - r).powi(2);
+        den += f64::from(*r).powi(2);
+        dev_sq += f64::from(*d).powi(2);
+        dot += f64::from(*d) * f64::from(*r);
+    }
+    let rms = if den > 0.0 { (num / den).sqrt() } else { 0.0 };
+    // The two numbers that say *how* it is wrong rather than how much.
+    // `gain` is the device's own magnitude against the reference's, and
+    // `cos` is how much of the right direction is in it at all. Zero gain
+    // is a block returning nothing; gain far from one with `cos` near one
+    // is a scale that did not cancel; low `cos` is arithmetic.
+    let gain = if den > 0.0 {
+        (dev_sq / den).sqrt()
+    } else {
+        0.0
+    };
+    let cos = if dev_sq > 0.0 && den > 0.0 {
+        dot / (dev_sq.sqrt() * den.sqrt())
+    } else {
+        0.0
+    };
+    let peak = x.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    eprintln!(
+        "orangu-server: [npu] check layer {layer} at {tokens} tokens: \
+         {:.1}% rms, gain {gain:.3}, cos {cos:.3}, |x| peak {peak:.2}",
+        rms * 100.0
+    );
+}
+
 impl LlamaModel {
     /// One decode step as a single GPU submission, or `None` when this model or
     /// this step is not one the fused chain can describe.
@@ -306,6 +562,7 @@ impl LlamaModel {
         tokens: &[u32],
         start_pos: usize,
         slot_id: usize,
+        tail: Tail,
     ) -> Option<(wgpu::CommandEncoder, wgpu::Buffer, u64)> {
         if tokens.len() != 1 {
             return None;
@@ -322,8 +579,22 @@ impl LlamaModel {
             &x0,
             start_pos,
             slot_id,
-            true,
+            tail,
         )
+    }
+
+    /// Whether this model's vocabulary projection belongs on the host — see
+    /// [`crate::engine::backend::tail_prefers_host`], which runs decode steps
+    /// both ways and keeps the faster rather than inferring it from the
+    /// weight's size.
+    fn tail_on_host(&self) -> bool {
+        crate::engine::backend::tail_prefers_host()
+    }
+
+    /// The vocabulary projection on the host, from a run that stopped after
+    /// `output_norm`.
+    fn host_tail(&self, normed: &[f32]) -> Vec<f32> {
+        crate::engine::backend::CpuBackend.matmul(normed, 1, &self.output_weight)
     }
 
     /// One *run* of the decode chain: layers `layers`, starting from the
@@ -354,13 +625,20 @@ impl LlamaModel {
         x_in: &[f32],
         start_pos: usize,
         slot_id: usize,
-        with_tail: bool,
+        tail: Tail,
     ) -> Option<(wgpu::CommandEncoder, wgpu::Buffer, u64)> {
         use crate::engine::backend::vulkan::{
             FfnActivation, FusedAttnProjection, FusedLayerInput, GpuInput, RopeYarn,
         };
 
         if no_fused_qkv() || no_fused_post_attention() {
+            return None;
+        }
+        // The chain does its own embedding lookup and its own residual adds,
+        // and has no term for scaling either. Granite needs both scaled, so
+        // it takes the step-by-step path in `run_layers` instead — correct
+        // and slower, rather than fast and quietly wrong.
+        if !self.mul.is_identity() {
             return None;
         }
         if !vulkan.prefill_attention_enabled() {
@@ -381,15 +659,61 @@ impl LlamaModel {
         // reads them is recorded: a layer's `GpuInput` borrows the previous
         // layer's buffer, so they cannot be dropped inside the loop.
         let mut bufs: Vec<(wgpu::Buffer, u64)> = Vec::with_capacity(self.layers.len());
+        // The NPU takes the feed-forward network when it holds this model's
+        // blocks at this width, and the GPU keeps everything else. Measured
+        // on Llama 3.2 3B: the FFN is 473 ms of a 582 ms decode step — 16.9
+        // ms a layer — against 3.15 ms for the same block on the device.
+        //
+        // The cost is one submit-and-read per layer instead of one per
+        // token, which `_scratch_measure_submit_roundtrip` puts at 0.199 ms.
+        // 27 extra round trips is 5.4 ms against ~385 ms saved.
+        //
+        // llama has neither an attention post-norm nor an FFN post-norm, so
+        // the part this has to do on the host is a residual add. An
+        // architecture with either — gemma — cannot use this path as it
+        // stands; `FusedPostAttentionInput::stop_at_ffn_norm` says so.
+        // **Nearly every layer.** Taking this seam costs a submit-and-read
+        // for the whole step rather than one per token, and a layer the
+        // device does not hold pays that round trip and then computes the
+        // network on the backend anyway — so a set with half the model
+        // missing is worse than no set at all, and testing layer zero alone
+        // was not enough.
+        //
+        // Not *every* layer, though, which is what this asked for first.
+        // Llama's layer 1 carries the family's massive activations: its
+        // `silu(gate) * up` is peaked enough that one channel sets the
+        // `uint8` range and the rest quantizes to nothing, so the block
+        // comes back exactly zero and `NpuFfn` withdraws it. That is one
+        // layer of 16 on llama 3.2 1B and one of 28 on the 3B, and
+        // demanding all of them meant a single unrepresentable block took
+        // decode off the device for every checkpoint in the family.
+        let npu = crate::engine::npu_ffn_service().filter(|npu| {
+            let held = layers.clone().filter(|il| npu.has(*il, 1)).count();
+            held * 100 >= layers.len() * DECODE_SEAM_COVERAGE_PERCENT
+        });
+        let mut host_x: Vec<f32> = Vec::new();
+        let mut ffn_scratch = super::FfnScratch::default();
+        let mut ffn_normed: Vec<f32> = Vec::new();
+        let mut ffn_out: Vec<f32> = Vec::new();
+        // Only ever filled under `npu_block_check`; an ordinary run leaves
+        // it empty and never allocates it.
+        let mut ffn_device: Vec<f32> = Vec::new();
+        // The same, for the width-16 comparison the check makes.
+        let (mut tiled, mut wide): (Vec<f32>, Vec<f32>) = (Vec::new(), Vec::new());
         for il in layers.clone() {
             let layer = &self.layers[il];
-            let x_input = match bufs.last() {
-                Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
-                None => GpuInput::Cpu(x_in),
+            let x_input = if npu.is_some() && !host_x.is_empty() {
+                GpuInput::Cpu(&host_x)
+            } else {
+                match bufs.last() {
+                    Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
+                    None => GpuInput::Cpu(x_in),
+                }
             };
             let out = vulkan.record_fused_layer(
                 &mut encoder,
                 FusedLayerInput {
+                    stop_at_ffn_norm: npu.is_some(),
                     x: x_input,
                     // `llama`/`mistral` are NORM; `qwen2` and the rest NEOX.
                     pairing: self.rope.layout,
@@ -397,22 +721,30 @@ impl LlamaModel {
                     // no YaRN today, and `from_params` keeps the chain correct
                     // rather than merely lucky if that changes.
                     yarn: RopeYarn::from_params(&self.rope),
-                    // This family is SwiGLU throughout, has no per-head Q/K
-                    // norms, no post-norm on either residual, and — the
-                    // convention that is invisible from every shape — does not
-                    // normalize V.
+                    // This family is SwiGLU throughout, has no post-norm on
+                    // either residual, and — the convention that is invisible
+                    // from every shape — does not normalize V.
                     activation: FfnActivation::Swiglu,
                     normalize_v: false,
                     attn_norm: &layer.attn_norm,
                     wq: &layer.wq,
                     q_bias: layer.q_bias.as_deref(),
-                    q_norm: None,
+                    // **Passed, not `None`.** These were hardcoded `None`
+                    // under a comment claiming this family has no per-head
+                    // Q/K norms. `LlamaLayer::q_norm` exists precisely
+                    // because Qwen3 and Qwen3VL do, and `run_layers` applies
+                    // them — so prefill was right and decode quietly skipped
+                    // them. Nothing about that is visible in a shape: the
+                    // prompt is processed correctly and generation is token
+                    // soup from the first token. Qwen3-1.7B answered "what
+                    // is a hash table" with `บทuyếtuyếtжеuyết}}{{Про胞...`.
+                    q_norm: layer.q_norm.as_deref(),
                     kv: Some(FusedAttnProjection {
                         wk: &layer.wk,
                         wv: Some(&layer.wv),
                         k_bias: layer.k_bias.as_deref(),
                         v_bias: layer.v_bias.as_deref(),
-                        k_norm: None,
+                        k_norm: layer.k_norm.as_deref(),
                     }),
                     n_head: cfg.n_head,
                     n_head_kv: cfg.n_head_kv,
@@ -425,7 +757,7 @@ impl LlamaModel {
                     // Causal to this position, no sliding window.
                     window_start: 0,
                     window: None,
-                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    scale: self.attn_scale(),
                     cache: &mut cache.layers[il],
                     wo: &layer.wo,
                     attn_post_norm: None,
@@ -441,11 +773,121 @@ impl LlamaModel {
                 },
             );
             ts.after_layer(&mut encoder, il);
+
+            // With the FFN on the device, `out` is `x1` — the post-attention
+            // residual — rather than the layer's output. Finish the layer
+            // here: normalise, run the network, add the residual back.
+            if let Some(npu) = npu {
+                let finished = std::mem::replace(
+                    &mut encoder,
+                    vulkan.new_encoder("orangu-server llama decode layer"),
+                );
+                let t_read = seam_clock();
+                host_x = vulkan.submit_and_read_at(finished, &out.0, out.1, n_embd);
+                let read_ns = seam_elapsed(t_read);
+
+                ffn_normed.clear();
+                ffn_normed.extend_from_slice(&host_x);
+                crate::engine::tensor::rmsnorm_inplace(
+                    &mut ffn_normed,
+                    &layer.ffn_norm,
+                    1,
+                    n_embd,
+                    cfg.rms_eps,
+                );
+                // Both ways, when a measurement asked for it: the device's
+                // answer is compared against the backend's and then thrown
+                // away, so every layer is judged on an input the model would
+                // really have produced. See `npu_block_check`.
+                let checked = if npu_block_check() {
+                    npu.forward_into(il, 1, &ffn_normed, &mut ffn_device)
+                } else {
+                    false
+                };
+                let t_dev = seam_clock();
+                let on_device = !checked
+                    && !decode_seam_host_ffn()
+                    && npu.forward_into(il, 1, &ffn_normed, &mut ffn_out);
+                record_seam_timing(read_ns, seam_elapsed(t_dev), n_layer);
+                if on_device {
+                    crate::engine::tensor::add_inplace(&mut host_x, &ffn_out);
+                } else {
+                    // The device declined or failed. `host_x` is `x1` and the
+                    // network still has to run, so fall back to the backend
+                    // for this layer rather than dropping it.
+                    super::swiglu_ffn_into(
+                        self.backend.as_ref(),
+                        &mut ffn_out,
+                        &mut ffn_scratch,
+                        &ffn_normed,
+                        1,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &layer.w_down,
+                    );
+                    if checked {
+                        report_npu_block_error(il, 1, &ffn_normed, &ffn_device, &ffn_out);
+                        // **The same row through this layer's other graph.**
+                        // A width-16 graph fed sixteen copies of one row
+                        // computes the same function on each of them, so its
+                        // first row is directly comparable with the width-1
+                        // answer above. Two numbers that differ are a graph
+                        // problem; two that agree are a quantization problem
+                        // the width does not change.
+                        if npu.has(il, npu_tool::prefill_width()) {
+                            tiled.clear();
+                            for _ in 0..npu_tool::prefill_width() {
+                                tiled.extend_from_slice(&ffn_normed);
+                            }
+                            if npu.forward_into(il, npu_tool::prefill_width(), &tiled, &mut wide) {
+                                wide.truncate(ffn_out.len());
+                                report_npu_block_error(il, 16, &ffn_normed, &wide, &ffn_out);
+                            }
+                        }
+                    }
+                    crate::engine::tensor::add_inplace(&mut host_x, &ffn_out);
+                }
+                continue;
+            }
             bufs.push(out);
         }
 
+        // On the NPU path the layer loop ends with the hidden state on the
+        // host, not in `bufs` — every layer was finished there. Hand it to
+        // the tail as a CPU input; `record_output_norm` takes either.
+        if npu.is_some() {
+            // `Tail::None` wants this run's *pre-norm* hidden state, and on
+            // this path it is on the host rather than in any buffer — there
+            // is nothing to hand back. Declining sends the caller to the
+            // unfused path, which is slower and right; the alternative,
+            // handing back `output_norm(x)` and letting the next device run
+            // layers on it, is what this used to do.
+            if tail == Tail::None {
+                return None;
+            }
+            let normed = vulkan.record_output_norm(
+                &mut encoder,
+                GpuInput::Cpu(&host_x),
+                &self.output_norm,
+                cfg.rms_eps,
+                n_embd,
+            );
+            if tail == Tail::Host {
+                ts.finish(vulkan, &mut encoder, n_layer);
+                return Some((encoder, normed, 0));
+            }
+            let (logits_buf, logits_offset) = vulkan.record_full_matmul(
+                &mut encoder,
+                GpuInput::Gpu(&normed, 0),
+                &self.output_weight,
+                slot_id + 1,
+            );
+            ts.finish(vulkan, &mut encoder, n_layer);
+            return Some((encoder, logits_buf, logits_offset));
+        }
+
         let (last_buf, last_offset) = bufs.last()?;
-        if !with_tail {
+        if tail == Tail::None {
             // This run's hidden state, for the caller to read back and hand
             // to the next device. The timestamp resolve still has to be
             // recorded, or the query set this encoder wrote into is never
@@ -461,6 +903,10 @@ impl LlamaModel {
             cfg.rms_eps,
             n_embd,
         );
+        if tail == Tail::Host {
+            ts.finish(vulkan, &mut encoder, n_layer);
+            return Some((encoder, normed, 0));
+        }
         // `slot_id + 1`, not `slot_id`: op resources are keyed by
         // `(weight, batch_slot)`, and the vocab projection must not share a slot
         // with the layer chain that runs into it. gemma keys its own output
@@ -485,15 +931,29 @@ impl LlamaModel {
         start_pos: usize,
         slot_id: usize,
     ) -> Option<Vec<f32>> {
+        // Both routes below fuse the residual adds — see
+        // `record_decode_chain`.
+        if !self.mul.is_identity() {
+            return None;
+        }
         let Some(vulkan) = self.backend.as_wgpu() else {
             // No single device holds the whole model: either there is no GPU
             // at all, or the model is split. `Self::record_split_decode`
             // answers the second case and `None` the first.
             return self.record_split_decode(cache, tokens, start_pos, slot_id);
         };
-        let (encoder, _, _) =
-            self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id)?;
-        let logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
+        let host_tail = self.tail_on_host();
+        let tail = if host_tail { Tail::Host } else { Tail::Device };
+        let (encoder, buf, offset) =
+            self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id, tail)?;
+        let logits = if host_tail {
+            // `[n_embd]` back instead of `[n_vocab]` — on a 128k vocabulary
+            // that is half a megabyte of readback this no longer does.
+            let normed = vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd);
+            self.host_tail(&normed)
+        } else {
+            vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1)
+        };
         if vulkan.gpu_timestamps() {
             vulkan.report_timestamps(start_pos, self.layers.len());
         }
@@ -547,6 +1007,10 @@ impl LlamaModel {
         for (index, (device, layers)) in runs.iter().enumerate() {
             let vulkan = self.backend.as_wgpu_on(*device)?;
             let last = index + 1 == runs.len();
+            // `Tail::Device` rather than `Tail::Host` even where the host
+            // would be faster: the rule is measured, but a split is the one
+            // shape this project has no machine to measure it on, and an
+            // untested path is not worth the megabyte it would save.
             let with_tail = last && *device == tail_device;
             let (encoder, buf, offset) = self.record_decode_run(
                 vulkan,
@@ -555,7 +1019,7 @@ impl LlamaModel {
                 &x,
                 start_pos,
                 slot_id,
-                with_tail,
+                if with_tail { Tail::Device } else { Tail::None },
             )?;
             if with_tail {
                 return Some(vulkan.submit_and_readback_for(
@@ -612,6 +1076,11 @@ impl LlamaModel {
             anyhow::ensure!(tok < cfg.n_vocab, "token id {tok} is out of vocab range");
             x[t * n_embd..(t + 1) * n_embd].copy_from_slice(&self.tok_embeddings.row(tok));
         }
+        if self.mul.embedding != 1.0 {
+            for v in x.iter_mut() {
+                *v *= self.mul.embedding;
+            }
+        }
 
         // Grown once and reused across layers rather than allocated per layer:
         // at prefill widths this is megabytes a layer. The two norm scratch
@@ -624,6 +1093,8 @@ impl LlamaModel {
         // `Backend::matmul_into`. `ffn` is the big one: `n_tokens * n_ff`.
         let mut attn_proj: Vec<f32> = Vec::new();
         let mut ffn_out: Vec<f32> = Vec::new();
+        // Only ever filled under `npu_block_check`.
+        let mut ffn_device: Vec<f32> = Vec::new();
         let mut ffn_scratch = super::FfnScratch::default();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -638,6 +1109,10 @@ impl LlamaModel {
                 n_embd,
                 cfg.rms_eps,
             );
+            // What `Q`/`K`/`V` read, captured for the device to calibrate
+            // against. Formed here whatever the fused chain decides below,
+            // so this sees every layer of every chunk.
+            crate::engine::dump_attn_input(layer_idx, n_tokens, &normed);
 
             // The whole pre-attention half — Q/K/V, RoPE, the KV-cache write
             // and attention itself — as one GPU submission, when this layer's
@@ -677,11 +1152,22 @@ impl LlamaModel {
                 && !no_fused_qkv()
                 && layer.q_norm.is_none()
                 && layer.k_norm.is_none();
+            // **The device takes `Q`/`K`/`V` when it has them**, which means
+            // declining this fusion for the layer: the chain computes the
+            // projections itself, so there is no way to have both. Measured
+            // before it was wired — llama 3.2 1B `Q8_0`, prefill of 1024
+            // tokens with the feed-forward already on the device — giving up
+            // the fusion costs 77.75 ± 0.82 against 77.09 ± 0.96 tok/s,
+            // which is nothing: with the network gone the GPU's remaining
+            // work is small and a 128-token chunk amortises the extra
+            // submissions.
+            let attn_on_npu = crate::npu_tool::attention_enabled()
+                && orangu::npu_ffn::service().is_some_and(|npu| npu.has_attn(layer_idx, n_tokens));
             let fused_qkv = self
                 .backend
                 // This layer's card — see `Backend::as_wgpu_on`.
                 .as_wgpu_on(layer.wo.device())
-                .filter(|_| fusable && !no_fused_post_attention())
+                .filter(|_| fusable && !no_fused_post_attention() && !attn_on_npu)
                 .and_then(|vulkan| {
                     vulkan.fused_attention_prefill(
                         crate::engine::backend::vulkan::FusedAttnPrefillInput {
@@ -710,7 +1196,7 @@ impl LlamaModel {
                             eps: cfg.rms_eps,
                             n_swa: 0,
                             causal: true,
-                            scale: 1.0 / (head_dim as f32).sqrt(),
+                            scale: self.attn_scale(),
                             want_attn_out_host: true,
                         },
                         &mut cache.layers[layer_idx],
@@ -727,23 +1213,49 @@ impl LlamaModel {
                 // Independent given the same normed input — one batched
                 // dispatch instead of three sequential round-trips (matters
                 // most for a GPU backend; see `Backend::matmul_batch`).
-                let mut qkv = self.backend.matmul_batch(&[
-                    MatmulOp {
-                        x: &normed,
-                        n_tokens,
-                        w: &layer.wq,
-                    },
-                    MatmulOp {
-                        x: &normed,
-                        n_tokens,
-                        w: &layer.wk,
-                    },
-                    MatmulOp {
-                        x: &normed,
-                        n_tokens,
-                        w: &layer.wv,
-                    },
-                ]);
+                // The device first, when it holds this layer's projections:
+                // one call for all three, answered as `q|k|v` back to back.
+                // Falls through to the backend on any refusal, with the same
+                // result and only slower.
+                let mut qkv = attn_on_npu
+                    .then(|| {
+                        let mut packed = Vec::new();
+                        let served = orangu::npu_ffn::service().is_some_and(|npu| {
+                            npu.forward_attn_into(layer_idx, n_tokens, &normed, &mut packed)
+                        });
+                        let q_len = n_tokens * cfg.n_head * head_dim;
+                        let kv_len = n_tokens * cfg.n_head_kv * head_dim;
+                        (served && packed.len() == q_len + 2 * kv_len).then(|| {
+                            let v = packed[q_len + kv_len..].to_vec();
+                            let k = packed[q_len..q_len + kv_len].to_vec();
+                            packed.truncate(q_len);
+                            vec![packed, k, v]
+                        })
+                    })
+                    .flatten()
+                    .unwrap_or_else(|| {
+                        // Independent given the same normed input — one
+                        // batched dispatch instead of three sequential round
+                        // trips (matters most for a GPU backend; see
+                        // `Backend::matmul_batch`).
+                        self.backend.matmul_batch(&[
+                            MatmulOp {
+                                x: &normed,
+                                n_tokens,
+                                w: &layer.wq,
+                            },
+                            MatmulOp {
+                                x: &normed,
+                                n_tokens,
+                                w: &layer.wk,
+                            },
+                            MatmulOp {
+                                x: &normed,
+                                n_tokens,
+                                w: &layer.wv,
+                            },
+                        ])
+                    });
                 let mut v = qkv.pop().unwrap();
                 let mut k = qkv.pop().unwrap();
                 let mut q = qkv.pop().unwrap();
@@ -820,7 +1332,7 @@ impl LlamaModel {
                     n_head,
                     n_head_kv,
                     head_dim,
-                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    scale: self.attn_scale(),
                     causal: true,
                     n_swa: 0,
                     start_pos,
@@ -860,10 +1372,25 @@ impl LlamaModel {
             // fused chain is cross-checked against exactly the sequence in the
             // `else` branch below
             // (`fused_post_attention_prefill_matches_the_unfused_sequence_swiglu_*`).
+            //
+            // **Declined when the NPU has this layer at this width.** The
+            // fused chain computes the FFN itself, so taking it is what kept
+            // this whole family off the device: gemma reached the NPU only
+            // because its own chain is declined the same way. Routing to the
+            // `else` arm is how the device gets asked at all; if it then
+            // declines or fails, that arm computes the block as before.
+            let ffn_on_npu =
+                orangu::npu_ffn::service().is_some_and(|npu| npu.has(layer_idx, n_tokens));
             let fused = self
                 .backend
                 .as_wgpu_on(layer.wo.device())
-                .filter(|_| !no_fused_post_attention())
+                // `mul.residual` scales each branch before its add and this
+                // chain does both adds internally, so Granite declines it.
+                .filter(|_| !no_fused_post_attention() && self.mul.residual == 1.0)
+                .filter(|_| !ffn_on_npu)
+                // The chain never forms `normed2` on the host, so a run that
+                // is capturing activations takes the slow arm instead.
+                .filter(|_| crate::engine::dump_ffn_dir().is_none())
                 .and_then(|vulkan| {
                     vulkan.fused_post_attention_prefill(
                         match &attn_on_device {
@@ -900,6 +1427,7 @@ impl LlamaModel {
                 }
                 self.backend
                     .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
+                self.scale_residual(&mut attn_proj);
                 tensor::add_inplace(&mut x, &attn_proj);
 
                 tensor::rmsnorm_into(
@@ -910,20 +1438,54 @@ impl LlamaModel {
                     n_embd,
                     cfg.rms_eps,
                 );
+                // The NPU, when this model's block was compiled for exactly
+                // this width. It runs the three projections and applies
+                // SwiGLU on the host — see `orangu::npu_ffn`. Anything it
+                // does not have, or any failure, falls through to the
+                // backend below with the same result, only slower.
+                //
+                // Both widths reach the device now — the decode step has
+                // its own graph and its own seam, see
+                // `npu_tool::decode_enabled` — so this hook fires at 16 and
+                // `record_decode_run` at 1.
+                crate::engine::dump_ffn_input(layer_idx, n_tokens, &normed2);
+                // Both ways under `npu_block_check`, keeping the backend's
+                // answer, so prefill is measured on the same footing as the
+                // decode seam.
+                let checked = npu_block_check()
+                    && orangu::npu_ffn::service().is_some_and(|npu| {
+                        npu.forward_into(layer_idx, n_tokens, &normed2, &mut ffn_device)
+                    });
+                let from_npu = !checked
+                    && orangu::npu_ffn::service().is_some_and(|npu| {
+                        npu.forward_into(layer_idx, n_tokens, &normed2, &mut ffn_out)
+                    });
                 // Shared with the dense FFN of the Qwen 3.5 hybrid trunk —
                 // `LLM_FFN_SILU`/`LLM_FFN_PAR` is one computation and this
                 // family (Llama, Mistral, Qwen2, Qwen3) and that one run the
                 // same one.
-                super::swiglu_ffn_into(
-                    self.backend.as_ref(),
-                    &mut ffn_out,
-                    &mut ffn_scratch,
-                    &normed2,
-                    n_tokens,
-                    &layer.w_gate,
-                    &layer.w_up,
-                    &layer.w_down,
-                );
+                if !from_npu {
+                    super::swiglu_ffn_into(
+                        self.backend.as_ref(),
+                        &mut ffn_out,
+                        &mut ffn_scratch,
+                        &normed2,
+                        n_tokens,
+                        &layer.w_gate,
+                        &layer.w_up,
+                        &layer.w_down,
+                    );
+                    if checked {
+                        report_npu_block_error(
+                            layer_idx,
+                            n_tokens,
+                            &normed2,
+                            &ffn_device,
+                            &ffn_out,
+                        );
+                    }
+                }
+                self.scale_residual(&mut ffn_out);
                 tensor::add_inplace(&mut x, &ffn_out);
             }
         }
@@ -954,41 +1516,62 @@ impl ModelForward for LlamaModel {
         greedy_sample: Option<super::GreedySampleParams<'_>>,
         slot_id: usize,
     ) -> Result<super::ForwardOutcome> {
-        if tokens.len() == 1
-            && let Some(params) = &greedy_sample
-            && let Some(vulkan) = self.backend.as_wgpu()
-            && vulkan.gpu_sample()
-            && let Some((mut encoder, logits_buf, logits_offset)) =
-                self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id)
-        {
-            let sample_buf = vulkan.record_argmax_sample(
-                &mut encoder,
-                crate::engine::backend::vulkan::GpuArgmaxSampleInput {
-                    // `GpuInput::Gpu`'s offset is in elements; the arena aligns
-                    // every output to at least 4 bytes, so this divides evenly.
-                    logits: crate::engine::backend::vulkan::GpuInput::Gpu(
-                        &logits_buf,
-                        (logits_offset / 4) as usize,
-                    ),
-                    n_vocab: self.output_weight.out_dim,
-                    recent_tokens: params.recent_tokens,
-                    repeat_penalty: params.repeat_penalty,
-                    // This family has no final-logit softcap.
-                    logit_softcap: None,
-                },
-                // Per-slot, so two concurrently-decoding sequences never share
-                // the cached sample scratch — same reason the op cache keys on
-                // `slot_id + 1` just above.
-                slot_id + 1,
-            );
-            let next = vulkan.submit_and_readback_u32(encoder, &sample_buf);
-            if vulkan.gpu_timestamps() {
-                vulkan.report_timestamps(start_pos, self.layers.len());
+        // Timed, when it is a decode step, so that
+        // `backend::tail_prefers_host` can compare its two arms on whole
+        // steps — the only comparison that charges each of them for
+        // exactly what it costs. A prefill runs through here too and is
+        // not a step of this kind.
+        let at = (tokens.len() == 1).then(std::time::Instant::now);
+        let outcome = (|| -> Result<super::ForwardOutcome> {
+            if tokens.len() == 1
+                && self.mul.is_identity()
+                && let Some(params) = &greedy_sample
+                && let Some(vulkan) = self.backend.as_wgpu()
+                && vulkan.gpu_sample()
+                // Sampling on the device is only worth having if the logits are
+                // *made* there. When the projection belongs on the host
+                // (`tail_prefers_host`) this path would drag it back onto the
+                // device to save a readback a tenth its cost, so it stands down
+                // and `record_decode_forward` returns host logits for the
+                // caller to sample — which is the same arithmetic in the same
+                // order, on the processor that is faster at it.
+                && !self.tail_on_host()
+                && let Some((mut encoder, logits_buf, logits_offset)) =
+                    self.record_decode_chain(vulkan, cache, tokens, start_pos, slot_id, Tail::Device)
+            {
+                let sample_buf = vulkan.record_argmax_sample(
+                    &mut encoder,
+                    crate::engine::backend::vulkan::GpuArgmaxSampleInput {
+                        // `GpuInput::Gpu`'s offset is in elements; the arena aligns
+                        // every output to at least 4 bytes, so this divides evenly.
+                        logits: crate::engine::backend::vulkan::GpuInput::Gpu(
+                            &logits_buf,
+                            (logits_offset / 4) as usize,
+                        ),
+                        n_vocab: self.output_weight.out_dim,
+                        recent_tokens: params.recent_tokens,
+                        repeat_penalty: params.repeat_penalty,
+                        // This family has no final-logit softcap.
+                        logit_softcap: None,
+                    },
+                    // Per-slot, so two concurrently-decoding sequences never share
+                    // the cached sample scratch — same reason the op cache keys on
+                    // `slot_id + 1` just above.
+                    slot_id + 1,
+                );
+                let next = vulkan.submit_and_readback_u32(encoder, &sample_buf);
+                if vulkan.gpu_timestamps() {
+                    vulkan.report_timestamps(start_pos, self.layers.len());
+                }
+                return Ok(super::ForwardOutcome::Token(next));
             }
-            return Ok(super::ForwardOutcome::Token(next));
+            self.forward(cache, tokens, start_pos, slot_id)
+                .map(super::ForwardOutcome::Logits)
+        })();
+        if let Some(at) = at {
+            crate::engine::backend::note_tail_step(at.elapsed());
         }
-        self.forward(cache, tokens, start_pos, slot_id)
-            .map(super::ForwardOutcome::Logits)
+        outcome
     }
 
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
@@ -1027,7 +1610,19 @@ impl ModelForward for LlamaModel {
         // logits — a batched prefill doesn't need every position's output.
         let last = &mut x[(n_tokens - 1) * n_embd..].to_vec();
         tensor::rmsnorm_inplace(last, &self.output_norm, 1, n_embd, cfg.rms_eps);
-        let logits = self.backend.matmul(last, 1, &self.output_weight);
+        // One row whether this was a decode step or a thousand-token
+        // prefill — only the last position's logits are ever wanted — so the
+        // same rule applies here as to the fused path's tail.
+        let mut logits = match self.backend.as_wgpu() {
+            Some(_) if self.tail_on_host() => self.host_tail(last),
+            _ => self.backend.matmul(last, 1, &self.output_weight),
+        };
+        // Granite divides; everything else has `logit == 1.0`.
+        if self.mul.logit != 1.0 {
+            for v in logits.iter_mut() {
+                *v /= self.mul.logit;
+            }
+        }
         Ok(logits)
     }
 

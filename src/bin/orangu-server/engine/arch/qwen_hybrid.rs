@@ -887,12 +887,16 @@ fn split_beta_alpha(
 /// `normed` is `[n_tokens, n_embd]`, already post-attention-normed; the
 /// return is the same shape, to be added back into the residual stream.
 pub(crate) trait HybridFfn: Send + Sync {
+    /// `il` is the layer's index, which the feed-forward needs for no
+    /// arithmetic reason: it is how a compiled NPU block is looked up, and
+    /// how a captured activation is filed for the compiler to calibrate on.
     fn forward(
         &self,
         backend: &dyn Backend,
         n_embd: usize,
         normed: &[f32],
         n_tokens: usize,
+        il: usize,
     ) -> Vec<f32>;
 
     /// [`Self::forward`] into caller-owned buffers — see
@@ -900,6 +904,7 @@ pub(crate) trait HybridFfn: Send + Sync {
     /// implementation only overrides it when it has something to reuse;
     /// `MoeFfn` builds its output by summing per-expert contributions and
     /// has no single projection to redirect.
+    #[allow(clippy::too_many_arguments)]
     fn forward_into(
         &self,
         backend: &dyn Backend,
@@ -908,9 +913,10 @@ pub(crate) trait HybridFfn: Send + Sync {
         n_embd: usize,
         normed: &[f32],
         n_tokens: usize,
+        il: usize,
     ) {
         let _ = scratch;
-        *out = self.forward(backend, n_embd, normed, n_tokens);
+        *out = self.forward(backend, n_embd, normed, n_tokens, il);
     }
 }
 
@@ -931,7 +937,17 @@ impl HybridFfn for DenseFfn {
         _n_embd: usize,
         normed: &[f32],
         n_tokens: usize,
+        il: usize,
     ) -> Vec<f32> {
+        crate::engine::dump_ffn_input(il, n_tokens, normed);
+        if let Some(npu) = orangu::npu_ffn::service()
+            && npu.has(il, n_tokens)
+        {
+            let mut out = Vec::new();
+            if npu.forward_into(il, n_tokens, normed, &mut out) {
+                return out;
+            }
+        }
         super::swiglu_ffn(backend, normed, n_tokens, &self.gate, &self.up, &self.down)
     }
 
@@ -943,7 +959,15 @@ impl HybridFfn for DenseFfn {
         _n_embd: usize,
         normed: &[f32],
         n_tokens: usize,
+        il: usize,
     ) {
+        crate::engine::dump_ffn_input(il, n_tokens, normed);
+        if let Some(npu) = orangu::npu_ffn::service()
+            && npu.has(il, n_tokens)
+            && npu.forward_into(il, n_tokens, normed, out)
+        {
+            return;
+        }
         super::swiglu_ffn_into(
             backend, out, scratch, normed, n_tokens, &self.gate, &self.up, &self.down,
         );
@@ -1000,8 +1024,12 @@ impl HybridFfn for MoeFfn {
         n_embd: usize,
         normed: &[f32],
         n_tokens: usize,
+        il: usize,
     ) -> Vec<f32> {
         let ffn = self;
+        // The shared expert's input, for the compiler to calibrate on — the
+        // same vector a dense block captures.
+        crate::engine::dump_ffn_input(il, n_tokens, normed);
         let mut out = vec![0f32; n_tokens * n_embd];
         let mut experts =
             moe_stats::LayerRecorder::for_tensors(&[&ffn.gate_exps, &ffn.up_exps, &ffn.down_exps]);
@@ -1135,6 +1163,24 @@ impl HybridFfn for MoeFfn {
         // the `down` projection goes to.
         let shared_branch = || {
             decode_stages::scope(Stage::FfnShared, || {
+                // On the NPU when this layer's shared expert has been
+                // compiled for this width. It is a plain gated feed-forward
+                // block and the only part of a routed FFN a static graph can
+                // take — an expert is chosen per token, and a graph has one
+                // shape. Measured on this project's board it is a wash at
+                // expert widths (a 512-wide expert costs 11.7 ms on the
+                // device against 11.5 on the host, the dispatch eating the
+                // saving) and it runs inside the routed branch's shadow
+                // anyway, so this is coverage rather than speed.
+                if super::moe_shared_on_npu()
+                    && let Some(npu) = orangu::npu_ffn::service()
+                    && npu.has(il, n_tokens)
+                {
+                    let mut out = Vec::new();
+                    if npu.forward_into(il, n_tokens, normed, &mut out) {
+                        return out;
+                    }
+                }
                 let cpu = crate::engine::backend::CpuBackend;
                 let use_cpu_shared = !backend.supports_type(ffn.gate_shexp.ggml_type())
                     || !backend.supports_type(ffn.up_shexp.ggml_type())
@@ -1412,9 +1458,10 @@ impl<F: HybridFfn> Trunk<F> {
         // model may run concurrently. See `tensor::rmsnorm_into`.
         let mut scratch = LayerScratch::default();
 
-        for layer in &self.layers {
+        for (il, layer) in self.layers.iter().enumerate() {
             match layer {
                 Layer::FullAttn(weights, ffn) => self.forward_full_attn_layer(
+                    il,
                     weights,
                     ffn,
                     cache,
@@ -1424,6 +1471,7 @@ impl<F: HybridFfn> Trunk<F> {
                     &mut scratch,
                 )?,
                 Layer::Recurrent(weights, ffn) => self.forward_recurrent_layer(
+                    il,
                     weights,
                     ffn,
                     cache,
@@ -1445,8 +1493,10 @@ impl<F: HybridFfn> Trunk<F> {
     // Eight because the scratch buffers are threaded rather than held in
     // `self`; grouping them into `LayerScratch` already removed one.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn forward_full_attn_layer(
         &self,
+        il: usize,
         layer: &FullAttnWeights,
         ffn: &F,
         cache: &mut KvCache,
@@ -1483,6 +1533,7 @@ impl<F: HybridFfn> Trunk<F> {
 
         tensor::add_inplace(x, &sub_out);
         self.apply_ffn(
+            il,
             ffn,
             &layer.post_attention_norm,
             x,
@@ -1494,8 +1545,10 @@ impl<F: HybridFfn> Trunk<F> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_recurrent_layer(
         &self,
+        il: usize,
         layer: &RecurrentWeights,
         ffn: &F,
         cache: &mut KvCache,
@@ -1530,6 +1583,7 @@ impl<F: HybridFfn> Trunk<F> {
 
         tensor::add_inplace(x, &sub_out);
         self.apply_ffn(
+            il,
             ffn,
             &layer.post_attention_norm,
             x,
@@ -1547,8 +1601,10 @@ impl<F: HybridFfn> Trunk<F> {
     // `self`, the same reason `forward_full_attn_layer` carries this allow:
     // `forward` takes `&self` and two layers may be in flight at once.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn apply_ffn(
         &self,
+        il: usize,
         ffn: &F,
         post_attention_norm: &[f32],
         x: &mut [f32],
@@ -1566,7 +1622,15 @@ impl<F: HybridFfn> Trunk<F> {
             n_embd,
             self.dims.rms_eps,
         );
-        ffn.forward_into(self.backend.as_ref(), out, work, n_embd, normed, n_tokens);
+        ffn.forward_into(
+            self.backend.as_ref(),
+            out,
+            work,
+            n_embd,
+            normed,
+            n_tokens,
+            il,
+        );
         tensor::add_inplace(x, out);
     }
 }

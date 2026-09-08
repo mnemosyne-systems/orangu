@@ -80,6 +80,11 @@ pub enum ArchFamily {
     /// Llama, Llama3, Qwen2, Qwen3, Mistral — the plain GQA+RoPE+RMSNorm+
     /// SwiGLU transformer, no soft-capping or sliding-window attention.
     LlamaStyle,
+    /// IBM Granite 3.x — `arch::llama`'s block exactly, plus four scalar
+    /// multipliers (embedding, residual, logit, attention scale) the GGUF
+    /// carries and that are wrong-by-default rather than absent. See
+    /// `engine::arch::granite`.
+    Granite,
     /// Gemma/Gemma2/Gemma3/Gemma4 — QK-norm, per-layer-varying SWA/full
     /// attention, cross-layer KV sharing, per-layer embeddings, GEGLU FFN,
     /// final logit softcapping, and (`gemma-4-26B-A4B`) optional per-layer
@@ -211,6 +216,14 @@ const LLAMA_STYLE_ARCHITECTURES: &[&str] = &["llama", "qwen2", "qwen3", "mistral
 /// `mistral3` (e.g. `unsloth/Ministral-3-3B-Instruct-2512-GGUF`) — see
 /// [`ArchFamily::Mistral3`] and `engine::arch::mistral`.
 const MISTRAL_ARCHITECTURES: &[&str] = &["mistral3"];
+
+/// [`ArchFamily::Granite`] and `engine::arch::granite`.
+///
+/// Deliberately *not* folded into [`LLAMA_STYLE_ARCHITECTURES`], which it
+/// would otherwise fit: Granite's shapes are llama's, so reading it as
+/// llama loads cleanly and generates nonsense. The four multipliers have to
+/// be read, and a separate family is what forces that.
+const GRANITE_ARCHITECTURES: &[&str] = &["granite"];
 /// `gemma-embedding` (e.g. `ggml-org/embeddinggemma-300M-GGUF`) is the
 /// bidirectional-attention, embeddings-only sibling of the causal
 /// gemma3/gemma4 decoders — same per-layer block shape (QK-norm, sandwich
@@ -380,6 +393,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     }
     if MISTRAL_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Mistral3);
+    }
+    if GRANITE_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Granite);
     }
     if MUSE_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Muse);
@@ -776,6 +792,46 @@ impl QuantMatrix {
 /// cache keyed off `QuantMatrix::cache_key()` (a raw `(mmap.as_ptr(),
 /// start)` pair) assumes that address is a stable identity, which silently
 /// stops being true the moment an address gets freed and reused.
+/// A `QuantMatrix` over weights this process built rather than mapped.
+///
+/// For a self-check: [`crate::engine::backend::vulkan::VulkanBackend`] uses
+/// it to run a known answer through its own optimized kernels at startup and
+/// find out whether this device computes them correctly. Nothing in a served
+/// model takes this path.
+///
+/// The buffer is **leaked on purpose**. Caches all over the backend are keyed
+/// on `QuantMatrix::cache_key()`, which is a raw `(pointer, start)` pair; a
+/// buffer that is freed can have its address handed back out for something
+/// else, and a stale entry would then match a matrix it knows nothing about.
+/// A real model's mmap lives for the whole process, so those caches were
+/// never built to notice. This keeps one small probe buffer alive for the
+/// same duration rather than teaching them to.
+pub(crate) fn probe_quant_matrix(
+    bytes: Vec<u8>,
+    ggml_type: u32,
+    in_dim: usize,
+    out_dim: usize,
+) -> QuantMatrix {
+    static LEAKED: std::sync::Mutex<Vec<TensorBytes>> = std::sync::Mutex::new(Vec::new());
+    debug_assert!(out_dim > 0 && bytes.len().is_multiple_of(out_dim));
+    let row_bytes = bytes.len() / out_dim;
+    let held: TensorBytes = Arc::new(bytes);
+    LEAKED
+        .lock()
+        .expect("probe buffer registry poisoned")
+        .push(held.clone());
+    QuantMatrix {
+        bytes: held,
+        ggml_type,
+        start: 0,
+        row_bytes,
+        in_dim,
+        out_dim,
+        device: 0,
+        layer: NO_LAYER,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_quant_matrix(
     bytes: &[u8],
@@ -1340,6 +1396,21 @@ impl LoadedModel {
             spans[layer].push((base, loc.len));
         }
         spans
+    }
+
+    /// Every quantization this model's weights are stored in, deduplicated.
+    ///
+    /// What a backend needs in order to say something about *this* model
+    /// rather than about every type it supports — see
+    /// `VulkanBackend::quantization_notes_for`. A file is usually two or
+    /// three types, not one: a `Q4_K_M` build keeps some tensors at `Q6_K`
+    /// and its norms at `F32`, and a warning that skipped those would miss
+    /// the type the model actually spends its time in.
+    pub fn quantization_types(&self) -> Vec<u32> {
+        let mut types: Vec<u32> = self.tensors.values().map(|t| t.ggml_type).collect();
+        types.sort_unstable();
+        types.dedup();
+        types
     }
 
     pub fn resident_tensor_sizes(&self) -> impl Iterator<Item = (&str, u64)> {
@@ -2076,6 +2147,7 @@ mod tests {
                 ArchFamily::Deepseek4 => "Deepseek4",
                 ArchFamily::Phi3 => "Phi3",
                 ArchFamily::Mistral3 => "Mistral3",
+                ArchFamily::Granite => "Granite",
                 ArchFamily::Muse => "Muse",
                 ArchFamily::Inkling => "Inkling",
                 ArchFamily::NemotronHMoe => "NemotronHMoe",

@@ -490,6 +490,19 @@ impl<'a> BindSrc<'a> {
 pub struct VulkanBackend {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Staging buffers kept for reuse by [`Self::submit_and_readback_split`],
+    /// keyed by exact byte length.
+    ///
+    /// **Because a decode step that hands its feed-forward to the NPU reads
+    /// back once per layer, not once per token.** That path
+    /// (`LlamaModel::record_decode_run`) breaks the fused chain at
+    /// `ffn_norm`, so a 28-layer model pays 28 readbacks a token, and
+    /// allocating a fresh `MAP_READ` buffer for each was measured at 4.0 ms
+    /// per layer — 112 ms of a 289 ms step, against the 0.199 ms a single
+    /// round trip was priced at. Keyed by exact length rather than
+    /// best-fit: `map_read` maps the whole buffer, so a larger one would
+    /// hand back more bytes than the caller asked for.
+    readback_pool: std::sync::Mutex<HashMap<u64, Vec<wgpu::Buffer>>>,
     bind_group_layout: wgpu::BindGroupLayout,
     /// The `IQ*` codebooks (`iq_grid_words`), uploaded once and bound at
     /// `@binding(4)` of every matmul bind group. ~15 KiB, device-resident
@@ -785,6 +798,21 @@ pub struct VulkanBackend {
     /// (`supports_subgroup && ORANGU_SUBGROUP`) — needed to rebuild the
     /// split-attention shader at the right head_dim in
     /// `attn_split_pipeline_for`.
+    /// Whether the reduce kernels use `subgroupAdd` for their cross-lane
+    /// sum instead of the workgroup-barrier tree.
+    ///
+    /// **A policy, not a capability**, and the distinction cost this device
+    /// its `Q4_K` performance. `ORANGU_SUBGROUP` opts in; the field it is
+    /// easy to reach for instead — `supports_subgroup` — says only that the
+    /// adapter *has* the feature. The light and dual-nibble kernels were
+    /// built against that one, so on any adapter advertising subgroups they
+    /// took the subgroup path whatever the policy said. On the Mali-G720
+    /// they came back 164279% (`Q4_K`), 212984% (`Q5_K`) and 136476%
+    /// (`Q6_K`) off the fallback; built against this flag they land at
+    /// 51.7%, 13.4% and 261.7%, which is where the healthy `block-hoisted`
+    /// types sit on the same fixture. That device also miscompiles the
+    /// cooperative attention kernel, which is the other subgroup-using
+    /// shader here — see `Self::attention_agrees`.
     subgroup_reduce: bool,
     /// Split-k attention, phase 2 — see `vulkan_shaders::
     /// ATTENTION_SPLIT_REDUCE_SHADER`'s own doc comment. Reuses
@@ -1226,6 +1254,27 @@ pub struct VulkanBackend {
     /// comment for why this needs both `TIMESTAMP_QUERY` and
     /// `TIMESTAMP_QUERY_INSIDE_ENCODERS`, and why it's opt-in.
     gpu_timestamps: bool,
+    /// Quantizations this device computes wrongly even with every tuned
+    /// kernel off.
+    ///
+    /// Empty on every machine measured so far, and there is currently no
+    /// referee that could fill it: the probe compares the tuned kernels
+    /// against the fallback, so it can say the optimization is wrong but
+    /// not that the fallback is. Kept because the reporting path for it is
+    /// the same one the detuned note uses, and a future check that *can*
+    /// answer that question has somewhere to put its answer.
+    untrusted_types: Vec<(u32, f32)>,
+    /// Quantizations whose tuned decode kernels this device miscompiles,
+    /// and which are therefore running on the reference kernel instead.
+    /// Correct, only slower, so it is a note rather than a warning.
+    ///
+    /// **How much slower is worth knowing.** While the Mali-G720 had its
+    /// `Q4_K` kernels detuned, gemma 4 E2B at `Q4_K_M` served 2.11 tok/s of
+    /// prefill and 1.71 of decode against 47.65 and 6.93 for the same model
+    /// on `backend = cpu` — the GPU losing by 22x on prefill. With the
+    /// kernels working it is 13.34 and 9.65, so the note is not a small
+    /// one: a detuned type can turn the GPU into the slower device.
+    detuned_types: Vec<u32>,
     /// Running totals of every GPU-timestamped decode step, so the breakdown
     /// can be *collected* and not only printed — see [`GpuTimings`].
     timing_totals: Mutex<GpuTimings>,
@@ -2014,6 +2063,58 @@ impl TraceClock {
     }
 }
 
+/// How many readbacks of each byte length have happened and what the four
+/// parts of [`ReadbackSplit`] have summed to across them.
+type ReadbackTotals = HashMap<u64, (u64, [f64; 4])>;
+
+/// Accumulates [`ReadbackSplit`] and reports every 256 readbacks.
+///
+/// The decode seam pays one of these per **layer**, and which of the four
+/// parts it is deciding whether that is fixable: `alloc_ms` is a staging
+/// buffer (pooled, so this should be near zero), `submit_ms` is handing the
+/// command buffer to `wgpu`, `wait_ms` is the only part that is GPU time,
+/// and `copy_ms` is mapping and copying 12 KB back out. Reported in
+/// aggregate rather than per call because printing inside the submission
+/// loop changes the cost being measured.
+fn record_readback_split(byte_len: u64, alloc_ms: f64, submit_ms: f64, wait_ms: f64, copy_ms: f64) {
+    // **Keyed by size.** One process mixes readbacks of very different
+    // shapes — a decode seam brings back `n_embd` floats after one layer, a
+    // prefill chunk brings back far more after far more work — and averaged
+    // together they describe neither. The seam's is the small one.
+    static BY_SIZE: std::sync::Mutex<Option<ReadbackTotals>> = std::sync::Mutex::new(None);
+    if !ple_trace() {
+        return;
+    }
+    let Ok(mut by_size) = BY_SIZE.lock() else {
+        return;
+    };
+    let entry = by_size
+        .get_or_insert_with(HashMap::new)
+        .entry(byte_len)
+        .or_insert((0, [0.0; 4]));
+    entry.0 += 1;
+    for (slot, ms) in entry
+        .1
+        .iter_mut()
+        .zip([alloc_ms, submit_ms, wait_ms, copy_ms])
+    {
+        *slot += ms;
+    }
+    let (n, sums) = *entry;
+    if !n.is_multiple_of(256) {
+        return;
+    }
+    let us = |i: usize| sums[i] * 1000.0 / n as f64;
+    eprintln!(
+        "orangu-server: [readback] {n} of {byte_len} bytes, us each: alloc {:.0}, \
+         submit {:.0}, wait {:.0}, copy {:.0}",
+        us(0),
+        us(1),
+        us(2),
+        us(3)
+    );
+}
+
 /// Where the wall clock went inside one
 /// [`VulkanBackend::submit_and_readback_split`], in milliseconds.
 ///
@@ -2065,6 +2166,18 @@ fn dump_shaders_if_requested(
         (
             "q6k_matmul_dual.wgsl".into(),
             vulkan_shaders::shader_source_reduce_q6k_dual(n, subgroup),
+        ),
+        (
+            format!("q4k_matmul_wide_unroll_n{n}.wgsl"),
+            vulkan_shaders::shader_source_reduce_q4k_wide_unroll(n, subgroup),
+        ),
+        (
+            format!("q5k_matmul_wide_unroll_n{n}.wgsl"),
+            vulkan_shaders::shader_source_reduce_q5k_wide_unroll(n, subgroup),
+        ),
+        (
+            format!("q6k_matmul_wide_unroll_n{n}.wgsl"),
+            vulkan_shaders::shader_source_reduce_q6k_wide_unroll(n, subgroup),
         ),
         (
             "attention_split_headdim256.wgsl".into(),
@@ -2155,6 +2268,28 @@ const ARGMAX_SPLIT_N: u32 = 256;
 /// The `ggml_type`s a shader exists for — kept in one place so
 /// construction (build every pipeline up front) and the `matmul` dispatch
 /// (look one up) can't drift apart.
+/// The prefill width [`VulkanBackend::decode_kernel_agrees`] asks about
+/// beside a decode step. Matches what `engine::generate` issues, so the
+/// probe exercises the pipeline a real prompt does.
+const KERNEL_PROBE_PREFILL: usize = 16;
+
+/// What [`VulkanBackend::disable_optional_decode_kernels`] took away, so
+/// [`VulkanBackend::restore_optional_decode_kernels`] can put it back.
+///
+/// The probe decides whether the tuned kernels are trustworthy by running
+/// the same matmul with and without them, which means it has to be able to
+/// undo a disable and keep whichever the evidence supports.
+#[derive(Default)]
+struct DisabledKernels {
+    wide_unroll: Option<wgpu::ComputePipeline>,
+    block_hoisted: Option<wgpu::ComputePipeline>,
+    wide_load: Option<wgpu::ComputePipeline>,
+    q4_k_mmvq: bool,
+    q4: [Option<wgpu::ComputePipeline>; 8],
+    q5: [Option<wgpu::ComputePipeline>; 1],
+    q6: [Option<wgpu::ComputePipeline>; 2],
+}
+
 pub(crate) const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_F32,
     crate::engine::quant::GGML_TYPE_F16,
@@ -2192,6 +2327,26 @@ pub(crate) const SUPPORTED_TYPES: &[u32] = &[
 static KV_CACHE_PREFERENCE: std::sync::OnceLock<crate::config::KvCache> =
     std::sync::OnceLock::new();
 
+/// `[orangu-server].mlp_unroll`, once the configuration has been read.
+///
+/// A process-global rather than another parameter threaded through
+/// `select_backend`, matching how every other kernel toggle in this file
+/// reaches the same place. Set before the first backend is built; `None`
+/// (never set, or set to `None`) leaves the decision to
+/// [`VulkanBackend::disable_miscompiled_decode_kernels`].
+static MLP_UNROLL_OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+
+/// Records the operator's choice. Later calls are ignored — the first
+/// backend built has already read it, and a value that changed underneath
+/// would describe a backend that does not exist.
+pub fn set_mlp_unroll_override(chosen: Option<bool>) {
+    let _ = MLP_UNROLL_OVERRIDE.set(chosen);
+}
+
+fn mlp_unroll_override() -> Option<bool> {
+    MLP_UNROLL_OVERRIDE.get().copied().flatten()
+}
+
 /// Records what `[orangu-server].kv_cache` asked for. Called by `main` before
 /// any backend exists; later calls are ignored, so a second one cannot change
 /// the storage out from under a device that already compiled shaders for it.
@@ -2204,6 +2359,14 @@ pub fn set_kv_cache_preference(preference: crate::config::KvCache) {
 fn kv_cache_preference() -> crate::config::KvCache {
     KV_CACHE_PREFERENCE.get().copied().unwrap_or_default()
 }
+
+/// Set when this process has found the cooperative attention kernel to be
+/// miscompiled, so the rebuild below — and every later backend in this
+/// process — leaves it off. An `AtomicBool` rather than a parameter because
+/// `try_init_selected` is the public entry point and its signature is not
+/// this concern's to change.
+static ATTN_COOP_MISCOMPILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 impl VulkanBackend {
     /// Looks for a usable Vulkan adapter and builds every quant type's
@@ -2312,7 +2475,76 @@ impl VulkanBackend {
             .collect();
         let &head = positions.first()?;
         let adapter = adapters.into_iter().nth(head)?;
-        Self::init_on_adapter(adapter, candidates, positions)
+        let backend = Self::init_on_adapter(adapter, candidates, positions)?;
+
+        // Attention cannot be switched off after the fact the way a decode
+        // kernel can: `attn_coop` decides which pipelines get *built*, so
+        // clearing the flag on a finished backend leaves it half-configured.
+        // The device is asked once, and if the answer is wrong the backend
+        // is built again with the cooperative path off from the start —
+        // consistent by construction, and it happens at most once, because
+        // the second attempt reads the flag this sets.
+        if backend.attn_coop && !backend.attention_agrees() {
+            ATTN_COOP_MISCOMPILED.store(true, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "orangu-server: [vulkan] this device computes the cooperative attention kernel \
+                 incorrectly; rebuilding without it"
+            );
+            return Self::try_init_selected(backends, selected);
+        }
+        Some(backend)
+    }
+
+    /// The startup lines this device owes an operator **about the model
+    /// they are loading**, given the quantizations it actually contains.
+    ///
+    /// The self-check runs over every type this backend supports, before
+    /// any model is chosen, and it has to: the answer decides which
+    /// pipelines are trusted. But its findings are only news about the
+    /// types in the file. Reporting them all meant telling someone loading
+    /// a `Q8_0` model that `Q5_1` and `Q2_K` are wrong here — twice over,
+    /// because a device that fails `attention_agrees` builds the backend a
+    /// second time and every line printed during construction printed
+    /// again.
+    ///
+    /// Two kinds of finding, and they are not the same news:
+    ///
+    /// - a type whose *tuned* kernels are wrong runs on the reference
+    ///   kernel, which is correct and slower — worth knowing when a model
+    ///   is slower than expected, which is exactly the shape of "`Q4_K_M`
+    ///   feels slow on this box".
+    /// - a type that is wrong with every tuned kernel disabled has no
+    ///   working path here at all, and its output cannot be trusted.
+    pub fn quantization_notes_for(&self, types: &[u32]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let api = self.api_tag();
+        for ggml_type in &self.detuned_types {
+            if !types.contains(ggml_type) {
+                continue;
+            }
+            let name = orangu::gguf::ggml_type_name(*ggml_type);
+            lines.push(format!(
+                "orangu-server: [{api}] this device computes the tuned {name} decode kernels \
+incorrectly, so this model runs on the reference kernel for {name} — correct, and much \
+slower. If it is far enough off to matter, `backend = cpu` may beat this device outright for \
+this model."
+            ));
+        }
+        for (ggml_type, err) in &self.untrusted_types {
+            if !types.contains(ggml_type) {
+                continue;
+            }
+            let name = orangu::gguf::ggml_type_name(*ggml_type);
+            lines.push(format!(
+                "orangu-server: [{api}] {name} matmul disagrees with the CPU by {:.1}% here \
+with every tuned kernel disabled, and this model is {name} — its output on this device may be \
+wrong, and it is slow: with every tuned kernel off this runs the reference path, which measured \
+1.90 tok/s of decode on gemma 4 E2B against 4.11 for the same model at `Q8_0` — smaller and less \
+than half the speed. Prefer another quantization of this model, or `backend = cpu`.",
+                err * 100.0
+            ));
+        }
+        lines
     }
 
     /// Which `wgpu` API this instance actually came up on. `Vulkan` for
@@ -2663,6 +2895,10 @@ impl VulkanBackend {
                 "coop_vec4_tile_x": vulkan_shaders::coop_vec4_tiles(self.wgpu_backend).x,
                 "thin_tile": self.thin_tile,
                 "subgroup_reduce": self.subgroup_reduce,
+                // Reported beside the policy so the two are never confused
+                // again: this is what the adapter offers, that is what this
+                // process chose.
+                "supports_subgroup": self.supports_subgroup,
                 "attn_split": self.attn_split,
                 "attn_coop": self.attn_coop,
                 "attn_gqa": self.attn_gqa,
@@ -2945,7 +3181,10 @@ impl VulkanBackend {
         // decode reduce loop. No `supports_f16`
         // gate — the arithmetic is all `f32`, only `unpack2x16float` (core
         // WGSL) touches half-floats.
-        let wide_unroll = !crate::engine::env::flag_on("ORANGU_NO_MLP_UNROLL");
+        let wide_unroll = match mlp_unroll_override() {
+            Some(chosen) => chosen,
+            None => !crate::engine::env::flag_on("ORANGU_NO_MLP_UNROLL"),
+        };
         // See `Self::q4_k_dual_pipeline`'s own doc comment. **On by default**
         // for `Q4_K` decode (opt out with `ORANGU_NO_DUAL_NIBBLE=1`), the
         // same convention as `wide_unroll`/`tiled_prefill`. Only active when
@@ -3016,7 +3255,9 @@ impl VulkanBackend {
         // attention — **on by default** when subgroups are supported (opt out with
         // `ORANGU_NO_ATTN_COOP`). Falls back to the classic split kernel per-layer
         // when `head_dim % 32 != 0`. The large long-context decode win.
-        let attn_coop = supports_subgroup && (!crate::engine::env::flag_on("ORANGU_NO_ATTN_COOP"));
+        let attn_coop = supports_subgroup
+            && !crate::engine::env::flag_on("ORANGU_NO_ATTN_COOP")
+            && !ATTN_COOP_MISCOMPILED.load(std::sync::atomic::Ordering::Relaxed);
         // Effective decode-attention split-k. An explicit `ORANGU_ATTN_SPLIT_K`
         // always wins; otherwise the cooperative kernel — serial over positions
         // per split — wants more splits than the classic kernel to shorten that
@@ -3576,7 +3817,7 @@ impl VulkanBackend {
         let q4_k_dual_pipeline = (wide_unroll && dual_nibble && !packed_dot_f16).then(|| {
             build_pipeline(vulkan_shaders::shader_source_reduce_q4k_dual_nibble(
                 reduce_n_rows(),
-                supports_subgroup,
+                subgroup_reduce,
             ))
         });
 
@@ -3607,7 +3848,7 @@ impl VulkanBackend {
             .then(|| {
                 build_pipeline(vulkan_shaders::shader_source_reduce_q4k_light(
                     reduce_n_rows(),
-                    supports_subgroup,
+                    subgroup_reduce,
                 ))
             });
 
@@ -3619,7 +3860,7 @@ impl VulkanBackend {
         let q5_k_light_pipeline = (wide_unroll && q5k_light).then(|| {
             build_pipeline(vulkan_shaders::shader_source_reduce_q5k_light(
                 reduce_n_rows(),
-                supports_subgroup,
+                subgroup_reduce,
             ))
         });
 
@@ -3630,7 +3871,7 @@ impl VulkanBackend {
         let q6_k_light_pipeline = (wide_unroll && q6k_light).then(|| {
             build_pipeline(vulkan_shaders::shader_source_reduce_q6k_light(
                 reduce_n_rows(),
-                supports_subgroup,
+                subgroup_reduce,
             ))
         });
 
@@ -3680,7 +3921,7 @@ impl VulkanBackend {
         let q6_k_dual_pipeline = (wide_unroll && dual_nibble && q6k_dual).then(|| {
             build_pipeline(vulkan_shaders::shader_source_reduce_q6k_dual(
                 reduce_n_rows(),
-                supports_subgroup,
+                subgroup_reduce,
             ))
         });
 
@@ -3766,7 +4007,8 @@ impl VulkanBackend {
             );
         }
 
-        Some(Self {
+        let mut backend = Self {
+            readback_pool: std::sync::Mutex::new(HashMap::new()),
             device,
             queue,
             timing_totals: Mutex::new(GpuTimings::default()),
@@ -3887,8 +4129,390 @@ impl VulkanBackend {
             attn_split_k,
             attn_split_k_pinned,
             gpu_timestamps,
+            untrusted_types: Vec::new(),
+            detuned_types: Vec::new(),
             timestamps: Mutex::new(None),
-        })
+        };
+        backend.disable_miscompiled_decode_kernels();
+        Some(backend)
+    }
+
+    /// Runs a known answer through each optimized decode kernel and drops
+    /// the ones this device gets wrong.
+    ///
+    /// **Why a running device needs checking at all.** These kernels are
+    /// optimizations: every type they cover also has a slower path that
+    /// computes the same thing, and `selects_wide_unroll` only picks the
+    /// fast one when a pipeline for that type exists. So removing an entry
+    /// here is not a failure mode — it is the fallback, taken automatically.
+    ///
+    /// It is needed because a driver can compile correct code incorrectly.
+    /// On the Mali-G720 this was written against, the block-unroll kernels
+    /// for `Q4_K`/`Q5_K`/`Q6_K` return wrong products at decode shapes —
+    /// `Q6_K` drops one super-block's contribution entirely, `Q4_K` comes
+    /// back with the wrong sign — while the same weights through the
+    /// cooperative and tiled kernels are exact. The generated WGSL was read
+    /// line by line against the reference decoder and is correct, so there
+    /// is nothing to fix in it from here.
+    ///
+    /// Without this the failure is **silent**: a `Q4_K_M` model, the most
+    /// common quantization anyone runs, produces quietly degraded output
+    /// with no error anywhere. A few milliseconds at startup to find that
+    /// out is worth paying, and paying it on every device — a check that
+    /// only runs where a problem is already known would not have caught
+    /// this one.
+    fn disable_miscompiled_decode_kernels(&mut self) {
+        // **Every type this backend can run**, not the types in any one
+        // optional pipeline map. Deriving the list from
+        // `wide_unroll_pipelines` is what this used to do, and it made the
+        // whole check vanish silently: the light and dual-nibble kernels are
+        // separate fields, so on a device where that map came out empty the
+        // loop body never ran, nothing was probed, and every other tuned
+        // kernel shipped unchecked. That is not a hypothetical — it is how a
+        // `Q4_K_M` model came to produce word salad on a Mali-G720 while
+        // this function printed nothing at all.
+        // An operator who set `mlp_unroll` has decided about these kernels
+        // on hardware they can measure, so the probe does not overrule them.
+        // Every other check here still runs.
+        if mlp_unroll_override().is_some() {
+            return;
+        }
+        // A way to measure the tuned kernels themselves, which is otherwise
+        // impossible from outside: by the time anything can call `matmul`,
+        // this has already removed whichever ones it distrusts.
+        if std::env::var_os("ORANGU_PROBE_TRACE").is_some() {
+            for ggml_type in SUPPORTED_TYPES.iter().copied() {
+                eprintln!(
+                    "orangu-server: [probe] {:<6} t=1 {:<16} t=16 {:<16} err {:>10.2}%",
+                    orangu::gguf::ggml_type_name(ggml_type),
+                    self.pipeline_for_named(ggml_type, 2048, 1).1,
+                    self.pipeline_for_named(ggml_type, 2048, KERNEL_PROBE_PREFILL)
+                        .1,
+                    self.decode_kernel_error(ggml_type) * 100.0,
+                );
+            }
+        }
+        // Placed *after* the trace: the point of skipping the check is to
+        // measure the tuned kernels, and a trace below this would only ever
+        // report the ones that survived it.
+        if std::env::var_os("ORANGU_VK_NO_SELFCHECK").is_some() {
+            return;
+        }
+        for ggml_type in SUPPORTED_TYPES.iter().copied() {
+            if self.decode_kernel_agrees(ggml_type) {
+                continue;
+            }
+            // Already disabled by the failing probe — it leaves them off
+            // rather than restoring them — so this is a note about a kernel
+            // choice rather than a warning about results, and only
+            // interesting for a type the model in hand contains.
+            self.detuned_types.push(ggml_type);
+        }
+    }
+
+    /// Removes the optional decode kernels for one quantization, so the
+    /// reference kernel serves it instead.
+    ///
+    /// Everything here is an optimization with a slower path behind it, so
+    /// removing an entry is the fallback rather than a failure. Returns what
+    /// it took, so [`Self::restore_optional_decode_kernels`] can put it back
+    /// when the probe clears them.
+    fn disable_optional_decode_kernels(&mut self, ggml_type: u32) -> DisabledKernels {
+        use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K};
+
+        let mut saved = DisabledKernels {
+            wide_unroll: self.wide_unroll_pipelines.remove(&ggml_type),
+            block_hoisted: self.block_hoisted_pipelines.remove(&ggml_type),
+            wide_load: self.wide_load_pipelines.remove(&ggml_type),
+            ..DisabledKernels::default()
+        };
+        if ggml_type == GGML_TYPE_Q4_K {
+            saved.q4_k_mmvq = self.q4_k_mmvq;
+            saved.q4 = [
+                self.q4_k_mmvq_fused_pipeline.take(),
+                self.q4_k_packed_f16_pipeline.take(),
+                self.q4_k_unroll_packed_pipeline.take(),
+                self.q4_k_dual_pipeline.take(),
+                self.q4_k_light_pipeline.take(),
+                self.q4_k_glsl_pipeline.take(),
+                self.q4_k_contig_pipeline.take(),
+                self.wide_packed_pipeline.take(),
+            ];
+            self.q4_k_mmvq = false;
+        }
+        if ggml_type == GGML_TYPE_Q5_K {
+            saved.q5 = [self.q5_k_light_pipeline.take()];
+        }
+        if ggml_type == GGML_TYPE_Q6_K {
+            saved.q6 = [
+                self.q6_k_dual_pipeline.take(),
+                self.q6_k_light_pipeline.take(),
+            ];
+        }
+        saved
+    }
+
+    /// Puts back what [`Self::disable_optional_decode_kernels`] took, when
+    /// the probe finds nothing wrong with it.
+    fn restore_optional_decode_kernels(&mut self, ggml_type: u32, saved: DisabledKernels) {
+        let DisabledKernels {
+            wide_unroll,
+            block_hoisted,
+            wide_load,
+            q4_k_mmvq,
+            q4,
+            q5,
+            q6,
+        } = saved;
+        if let Some(p) = wide_unroll {
+            self.wide_unroll_pipelines.insert(ggml_type, p);
+        }
+        if let Some(p) = block_hoisted {
+            self.block_hoisted_pipelines.insert(ggml_type, p);
+        }
+        if let Some(p) = wide_load {
+            self.wide_load_pipelines.insert(ggml_type, p);
+        }
+        // **Only for the type that was disabled.** These fields are not
+        // keyed by type the way the pipeline maps are, so writing them
+        // unconditionally puts `None` back for a type that was never
+        // touched — restoring after `Q4_0` would silently wipe `Q4_K`'s
+        // kernels, which is exactly what it did until the probe trace
+        // showed `Q4_K` selecting `block-unroll` before it had been
+        // checked.
+        use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K};
+        if ggml_type == GGML_TYPE_Q4_K {
+            self.q4_k_mmvq = q4_k_mmvq;
+            let [fused, packed, unroll, dual, light, glsl, contig, wide] = q4;
+            self.q4_k_mmvq_fused_pipeline = fused;
+            self.q4_k_packed_f16_pipeline = packed;
+            self.q4_k_unroll_packed_pipeline = unroll;
+            self.q4_k_dual_pipeline = dual;
+            self.q4_k_light_pipeline = light;
+            self.q4_k_glsl_pipeline = glsl;
+            self.q4_k_contig_pipeline = contig;
+            self.wide_packed_pipeline = wide;
+        }
+        if ggml_type == GGML_TYPE_Q5_K {
+            let [q5_light] = q5;
+            self.q5_k_light_pipeline = q5_light;
+        }
+        if ggml_type == GGML_TYPE_Q6_K {
+            let [q6_dual, q6_light] = q6;
+            self.q6_k_dual_pipeline = q6_dual;
+            self.q6_k_light_pipeline = q6_light;
+        }
+    }
+
+    /// One small prefill attention, against the same reference the CPU path
+    /// computes.
+    ///
+    /// Grouped-query with more than one KV head and a start position past
+    /// zero, because both are places where getting the dispatch's
+    /// `(kv_head, slice)` split wrong is silent at the simpler shapes.
+    fn attention_agrees(&self) -> bool {
+        const N_HEAD: usize = 4;
+        const N_HEAD_KV: usize = 2;
+        const HEAD_DIM: usize = 32;
+        const N_TOKENS: usize = 9;
+        const START_POS: usize = 5;
+        const SCALE: f32 = 0.125;
+
+        let kv_dim = N_HEAD_KV * HEAD_DIM;
+        let mut seed = 0xA77Eu64;
+        let mut values = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    ((seed >> 33) as f32 / (1u64 << 30) as f32) - 2.0
+                })
+                .collect()
+        };
+
+        let mut cache =
+            crate::engine::kv_cache::KvCache::new_with_dims(START_POS + N_TOKENS + 8, &[kv_dim]);
+        for _ in 0..(START_POS + N_TOKENS) {
+            let (k, v) = (values(kv_dim), values(kv_dim));
+            cache.layers[0].push(&k, &v);
+        }
+        let q = values(N_TOKENS * N_HEAD * HEAD_DIM);
+
+        // Causal attention in `f32`, the same shape `run_layers_cpu` does.
+        let group = N_HEAD / N_HEAD_KV;
+        let mut want = vec![0f32; N_TOKENS * N_HEAD * HEAD_DIM];
+        for t in 0..N_TOKENS {
+            let pos = START_POS + t;
+            for h in 0..N_HEAD {
+                let kv_head = h / group;
+                let qh = &q[(t * N_HEAD + h) * HEAD_DIM..(t * N_HEAD + h + 1) * HEAD_DIM];
+                let mut scores: Vec<f32> = (0..=pos)
+                    .map(|p| {
+                        crate::engine::tensor::dot(qh, cache.layers[0].key_at(p, kv_head, HEAD_DIM))
+                            * SCALE
+                    })
+                    .collect();
+                crate::engine::tensor::softmax_inplace(&mut scores);
+                let out = &mut want[(t * N_HEAD + h) * HEAD_DIM..(t * N_HEAD + h + 1) * HEAD_DIM];
+                for (p, &weight) in scores.iter().enumerate() {
+                    let vh = cache.layers[0].value_at(p, kv_head, HEAD_DIM);
+                    for (o, vi) in out.iter_mut().zip(vh.iter()) {
+                        *o += weight * vi;
+                    }
+                }
+            }
+        }
+
+        let got = self.gpu_attention_prefill(
+            &q,
+            &mut cache.layers[0],
+            START_POS,
+            N_TOKENS,
+            N_HEAD,
+            N_HEAD_KV,
+            HEAD_DIM,
+            0,
+            true,
+            SCALE,
+        );
+        got.len() == want.len()
+            && want
+                .iter()
+                .zip(&got)
+                .all(|(a, b)| (a - b).abs() <= 0.02 * a.abs().max(1.0))
+    }
+
+    /// One decode-shaped matmul of this type, against [`CpuBackend`].
+    ///
+    /// **The shape is the probe.** A tuned kernel is only *selected* for
+    /// shapes worth tuning for, so a small fixture measures the fallback
+    /// and reports the device healthy whatever the fast path does. This
+    /// used 512x4, and on the Mali-G720 it was written for that shape
+    /// misses the fault entirely: with the tuned `Q4_K` kernels in place
+    /// this device computes
+    ///
+    /// | shape | 1 token | 4 | 16 | 32 |
+    /// |---|---|---|---|---|
+    /// | 512 x 4 | 0.0% | — | — | — |
+    /// | 2048 x 256 | **6043%** | 164269% | 164269% | 0.1% |
+    /// | 2560 x 10240 | **168313%** | 168313% | 168397% | 0.2% |
+    ///
+    /// — wrong by orders of magnitude below 32 tokens, exactly right at and
+    /// above it, and perfectly fine at the shape the probe was using. A
+    /// `Q4_K_M` model answered "explain a hash table" with ` leggings
+    /// painting ### accidentally...` while this reported nothing.
+    fn decode_kernel_agrees(&mut self, ggml_type: u32) -> bool {
+        // **This device against itself.** Every tuned kernel here is an
+        // optimization of a fallback that computes the same thing, so the
+        // question is not "does this match some other machine's arithmetic"
+        // but "does turning these on change the answer". Asking it that way
+        // needs no external reference, which matters, because neither
+        // available reference survives contact with this fixture:
+        //
+        // - `CpuBackend::matmul_dequant` keeps activations in `f32` where
+        //   both `matmul`s round them to `int8`. Measured against it, the
+        //   healthy `block-hoisted` kernels come back 25%, 73%, 207%, 264%
+        //   off on synthetic blocks — indistinguishable, by any threshold,
+        //   from a kernel that is actually wrong.
+        // - `CpuBackend::matmul` removes that difference and agrees to
+        //   0.00% at 512x4, but at a realistic 2048x256 it is itself 51.7%
+        //   from its own exact answer on these blocks, so it cannot referee
+        //   there either.
+        //
+        // Against the fallback, the answer is unambiguous: on the
+        // Mali-G720 this was written for, the `q4_k-light`, `q5_k-light`
+        // and `q6_k-light` kernels differ from it by 164279%, 213084% and
+        // 136476%, and every other type by nothing at all.
+        let Some(cases) = self.kernel_probe_cases(ggml_type) else {
+            return true;
+        };
+        let tuned: Vec<Vec<f32>> = cases
+            .iter()
+            .map(|(x, n, w)| self.matmul(x, *n, w))
+            .collect();
+        let saved = self.disable_optional_decode_kernels(ggml_type);
+        let plain: Vec<Vec<f32>> = cases
+            .iter()
+            .map(|(x, n, w)| self.matmul(x, *n, w))
+            .collect();
+        // 2% of the fallback's own answer. A correct optimization is not
+        // merely close to it — the two agree exactly — so this is slack for
+        // summation order, not for arithmetic.
+        let agrees = tuned.iter().zip(&plain).all(|(a, b)| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(a, b)| (a - b).abs() <= 0.02 * a.abs().max(1.0))
+        });
+        if agrees {
+            self.restore_optional_decode_kernels(ggml_type, saved);
+        }
+        agrees
+    }
+
+    /// The probe's inputs: one decode step and one prefill chunk of a
+    /// realistically shaped matrix.
+    ///
+    /// **The shape is half the probe.** A tuned kernel is only *selected*
+    /// for shapes worth tuning for, so a small fixture measures the
+    /// fallback and calls the device healthy whatever the fast path does.
+    /// This used 512x4 at one token; on the Mali-G720 it was written for,
+    /// the tuned `Q4_K` kernels are exact there and wrong by five orders of
+    /// magnitude at four and sixteen tokens on a 2048x256 matrix. A
+    /// `Q4_K_M` model answered "explain a hash table" with ` leggings
+    /// painting ### accidentally...` while this reported nothing.
+    fn kernel_probe_cases(
+        &self,
+        ggml_type: u32,
+    ) -> Option<Vec<(Vec<f32>, usize, crate::engine::loader::QuantMatrix)>> {
+        use crate::engine::quant::block_layout;
+        const IN_DIM: usize = 2048;
+        const OUT_DIM: usize = 256;
+
+        let (_, block_elems) = block_layout(ggml_type)?;
+        if !IN_DIM.is_multiple_of(block_elems) {
+            return None;
+        }
+        // **Valid blocks**, from the fixture the backend cross-checks share.
+        // Arbitrary bytes are not a legal block: every type with an `f16`
+        // scale reads one of those fields back as a float, and a random one
+        // is `NaN` or `Inf` about half the time, which compares equal to
+        // nothing and reports every type broken.
+        let mut seed = 0x51ed_1234u64;
+        let bytes: Vec<u8> = (0..IN_DIM * OUT_DIM / block_elems)
+            .flat_map(|_| super::probe_blocks::build_block(ggml_type, &mut seed))
+            .collect();
+        let weights = crate::engine::loader::probe_quant_matrix(bytes, ggml_type, IN_DIM, OUT_DIM);
+        Some(
+            [1usize, KERNEL_PROBE_PREFILL]
+                .into_iter()
+                .map(|n_tokens| {
+                    let x: Vec<f32> = (0..IN_DIM * n_tokens)
+                        .map(|i| ((i % 13) as f32 - 6.0) * 0.05)
+                        .collect();
+                    (x, n_tokens, weights.clone())
+                })
+                .collect(),
+        )
+    }
+
+    /// The worst relative disagreement [`Self::decode_kernel_agrees`] sees,
+    /// for reporting. Same fixture, same reference.
+    fn decode_kernel_error(&self, ggml_type: u32) -> f32 {
+        let Some(cases) = self.kernel_probe_cases(ggml_type) else {
+            return 0.0;
+        };
+        cases
+            .iter()
+            .map(|(x, n_tokens, weights)| {
+                let reference = CpuBackend.matmul_dequant(x, *n_tokens, weights);
+                let mine = self.matmul(x, *n_tokens, weights);
+                reference
+                    .iter()
+                    .zip(&mine)
+                    .map(|(a, b)| (a - b).abs() / a.abs().max(1.0))
+                    .fold(0.0f32, f32::max)
+            })
+            .fold(0.0f32, f32::max)
     }
 
     /// Total `queue.submit` calls this backend has made so far — read
@@ -4116,6 +4740,34 @@ impl VulkanBackend {
             tail[..bytes.len() - head].copy_from_slice(&bytes[head..]);
             self.queue.write_buffer(buffer, offset + head as u64, &tail);
         }
+    }
+
+    /// Drops every cached weight upload and returns the device memory.
+    ///
+    /// `weight_cache` never evicts on purpose — a served model's weights stay
+    /// resident for its lifetime — so this exists only for
+    /// `teardown_probe_holds_gpu_memory`, which needs to hold one weight's
+    /// worth at a time while allocating many, to show that this device
+    /// charges its exit stall on the *cumulative* total rather than on what
+    /// is resident. `destroy()` rather than a bare `drop`: dropping a
+    /// `wgpu::Buffer` only marks it for release, and the poll is what makes
+    /// that happen here rather than later.
+    ///
+    /// Note that it does **not** shorten the stall, precisely because `wgpu`
+    /// suballocates: the memory returns to `wgpu`, never to the driver.
+    ///
+    /// **Only safe when nothing is in flight.**
+    #[cfg(test)]
+    pub(crate) fn release_weight_cache(&self) {
+        let mut arena = self.weight_cache.lock().expect("weight cache poisoned");
+        arena.slots.clear();
+        for chunk in arena.chunks.drain(..) {
+            chunk.destroy();
+        }
+        arena.current_chunk_capacity = 0;
+        arena.next_offset = 0;
+        drop(arena);
+        self.poll_blocking("release_weight_cache");
     }
 
     fn weight_buffer(&self, w: &QuantMatrix) -> (wgpu::Buffer, u64, u64) {
@@ -4950,6 +5602,28 @@ impl VulkanBackend {
     /// does the selecting, rather than from a second copy of this branch
     /// ladder, is what keeps the report from drifting away from the truth the
     /// moment a branch is added here.
+    /// The name of the kernel [`Self::pipeline_for`] would select, and
+    /// whether the block-unroll family is on at all.
+    ///
+    /// For diagnostics that cross-check a kernel: a sweep that ran against
+    /// the reference path without saying so is not evidence about the tuned
+    /// one, and this is what lets such a sweep prove which it measured.
+    #[cfg(test)]
+    pub(crate) fn selected_kernel_name(
+        &self,
+        ggml_type: u32,
+        in_dim: usize,
+        n_tokens: usize,
+    ) -> &'static str {
+        self.pipeline_for_named(ggml_type, in_dim, n_tokens).1
+    }
+
+    /// Whether the block-unroll kernel family is enabled on this backend.
+    #[cfg(test)]
+    pub(crate) fn wide_unroll_on(&self) -> bool {
+        self.wide_unroll
+    }
+
     fn pipeline_for_named(
         &self,
         ggml_type: u32,
@@ -5839,6 +6513,34 @@ pub enum FfnActivation {
 }
 
 pub struct FusedPostAttentionInput<'a> {
+    /// Stop before the feed-forward network, returning the post-attention
+    /// residual `x1` instead of the layer's output.
+    ///
+    /// For handing the FFN to the NPU. This model's decode step spends 298
+    /// ms of its 415 ms in the FFN on the GPU — 7.1 ms a layer — against
+    /// 3.36 ms for the same block on the device
+    /// (`ORANGU_GPU_TIMESTAMPS=1`, and `npu_ort`'s own hardware tests). The
+    /// obstacle was never the arithmetic; it was that decode records every
+    /// layer into one submission, so asking for the FFN alone meant
+    /// declining the fusion for the whole layer and losing far more than it
+    /// gained — measured at 2.39 -> 1.71 tok/s. Stopping here keeps
+    /// attention, `wo` and both norms fused and gives up only the part the
+    /// device is faster at.
+    ///
+    /// The caller pays one submit-and-readback per layer for it, which
+    /// `_scratch_measure_submit_roundtrip` puts at 0.199 ms — 8.2 ms across
+    /// 42 layers, against 157 ms saved.
+    ///
+    /// **Not usable on an architecture with per-layer embeddings.** The PLE
+    /// projection is recorded *after* the feed-forward network in this same
+    /// function, so stopping early skips it too, and skipping it is not an
+    /// error anywhere — the hidden state comes out slightly wrong and the
+    /// model reads as slightly worse. A caller wanting this on Gemma 4 has
+    /// to replicate `ffn_post_norm`, the residual **and** the PLE gate and
+    /// projection on the host; llama, mistral and phi have no PLE and can
+    /// use it as-is. The `debug_assert` below makes the unhandled case loud
+    /// rather than silent.
+    pub stop_at_ffn_norm: bool,
     /// Attention's output, `[n_embd]`.
     pub attn_out: GpuInput<'a>,
     /// `x` from before this sub-layer's residual adds.
@@ -6217,6 +6919,9 @@ pub struct FusedAttnInput<'a> {
 /// weight, the one piece neither of the two chains it wraps already
 /// covered).
 pub struct FusedLayerInput<'a> {
+    /// Stop after `ffn_norm`, leaving the feed-forward network to the
+    /// caller. See [`FusedPostAttentionInput::stop_at_ffn_norm`].
+    pub stop_at_ffn_norm: bool,
     /// This layer's residual-stream input, `[n_embd]` — `Cpu` for the
     /// first layer of a forward pass (the embedding row), `Gpu` for every
     /// later layer when [`VulkanBackend::record_fused_layer`] chains one
@@ -6596,6 +7301,40 @@ impl VulkanBackend {
     /// really the host-side copy, so the split is measured here rather than
     /// inferred from the total. The four `Instant::now` calls are per
     /// readback, not per element.
+    /// A `MAP_READ` staging buffer of exactly `byte_len` bytes, from
+    /// [`Self::readback_pool`] when one is there and freshly created when
+    /// it is not.
+    fn take_readback(&self, byte_len: u64) -> wgpu::Buffer {
+        if let Ok(mut pool) = self.readback_pool.lock()
+            && let Some(buffer) = pool.get_mut(&byte_len).and_then(Vec::pop)
+        {
+            return buffer;
+        }
+        self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server generic readback"),
+            size: byte_len,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Returns an unmapped staging buffer for the next caller of the same
+    /// size.
+    ///
+    /// Bounded, because the sizes are not: a readback happens at every
+    /// shape this engine reads back, and an unbounded pool would keep one
+    /// buffer alive for each. Four per size covers the concurrency a single
+    /// device sees here and drops the rest.
+    fn put_readback(&self, byte_len: u64, buffer: wgpu::Buffer) {
+        const KEPT_PER_SIZE: usize = 4;
+        if let Ok(mut pool) = self.readback_pool.lock() {
+            let kept = pool.entry(byte_len).or_default();
+            if kept.len() < KEPT_PER_SIZE {
+                kept.push(buffer);
+            }
+        }
+    }
+
     fn submit_and_readback_split(
         &self,
         mut encoder: wgpu::CommandEncoder,
@@ -6606,12 +7345,7 @@ impl VulkanBackend {
         const CONTEXT: &str = "reading back a fused layer's output";
         let byte_len = (len_f32 as u64) * 4;
         let t_alloc = TraceClock::start();
-        let readback_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("orangu-server generic readback"),
-            size: byte_len,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let readback_buffer = self.take_readback(byte_len);
         let alloc_ms = t_alloc.ms();
         let t_submit = TraceClock::start();
         encoder.copy_buffer_to_buffer(src, src_offset, &readback_buffer, 0, byte_len);
@@ -6633,6 +7367,8 @@ impl VulkanBackend {
         drop(data);
         readback_buffer.unmap();
         let copy_ms = t_copy.ms();
+        self.put_readback(byte_len, readback_buffer);
+        record_readback_split(byte_len, alloc_ms, submit_ms, wait_ms, copy_ms);
         (
             result,
             ReadbackSplit {
@@ -7195,13 +7931,13 @@ impl VulkanBackend {
             && n_tokens < self.coop_min_n_tokens
             && self.q4_k_dual_pipeline.is_some()
         {
-            return vulkan_shaders::shader_source_reduce_q4k_dual_nibble(n, self.supports_subgroup);
+            return vulkan_shaders::shader_source_reduce_q4k_dual_nibble(n, self.subgroup_reduce);
         }
         if ggml_type == GGML_TYPE_Q6_K
             && n_tokens < self.coop_min_n_tokens
             && self.q6_k_dual_pipeline.is_some()
         {
-            return vulkan_shaders::shader_source_reduce_q6k_dual(n, self.supports_subgroup);
+            return vulkan_shaders::shader_source_reduce_q6k_dual(n, self.subgroup_reduce);
         }
         if self.selects_wide_unroll(ggml_type, n_tokens)
             && let Some(src) =
@@ -8145,6 +8881,28 @@ impl VulkanBackend {
                     [1, 1, 1],
                 )
             });
+        }
+        // Everything below this point is the feed-forward network. A caller
+        // that is running it elsewhere takes `ffn_normed` and stops here —
+        // see `FusedPostAttentionInput::stop_at_ffn_norm`.
+        // A caller that stops here also skips everything below, and the
+        // per-layer-embedding projection is below. Gemma 4 has one, and
+        // dropping it is not an error anywhere — it is a slightly wrong
+        // hidden state that reads as a slightly worse model. Refuse instead.
+        debug_assert!(
+            !(input.stop_at_ffn_norm && input.ple.is_some()),
+            "stop_at_ffn_norm skips the per-layer-embedding projection, which this layer has"
+        );
+        if input.stop_at_ffn_norm {
+            // **`x1`, not `ffn_normed`** — the post-attention residual,
+            // which is what a caller finishing the layer elsewhere actually
+            // needs. It needs both halves: `ffn_normed` to feed the network
+            // and `x1` to add its result back to. Handing back `x1` gives
+            // both, because `ffn_normed` is `rmsnorm(x1)` and that is 2560
+            // elements the host can do itself in nothing flat. Handing back
+            // `ffn_normed` would give only one, and `x1` is not recoverable
+            // from it.
+            return (res.x1.clone(), res.x1_offset);
         }
         // On the non-MMVQ path the gate/up matmuls read `ffn_normed`
         // directly (`res.bg_gate_matmul`/`bg_up_matmul`), so these two copies
@@ -11678,8 +12436,23 @@ impl VulkanBackend {
         // and one destination row, so the two paths differ only in what those
         // are. That is the whole port: a paged step is the same step with a
         // different address.
-        let paged = self
-            .attn_split
+        // **A pool-backed layer forces the split-k path**, whatever
+        // `attn_split` says. Its rows live in the page pool and its mirror
+        // was deliberately left at one row, so the un-split kernel — which
+        // has no block-table binding here — cannot read them at all, and
+        // the `None` arm below would reach `KvLayer::sync_gpu` and panic
+        // with `its mirror holds no rows`. That is the same crash
+        // `attention::gpu_split_decode` had, and a wide prefill chunk is
+        // what made either of them reachable.
+        //
+        // Overriding the operator is safe *because of where the flag comes
+        // from*: `attn_split` is `!ORANGU_NO_ATTN_SPLIT` and nothing else —
+        // the kernel self-check never clears it — so it is a preference for
+        // the classic kernel, not a report that the split one is broken on
+        // this device. Had it been the latter, forcing it would trade a
+        // loud crash for a quiet wrong answer, which is the worse bargain.
+        let pool_backed = cache.is_pool_backed();
+        let paged = (self.attn_split || pool_backed)
             .then(|| cache.paged_fused_refs(&self.queue, write_pos))
             .flatten();
         // All three are aligned sub-ranges of one buffer now; the `Arc`-backed
@@ -11816,7 +12589,11 @@ impl VulkanBackend {
             // decode step that writes them (never read back to the CPU,
             // never persisted across steps), so there's no correctness
             // reason to size them any larger than `ATTN_SPLIT_K` needs.
-            let split = self.attn_split.then(|| {
+            // `paged.is_some()` as well as the flag: the paged bindings are
+            // the split kernel's, so a pool-backed layer needs these
+            // resources even where the operator asked for the classic
+            // kernel. See the note on `paged` above.
+            let split = (self.attn_split || paged.is_some()).then(|| {
                 let partial_ml = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("orangu-server attention split partial m/l"),
                     size: (n_head as u64) * (self.attn_split_k as u64) * 2 * 4,
@@ -12641,6 +13418,7 @@ impl VulkanBackend {
         );
 
         let FusedLayerInput {
+            stop_at_ffn_norm: _,
             x,
             pairing,
             activation,
@@ -12764,6 +13542,7 @@ impl VulkanBackend {
         self.record_fused_post_attention(
             encoder,
             FusedPostAttentionInput {
+                stop_at_ffn_norm: input.stop_at_ffn_norm,
                 activation,
                 attn_out: GpuInput::Gpu(&attn_out_buf, 0),
                 residual: GpuInput::Gpu(&layer_res.x_buf, (layer_res.x_buf_offset / 4) as usize),
@@ -12809,6 +13588,23 @@ impl VulkanBackend {
     /// `record_output_norm`,
     /// `record_full_matmul` for `lm_head`, all chained into **one**
     /// encoder it submits itself via [`Self::submit_and_readback`]).
+    /// [`Self::upload_new`], for the round-trip probe in `tests`.
+    #[cfg(test)]
+    pub(crate) fn upload_for_test(&self, data: &[f32]) -> wgpu::Buffer {
+        self.upload_new(data)
+    }
+
+    /// [`Self::submit_and_readback`], for the round-trip probe in `tests`.
+    #[cfg(test)]
+    pub(crate) fn submit_and_readback_for_test(
+        &self,
+        encoder: wgpu::CommandEncoder,
+        src: &wgpu::Buffer,
+        len_f32: usize,
+    ) -> Vec<f32> {
+        self.submit_and_readback(encoder, src, 0, len_f32)
+    }
+
     pub fn new_encoder(&self, label: &str) -> wgpu::CommandEncoder {
         self.device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
@@ -14266,6 +15062,82 @@ struct FusedResources {
 /// non-`#[ignore]` tests — run against a real Metal device on the macOS CI
 /// runner instead of silently skipping, which is all the coverage the
 /// Metal path would otherwise have.
+/// Serializes GPU work across the whole test binary.
+///
+/// **One shared device was not enough.** [`shared_test_backend`] already
+/// exists because creating several `wgpu::Instance`/`Device` objects at
+/// once intermittently crashed below wgpu. Sharing one device fixed that
+/// and left a second failure behind it: many tests *using* that one device
+/// concurrently — each creating and dropping its own buffers, pipelines and
+/// bind groups — makes this Mali driver fault. The kernel log fills with
+///
+/// ```text
+/// arm-smmu-v3 arm-smmu-v3.0.auto: event 0x07 received:
+/// ```
+///
+/// an SMMU translation fault at IOVA 0, after which the device is lost.
+/// From the test binary that surfaces two ways depending on timing: a
+/// `Result::unwrap()` on `ERROR_DEVICE_LOST`, or a cascade of
+/// `Buffer with 'orangu-server kv cache (k|v)' label is invalid` as every
+/// later test uses resources belonging to a dead device — and, when a
+/// submission was already in flight, a wait on a fence that will never
+/// signal, which is the whole suite appearing to hang with every thread
+/// parked in `futex_wait`.
+///
+/// Measured on a Mali-G720 with `engine::backend`, 299 tests:
+///
+/// | | result |
+/// |---|---|
+/// | `cargo test` default parallelism | hung, or 7-16 failures |
+/// | `--test-threads=1` | 299 passed, three runs, no failures |
+///
+/// Concurrent *use* of one device is not what breaks: the stress test that
+/// hammers this backend from eight threads passes on its own five times out
+/// of five. It is many tests doing *different* work at once, which is why
+/// the server — which allocates once and reuses — does not hit this.
+///
+/// Reentrant, because a test holding this may call a probe helper that
+/// takes it again (`m6_probe`, `decode_matvec_probe`), and a plain mutex
+/// would deadlock rather than serialize.
+#[cfg(test)]
+pub(crate) struct GpuTestLock {
+    /// Held for its `Drop` and never read: releasing it is the whole
+    /// effect. `None` on a reentrant take, where an outer [`GpuTestLock`]
+    /// on this thread already holds the mutex.
+    _guard: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(test)]
+impl Drop for GpuTestLock {
+    fn drop(&mut self) {
+        // The guard is released after this body, which is the order
+        // that matters: the depth must not reach zero while another thread
+        // could still see the lock held.
+        GPU_TEST_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static GPU_TEST_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Takes [`GpuTestLock`] for the rest of the caller's scope.
+#[cfg(test)]
+pub(crate) fn gpu_test_lock() -> GpuTestLock {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let outermost = GPU_TEST_DEPTH.with(|d| {
+        let depth = d.get();
+        d.set(depth + 1);
+        depth == 0
+    });
+    // A poisoned lock means some other GPU test panicked, which is a
+    // reported failure and not a reason to fail every test after it.
+    GpuTestLock {
+        _guard: outermost.then(|| LOCK.lock().unwrap_or_else(|e| e.into_inner())),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn shared_test_backend() -> Option<&'static VulkanBackend> {
     static BACKEND: std::sync::OnceLock<Option<VulkanBackend>> = std::sync::OnceLock::new();

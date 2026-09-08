@@ -113,6 +113,8 @@ pub async fn props(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         // `null` on a backend with no kernel selection to report — see
         // `AppState::gpu_tuning`.
         "gpu": state.gpu_tuning,
+        // `null` on a machine with no NPU — see `npu_tool::npu_props`.
+        "npu": crate::npu_tool::npu_props(),
         "architecture": cfg.architecture,
         "n_ctx": cfg.n_ctx_train,
         "n_vocab": state.engine.tokenizer.vocab_size(),

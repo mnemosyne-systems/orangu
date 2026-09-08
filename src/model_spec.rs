@@ -409,6 +409,12 @@ pub fn resolve_refresh_target(models_dir: &Path, requested: &str) -> Result<Mode
 /// dangling). Empty snapshot/model directories left behind are removed
 /// too, walking up from each deleted path but never past `models_dir`
 /// itself, which is left alone regardless of what remains inside it.
+///
+/// A Hugging Face repo directory whose last model this was goes **whole**,
+/// not just its empty parts: the cache keeps `refs/main` — a file naming
+/// the revision — so `refs/` is never empty and the upward sweep always
+/// stopped one level too low, leaving `models--user--repo/refs/main` on
+/// disk with every model gone.
 pub fn delete_model(models_dir: &Path, group: &ModelGroup) -> Result<()> {
     // Resolve symlinks while they still exist: registry records use the
     // canonical blob path, which cannot be recovered after the snapshot
@@ -418,6 +424,7 @@ pub fn delete_model(models_dir: &Path, group: &ModelGroup) -> Result<()> {
         .iter()
         .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
         .collect();
+    let mut emptied_repos: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
     for path in &group.paths {
         let blob_target = std::fs::symlink_metadata(path)
             .ok()
@@ -455,11 +462,86 @@ pub fn delete_model(models_dir: &Path, group: &ModelGroup) -> Result<()> {
         }
 
         remove_empty_ancestors(path, models_dir);
+        if let Some(root) = hf_repo_root_from_path(path) {
+            emptied_repos.insert(root);
+        }
     }
+
+    // **The repo directory itself, once nothing servable is left in it.**
+    // Sweeping empty ancestors is not enough for a Hugging Face cache: a
+    // repo keeps `refs/main`, a *file* naming the revision, so `refs/` is
+    // never empty, so the repo root is never empty, so deleting the last
+    // model left `models--user--repo/refs/main` behind with every model
+    // gone. Same for `.no_exist/` markers and any partial download.
+    for root in emptied_repos {
+        if root.starts_with(models_dir) && !root_holds_a_model(&root) {
+            // Whole subtree: what remains is cache bookkeeping for models
+            // that are no longer here. A failure is not worth failing the
+            // delete over — the models are gone either way — but it is
+            // worth saying, because the leftovers are invisible otherwise.
+            if let Err(err) = std::fs::remove_dir_all(&root) {
+                eprintln!(
+                    "warning: deleted the models but could not remove {}: {err}",
+                    root.display()
+                );
+            } else {
+                remove_empty_ancestors(&root, models_dir);
+            }
+        }
+    }
+
     if let Err(err) = crate::model_registry::forget(&registry_paths) {
         eprintln!("warning: could not update ~/.orangu/models: {err:#}");
     }
     Ok(())
+}
+
+/// Whether a Hugging Face repo directory still holds something worth
+/// keeping it for: any `.gguf` beneath it that [`scan_models_dir`] would
+/// list as a model.
+///
+/// **The same definition of "a model" the listing uses**, which means an
+/// mmproj sidecar does not count. A multimodal repo keeps its projector
+/// beside the weights, and deleting the model left a repo holding nothing
+/// but a companion file for a model that is no longer there — 815 MiB of
+/// `mmproj-BF16.gguf` under a `models--...--gemma-3-12b-it-GGUF` the
+/// operator had already deleted, listed by nothing and reachable by
+/// nothing.
+///
+/// Walked here rather than delegated to `scan_models_dir` because a
+/// snapshot entry is a symlink and the one just deleted may be gone while a
+/// *sibling* revision still points at a blob that is still there. A
+/// `.gguf` that cannot be opened counts as a model: unreadable is not
+/// absent, and a dangling link is a repo mid-repair rather than a repo to
+/// delete.
+fn root_holds_a_model(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        // Unreadable is not empty. Refusing to delete what cannot be
+        // inspected is the safe direction for a recursive removal.
+        return true;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .map(|t| t.is_dir())
+            .unwrap_or_else(|_| path.is_dir());
+        if is_dir {
+            if root_holds_a_model(&path) {
+                return true;
+            }
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        {
+            match GgufFile::open(&path) {
+                Ok(gguf) if gguf.is_clip_projector() => {}
+                _ => return true,
+            }
+        }
+    }
+    false
 }
 
 /// The Hugging Face hub-cache repo root a path lives under
@@ -2485,10 +2567,22 @@ mod tests {
         // latter would leave a hollowed-out `blobs/` (and the whole repo
         // directory, since it'd still contain that leftover `blobs/`)
         // behind even after the blob itself was reclaimed.
+        //
+        // **`refs/main` is what made this a real bug.** This fixture used
+        // to hold only `blobs/` and `snapshots/`, which both empty out, so
+        // the upward sweep finished the job and the test passed while
+        // `models--user--repo/refs/main` was surviving every delete on a
+        // real machine. A ref is a *file*, so its directory is never empty,
+        // so the sweep stopped one level below the repo root. Anything the
+        // cache keeps beside the models belongs in here.
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("models--org--solo");
         std::fs::create_dir_all(repo.join("blobs")).unwrap();
         std::fs::create_dir_all(repo.join("snapshots/rev1")).unwrap();
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), "0123456789abcdef").unwrap();
+        std::fs::create_dir_all(repo.join(".no_exist/rev1")).unwrap();
+        std::fs::write(repo.join(".no_exist/rev1/config.json"), "").unwrap();
 
         let blob = repo.join("blobs/only");
         write_minimal_gguf(&blob, "llama", None);
@@ -2502,6 +2596,86 @@ mod tests {
 
         assert!(!repo.exists(), "the whole repo directory should be gone");
         assert!(dir.path().exists());
+    }
+
+    /// A repo left holding only a companion projector is a repo holding
+    /// nothing: `scan_models_dir` does not list an mmproj as a model, so
+    /// neither can the check that decides whether a repo is still needed.
+    #[cfg(unix)]
+    #[test]
+    fn delete_model_prunes_a_repo_whose_only_leftover_is_an_mmproj_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("models--org--vision");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/rev1")).unwrap();
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), "0123456789abcdef").unwrap();
+
+        let model_blob = repo.join("blobs/model");
+        write_minimal_gguf(&model_blob, "gemma3", None);
+        std::os::unix::fs::symlink(&model_blob, repo.join("snapshots/rev1/model-Q8_0.gguf"))
+            .unwrap();
+        // `clip` is what `GgufFile::is_clip_projector` keys on, and it is
+        // what a real `mmproj-*.gguf` carries.
+        let proj_blob = repo.join("blobs/proj");
+        write_minimal_gguf(&proj_blob, "clip", None);
+        std::os::unix::fs::symlink(&proj_blob, repo.join("snapshots/rev1/mmproj-BF16.gguf"))
+            .unwrap();
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        assert_eq!(groups.len(), 1, "the projector is not a model of its own");
+
+        delete_model(dir.path(), &groups[0]).unwrap();
+
+        assert!(
+            !repo.exists(),
+            "a repo holding only a projector for a model that is gone should go too"
+        );
+        assert!(dir.path().exists());
+    }
+
+    /// The other half: a repo that still has a model keeps everything.
+    #[cfg(unix)]
+    #[test]
+    fn delete_model_keeps_a_repo_that_still_holds_another_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("models--org--pair");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/rev1")).unwrap();
+        std::fs::create_dir_all(repo.join("refs")).unwrap();
+        std::fs::write(repo.join("refs/main"), "0123456789abcdef").unwrap();
+
+        for (blob_name, link) in [
+            ("blob_q4", "model-Q4_K_M.gguf"),
+            ("blob_q8", "model-Q8_0.gguf"),
+        ] {
+            let blob = repo.join("blobs").join(blob_name);
+            write_minimal_gguf(&blob, "llama", None);
+            std::os::unix::fs::symlink(&blob, repo.join("snapshots/rev1").join(link)).unwrap();
+        }
+
+        let models = scan_models_dir(dir.path()).unwrap();
+        let groups = group_models(&models);
+        assert_eq!(groups.len(), 2, "two quantizations, two rows");
+        let kept = groups
+            .iter()
+            .find(|g| g.label.contains("Q8_0") || g.paths[0].to_string_lossy().contains("Q8_0"))
+            .expect("a Q8_0 row");
+        let going = groups
+            .iter()
+            .find(|g| !std::ptr::eq(*g, kept))
+            .expect("the other row");
+        let survivor = kept.paths[0].clone();
+
+        delete_model(dir.path(), going).unwrap();
+
+        assert!(repo.exists(), "the repo still holds a model");
+        assert!(survivor.exists(), "the other model is untouched");
+        assert!(
+            repo.join("refs/main").exists(),
+            "and so is the cache bookkeeping it needs"
+        );
     }
 
     #[cfg(unix)]

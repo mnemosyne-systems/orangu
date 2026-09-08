@@ -36,6 +36,7 @@ use crate::engine::quant::GGML_TYPE_Q4_K;
 #[test]
 #[ignore]
 fn m6_expert_shaped_matmul_gpu_versus_cpu() {
+    let _gpu_lock = super::gpu_test_lock();
     let Some(gpu) = shared_test_backend() else {
         eprintln!("skipping: no GPU backend");
         return;

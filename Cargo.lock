@@ -3558,6 +3558,7 @@ dependencies = [
  "ignore",
  "infer",
  "libc",
+ "libloading 0.9.0",
  "markdown",
  "memmap2",
  "merman",

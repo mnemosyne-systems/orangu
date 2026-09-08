@@ -78,6 +78,10 @@ pub struct Options {
 /// leaves the child running, so the caller must always finish it — including on
 /// the error path, which is why `finish` takes `self` and reports rather than
 /// panics.
+///
+/// That covers every path a *running* benchmark takes. The one it cannot cover
+/// is the benchmark being killed, where no parent-side code runs at all; the
+/// child is armed with `PR_SET_PDEATHSIG` in [`Recorder::start`] for that.
 pub struct Recorder {
     perf: Child,
     data: PathBuf,
@@ -138,7 +142,8 @@ impl Recorder {
         let stderr_log = sibling(&opts.svg, "perf.log");
         let log = std::fs::File::create(&stderr_log)?;
 
-        let perf = Command::new("perf")
+        let mut command = Command::new("perf");
+        command
             .args(["record", "-F"])
             .arg(opts.freq.to_string())
             .arg("-g")
@@ -150,7 +155,27 @@ impl Recorder {
             .arg(&data)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(log))
+            .stderr(Stdio::from(log));
+        // **`perf` has to die with this process.** `finish` stops it on every
+        // path a *running* benchmark can take, but no parent-side code runs
+        // when the benchmark is itself killed — a Ctrl-C during a long sweep,
+        // or the supervisor above it going away — and the child left behind
+        // goes on sampling.
+        //
+        // How much that matters depends on what is being profiled. `perf
+        // record -p` exits when its target exits, so a profile of a server
+        // this run started dies with that server anyway. The case that leaks
+        // is the ordinary one: `--flamegraph` against a server that was
+        // already running and stays running. There the orphan samples at
+        // `-F <freq>` indefinitely, growing a `perf.data` nobody will read
+        // and taxing the very process the next measurement is about.
+        //
+        // `SIGINT`, not `SIGKILL`, for the reason `finish` gives below:
+        // `perf record` writes its data file while shutting down and a killed
+        // one leaves an unreadable stub.
+        #[cfg(target_os = "linux")]
+        crate::child::die_with_parent(&mut command, libc::SIGINT);
+        let perf = command
             .spawn()
             .map_err(|e| anyhow::anyhow!("could not run `perf record`: {e}"))?;
 

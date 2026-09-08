@@ -429,8 +429,8 @@ impl GlmModel {
         // last scoring layer chose, so the choice is carried down the stack
         // — per token, since each token scores its own history.
         let mut scratch = LayerScratch::default();
-        for layer in &self.layers {
-            self.forward_layer(layer, cache, &mut x, n_tokens, start_pos, &mut scratch)?;
+        for (il, layer) in self.layers.iter().enumerate() {
+            self.forward_layer(il, layer, cache, &mut x, n_tokens, start_pos, &mut scratch)?;
         }
 
         tensor::rmsnorm_inplace(
@@ -443,8 +443,10 @@ impl GlmModel {
         Ok(x)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_layer(
         &self,
+        il: usize,
         layer: &GlmLayer,
         cache: &mut KvCache,
         x: &mut [f32],
@@ -491,7 +493,7 @@ impl GlmModel {
                 up,
                 down,
             ),
-            Ffn::Moe(moe) => *ffn_out = self.moe_ffn(moe, normed, n_tokens),
+            Ffn::Moe(moe) => *ffn_out = self.moe_ffn(moe, normed, n_tokens, il),
         }
         tensor::add_inplace(x, ffn_out);
         Ok(())
@@ -712,7 +714,7 @@ impl GlmModel {
     /// shared with `engine::arch::bailingmoe`, which runs the same
     /// computation over the same tensor names under whatever routing rules
     /// its own file declares.
-    fn moe_ffn(&self, moe: &Moe, normed: &[f32], n_tokens: usize) -> Vec<f32> {
+    fn moe_ffn(&self, moe: &Moe, normed: &[f32], n_tokens: usize, il: usize) -> Vec<f32> {
         super::swiglu_moe_ffn(
             self.backend.as_ref(),
             &self.routing,
@@ -734,6 +736,7 @@ impl GlmModel {
                 clamp_exp: super::SwigluLimit::None,
                 clamp_shexp: super::SwigluLimit::None,
             },
+            il,
         )
     }
 }

@@ -78,6 +78,33 @@ fn read_u8(byte_offset: u32) -> u32 {
     return (word >> shift) & 0xFFu;
 }
 
+// Four consecutive bytes as one `u32`, at any alignment. A block layout is
+// rarely a multiple of 4 (`Q8_0` is 34 bytes, `Q4_0` 18, `Q6_K` 210), so a
+// run of bytes inside a row straddles a word boundary more often than not
+// and `read_u8` is the only reader that needs no alignment at all. That
+// costs a load per byte, and a kernel reading four bytes a lane spends four
+// loads where the data occupies at most two words.
+//
+// Both words are read unconditionally rather than under a branch: `shift`
+// is uniform across the lanes sharing a row (they differ by whole words),
+// so the branch would not diverge, but the second read is in cache either
+// way and a `select` keeps the generated code straight-line. The `& 31u`
+// only exists to keep the shift count in range when `shift` is zero, where
+// the result is discarded.
+fn read_u32_at(byte_offset: u32) -> u32 {
+    let index = byte_offset >> 2u;
+    let shift = (byte_offset & 3u) * 8u;
+    let lo = weights[index] >> shift;
+    let hi = weights[index + 1u] << ((32u - shift) & 31u);
+    return lo | select(hi, 0u, shift == 0u);
+}
+
+// Two consecutive bytes as one `u32` — a block's `f16` scale, in one load
+// when it does not straddle a word and two when it does.
+fn read_u16_at(byte_offset: u32) -> u32 {
+    return read_u32_at(byte_offset) & 0xFFFFu;
+}
+
 // IEEE 754 binary16 -> f32: `unpack2x16float` is a core WGSL builtin that
 // does the exact conversion in hardware, so this delegates to it rather
 // than hand-rolling the exponent/mantissa math — bit-for-bit the same
@@ -2442,22 +2469,19 @@ const BLOCK_BYTES: u32 = 34u;
 const BLOCK_ELEMS: u32 = 32u;
 const LANES_PER_BLOCK: u32 = 8u;
 fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
-    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
-    var acc: f32 = 0.0;
-    var m: u32 = 0u;
-    loop {
-        if (m >= 4u) {
-            break;
-        }
-        let j = sub * 4u + m;
-        var v: i32 = i32(read_u8(byte_offset + 2u + j));
-        if (v >= 128) {
-            v = v - 256;
-        }
-        acc = acc + (f32(v) * d) * x[x_off + j];
-        m = m + 1u;
-    }
-    return acc;
+    let d = f16_to_f32(read_u16_at(byte_offset));
+    let j = sub * 4u;
+    // This lane's four weights are four *consecutive* bytes, so they are one
+    // unaligned word rather than four byte reads — `read_u32_at`. Sign
+    // extension is the same fold `Q8_0_COOP_MIDDLE` does, arranged as a
+    // vector so the four multiplies are one `dot`: a byte `b` stands for
+    // `b - 256` once it is above 127, which is `(b ^ 0x80) - 128` without a
+    // comparison.
+    let packed = read_u32_at(byte_offset + 2u + j);
+    let bytes = vec4<u32>(packed, packed >> 8u, packed >> 16u, packed >> 24u) & vec4<u32>(0xFFu);
+    let w = vec4<f32>(bytes ^ vec4<u32>(0x80u)) - vec4<f32>(128.0);
+    let xs = vec4<f32>(x[x_off + j], x[x_off + j + 1u], x[x_off + j + 2u], x[x_off + j + 3u]);
+    return dot(w * d, xs);
 }
 "#;
 

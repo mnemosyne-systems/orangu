@@ -1090,7 +1090,7 @@ impl Qwen4ExpModel {
             }
         }
 
-        for layer in &self.layers {
+        for (il, layer) in self.layers.iter().enumerate() {
             if let (Some(ple), Some(layer_ple)) = (self.ple.as_ref(), layer.ple.as_ref()) {
                 self.forward_ple(ple, layer_ple, cache, &mut x, tokens);
             }
@@ -1128,7 +1128,7 @@ impl Qwen4ExpModel {
                 use qwen_hybrid::HybridFfn as _;
                 layer
                     .ffn
-                    .forward(self.backend.as_ref(), n_embd, &cur, n_tokens)
+                    .forward(self.backend.as_ref(), n_embd, &cur, n_tokens, il)
             };
             self.hc_combine(&mut x, &ffn_out, &inject, n_tokens);
         }

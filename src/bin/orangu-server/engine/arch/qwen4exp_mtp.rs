@@ -362,7 +362,15 @@ impl MtpHead for Qwen4ExpMtpHead {
         let inject = inject.expect("a block mixer always carries its injection weights");
         let ffn_out = self
             .ffn
-            .forward(self.backend.as_ref(), n_embd, &cur, n_tokens);
+            // The draft head is not one of the model's layers: no compiled
+            // block, and its activations are not a layer's to calibrate on.
+            .forward(
+                self.backend.as_ref(),
+                n_embd,
+                &cur,
+                n_tokens,
+                crate::engine::NOT_A_MODEL_LAYER,
+            );
         qwen4exp::hc_combine(n_embd, self.hc, &mut x, &ffn_out, &inject, n_tokens);
 
         let hc_dim = self.hc * n_embd;

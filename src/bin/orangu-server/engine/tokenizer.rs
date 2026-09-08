@@ -1322,6 +1322,59 @@ fn split_newline_runs(text: &str) -> Vec<&str> {
 /// upstream source rather than guessed) — see [`Tokenizer::
 /// clean_up_tokenization_spaces`] for what and why.
 fn clean_spaces_postprocess(text: &str) -> String {
+    // **Prose only, and never a line's indentation.** Upstream runs this
+    // over a whole detokenized string, which is right for the artifact it
+    // repairs (`word .` from a tokenizer that split the punctuation off)
+    // and wrong for everything else in a chat answer. Two exclusions, both
+    // from output this served:
+    //
+    // - *Inside a fenced code block.* The pass rewrites code: `foo (a , b)`
+    //   becomes `foo (a, b)`, and a Python `[1 , 2]` becomes `[1, 2]`. It
+    //   is repairing a tokenizer artifact that code does not have.
+    // - *A line's leading spaces.* "Drop the space before `.`" eats
+    //   indentation whenever the first thing on a line is punctuation.
+    //   gemma 4 E2B ends a doubly-linked-list answer with `  ./dll` inside
+    //   a three-space fence; this pass turned it into ` ./dll`, one space
+    //   short of where it already was, and an under-indented body line
+    //   breaks its code block out of the list item it lives in.
+    //
+    // Applied per line, so the passes below see prose and only prose.
+    let mut out = String::with_capacity(text.len());
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let indent = body.len() - body.trim_start_matches(' ').len();
+        let rest = &body[indent..];
+        let marker = (indent <= 3)
+            .then(|| rest.chars().next().filter(|c| *c == '`' || *c == '~'))
+            .flatten()
+            .map(|c| (c, rest.chars().take_while(|x| *x == c).count()))
+            .filter(|(_, len)| *len >= 3);
+        match (fence, marker) {
+            (Some((open_c, open_len)), Some((c, len)))
+                if c == open_c && len >= open_len && rest[len..].trim().is_empty() =>
+            {
+                fence = None;
+                out.push_str(line);
+            }
+            (None, Some((c, len))) => {
+                fence = Some((c, len));
+                out.push_str(line);
+            }
+            // Inside a block: code, left exactly as the model wrote it.
+            (Some(_), _) => out.push_str(line),
+            // Prose: the indentation is structure, the rest is text.
+            (None, None) => {
+                out.push_str(&line[..indent]);
+                out.push_str(&clean_spaces_in_prose(&line[indent..]));
+            }
+        }
+    }
+    out
+}
+
+/// The three upstream passes, over one line of prose.
+fn clean_spaces_in_prose(text: &str) -> String {
     let mut chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
         return text.to_string();
@@ -2019,6 +2072,31 @@ mod tests {
     /// cleanup pass — real upstream `llama.cpp` sets `clean_spaces = false`
     /// for `LLAMA_VOCAB_TYPE_SPM` specifically (confirmed directly against
     /// `src/llama-vocab.cpp`), unlike the `"gemma4"` BPE variant.
+    /// The space cleanup repairs prose and must not touch code or
+    /// indentation — both of which it used to rewrite.
+    #[test]
+    fn clean_up_tokenization_spaces_leaves_code_and_indentation_alone() {
+        let gguf = build_gemma4_gguf(&["a", "b"], &[]);
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+
+        // Verbatim from gemma 4 E2B: a three-space fence with a two-space
+        // body. Dropping "the space before `.`" ate one of those two and
+        // broke the block out of its list item in the console.
+        let answer = "3. Run the executable:\n   ```bash\n  ./dll\n   ```\n";
+        assert_eq!(tok.clean_up_tokenization_spaces(answer), answer);
+
+        // Code is not prose: this pass exists for a tokenizer artifact that
+        // code does not have.
+        let code = "```c\nfoo (a , b) ;\n```\n";
+        assert_eq!(tok.clean_up_tokenization_spaces(code), code);
+
+        // Prose is still repaired, indentation included but untouched.
+        assert_eq!(
+            tok.clean_up_tokenization_spaces("  a word , and one more .\n"),
+            "  a word, and one more.\n"
+        );
+    }
+
     #[test]
     fn clean_up_tokenization_spaces_is_a_no_op_for_spm_unigram() {
         let gguf = build_spm_gguf(&["a"], &[0.0], Some(false));

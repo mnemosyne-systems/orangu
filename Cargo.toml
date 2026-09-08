@@ -132,6 +132,10 @@ ratatui = "0.30.2"
 ansi-to-tui = "8.0.1"
 unicode-width = "0.2.2"
 if-addrs = "0.15.0"
+# `dlopen` for the NPU inventory probe in `npu`: the vendor NOE driver ships
+# with a board BSP, lives off the default loader path, and is absent from
+# nearly every machine, so it is resolved at runtime rather than linked.
+libloading = "0.9"
 
 [features]
 rocm = ["dep:cubecl-hip-sys"]

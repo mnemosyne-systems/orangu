@@ -451,8 +451,8 @@ impl Glm5Model {
         let mut x = self.hyper.seed(&embeddings, n_tokens);
 
         let mut scratch = Scratch::default();
-        for layer in &self.layers {
-            self.forward_layer(layer, cache, &mut x, n_tokens, start_pos, &mut scratch)?;
+        for (il, layer) in self.layers.iter().enumerate() {
+            self.forward_layer(il, layer, cache, &mut x, n_tokens, start_pos, &mut scratch)?;
         }
 
         let mut out = Vec::new();
@@ -467,8 +467,10 @@ impl Glm5Model {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_layer(
         &self,
+        il: usize,
         layer: &Layer,
         cache: &mut KvCache,
         x: &mut [f32],
@@ -607,6 +609,7 @@ impl Glm5Model {
                         clamp_exp: layer.clamp_exp,
                         clamp_shexp: layer.clamp_shexp,
                     },
+                    il,
                 )
             }
         }

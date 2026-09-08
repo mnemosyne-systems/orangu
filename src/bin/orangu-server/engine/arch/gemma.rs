@@ -180,7 +180,14 @@ struct GemmaLayer {
     wk: Option<QuantMatrix>,
     wv: Option<QuantMatrix>,
     wo: QuantMatrix,
-    attn_q_norm: Vec<f32>,
+    /// QK-norm on the query, when the checkpoint has it.
+    ///
+    /// `None` for gemma 2, which predates QK-norm. gemma 3 and 4 both carry
+    /// it, and requiring it unconditionally is what stopped every gemma 2
+    /// checkpoint from loading at all: `list` reported the architecture
+    /// supported and the server then failed with `model is missing tensor
+    /// 'blk.0.attn_q_norm.weight'`.
+    attn_q_norm: Option<Vec<f32>>,
     attn_k_norm: Option<Vec<f32>>,
     attn_post_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
@@ -281,6 +288,31 @@ impl GemmaModel {
         // layer with this still `0` is rejected after the layer loop below.
         let n_expert_used = loaded.metadata_u64("expert_used_count").unwrap_or(0) as usize;
         let final_logit_softcapping = loaded.metadata_f32("final_logit_softcapping");
+
+        // gemma 2 caps the *attention* logits inside every layer, at 50,
+        // and gemma 3 and 4 dropped that in favour of QK-norm. This module
+        // reads all three and implements only the final-logit cap above, so
+        // a gemma 2 checkpoint runs its attention uncapped and generates
+        // fluent-looking nonsense.
+        //
+        // Said here rather than left to the output, because the two are not
+        // distinguishable by looking: gemma-2-2b-it answers a question about
+        // hash tables with `sweetsweetssss* 1999999...`. Making
+        // `attn_q_norm` and `attn_k_norm` optional got this architecture as
+        // far as loading and running — the fields were already `Option` and
+        // the code asserted they were `Some`, which was wrong on its own
+        // terms — but capping attention logits is a change to both attention
+        // kernels and is not done.
+        if let Some(cap) = loaded.metadata_f32("attn_logit_softcapping")
+            && cap > 0.0
+        {
+            anyhow::bail!(
+                "this checkpoint caps its attention logits at {cap} and that is not \
+implemented here — gemma 2 needs it and gemma 3 and 4 do not. The model would load \
+and generate nonsense rather than fail, so it is refused instead. Use a gemma 3 or \
+gemma 4 checkpoint."
+            );
+        }
         let n_embd_per_layer = loaded
             .metadata_u64("embedding_length_per_layer_input")
             .unwrap_or(0) as usize;
@@ -303,16 +335,35 @@ impl GemmaModel {
             .metadata_array_u64("attention.sliding_window_pattern")
             .map(|arr| arr.iter().map(|&v| v != 0).collect())
             .unwrap_or_else(|| {
-                if is_embedding_arch {
-                    // Upstream `llama.cpp`'s `src/models/gemma-embedding.cpp`
-                    // hardcodes a period-6 SWA pattern (`swa_period = 6`)
-                    // when this key is absent from the file — which it
-                    // always is for `embeddinggemma-300M` (confirmed
-                    // directly against the real GGUF's metadata dump: no
-                    // `attention.sliding_window_pattern` key at all). Every
-                    // 6th layer (last of each group of 6) is full attention,
-                    // the rest SWA — `llama_hparams::set_swa_pattern`'s own
-                    // formula, `dense_first = false`.
+                if is_embedding_arch || config.architecture == "gemma3" {
+                    // Upstream `llama.cpp` hardcodes a period-6 SWA pattern
+                    // (`set_swa_pattern(6)`, `dense_first = false`) for both
+                    // of these when the key is absent from the file — which
+                    // it always is. Every 6th layer (the last of each group
+                    // of 6) is full attention, the rest sliding-window.
+                    //
+                    // **This was `false` for every layer of gemma 3**,
+                    // which cannot be right: those files carry
+                    // `attention.sliding_window` (512 for 1B, 1024 for 4B)
+                    // and all-dense makes that key dead. It also decides
+                    // the RoPE base per layer — a gemma 3 file has
+                    // `rope.freq_base = 1000000` and no `..._swa`, so
+                    // all-dense rotated every layer at the global base
+                    // where five in six want 10000.
+                    //
+                    // **It does not fix gemma 3**, which still answers in
+                    // word salad on the CPU backend at both sizes. The
+                    // output changes, so the pattern is reaching the
+                    // attention, and something else is also wrong. This
+                    // stays because it matches upstream and the previous
+                    // value contradicted the file, not because it was
+                    // measured to help.
+                    //
+                    // Gemma 4 is untouched by this default: its files carry
+                    // the pattern explicitly, and a *period-5* one
+                    // (`[true, true, true, true, false, ...]`), which is
+                    // exactly why the fallback cannot be shared blindly
+                    // across the family.
                     (0..n_layer).map(|il| il % 6 < 5).collect()
                 } else {
                     vec![false; n_layer]
@@ -509,7 +560,7 @@ impl GemmaModel {
                     None
                 },
                 wo: get_matrix("attn_output.weight")?,
-                attn_q_norm: get("attn_q_norm.weight")?,
+                attn_q_norm: get_optional("attn_q_norm.weight")?,
                 attn_k_norm: if has_kv {
                     get_optional("attn_k_norm.weight")?
                 } else {
@@ -921,17 +972,12 @@ impl GemmaModel {
                     .wk
                     .as_ref()
                     .expect("layer has_kv but no attn_k.weight"),
-                // gemma always has a per-head K norm; `Some` states that
-                // rather than relying on the field's old non-optional type.
-                // gemma has no projection biases.
+                // gemma 3 and 4 have a per-head K norm and gemma 2 does
+                // not, so `has_kv` does not imply one. gemma has no
+                // projection biases.
                 k_bias: None,
                 v_bias: None,
-                k_norm: Some(
-                    layer
-                        .attn_k_norm
-                        .as_ref()
-                        .expect("layer has_kv but no attn_k_norm"),
-                ),
+                k_norm: layer.attn_k_norm.as_deref(),
                 wv: layer.wv.as_ref(),
             });
             // `il`'s per-layer-embedding slice, read straight out of
@@ -967,6 +1013,7 @@ impl GemmaModel {
             let out = vulkan.record_fused_layer(
                 encoder,
                 FusedLayerInput {
+                    stop_at_ffn_norm: false,
                     q_bias: None,
                     // gemma normalizes V per head, weightlessly — the third
                     // convention, which the decode chain used to assume.
@@ -978,7 +1025,7 @@ impl GemmaModel {
                     x: x_input,
                     attn_norm: &layer.attn_norm,
                     wq: &layer.wq,
-                    q_norm: Some(&layer.attn_q_norm),
+                    q_norm: layer.attn_q_norm.as_deref(),
                     kv,
                     n_head: self.n_head,
                     n_head_kv: layer.n_head_kv,
@@ -1175,17 +1222,12 @@ impl GemmaModel {
                             n_tokens,
                             start_pos,
                             wq: &layer.wq,
-                            q_norm: Some(&layer.attn_q_norm),
+                            q_norm: layer.attn_q_norm.as_deref(),
                             kv: wk.map(|wk| crate::engine::backend::vulkan::FusedAttnPrefillKv {
                                 k_bias: None,
                                 v_bias: None,
                                 wk,
-                                k_norm: Some(
-                                    layer
-                                        .attn_k_norm
-                                        .as_ref()
-                                        .expect("layer has_kv but no attn_k_norm"),
-                                ),
+                                k_norm: layer.attn_k_norm.as_deref(),
                                 wv: owns_v.then(|| layer.wv.as_ref().unwrap()),
                             }),
                             n_head: self.n_head,
@@ -1251,13 +1293,9 @@ impl GemmaModel {
                     );
                 }
                 let mut q = results.next().unwrap();
-                tensor::rmsnorm_inplace(
-                    &mut q,
-                    &layer.attn_q_norm,
-                    n_tokens * self.n_head,
-                    head_dim,
-                    eps,
-                );
+                if let Some(q_norm) = &layer.attn_q_norm {
+                    tensor::rmsnorm_inplace(&mut q, q_norm, n_tokens * self.n_head, head_dim, eps);
+                }
                 // Each token's RoPE touches only its own row and depends only on
                 // its own position, so this parallelises across tokens exactly the
                 // way the attention loop below does — and at prefill widths it is
@@ -1280,16 +1318,15 @@ impl GemmaModel {
                 if layer.has_kv {
                     let kv_dim = layer.n_head_kv * head_dim;
                     let mut k = results.next().unwrap();
-                    tensor::rmsnorm_inplace(
-                        &mut k,
-                        layer
-                            .attn_k_norm
-                            .as_ref()
-                            .context("layer has_kv but no attn_k_norm")?,
-                        n_tokens * layer.n_head_kv,
-                        head_dim,
-                        eps,
-                    );
+                    if let Some(k_norm) = layer.attn_k_norm.as_ref() {
+                        tensor::rmsnorm_inplace(
+                            &mut k,
+                            k_norm,
+                            n_tokens * layer.n_head_kv,
+                            head_dim,
+                            eps,
+                        );
+                    }
                     let mut v = if owns_v {
                         results.next().unwrap()
                     } else {
@@ -1372,7 +1409,20 @@ impl GemmaModel {
             // per token on the CPU, so its FFN can't be recorded ahead of
             // time, and it takes the step-by-step path below.
             let t0 = Instant::now();
-            let fused_layer = if layer.moe.is_none() {
+            // Declined when the NPU holds this block, for the same reason the
+            // inner `fused_ffn_prefill` below is: this fusion swallows the
+            // FFN, so taking it means the device is never asked. Both had to
+            // be handled — patching only the inner one left the hook in a
+            // branch that is not taken whenever a GPU is present, which is
+            // why `NpuFfn` reports the first block it actually runs rather
+            // than only the ones it loaded.
+            let ffn_on_npu = orangu::npu_ffn::service().is_some_and(|npu| npu.has(il, n_tokens));
+            // A run capturing activations declines it too: this chain never
+            // forms `ffn_normed` on the host, so there would be nothing to
+            // capture — the same reason `LlamaModel::run_layers` declines
+            // its own.
+            let capturing = crate::engine::dump_ffn_dir().is_some();
+            let fused_layer = if layer.moe.is_none() && !ffn_on_npu && !capturing {
                 self.backend
                     .as_wgpu_on(layer.wo.device())
                     .and_then(|vulkan| {
@@ -1470,18 +1520,31 @@ impl GemmaModel {
                     // for `ORANGU_Q4K_MMVQ`, which needs a quantize pass the fused
                     // recorder doesn't emit.
                     let t0 = Instant::now();
-                    let fused = self
-                        .backend
-                        .as_wgpu_on(layer.wo.device())
-                        .and_then(|vulkan| {
-                            vulkan.fused_ffn_prefill(
-                                &ffn_normed,
-                                n_tokens,
-                                &layer.ffn_gate,
-                                &layer.ffn_up,
-                                &layer.ffn_down,
-                            )
-                        });
+                    // The NPU takes this block when it has one compiled for
+                    // exactly this width, ahead of the GPU's fused path —
+                    // measured at 8.04 ms against the CPU's 13.29 ms for a
+                    // 16-token block of this model. Declining the fusion
+                    // here is what routes the work to the `else` arm below,
+                    // where the device is actually asked; if it then fails,
+                    // that arm computes the block the ordinary way.
+                    crate::engine::dump_ffn_input(il, n_tokens, &ffn_normed);
+                    let on_npu =
+                        orangu::npu_ffn::service().is_some_and(|npu| npu.has(il, n_tokens));
+                    let fused = if on_npu {
+                        None
+                    } else {
+                        self.backend
+                            .as_wgpu_on(layer.wo.device())
+                            .and_then(|vulkan| {
+                                vulkan.fused_ffn_prefill(
+                                    &ffn_normed,
+                                    n_tokens,
+                                    &layer.ffn_gate,
+                                    &layer.ffn_up,
+                                    &layer.ffn_down,
+                                )
+                            })
+                    };
                     if let Some(mut ffn_out) = fused {
                         if prefill_trace {
                             eprintln!(
@@ -1499,43 +1562,54 @@ impl GemmaModel {
                         );
                         tensor::add_inplace(&mut x, &ffn_out);
                     } else {
-                        self.backend.matmul_batch_into(
-                            &mut gate_up_scratch,
-                            &[
-                                MatmulOp {
-                                    x: &ffn_normed,
-                                    n_tokens,
-                                    w: &layer.ffn_gate,
-                                },
-                                MatmulOp {
-                                    x: &ffn_normed,
-                                    n_tokens,
-                                    w: &layer.ffn_up,
-                                },
-                            ],
-                        );
-                        if prefill_trace {
-                            eprintln!(
-                                "orangu-server: [prefill-trace] layer {il} gate_up_matmul_batch \
-                         n_tokens={n_tokens}: {:.1}ms",
-                                t0.elapsed().as_secs_f64() * 1000.0
+                        // The NPU, when this model's block was compiled for
+                        // exactly this width. It runs the three projections
+                        // and applies the activation on the host — see
+                        // `orangu::npu_ffn`. Anything it does not have, or
+                        // any failure, falls through to the backend below
+                        // with the same result, only slower.
+                        let from_npu = orangu::npu_ffn::service().is_some_and(|npu| {
+                            npu.forward_into(il, n_tokens, &ffn_normed, &mut ffn_out)
+                        });
+                        if !from_npu {
+                            self.backend.matmul_batch_into(
+                                &mut gate_up_scratch,
+                                &[
+                                    MatmulOp {
+                                        x: &ffn_normed,
+                                        n_tokens,
+                                        w: &layer.ffn_gate,
+                                    },
+                                    MatmulOp {
+                                        x: &ffn_normed,
+                                        n_tokens,
+                                        w: &layer.ffn_up,
+                                    },
+                                ],
                             );
-                        }
-                        // Borrowed in dispatch order rather than popped, so
-                        // the buffers stay in the scratch for the next layer.
-                        let (gate, up) = gate_up_scratch.split_at_mut(1);
-                        let gate = &mut gate[0];
-                        tensor::gelu_inplace(gate);
-                        tensor::mul_inplace(gate, &up[0]);
-                        let t0 = Instant::now();
-                        self.backend
-                            .matmul_into(&mut ffn_out, gate, n_tokens, &layer.ffn_down);
-                        if prefill_trace {
-                            eprintln!(
-                                "orangu-server: [prefill-trace] layer {il} ffn_down_matmul \
+                            if prefill_trace {
+                                eprintln!(
+                                    "orangu-server: [prefill-trace] layer {il} gate_up_matmul_batch \
                          n_tokens={n_tokens}: {:.1}ms",
-                                t0.elapsed().as_secs_f64() * 1000.0
-                            );
+                                    t0.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
+                            // Borrowed in dispatch order rather than popped, so
+                            // the buffers stay in the scratch for the next layer.
+                            let (gate, up) = gate_up_scratch.split_at_mut(1);
+                            let gate = &mut gate[0];
+                            tensor::gelu_inplace(gate);
+                            tensor::mul_inplace(gate, &up[0]);
+                            let t0 = Instant::now();
+                            self.backend
+                                .matmul_into(&mut ffn_out, gate, n_tokens, &layer.ffn_down);
+                            if prefill_trace {
+                                eprintln!(
+                                    "orangu-server: [prefill-trace] layer {il} ffn_down_matmul \
+                         n_tokens={n_tokens}: {:.1}ms",
+                                    t0.elapsed().as_secs_f64() * 1000.0
+                                );
+                            }
                         }
                         tensor::rmsnorm_inplace(
                             &mut ffn_out,
@@ -2045,9 +2119,7 @@ impl ModelForward for GemmaModel {
             self.backend.matmul(last, 1, &self.output_weight)
         };
         if let Some(cap) = self.final_logit_softcapping {
-            for v in logits.iter_mut() {
-                *v = (*v / cap).tanh() * cap;
-            }
+            tensor::softcap_inplace(&mut logits, cap);
         }
         if let Some(before) = submissions_before
             && let Some(vulkan) = self.backend.as_wgpu_on(0)
@@ -2109,9 +2181,7 @@ impl ModelForward for GemmaModel {
         for t in 0..n_tokens {
             let mut row = flat[t * n_vocab..(t + 1) * n_vocab].to_vec();
             if let Some(cap) = self.final_logit_softcapping {
-                for v in row.iter_mut() {
-                    *v = (*v / cap).tanh() * cap;
-                }
+                tensor::softcap_inplace(&mut row, cap);
             }
             out.push(row);
         }

@@ -363,6 +363,7 @@ async fn system_report(State(state): State<Arc<WebState>>) -> impl IntoResponse 
     let os = orangu::os::detect();
     let cpu = orangu::hardware::detect_cpu();
     let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
+    let npu = orangu::npu::detect_npu();
     let mut report = format!(
         "orangu-server {}\nModel        {}\nArchitecture {}\nBackend      {}\nWorkspace    {}\n\n",
         state.version,
@@ -372,7 +373,13 @@ async fn system_report(State(state): State<Arc<WebState>>) -> impl IntoResponse 
         state.workspace.display(),
     );
     let power = orangu::hardware::detect_power();
-    report.push_str(&orangu::hardware::format_report(&os, &cpu, &gpus, &power));
+    report.push_str(&orangu::hardware::format_report(
+        &os,
+        &cpu,
+        &gpus,
+        npu.as_ref(),
+        &power,
+    ));
     (
         StatusCode::OK,
         [

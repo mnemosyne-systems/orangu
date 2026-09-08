@@ -853,10 +853,13 @@ pub fn l2_norm_inplace(x: &mut [f32], eps: f32) {
 /// ggml's own `ggml_gelu_f32` formula exactly (`ggml-cpu/vec.h`), not the
 /// erf-exact variant.
 pub fn gelu(x: f32) -> f32 {
-    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
-    const GELU_COEF_A: f32 = 0.044715;
     0.5 * x * (1.0 + (SQRT_2_OVER_PI * x * (1.0 + GELU_COEF_A * x * x)).tanh())
 }
+
+/// `sqrt(2/pi)`, and the cubic's coefficient — ggml's own values. Module
+/// scope so [`gelu`] and its vector twin cannot drift apart.
+const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+const GELU_COEF_A: f32 = 0.044715;
 
 /// Which two elements of a head RoPE rotates together — llama.cpp's own
 /// `LLAMA_ROPE_TYPE_NEOX` vs `LLAMA_ROPE_TYPE_NORM`, chosen **per
@@ -1266,15 +1269,150 @@ pub fn mul_inplace(a: &mut [f32], b: &[f32]) {
     }
 }
 
+/// `x -> cap * tanh(x / cap)`, in place — Gemma's final logit softcap.
+///
+/// Applied to the **whole logits vector every token**, and Gemma 4's vocab
+/// is 262144, so this is a quarter of a million transcendentals per
+/// generated token. Profiling a web-console generation put 13% of decode CPU
+/// in `tanhf32` and `expm1f32`, all of it here.
+///
+/// `tanh(t)` is written `1 - 2/(e^{2t} + 1)` so the vector path needs one
+/// exponential rather than a library call per element.
+pub fn softcap_inplace(x: &mut [f32], cap: f32) {
+    if x.len() >= PAR_ELEMS_THRESHOLD {
+        x.par_chunks_mut(PAR_ELEMS_THRESHOLD)
+            .for_each(|chunk| softcap_slice(chunk, cap));
+    } else {
+        softcap_slice(x, cap);
+    }
+}
+
+fn softcap_slice(x: &mut [f32], cap: f32) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64, and the helper reads and writes
+    // only within `x`.
+    unsafe {
+        softcap_neon(x, cap)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    for v in x.iter_mut() {
+        *v = (*v / cap).tanh() * cap;
+    }
+}
+
+/// [`softcap_slice`] on NEON.
+#[cfg(target_arch = "aarch64")]
+unsafe fn softcap_neon(x: &mut [f32], cap: f32) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let inv = 1.0 / cap;
+        let n = x.len();
+        let mut i = 0;
+        while i + 4 <= n {
+            let v = vld1q_f32(x.as_ptr().add(i));
+            let t = vmulq_n_f32(v, inv);
+            let e = exp_neon(vaddq_f32(t, t));
+            let tanh = vsubq_f32(
+                vdupq_n_f32(1.0),
+                vdivq_f32(vdupq_n_f32(2.0), vaddq_f32(e, vdupq_n_f32(1.0))),
+            );
+            vst1q_f32(x.as_mut_ptr().add(i), vmulq_n_f32(tanh, cap));
+            i += 4;
+        }
+        for v in x[i..].iter_mut() {
+            *v = (*v / cap).tanh() * cap;
+        }
+    }
+}
+
 /// Elementwise in-place GELU (tanh approximation) — the FFN gate activation.
 /// Parallelised above `PAR_ELEMS_THRESHOLD` (prefill applies it to the whole
 /// `n_tokens × ffn_len` gate buffer, the single largest CPU-elementwise cost
 /// there — each element an independent transcendental).
 pub fn gelu_inplace(x: &mut [f32]) {
     if x.len() >= PAR_ELEMS_THRESHOLD {
-        x.par_iter_mut().for_each(|v| *v = gelu(*v));
+        x.par_chunks_mut(PAR_ELEMS_THRESHOLD).for_each(gelu_slice);
     } else {
-        for v in x.iter_mut() {
+        gelu_slice(x);
+    }
+}
+
+/// [`gelu_inplace`] over one contiguous run, vectorised where the hardware
+/// has it.
+///
+/// Worth vectorising because it is not a small cost: profiling a web-console
+/// generation put **12.6% of decode CPU** in `tanhf32` and `expm1f32`
+/// beneath this function — more than any single piece of the model's own
+/// arithmetic outside the matmuls. Every element is an independent
+/// transcendental, so it is exactly the shape a vector unit wants.
+fn gelu_slice(x: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64, and the helper reads and writes
+    // only within `x`.
+    unsafe {
+        gelu_neon(x)
+    };
+    #[cfg(not(target_arch = "aarch64"))]
+    for v in x.iter_mut() {
+        *v = gelu(*v);
+    }
+}
+
+/// `e^x` for four lanes: range reduction to `x = n*ln2 + r`, a degree-5
+/// polynomial for `e^r`, and `2^n` folded in through the exponent field.
+///
+/// Clamped so an input far outside the range this ever sees cannot overflow
+/// the exponent arithmetic into a `NaN`. `tanh` saturates long before the
+/// clamp bites, so the bound costs nothing real.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0)), vdupq_n_f32(88.0));
+        let n = vrndnq_f32(vmulq_n_f32(x, std::f32::consts::LOG2_E));
+        let r = vfmaq_n_f32(x, n, -0.693_359_4);
+        let r = vfmaq_n_f32(r, n, 2.121_944_4e-4);
+        let mut p = vfmaq_n_f32(vdupq_n_f32(1.0 / 24.0), r, 1.0 / 120.0);
+        p = vfmaq_f32(vdupq_n_f32(1.0 / 6.0), r, p);
+        p = vfmaq_f32(vdupq_n_f32(0.5), r, p);
+        p = vfmaq_f32(vdupq_n_f32(1.0), r, p);
+        p = vfmaq_f32(vdupq_n_f32(1.0), r, p);
+        let scale = vreinterpretq_f32_s32(vshlq_n_s32(
+            vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127)),
+            23,
+        ));
+        vmulq_f32(p, scale)
+    }
+}
+
+/// [`gelu_slice`] on NEON.
+///
+/// The same tanh approximation [`gelu`] spells, with `tanh(t)` written as
+/// `1 - 2/(e^{2t} + 1)` so it needs one exponential rather than a library
+/// call per element.
+#[cfg(target_arch = "aarch64")]
+unsafe fn gelu_neon(x: &mut [f32]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let n = x.len();
+        let mut i = 0;
+        while i + 4 <= n {
+            let v = vld1q_f32(x.as_ptr().add(i));
+            // `t = sqrt(2/pi) * v * (1 + A v^2)`
+            let vv = vmulq_f32(v, v);
+            let inner = vfmaq_n_f32(vdupq_n_f32(1.0), vv, GELU_COEF_A);
+            let t = vmulq_f32(vmulq_n_f32(v, SQRT_2_OVER_PI), inner);
+            let e = exp_neon(vaddq_f32(t, t));
+            let tanh = vsubq_f32(
+                vdupq_n_f32(1.0),
+                vdivq_f32(vdupq_n_f32(2.0), vaddq_f32(e, vdupq_n_f32(1.0))),
+            );
+            let out = vmulq_f32(vmulq_n_f32(v, 0.5), vaddq_f32(vdupq_n_f32(1.0), tanh));
+            vst1q_f32(x.as_mut_ptr().add(i), out);
+            i += 4;
+        }
+        for v in x[i..].iter_mut() {
             *v = gelu(*v);
         }
     }
@@ -1283,6 +1421,86 @@ pub fn gelu_inplace(x: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The vector softcap against the scalar form it replaces.
+    ///
+    /// A length that is not a multiple of four so the tail is covered, and a
+    /// range that reaches both saturated ends of `tanh` — real logits go well
+    /// past the cap in both directions, which is the whole point of capping
+    /// them.
+    #[test]
+    fn softcap_matches_the_scalar_form() {
+        let cap = 30.0f32;
+        let values: Vec<f32> = (0..1023).map(|i| (i as f32 - 511.0) / 3.0).collect();
+        let want: Vec<f32> = values.iter().map(|v| (*v / cap).tanh() * cap).collect();
+        let mut got = values.clone();
+        softcap_inplace(&mut got, cap);
+        for (i, (w, g)) in want.iter().zip(&got).enumerate() {
+            assert!(
+                (w - g).abs() <= 1e-5 * w.abs().max(1.0),
+                "element {i} (x = {}): scalar {w}, vector {g}",
+                values[i]
+            );
+        }
+    }
+
+    /// The same over a real vocab's worth, which takes the parallel path.
+    #[test]
+    fn softcap_matches_the_scalar_form_at_vocab_scale() {
+        let cap = 30.0f32;
+        let n = 262_144usize + 3;
+        let values: Vec<f32> = (0..n)
+            .map(|i| ((i % 8192) as f32 - 4096.0) / 64.0)
+            .collect();
+        let want: Vec<f32> = values.iter().map(|v| (*v / cap).tanh() * cap).collect();
+        let mut got = values.clone();
+        softcap_inplace(&mut got, cap);
+        for (w, g) in want.iter().zip(&got) {
+            assert!(
+                (w - g).abs() <= 1e-5 * w.abs().max(1.0),
+                "scalar {w}, vector {g}"
+            );
+        }
+    }
+
+    /// The vector GELU against the scalar one it replaces.
+    ///
+    /// A length that is not a multiple of four, so the tail is covered, and a
+    /// range wide enough to reach both saturated ends of `tanh` as well as
+    /// the part in between where the curve actually varies.
+    #[test]
+    fn gelu_inplace_matches_the_scalar_form() {
+        let values: Vec<f32> = (0..1023).map(|i| (i as f32 - 511.0) / 29.0).collect();
+        let want: Vec<f32> = values.iter().map(|v| gelu(*v)).collect();
+        let mut got = values.clone();
+        gelu_inplace(&mut got);
+        for (i, (w, g)) in want.iter().zip(&got).enumerate() {
+            assert!(
+                (w - g).abs() <= 1e-5 * w.abs().max(1.0),
+                "element {i} (x = {}): scalar {w}, vector {g}",
+                values[i]
+            );
+        }
+    }
+
+    /// The same, over a buffer long enough to take the parallel path, so the
+    /// chunking that feeds `gelu_slice` is covered too.
+    #[test]
+    fn gelu_inplace_matches_the_scalar_form_when_parallel() {
+        let n = PAR_ELEMS_THRESHOLD * 2 + 7;
+        let values: Vec<f32> = (0..n)
+            .map(|i| ((i % 4096) as f32 - 2048.0) / 512.0)
+            .collect();
+        let want: Vec<f32> = values.iter().map(|v| gelu(*v)).collect();
+        let mut got = values.clone();
+        gelu_inplace(&mut got);
+        for (w, g) in want.iter().zip(&got) {
+            assert!(
+                (w - g).abs() <= 1e-5 * w.abs().max(1.0),
+                "scalar {w}, vector {g}"
+            );
+        }
+    }
 
     #[test]
     fn dot_matches_scalar_reference_for_odd_and_even_lengths() {

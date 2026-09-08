@@ -1541,6 +1541,9 @@ fn provenance_fields(args: &Args, env: &Environment) -> Vec<(String, String)> {
             },
         ));
     }
+    if let Some(line) = format_npu(env.props.get("npu")) {
+        println!("  {line}");
+    }
     for line in format_gpu_tuning(env.props.get("gpu")) {
         // `format_gpu_tuning` returns "label  value" pairs already padded for
         // a terminal; the report's own columns replace that padding.
@@ -1749,6 +1752,11 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(args.timeout))
         .build()?;
 
+    // Once, before anything is started: the accelerators already in use on
+    // this machine are furniture, and everything that appears from here on is
+    // this sweep's own leftover. See `sweep::Baseline`.
+    let baseline = sweep::accelerator_baseline();
+
     let mut all = Vec::new();
     let mut bundles = Vec::new();
     for value in &spec.values {
@@ -1760,7 +1768,7 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
         let log = std::path::PathBuf::from(format!("orangu-sweep-{}.log", slug(&label)));
         let mut env = fixed.clone();
         env.push((spec.var.clone(), value.clone()));
-        let server = sweep::start(cmd, &env, port, &log, timeout)?;
+        let server = sweep::start(cmd, &env, port, &log, timeout, &baseline)?;
         sweep::wait_until_serving(&client, &args.url, &server, timeout)?;
 
         if !args.no_warmup {
@@ -2190,6 +2198,9 @@ fn write_report_from_bundle(
     }
     if let Some(build) = server_build(Some(&bundle.props)) {
         provenance.push(("server build".to_string(), build));
+    }
+    if let Some(line) = format_npu(bundle.props.get("npu")) {
+        println!("  {line}");
     }
     for line in format_gpu_tuning(bundle.props.get("gpu")) {
         if let Some((label, value)) = line.split_once("  ") {
@@ -4228,6 +4239,10 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
                 // six months ago is only re-interpretable if the whole
                 // configuration travelled with it.
                 "gpu_tuning": gpu_tuning,
+                // Verbatim too, and for the same reason: on a machine with
+                // an NPU this is the largest single thing separating two
+                // otherwise identical runs — see `format_npu`.
+                "npu": props.as_ref().and_then(|p| p.get("npu")).cloned(),
                 "model_cache": model_cache,
             })
         );
@@ -4240,6 +4255,11 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
         // *which build* it is running.
         if let Some(build) = &build {
             println!("  build    {build}");
+        }
+        // Beside the GPU's tuning, because the two together are what a
+        // stored result needs to be comparable — see `format_npu`.
+        if let Some(line) = props.as_ref().and_then(|p| format_npu(p.get("npu"))) {
+            println!("  {line}");
         }
         for line in format_gpu_tuning(gpu_tuning.as_ref()) {
             println!("  {line}");
@@ -4312,6 +4332,54 @@ fn report_environment(client: &reqwest::blocking::Client, args: &Args) -> Enviro
 /// *before* trusting the run: which quantized matmul kernel is live, which
 /// attention path, and the geometry constants that were swept on one AMD card
 /// and inherited everywhere else.
+/// One line describing the NPU, or `None` when the server reported none.
+///
+/// **A result that does not say whether the device was in use cannot be
+/// compared with one that does.** On this project's own hardware the NPU is
+/// worth about a factor of two on prefill, so it is the single largest
+/// thing separating two otherwise identical runs — and it was invisible
+/// here, because `/props` reported the GPU's kernel selection and nothing
+/// about the other processor.
+///
+/// `None` rather than a placeholder on a machine without one, so an
+/// ordinary box's report is unchanged.
+fn format_npu(npu: Option<&serde_json::Value>) -> Option<String> {
+    let npu = npu.filter(|n| !n.is_null())?;
+    let text = |key: &str| {
+        npu.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    let cores = npu.get("cores").and_then(serde_json::Value::as_u64);
+    let head = match cores {
+        Some(1) => format!("{} {} [1 core]", text("vendor"), text("target")),
+        Some(n) => format!("{} {} [{n} cores]", text("vendor"), text("target")),
+        None => format!("{} {}", text("vendor"), text("target")),
+    };
+    if npu.get("in_use").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Some(format!("npu      {head} · not in use"));
+    }
+    let blocks = npu
+        .get("blocks")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let widths = npu
+        .get("widths")
+        .and_then(serde_json::Value::as_array)
+        .map(|w| {
+            w.iter()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "npu      {head} · in use · {blocks} feed-forward blocks · widths [{widths}]"
+    ))
+}
+
 fn format_gpu_tuning(gpu: Option<&serde_json::Value>) -> Vec<String> {
     let Some(gpu) = gpu.filter(|g| !g.is_null()) else {
         return Vec::new();

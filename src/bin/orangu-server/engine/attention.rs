@@ -211,6 +211,22 @@ pub fn attention_decode_on_device(
     if window_end < window_start || window_end + 1 - window_start < min_gpu_decode_pos() {
         return None;
     }
+    // **Not for a layer whose rows live in the page pool.** The split
+    // kernel binds the per-request mirror directly and has no block table
+    // to resolve a position through, so it cannot read the pool at all.
+    // `VulkanBackend::record_attention_split` therefore calls
+    // `KvLayer::sync_gpu` unconditionally, and on a pool-backed layer that
+    // is a panic — `its mirror holds no rows` — not a wrong answer.
+    //
+    // It took a wider prefill chunk to reach: a narrow one never took the
+    // paged range path, so the layer was never marked, and granite 3.1 2B
+    // `Q8_0` only started crashing when the device asked for 64-token
+    // chunks. Declining here costs the split optimization on a paged
+    // sequence and hands the work to `VulkanBackend::gpu_attention`, which
+    // reads the pool properly.
+    if cache.is_pool_backed() {
+        return None;
+    }
     Some(
         vulkan.gpu_attention_split_on_device(crate::engine::backend::vulkan::GpuAttentionInput {
             q,
@@ -625,6 +641,11 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "attention window disagrees")]
+    // The guard is a `debug_assert`, which a release build compiles out —
+    // so in release this test would wait for a panic that cannot happen.
+    // Skipped there rather than weakened here: the check is worth having in
+    // the build that runs it, and `cargo test --release` should be green.
+    #[cfg_attr(not(debug_assertions), ignore = "the guard is a debug_assert")]
     fn a_caller_whose_closure_disagrees_with_its_flags_is_caught() {
         // The hazard this guard exists for: `n_swa: 0` says "attend to
         // everything up to my position" while the closure says "the last four".

@@ -48,6 +48,7 @@ pub mod device;
 pub mod metal;
 pub mod multi;
 pub mod opencl;
+pub mod probe_blocks;
 #[cfg(feature = "rocm")]
 pub mod rocm;
 pub mod vendor_shaders;
@@ -287,6 +288,149 @@ pub(crate) fn weights_prefer_host_matmul(n_tokens: usize, weights: &[&QuantMatri
         }
     }
     true
+}
+
+/// **Where should the vocabulary projection run?** Decided by running it
+/// both ways on this machine's own decode steps and keeping the faster.
+///
+/// [`host_matmul_threshold_bytes`] answers the same question for every other
+/// decode matmul, and answers it with a size: below the crossing the device's
+/// fixed cost dominates, above it the device's bandwidth wins. The second
+/// half of that is only true if the device reads a weight faster than the
+/// host does, and whether it does depends on the *format* the weight is
+/// stored in — `decode_matvec_format_sweep_gpu_versus_cpu`, one shape, four
+/// formats:
+///
+/// | format | GPU | CPU |
+/// | --- | --: | --: |
+/// | F16 | 19.7 GB/s | 13.4 GB/s |
+/// | **Q8_0** | **9.5** | **36.0** |
+/// | Q6_K | 15.6 | 20.7 |
+/// | Q4_K | 19.2 | 15.5 |
+///
+/// So the largest matmul in a decode step can be on the wrong processor
+/// precisely because it is large. A per-format table would fit this card and
+/// mislead the next one.
+///
+/// **Why not time the two engines directly and compare?** That was the first
+/// version of this, and it was wrong on the second model it met. A standalone
+/// `matmul` pays a submission, a fence and an `n_vocab`-sized readback that
+/// the recorded tail does not, which overcharged the device by about half:
+/// Llama-3.2-1B measured 34.6 ms against a real in-encoder cost of 23.0 ms.
+/// It still chose right there — but on Llama-3.2-3B it moved a projection the
+/// device was winning and cost 6% of decode. Subtracting the overhead means
+/// modelling it, and the overhead is exactly the part that differs between
+/// the sampling path (logits stay on the device) and the plain one (they come
+/// back).
+///
+/// So this measures whole decode steps instead, alternating the two arms
+/// ABAB rather than running them in blocks — the same reason a benchmark
+/// interleaves: on a board that throttles, a block comparison measures the
+/// heat. Both arms produce the same tokens, so the model is answering
+/// normally throughout.
+///
+/// Only the vocabulary projection, and only at one row. It is the one matmul
+/// whose result is host-bound anyway — it is read back to be sampled — so
+/// moving it off the device costs no synchronization that was not already
+/// being paid, and turns an `n_vocab`-sized readback into an `n_embd`-sized
+/// one. Nothing else in the chain has that property.
+pub(crate) fn tail_prefers_host() -> bool {
+    if let Some(forced) = tail_forced() {
+        return forced;
+    }
+    TAIL_PROBE.lock().expect("tail probe poisoned").arm()
+}
+
+/// Records how long a decode step took, against whichever arm
+/// [`tail_prefers_host`] handed out for it.
+///
+/// Called once per single-token forward pass. A prefill is not a decode step
+/// and must not be timed as one; the callers check.
+pub(crate) fn note_tail_step(elapsed: std::time::Duration) {
+    if tail_forced().is_some() {
+        return;
+    }
+    TAIL_PROBE
+        .lock()
+        .expect("tail probe poisoned")
+        .note(elapsed);
+}
+
+/// `ORANGU_TAIL_HOST=0|1` pins the answer, for measuring one arm against the
+/// other from outside.
+fn tail_forced() -> Option<bool> {
+    static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| match std::env::var("ORANGU_TAIL_HOST").as_deref() {
+        Ok("0") => Some(false),
+        Ok("1") => Some(true),
+        _ => None,
+    })
+}
+
+static TAIL_PROBE: std::sync::Mutex<TailProbe> = std::sync::Mutex::new(TailProbe::new());
+
+/// The A/B behind [`tail_prefers_host`].
+struct TailProbe {
+    /// The arm the current step is running, and the one [`TailProbe::note`]
+    /// will credit. Latched rather than recomputed because a single step asks
+    /// twice — once where the device-sampling path decides whether to stand
+    /// down, once where the tail is recorded — and the two must agree.
+    arm: bool,
+    /// Step times for the device arm and the host arm.
+    samples: [Vec<u64>; 2],
+    /// The answer, once both arms have enough steps to compare.
+    decided: Option<bool>,
+}
+
+impl TailProbe {
+    const fn new() -> Self {
+        Self {
+            arm: false,
+            samples: [Vec::new(), Vec::new()],
+            decided: None,
+        }
+    }
+
+    /// Steps to time per arm before deciding, past the discarded ones.
+    const TIMED: usize = 4;
+
+    /// Steps to discard per arm. The first step on either arm pays for
+    /// whatever that path touches for the first time — a weight the device
+    /// has not uploaded, a thread pool that has not run — and the second is
+    /// the first one that measures steady state.
+    const WARMUP: usize = 2;
+
+    fn arm(&self) -> bool {
+        self.decided.unwrap_or(self.arm)
+    }
+
+    fn note(&mut self, elapsed: std::time::Duration) {
+        if self.decided.is_some() {
+            return;
+        }
+        let side = usize::from(self.arm);
+        self.samples[side].push(elapsed.as_nanos() as u64);
+        self.arm = !self.arm;
+        let enough = Self::WARMUP + Self::TIMED;
+        if self.samples.iter().any(|s| s.len() < enough) {
+            return;
+        }
+        let median = |side: usize| {
+            let mut steps: Vec<u64> = self.samples[side][Self::WARMUP..].to_vec();
+            steps.sort_unstable();
+            steps[steps.len() / 2]
+        };
+        let (there, host) = (median(0), median(1));
+        self.decided = Some(host < there);
+        if crate::engine::env::flag_on("ORANGU_TAIL_TRACE") {
+            eprintln!(
+                "orangu-server: [tail] device {:.1} ms vs host {:.1} ms per step — {}",
+                there as f64 / 1e6,
+                host as f64 / 1e6,
+                if host < there { "host" } else { "device" }
+            );
+        }
+    }
 }
 
 /// [`prefers_host_matmul`] against an explicit threshold.
@@ -809,7 +953,17 @@ pub fn device_resident_split<'a>(tensors: impl Iterator<Item = (&'a str, u64)>) 
 }
 
 pub(crate) fn is_cpu_only_tensor(name: &str) -> bool {
-    name.ends_with(".ffn_gate_exps.weight")
+    // Gemma's per-layer embedding table is gathered a row at a time on the
+    // host — `GemmaModel::gather_per_layer_tok_embd` dequantizes one row per
+    // token and hands the *result* to `record_ple_projection`. The table
+    // itself never becomes a GPU buffer, so counting it against the device
+    // is not merely pessimistic: on gemma-4-E4B it is 2.79 GiB against a
+    // Mali adapter's 2 GiB maximum buffer size, which tripped the
+    // oversized-tensor check and pushed the whole model onto the CPU. A
+    // tensor the device never sees should not be what decides it cannot be
+    // used.
+    name == "per_layer_token_embd.weight"
+        || name.ends_with(".ffn_gate_exps.weight")
         || name.ends_with(".ffn_up_exps.weight")
         || name.ends_with(".ffn_down_exps.weight")
         || name.ends_with(".ffn_gate_up_exps.weight")
@@ -1201,6 +1355,28 @@ mod tests {
             &Picky(&[GGML_TYPE_IQ4_NL, GGML_TYPE_IQ1_S]),
         );
         assert_eq!(found, vec!["IQ1_S".to_string(), "IQ4_NL".to_string()]);
+    }
+
+    /// The table Gemma gathers on the host does not count against the
+    /// device, and the projection it feeds still does.
+    #[test]
+    fn the_per_layer_embedding_table_is_host_side() {
+        assert!(is_cpu_only_tensor("per_layer_token_embd.weight"));
+        assert!(
+            !is_cpu_only_tensor("per_layer_model_proj.weight"),
+            "the PLE projection is a real matmul and belongs on the device"
+        );
+
+        let (device, host) = device_resident_split(
+            [
+                ("per_layer_token_embd.weight", 3_000_000_000),
+                ("per_layer_model_proj.weight", 100),
+                ("blk.0.attn_q.weight", 200),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(host, 3_000_000_000);
+        assert_eq!(device, 300);
     }
 
     #[test]

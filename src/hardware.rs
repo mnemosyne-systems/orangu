@@ -45,19 +45,56 @@ pub struct CpuInfo {
     pub features: CpuFeatures,
 }
 
-/// SIMD instruction sets that llama.cpp's CPU backend probes for at startup
-/// to pick its matmul kernels. Detected via CPUID at run time (not compile
+/// SIMD instruction sets the CPU reports, detected at run time (not compile
 /// time) so a binary built on one machine reports accurately on whatever
 /// machine it actually runs on — the two can easily differ.
+///
+/// Two architectures' worth of fields, and only one set is ever populated:
+/// the x86 group on x86/x86_64, the AArch64 group on ARM, all-`false`
+/// everywhere else. They are separate fields rather than one abstracted
+/// "has SIMD" because the report names the actual instruction set, and
+/// because the two families are not comparable — `avx2` and `sve2` are not
+/// two values of one thing.
+///
+/// **Capability, not dispatch.** This is what the *hardware* offers. What
+/// orangu's own kernels will use is a narrower question with a different
+/// answer: `engine::vecdot` and `engine::tensor` have x86 paths and no
+/// AArch64 ones, so a machine can honestly report `sve2` here and still run
+/// the scalar matmul. Keeping the two apart is the point — conflating them
+/// would either hide real hardware or promise kernels that don't exist.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CpuFeatures {
     pub sse4_2: bool,
     pub avx2: bool,
     pub avx512f: bool,
+    /// Baseline ARM SIMD — architecturally mandatory on AArch64, so this is
+    /// effectively always true there. Reported anyway rather than assumed,
+    /// since the report's job is to say what was observed.
+    pub neon: bool,
+    pub sve: bool,
+    pub sve2: bool,
+    /// `SDOT`/`UDOT` — the 8-bit dot product that a quantized matmul is
+    /// built out of, and the first ARM feature that would matter to a
+    /// future AArch64 `vecdot` path.
+    pub dotprod: bool,
+    /// `SMMLA`/`UMMLA` — 8-bit integer *matrix* multiply, a step beyond
+    /// `dotprod` and the widest lever an int8 kernel has on this
+    /// architecture.
+    pub i8mm: bool,
+    /// Half-precision arithmetic (`FEAT_FP16`), not merely half-precision
+    /// storage/conversion — which every AArch64 part has.
+    pub fp16: bool,
+    pub bf16: bool,
 }
 
-/// Runs the actual CPUID checks. Only meaningful on x86/x86_64: the feature
-/// names themselves (`is_x86_feature_detected!`) don't exist on other
-/// architectures, so ARM/RISC-V etc. simply report all three as absent.
+/// Runs the actual run-time feature checks for whichever architecture this
+/// binary was built for.
+///
+/// The detection macros are architecture-specific and don't exist off their
+/// own target (`is_x86_feature_detected!` on ARM, `is_aarch64_feature_
+/// detected!` on x86), so each group is behind its own `cfg` and a target
+/// that is neither — RISC-V, PowerPC, WebAssembly — reports everything
+/// absent rather than failing to build.
 fn detect_cpu_features() -> CpuFeatures {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -65,15 +102,25 @@ fn detect_cpu_features() -> CpuFeatures {
             sse4_2: is_x86_feature_detected!("sse4.2"),
             avx2: is_x86_feature_detected!("avx2"),
             avx512f: is_x86_feature_detected!("avx512f"),
+            ..CpuFeatures::default()
         }
     }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
     {
         CpuFeatures {
-            sse4_2: false,
-            avx2: false,
-            avx512f: false,
+            neon: std::arch::is_aarch64_feature_detected!("neon"),
+            sve: std::arch::is_aarch64_feature_detected!("sve"),
+            sve2: std::arch::is_aarch64_feature_detected!("sve2"),
+            dotprod: std::arch::is_aarch64_feature_detected!("dotprod"),
+            i8mm: std::arch::is_aarch64_feature_detected!("i8mm"),
+            fp16: std::arch::is_aarch64_feature_detected!("fp16"),
+            bf16: std::arch::is_aarch64_feature_detected!("bf16"),
+            ..CpuFeatures::default()
         }
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        CpuFeatures::default()
     }
 }
 
@@ -96,10 +143,11 @@ pub struct GpuInfo {
 pub enum MemoryKind {
     Dedicated,
     Shared,
-    /// No source strong enough to tell either way was available. Only ever
-    /// constructed on macOS/Windows, whose detection is `cfg`'d out on other
-    /// build targets — hence the blanket `allow` rather than a per-target one.
-    #[allow(dead_code)]
+    /// No source strong enough to tell either way was available — the
+    /// macOS/Windows probes when their own heuristics don't fire, and the
+    /// Vulkan scan for any device the driver classifies as neither discrete
+    /// nor integrated (`VIRTUAL_GPU`, `OTHER`). Guessing at that point would
+    /// put a made-up capacity in front of a reader deciding what fits.
     Unknown,
 }
 
@@ -445,8 +493,147 @@ pub fn detect_gpus(total_memory_bytes: u64) -> Vec<GpuInfo> {
         );
     }
 
+    // Last resort, and only when nothing above answered: ask the graphics
+    // API itself.
+    //
+    // Every source above reads an *OS* description of a PCI device, and an
+    // SoC has neither. On a CIX P1 board the five `/sys/class/drm/cardN`
+    // nodes are ACPI display controllers (`linlondp`) with no `vendor`
+    // file, so the sysfs scan discards all of them, while the actual GPU —
+    // a Mali-G720-Immortalis on `/dev/mali0` — has no DRM node at all.
+    // The machine reported no GPU whatsoever, and then ran the model on it
+    // through Vulkan anyway. The driver that does the work is the one
+    // source guaranteed to know the device exists.
+    //
+    // Gated on `is_empty` rather than merged, deliberately. The two sources
+    // name the same card differently — sysfs says "Advanced Micro Devices,
+    // Inc. [AMD/ATI] Navi 14", Vulkan says "AMD Radeon RX 5500M (RADV
+    // NAVI14)" — so there is no reliable key to join them on, and a
+    // best-effort match would list one card twice on exactly the ordinary
+    // desktops that work fine today. Filling a hole is safe; merging is
+    // not.
+    if gpus.is_empty() {
+        gpus.extend(detect_vulkan_gpus());
+    }
+
     apply_shared_memory_total(&mut gpus, total_memory_bytes);
     gpus
+}
+
+/// Enumerates GPUs through the Vulkan loader.
+///
+/// Returns an empty list — never an error — when there is no loader, no
+/// driver, or no device, which is the same "simply doesn't show up"
+/// contract every other source here has. The instance is created and
+/// destroyed within the call: this is a report, and holding a Vulkan
+/// instance open for the life of the process would be a real resource for
+/// an inventory line.
+///
+/// Only core Vulkan 1.0 is used — no extensions, no layers, no device
+/// creation. Enumerating physical devices and reading their properties is
+/// the cheapest thing the API can be asked to do, and it is all this needs.
+fn detect_vulkan_gpus() -> Vec<GpuInfo> {
+    // SAFETY: `Entry::load` dlopens the system Vulkan loader, which is the
+    // library's documented entry point and returns `Err` rather than
+    // aborting when there isn't one.
+    let Ok(entry) = (unsafe { ash::Entry::load() }) else {
+        return Vec::new();
+    };
+
+    let app_info = ash::vk::ApplicationInfo::default().api_version(ash::vk::API_VERSION_1_0);
+    let create_info = ash::vk::InstanceCreateInfo::default().application_info(&app_info);
+    // SAFETY: `create_info` borrows `app_info`, which outlives this call;
+    // no extensions or layers are requested, so there is nothing else for
+    // the pointers in it to dangle to.
+    let Ok(instance) = (unsafe { entry.create_instance(&create_info, None) }) else {
+        return Vec::new();
+    };
+
+    // SAFETY: `instance` was just created successfully and is destroyed
+    // below, after the last use of anything derived from it.
+    let devices = unsafe { instance.enumerate_physical_devices() }.unwrap_or_default();
+    let mut gpus = Vec::new();
+    for device in devices {
+        // SAFETY: `device` came from this instance's own enumeration.
+        let properties = unsafe { instance.get_physical_device_properties(device) };
+        // SAFETY: as above.
+        let memory = unsafe { instance.get_physical_device_memory_properties(device) };
+
+        // A CPU implementation is a software rasterizer (lavapipe, SwiftShader)
+        // pretending to be a GPU. `engine::backend::device` already refuses to
+        // select one for inference; listing it as a GPU here would be the same
+        // untruth in a different place.
+        if properties.device_type == ash::vk::PhysicalDeviceType::CPU {
+            continue;
+        }
+
+        let name = properties
+            .device_name_as_c_str()
+            .ok()
+            .and_then(|name| name.to_str().ok())
+            .unwrap_or("Unknown device")
+            .trim()
+            .to_string();
+
+        // Device-local heaps are the device's own memory. On an integrated
+        // GPU that is a window onto system RAM, which `apply_shared_memory_
+        // total` then overrides with the real system total — the same
+        // correction it applies to every other `Shared` source.
+        let vram_total_bytes = memory.memory_heaps[..memory.memory_heap_count as usize]
+            .iter()
+            .filter(|heap| heap.flags.contains(ash::vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|heap| heap.size)
+            .sum::<u64>();
+
+        gpus.push(GpuInfo {
+            vendor: vulkan_vendor_name(properties.vendor_id),
+            name,
+            vram_total_bytes: (vram_total_bytes > 0).then_some(vram_total_bytes),
+            // Vulkan reports no allocation accounting without an extension,
+            // and a wrong number here would be worse than none.
+            vram_used_bytes: None,
+            driver: Some(format!(
+                "Vulkan {}.{}.{}",
+                ash::vk::api_version_major(properties.api_version),
+                ash::vk::api_version_minor(properties.api_version),
+                ash::vk::api_version_patch(properties.api_version),
+            )),
+            memory_kind: match properties.device_type {
+                ash::vk::PhysicalDeviceType::DISCRETE_GPU => MemoryKind::Dedicated,
+                ash::vk::PhysicalDeviceType::INTEGRATED_GPU => MemoryKind::Shared,
+                _ => MemoryKind::Unknown,
+            },
+        });
+    }
+
+    // SAFETY: no device was created from this instance and nothing derived
+    // from it is used after this point, so there is nothing outstanding to
+    // outlive it.
+    unsafe { instance.destroy_instance(None) };
+    gpus
+}
+
+/// Vendor names for the IDs Vulkan reports.
+///
+/// Mostly PCI vendor IDs, which is why the values overlap
+/// `pci_vendor_name`'s — but this one is deliberately separate: that
+/// function is Linux-only (it is part of the sysfs scan and reads
+/// `pci.ids`), whereas Vulkan enumeration runs on every platform, and the
+/// SoC vendors that matter here are exactly the ones a PCI table never
+/// lists.
+fn vulkan_vendor_name(vendor_id: u32) -> String {
+    match vendor_id {
+        0x1002 => "AMD",
+        0x10de => "NVIDIA",
+        0x8086 => "Intel",
+        0x13b5 => "ARM",
+        0x5143 => "Qualcomm",
+        0x1010 => "Imagination",
+        0x106b => "Apple",
+        0x14e4 => "Broadcom",
+        _ => "",
+    }
+    .to_string()
 }
 
 fn apply_shared_memory_total(gpus: &mut [GpuInfo], total_memory_bytes: u64) {
@@ -804,6 +991,44 @@ fn windows_memory_kind(name: &str) -> MemoryKind {
     }
 }
 
+/// The feature rows worth printing on the architecture this binary was
+/// built for, in report order: widest-reaching first, so the line that most
+/// affects a matmul sits nearest the top.
+///
+/// Returns pairs rather than pushing strings so the caller owns the
+/// formatting, and so the ordering decision lives in one place per
+/// architecture instead of being spread across `push_str` calls.
+fn cpu_feature_rows(features: &CpuFeatures) -> Vec<(&'static str, bool)> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        vec![
+            ("SSE4.2", features.sse4_2),
+            ("AVX2", features.avx2),
+            ("AVX512", features.avx512f),
+        ]
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        vec![
+            ("NEON", features.neon),
+            ("SVE", features.sve),
+            ("SVE2", features.sve2),
+            ("DotProd", features.dotprod),
+            ("I8MM", features.i8mm),
+            ("FP16", features.fp16),
+            ("BF16", features.bf16),
+        ]
+    }
+    // A target with no feature group of its own prints no feature rows at
+    // all, rather than a block of `no` that says only "this code doesn't
+    // know how to ask".
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = features;
+        Vec::new()
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "Yes" } else { "No" }
 }
@@ -946,7 +1171,16 @@ fn format_power_section(power: &PowerInfo) -> String {
     out
 }
 
-pub fn format_report(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo], power: &PowerInfo) -> String {
+/// `npu` is `Option` rather than a slice because the vendor runtime models
+/// one accelerator per context — several *cores*, but one device — so a
+/// list would be a shape the source cannot produce.
+pub fn format_report(
+    os: &OsInfo,
+    cpu: &CpuInfo,
+    gpus: &[GpuInfo],
+    npu: Option<&crate::npu::NpuInfo>,
+    power: &PowerInfo,
+) -> String {
     let mut out = crate::os::format_section(os);
     out.push('\n');
     out.push_str("CPU\n");
@@ -976,29 +1210,57 @@ pub fn format_report(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo], power: &Power
         "  Memory available : {}\n",
         format_bytes(cpu.available_memory_bytes)
     ));
-    out.push_str(&format!(
-        "  SSE4.2           : {}\n",
-        yes_no(cpu.features.sse4_2)
-    ));
-    out.push_str(&format!(
-        "  AVX2             : {}\n",
-        yes_no(cpu.features.avx2)
-    ));
-    out.push_str(&format!(
-        "  AVX512           : {}\n",
-        yes_no(cpu.features.avx512f)
-    ));
+    // Only this architecture's own feature group is printed. Three "no"
+    // rows for AVX on an ARM board are not an inventory: they describe
+    // instruction sets the CPU could never have had, and a reader can act
+    // on neither their absence nor their presence. See [`CpuFeatures`].
+    for (label, present) in cpu_feature_rows(&cpu.features) {
+        out.push_str(&format!("  {label:<17}: {}\n", yes_no(present)));
+    }
 
     out.push_str(&format_power_section(power));
 
     // No GPU at all means no GPU section: a heading over a single "none
     // found" line is two lines of report saying nothing the reader can act
     // on, and it's the CPU inventory above that matters on such a machine.
-    if gpus.is_empty() {
-        return out;
+    //
+    // A guard rather than the early return this used to be — an NPU section
+    // follows, and a machine can perfectly well have an NPU and no GPU this
+    // knows how to see (the two probes share no source).
+    if !gpus.is_empty() {
+        out.push_str("\nGPU\n");
+        format_gpu_entries(&mut out, gpus);
     }
 
-    out.push_str("\nGPU\n");
+    if let Some(npu) = npu {
+        out.push_str("\nNPU\n");
+        out.push_str(&format!(
+            "  Model            : {} {}\n",
+            npu.vendor, npu.target
+        ));
+        out.push_str(&format!("  Cores            : {}\n", npu.cores));
+        out.push_str(&format!("  Clusters         : {}\n", npu.clusters));
+        out.push_str(&format!("  Partitions       : {}\n", npu.partitions));
+        out.push_str(&format!("  Runtime          : {}\n", npu.runtime.display()));
+        // Scoped precisely, because an NPU row in a report about running
+        // models otherwise reads as a promise about *this* model. orangu can
+        // compile a layer for this device and execute it repeatedly — see
+        // `crate::npu_ort` and `crate::npu::NpuRuntime` — but it does not
+        // serve a GGUF model on it. Two reasons, both about the engine
+        // rather than the device: a graph is compiled for one fixed shape,
+        // and compiling cannot share a process with executing, so a serving
+        // path needs an ahead-of-time compile step that does not exist yet.
+        out.push_str("  Inference        : precompiled graphs (not GGUF models)\n");
+    }
+
+    out
+}
+
+/// The per-GPU body of [`format_report`]'s GPU section.
+///
+/// Split out only so the section's guard stays a two-line `if` at the call
+/// site; the loop is otherwise unchanged and has no other caller.
+fn format_gpu_entries(out: &mut String, gpus: &[GpuInfo]) {
     for (index, gpu) in gpus.iter().enumerate() {
         if index > 0 {
             out.push('\n');
@@ -1037,8 +1299,6 @@ pub fn format_report(os: &OsInfo, cpu: &CpuInfo, gpus: &[GpuInfo], power: &Power
             out.push_str(&format!("      Driver       : {driver}\n"));
         }
     }
-
-    out
 }
 
 #[cfg(test)]
@@ -1122,7 +1382,7 @@ mod tests {
             features: CpuFeatures {
                 sse4_2: true,
                 avx2: true,
-                avx512f: false,
+                ..CpuFeatures::default()
             },
         }
     }
@@ -1132,15 +1392,88 @@ mod tests {
     /// there, so it also ends without a trailing blank line.
     #[test]
     fn the_gpu_section_is_omitted_when_no_gpu_was_detected() {
-        let report = format_report(&crate::os::detect(), &cpu(), &[], &PowerInfo::default());
+        let report = format_report(
+            &crate::os::detect(),
+            &cpu(),
+            &[],
+            None,
+            &PowerInfo::default(),
+        );
         assert!(
             !report.contains("\nGPU\n"),
             "unexpected GPU section:\n{report}"
         );
         assert!(report.contains("\nCPU\n"), "report:\n{report}");
+        // Ends right after the CPU section, with no trailing blank line.
+        // *Which* row is last depends on the architecture whose feature
+        // group was printed, so the expectation is derived from
+        // `cpu_feature_rows` rather than spelled out — hardcoding `AVX512`
+        // here made this test pass only on x86.
+        let cpu = cpu();
+        let last_row = cpu_feature_rows(&cpu.features)
+            .last()
+            .map(|(label, _)| format!("{label:<17}: No\n"))
+            .unwrap_or_else(|| {
+                format!(
+                    "{:<17}: {}\n",
+                    "Memory available",
+                    format_bytes(cpu.available_memory_bytes)
+                )
+            });
+        assert!(report.ends_with(&last_row), "report:\n{report}");
+    }
+
+    fn npu() -> crate::npu::NpuInfo {
+        crate::npu::NpuInfo {
+            vendor: "Arm China".to_string(),
+            target: "X2_1204MP3".to_string(),
+            partitions: 1,
+            clusters: 1,
+            cores: 3,
+            runtime: std::path::PathBuf::from("/usr/share/cix/lib/libnoe.so.0"),
+        }
+    }
+
+    /// The NPU section stands on its own: a machine can carry an NPU and no
+    /// GPU any of the GPU sources can see — the two share no detection
+    /// path — and the GPU section's "nothing found" case used to `return`
+    /// out of the whole report, which would have swallowed this one.
+    #[test]
+    fn the_npu_section_is_reported_even_when_no_gpu_was_detected() {
+        let npu = npu();
+        let report = format_report(
+            &crate::os::detect(),
+            &cpu(),
+            &[],
+            Some(&npu),
+            &PowerInfo::default(),
+        );
+
+        assert!(report.contains("\nNPU\n"), "report:\n{report}");
+        assert!(report.contains("Arm China X2_1204MP3"), "report:\n{report}");
+        assert!(report.contains("Cores            : 3"), "report:\n{report}");
+        // The row that stops an inventory line from reading as a promise
+        // that orangu can run a model on the thing it just listed.
         assert!(
-            report.ends_with("AVX512           : No\n"),
+            report.contains("Inference        : precompiled graphs"),
             "report:\n{report}"
+        );
+    }
+
+    /// No NPU means no heading — the same rule the GPU section follows, and
+    /// for the same reason.
+    #[test]
+    fn the_npu_section_is_omitted_when_no_npu_was_detected() {
+        let report = format_report(
+            &crate::os::detect(),
+            &cpu(),
+            &[],
+            None,
+            &PowerInfo::default(),
+        );
+        assert!(
+            !report.contains("\nNPU\n"),
+            "unexpected NPU section:\n{report}"
         );
     }
 
@@ -1148,7 +1481,13 @@ mod tests {
     /// the CPU and GPU inventories under it should be read.
     #[test]
     fn the_os_section_comes_first() {
-        let report = format_report(&crate::os::detect(), &cpu(), &[], &PowerInfo::default());
+        let report = format_report(
+            &crate::os::detect(),
+            &cpu(),
+            &[],
+            None,
+            &PowerInfo::default(),
+        );
         assert!(report.starts_with("OS\n"), "report:\n{report}");
         assert!(
             report.find("\nCPU\n") < report.find("\nGPU\n").or(Some(usize::MAX)),
@@ -1164,6 +1503,7 @@ mod tests {
             &crate::os::detect(),
             &cpu(),
             &[gpu(MemoryKind::Dedicated, Some(4 * 1024 * 1024 * 1024))],
+            None,
             &PowerInfo::default(),
         );
         assert!(report.contains("\nGPU\n"), "report:\n{report}");

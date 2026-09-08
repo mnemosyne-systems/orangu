@@ -15,6 +15,7 @@
 
 pub mod agents;
 pub mod build_info;
+pub mod child;
 pub mod compression;
 pub mod compression_cache;
 pub mod config;
@@ -36,6 +37,10 @@ pub mod mcp;
 pub mod model_download;
 pub mod model_registry;
 pub mod model_spec;
+pub mod npu;
+pub mod npu_cache;
+pub mod npu_ffn;
+pub mod npu_ort;
 pub mod os;
 pub mod profiling;
 
