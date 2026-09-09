@@ -192,7 +192,6 @@ pub fn help_text() -> &'static str {
 /duplicates [<threshold>]                       Scan source functions (Rust, C/C++, Go, Python, JS/TS, and ~20 more languages) for duplicates; on a non-default branch only the functions it adds/changes are compared against the project; optional threshold is a percentage (default 80%)
 /add_file <path>                                Obsolete spelling of /create_file, kept working
 /auto_review [<file>|all] [immediate] [deep]    LLM auto review in a split view: the whole branch, one Tab-completed file (the full file on main/master, its changes on a branch), or every Git-tracked project file with all; add immediate to start the run at once; add deep to start every file in Deep mode (no diff truncation, cross-file graph context, a verify pass on rejects)
-/create_patch                                   Apply fixes from the most recently completed /review or /auto_review; also resolve live Git merge/rebase/cherry-pick conflicts, even without a review report
 /create_directory <path> [with <mode>]          Create a directory in the workspace, optionally with octal permissions
 /amend <message>                                Rewrite the last commit message with git commit --amend
 /bisect [start|good|bad|skip|reset|log]         Binary-search history for the commit that introduced a bug (git bisect); bare /bisect shows the session status
@@ -200,6 +199,7 @@ pub fn help_text() -> &'static str {
 /cherry_pick <commit>                           Cherry-pick a commit onto the current branch
 /comment <number> "<comment>"|<file>            Add a comment to a GitHub/GitLab issue; inline body, file from ~/.orangu/comments/, or `with [auto] review` to post the last /review or /auto_review report
 /create_file <path> [with <mode>] [containing <text>] Create a file (or stage an existing one), with optional permissions and content
+/create_patch                                   Apply fixes from the most recently completed /review or /auto_review; also resolve live Git merge/rebase/cherry-pick conflicts, even without a review report
 /close -i <number>|-p <number>                  Close a GitHub/GitLab issue or pull request with gh/glab
 /commit <message>                               Commit all tracked changes with git commit -a -m
 /delete_directory <path>                        Delete an empty directory from the workspace
