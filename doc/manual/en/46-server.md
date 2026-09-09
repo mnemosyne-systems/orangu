@@ -472,16 +472,41 @@ it through Vulkan anyway; the driver doing the work is the one source
 guaranteed to know the device exists. It fills a hole rather than merging
 with the others, because the two name the same card differently
 (`Advanced Micro Devices, Inc. [AMD/ATI] Navi 14` against `AMD Radeon RX
-5500M (RADV NAVI14)`) and there is no reliable key to join them on. A
-machine where nothing at all answers gets no `GPU` section — the CPU
+5500M (RADV NAVI14)`) and there is no reliable key to join them on.
+
+When even Vulkan answers nothing, the kernel driver itself is read — one
+layer further down, for one layer further of the same problem. A board
+running Arm's own `mali` kbase driver has no Vulkan loader to ask: Mesa has
+no Vulkan driver for kbase (its `panvk` drives the mainline
+`panfrost`/`panthor` interface instead), and the proprietary one ships with
+a BSP most images leave out. An Orange Pi 5 (RK3588, Mali-G610) is exactly
+that machine — `/dev/mali0` and a `mali` platform driver, no `libvulkan`
+anywhere — and it reported no GPU at all:
+
+```
+GPU
+  [0] ARM Mali-G610
+      Memory type  : Shared
+      VRAM total   : 15.59 GiB
+      Driver       : mali
+```
+
+That comes from `gpuinfo`, the single line kbase publishes on its platform
+device (`Mali-G610 4 cores r0p0 0x0A080607`) — the driver's own answer to
+"what is this chip", and so the best source there is on such a board. It is
+keyed on that file rather than on anything that merely looks like a GPU,
+because an SoC's platform bus is full of nodes and two on this same RK3588
+are traps: `/sys/class/drm/card0` is the display controller (a scanout
+engine, not a GPU) and `card1` is the NPU, which registers a DRM render node
+of its own.
+
+A machine where nothing at all answers gets no `GPU` section — the CPU
 inventory is the whole report — rather than a heading over a "none
 detected" line. `Memory type` tells apart a
 genuine dedicated card from an integrated GPU/APU sharing the CPU's system
 RAM — a `Shared` GPU's `VRAM total` is always reported as the machine's
 total system RAM regardless of what its own platform query said, since
 that's the real ceiling on how much it can actually draw on.
-
-### NPU
 
 ### The GPU is checked before it is trusted
 
@@ -511,6 +536,8 @@ expected would not have found this one. If a type still disagrees with every
 tuned kernel disabled, that is said loudly, because then the fallback is not
 a fallback and `backend = cpu` is the only correct answer.
 
+### NPU
+
 A machine with a neural processing unit gets an `NPU` section too:
 
 ```
@@ -523,16 +550,140 @@ NPU
   Inference        : precompiled graphs (not GGUF models)
 ```
 
-One family is detected today: an Arm China Zhouyi AIPU reached through
-CIX's NOE user-mode driver, which is the stack shipped on CIX P1/CD8180
-boards (kernel-side `aipu.ko` behind `/dev/aipu`). `libnoe` is opened at
-*runtime* rather than linked — it ships with a board BSP, lives off the
-default loader path, and exists on approximately no other machine — so its
-absence is an ordinary "no NPU" answer and not an error. `ORANGU_NPU_LIB`
-points the probe at a specific library when a BSP is installed somewhere
-it does not guess. Other vendors' NPUs (Rockchip's RKNN, Intel's,
-Qualcomm's Hexagon) have entirely separate userspace stacks and are not
-detected: such a machine reports no NPU rather than a wrong one.
+One family can be *run on*: an Arm China Zhouyi AIPU reached through CIX's
+NOE user-mode driver, which is the stack shipped on CIX P1/CD8180 boards
+(kernel-side `aipu.ko` behind `/dev/aipu`). `libnoe` is opened at *runtime*
+rather than linked — it ships with a board BSP, lives off the default loader
+path, and exists on approximately no other machine — so its absence is an
+ordinary "no NPU" answer and not an error. `ORANGU_NPU_LIB` points the probe
+at a specific library when a BSP is installed somewhere it does not guess.
+
+A second family is Rockchip's RKNPU, on boards like the RK3588 — detected the
+same way and, unlike NOE, usable as a backend:
+
+```
+NPU
+  Model            : Rockchip RK3588 RKNPU
+  Cores            : 3
+  Driver           : RKNPU
+  Runtime          : /usr/lib/librknnrt.so
+  Inference        : matmul offload (backend = npu)
+```
+
+That is read out of the kernel driver's sysfs node, which is the opposite of
+the choice made for NOE and for the same reason — it is the better source
+here. `librknnrt` has no "describe the device" entry point: every query it
+offers needs a context, and a context needs a compiled `.rknn` model, so
+asking the library what the hardware is would mean loading a model in order
+to print a report. The driver meanwhile publishes the device and its device
+tree node unconditionally. A node with no driver bound to it is not reported,
+since the SoC's `.dtsi` declares one on every RK3588 board whether or not the
+module is loaded; the core count is counted from the per-core names the node
+carries (three `npuN_irq` interrupts on an RK3588, one `npu_irq` on an
+RK3568) rather than looked up per SoC.
+
+The rows a source cannot answer are absent rather than filled in — a sysfs
+node knows nothing of clusters or partitions, and a printed `1` would be a
+claim nobody made.
+
+Detection is two separate probes, not one with a flag, and that is what keeps
+the two stacks apart: everything that dispatches NOE work gates on the NOE
+probe, so a Rockchip board is never sent at a runtime that does not speak NOE,
+and the RKNPU backend is never handed a Zhouyi part. Other vendors' NPUs
+(Intel's, Qualcomm's Hexagon) have entirely separate stacks again and are not
+detected at all: such a machine reports no NPU rather than a wrong one.
+
+### Setting an Orange Pi 5 up
+
+Both accelerators ship present and unusable: the NPU sits behind a
+`root:render` device node that nobody is a member of, and the GPU has a kernel
+driver and no userspace driver at all. `contrib/orangepi5.sh` does both halves
+and checks its work:
+
+```sh
+sudo ./contrib/orangepi5.sh            # groups + Mali userspace driver
+./contrib/orangepi5.sh --check         # report only, changes nothing
+sudo ./contrib/orangepi5.sh --uninstall
+```
+
+Group membership is granted at login, so the shell you ran it from still does
+not have it — log out and back in, or use `sg render -c "sg video -c
+'orangu-server'"` in the meantime.
+
+Without that access, `orangu-server` falls back to the CPU and says why
+(`present but unreachable (/dev/dri/renderD129 is not readable by this user)`).
+It does not fail: both vendor probes check the device node before loading the
+vendor library, which is not politeness — Arm's Mali blob *segmentation faults*
+rather than returning an error when it cannot open `/dev/mali0`, and once that
+blob is installed as the system `libOpenCL.so` every process that enumerates
+OpenCL devices is exposed to it.
+
+### `backend = npu` on an RK3588
+
+`librknnrt` exposes `rknn_matmul_create` / `rknn_matmul_run`, which is exactly
+the per-operation `C = A × B` seam the forward pass needs — so on a Rockchip
+board the NPU is a real matmul backend rather than an inventory line. `auto`
+tries it before any GPU.
+
+**It is a prefill accelerator, and only that.** Measured on an Orange Pi 5
+(RK3588, 16 GiB) serving `gemma-4-E2B-it` at `Q4_K_M`, every configuration
+producing identical text:
+
+| backend | decode | prefill (fresh 1976-token prompt) |
+|---|---|---|
+| `cpu` | 5.27 tok/s | 16.4 tok/s |
+| `npu` | 5.12 tok/s | **21.2 tok/s** |
+| `opencl` (Mali-G610) | 0.82 tok/s | 9.3 tok/s |
+
+Decode is bandwidth-bound and the device loses it outright: its fixed cost is
+about 0.4 ms per call against a decode step that is nothing but small
+matmuls, and it reads a requantized copy of each weight at 1 byte per element
+where the CPU reads the `Q4_K` original at 0.56. So every decode and every
+call narrower than `ORANGU_NPU_MIN_TOKENS` (16) goes to the CPU backend, and
+prefill keeps the device — where int8 at 512 tokens is 1190 GFLOP/s against
+roughly 65 from eight Cortex-A55s.
+
+Weights are offloaded one at a time as the forward pass meets them, as int8
+with a symmetric scale per output channel, until `ORANGU_NPU_WEIGHTS_GB`
+(default 1.5) is spent; everything else stays on the CPU. **How much fits is
+the biggest lever on what the backend is worth**, because the device stops
+handing out memory near 2 GiB across all contexts:
+
+| `ORANGU_NPU_WEIGHTS_GB` | prefill | vs `cpu` |
+|---|---|---|
+| 0 (control: every matmul on the CPU) | 16.3 tok/s | 0.99× |
+| 1.0 | 19.4 tok/s | 1.18× |
+| 1.5 (default) | 21.2 tok/s | 1.29× |
+| 1.75 | 22.2 tok/s | 1.35× |
+
+`ORANGU_NPU_MODE=fp16` selects `float16 × float16 → float32` instead of int8.
+It needs no requantization of a GGUF weight at all, so it is the fallback if
+int8 ever costs visible quality — at about a quarter of int8's throughput and
+twice the bytes per weight. `fp16 × int8` and every int4 variant are rejected
+by this runtime as unsupported on RK3588, so the mixed-precision path that
+would have given int8's density with fp16's activations does not exist here.
+`ORANGU_RKNN_LIB` points the probe and the backend at a specific
+`librknnrt.so` when the SDK is installed somewhere neither guesses.
+
+Three things about this are worth knowing before trusting a number from it.
+
+A weight only reaches the device when its shape fits the *enforced* alignment
+— `K` a multiple of 32 elements, `N` a multiple of 32 for int8 or 16 for fp16
+— which is not what the vendor header documents (it says 16 and 8, and states
+a maximum `K` of 10240 that the runtime does not enforce and that real weights
+exceed correctly). So nothing is taken on trust: every offloaded weight is
+checked against a host reference before it is used, and declined if it
+disagrees. Mixed residency is the normal case here, not a degraded one.
+
+Accuracy is two separate questions. The device computes what it is asked to
+within about 1e-6; quantizing the operands is the real cost and it is the
+backend's own choice. One scale per activation *tensor* was enough to stop
+this model being able to count to twenty — one per *token*, which is what it
+does, produces output identical to the CPU's.
+
+And measure prefill on a prompt the server has not seen. Warming up on the
+same text reads the prefix cache and reports about eight times what the cores
+can actually do, which made this very speed-up look like a regression.
 
 **The last line is the important one, and it is precise.** orangu *can*
 run work on the NPU, in two ways.
@@ -1447,8 +1598,9 @@ reexec = yes
 
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `dx12`,
   `cuda`, `opencl`,
-  `rocm`, or `npu` (recognized but not yet runnable — see **NPU** below).
-  `auto` tries every GPU backend compiled into this build, in order
+  `rocm`, or `npu` (Rockchip RKNPU — a prefill accelerator; see **NPU**
+  below, and read the measurements there first). `auto` tries the NPU, then
+  every GPU backend compiled into this build, in order
   (Vulkan, CUDA, OpenCL, then ROCm if built with the `rocm` feature),
   falling back to the CPU backend silently if none is found. **On macOS the
   order starts with Metal**, which is the only GPU API Apple ships — Vulkan

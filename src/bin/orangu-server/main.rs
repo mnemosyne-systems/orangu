@@ -2289,7 +2289,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         let os = orangu::os::detect();
         let cpu = orangu::hardware::detect_cpu();
         let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-        let npu = orangu::npu::detect_npu();
+        let npu = orangu::npu::detect_npu_inventory();
         let power = orangu::hardware::detect_power();
         print!(
             "{}",
@@ -2671,7 +2671,7 @@ fn run_command(
                 .and_then(|conf| orangu::os::detect_model_storage(&conf.models));
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-            let npu = orangu::npu::detect_npu();
+            let npu = orangu::npu::detect_npu_inventory();
             let power = orangu::hardware::detect_power();
             print!(
                 "{}",
@@ -2691,7 +2691,7 @@ fn run_command(
                 .and_then(|conf| orangu::os::detect_model_storage(&conf.models));
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-            let npu = orangu::npu::detect_npu();
+            let npu = orangu::npu::detect_npu_inventory();
             print!(
                 "{}",
                 suggest::format_suggestion(&os, &cpu, &gpus, npu.as_ref())
@@ -3455,11 +3455,49 @@ fn cpu_inventory(role: &str, threads: Option<usize>) -> String {
 /// later line says what came of it. `role` carries the second half, since
 /// whether the device will be asked at all is the caller's configuration
 /// rather than anything the probe can see.
+/// Whether this process can open an NPU's device node.
+///
+/// Mirrors `engine::backend::rknpu`'s own check — deliberately duplicated
+/// rather than shared, because that one gates *work* and this one gates a
+/// *sentence*, and a banner must not be able to make the backend's decision
+/// for it.
+fn npu_node_is_openable(node: &std::path::Path) -> bool {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(node)
+        .is_ok()
+}
+
 fn npu_inventory(role: &str) -> Option<String> {
-    let npu = orangu::npu::detect_npu()?;
+    let npu = orangu::npu::detect_npu_inventory()?;
     let cores = match npu.cores {
         1 => "1 core".to_string(),
         cores => format!("{cores} cores"),
+    };
+    // The caller's `role` is about the feed-forward precompile pipeline,
+    // which is a NOE pipeline. An RKNPU is reached a different way
+    // entirely — `engine::backend::rknpu`, selected as `backend` — so it
+    // gets its own second half rather than one that would read as a plan
+    // for it. Stated as availability and not as use, because this line is
+    // built before a backend is chosen: whether the device *was* chosen is
+    // on the banner's `Model` row and in `RknpuBackend`'s own bring-up line.
+    let role = match npu.stack {
+        orangu::npu::NpuStack::Noe => role,
+        // Reachability, not just presence. The device node is `root:render`
+        // on a stock image, so a server run by a user outside that group sees
+        // an NPU it cannot open — and the two vendor runtimes report that as
+        // either two lines of C library stderr or a segmentation fault, both
+        // of which read as a broken install rather than as a permission. The
+        // one thing the operator can act on is which group to join, so say
+        // that.
+        orangu::npu::NpuStack::Rknpu => match &npu.render_node {
+            Some(node) if !npu_node_is_openable(node) => &format!(
+                "— present but unreachable ({} is not readable by this user)",
+                node.display()
+            ),
+            _ => "— available as backend = npu",
+        },
     };
     Some(format!(
         "orangu-server: [npu] {} {} [{cores}] {role}",
@@ -4399,19 +4437,23 @@ fn select_backend(
                 ))
             }
         }
-        // Recognized, detected, and still not runnable — so the error says
-        // which of those three it is. "No NPU backend" and "no NPU on this
-        // machine" are very different problems, and an operator who has
-        // just seen the device listed in `orangu-server system` deserves
-        // the first answer rather than being left to suspect the second.
-        BackendPreference::Npu => Err(anyhow!(
-            "[{}].backend = npu, but orangu-server has no NPU backend. The NPU is \
-             detected and reported by `orangu-server system` as inventory only: the \
-             vendor runtime runs whole graphs compiled ahead of time and offers no \
-             per-operation entry point for the forward pass to call. Use backend = \
-             auto, vulkan, or cpu.",
-            config::SERVER_SECTION
-        )),
+        // Runnable on exactly one stack. `RknpuBackend::devices()` is
+        // empty on a machine whose NPU is a NOE/Zhouyi part — that runtime
+        // executes whole graphs compiled ahead of time and has no
+        // per-operation entry point for the forward pass to call — and
+        // `choose_device` turns that into the error below, which names
+        // which of "no NPU", "no NPU backend" and "an NPU of the other
+        // kind" this machine is. An operator who has just seen the device
+        // in `orangu-server system` needs that distinction.
+        BackendPreference::Npu => {
+            use engine::backend::RknpuBackend;
+            let index = choose_device("npu", &RknpuBackend::devices(), device)
+                .map_err(|err| named("npu", err))?[0];
+            let backend =
+                RknpuBackend::try_init_index(index).ok_or_else(|| unusable("npu", index))?;
+            let label = format!("NPU/{}", backend.device_name);
+            Ok((Arc::new(backend), label))
+        }
         BackendPreference::Auto => {
             // An explicitly requested device that an API in this chain
             // *has* devices for but doesn't offer. Remembered rather than
@@ -4430,6 +4472,32 @@ fn select_backend(
                 }
             };
 
+            // **First, ahead of every GPU.** An NPU is the most
+            // specialized processor on a board that has one, and on the
+            // SoCs that carry one it is also the fastest at a large
+            // matmul — an RK3588's three NPU cores against four
+            // Cortex-A55s is not a close contest at prefill widths.
+            //
+            // Safe to put first precisely because it is not all-or-nothing:
+            // `RknpuBackend` answers the shapes the device can take and
+            // hands every other one to `CpuBackend`, so preferring it
+            // cannot strand a model whose weights the device would refuse.
+            // On a machine with both an NPU and a real GPU this is still
+            // the right default — and `backend = vulkan` overrides it —
+            // but it is the ordering that deserves revisiting first if a
+            // board ever has a fast discrete card beside a small NPU.
+            {
+                use engine::backend::RknpuBackend;
+                match choose_device("npu", &RknpuBackend::devices(), device) {
+                    Ok(selected) => {
+                        if let Some(backend) = RknpuBackend::try_init_index(selected[0]) {
+                            let label = format!("NPU/{}", backend.device_name);
+                            return Ok((Arc::new(backend), label));
+                        }
+                    }
+                    Err(err) => remember(err),
+                }
+            }
             // Ahead of Vulkan, and only where it can succeed at all — see
             // this function's doc comment for both halves of that.
             if HAS_METAL {

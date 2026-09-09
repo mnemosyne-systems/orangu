@@ -49,6 +49,7 @@ pub mod metal;
 pub mod multi;
 pub mod opencl;
 pub mod probe_blocks;
+pub mod rknpu;
 #[cfg(feature = "rocm")]
 pub mod rocm;
 pub mod vendor_shaders;
@@ -62,6 +63,7 @@ pub use device::{DeviceCandidate, DeviceError, DeviceErrorKind, DeviceRequest};
 pub use metal::MetalBackend;
 pub use multi::MultiDeviceBackend;
 pub use opencl::OpenClBackend;
+pub use rknpu::RknpuBackend;
 #[cfg(feature = "rocm")]
 pub use rocm::RocmBackend;
 pub use vulkan::VulkanBackend;

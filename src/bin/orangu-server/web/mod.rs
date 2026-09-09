@@ -363,7 +363,7 @@ async fn system_report(State(state): State<Arc<WebState>>) -> impl IntoResponse 
     let os = orangu::os::detect();
     let cpu = orangu::hardware::detect_cpu();
     let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
-    let npu = orangu::npu::detect_npu();
+    let npu = orangu::npu::detect_npu_inventory();
     let mut report = format!(
         "orangu-server {}\nModel        {}\nArchitecture {}\nBackend      {}\nWorkspace    {}\n\n",
         state.version,

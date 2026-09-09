@@ -365,6 +365,38 @@ report) rather than a heading over a "none detected" line:
   discrete line), and AMD is reported `Unknown` — its driver names an APU's
   integrated GPU and a discrete Radeon card too similarly to guess from the
   name alone.
+- **Last resorts, only when nothing above answered.** Every source above
+  reads an *OS* description of a PCI device, and an SoC GPU is neither. So
+  the Vulkan loader is asked directly — the driver doing the work is the one
+  source guaranteed to know the device exists — and failing even that, Arm's
+  `mali` kbase driver is read out of sysfs: its `gpuinfo` line on the
+  platform device (`Mali-G610 4 cores r0p0 0x0A080607`) names the chip on a
+  board that has no Vulkan loader installed at all, which is the usual state
+  of an Orange Pi 5. Both are `Shared`. They fill a hole rather than merging
+  with the sources above, because each names the same card differently and
+  there is no reliable key to join them on.
+
+**Detecting an SoC GPU is not the same as being able to compute on it.**
+`contrib/orangepi5.sh` does the whole setup for an Orange Pi 5 — device-node
+group membership and the GPU userspace driver — and `--check` reports the state
+without changing anything. A
+stock Orange Pi 5 image has the `mali` kernel driver and `/dev/mali0` and *no*
+userspace driver at all — no `libmali`, no `libOpenCL`, no `libvulkan` — so the
+GPU is reported and unusable. Arm's Valhall userspace blob supplies OpenCL 3.0
+for the G610; installed as `libmali.so.1` with `libOpenCL.so.1` symlinked at
+it, `backend = opencl` then binds the device and passes every cross-check. That
+is the same arrangement the `opencl` backend already documents for the CIX
+board's `/opt/cixgpu-pro/libOpenCL.so` — the vendor library acting as its own
+loader, with no `/etc/OpenCL/vendors` ICD to find. Match the blob to the
+kernel's DDK version (`dmesg | grep "DDK version"`); `g24p0` userspace works
+against a `g25p0` kernel.
+
+Worth knowing before you bother: on an RK3588 the Mali-G610 through OpenCL is
+**slower than the CPU** for inference — 0.82 tok/s decode and 9.3 tok/s prefill
+against the CPU's 5.27 and 16.4. The matmul-only kernels pay a per-call
+dispatch on every projection and the iGPU shares the CPU's DRAM, so there is no
+bandwidth to win back. The NPU is the accelerator worth having on that board;
+see **NPU** in the manual.
 
 A `Shared` GPU's `VRAM total` is always the machine's total system RAM,
 regardless of what (if anything) its own platform query reported — the
@@ -1144,11 +1176,16 @@ reexec = yes
   default memory mapping leaves request size to the kernel's readahead, so on
   a default deployment this key changes nothing.
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `cuda`,
-  `opencl`,
-  `rocm`, or `npu` (recognized but not yet runnable — orangu detects and
-  reports an NPU as inventory only; see **NPU** in the manual).
-  `auto` tries every GPU backend compiled into this build, in order
-  (Vulkan, CUDA, OpenCL, then ROCm if built with `--features rocm`),
+  `opencl`, `rocm`, or `npu`. `npu` is Rockchip RKNPU only — a matmul-only
+  backend over `librknnrt`; an NPU of the other kind orangu knows about
+  (NOE/Zhouyi) runs whole graphs compiled ahead of time and is still
+  inventory only, so `backend = npu` reports that rather than starting. It is
+  a **prefill** accelerator: on an RK3588 it prefills at 1.29× `cpu` and
+  decodes at parity, because every decode and every call under
+  `ORANGU_NPU_MIN_TOKENS` tokens is handed to the CPU backend on purpose. See
+  **NPU** in the manual for the measurements and the knobs.
+  `auto` tries the NPU first, then every GPU backend compiled into this build,
+  in order (Vulkan, CUDA, OpenCL, then ROCm if built with `--features rocm`),
   falling back to the CPU backend silently if none is found. **On macOS the
   order starts with Metal**, which is the only GPU API Apple ships — Vulkan
   is still tried behind it, for a Mac running MoltenVK. Naming a

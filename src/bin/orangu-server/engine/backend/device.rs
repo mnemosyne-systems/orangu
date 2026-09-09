@@ -85,6 +85,11 @@ use orangu::format::format_bytes;
 /// so adding a class later can't silently re-rank the existing ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeviceClass {
+    /// A neural accelerator rather than a GPU — `engine::backend::rknpu`'s
+    /// RKNPU. Top of the ranking, which costs nothing today: the NPU is its
+    /// own rung in `select_backend`'s chain and is never ranked against a
+    /// GPU, so this only orders NPUs against each other.
+    Npu,
     /// A card with its own memory.
     Discrete,
     /// A real device the API didn't classify. See the module doc for why
@@ -103,6 +108,7 @@ impl DeviceClass {
     /// each step.
     pub fn rank(self) -> u8 {
         match self {
+            Self::Npu => 5,
             Self::Discrete => 4,
             Self::Other => 3,
             Self::Virtual => 2,
@@ -114,6 +120,7 @@ impl DeviceClass {
     /// The one-word form used in the startup inventory and in `/props`.
     pub fn label(self) -> &'static str {
         match self {
+            Self::Npu => "npu",
             Self::Discrete => "discrete",
             Self::Other => "other",
             Self::Virtual => "virtual",

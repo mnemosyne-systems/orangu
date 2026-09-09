@@ -17,13 +17,28 @@
 //! the same spirit as [`crate::hardware`]'s CPU and GPU probes) and how to
 //! run a compiled graph on it ([`NpuRuntime`]).
 //!
-//! Today that means one family, reached one way: an Arm China Zhouyi AIPU
-//! through CIX's NOE user-mode driver (`libnoe`). That is the stack shipped
-//! on CIX P1/CD8180-class boards, where the kernel side is `aipu.ko` behind
-//! `/dev/aipu`. Other vendors' NPUs (Rockchip's RKNN, Intel's, Qualcomm's
-//! Hexagon) have entirely separate userspace stacks and are simply not
-//! detected — they would each need their own probe here, and a machine
-//! carrying one reports no NPU rather than a wrong one.
+//! One family can be *executed* on, reached one way: an Arm China Zhouyi
+//! AIPU through CIX's NOE user-mode driver (`libnoe`). That is the stack
+//! shipped on CIX P1/CD8180-class boards, where the kernel side is `aipu.ko`
+//! behind `/dev/aipu`. [`detect_npu`] is that probe, and every caller that
+//! gates real work on the device uses it.
+//!
+//! A second family is *inventoried* here and executed on elsewhere:
+//! Rockchip's RKNPU, read straight out of the kernel driver's sysfs node on
+//! boards like the RK3588, and driven per-matmul by `orangu-server`'s
+//! `engine::backend::rknpu`. This module only ever describes it —
+//! [`detect_npu_inventory`] is the probe that reports either family, and the
+//! report it feeds says plainly which of the two a machine has (see
+//! [`NpuStack`]).
+//!
+//! The split between the two probes is the point, and it is load-bearing
+//! rather than tidy: `detect_npu` gates NOE work and must never answer for a
+//! Rockchip board, because `npu_ffn` and `npu_tool` would then dispatch NOE
+//! graphs at a device that does not speak NOE. One probe answering both
+//! questions would either hide the hardware or make that mistake. Other
+//! vendors' NPUs (Intel's, Qualcomm's Hexagon) have entirely separate stacks
+//! again and are not detected at all — a machine carrying one reports no NPU
+//! rather than a wrong one.
 //!
 //! # Why `dlopen` rather than linking
 //!
@@ -114,7 +129,48 @@ const LIBRARY_CANDIDATES: &[&str] = &[
 /// installed somewhere this doesn't guess.
 const LIBRARY_ENV: &str = "ORANGU_NPU_LIB";
 
-/// One NPU, as the vendor runtime describes it.
+/// Where the kernel publishes SoC-internal devices, and so where an RKNPU
+/// shows up: `/sys/class/drm` is no use for it — the driver does register a
+/// DRM render node, but as a platform device it has none of the PCI
+/// `vendor`/`device` files [`crate::hardware`]'s GPU scan reads, and the node
+/// sits beside the display controller's with nothing to tell them apart.
+#[cfg(target_os = "linux")]
+const RKNPU_PLATFORM_DEVICES: &str = "/sys/bus/platform/devices";
+
+/// Where Rockchip's RKNN runtime is installed, in order. Unlike
+/// [`LIBRARY_CANDIDATES`] these are only ever *stat*ed, never opened — see
+/// [`rknpu_runtime`] — so the list can afford to be plain paths with no
+/// loader search behind them. The first is where the vendor `.deb` and the
+/// RKNN toolkit's own install script both put it.
+#[cfg(target_os = "linux")]
+const RKNPU_RUNTIME_CANDIDATES: &[&str] = &[
+    "/usr/lib/librknnrt.so",
+    "/usr/lib64/librknnrt.so",
+    "/usr/local/lib/librknnrt.so",
+    "/usr/lib/aarch64-linux-gnu/librknnrt.so",
+];
+
+/// Which stack an [`NpuInfo`] came from — and so whether orangu can run
+/// anything on the device it describes.
+///
+/// Carried on the struct rather than left implicit because the two probes
+/// answer different questions and a reader of the report must not have to
+/// guess which one they are looking at. [`crate::hardware::format_report`]
+/// turns this into the `Inference` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NpuStack {
+    /// Arm China Zhouyi through CIX's NOE user-mode driver — the one stack
+    /// [`NpuRuntime`] drives, and the only one orangu executes graphs on.
+    Noe,
+    /// Rockchip RKNPU, seen through its kernel driver's sysfs node.
+    ///
+    /// Inventory as far as *this module* is concerned — it never opens the
+    /// device. `orangu-server`'s `engine::backend::rknpu` does, per matmul,
+    /// which is what `backend = npu` selects.
+    Rknpu,
+}
+
+/// One NPU, as the vendor runtime or the kernel driver describes it.
 ///
 /// The counts are a hierarchy, not three independent numbers: a device has
 /// partitions, each partition has clusters, each cluster has cores.
@@ -122,21 +178,54 @@ const LIBRARY_ENV: &str = "ORANGU_NPU_LIB";
 /// tree, since a machine with one partition — every one seen so far — makes
 /// the distinction invisible anyway, and the total is the figure a reader
 /// is actually after.
+///
+/// Most fields are [`Option`] because the two probes see genuinely different
+/// amounts: NOE is asked and answers, while a sysfs node only says what the
+/// device tree happens to declare. A `None` is "this source could not say",
+/// and prints no row at all — a fabricated `1` in an inventory is worse than
+/// a missing line, since the whole value of the report is being trusted.
 pub struct NpuInfo {
+    /// Which stack answered. See [`NpuStack`].
+    pub stack: NpuStack,
+    /// The device node userspace has to open to reach this NPU, where the
+    /// probe can name one.
+    ///
+    /// Reported so a caller can find out whether the device is *reachable*
+    /// without loading a vendor runtime to ask. `librknnrt` writes two lines
+    /// to stderr and gives up when it cannot open the node, which on a server
+    /// run by a user outside the `render` group is every start-up — and the
+    /// same question, asked of a different vendor's blob, is a segmentation
+    /// fault rather than a message (see
+    /// `engine::backend::opencl::vendor_device_is_openable`). Checking the
+    /// node first is cheap, silent, and answers for both.
+    ///
+    /// `None` from NOE, which reaches its device through a library and is
+    /// never told what is underneath it.
+    pub render_node: Option<PathBuf>,
     /// Who makes the accelerator, as a display string. Fixed per probe
     /// rather than queried: NOE drives Zhouyi parts and nothing else, so
-    /// reaching this struct through `libnoe` *is* the vendor answer.
+    /// reaching this struct through `libnoe` *is* the vendor answer, and the
+    /// same holds for an `rknpu` sysfs node.
     pub vendor: String,
     /// The hardware architecture string straight from `noe_get_target`,
-    /// e.g. `X2_1204MP3` — Zhouyi X2, configuration 1204, three cores.
+    /// e.g. `X2_1204MP3` — Zhouyi X2, configuration 1204, three cores — or,
+    /// for RKNPU, the part the device tree names (`RK3588 RKNPU`).
     pub target: String,
-    pub partitions: u32,
-    pub clusters: u32,
+    pub partitions: Option<u32>,
+    pub clusters: Option<u32>,
+    /// Always known: it is the one count both probes can establish, and the
+    /// startup banner prints it.
     pub cores: u32,
+    /// The kernel driver bound to the device, where the probe read one out
+    /// of sysfs. `None` from NOE, which talks to a user-mode library and is
+    /// never told what is underneath it.
+    pub driver: Option<String>,
     /// Which library file answered, so a report names the stack it actually
     /// talked to rather than leaving the reader to guess between a BSP
-    /// install and one on the loader path.
-    pub runtime: PathBuf,
+    /// install and one on the loader path. `None` when the device was found
+    /// without one — an RKNPU with no RKNN runtime installed is still an
+    /// RKNPU.
+    pub runtime: Option<PathBuf>,
 }
 
 /// The NOE entry points this probe needs, resolved out of an open library.
@@ -227,7 +316,230 @@ impl Noe {
     }
 }
 
-/// The machine's NPU, or `None` when it has none this knows how to see.
+/// Every NPU this machine has that orangu can *see*, for the report — not
+/// the narrower question of what it can run on.
+///
+/// Use this anywhere the answer is shown to a person (`orangu-server
+/// system`, `suggest`, the startup banner, the web UI's debug report), and
+/// [`detect_npu`] anywhere the answer gates work being dispatched to the
+/// device. The two are deliberately separate functions rather than one
+/// function with a flag: a Rockchip board returning an `NpuInfo` here must
+/// not send `npu_ffn` and `npu_tool` down the NOE path, and a future fifth
+/// execution gate should get that right by default.
+///
+/// NOE first, because it is the stack that can actually be used and a board
+/// carrying both would want to be described by the one orangu will drive.
+pub fn detect_npu_inventory() -> Option<NpuInfo> {
+    detect_npu().or_else(detect_rknpu)
+}
+
+/// Rockchip's RKNPU, read out of sysfs.
+///
+/// Sysfs rather than the vendor runtime, which is the opposite of the choice
+/// [`detect_npu`] makes, because here it is the better source. `librknnrt`
+/// has no "describe the device" entry point: every query it offers needs a
+/// context, and a context needs a compiled `.rknn` model, so asking the
+/// library what the hardware is would mean loading a model in order to print
+/// a report. The kernel driver meanwhile publishes the device and its device
+/// tree node unconditionally, which is exactly the question being asked.
+///
+/// Returns `None` on every non-Rockchip machine without touching anything
+/// but one `read_dir`, which is the same contract the rest of this module
+/// and [`crate::hardware`] have.
+#[cfg(target_os = "linux")]
+fn detect_rknpu() -> Option<NpuInfo> {
+    for entry in std::fs::read_dir(RKNPU_PLATFORM_DEVICES).ok()?.flatten() {
+        let device = entry.path();
+        let of_node = device.join("of_node");
+        let Some(compatible) = dt_strings(&of_node.join("compatible"))
+            .into_iter()
+            .find(|value| value.contains("rknpu"))
+        else {
+            continue;
+        };
+
+        // A device tree node with no driver bound to it is a node, not an
+        // NPU: the SoC's `.dtsi` declares one on every RK3588 board whether
+        // or not `status` enables it and whether or not the module is
+        // loaded. Reporting those would tell an operator the machine has an
+        // NPU when nothing can reach it.
+        let Some(driver) = std::fs::read_link(device.join("driver"))
+            .ok()
+            .and_then(|target| {
+                target
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+        else {
+            continue;
+        };
+
+        return Some(NpuInfo {
+            stack: NpuStack::Rknpu,
+            render_node: rknpu_render_node(&device),
+            vendor: "Rockchip".to_string(),
+            target: rknpu_target(&compatible),
+            // Neither concept exists on this part, and neither is anywhere
+            // in the device tree. See [`NpuInfo`] on why that is a `None`
+            // and not a `1`.
+            partitions: None,
+            clusters: None,
+            cores: rknpu_cores(&of_node),
+            driver: Some(driver),
+            runtime: rknpu_runtime(),
+        });
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detect_rknpu() -> Option<NpuInfo> {
+    // RKNPU is a Rockchip SoC block behind a Linux kernel driver; there is
+    // no sysfs to read anywhere else, and no other interface to fall back
+    // to.
+    None
+}
+
+/// The DRM render node the RKNPU driver registers, e.g.
+/// `/dev/dri/renderD129`.
+///
+/// Read from the device's own `drm/` directory rather than guessed at: the
+/// numbering depends on what else registered a DRM device first, and on this
+/// board the display controller takes `renderD128`. A node named there but
+/// missing from `/dev` is reported as `None` rather than as a path that cannot
+/// be opened.
+#[cfg(target_os = "linux")]
+fn rknpu_render_node(device: &std::path::Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(device.join("drm")).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(rest) = name.strip_prefix("renderD")
+            && rest.chars().all(|c| c.is_ascii_digit())
+        {
+            let node = PathBuf::from("/dev/dri").join(name.as_ref());
+            return node.exists().then_some(node);
+        }
+    }
+    None
+}
+
+/// Turns `rockchip,rk3588-rknpu` into `RK3588 RKNPU`.
+///
+/// Derived from the compatible string rather than looked up in a table of
+/// SoCs, so a part this was never run on (RK3576, and whatever follows it)
+/// is named correctly instead of reported as unknown. A string that does not
+/// split the way this expects falls back to the raw compatible, which is
+/// still a true statement about the device.
+#[cfg(target_os = "linux")]
+fn rknpu_target(compatible: &str) -> String {
+    let Some((_vendor, part)) = compatible.split_once(',') else {
+        return compatible.to_string();
+    };
+    match part.strip_suffix("-rknpu") {
+        Some(soc) if !soc.is_empty() => format!("{} RKNPU", soc.to_uppercase()),
+        _ => compatible.to_string(),
+    }
+}
+
+/// How many NPU cores the device tree declares.
+///
+/// Counted from the per-core names the node carries rather than hardcoded
+/// per SoC: an RK3588 lists `npu0_irq`/`npu1_irq`/`npu2_irq` and three
+/// `npu0`/`npu1`/`npu2` power domains for its three cores, an RK3568 lists
+/// one `npu_irq` for its one. Interrupts first because every binding has
+/// them; power domains as the fallback for a node that doesn't name its
+/// interrupts.
+///
+/// Falls back to 1, not 0: the probe only gets here having found a bound
+/// driver, so the device is real, and "1" is the floor for a real NPU rather
+/// than a guess at its width.
+#[cfg(target_os = "linux")]
+fn rknpu_cores(of_node: &std::path::Path) -> u32 {
+    for property in ["interrupt-names", "power-domain-names"] {
+        let cores = dt_strings(&of_node.join(property))
+            .iter()
+            .filter(|name| name.starts_with("npu"))
+            .count();
+        if cores > 0 {
+            return cores as u32;
+        }
+    }
+    1
+}
+
+/// The RKNN runtime, if one is installed — **reported here, never opened
+/// here**.
+///
+/// Existence is the whole question this module has: a report should not run a
+/// vendor library's initializers for a line of output it can read off the
+/// filesystem, and the answer it needs is only whether the userspace half of
+/// the stack is present. `engine::backend::rknpu` is what actually `dlopen`s
+/// it, through the shared [`rknn_runtime`] so the two cannot name different
+/// files.
+#[cfg(target_os = "linux")]
+fn rknpu_runtime() -> Option<PathBuf> {
+    rknn_runtime()
+}
+
+/// Where Rockchip's RKNN runtime is installed, if it is — **the one answer**,
+/// shared by this module's inventory probe and by `orangu-server`'s
+/// `engine::backend::rknpu`, which actually opens it.
+///
+/// Shared because the two must not be able to disagree: the report says which
+/// library is present and the backend binds one, and a machine where those are
+/// different files is a machine whose report is a lie. It also means
+/// `ORANGU_RKNN_LIB` is honoured identically by both without either having to
+/// know the other exists.
+///
+/// An override replaces the search rather than being tried first, the same rule
+/// [`LIBRARY_ENV`] has and for the same reason: a probe pointed at one library
+/// must not quietly succeed against another that happens to be installed.
+pub fn rknn_runtime() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(path) = std::env::var_os(RKNN_LIBRARY_ENV).filter(|p| !p.is_empty()) {
+            let path = PathBuf::from(path);
+            return path.is_file().then_some(path);
+        }
+        RKNPU_RUNTIME_CANDIDATES
+            .iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// Overrides [`rknn_runtime`]'s search with a single explicit path, for an SDK
+/// installed somewhere this doesn't guess — `ORANGU_NPU_LIB`'s counterpart for
+/// the Rockchip stack.
+pub const RKNN_LIBRARY_ENV: &str = "ORANGU_RKNN_LIB";
+
+/// Reads a device tree property that holds a NUL-separated list of strings
+/// (`compatible`, `interrupt-names`, ...) as those strings.
+///
+/// Empty — never an error — for a property that isn't there, which is the
+/// ordinary case for every node this walks past.
+#[cfg(target_os = "linux")]
+fn dt_strings(path: &std::path::Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    raw.split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// The machine's NOE-drivable NPU, or `None` when it has none this knows how
+/// to see.
+///
+/// **The execution gate**, not the inventory: this answers "is there a
+/// device orangu can run a graph on", and [`detect_npu_inventory`] answers
+/// "what accelerator does this machine have". A Rockchip board has the
+/// second and not the first.
 ///
 /// Never an error and never a panic: a missing library, a library that
 /// isn't NOE, a driver that refuses to initialize, and a board with no NPU
@@ -351,12 +663,17 @@ fn read_info(noe: &Noe, ctx: *mut c_void, runtime: PathBuf) -> Option<NpuInfo> {
     }
 
     Some(NpuInfo {
+        stack: NpuStack::Noe,
+        render_node: None,
         vendor: "Arm China".to_string(),
         target: target.to_string(),
-        partitions,
-        clusters,
+        partitions: Some(partitions),
+        clusters: Some(clusters),
         cores,
-        runtime,
+        // NOE is a user-mode library and never says what kernel module is
+        // underneath it, so there is nothing honest to put here.
+        driver: None,
+        runtime: Some(runtime),
     })
 }
 
@@ -1126,6 +1443,88 @@ mod tests {
         // SAFETY: as above.
         unsafe { std::env::remove_var(LIBRARY_ENV) };
         assert_eq!(candidates().len(), LIBRARY_CANDIDATES.len());
+    }
+
+    /// The inventory probe has the same contract as the execution one on a
+    /// machine with neither kind of device: it answers. It is called from the
+    /// startup banner, where a panic would take the server down before it
+    /// served anything.
+    #[test]
+    fn the_inventory_probe_answers_rather_than_failing_when_there_is_no_npu() {
+        let _ = detect_npu_inventory();
+    }
+
+    /// **An RKNPU is never reported as something orangu can run on.** The
+    /// whole reason the two probes are separate functions is that
+    /// `npu_ffn`/`npu_tool` gate real dispatch on `detect_npu`, so anything
+    /// that probe returns must be a NOE device — on a Rockchip board
+    /// included, where the inventory probe does find hardware.
+    #[test]
+    fn only_the_noe_stack_is_ever_reported_by_the_execution_gate() {
+        if let Some(npu) = detect_npu() {
+            assert_eq!(npu.stack, NpuStack::Noe);
+        }
+    }
+
+    /// The part name comes out of the compatible string, so a Rockchip SoC
+    /// this was never run on is still named correctly. A string that doesn't
+    /// split the expected way is reported verbatim rather than mangled into
+    /// a confident-looking wrong answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_rknpu_part_name_is_derived_from_the_compatible_string() {
+        // Verified against a real RK3588 (Orange Pi 5), whose node reports
+        // exactly this.
+        assert_eq!(rknpu_target("rockchip,rk3588-rknpu"), "RK3588 RKNPU");
+        assert_eq!(rknpu_target("rockchip,rk3568-rknpu"), "RK3568 RKNPU");
+        assert_eq!(rknpu_target("rockchip,rknpu"), "rockchip,rknpu");
+        assert_eq!(rknpu_target("rknpu"), "rknpu");
+    }
+
+    /// Device tree string-list properties are NUL-separated, trailing NUL
+    /// included, and a missing property is an ordinary empty answer — this
+    /// walks past every non-NPU node on the platform bus.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn device_tree_string_lists_are_split_on_nul_and_missing_ones_are_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("interrupt-names");
+        std::fs::write(&path, b"npu0_irq\0npu1_irq\0npu2_irq\0").unwrap();
+        assert_eq!(dt_strings(&path), ["npu0_irq", "npu1_irq", "npu2_irq"]);
+        assert!(dt_strings(&dir.path().join("absent")).is_empty());
+    }
+
+    /// Core count is counted from what the node declares rather than looked
+    /// up per SoC: three `npuN_irq` interrupts on an RK3588, one `npu_irq` on
+    /// an RK3568. Both shapes come from real bindings.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rknpu_cores_are_counted_from_the_nodes_own_per_core_names() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("interrupt-names"),
+            b"npu0_irq\0npu1_irq\0npu2_irq\0",
+        )
+        .unwrap();
+        assert_eq!(rknpu_cores(dir.path()), 3);
+
+        let single = tempfile::tempdir().unwrap();
+        std::fs::write(single.path().join("interrupt-names"), b"npu_irq\0").unwrap();
+        assert_eq!(rknpu_cores(single.path()), 1);
+    }
+
+    /// Power domains are the fallback for a node that doesn't name its
+    /// interrupts, and a node that names neither still reports the one core
+    /// it certainly has — the probe only reaches this with a bound driver.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rknpu_cores_fall_back_to_power_domains_then_to_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("power-domain-names"), b"npu0\0npu1\0").unwrap();
+        assert_eq!(rknpu_cores(dir.path()), 2);
+
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(rknpu_cores(bare.path()), 1);
     }
 
     /// A library that opens but isn't NOE resolves none of the entry points

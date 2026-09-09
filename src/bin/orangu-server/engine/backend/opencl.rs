@@ -97,6 +97,11 @@ fn kernel_source(ggml_type: u32) -> Option<String> {
 /// `type_complexity` lint.
 type WeightCacheKey = (usize, usize);
 
+/// Arm's kbase driver node. See [`OpenClBackend::vendor_device_is_openable`]
+/// for why this module knows about it at all.
+#[cfg(target_os = "linux")]
+const MALI_DEVICE: &str = "/dev/mali0";
+
 pub struct OpenClBackend {
     context: Context,
     queue: Mutex<CommandQueue>,
@@ -141,6 +146,9 @@ impl OpenClBackend {
         if cfg!(target_vendor = "apple") {
             return Vec::new();
         }
+        if !Self::vendor_device_is_openable() {
+            return Vec::new();
+        }
         let Ok(ids) = get_all_devices(CL_DEVICE_TYPE_GPU) else {
             return Vec::new();
         };
@@ -169,9 +177,54 @@ impl OpenClBackend {
             .collect()
     }
 
+    /// Whether the vendor driver's own device node can be opened — checked
+    /// **before** any OpenCL call, because on one real driver the answer to
+    /// "no" is a segmentation fault rather than an error.
+    ///
+    /// Arm's Mali userspace blob (`libmali.so.1`, symlinked as
+    /// `libOpenCL.so.1` on an RK3588) prints `failed to open device file
+    /// /dev/mali0 with errno 13 (Permission denied)` and then crashes inside
+    /// `get_all_devices` — taking `orangu-server` down during backend
+    /// selection, before it has served anything. A server run by a user who
+    /// is not in the `video` group is exactly that case, and it is the
+    /// ordinary case on a fresh install: the blob is system-wide, the group
+    /// membership is per user.
+    ///
+    /// Deliberately narrow. It guards only the node whose absence-of-a-check
+    /// was observed to crash, and only when that node **exists** — on any
+    /// machine without `/dev/mali0` this returns `true` and nothing about the
+    /// existing AMD/Intel/NVIDIA paths changes. That is the same shape as this
+    /// module's other carve-out, the Apple ICD that reports a device and then
+    /// segfaults on first use: a known-crashing driver is refused by name
+    /// rather than discovered the hard way.
+    ///
+    /// Opened read-write and immediately dropped, because read-only succeeds
+    /// on a node the driver still cannot use.
+    #[cfg(target_os = "linux")]
+    fn vendor_device_is_openable() -> bool {
+        let mali = std::path::Path::new(MALI_DEVICE);
+        !mali.exists()
+            || std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(mali)
+                .is_ok()
+    }
+
+    /// No kbase driver anywhere but Linux, so nothing to guard.
+    #[cfg(not(target_os = "linux"))]
+    fn vendor_device_is_openable() -> bool {
+        true
+    }
+
     /// [`Self::try_init`] against a specific device in [`Self::devices`]'s
     /// order.
     pub fn try_init_index(index: usize) -> Option<Self> {
+        // Both entry points, not just `devices`: `select_backend` calls them
+        // separately, and a crash in either is the same crash.
+        if !Self::vendor_device_is_openable() {
+            return None;
+        }
         // Apple's own OpenCL ICD reports a device but segfaults inside
         // clSetKernelArg on the first real matmul call (confirmed on Apple
         // Silicon). Refuse to initialize there rather than crash.
@@ -530,6 +583,37 @@ mod tests {
                 "index {i}: expected {e}, got {a} (ggml_type {ggml_type}, n_tokens {n_tokens})"
             );
         }
+    }
+
+    /// **Enumerating devices must not take the process down.** This is a
+    /// regression test for a real crash, not a smoke test: with Arm's Mali
+    /// blob installed as the system `libOpenCL.so`, a process that cannot open
+    /// `/dev/mali0` — any user outside the `video` group — segfaulted inside
+    /// `get_all_devices` during backend selection, before the server had
+    /// answered anything. A segmentation fault fails this test by killing the
+    /// runner, which is the only way a crash can be asserted against.
+    ///
+    /// It runs on every machine, including ones with no OpenCL at all, since
+    /// "returns an empty list" is the correct answer there and the crash being
+    /// guarded is in the enumeration itself.
+    #[test]
+    fn enumerating_devices_never_crashes_however_the_driver_feels() {
+        let _ = OpenClBackend::devices();
+        let _ = OpenClBackend::devices();
+    }
+
+    /// The device list and bring-up must agree, because `select_backend`
+    /// treats a listed device that then fails to initialize as a hard error
+    /// rather than a reason to try the next backend. The guard that skips an
+    /// unopenable driver has to be on both or it creates exactly that
+    /// mismatch.
+    #[test]
+    fn the_device_list_and_bring_up_agree_about_this_machine() {
+        assert_eq!(
+            OpenClBackend::devices().is_empty(),
+            shared_opencl().is_none(),
+            "devices() and try_init() must not disagree"
+        );
     }
 
     #[test]

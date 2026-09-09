@@ -516,8 +516,100 @@ pub fn detect_gpus(total_memory_bytes: u64) -> Vec<GpuInfo> {
         gpus.extend(detect_vulkan_gpus());
     }
 
+    // And when even *that* answers nothing, ask the kernel driver directly.
+    //
+    // The Vulkan fallback above assumes a loader and an ICD are installed,
+    // and on a board running Arm's own `mali` kbase driver neither is: Mesa
+    // has no Vulkan driver for kbase (its `panvk` drives the mainline
+    // `panfrost`/`panthor` interface instead), and the proprietary one ships
+    // with a BSP that most images don't include. An Orange Pi 5 (RK3588,
+    // Mali-G610) is exactly that machine — `/dev/mali0` and a `mali` platform
+    // driver, no `libvulkan` anywhere — and it reported no GPU at all, for
+    // the same reason the CIX board above did and one layer further down.
+    //
+    // Last in the chain rather than merged for the reason the Vulkan comment
+    // gives: this names the same device differently again ("Mali-G610" here,
+    // "Mali-G610 (Panfrost)" or a vendor string from Vulkan), so there is no
+    // key to join on. Filling a hole is safe; merging is not.
+    #[cfg(target_os = "linux")]
+    if gpus.is_empty() {
+        gpus.extend(detect_linux_platform_gpus());
+    }
+
     apply_shared_memory_total(&mut gpus, total_memory_bytes);
     gpus
+}
+
+/// Enumerates SoC GPUs that are platform devices rather than PCI ones, by
+/// reading the kernel driver's own description of them.
+///
+/// Only one such description is read today: `gpuinfo`, which Arm's kbase
+/// driver (`mali`, the `bifrost`/`midgard` vendor stack) publishes on its
+/// platform device as a single line — `Mali-G610 4 cores r0p0 0x0A080607`.
+/// That file *is* the driver's answer to "what is this chip", so it is both
+/// the most accurate source available on such a board and the cheapest.
+///
+/// Deliberately not a scan for anything that looks like a GPU. A platform
+/// bus on an SoC is full of nodes, and on this same RK3588 two of them are
+/// traps: `/sys/class/drm/card0` is the display controller (a scanout engine,
+/// not a GPU) and `card1` is the NPU, which registers a DRM render node of
+/// its own. Keying on a file only a GPU driver writes avoids inventing a
+/// GPU out of either — and a board whose driver publishes no such file
+/// reports no GPU, which is this module's standing contract.
+#[cfg(target_os = "linux")]
+fn detect_linux_platform_gpus() -> Vec<GpuInfo> {
+    let Ok(entries) = std::fs::read_dir("/sys/bus/platform/devices") else {
+        return Vec::new();
+    };
+
+    let mut gpus = Vec::new();
+    for entry in entries.flatten() {
+        let device = entry.path();
+        let Some(name) = mali_gpuinfo_name(&device.join("gpuinfo")) else {
+            continue;
+        };
+
+        gpus.push(GpuInfo {
+            vendor: "ARM".to_string(),
+            name,
+            // Left `None` for `apply_shared_memory_total` to fill with the
+            // real system total, the same as every other `Shared` source.
+            vram_total_bytes: None,
+            // kbase accounts its memory pools, not a VRAM-shaped total, and
+            // nothing it publishes is the figure this row means.
+            vram_used_bytes: None,
+            driver: std::fs::read_link(device.join("driver"))
+                .ok()
+                .and_then(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                }),
+            // An SoC GPU has no memory of its own at all: it reads the same
+            // DRAM the CPU does, so the ceiling is system RAM.
+            memory_kind: MemoryKind::Shared,
+        });
+    }
+    gpus
+}
+
+/// The model name out of a kbase `gpuinfo` line, or `None` for a file that
+/// isn't one.
+///
+/// `Mali-G610 4 cores r0p0 0x0A080607` — the first token is the part. The
+/// rest is deliberately dropped: the core count and revision have nowhere to
+/// go in [`GpuInfo`], and the `gpuinfo` format is the driver's, not a
+/// stable ABI, so parsing past the one field that is unambiguous buys
+/// fragility for no row of output.
+///
+/// Required to start with `Mali` rather than taken as-is, since that is the
+/// only shape this has been checked against; anything else is a file named
+/// `gpuinfo` that this does not understand, and inventing a GPU's name from
+/// it would be the one failure mode worse than missing the device.
+#[cfg(target_os = "linux")]
+fn mali_gpuinfo_name(path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let name = content.split_whitespace().next()?;
+    name.starts_with("Mali").then(|| name.to_string())
 }
 
 /// Enumerates GPUs through the Vulkan loader.
@@ -1239,18 +1331,45 @@ pub fn format_report(
             npu.vendor, npu.target
         ));
         out.push_str(&format!("  Cores            : {}\n", npu.cores));
-        out.push_str(&format!("  Clusters         : {}\n", npu.clusters));
-        out.push_str(&format!("  Partitions       : {}\n", npu.partitions));
-        out.push_str(&format!("  Runtime          : {}\n", npu.runtime.display()));
+        // Row per field the probe could actually answer. A sysfs probe knows
+        // nothing of clusters or partitions and a printed `1` would be a
+        // claim nobody made — see `npu::NpuInfo`.
+        if let Some(clusters) = npu.clusters {
+            out.push_str(&format!("  Clusters         : {clusters}\n"));
+        }
+        if let Some(partitions) = npu.partitions {
+            out.push_str(&format!("  Partitions       : {partitions}\n"));
+        }
+        if let Some(driver) = &npu.driver {
+            out.push_str(&format!("  Driver           : {driver}\n"));
+        }
+        if let Some(runtime) = &npu.runtime {
+            out.push_str(&format!("  Runtime          : {}\n", runtime.display()));
+        }
         // Scoped precisely, because an NPU row in a report about running
-        // models otherwise reads as a promise about *this* model. orangu can
-        // compile a layer for this device and execute it repeatedly — see
-        // `crate::npu_ort` and `crate::npu::NpuRuntime` — but it does not
-        // serve a GGUF model on it. Two reasons, both about the engine
-        // rather than the device: a graph is compiled for one fixed shape,
-        // and compiling cannot share a process with executing, so a serving
-        // path needs an ahead-of-time compile step that does not exist yet.
-        out.push_str("  Inference        : precompiled graphs (not GGUF models)\n");
+        // models otherwise reads as a promise about *this* model.
+        //
+        // On NOE, orangu can compile a layer for the device and execute it
+        // repeatedly — see `crate::npu_ort` and `crate::npu::NpuRuntime` —
+        // but it does not serve a GGUF model on it. Two reasons, both about
+        // the engine rather than the device: a graph is compiled for one
+        // fixed shape, and compiling cannot share a process with executing,
+        // so a serving path needs an ahead-of-time compile step that does
+        // not exist yet.
+        //
+        // On RKNPU the answer is the other way round and narrower than it
+        // looks: `engine::backend::rknpu` runs *matmuls* on the device, per
+        // call, which is what lets `backend = npu` serve an ordinary GGUF
+        // model — but only for the weights whose shape the device accepts,
+        // with `CpuBackend` behind it for the rest. Naming the backend is
+        // what makes the row actionable, since selecting it is a
+        // configuration decision and not something this probe can see.
+        out.push_str(match npu.stack {
+            crate::npu::NpuStack::Noe => {
+                "  Inference        : precompiled graphs (not GGUF models)\n"
+            }
+            crate::npu::NpuStack::Rknpu => "  Inference        : matmul offload (backend = npu)\n",
+        });
     }
 
     out
@@ -1425,12 +1544,15 @@ mod tests {
 
     fn npu() -> crate::npu::NpuInfo {
         crate::npu::NpuInfo {
+            stack: crate::npu::NpuStack::Noe,
+            render_node: None,
             vendor: "Arm China".to_string(),
             target: "X2_1204MP3".to_string(),
-            partitions: 1,
-            clusters: 1,
+            partitions: Some(1),
+            clusters: Some(1),
             cores: 3,
-            runtime: std::path::PathBuf::from("/usr/share/cix/lib/libnoe.so.0"),
+            driver: None,
+            runtime: Some(std::path::PathBuf::from("/usr/share/cix/lib/libnoe.so.0")),
         }
     }
 
@@ -1538,6 +1660,91 @@ mod tests {
         // (Renoir, doesn't) on the same machine.
         assert_eq!(linux_memory_kind(true), MemoryKind::Dedicated);
         assert_eq!(linux_memory_kind(false), MemoryKind::Shared);
+    }
+
+    /// The one field of kbase's `gpuinfo` line this parses, against the exact
+    /// text a real RK3588 (Orange Pi 5, Mali-G610) publishes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mali_gpuinfo_line_yields_the_part_name_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gpuinfo");
+        std::fs::write(&path, "Mali-G610 4 cores r0p0 0x0A080607\n").unwrap();
+        assert_eq!(mali_gpuinfo_name(&path).as_deref(), Some("Mali-G610"));
+    }
+
+    /// **A file named `gpuinfo` that isn't kbase's is not a GPU.** The scan
+    /// walks a platform bus full of unrelated nodes, and naming a device out
+    /// of a format this has never seen would be worse than missing it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_gpuinfo_file_that_is_not_malis_is_rejected_rather_than_guessed_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("gpuinfo");
+        std::fs::write(&other, "some-other-block 1 unit\n").unwrap();
+        assert_eq!(mali_gpuinfo_name(&other), None);
+        assert_eq!(mali_gpuinfo_name(&dir.path().join("absent")), None);
+
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, "\n").unwrap();
+        assert_eq!(mali_gpuinfo_name(&empty), None);
+    }
+
+    /// Whatever this machine is, asking it for GPUs answers — the platform
+    /// scan added for SoC boards runs on every Linux machine and reads a
+    /// directory that may not exist at all.
+    #[test]
+    fn detecting_gpus_answers_rather_than_failing_on_any_machine() {
+        let _ = detect_gpus(16 * 1024 * 1024 * 1024);
+    }
+
+    /// **A sysfs-probed device claims only what sysfs said.** The rows that
+    /// probe has no answer for are absent rather than filled with a
+    /// plausible `1`, and the `Inference` row names how the device is
+    /// reached — which for RKNPU is a backend an operator has to select,
+    /// so the row names it.
+    #[test]
+    fn a_sysfs_probed_npu_omits_what_it_cannot_say_and_names_how_it_is_reached() {
+        let npu = crate::npu::NpuInfo {
+            stack: crate::npu::NpuStack::Rknpu,
+            render_node: None,
+            vendor: "Rockchip".to_string(),
+            target: "RK3588 RKNPU".to_string(),
+            partitions: None,
+            clusters: None,
+            cores: 3,
+            driver: Some("RKNPU".to_string()),
+            runtime: Some(std::path::PathBuf::from("/usr/lib/librknnrt.so")),
+        };
+        let cpu = detect_cpu();
+        let report = format_report(
+            &crate::os::detect(),
+            &cpu,
+            &[],
+            Some(&npu),
+            &PowerInfo::default(),
+        );
+
+        assert!(
+            report.contains("  Model            : Rockchip RK3588 RKNPU\n"),
+            "report:\n{report}"
+        );
+        assert!(
+            report.contains("  Cores            : 3\n"),
+            "report:\n{report}"
+        );
+        assert!(
+            report.contains("  Driver           : RKNPU\n"),
+            "report:\n{report}"
+        );
+        assert!(
+            report.contains("  Inference        : matmul offload (backend = npu)\n"),
+            "report:\n{report}"
+        );
+        assert!(
+            !report.contains("Clusters") && !report.contains("Partitions"),
+            "a sysfs probe knows neither and must invent neither, report:\n{report}"
+        );
     }
 
     #[cfg(target_os = "macos")]
