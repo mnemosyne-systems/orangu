@@ -35,9 +35,9 @@ beside the built-in ones. orangu connects; it does not launch them.
 | Command | What it does |
 | --- | --- |
 | `orangu-coordinator` | An HTTP proxy that swaps `orangu-server` models on demand — one GPU, a different model per role. |
-| `orangu-server bundle <model>` | One executable carrying the server and its model: copy it over and run it. |
+| `orangu-server` | `list` what is installed — `delete`, `refresh`, `-d` detached; `bundle` ships server and model as one file. |
 | `orangu-bench` | Benchmark a model or a server — throughput, latency, and quality. |
-| `orangu-server list` | What is installed; `delete` removes one, `refresh` re-fetches it, `-d` runs detached. |
+| `orangu-gguf` | Build a model: train one from a manifest, or re-quantize one you have. |
 | Web console | `orangu-server -i` offers it on port 8101: models, load and requests, in a browser. |
 | GPU backends | Vulkan, Metal, CUDA, ROCm, OpenCL — or plain CPU. Pure Rust either way. |
 

@@ -10,8 +10,8 @@ download and the server read the models directory the wizard writes, and
 curl -fsSL https://mnemosyne-systems.github.io/orangu/install.sh | sh
 ```
 
-Installs `orangu`, `orangu-coordinator`, `orangu-server` and `orangu-bench`
-into `~/.local/bin`. On Windows: `install.cmd`.
+Installs `orangu`, `orangu-coordinator`, `orangu-server`, `orangu-bench` and
+`orangu-gguf` into `~/.local/bin`. On Windows: `install.cmd`.
 
 | Command | What it does |
 | --- | --- |
