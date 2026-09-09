@@ -523,6 +523,8 @@ Merges a branch into the current branch.
 
 If `gh` is installed it uses `gh pr merge --merge`; otherwise it uses `git merge`.
 
+When the merge stops on conflicts, `/create_patch` resolves them: it hands the model every unmerged path, has it reconstruct the intended combined behavior, and stages the result. It leaves the merge itself for you to commit or abort. See the Core tools chapter.
+
 **Examples**
 
 ```text
@@ -549,6 +551,8 @@ A target argument rebases onto a specific branch, resolved against the configure
 - A local branch (or any committish) is handed straight to `git rebase <target>` without contacting a remote.
 - A remote-tracking branch such as `origin/main` — whose first segment is a configured remote — is refreshed with `git fetch <remote> <branch>` and rebased onto the updated `<remote>/<branch>`.
 - A bare remote name such as `origin` resolves the remote's default branch (from `refs/remotes/<remote>/HEAD`, falling back to `main` then `master`) and rebases onto it, refreshing it first.
+
+A rebase that stops on conflicts is handled by `/create_patch`, which resolves and stages the unmerged paths and leaves `git rebase --continue` (or `--abort`) to you. See the Core tools chapter.
 
 Tab completion after `/rebase ` (or the natural-language forms `rebase ` / `git rebase `) offers, in order, local branch names (from `git branch`), then the configured remotes (from `git remote`, with `origin` floated to the front), then the remote-tracking branches (from `git branch --all`, e.g. `origin/main`). The first local branch is previewed as the grey inline ghost.
 
@@ -577,6 +581,8 @@ git rebase origin/main
 Cherry-picks a commit onto the current branch with `git cherry-pick`.
 
 `gh` has no equivalent, so it always uses plain Git. Tab completion offers abbreviated commit hashes from the default branch (`origin/main`, `origin/master`, `main`, or `master`, tried in that order).
+
+As with `/merge` and `/rebase`, `/create_patch` resolves and stages the conflicts a stopped cherry-pick leaves behind. See the Core tools chapter.
 
 **Examples**
 

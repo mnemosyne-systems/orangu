@@ -186,6 +186,7 @@ Then start with:
 /shell ls -la
 /create_file README.md
 /auto_review
+/create_patch
 /amend "[#42] My feature"
 /branch main
 /branch -b feature/new
@@ -251,6 +252,14 @@ auto review
 orangu reviews the whole change and each file across the Overall, Code, Security, Memory, Performance, Test Suite, and Documentation categories, marks every file with a green or red dot, and ends with an `orangu approves/rejects this patch` verdict. When the run finishes you can override any verdict and remove findings before the report lands on the clipboard.
 
 > The branch must be rebased up to date first — if it is behind, orangu points you at `/rebase`. If you review with a *thinking* model and the answers look truncated, raise `review_max_tokens` in `[orangu]` (e.g. `2048`); see the Configuration chapter.
+
+Neither reviewer touches your code. To act on what it found, run:
+
+```text
+create patch
+```
+
+The model gets the findings of whichever review ran last, checks each one against the current code, fixes the valid ones, and reports anything it deliberately left alone. It edits the working tree and never commits, so `/diff` shows you exactly what it did. The same command resolves the conflicts of an in-progress merge, rebase, or cherry-pick, with or without a review to go with them.
 
 Share the result without leaving the terminal:
 

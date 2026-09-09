@@ -47,6 +47,8 @@ Two groups of commands are refused rather than run, with a message saying which 
 - Commands whose only effect is on the running session — `/model`, `/server`, `/theme <name>`, `/license <spdx>`, `/verbosity`, `/disconnect`, `/reload` — since a one-shot exits before the change could matter. (`/license` with no argument still reports; it is only *setting* one that a one-shot cannot keep.) Select the server and model in `orangu.conf`, or point `--config` at a different file.
 - Commands that need the terminal interface — `/review`, `/auto_review`, `/manual`, `/pending`, `/clear`, `/copy`, `/quit`, `/restart`, and the forms of `/workspace`, `/create_workspace`, and `/session` that switch tab or session. The reporting forms still work: a bare `/workspace` prints the active workspace, and a bare `/session` lists the stored sessions.
 
+`/create_patch` is not in either group: a one-shot has no stored review report, but it still resolves the conflicts of an in-progress merge, rebase, or cherry-pick, which is what makes `orangu -p "/create_patch"` usable from a script that hits one.
+
 `/export` covers the targets that are computed at export time: `pr`, `statistics`, and `duplicates`. `console`, `review`, and `auto review` export what an interactive session accumulated, and report that there is nothing to export.
 
 ### Quiet mode

@@ -10,6 +10,7 @@ copy the report to the clipboard on exit.
 | `/auto_review` | The model reviews the branch and each file, and marks every file green or red. |
 | `/auto_review src/tui.rs` `all` | One file, or every Git-tracked file in the project. |
 | `is this thread-safe?` | Type a question in either view and press Enter to ask about the selected file. |
+| `/create_patch` | Hands the finished report to the model, which verifies each finding and fixes it in the working tree. Never commits. |
 
 ## Keys, in both views
 
@@ -43,6 +44,7 @@ One rebased commit, pushed, then a pull request — which is exactly what
 | `/push` | `git push origin <branch>`. `--force` works, but never on `main` or `master`. |
 | `/pull_request` | Push with upstream and open the pull request from the commit message. Needs `gh`. |
 | `/pull 42` `/merge feature/login` | Check out someone's pull request; merge a branch. |
+| `/create_patch` | Resolve the conflicts a stopped merge, rebase or cherry-pick left behind, and stage them. No review needed. |
 | `/close -i 42` `/issue reviewer 114 <user>` | Close an issue; add a reviewer, assignee or label. |
 
 Set `auto_rebase = on` and `auto_squash = on` in `[orangu]` to have the
