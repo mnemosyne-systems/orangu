@@ -1103,11 +1103,11 @@ impl GraphExtractor {
             let mut acc = Vec::new();
             while let Some(m) = matches.next() {
                 let name_cap = m
-                    .captures
+                    .captures()
                     .iter()
                     .find(|c| queries.defs.capture_names()[c.index as usize] == "name");
                 let def_cap = m
-                    .captures
+                    .captures()
                     .iter()
                     .find(|c| queries.defs.capture_names()[c.index as usize] != "name");
                 if let (Some(nc), Some(dc)) = (name_cap, def_cap) {
@@ -1128,7 +1128,7 @@ impl GraphExtractor {
             let mut acc = Vec::new();
             while let Some(m) = matches.next() {
                 let callee_cap = m
-                    .captures
+                    .captures()
                     .iter()
                     .find(|c| queries.calls.capture_names()[c.index as usize] == "callee");
                 if let Some(cap) = callee_cap {
@@ -1148,7 +1148,7 @@ impl GraphExtractor {
             let mut acc = Vec::new();
             while let Some(m) = matches.next() {
                 let import_cap = m
-                    .captures
+                    .captures()
                     .iter()
                     .find(|c| queries.imports.capture_names()[c.index as usize] == "import_path");
                 if let Some(cap) = import_cap {
