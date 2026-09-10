@@ -61,7 +61,7 @@ if exist "!TMP!\out\!CHEATSHEET!" (
 
 rd /s /q "!TMP!" >nul 2>&1
 echo Installed the orangu stack to !INSTALL_DIR!:
-echo   orangu.exe  orangu-coordinator.exe  orangu-server.exe  orangu-bench.exe
+echo   orangu.exe  orangu-coordinator.exe  orangu-server.exe  orangu-bench.exe  orangu-gguf.exe
 if defined CHEATSHEET_INSTALLED echo Setup, coding, review, merge and push on four pages: !DOC_DIR!\!CHEATSHEET!
 echo Run "orangu --help" to get started.
 echo Run "orangu -s" and add the output to your PowerShell $PROFILE for completions.
