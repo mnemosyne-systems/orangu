@@ -1294,6 +1294,17 @@ async fn run() -> Result<()> {
             }
         }
 
+        // A merge flow that has run its course leaves the cached open requests
+        // stale (the request it landed is already dropped from them), so fetch
+        // them again — unless a fetch is still in flight, in which case the
+        // request is left for the next pass.
+        if pr_handle.is_none() && completion::flow::take_refresh_request() {
+            pr_handle = discover_git_root(tools.workspace()).map(|_| {
+                let w = tools.workspace().to_path_buf();
+                tokio::task::spawn_blocking(move || fetch_active_pull_requests(&w, forge))
+            });
+        }
+
         // Collect the startup pull-request fetch once it finishes, caching the
         // open requests in memory for later use (e.g. `/pull` completion).
         if pr_handle

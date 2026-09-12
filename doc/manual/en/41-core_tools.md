@@ -111,15 +111,21 @@ merge <BRANCH_NAME>
 push
 delete <BRANCH_NAME>
 comment on <PR_NUMBER> merged.md
+close pr <PR_NUMBER>            (only after a rebase on the pulled branch)
+close issue <ISSUE_NUMBER>      (only after a rebase, when a commit names an issue)
 ```
 
 `pull` remembers the request number and the branch it checked out, so the following steps are hinted with the real names — `merge pr-231`, not a placeholder. Each step advances only when the command it hints actually succeeds, so a failed merge keeps the merge on offer.
+
+A request that needs a rebase (`pull` says so) gets two more steps once `rebase` has been run on its branch: rebasing rewrites the commits, so the forge no longer recognises the merge as the request's and leaves it open. After the comment the flow therefore hints `close pr <PR_NUMBER>`, and — when the request refers to an issue, as `[#45]`, `#45`, or `issue 45` in the subject of one of its commits or, failing that, in its title — `close issue 45` after that. A request merged as it was pulled ends with the comment, as the forge closes it itself.
+
+Once the last step has run, the request is dropped from the open requests the empty prompt offers to `pull`, and the list is fetched again in the background.
 
 `build`, `review`, and `auto review` are offered as optional steps while the pulled branch is still checked out — what you would reasonably do to a request before taking it to the base branch. They are never the first suggestion, and running one advances nothing: the flow is remembered across them, so the next auto-suggestion is still the step the request is waiting on. They stop being offered once the flow has left the branch.
 
 Within the mode the flow comes first everywhere the prompt suggests something: as the inline ghost, in the `Shift+Tab` cycle, and in the `Tab` candidate list, where the rest of the flow follows the current step so a step can be skipped by cycling past it. The remembered branch and request number also lead the argument completions for `merge `, `delete `, `switch to `, and `comment on `. Nothing is hidden — workspace files, branches, and the natural-language bindings still follow. See **The merge flow** in the Terminal chapter for the full behaviour.
 
-The flow belongs to the workspace it was started in, so other workspace tabs are unaffected. Checking out a branch that is neither the request's nor the base ends it, as does commenting on the request. Steps taken in developer mode are still tracked, so `/committer` picks up where the branch actually is.
+The flow belongs to the workspace it was started in, so other workspace tabs are unaffected. Checking out a branch that is neither the request's nor the base ends it, as does its last step — the comment, or the closing steps after a rebase. Steps taken in developer mode are still tracked, so `/committer` picks up where the branch actually is.
 
 The comment body comes from `~/.orangu/comments/merged.md`, like any other `/comment` template.
 

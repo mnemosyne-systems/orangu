@@ -38,6 +38,27 @@ pub fn set_active_pull_requests(requests: &[PullRequest]) {
         .collect();
 }
 
+/// Drop one request from the cache: the merge flow has landed it, so the prompt
+/// must stop offering `pull <number>` for it before the refetch that follows
+/// (see `crate::completion::flow::take_refresh_request`) has had time to run.
+pub fn remove_active_pull_request(number: u64) {
+    let mut guard = ACTIVE_PULL_REQUESTS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|(cached, _)| *cached != number);
+}
+
+/// The cached title of open pull/merge request `number`, or `None` when it is
+/// not among the requests fetched at startup.
+pub(crate) fn pull_request_title(number: u64) -> Option<String> {
+    ACTIVE_PULL_REQUESTS
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|(cached, _)| *cached == number)
+        .map(|(_, title)| title.clone())
+}
+
 /// The cached open pull/merge request numbers whose decimal spelling starts with
 /// `token`, as the strings `/pull` completion inserts. Numeric order, so the
 /// lowest matching number is offered first.
@@ -278,6 +299,15 @@ mod tests {
         assert!(pull_number_candidates("7").is_empty());
         // Empty token offers every cached number.
         assert_eq!(pull_number_candidates(""), vec!["9", "58", "90"]);
+        // The title travels with the number.
+        assert_eq!(pull_request_title(58).as_deref(), Some("Fix rebase"));
+        assert_eq!(pull_request_title(7), None);
+        // A landed request drops out; the others are untouched.
+        remove_active_pull_request(58);
+        assert_eq!(pull_number_candidates(""), vec!["9", "90"]);
+        assert_eq!(pull_request_title(58), None);
+        remove_active_pull_request(7);
+        assert_eq!(pull_number_candidates(""), vec!["9", "90"]);
         set_active_pull_requests(&[]);
     }
 

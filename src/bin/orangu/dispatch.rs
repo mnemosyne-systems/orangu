@@ -1326,7 +1326,10 @@ pub(crate) fn handle_command(
             close_usage_message().to_string(),
         )),
         LocalCommand::Close(Some(target)) => match close_output(workspace, &target, forge) {
-            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Ok(output) => {
+                completion::flow::note_close(&target);
+                Ok(CommandOutcome::Output(output))
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Issue(None) => Ok(CommandOutcome::OutputError(
@@ -1352,7 +1355,12 @@ pub(crate) fn handle_command(
             })))
         }
         LocalCommand::Rebase(target) => match rebase_output(workspace, target.as_deref(), forge) {
-            Ok(_) => Ok(CommandOutcome::Quiet),
+            // Rebasing the pulled branch is what adds the closing steps to
+            // the merge flow: the forge will not close the request itself.
+            Ok(_) => {
+                completion::flow::note_rebase(workspace);
+                Ok(CommandOutcome::Quiet)
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Merge(None) => Ok(CommandOutcome::OutputError(

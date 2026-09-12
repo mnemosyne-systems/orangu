@@ -276,15 +276,19 @@ merge <BRANCH_NAME>
 push
 delete <BRANCH_NAME>
 comment on <PR_NUMBER> merged.md
+close pr <PR_NUMBER>            (only after a rebase on the pulled branch)
+close issue <ISSUE_NUMBER>      (only after a rebase, when a commit names an issue)
 ```
 
 - Before a request is checked out, the empty prompt hints `pull <PR_NUMBER>` for the open pull/merge requests fetched at startup; `Shift+Tab` cycles through them.
 - While the pulled branch is still checked out, `build`, `review`, and `auto review` are offered too — the things worth doing to a request before taking it to the base branch. They are never the first suggestion and they never advance anything: the flow is remembered across them, so after a build or a review the prompt still opens with `switch to main`. They drop off the list once the flow has left the branch.
 - `pull` remembers the request number and the branch it checked out. From then on the empty prompt hints the next step — `switch to main`, then `merge <BRANCH_NAME>`, `push`, `delete <BRANCH_NAME>`, and finally `comment on <PR_NUMBER> merged.md` (the body is read from `~/.orangu/comments/merged.md`, like any other comment template).
 - Each step advances only when the command it hints actually succeeds, so a failed merge keeps the merge on offer.
+- Running `rebase` on the pulled branch adds the closing steps: the forge cannot tie a merge of rewritten commits to the request, so after the comment the flow hints `close pr <PR_NUMBER>`, and then `close issue <ISSUE_NUMBER>` when the request refers to an issue (`[#45]`, `#45`, `issue 45`) in the subject of one of its commits or, failing that, in its title. Without a rebase the comment is the last step.
+- When the last step has run, the request is dropped from the `pull <PR_NUMBER>` suggestions at once and the open requests are fetched again in the background, so the empty prompt never offers to pull a request that has just been merged.
 - The steps come first everywhere the prompt suggests something: as the inline ghost, in the `Shift+Tab` cycle, and in the `Tab` candidate list — where the rest of the flow follows the current step, so a step can be skipped by cycling past it. Nothing is hidden: workspace files and the natural-language bindings still follow.
-- While a request is being merged, its branch also leads the argument completions — `merge `, `delete `, and `switch to ` offer the remembered branch and the base branch first, and `comment on ` offers the request number and `merged.md` first. Every other candidate is still listed, just after them.
-- The flow belongs to the workspace it was started in, so other workspace tabs are not hinted at its branches. Checking out a branch that is neither the request's nor the base ends it, as does commenting on the request.
+- While a request is being merged, its branch also leads the argument completions — `merge `, `delete `, and `switch to ` offer the remembered branch and the base branch first, and `comment on ` and `close pr ` offer the request number (and `merged.md`) first. Every other candidate is still listed, just after them.
+- The flow belongs to the workspace it was started in, so other workspace tabs are not hinted at its branches. Checking out a branch that is neither the request's nor the base ends it, as does its last step.
 - Steps run in developer mode are still tracked, so `/committer` picks up where the branch actually is instead of starting over.
 
 ### Tab completion

@@ -937,6 +937,25 @@ pub fn git_squash(repo_root: &Path) -> Result<String> {
     Ok(format!("Squashed {count} commits into '{current}'"))
 }
 
+/// The subject line of every commit the checked-out branch adds on top of
+/// `base_ref`, newest first. Empty when there are none or `git log` fails.
+pub fn git_branch_subjects(repo_root: &Path, base_ref: &str) -> Vec<String> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["log", "--format=%s", &format!("{base_ref}..HEAD")])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn git_find_base_ref(repo_root: &Path) -> Result<String> {
     for branch in ["origin/main", "origin/master"] {
         let check = std::process::Command::new("git")
