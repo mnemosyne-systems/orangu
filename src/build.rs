@@ -44,6 +44,32 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ORANGU_BUILD_COMMIT");
 
     println!("cargo:rustc-env=ORANGU_BUILD_COMMIT={}", commit());
+
+    // Reported by `orangu_server_build_info`. Cargo always sets `TARGET` and
+    // `PROFILE` for a build script; `rustc` is asked for its own version and
+    // reports `unknown` if it can't answer, like the commit.
+    println!("cargo:rustc-env=ORANGU_BUILD_RUSTC={}", rustc_version());
+    println!(
+        "cargo:rustc-env=ORANGU_BUILD_PROFILE={}",
+        std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string())
+    );
+    println!(
+        "cargo:rustc-env=ORANGU_BUILD_TARGET={}",
+        std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string())
+    );
+}
+
+/// `1.91.0` from `rustc 1.91.0 (f8297e351 2025-10-28)`.
+fn rustc_version() -> String {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    Command::new(rustc)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.split_whitespace().nth(1).map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The short commit, with `-dirty` appended when tracked files differ from it.

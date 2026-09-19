@@ -70,6 +70,8 @@ pub struct AppState {
     /// see which tree it is talking to.
     pub workspace: PathBuf,
     pub started_at: Instant,
+    /// Build, host, process and in-flight-request metrics for `/metrics`.
+    pub process_metrics: Arc<crate::engine::metrics::ProcessMetrics>,
     pub shutdown_tx: mpsc::Sender<()>,
 }
 
@@ -225,7 +227,8 @@ pub fn reject_oversized_context(prompt_tokens: usize) -> Option<Response> {
 }
 
 pub fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let metrics = state.process_metrics.clone();
+    let router = Router::new()
         .route("/health", get(native::health))
         .route("/ready", get(native::ready))
         .route("/props", get(native::props))
@@ -255,6 +258,77 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             state.clone(),
             require_api_key,
         ))
+        .with_state(state);
+    count_requests(router, metrics)
+}
+
+/// Adds request counting to a listener's router, for `orangu_server_http_requests`.
+/// The API and the web console get it; the dedicated metrics listener does not,
+/// so scraping it never shows up in the figures.
+pub fn count_requests(
+    router: Router,
+    metrics: Arc<crate::engine::metrics::ProcessMetrics>,
+) -> Router {
+    router.layer(axum::middleware::from_fn_with_state(
+        metrics,
+        count_in_flight,
+    ))
+}
+
+/// Holds a request in flight until its response *body* has been sent or
+/// dropped, not just until the headers are ready: a streamed completion is
+/// in flight for as long as it is generating. Also tallies the status, for
+/// requests the key check turns away as much as for the rest.
+async fn count_in_flight(
+    State(metrics): State<Arc<crate::engine::metrics::ProcessMetrics>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let guard = metrics.track_request();
+    let response = next.run(request).await;
+    metrics.record_response(response.status().as_u16());
+    let (parts, body) = response.into_parts();
+    Response::from_parts(
+        parts,
+        axum::body::Body::new(TrackedBody {
+            inner: body,
+            _guard: guard,
+        }),
+    )
+}
+
+struct TrackedBody {
+    inner: axum::body::Body,
+    _guard: crate::engine::metrics::InFlightGuard,
+}
+
+impl http_body::Body for TrackedBody {
+    type Data = <axum::body::Body as http_body::Body>::Data;
+    type Error = <axum::body::Body as http_body::Body>::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// The dedicated metrics listener's router (see `main.rs`) — `/metrics` and
+/// a static landing page at `/`, with no [`require_api_key`] layer. Keep it
+/// that way: don't merge this into [`build_router`] or add other routes to it.
+pub fn build_metrics_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(native::metrics_index))
+        .route("/metrics", get(native::metrics))
         .with_state(state)
 }
 
@@ -278,6 +352,53 @@ async fn shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Requests through a counted router show up in the figures, whichever
+    /// status they get, and none is left in flight once it has been answered.
+    #[tokio::test]
+    async fn counted_routers_tally_requests_by_status() {
+        let metrics = Arc::new(crate::engine::metrics::ProcessMetrics::new());
+        let router = count_requests(
+            Router::new().route("/ok", get(|| async { "hi" })),
+            metrics.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        for path in ["ok", "ok", "missing"] {
+            let response = reqwest::get(format!("http://{addr}/{path}")).await.unwrap();
+            response.bytes().await.unwrap();
+        }
+
+        // The guard drops as the server finishes with the body, which can be a
+        // moment after the client has finished reading it.
+        for _ in 0..50 {
+            if metrics.in_flight() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let body = metrics.render(std::time::Duration::ZERO);
+        for expected in [
+            "orangu_server_http_requests{stat=\"in_flight\"} 0
+",
+            "orangu_server_http_requests{stat=\"total\"} 3
+",
+            "orangu_server_http_requests{stat=\"client_errors\"} 1
+",
+            "orangu_server_http_requests{stat=\"server_errors\"} 0
+",
+        ] {
+            assert!(
+                body.contains(expected),
+                "{expected}
+{body}"
+            );
+        }
+    }
 
     /// The probes stay reachable without a key, and nothing else does.
     ///

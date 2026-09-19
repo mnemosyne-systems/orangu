@@ -219,6 +219,11 @@ struct ListenFlags {
     /// (8200).
     #[arg(long)]
     web: Option<u16>,
+    /// Port a dedicated /metrics listener binds to, or 0 to disable it (the
+    /// default). Serving, it overrides [prometheus].port; on
+    /// `bundle`, it is the bundle's own default.
+    #[arg(long)]
+    metrics: Option<u16>,
 }
 
 impl ListenFlags {
@@ -229,6 +234,7 @@ impl ListenFlags {
             host: self.host.clone(),
             port: self.port,
             web: self.web,
+            metrics: self.metrics,
         }
     }
 
@@ -240,6 +246,7 @@ impl ListenFlags {
             host: self.host.clone().or_else(|| other.host.clone()),
             port: self.port.or(other.port),
             web: self.web.or(other.web),
+            metrics: self.metrics.or(other.metrics),
         }
     }
 }
@@ -678,6 +685,7 @@ fn main() -> ExitCode {
         host: args.listen.host.clone(),
         api: args.listen.port,
         web: args.listen.web,
+        metrics: args.listen.metrics,
     };
     let prepared = match prepare(args) {
         Ok(prepared) => prepared,
@@ -811,6 +819,9 @@ struct Prepared {
     workspace: PathBuf,
     api_listener: std::net::TcpListener,
     web_listener: Option<std::net::TcpListener>,
+    /// Bound when `[prometheus].port` (or `--metrics`) names a
+    /// non-zero port; `None` — the default — otherwise.
+    metrics_listener: Option<std::net::TcpListener>,
 }
 
 /// Which model this process is about to serve, and where its bytes are.
@@ -1874,6 +1885,25 @@ fn prepare(args: Args) -> Result<Prepared> {
         None
     };
 
+    // `[prometheus].port`/`--metrics`. `0` (the default) binds nothing.
+    // Like the console, it follows `--host` only when `[prometheus].host` was
+    // not set explicitly.
+    let metrics_host = match conf.metrics_host_explicit {
+        true => conf.metrics_host.as_str(),
+        false => host,
+    };
+    let metrics_port = args.listen.metrics.unwrap_or(conf.metrics);
+    let metrics_listener = if metrics_port != 0 {
+        let metrics_addr = format!("{}:{metrics_port}", config::resolve_bind_host(metrics_host));
+        let listener = reexec::adopt_or_bind(inherited.metrics, &metrics_addr)?;
+        listener
+            .set_nonblocking(true)
+            .with_context(|| format!("failed to configure metrics listener on {metrics_addr}"))?;
+        Some(listener)
+    } else {
+        None
+    };
+
     if args.daemon {
         daemonize().context("failed to start as a daemon")?;
     }
@@ -1903,6 +1933,7 @@ fn prepare(args: Args) -> Result<Prepared> {
             host: args.listen.host.clone(),
             api: args.listen.port,
             web: args.listen.web,
+            metrics: args.listen.metrics,
         },
         role,
         reexec: conf.reexec,
@@ -1918,6 +1949,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         workspace,
         api_listener,
         web_listener,
+        metrics_listener,
     })
 }
 
@@ -2347,6 +2379,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         workspace,
         api_listener,
         web_listener,
+        metrics_listener,
     } = prepared;
 
     // A handle to the pool taken before `engine` is moved into the router's
@@ -2376,6 +2409,13 @@ async fn serve(prepared: Prepared) -> Result<()> {
         ),
         None => None,
     };
+    let metrics_listener = match metrics_listener {
+        Some(l) => Some(
+            tokio::net::TcpListener::from_std(l)
+                .context("failed to attach metrics listener to the async runtime")?,
+        ),
+        None => None,
+    };
 
     // How the model is *named* to a human — `MODEL:QUANT`, so which of a
     // repo's quantizations is actually loaded is visible at a glance. Kept
@@ -2402,8 +2442,12 @@ async fn serve(prepared: Prepared) -> Result<()> {
         wgpu_backend: wgpu_backend.clone(),
         workspace: workspace.clone(),
         started_at: std::time::Instant::now(),
+        process_metrics: Arc::new(engine::metrics::ProcessMetrics::new()),
         shutdown_tx,
     });
+    // Cloned before `build_router` consumes `state`, for `build_metrics_router` below.
+    let metrics_state = state.clone();
+    let process_metrics = state.process_metrics.clone();
     let app = http::build_router(state);
 
     // The banner, through the logger: on a console it prints as it always
@@ -2492,6 +2536,11 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // The bound address, not the configured `host`: `all` says nothing
         // about where to point a client, `0.0.0.0:8100` does.
         log::info!("API        {scheme}://{}", listener.local_addr()?);
+        // Plain `http`, never `scheme`: this listener has no TLS of its own.
+        match &metrics_listener {
+            Some(l) => println!("Metrics    http://{}/metrics", l.local_addr()?),
+            None => println!("Metrics    disabled"),
+        }
         // The two deployment gates, on the two lines under the address they
         // are gates on, and printed on *every* start rather than only on the
         // ones where they are missing. A row that always has a value is a
@@ -2551,6 +2600,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
                     reexec::InheritedFds {
                         api: Some(listener_fd(&listener)),
                         web: Some(listener_fd(&web_listener)),
+                        metrics: metrics_listener.as_ref().map(listener_fd),
                     },
                 )
                 .map(Arc::new)
@@ -2585,7 +2635,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
             loading: Default::default(),
             mcp_servers,
         });
-        let web_app = web::build_router(web_state);
+        let web_app = http::count_requests(web::build_router(web_state), process_metrics);
         // Not joined: when `serve` returns (any shutdown path below), the
         // tokio Runtime it's driven by is dropped right after in `main`,
         // which cancels every still-running spawned task, this one
@@ -2593,6 +2643,16 @@ async fn serve(prepared: Prepared) -> Result<()> {
         // listener gets from losing the `tokio::select!` race below.
         tokio::spawn(async move {
             let _ = axum::serve(web_listener, web_app).await;
+        });
+    }
+
+    if let Some(metrics_listener) = metrics_listener {
+        let metrics_app = http::build_metrics_router(metrics_state);
+        // Fire-and-forget, same reasoning as the web console's listener just
+        // above: this task is cancelled for free when the runtime is dropped
+        // at shutdown, alongside every other spawned task.
+        tokio::spawn(async move {
+            let _ = axum::serve(metrics_listener, metrics_app).await;
         });
     }
 

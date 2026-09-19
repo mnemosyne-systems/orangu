@@ -14,7 +14,9 @@ directory, or a `<user>/<model>[:quant]` Hugging Face repo (fetched on first
 use). The role flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`,
 mutually exclusive, `--all` by default) selects how the server presents itself;
 give each running server its own port in `orangu-server.conf` when you run more
-than one at a time.
+than one at a time — including `metrics`, if the dedicated Prometheus
+listener is enabled: two servers sharing one metrics port would otherwise
+fail to start rather than merge.
 
 `role = all`
 

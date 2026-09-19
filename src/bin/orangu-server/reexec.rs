@@ -88,6 +88,7 @@ pub const fn supported() -> bool {
 pub struct InheritedFds {
     pub api: Option<i32>,
     pub web: Option<i32>,
+    pub metrics: Option<i32>,
 }
 
 static INHERITED: OnceLock<InheritedFds> = OnceLock::new();
@@ -144,6 +145,7 @@ fn parse_inherit_fds(value: &str) -> InheritedFds {
         match name.trim() {
             "api" => fds.api = Some(fd),
             "web" => fds.web = Some(fd),
+            "metrics" => fds.metrics = Some(fd),
             _ => {}
         }
     }
@@ -224,6 +226,7 @@ pub struct Listen {
     pub host: Option<String>,
     pub api: Option<u16>,
     pub web: Option<u16>,
+    pub metrics: Option<u16>,
 }
 
 impl Handover {
@@ -270,6 +273,10 @@ impl Handover {
             argv.push("--web".into());
             argv.push(web.to_string().into());
         }
+        if let Some(metrics) = self.listen.metrics {
+            argv.push("--metrics".into());
+            argv.push(metrics.to_string().into());
+        }
         argv.push("--workspace".into());
         argv.push((&self.workspace).into());
         argv.push(role_flag(self.role).into());
@@ -287,6 +294,9 @@ impl Handover {
         }
         if let Some(fd) = self.fds.web {
             parts.push(format!("web:{fd}"));
+        }
+        if let Some(fd) = self.fds.metrics {
+            parts.push(format!("metrics:{fd}"));
         }
         (!parts.is_empty()).then(|| parts.join(","))
     }
@@ -306,7 +316,10 @@ impl Handover {
         // replaced — and the new one would find nothing to adopt and have to
         // bind again, reopening exactly the window this whole approach
         // exists to avoid.
-        for fd in [self.fds.api, self.fds.web].into_iter().flatten() {
+        for fd in [self.fds.api, self.fds.web, self.fds.metrics]
+            .into_iter()
+            .flatten()
+        {
             if unsafe { libc::fcntl(fd, libc::F_SETFD, 0) } == -1 {
                 return anyhow!(
                     "failed to clear FD_CLOEXEC on descriptor {fd}: {}",
@@ -389,14 +402,16 @@ mod tests {
 
     #[test]
     fn parses_both_descriptors_and_ignores_anything_else() {
-        let fds = parse_inherit_fds("api:3,web:4");
+        let fds = parse_inherit_fds("api:3,web:4,metrics:5");
         assert_eq!(fds.api, Some(3));
         assert_eq!(fds.web, Some(4));
+        assert_eq!(fds.metrics, Some(5));
 
-        // Web UI disabled: only the API listener is handed over.
+        // Web UI and metrics disabled: only the API listener is handed over.
         let fds = parse_inherit_fds("api:3");
         assert_eq!(fds.api, Some(3));
         assert_eq!(fds.web, None);
+        assert_eq!(fds.metrics, None);
 
         // Anything unparseable is dropped rather than guessed at — the
         // caller then binds, which is correct behavior, not a failure.
@@ -419,6 +434,7 @@ mod tests {
                 host: Some("0.0.0.0".to_string()),
                 api: Some(9100),
                 web: Some(9200),
+                metrics: Some(9300),
             },
             workspace: PathBuf::from("/srv/project"),
             role: Role::Review,
@@ -426,6 +442,7 @@ mod tests {
             fds: InheritedFds {
                 api: Some(3),
                 web: Some(4),
+                metrics: Some(5),
             },
         };
 
@@ -447,13 +464,18 @@ mod tests {
                 "9100",
                 "--web",
                 "9200",
+                "--metrics",
+                "9300",
                 "--workspace",
                 "/srv/project",
                 "--review",
             ]
         );
         assert!(!argv.iter().any(|arg| arg == "--daemon"));
-        assert_eq!(handover.inherit_value().as_deref(), Some("api:3,web:4"));
+        assert_eq!(
+            handover.inherit_value().as_deref(),
+            Some("api:3,web:4,metrics:5")
+        );
     }
 
     /// A server started with no `--config` must not gain one: it did its own
@@ -470,6 +492,7 @@ mod tests {
             fds: InheritedFds {
                 api: Some(3),
                 web: None,
+                metrics: None,
             },
         };
 
@@ -486,7 +509,8 @@ mod tests {
         assert!(!argv.iter().any(|arg| arg == "--host"), "{argv:?}");
         assert!(!argv.iter().any(|arg| arg == "--port"), "{argv:?}");
         assert!(!argv.iter().any(|arg| arg == "--web"), "{argv:?}");
-        // Web UI disabled — only the API descriptor travels.
+        assert!(!argv.iter().any(|arg| arg == "--metrics"), "{argv:?}");
+        // Web UI and metrics disabled — only the API descriptor travels.
         assert_eq!(handover.inherit_value().as_deref(), Some("api:3"));
     }
 }

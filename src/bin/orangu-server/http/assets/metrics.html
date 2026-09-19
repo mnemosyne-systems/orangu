@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>orangu-server metrics</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    max-width: 32rem;
+    margin: 4rem auto;
+    padding: 0 1rem;
+    line-height: 1.5;
+  }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  .version { opacity: 0.6; margin-top: 0; }
+  a { color: #e8590c; }
+</style>
+</head>
+<body>
+<h1>orangu-server</h1>
+<p class="version">version {{version}}</p>
+<p>This port serves Prometheus metrics.</p>
+<p><a href="/metrics">/metrics</a></p>
+</body>
+</html>

@@ -44,9 +44,17 @@
 //!
 //! Counters carry the totals a rate is taken from: requests by how they
 //! finished, and tokens in and out.
+//!
+//! [`ProcessMetrics`], further down, covers the server process itself: build
+//! and host identity, uptime, CPU and memory, and HTTP requests in flight.
+//! Where Prometheus has a conventional name (`process_*`) it is used, so stock
+//! dashboards work unmodified.
 
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 /// Latency bucket bounds, in seconds.
 ///
@@ -340,9 +348,275 @@ impl ServerMetrics {
     }
 }
 
+// ------------------------------------------------------------- process ---
+
+pub struct ProcessMetrics {
+    http_in_flight: Arc<AtomicU64>,
+    http_total: AtomicU64,
+    http_client_errors: AtomicU64,
+    http_server_errors: AtomicU64,
+    system: Mutex<System>,
+    pid: Pid,
+    /// Unix seconds; the OS's own answer, falling back to when this was built.
+    start_time_seconds: u64,
+    logical_cores: usize,
+    host_info: String,
+}
+
+/// Counts one in-flight HTTP request for as long as it is alive. Owned, so it
+/// can ride along with a response body until the last byte has been sent.
+pub struct InFlightGuard(Arc<AtomicU64>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl Default for ProcessMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessMetrics {
+    pub fn new() -> Self {
+        let pid = Pid::from_u32(std::process::id());
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            ProcessRefreshKind::everything(),
+        );
+        let start_time_seconds = system
+            .process(pid)
+            .map(|process| process.start_time())
+            .filter(|&start| start != 0)
+            .unwrap_or_else(now_unix_seconds);
+
+        let host_info = info_line(
+            "orangu_server_host_info",
+            "Build of this server and the host it runs on; the value is always 1.",
+            &[
+                ("name", env!("CARGO_BIN_NAME")),
+                ("version", orangu::build_info::VERSION),
+                ("commit", orangu::build_info::COMMIT),
+                ("rustc", orangu::build_info::RUSTC),
+                ("profile", orangu::build_info::PROFILE),
+                ("target", orangu::build_info::TARGET),
+                ("os", &System::name().unwrap_or_default()),
+                ("os_version", &System::os_version().unwrap_or_default()),
+                ("kernel", &System::kernel_version().unwrap_or_default()),
+                ("arch", std::env::consts::ARCH),
+            ],
+        );
+
+        Self {
+            http_in_flight: Arc::new(AtomicU64::new(0)),
+            http_total: AtomicU64::new(0),
+            http_client_errors: AtomicU64::new(0),
+            http_server_errors: AtomicU64::new(0),
+            system: Mutex::new(system),
+            pid,
+            start_time_seconds,
+            logical_cores: std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            host_info,
+        }
+    }
+
+    /// Marks a request as in flight until the returned guard is dropped.
+    pub fn track_request(&self) -> InFlightGuard {
+        self.http_in_flight.fetch_add(1, Ordering::Relaxed);
+        InFlightGuard(self.http_in_flight.clone())
+    }
+
+    /// Records the status a finished request was answered with.
+    pub fn record_response(&self, status: u16) {
+        self.http_total.fetch_add(1, Ordering::Relaxed);
+        match status {
+            400..=499 => self.http_client_errors.fetch_add(1, Ordering::Relaxed),
+            500..=599 => self.http_server_errors.fetch_add(1, Ordering::Relaxed),
+            _ => 0,
+        };
+    }
+
+    pub fn in_flight(&self) -> u64 {
+        self.http_in_flight.load(Ordering::Relaxed)
+    }
+
+    pub fn render(&self, uptime: Duration) -> String {
+        let (cpu_seconds, resident, virtual_bytes, mem_total, mem_available) = {
+            let mut system = self.system.lock().unwrap_or_else(|e| e.into_inner());
+            system.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&[self.pid]),
+                true,
+                ProcessRefreshKind::everything(),
+            );
+            system.refresh_memory();
+            let process = system.process(self.pid);
+            (
+                process.map_or(0.0, |p| p.accumulated_cpu_time() as f64 / 1000.0),
+                process.map_or(0, |p| p.memory()),
+                process.map_or(0, |p| p.virtual_memory()),
+                system.total_memory(),
+                system.available_memory(),
+            )
+        };
+
+        let mut out = String::new();
+        out.push_str(&self.host_info);
+        labelled_gauge(
+            &mut out,
+            "orangu_server_uptime",
+            "Seconds since this server started; start_time is when, as a Unix timestamp.",
+            "start_time",
+            &[(
+                self.start_time_seconds.to_string(),
+                uptime.as_secs_f64().to_string(),
+            )],
+        );
+
+        let mut cpu = vec![
+            ("process_seconds".to_string(), cpu_seconds.to_string()),
+            ("logical_cores".to_string(), self.logical_cores.to_string()),
+        ];
+        // `sysinfo` reports zeros for the load average on Windows, so it
+        // reports nothing there rather than three convincing-looking zeros.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let load = System::load_average();
+            cpu.push(("load1".to_string(), load.one.to_string()));
+            cpu.push(("load5".to_string(), load.five.to_string()));
+            cpu.push(("load15".to_string(), load.fifteen.to_string()));
+        }
+        labelled_gauge(
+            &mut out,
+            "orangu_server_cpu",
+            "CPU: process_seconds is CPU time this process has used, load1/load5/load15 are the host's load averages, logical_cores what the process may use.",
+            "stat",
+            &cpu,
+        );
+
+        gauge(
+            &mut out,
+            "process_resident_memory_bytes",
+            "Resident memory size in bytes.",
+            resident,
+        );
+        gauge(
+            &mut out,
+            "process_virtual_memory_bytes",
+            "Virtual memory size in bytes.",
+            virtual_bytes,
+        );
+        #[cfg(target_os = "linux")]
+        if let Ok(fds) = std::fs::read_dir("/proc/self/fd") {
+            gauge(
+                &mut out,
+                "process_open_fds",
+                "Number of open file descriptors.",
+                fds.count(),
+            );
+        }
+        gauge(
+            &mut out,
+            "orangu_server_host_memory_total_bytes",
+            "Total physical memory of the host, in bytes.",
+            mem_total,
+        );
+        gauge(
+            &mut out,
+            "orangu_server_host_memory_available_bytes",
+            "Physical memory of the host available to start new work, in bytes.",
+            mem_available,
+        );
+        labelled_gauge(
+            &mut out,
+            "orangu_server_http_requests",
+            "HTTP requests on the API and web console listeners (not the dedicated metrics port): in_flight now, then total, client_errors (4xx) and server_errors (5xx) answered since start.",
+            "stat",
+            &[
+                ("in_flight".to_string(), self.in_flight().to_string()),
+                (
+                    "total".to_string(),
+                    self.http_total.load(Ordering::Relaxed).to_string(),
+                ),
+                (
+                    "client_errors".to_string(),
+                    self.http_client_errors.load(Ordering::Relaxed).to_string(),
+                ),
+                (
+                    "server_errors".to_string(),
+                    self.http_server_errors.load(Ordering::Relaxed).to_string(),
+                ),
+            ],
+        );
+        out
+    }
+}
+
+fn now_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn gauge(out: &mut String, name: &str, help: &str, value: impl std::fmt::Display) {
+    let _ = write!(
+        out,
+        "# HELP {name} {help}\n# TYPE {name} gauge\n{name} {value}\n"
+    );
+}
+
+/// A gauge family with one series per row, each labelled `label_key="<row.0>"`
+/// and valued `row.1`.
+fn labelled_gauge(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    label_key: &str,
+    rows: &[(String, String)],
+) {
+    let _ = write!(out, "# HELP {name} {help}\n# TYPE {name} gauge\n");
+    for (label, value) in rows {
+        let _ = writeln!(
+            out,
+            "{name}{{{label_key}=\"{}\"}} {value}",
+            escape_label(label)
+        );
+    }
+}
+
+/// One `_info`-style gauge: constant `1`, the facts carried as labels.
+fn info_line(name: &str, help: &str, labels: &[(&str, &str)]) -> String {
+    let labels = labels
+        .iter()
+        .map(|(key, value)| format!("{key}=\"{}\"", escape_label(value)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("# HELP {name} {help}\n# TYPE {name} gauge\n{name}{{{labels}}} 1\n")
+}
+
+/// Label values escape `\`, `"` and newline, and nothing else.
+fn escape_label(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     fn secs(v: f64) -> Duration {
         Duration::from_secs_f64(v)
@@ -479,5 +753,112 @@ mod tests {
         let text = h.render("t", "h");
         assert!(text.contains("t_bucket{le=\"0.05\"} 1"), "{text}");
         assert!(text.contains("t_bucket{le=\"0.5\"} 2"), "{text}");
+    }
+
+    #[test]
+    fn label_values_are_escaped() {
+        assert_eq!(escape_label("a\\b\"c\nd"), "a\\\\b\\\"c\\nd");
+    }
+
+    #[test]
+    fn in_flight_returns_to_zero_when_guards_drop() {
+        let metrics = ProcessMetrics::new();
+        assert_eq!(metrics.in_flight(), 0);
+        let first = metrics.track_request();
+        let second = metrics.track_request();
+        assert_eq!(metrics.in_flight(), 2);
+        drop(first);
+        assert_eq!(metrics.in_flight(), 1);
+        drop(second);
+        assert_eq!(metrics.in_flight(), 0);
+    }
+
+    /// Every sample sits under a `# HELP`/`# TYPE` pair for its own name, no
+    /// name is declared twice, and every value parses as a number.
+    #[test]
+    fn output_is_well_formed_exposition_text() {
+        let body = ProcessMetrics::new().render(Duration::from_secs(5));
+        let mut typed = HashSet::new();
+        let mut helped = HashSet::new();
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix("# HELP ") {
+                let name = rest.split_whitespace().next().unwrap();
+                assert!(helped.insert(name.to_string()), "duplicate HELP {name}");
+            } else if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let name = rest.split_whitespace().next().unwrap();
+                assert!(helped.contains(name), "TYPE before HELP for {name}");
+                assert!(typed.insert(name.to_string()), "duplicate TYPE {name}");
+            } else {
+                let (series, value) = line.rsplit_once(' ').expect(line);
+                let name = series.split('{').next().unwrap();
+                assert!(typed.contains(name), "sample without TYPE: {line}");
+                value.parse::<f64>().unwrap_or_else(|_| panic!("{line}"));
+            }
+        }
+    }
+
+    #[test]
+    fn responses_are_counted_by_class() {
+        let metrics = ProcessMetrics::new();
+        for status in [200, 204, 404, 401, 503] {
+            metrics.record_response(status);
+        }
+        let body = metrics.render(Duration::ZERO);
+        for expected in [
+            "orangu_server_http_requests{stat=\"total\"} 5\n",
+            "orangu_server_http_requests{stat=\"client_errors\"} 2\n",
+            "orangu_server_http_requests{stat=\"server_errors\"} 1\n",
+        ] {
+            assert!(body.contains(expected), "{expected}\n{body}");
+        }
+    }
+
+    #[test]
+    fn reports_identity_time_and_memory() {
+        let body = ProcessMetrics::new().render(Duration::from_secs(42));
+        assert!(
+            body.contains("\"} 42\n") && body.contains("orangu_server_uptime{start_time=\""),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!(
+                "orangu_server_host_info{{name=\"orangu-server\",version=\"{}\"",
+                orangu::build_info::VERSION
+            )),
+            "{body}"
+        );
+        assert!(
+            body.contains(&format!("arch=\"{}\"}} 1\n", std::env::consts::ARCH)),
+            "{body}"
+        );
+        assert!(
+            body.contains("orangu_server_http_requests{stat=\"in_flight\"} 0\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("orangu_server_cpu{stat=\"process_seconds\"} "),
+            "{body}"
+        );
+        assert!(!body.contains("orangu_server_build_info"), "{body}");
+        let start: u64 = body
+            .lines()
+            .find_map(|l| l.strip_prefix("orangu_server_uptime{start_time=\""))
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            start > 1_600_000_000 && start <= now_unix_seconds(),
+            "{start}"
+        );
+        let rss: u64 = body
+            .lines()
+            .find_map(|l| l.strip_prefix("process_resident_memory_bytes "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(rss > 0);
     }
 }

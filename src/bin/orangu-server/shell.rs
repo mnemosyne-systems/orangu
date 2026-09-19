@@ -110,14 +110,14 @@ _orangu_server() {
             COMPREPLY=( $(compgen -W "off auto all cpu" -- "$cur") )
             return 0
             ;;
-        -p|--port|--web|--device|--threads)
+        -p|--port|--web|--device|--threads|--metrics)
             return 0
             ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -w --workspace --host -p --port --web --device --device-split --threads -i --init -s --shell-completions -d --daemon \
+            "-c --config -w --workspace --host -p --port --web --device --device-split --threads --metrics -i --init -s --shell-completions -d --daemon \
              --all --code --review --explorer --embedding -o --output --binary --deep --sort -y --yes -h --help -V --version" -- "$cur") )
         return 0
     fi
@@ -187,6 +187,7 @@ _orangu_server() {
         '--device[GPU device to use exclusively: an index, part of its name, or auto]:device:' \
         '--device-split[Spread the model'"'"'s layers across the selected devices: off, auto, all, cpu, or shares like 3,1]:mode:(off auto all cpu)' \
         '--threads[Worker threads for every CPU path (default: one per logical core)]:n:' \
+        '--metrics[Port a dedicated /metrics listener binds to, 0 to disable it (overrides the config file)]:port:' \
         '(-i --init)'{-i,--init}'[Interactively create ~/.orangu/orangu-server.conf and exit]' \
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
         '(-d --daemon)'{-d,--daemon}'[Run in the background, detached from the terminal]' \
@@ -278,6 +279,7 @@ complete -c orangu-server      -l web                 -x -d 'Port the web consol
 complete -c orangu-server      -l device              -x -d 'GPU device to use exclusively: an index, part of its name, or auto'
 complete -c orangu-server      -l device-split        -x -a 'off auto all cpu' -d 'Spread the model\'s layers across the selected devices: off, auto, all, cpu, or shares like 3,1'
 complete -c orangu-server      -l threads             -x -d 'Worker threads for every CPU path (default: one per logical core)'
+complete -c orangu-server      -l metrics             -x -d 'Port a dedicated /metrics listener binds to, 0 to disable it (overrides the config file)'
 complete -c orangu-server -s i -l init                    -d 'Interactively create ~/.orangu/orangu-server.conf and exit'
 complete -c orangu-server -s s -l shell-completions       -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu-server -s d -l daemon                  -d 'Run in the background, detached from the terminal'
@@ -324,6 +326,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-server' -ScriptBlock {
         @('--device', 'GPU device to use exclusively: an index, part of its name, or auto'),
         @('--device-split', 'Spread the model''s layers across the selected devices: off, auto, all, cpu, or shares like 3,1'),
         @('--threads', 'Worker threads for every CPU path (default: one per logical core)'),
+        @('--metrics', 'Port a dedicated /metrics listener binds to, 0 to disable it (overrides the config file)'),
         @('-i', '--init', 'Interactively create ~/.orangu/orangu-server.conf and exit'),
         @('-s', '--shell-completions', 'Print shell completion script for the detected shell and exit'),
         @('-d', '--daemon', 'Run in the background, detached from the terminal'),
@@ -389,7 +392,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-server' -ScriptBlock {
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
         '--sort' { return Offer @('size', 'last-used') }
         '--device-split' { return Offer @('off', 'auto', 'all', 'cpu') }
-        { $_ -in '-p', '--port', '--web', '--device', '--threads' } { return }
+        { $_ -in '-p', '--port', '--web', '--device', '--threads', '--metrics' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

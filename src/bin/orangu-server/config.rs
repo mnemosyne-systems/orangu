@@ -64,6 +64,11 @@ pub const DEFAULT_READ_SIZE: usize = 8192;
 /// all, which is what `--init` writes when the web console is declined.
 pub const WEB_SECTION: &str = "web";
 
+/// The dedicated Prometheus listener's own section, mirroring [`WEB_SECTION`]:
+/// its *presence* is what enables the listener. A config with no
+/// `[prometheus]` section binds no third listener at all.
+pub const PROMETHEUS_SECTION: &str = "prometheus";
+
 /// The `host` value meaning "every network interface on this machine" —
 /// the default, and what `--init`'s `host` prompt offers first. `*` is
 /// accepted as an alias for it, since that is the spelling most other
@@ -108,6 +113,19 @@ pub fn default_web_port() -> u16 {
     8101
 }
 
+/// The resolved Prometheus-listener port when there is no `[prometheus]`
+/// section: `0`, meaning no third listener is bound at all.
+pub fn default_metrics() -> u16 {
+    0
+}
+
+/// The port a `[prometheus]` section that doesn't name one gets. Adjacent to
+/// the API's and web console's own defaults (`8100`/`8101`) so the trio reads
+/// as one server, and the value `-i`/`--init` has always offered.
+pub fn default_prometheus_port() -> u16 {
+    8300
+}
+
 /// The address a bundled server binds when it was started with no config
 /// file at all (see [`bundled_configuration`]) — the loopback interface,
 /// not [`HOST_ALL`].
@@ -146,6 +164,7 @@ pub struct BundledListen {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub web: Option<u16>,
+    pub metrics: Option<u16>,
 }
 
 /// The configuration a bundled `orangu-server` runs on when it finds no
@@ -186,14 +205,18 @@ pub fn bundled_configuration(
         // of it". `--web 0` at build time, or at run time, is how a bundle
         // exposes only the API.
         web_host: host.clone(),
+        metrics_host: host.clone(),
         host,
         port: listen.port.unwrap_or_else(default_port),
         slots: role.default_slots(),
         web: listen.web.unwrap_or_else(bundled_web_port),
+        // Off unless `bundle` was told a port, same as `web`.
+        metrics: listen.metrics.unwrap_or_else(default_metrics),
         // Nothing wrote a `[web].host` here, so `--host` at run time moves
         // the console along with the API — which is what makes `--host all`
         // on a bundle do the one thing somebody would reach for it to do.
         web_host_explicit: false,
+        metrics_host_explicit: false,
         backend: default_backend(),
         // A bundle runs on a machine nobody configured, so it takes the
         // default rather than a lossy format nobody chose.
@@ -590,6 +613,22 @@ pub struct ServerConfiguration {
     /// must not have the console quietly dragged onto `0.0.0.0` by a flag
     /// aimed at the API. An explicit key stands; an inherited one follows.
     pub web_host_explicit: bool,
+    /// `[prometheus].port`: the port a dedicated `/metrics` listener binds
+    /// to, alongside (not instead of) the API's own `port`. `0` — the
+    /// default, and what having no `[prometheus]` section resolves to —
+    /// disables it entirely. See `http::native::render_metrics_text` for the
+    /// response it serves.
+    pub metrics: u16,
+    /// `[prometheus].host`: the address the metrics listener binds, when it
+    /// should differ from the API's. Defaults to [`host`](Self::host); same
+    /// idea as [`web_host`](Self::web_host). Worth separating because the
+    /// listener carries no API key check: an API on `all`, metrics on a
+    /// loopback or private scrape address.
+    pub metrics_host: String,
+    /// Whether `[prometheus].host` was set *explicitly*; see
+    /// [`web_host_explicit`](Self::web_host_explicit) for why `--host` needs
+    /// the distinction.
+    pub metrics_host_explicit: bool,
     /// Which `Backend` runs the forward pass — CPU, a named GPU API, or
     /// (the default) whichever GPU this platform finds first, falling back
     /// to CPU.
@@ -962,6 +1001,27 @@ pub fn load_server_configuration(
         }
     };
 
+    // The dedicated Prometheus listener lives in its own `[prometheus]`
+    // section, the same shape as `[web]` above: *having* one is what enables
+    // it.
+    let (metrics, metrics_host, metrics_host_explicit) = match sections.remove(PROMETHEUS_SECTION) {
+        Some(prometheus_section) => {
+            let port = match prometheus_section.get("port") {
+                Some(value) => value.trim().parse::<u16>().map_err(|err| {
+                    anyhow!("invalid value for [{PROMETHEUS_SECTION}].port: {err}")
+                })?,
+                None => default_prometheus_port(),
+            };
+            let explicit = prometheus_section
+                .get("host")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let metrics_host = explicit.clone().unwrap_or_else(|| host.clone());
+            (port, metrics_host, explicit.is_some())
+        }
+        None => (default_metrics(), host.clone(), false),
+    };
+
     let model = section
         .get("model")
         .map(|value| value.trim().to_string())
@@ -1159,6 +1219,9 @@ pub fn load_server_configuration(
         models: expand_tilde(&models),
         host,
         port,
+        metrics,
+        metrics_host,
+        metrics_host_explicit,
         model,
         role_key,
         role,
@@ -1299,6 +1362,85 @@ mod tests {
             bundled_configuration(PathBuf::new(), Role::All, &BundledListen::default()).log,
             LogTarget::Console
         );
+    }
+
+    /// No `[prometheus]` section means disabled.
+    #[test]
+    fn no_prometheus_section_means_disabled() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.metrics, 0);
+    }
+
+    #[test]
+    fn reads_the_metrics_port_from_its_own_section() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[prometheus]\nport = 8300\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.metrics, 8300);
+    }
+
+    /// Having a `[prometheus]` section is what turns the listener on — a bare
+    /// section with no `port` key still takes the default port, the same way
+    /// a bare `[web]` section does.
+    #[test]
+    fn a_bare_prometheus_section_enables_the_listener_on_the_default_port() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[prometheus]\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.metrics, default_prometheus_port());
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_prometheus_port() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[prometheus]\nport = not-a-port\n"
+        )
+        .unwrap();
+        let err = load_server_configuration(file.path(), None, false).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid value for [prometheus].port"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn the_metrics_listener_inherits_the_api_host_when_it_names_none() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nhost = 192.168.1.10\n\n[prometheus]\nport = 8300\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.metrics_host, "192.168.1.10");
+        assert!(!conf.metrics_host_explicit);
+    }
+
+    #[test]
+    fn the_metrics_listener_can_bind_a_different_host_than_the_api() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\nhost = all\n\n[prometheus]\nport = 8300\nhost = 127.0.0.1\n"
+        )
+        .unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert_eq!(conf.host, "all");
+        assert_eq!(conf.metrics_host, "127.0.0.1");
+        assert!(conf.metrics_host_explicit);
     }
 
     /// The whole promise of a bundle: no config file, and it still comes up

@@ -151,6 +151,8 @@ struct Manifest {
     port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     web: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metrics: Option<u16>,
     /// The `orangu-server` version that wrote the bundle. Always this
     /// binary's own, since it is this binary's program image being copied —
     /// recorded so `bundle` can report it.
@@ -206,6 +208,7 @@ fn load_embedded() -> Option<Bundle> {
                     host: manifest.host,
                     port: manifest.port,
                     web: manifest.web,
+                    metrics: manifest.metrics,
                 },
             }),
             Err(err) => {
@@ -645,6 +648,7 @@ pub fn run(request: Request) -> Result<()> {
             host: listen.host.clone(),
             port: listen.port,
             web: listen.web,
+            metrics: listen.metrics,
             version: crate::VERSION.to_string(),
             shards: shard_entries,
         },
@@ -1008,6 +1012,7 @@ mod tests {
                 host: Some("0.0.0.0".to_string()),
                 port: Some(9100),
                 web: Some(9200),
+                metrics: Some(9300),
                 version: "1.1.0".to_string(),
                 shards,
             },
@@ -1089,6 +1094,7 @@ mod tests {
                 host: None,
                 port: None,
                 web: None,
+                metrics: None,
                 version: "1.1.0".to_string(),
                 shards,
             }
@@ -1255,6 +1261,7 @@ mod tests {
         assert_eq!(manifest.host.as_deref(), Some("0.0.0.0"));
         assert_eq!(manifest.port, Some(9100));
         assert_eq!(manifest.web, Some(9200));
+        assert_eq!(manifest.metrics, Some(9300));
     }
 
     /// A bundle built before these were recorded — or built without them —
@@ -1271,6 +1278,7 @@ mod tests {
         assert_eq!(manifest.host, None);
         assert_eq!(manifest.port, None);
         assert_eq!(manifest.web, None);
+        assert_eq!(manifest.metrics, None);
 
         let conf = crate::config::bundled_configuration(
             PathBuf::new(),
@@ -1280,6 +1288,7 @@ mod tests {
         assert_eq!(conf.host, crate::config::BUNDLED_HOST);
         assert_eq!(conf.port, 8100);
         assert_eq!(conf.web, 8200);
+        assert_eq!(conf.metrics, 0);
     }
 
     /// ...and one that does record an address comes up on it, console
@@ -1294,12 +1303,14 @@ mod tests {
                 host: Some("0.0.0.0".to_string()),
                 port: Some(9100),
                 web: Some(9200),
+                metrics: Some(9300),
             },
         );
         assert_eq!(conf.host, "0.0.0.0");
         assert_eq!(conf.web_host, "0.0.0.0");
         assert_eq!(conf.port, 9100);
         assert_eq!(conf.web, 9200);
+        assert_eq!(conf.metrics, 9300);
         // Still not "explicit": a run-time `--host` may move both, which is
         // the point of being able to override a bundle's baked-in address.
         assert!(!conf.web_host_explicit);
@@ -1336,6 +1347,7 @@ mod tests {
                 host: Some("all".to_string()),
                 port: None,
                 web: None,
+                metrics: None,
             }),
             "API all:8100, console all:8200"
         );
@@ -1344,6 +1356,7 @@ mod tests {
                 host: None,
                 port: Some(9100),
                 web: Some(0),
+                metrics: None,
             }),
             "API 127.0.0.1:9100, console off"
         );

@@ -424,9 +424,15 @@ struct SlotActionBody {
     filename: String,
 }
 
-pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+/// The full Prometheus exposition body for this server: live slot-pool
+/// gauges followed by [`ServerMetrics::render`](crate::engine::metrics::ServerMetrics::render).
+///
+/// Shared by [`metrics`], below, and the dedicated metrics listener in
+/// `main.rs`, so both serve the same body.
+pub fn render_metrics_text(state: &AppState) -> String {
     let snapshot = state.engine.slots.snapshot();
     let busy = snapshot.iter().filter(|s| s.busy).count();
+    let idle = state.engine.slots.total().saturating_sub(busy);
     let mut body = format!(
         "# HELP orangu_server_slots_total Configured concurrent request slots.\n\
          # TYPE orangu_server_slots_total gauge\n\
@@ -434,6 +440,9 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
          # HELP orangu_server_slots_busy Slots currently generating.\n\
          # TYPE orangu_server_slots_busy gauge\n\
          orangu_server_slots_busy {busy}\n\
+         # HELP orangu_server_slots_idle Slots free to take a request.\n\
+         # TYPE orangu_server_slots_idle gauge\n\
+         orangu_server_slots_idle {idle}\n\
          # HELP orangu_server_queue_depth Requests waiting for a slot.\n\
          # TYPE orangu_server_queue_depth gauge\n\
          orangu_server_queue_depth {}\n\
@@ -445,11 +454,29 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         state.engine.slots.queue_limit(),
     );
     body.push_str(&state.engine.metrics.render());
+    body.push_str(&state.process_metrics.render(state.started_at.elapsed()));
+    body
+}
+
+/// Serves [`render_metrics_text`] as `/metrics`, behind the API key like
+/// every other route on this router.
+pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (
         StatusCode::OK,
         [("Content-Type", "text/plain; version=0.0.4")],
-        body,
+        render_metrics_text(&state),
     )
+}
+
+const METRICS_INDEX_HTML: &str = include_str!("assets/metrics.html");
+
+/// Static landing page for `GET /` on the dedicated metrics port.
+pub async fn metrics_index() -> impl IntoResponse {
+    axum::response::Html(render_metrics_index())
+}
+
+fn render_metrics_index() -> String {
+    METRICS_INDEX_HTML.replace("{{version}}", env!("CARGO_PKG_VERSION"))
 }
 
 #[derive(Deserialize)]
@@ -729,6 +756,14 @@ pub async fn apply_template(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_metrics_index_links_to_metrics_and_fills_in_the_version() {
+        let html = render_metrics_index();
+        assert!(html.contains("href=\"/metrics\""));
+        assert!(html.contains(env!("CARGO_PKG_VERSION")));
+        assert!(!html.contains("{{version}}"));
+    }
 
     /// An unbounded queue is never "full", so a server without a
     /// `queue_limit` must never report itself unready for depth — it would

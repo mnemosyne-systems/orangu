@@ -16,8 +16,9 @@
 //! Interactive `--init` flow that writes `~/.orangu/orangu-server.conf`.
 
 use crate::config::{
-    DEFAULT_READ_SIZE, HOST_ALL, HOST_ALL_ALIAS, Role, WEB_SECTION, default_delete, default_host,
-    default_port, default_reexec, default_web_port,
+    DEFAULT_READ_SIZE, HOST_ALL, HOST_ALL_ALIAS, PROMETHEUS_SECTION, Role, WEB_SECTION,
+    default_delete, default_host, default_port, default_prometheus_port, default_reexec,
+    default_web_port,
 };
 use anyhow::{Context, Result, anyhow};
 use orangu::logging::{LOG_TYPES, LogTarget, default_log_path};
@@ -100,6 +101,18 @@ pub fn run_init() -> Result<()> {
         None
     };
 
+    // A section of its own, the same shape as the web console above. Off by
+    // default; declining writes no `[prometheus]` section at all.
+    let metrics = if prompt_bool("Add Prometheus metrics", false)? {
+        // Defaults to the API's address, like the console's; answering
+        // differently is how a keyless metrics port stays off the network.
+        let metrics_host = prompt_host(&host)?;
+        let metrics_port = prompt_line("port", &default_prometheus_port().to_string())?;
+        Some((metrics_host, metrics_port))
+    } else {
+        None
+    };
+
     let mut contents = format!("[orangu-server]\nmodels = {models}\n");
     if !model.is_empty() {
         contents.push_str(&format!("model = {model}\n"));
@@ -150,6 +163,12 @@ pub fn run_init() -> Result<()> {
                 if *delete { "yes" } else { "no" }
             ));
         }
+    }
+    if let Some((metrics_host, metrics_port)) = &metrics {
+        contents.push_str(&format!(
+            "\n[{PROMETHEUS_SECTION}]\nhost = {metrics_host}\nport = {}\n",
+            metrics_port.trim()
+        ));
     }
 
     println!("\nConfiguration to write:\n");

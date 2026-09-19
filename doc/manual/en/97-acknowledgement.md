@@ -14,6 +14,7 @@ Shashank Singh <shashanksgh3@gmail.com>
 Nishant raj Jha <nishantrajx924@gmail.com>
 Adesh Deshmukh <adeshkd123@gmail.com>
 Bassam Adnan <mailbassam@gmail.com>
+Saleh Enab <salehenab850@gmail.com>
 ```
 
 ## Committers
@@ -30,10 +31,10 @@ The PDF produced by the `/export` tool is set in **Red Hat Text**, copyright Red
 
 Contributions to [**orangu**][orangu] are managed on [GitHub][orangu]
 
-* [Ask a question][ask]
-* [Raise an issue][issue]
-* [Feature request][request]
-* [Code submission][submission]
+- [Ask a question][ask]
+- [Raise an issue][issue]
+- [Feature request][request]
+- [Code submission][submission]
 
 Contributions are most welcome!
 

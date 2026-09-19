@@ -6,7 +6,7 @@ API — both the OpenAI-compatible endpoints (`/v1/chat/completions`,
 native ones (`/health`, `/props`, `/slots`, `/metrics`, `/completion`,
 `/tokenize`, `/detokenize`, `/embedding`, `/apply-template`).
 
-`orangu-server` *is* the inference engine: GGUF loading, tokenization, the
+`orangu-server` _is_ the inference engine: GGUF loading, tokenization, the
 transformer forward pass, sampling, and request scheduling are implemented
 directly in Rust, with no dependency on llama.cpp/ggml's own compiled code.
 `orangu-coordinator` (see [COORDINATOR.md](COORDINATOR.md)) sits in front of
@@ -16,7 +16,7 @@ document covers `orangu-server` itself.
 
 It's also the machine's GGUF inventory tool — the `system`/`suggest`/
 `list`/`show`/`download`/`delete`/`refresh` subcommands (below) answer the
-questions that matter when *getting*, *choosing*, and *cleaning up* a model,
+questions that matter when _getting_, _choosing_, and _cleaning up_ a model,
 before or after serving. Those seven read (or write) GGUF files directly off
 disk and query the local machine, no model loaded and no HTTP listener bound;
 `download` and `refresh` talk to the Hugging Face Hub to fetch a model, and
@@ -59,7 +59,7 @@ NR  MODEL                            QUANT   SIZE        SUPPORTED
  2  unsloth/gemma-4-E2B-it-GGUF      Q4_K_M  2.89 GiB    Yes (gemma4)
 
 Select a model (NR): 2
-role [all]: 
+role [all]:
 ```
 
 When the directory holds exactly one model there is nothing to choose
@@ -72,7 +72,7 @@ NR  MODEL                            QUANT   SIZE        SUPPORTED
  1  Qwen/Qwen2.5-0.5B-Instruct-GGUF  Q4_K_M  468.64 MiB  Yes (qwen2)
 
 model: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
-role [all]: 
+role [all]:
 ```
 
 On startup, `orangu-server` prints the same OS/CPU/GPU report `system`
@@ -191,7 +191,7 @@ Device     3.12 GiB of weights on a 3.98 GiB GPU — fits, 878.08 MiB spare
 ```
 
 Only a model whose **dense** part does not fit stops to confirm — that one
-cannot run at any speed. A model whose *experts* do not fit never prompts:
+cannot run at any speed. A model whose _experts_ do not fit never prompts:
 those stream, which is what the streaming path is for. `-y`/`--yes` skips
 the confirmation. Planning is advisory and never a gate: an unreachable
 Hub, a private repo, or an unparseable header prints one line and the
@@ -309,24 +309,24 @@ file reads on Linux. Nothing here shells out to `uname`, `sysctl` or
 PowerShell. A field the running platform can't answer gets no line at all
 rather than a line saying `unknown`:
 
-| Field | What it is | Linux | macOS | Windows |
-|---|---|---|---|---|
-| `Name`, `Version` | Distribution or OS name and release | ✅ | ✅ | ✅ |
-| `Full name` | The verbose name, printed only when it adds something the two above don't — the macOS codename (`MacOS 15.1 Sequoia`) or the Windows edition (`Windows 11 Pro`) | — | ✅ | ✅ |
-| `Kernel` | Kernel release; the build number on Windows | ✅ | ✅ | ✅ |
-| `Distribution` | `/etc/os-release`'s `ID`, the spelling other tooling keys on. Omitted where it would only repeat `Name` | ✅ | — | — |
-| `Machine` | The physical machine's vendor and product, from SMBIOS/DMI (`/sys/class/dmi/id`) or `hw.model` | ✅ | ✅ | — |
-| `Hostname` | | ✅ | ✅ | ✅ |
-| `Uptime` | Time since boot, as its two largest units | ✅ | ✅ | ✅ |
-| `Load average` | 1/5/15-minute run-queue averages | ✅ | ✅ | — |
-| `Swap total`, `Swap used` | Omitted entirely on a machine with no swap configured | ✅ | ✅ | ✅ |
-| `Huge pages` | The transparent-hugepage policy (`always`/`madvise`/`never`), which decides whether a mapped model's weights get 2 MiB pages or 4 KiB ones | ✅ | — | — |
-| `Page size` | `sysconf(_SC_PAGESIZE)` — 4 KiB on most machines, 16 KiB on Apple Silicon | ✅ | ✅ | — |
-| `Open files` | `RLIMIT_NOFILE`, soft and hard. A server holding a listener, every accepted connection and one mapping per model shard runs into this one first | ✅ | ✅ | — |
-| `Models` | The configured `[orangu-server].models` directory. Printed only when a config file is found — `system` itself needs none | ✅ | ✅ | ✅ |
-| `Models used` | Bytes on disk under that directory: everything it holds, not only the `.gguf` files `list` shows, with a blob shared by several snapshot revisions counted once | ✅ | ✅ | ✅ |
-| `Models free` | Room left on the filesystem holding it — what the *next* `download` has to fit into. Excludes the root-only reserve, so it's space this user can actually use | ✅ | ✅ | — |
-| `Built for` | The target this binary was *built* for, which isn't always the machine it runs on: an `x86_64` build on an `aarch64` Mac is running under Rosetta | ✅ | ✅ | ✅ |
+| Field                     | What it is                                                                                                                                                      | Linux | macOS | Windows |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- | ----- | ------- |
+| `Name`, `Version`         | Distribution or OS name and release                                                                                                                             | ✅    | ✅    | ✅      |
+| `Full name`               | The verbose name, printed only when it adds something the two above don't — the macOS codename (`MacOS 15.1 Sequoia`) or the Windows edition (`Windows 11 Pro`) | —     | ✅    | ✅      |
+| `Kernel`                  | Kernel release; the build number on Windows                                                                                                                     | ✅    | ✅    | ✅      |
+| `Distribution`            | `/etc/os-release`'s `ID`, the spelling other tooling keys on. Omitted where it would only repeat `Name`                                                         | ✅    | —     | —       |
+| `Machine`                 | The physical machine's vendor and product, from SMBIOS/DMI (`/sys/class/dmi/id`) or `hw.model`                                                                  | ✅    | ✅    | —       |
+| `Hostname`                |                                                                                                                                                                 | ✅    | ✅    | ✅      |
+| `Uptime`                  | Time since boot, as its two largest units                                                                                                                       | ✅    | ✅    | ✅      |
+| `Load average`            | 1/5/15-minute run-queue averages                                                                                                                                | ✅    | ✅    | —       |
+| `Swap total`, `Swap used` | Omitted entirely on a machine with no swap configured                                                                                                           | ✅    | ✅    | ✅      |
+| `Huge pages`              | The transparent-hugepage policy (`always`/`madvise`/`never`), which decides whether a mapped model's weights get 2 MiB pages or 4 KiB ones                      | ✅    | —     | —       |
+| `Page size`               | `sysconf(_SC_PAGESIZE)` — 4 KiB on most machines, 16 KiB on Apple Silicon                                                                                       | ✅    | ✅    | —       |
+| `Open files`              | `RLIMIT_NOFILE`, soft and hard. A server holding a listener, every accepted connection and one mapping per model shard runs into this one first                 | ✅    | ✅    | —       |
+| `Models`                  | The configured `[orangu-server].models` directory. Printed only when a config file is found — `system` itself needs none                                        | ✅    | ✅    | ✅      |
+| `Models used`             | Bytes on disk under that directory: everything it holds, not only the `.gguf` files `list` shows, with a blob shared by several snapshot revisions counted once | ✅    | ✅    | ✅      |
+| `Models free`             | Room left on the filesystem holding it — what the _next_ `download` has to fit into. Excludes the root-only reserve, so it's space this user can actually use   | ✅    | ✅    | —       |
+| `Built for`               | The target this binary was _built_ for, which isn't always the machine it runs on: an `x86_64` build on an `aarch64` Mac is running under Rosetta               | ✅    | ✅    | ✅      |
 
 CPU statistics (model, vendor, architecture, physical/logical core counts,
 frequency, total/available system RAM) come from `sysinfo` too; the SIMD
@@ -366,7 +366,7 @@ report) rather than a heading over a "none detected" line:
   integrated GPU and a discrete Radeon card too similarly to guess from the
   name alone.
 - **Last resorts, only when nothing above answered.** Every source above
-  reads an *OS* description of a PCI device, and an SoC GPU is neither. So
+  reads an _OS_ description of a PCI device, and an SoC GPU is neither. So
   the Vulkan loader is asked directly — the driver doing the work is the one
   source guaranteed to know the device exists — and failing even that, Arm's
   `mali` kbase driver is read out of sysfs: its `gpuinfo` line on the
@@ -380,7 +380,7 @@ report) rather than a heading over a "none detected" line:
 `contrib/orangepi5.sh` does the whole setup for an Orange Pi 5 — device-node
 group membership and the GPU userspace driver — and `--check` reports the state
 without changing anything. A
-stock Orange Pi 5 image has the `mali` kernel driver and `/dev/mali0` and *no*
+stock Orange Pi 5 image has the `mali` kernel driver and `/dev/mali0` and _no_
 userspace driver at all — no `libmali`, no `libOpenCL`, no `libvulkan` — so the
 GPU is reported and unusable. Arm's Valhall userspace blob supplies OpenCL 3.0
 for the G610; installed as `libmali.so.1` with `libOpenCL.so.1` symlinked at
@@ -419,7 +419,7 @@ neither is known, which is normal in a container.
 At startup the same data drives the `Note` lines: one when running on
 battery, and one when a sensor is already within a tenth of a critical
 threshold the platform declared. Those two are all that remain — they are
-*conditions*, and neither has a command as a fix. The machine *settings*
+_conditions_, and neither has a command as a fix. The machine _settings_
 that once printed beside them are elsewhere now: the CPU governor is the
 banner's `Frequency` row, and AMD GPU power levels are documented under
 **Quick start**, beside it, rather than reprinted per card on every start.
@@ -494,17 +494,17 @@ Two such tables are printed, sized against two different budgets:
   eligible GPU's own total, or the CPU's total RAM, whichever is larger
   (a shared/integrated GPU's total is already the system's RAM, per the note
   above). Dedicated VRAM is one of the candidates, so this budget is never
-  smaller than the one above it: the `Dedicated` table is the *fast* subset
+  smaller than the one above it: the `Dedicated` table is the _fast_ subset
   of this one, not a different machine.
 
-  The largest pool, deliberately **not** the sum of every pool. A model runs
-  on exactly one backend, and there is no partial-offload split of layers
-  between a GPU and the CPU, so no single run can ever draw on a discrete
-  card's VRAM *and* system RAM at once — adding them would put a budget on
-  the table that nothing on the machine can reach (on the laptop above, a
-  3.98 GiB card beside 62.19 GiB of RAM would suggest a ~110B model that
-  neither pool can hold). Still a hardware ceiling rather than a promise:
-  the RAM in it is the same RAM the OS and everything else live in.
+    The largest pool, deliberately **not** the sum of every pool. A model runs
+    on exactly one backend, and there is no partial-offload split of layers
+    between a GPU and the CPU, so no single run can ever draw on a discrete
+    card's VRAM _and_ system RAM at once — adding them would put a budget on
+    the table that nothing on the machine can reach (on the laptop above, a
+    3.98 GiB card beside 62.19 GiB of RAM would suggest a ~110B model that
+    neither pool can hold). Still a hardware ceiling rather than a promise:
+    the RAM in it is the same RAM the OS and everything else live in.
 
 The memory-estimation formula mirrors [Sam McLeod's GGUF VRAM
 Estimator](https://smcleod.net/vram-estimator/) (read directly from its
@@ -565,7 +565,7 @@ listed:
   rather than fetching it again — resolving each candidate to its real,
   symlink-free path collapses those back down to a single entry.
 - **Multimodal projector ("mmproj") sidecar files don't count as their own
-  model.** A vision/audio "mmproj" file is meant to be loaded *alongside* a
+  model.** A vision/audio "mmproj" file is meant to be loaded _alongside_ a
   base model's own checkpoint (llama.cpp's `--mmproj` flag), not to stand
   in as a model of its own — so if you download 4 models and one of them
   ships a bundled `mmproj-*.gguf`, `list` still reports 4, not 5. Identified
@@ -601,7 +601,7 @@ of them in particular; a bare repo id takes the first row it matches, the one
 `NR` 1 above names. `delete` always spells out the quantization it is about to
 remove in its confirmation line (`Delete 'acme/Test-3B-GGUF' (Q8_0, 1 file,
 4.97 GiB) ...`), so an ambiguous argument can't quietly take the wrong one.
-The tagged form is also how you ask for a specific quantization that *isn't*
+The tagged form is also how you ask for a specific quantization that _isn't_
 downloaded yet, since a bare repo id lets the downloader pick (`Q4_K_M`, then
 `Q8_0`).
 
@@ -616,12 +616,12 @@ It is only shown when that tag really reads as a quantization (`Q4_K_M`,
 `IQ2_XXS`, `TQ1_0`, `F16`, ...); a name whose trailing token is something
 else (`gemma-4-E2B-it`, `TinyLlama-1.1B`) falls back to a coarser
 best-effort label instead: the `ggml_type` accounting for the most tensor
-*elements* overall, combined across every shard (not just the most tensors —
+_elements_ overall, combined across every shard (not just the most tensors —
 a model has far more small `F32` bias/norm tensors than large weight
 matrices, but those matrices hold nearly all the parameters).
 
 The fallback is genuinely coarser, which is why the name wins whenever there
-is one. A mixed scheme is *defined* by storing part of the model at a heavier
+is one. A mixed scheme is _defined_ by storing part of the model at a heavier
 type than its name — a real `Q4_K_M` model can have `Q5_K` or `Q6_K` as its
 single most common type — so reporting the dominant type would contradict the
 `MODEL` label sitting right next to it. It also can't tell `Q4_K_S` from
@@ -644,14 +644,14 @@ removes its entry.
 `SUPPORTED` says whether this build can actually load the model —
 `Yes (<arch>)` or `No (<arch>)`, judged from the file's header alone
 (`general.architecture` plus the tensor directory — cheap: no tensor data).
-It's stricter than just recognising the architecture *string*: a model whose
+It's stricter than just recognising the architecture _string_: a model whose
 architecture is known can still carry tensors the loader rejects when it goes
 to build the model, and reporting `Yes` for one would promise a load that
 then fails. No recognised architecture hits that today — gemma MoE
 checkpoints (`gemma-4-26B-A4B`, `ffn_gate_inp` present, fused or separate
 gate/up experts with optional per-expert `.scale` companions) load via the
 gemma routed-expert path, so they report `Yes (gemma4)`. A `No`
-row is printed *greyed*, not hidden: you can still select
+row is printed _greyed_, not hidden: you can still select
 it, but loading fails with a clear "not yet supported" error — the column
 just surfaces that before you commit. The greying is emitted only to a
 terminal; piped or redirected output stays plain text, so the shell
@@ -730,7 +730,7 @@ multi-shard model (`name-00001-of-00004.gguf`, ...) is deleted atomically,
 even when only one shard's own path was named. Omit the argument entirely
 and `delete` prints the same table `list` does and prompts for an `NR`,
 the same interaction bare `orangu-server` (no subcommand at all) uses to
-pick a model to *serve* — here picking one to remove instead.
+pick a model to _serve_ — here picking one to remove instead.
 
 Asks for confirmation before deleting anything (`[y/N]`, defaulting to
 **No** on an empty entry or a closed/non-interactive stdin) — `-y`/`--yes`
@@ -788,11 +788,11 @@ error: 'bartowski/Llama-3.2-1B-Instruct-GGUF' names 2 models on disk (Q4_K_M, Q6
 ```
 
 It has to: `refresh` deletes what it then downloads, so silently picking a
-row would refresh the wrong quantization *and* leave the one you meant
+row would refresh the wrong quantization _and_ leave the one you meant
 untouched. Name it as `<repo>:<quant>`, or use the row's `NR`.
 
 With no argument at all, `refresh` prints the same table `list` does — and
-greys every row that is *already* at its repo's latest commit, the inverse of
+greys every row that is _already_ at its repo's latest commit, the inverse of
 what `list` greys. Only the `NR`s worth refreshing (the `(Refresh)` rows)
 stand out:
 
@@ -805,7 +805,7 @@ Select a model to refresh (NR):
 ```
 
 When nothing is behind (or the Hub is unreachable, in which case nothing is
-*known* to be behind and no row is greyed), it says so before the prompt. As
+_known_ to be behind and no row is greyed), it says so before the prompt. As
 with the marker itself, a model outside the Hugging Face hub cache layout has
 no repo to refresh from; naming one is an error, raised before anything is
 deleted.
@@ -853,7 +853,7 @@ Frequency  Performance
 ```
 
 That is the whole point: one file to copy to a machine, and a working
-OpenAI-compatible server on it. The model is *inside* the binary — not
+OpenAI-compatible server on it. The model is _inside_ the binary — not
 downloaded on first run, not extracted to a cache directory, not referenced
 from one — so the binary is as large as the model, and copying it copies
 everything.
@@ -883,19 +883,19 @@ both after the subcommand (`bundle <model> --code`, which reads most
 naturally) and before it (`--code bundle <model>`). `-y`/`--yes` skips the
 role prompt as well as the confirmation, taking `all`.
 
-The role travels *with* the bundle: a `--code` bundle comes up in the coding
+The role travels _with_ the bundle: a `--code` bundle comes up in the coding
 role wherever it's run, with no flag needed.
 
-| flag | |
-|---|---|
-| `-o`, `--output` | where to write. Default `./orangu-server-bundle-<arch>` (plus `.exe` for a Windows binary) — never the running binary's own name, so a `bundle` run in a directory holding one can't overwrite it. |
-| `--binary` | the executable to bundle *into*, instead of this one. For bundling a build for another platform, which can't be run here to bundle itself. |
-| `--host`, `--port`, `--web` | the address the bundle listens on by default, baked in. `--host` takes `all`/`*` or a literal IP; `--web 0` builds a bundle with no web console. |
-| `-y`, `--yes` | skip the confirmation, and take the default role rather than asking. |
+| flag                        |                                                                                                                                                                                                    |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-o`, `--output`            | where to write. Default `./orangu-server-bundle-<arch>` (plus `.exe` for a Windows binary) — never the running binary's own name, so a `bundle` run in a directory holding one can't overwrite it. |
+| `--binary`                  | the executable to bundle _into_, instead of this one. For bundling a build for another platform, which can't be run here to bundle itself.                                                         |
+| `--host`, `--port`, `--web` | the address the bundle listens on by default, baked in. `--host` takes `all`/`*` or a literal IP; `--web 0` builds a bundle with no web console.                                                   |
+| `-y`, `--yes`               | skip the confirmation, and take the default role rather than asking.                                                                                                                               |
 
 ### Baking in the address
 
-`bundle` takes `--host`, `--port` and `--web` too, and records them *in* the
+`bundle` takes `--host`, `--port` and `--web` too, and records them _in_ the
 bundle — exactly as it records the role. A bundle is started without a config
 file, so where it listens has to be decidable when it is built, not only when
 it is run:
@@ -919,7 +919,7 @@ defaults included. Without any of these flags a bundle keeps the built-in
 The address is checked at build time rather than left for the target machine's
 `bind` to reject: `--host` accepts `all`, `*`, or a literal IP address, and a
 hostname or a typo is an error while there is still somebody to tell. Whatever
-is baked in is a *default*, not a lock — the same `--host`/`--port`/`--web`
+is baked in is a _default_, not a lock — the same `--host`/`--port`/`--web`
 flags at run time still override it, and so does a config file.
 
 ### The architecture is in the name
@@ -953,7 +953,7 @@ Only what it has to:
   `--host`/`--port`/`--web` — plus the Hugging Face hub cache as its `models`
   directory, and the role the bundle was built with. Loopback rather than the usual `all`: a binary somebody
   downloaded and ran should not put itself on every interface of a network
-  it knows nothing about. An `orangu-server.conf` that *is* found is used in
+  it knows nothing about. An `orangu-server.conf` that _is_ found is used in
   full, exactly as for any other server — including `host = all` to opt back
   in.
 - **It serves its own model without asking.** There is nothing to choose
@@ -971,7 +971,7 @@ Only what it has to:
   the network for it.
 
 Everything else — endpoints, roles, backends, the web console, sessions — is
-the same server, because it *is* the same binary with bytes after it.
+the same server, because it _is_ the same binary with bytes after it.
 
 ### Overriding the address and ports
 
@@ -989,7 +989,7 @@ bundle, the built-in defaults) resolved to:
 address — the same values `[orangu-server].host` accepts. It is how a bundle
 that was not built with an address of its own gets exposed to the network for
 one run, without writing a config file for it; to make that a bundle's
-*default*, pass the same flags to `bundle` itself (see **Baking in the
+_default_, pass the same flags to `bundle` itself (see **Baking in the
 address** above).
 
 It moves the **web console with the API**, since the two share an address
@@ -999,7 +999,7 @@ from the console cannot be exposed in a way that quietly exposes the console
 too. Use `--web 0` to turn the console off entirely when only the API should
 be reachable.
 
-Where to listen is the setting that is routinely per-*run* rather than
+Where to listen is the setting that is routinely per-_run_ rather than
 per-machine — a second server alongside one already on 8100, a port a firewall
 happens to allow, a bundle that should be reachable from the LAN for one
 afternoon — and a bundle may have no config file to edit. All three flags apply
@@ -1033,7 +1033,7 @@ bundled again: `./orangu-server-bundle-x86_64 bundle <other-model>` replaces the
 model rather than stacking a second one behind the first.
 
 On macOS the copied program image is re-signed ad-hoc (`codesign --force
---sign -`) *before* the model is appended to it — `codesign` writes the new
+--sign -`) _before_ the model is appended to it — `codesign` writes the new
 signature at the end of the image it is given, so signing afterwards would
 write it straight over the payload. Signing first leaves the model outside
 the signed range, where the kernel never looks. If `codesign` isn't
@@ -1069,6 +1069,9 @@ log_type = console
 [web]
 port = 8101
 reexec = yes
+
+[prometheus]
+port = 8300
 ```
 
 - `models` — the base directory a model spec resolves into: what `list`/
@@ -1083,9 +1086,9 @@ reexec = yes
   in can never disagree.
 - `model` — a model spec, the same shape as the CLI's positional argument
   (a local `.gguf` path, an `NR`/`MODEL` label, or a `<user>/<model>
-  [:quant]` Hugging Face repo). **Required by `--daemon`**, which has no
+[:quant]` Hugging Face repo). **Required by `--daemon`**, which has no
   terminal to prompt on — unless the binary is a bundle, which carries its
-  own model and so needs no key to name one. A `--daemon` run that *is* given
+  own model and so needs no key to name one. A `--daemon` run that _is_ given
   a positional model argument uses that instead of this key. An attached run
   still takes its model from the CLI argument when one is given; when none is, the interactive picker
   **pre-selects this one** — its `NR` is shown as the prompt's default and
@@ -1120,9 +1123,10 @@ reexec = yes
   keeps on loopback, without editing anything. It moves `[web].host` with it
   unless that key was set explicitly, so an API and a console a config
   deliberately separated stay separated. `-p`/`--port` overrides `port` the
-  same way, and `--web` overrides `[web].port` (`--web 0` turns the console
-  off) — useful for a second server alongside one already on 8100, and for a
-  bundle with no config file to edit.
+  same way, `--web` overrides `[web].port` (`--web 0` turns the console
+  off), and `--metrics` overrides `[prometheus].port` — useful for
+  a second server alongside one already on 8100, and for a bundle with no
+  config file to edit.
 - `slots` — how many requests generate concurrently, each with its own KV
   cache (default `1`). Raise it to serve overlapping requests without
   queuing behind each other.
@@ -1132,11 +1136,12 @@ reexec = yes
   in a reverse proxy stays valid — this exists so one binary on one machine is
   not forced into one.
 - `api_key` — bearer token every request must carry (`Authorization: Bearer
-  <key>`). Unset by default: the server is open, which suits the loopback bind
+<key>`). Unset by default: the server is open, which suits the loopback bind
   it also defaults to and does not suit a widened `host`. `ORANGU_API_KEY`
-  overrides the file so the secret need not be written down. Only `/health` is
-  exempt; everything else answers `401` with `WWW-Authenticate: Bearer`.
-- `device` — *which* card when `backend` finds more than one: `auto` (the
+  overrides the file so the secret need not be written down. Only `/health`
+  and `/ready` are exempt; everything else answers `401` with
+  `WWW-Authenticate: Bearer`.
+- `device` — _which_ card when `backend` finds more than one: `auto` (the
   default), an index as printed at startup, or any part of the device's name.
 - `device_split` — spread one model's layers across several devices; `off` by
   default. See **Splitting a model across devices**.
@@ -1206,7 +1211,7 @@ reexec = yes
   default) is exactly what it has always printed: the startup banner, a
   progress line rewritten once a second while a request runs, each
   request's completion line (`orangu-server: [slot 0] prompt 41 tokens in
-  0.31s ...`), and every note or warning along the way. `file` appends all
+0.31s ...`), and every note or warning along the way. `file` appends all
   of that to `log_path` instead — each line stamped with a time and a level
   — except the once-a-second progress, which a file has no use for: a file
   gets each request's completed line and nothing in between. `log_path`
@@ -1303,6 +1308,36 @@ works: a configuration written against it goes on serving the console on
 that port, with `host` and `reexec` at their defaults. A `[web]` section
 takes precedence over it wherever both appear.
 
+### The `[prometheus]` section
+
+A second, dedicated Prometheus listener, configured the same way as `[web]`:
+**having this section at all is what enables it**. A config with no
+`[prometheus]` binds no third listener; `-i`/`--init` asks
+`Add Prometheus metrics` and then `host` and `port`, or writes no
+section at all.
+
+```ini
+[prometheus]
+host = 127.0.0.1
+port = 8300
+```
+
+- `host` — the address it binds. **When the key is absent it falls back to
+  `[orangu-server].host`**, and `--host` moves it along with the API. Set it
+  explicitly to keep the keyless metrics port somewhere the API isn't — an
+  API on `all` with metrics on `127.0.0.1` or a private scrape interface. An
+  explicit `host` stands even under `--host`, the same as `[web].host`.
+- `port` — where the listener binds, alongside `[orangu-server].port` rather
+  than instead of it. Defaults to `8300` when the section is present but
+  says nothing. It serves the exact same Prometheus text as `/metrics` above
+  — but with **no `api_key` check**, even when one is set, since the point
+  is a scrape target that doesn't need the bearer token. Bind it only where
+  that is actually acceptable (behind a firewall, on a scrape-only
+  interface, or loopback). `--metrics` overrides it for one
+  run (`--metrics 0` turns the listener off). `GET /` on this port
+  serves a small static page linking to `/metrics`, so a browser doesn't
+  land on a 404; nothing else is served.
+
 Default lookup order for the config file: `-c`/`--config` picks one
 explicitly; without it, `./orangu-server.conf` then
 `~/.orangu/orangu-server.conf` are tried, in that order — the same order
@@ -1320,7 +1355,7 @@ directory that doesn't exist yet is created, parents included), then
 `all`), then `host` (TAB-completing — and previewing as an inline grey
 ghost — `all`, `*`, and every address this machine's network interfaces
 actually have, each listed with the interface it belongs to), then
-`port`/`web`, then `log_type` (TAB-completing `console`/`file`, ghosting
+`port`/`web`/`prometheus`, then `log_type` (TAB-completing `console`/`file`, ghosting
 `console`) and — only on `file` — `log_path` (TAB-completing real
 filesystem paths as you type, and ghosting its default,
 `orangu-server.log` in the current directory, on the empty line), shows the
@@ -1334,7 +1369,7 @@ the server is started from.
 (Unix-only) — it requires `model` to be set in the config, since there's no
 attached terminal left to pass a CLI argument to or prompt on; the config
 and model are resolved, the log file opened, and both listeners bound,
-*before* detaching, so a bad config, an unwritable `log_path` or a port
+_before_ detaching, so a bad config, an unwritable `log_path` or a port
 already in use is still reported to the invoking terminal rather than
 silently lost. A daemon with the console as its log logs nothing at all —
 set `log_type = file` to keep its output. `-h`/`--help` and
@@ -1380,7 +1415,7 @@ the path is made absolute against the directory the server was started in
 and normalized (`.` and `..` segments folded away, symlinks left alone),
 then checked to be an existing directory — a typo fails at startup, while
 there's still a terminal to report it on, rather than at first use. With
-`--daemon` this all happens *before* detaching, so a relative path still
+`--daemon` this all happens _before_ detaching, so a relative path still
 means what it meant in the launching shell.
 
 The resolved path is printed on the startup banner, reported as
@@ -1421,9 +1456,9 @@ that doesn't have `orangu-server`'s `--fit`/`--tools`/`--webui-mcp-proxy`/
   server's `--reasoning-budget 0 --reasoning off` without its reasoning-
   parsing machinery: `/v1/chat/completions` (and `/apply-template`, so it
   shows the same thing that will actually be sent) passes `enable_thinking:
-  false` into the chat template — the kwarg convention several reasoning-
+false` into the chat template — the kwarg convention several reasoning-
   capable models' own templates check (Qwen3's among them) to skip
-  whatever preamble tells the model to think first — *and* appends an
+  whatever preamble tells the model to think first — _and_ appends an
   empty, already-closed `<think>\n\n</think>\n\n` block right after the
   rendered prompt, so generation resumes immediately past any thinking
   phase rather than entering one. `<think>`/`</think>` is a near-universal
@@ -1432,15 +1467,15 @@ that doesn't have `orangu-server`'s `--fit`/`--tools`/`--webui-mcp-proxy`/
   prefill half of this (the `enable_thinking` kwarg still applies, for
   whatever templates check it).
 
-  A model whose format makes reasoning a *separate message* rather than a
-  tagged span — `muse-glimmer`, which addresses one message `to=self` and
-  the next `to=user`, and `inkling`, which opens one with
-  `<|content_thinking|>` and the next with `<|content_text|>` — is handled
-  exactly rather than approximated: the reasoning message is dropped from
-  the reply, and no `<think>` block is prefilled (that prefill would land
-  inside the message header the first format leaves open, or ahead of the
-  marker that types the body in the second, and the reply came back empty
-  when it did).
+    A model whose format makes reasoning a _separate message_ rather than a
+    tagged span — `muse-glimmer`, which addresses one message `to=self` and
+    the next `to=user`, and `inkling`, which opens one with
+    `<|content_thinking|>` and the next with `<|content_text|>` — is handled
+    exactly rather than approximated: the reasoning message is dropped from
+    the reply, and no `<think>` block is prefilled (that prefill would land
+    inside the message header the first format leaves open, or ahead of the
+    marker that types the body in the second, and the reply came back empty
+    when it did).
 
 `code` behaves identically to `all` today — no `orangu-server` feature is
 `code`-specific yet beyond what `all` already provides.
@@ -1467,7 +1502,7 @@ Five GPU backends are available, chosen via `backend` in the config (or
   pay for on every generated token. Reaches AMD GPUs through Mesa's RADV
   driver with no AMD-specific code needed, and reaches NVIDIA/Intel GPUs
   the same way, wherever a working Vulkan driver is installed — no Vulkan
-  SDK is needed to *build* `orangu-server`, only a Vulkan driver to *run*
+  SDK is needed to _build_ `orangu-server`, only a Vulkan driver to _run_
   it on a GPU. Verified end-to-end against real AMD hardware. Still
   meaningfully behind llama.cpp's own tuned Vulkan backend on the same
   model and hardware — a real, ongoing, and openly tracked performance
@@ -1495,7 +1530,7 @@ Five GPU backends are available, chosen via `backend` in the config (or
   NVIDIA/OpenCL/ROCm hardware during development, so treat them as
   functional but less proven than the Vulkan path until verified on your
   own hardware. ROCm additionally requires building with `cargo build
-  --features rocm` — see [BUILDING.md](BUILDING.md) — since it's off by
+--features rocm` — see [BUILDING.md](BUILDING.md) — since it's off by
   default in a plain build.
 
 Naming a `backend` explicitly fails to start rather than silently falling
@@ -1526,8 +1561,8 @@ lower right — the console's standard place for a download, the same as the
 save control under a finished answer — so a single block can be saved on
 its own rather than selected by hand out of a transcript. The name comes
 from the fence
-(```` ```rust src/main.rs ````, ```` ```rust:src/main.rs ````,
-```` ```rust title="src/main.rs" ````), or from a first line that is a
+(` ```rust src/main.rs `, ` ```rust:src/main.rs `,
+` ```rust title="src/main.rs" `), or from a first line that is a
 comment holding nothing but a name (`// src/lib.rs`), or failing both from
 a generated `orangu-snippet-<n>.<ext>` numbered by position and extended
 from the fence's language.
@@ -1578,13 +1613,13 @@ deployment posture worth configuring for.
 The topbar's **Models** button opens a panel showing the models directory from
 the same scan as `orangu-server list`, with its core numbered inventory fields:
 
-| | |
-| :-- | :-- |
-| `NR` | the row number, the same one `list` gives the same model |
-| `MODEL` | what to pass to `show`/`delete`/`refresh` on the command line |
-| `QUANT` | the quantization the file is stored at, `-` when it says nothing |
-| `SIZE` | summed across every shard |
-| `SUPPORTED` | e.g. `Yes (llama)`, `No (glm4moe)`, `No (llama, TQ1_0)` |
+|             |                                                                  |
+| :---------- | :--------------------------------------------------------------- |
+| `NR`        | the row number, the same one `list` gives the same model         |
+| `MODEL`     | what to pass to `show`/`delete`/`refresh` on the command line    |
+| `QUANT`     | the quantization the file is stored at, `-` when it says nothing |
+| `SIZE`      | summed across every shard                                        |
+| `SUPPORTED` | e.g. `Yes (llama)`, `No (glm4moe)`, `No (llama, TQ1_0)`          |
 
 Those strings come from the same code that prints them in the terminal, so
 the two tables cannot end up saying different things about the same file. A
@@ -1601,11 +1636,11 @@ much of its filesystem is used and free.
 
 Two icon buttons per row — hover either for what it does:
 
-| Icon | Tooltip | |
-| :-- | :-- | :-- |
-| play triangle | **Load ...** | serve this model instead — see below. Absent entirely when `[web].reexec` is off |
-| document | **Show ...** | this file's full GGUF metadata — `orangu-server show` |
-| waste basket | **Delete ...** | remove every shard — `orangu-server delete`. Absent entirely when `[web].delete` is off |
+| Icon          | Tooltip        |                                                                                         |
+| :------------ | :------------- | :-------------------------------------------------------------------------------------- |
+| play triangle | **Load ...**   | serve this model instead — see below. Absent entirely when `[web].reexec` is off        |
+| document      | **Show ...**   | this file's full GGUF metadata — `orangu-server show`                                   |
+| waste basket  | **Delete ...** | remove every shard — `orangu-server delete`. Absent entirely when `[web].delete` is off |
 
 The loaded model's row shows a check mark where its **Load** button would
 be (and is named **loaded** beside its own name, which is what says so when
@@ -1737,13 +1772,13 @@ What's left is then handled by the argument:
 - **No argument**: prints every remaining session as a numbered table,
   newest-updated first, and prompts for an `NR` or `all`:
 
-  ```
-  NR  ID                                    TITLE                MESSAGES  UPDATED
-   1  153ed918-1cde-4ac3-aa3e-fc8eb9d2c462  What is Rust?                4  2m ago  (active)
-   2  f082af10-39c9-465c-b2b1-92e4682bb689  Explain sliding windows      6  1d ago
+    ```
+    NR  ID                                    TITLE                MESSAGES  UPDATED
+     1  153ed918-1cde-4ac3-aa3e-fc8eb9d2c462  What is Rust?                4  2m ago  (active)
+     2  f082af10-39c9-465c-b2b1-92e4682bb689  Explain sliding windows      6  1d ago
 
-  Prune (NR or 'all', empty to cancel):
-  ```
+    Prune (NR or 'all', empty to cancel):
+    ```
 
 - **`all`**: deletes every remaining session **except** active ones,
   printing which were skipped and asking for confirmation (`-y`/`--yes`
@@ -1752,7 +1787,7 @@ What's left is then handled by the argument:
   prunes that one session.
 
 A session is **active** when its `session.json` names a process that's
-still running — checked by pid *and* start time, so a pid the OS has since
+still running — checked by pid _and_ start time, so a pid the OS has since
 reused for an unrelated process doesn't count. This is re-checked live
 against the current process table every time `prune` runs, in a separate
 CLI invocation from whatever server process actually owns the session — not
@@ -1780,51 +1815,51 @@ Three answers apply to every row rather than to any one of them: `401` when
 and `GET /ready` excepted); `503` with `Retry-After` when `queue_limit` is
 reached; and `https` on the same port when `tls_cert`/`tls_key` are set.
 
-| Endpoint | |
-| :-- | :-- |
-| `GET /v1/models` | |
-| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding`. Accepts `response_format` — `{"type": "json_object"}` constrains sampling so only tokens keeping the output a valid JSON object can be chosen, and withholds end-of-sequence until the document is complete. `json_schema` is treated the same way: valid JSON, not the schema's shape |
-| `POST /v1/completions` | legacy OpenAI completion, no chat template needed; disabled under `--embedding` |
-| `POST /v1/embeddings` | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized |
-| `GET /health` | liveness — stays `200` while the server is busy |
-| `GET /ready` | readiness — `503` (with a reason) when the admission queue is full or the GPU device was lost. Open without an `api_key`, like `/health` |
-| `GET /props` | model + server metadata |
-| `GET /slots` | per-slot busy/prompt/generated-token state |
-| `GET /metrics` | Prometheus text: slot and queue gauges; latency histograms (`queue_wait`, `time_to_first_token`, `inter_token`, `request`); counters for requests by outcome and for prompt/cached/generated tokens |
-| `GET /moe-stats` | mixture-of-experts counters since the previous call, **and reset** — expert visits, the per-layer-call union, rows and bytes dequantized, plus the process's fault and RSS figures. Drain once before a workload and again after to measure exactly that window. Dense models report `layer_calls: 0` |
-| `orangu-server plan <model> [--deep]` | (a subcommand, not an endpoint) Reports what a model would need to run here **without loading it** — dense vs routed-expert bytes, experts streamed per token, and a verdict. Reads only the GGUF tensor tables, so a 434 GiB 11-shard model takes well under a second. `--deep` also checks every shard is present and the architecture supported |
-| `GET /gpu-timings` | per-stage GPU timings for the last decode step, when `ORANGU_GPU_TIMESTAMPS=1` asked for them |
-| `POST /slots/{id_slot}` | `?action=save\|restore` — persist or reload that slot's KV cache |
-| `GET /model-cache` | how many of the model's bytes are in the page cache right now. `resident_bytes` is `null` where the platform cannot measure it — never `0`, which would make "unknowable" read as "cold" |
-| `POST /model-cache/drop` | evict the model from the page cache so the next request reads it from disk; loopback-only. Reports residency before and after rather than a success flag, because a partial drop is the realistic failure and looks identical from outside |
+| Endpoint                              |                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| :------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/models`                      |                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `POST /v1/chat/completions`           | streaming (SSE) and non-streaming; requires the model to have a `tokenizer.chat_template`; disabled under `--embedding`. Accepts `response_format` — `{"type": "json_object"}` constrains sampling so only tokens keeping the output a valid JSON object can be chosen, and withholds end-of-sequence until the document is complete. `json_schema` is treated the same way: valid JSON, not the schema's shape |
+| `POST /v1/completions`                | legacy OpenAI completion, no chat template needed; disabled under `--embedding`                                                                                                                                                                                                                                                                                                                                 |
+| `POST /v1/embeddings`                 | pooled (mean or last-token, per the model's own `pooling_type`) and L2-normalized                                                                                                                                                                                                                                                                                                                               |
+| `GET /health`                         | liveness — stays `200` while the server is busy                                                                                                                                                                                                                                                                                                                                                                 |
+| `GET /ready`                          | readiness — `503` (with a reason) when the admission queue is full or the GPU device was lost. Open without an `api_key`, like `/health`                                                                                                                                                                                                                                                                        |
+| `GET /props`                          | model + server metadata                                                                                                                                                                                                                                                                                                                                                                                         |
+| `GET /slots`                          | per-slot busy/prompt/generated-token state                                                                                                                                                                                                                                                                                                                                                                      |
+| `GET /metrics`                        | Prometheus text: slot and queue gauges; latency histograms (`queue_wait`, `time_to_first_token`, `inter_token`, `request`); counters for requests by outcome and for prompt/cached/generated tokens. The identical text is also served, **unauthenticated**, on `[prometheus].port`'s own port when that section is set (default off)                                                                           |
+| `GET /moe-stats`                      | mixture-of-experts counters since the previous call, **and reset** — expert visits, the per-layer-call union, rows and bytes dequantized, plus the process's fault and RSS figures. Drain once before a workload and again after to measure exactly that window. Dense models report `layer_calls: 0`                                                                                                           |
+| `orangu-server plan <model> [--deep]` | (a subcommand, not an endpoint) Reports what a model would need to run here **without loading it** — dense vs routed-expert bytes, experts streamed per token, and a verdict. Reads only the GGUF tensor tables, so a 434 GiB 11-shard model takes well under a second. `--deep` also checks every shard is present and the architecture supported                                                              |
+| `GET /gpu-timings`                    | per-stage GPU timings for the last decode step, when `ORANGU_GPU_TIMESTAMPS=1` asked for them                                                                                                                                                                                                                                                                                                                   |
+| `POST /slots/{id_slot}`               | `?action=save\|restore` — persist or reload that slot's KV cache                                                                                                                                                                                                                                                                                                                                                |
+| `GET /model-cache`                    | how many of the model's bytes are in the page cache right now. `resident_bytes` is `null` where the platform cannot measure it — never `0`, which would make "unknowable" read as "cold"                                                                                                                                                                                                                        |
+| `POST /model-cache/drop`              | evict the model from the page cache so the next request reads it from disk; loopback-only. Reports residency before and after rather than a success flag, because a partial drop is the realistic failure and looks identical from outside                                                                                                                                                                      |
 
 `/moe-stats` also carries a `store` block describing where routed experts'
 weights came from. Three environment variables govern it, all off by default:
 
-**Boolean flags read `0`, `false`, `no`, `off` and the empty string as OFF**, and anything else as on. They used to be presence-checked, so `FLAG=0` switched the feature *on* and a sweep of `0,1` measured it against itself. The variables that carry a value or a path — `ORANGU_NORM_WG`, `ORANGU_COOP_GEOM`, `ORANGU_DUMP_SHADERS`, `ORANGU_EXPERT_USAGE`, `ORANGU_PREFIX_CACHE_DIR` — are parsed or presence-checked instead, as their descriptions say.
+**Boolean flags read `0`, `false`, `no`, `off` and the empty string as OFF**, and anything else as on. They used to be presence-checked, so `FLAG=0` switched the feature _on_ and a sweep of `0,1` measured it against itself. The variables that carry a value or a path — `ORANGU_NORM_WG`, `ORANGU_COOP_GEOM`, `ORANGU_DUMP_SHADERS`, `ORANGU_EXPERT_USAGE`, `ORANGU_PREFIX_CACHE_DIR` — are parsed or presence-checked instead, as their descriptions say.
 
-| variable | effect |
-| :-- | :-- |
-| `ORANGU_EXPERT_CACHE_GB` | Size of an in-process expert weight cache, in GiB. Unset or `0` keeps the incumbent behaviour — weights read straight from the `mmap`, placement left to the OS page cache. Worth setting only when the model does **not** fit in RAM: below that the page cache already holds every expert and a cache can only duplicate memory. Even above it, measurement has not yet found a budget where the cache beats the page cache — it competes with it for the same RAM, and the page cache gets the rest of the machine |
-| `ORANGU_EXPERT_READ` | Where the expert cache's copies are read from: `mmap` (default — a memcpy from the page cache), `pread` (an explicit read of the shard, still cached), or `direct` (`O_DIRECT`, bypassing the page cache). **`direct` is dramatically slower on a model the page cache can hold** — measured 54x on a 26B MoE — because it converts every memcpy into a disk read. It is for models far larger than RAM |
-| `ORANGU_EXPERT_CACHE_POLICY` | Replacement rule: `lfru` (frequency-first with an admission margin), `lfu` (the same scoring, admitting every miss), or the default `lru`. Which one wins depends on the regime, so the default is not a recommendation: on a model that fits in RAM under a small budget, LRU measured 12x better than LFRU; on one whose experts genuinely do not fit, LRU gets **zero** hits at a tight budget while both frequency rules score, because a routing pass is a scan and recency evicts every expert before it comes round again. The rule actually in force is reported back in `/moe-stats` |
-| `ORANGU_PREFIX_CACHE_DIR` | Directory for a durable snapshot of the prefix-cache pool, so a conversation survives a restart instead of re-prefilling. Needs `ORANGU_PREFIX_CACHE` as well. A snapshot carries the model's fingerprint and is refused for any other model — a KV cache from elsewhere would match on token ids and answer from the wrong state. Sized per entry as a whole KV cache (~330 KB per position on a 26B MoE), so it is opt-in |
-| `ORANGU_EXPERT_BUDGET` | Cap on distinct experts evaluated per layer at decode. **Changes what the model computes** — the only setting here that does — and is off by default. Never applied to prefill, and never leaves a position with nothing routed |
-| `ORANGU_ROUTE_AHEAD` / `ORANGU_PREFETCH_K` | Measure how predictable the next layer's routing is, and prefetch the top `k` of that prediction. `k` above 2 wastes more than 20% of what it fetches on the model this was measured on |
-| `ORANGU_EXPERT_RESIDENCY` | `1` asks the kernel (`mincore`) whether each expert's bytes were in RAM at the moment they were wanted. Off by default because it is one syscall per expert per layer; with it off, acquisitions report as `unmeasured` rather than as misses |
-| `POST /completion` | native, streaming; disabled under `--embedding` |
-| `POST /tokenize` / `POST /detokenize` | |
-| `POST /embedding` | native embeddings |
-| `POST /apply-template` | renders the chat template without generating |
-| `POST /v1/create_file` | file lifecycle: write a new file, with optional permissions |
-| `POST /v1/modify_file` | file lifecycle: replace named line ranges, returning a diff |
-| `POST /v1/move_file` | file lifecycle: rename a file, optionally re-setting permissions |
-| `POST /v1/delete_file` | file lifecycle: delete a file |
-| `POST /v1/show_file` | file lifecycle: return a file's entire content |
-| `POST /v1/create_directory` | file lifecycle: create one directory, with optional permissions |
-| `POST /v1/move_directory` | file lifecycle: move an entire directory tree |
-| `POST /v1/delete_directory` | file lifecycle: delete an empty directory |
-| `POST /v1/shutdown` | not part of the standard API — orangu-server's own |
+| variable                                   | effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| :----------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ORANGU_EXPERT_CACHE_GB`                   | Size of an in-process expert weight cache, in GiB. Unset or `0` keeps the incumbent behaviour — weights read straight from the `mmap`, placement left to the OS page cache. Worth setting only when the model does **not** fit in RAM: below that the page cache already holds every expert and a cache can only duplicate memory. Even above it, measurement has not yet found a budget where the cache beats the page cache — it competes with it for the same RAM, and the page cache gets the rest of the machine                                                                         |
+| `ORANGU_EXPERT_READ`                       | Where the expert cache's copies are read from: `mmap` (default — a memcpy from the page cache), `pread` (an explicit read of the shard, still cached), or `direct` (`O_DIRECT`, bypassing the page cache). **`direct` is dramatically slower on a model the page cache can hold** — measured 54x on a 26B MoE — because it converts every memcpy into a disk read. It is for models far larger than RAM                                                                                                                                                                                       |
+| `ORANGU_EXPERT_CACHE_POLICY`               | Replacement rule: `lfru` (frequency-first with an admission margin), `lfu` (the same scoring, admitting every miss), or the default `lru`. Which one wins depends on the regime, so the default is not a recommendation: on a model that fits in RAM under a small budget, LRU measured 12x better than LFRU; on one whose experts genuinely do not fit, LRU gets **zero** hits at a tight budget while both frequency rules score, because a routing pass is a scan and recency evicts every expert before it comes round again. The rule actually in force is reported back in `/moe-stats` |
+| `ORANGU_PREFIX_CACHE_DIR`                  | Directory for a durable snapshot of the prefix-cache pool, so a conversation survives a restart instead of re-prefilling. Needs `ORANGU_PREFIX_CACHE` as well. A snapshot carries the model's fingerprint and is refused for any other model — a KV cache from elsewhere would match on token ids and answer from the wrong state. Sized per entry as a whole KV cache (~330 KB per position on a 26B MoE), so it is opt-in                                                                                                                                                                   |
+| `ORANGU_EXPERT_BUDGET`                     | Cap on distinct experts evaluated per layer at decode. **Changes what the model computes** — the only setting here that does — and is off by default. Never applied to prefill, and never leaves a position with nothing routed                                                                                                                                                                                                                                                                                                                                                               |
+| `ORANGU_ROUTE_AHEAD` / `ORANGU_PREFETCH_K` | Measure how predictable the next layer's routing is, and prefetch the top `k` of that prediction. `k` above 2 wastes more than 20% of what it fetches on the model this was measured on                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `ORANGU_EXPERT_RESIDENCY`                  | `1` asks the kernel (`mincore`) whether each expert's bytes were in RAM at the moment they were wanted. Off by default because it is one syscall per expert per layer; with it off, acquisitions report as `unmeasured` rather than as misses                                                                                                                                                                                                                                                                                                                                                 |
+| `POST /completion`                         | native, streaming; disabled under `--embedding`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `POST /tokenize` / `POST /detokenize`      |                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `POST /embedding`                          | native embeddings                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `POST /apply-template`                     | renders the chat template without generating                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `POST /v1/create_file`                     | file lifecycle: write a new file, with optional permissions                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `POST /v1/modify_file`                     | file lifecycle: replace named line ranges, returning a diff                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `POST /v1/move_file`                       | file lifecycle: rename a file, optionally re-setting permissions                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `POST /v1/delete_file`                     | file lifecycle: delete a file                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `POST /v1/show_file`                       | file lifecycle: return a file's entire content                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `POST /v1/create_directory`                | file lifecycle: create one directory, with optional permissions                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `POST /v1/move_directory`                  | file lifecycle: move an entire directory tree                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `POST /v1/delete_directory`                | file lifecycle: delete an empty directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `POST /v1/shutdown`                        | not part of the standard API — orangu-server's own                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 Those eight are orangu-server's own JSON API for the whole life cycle of a
 file and the directories it lives in, and are confined to the workspace (see
@@ -1847,23 +1882,23 @@ used only by that page's own JavaScript, not part of the OpenAI-
 compatible API above, and only reachable at all when a `[web]` section is
 configured:
 
-| Endpoint | |
-| :-- | :-- |
-| `GET /api/asset-version` | the served page's own asset fingerprint — powers the Reload prompt shown when a newer build is running behind an already-open tab |
-| `GET /api/system-report` | plain-text hardware report (`system`'s own output) plus model/backend identity — what an error bubble's **Save** button bundles into its downloadable debug report, alongside the visible conversation |
-| `POST /api/sessions` | creates a new, empty chat session, returning its id |
-| `GET /api/sessions` | lists every non-empty session, newest-updated first |
-| `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
-| `POST /api/sessions/{id}/messages` | sends one chat turn against that session; streaming (SSE) reply, the same shape `/v1/chat/completions`' own stream uses |
-| `DELETE /api/sessions/{id}` | deletes one chat session, directory and all — History's per-row cross |
-| `DELETE /api/sessions` | deletes every chat session — History's **Clear all** footer |
-| `GET /api/models` | the models directory as the manager panel draws it: `list`'s own table, which row is loaded, disk use, and any download in flight. Serves a cached scan; `?rescan=true` re-reads the directory |
-| `GET /api/models/updates` | which rows are behind their Hugging Face repo — `list`'s `(Refresh)` marker, one Hub request per distinct repo |
-| `GET /api/models/metadata?model=…` | a model's full GGUF metadata as plain text — `show`'s own output. `&tensors=true` and `&full=true` are `show --tensors`/`--full` |
-| `POST /api/models/select` | restarts the server on a different model, keeping both listening sockets and the pid; answers `202` before it acts, since `execve` leaves nothing to answer from |
-| `POST /api/models/download` | starts a Hugging Face download in the background, returning at once |
-| `DELETE /api/models` | deletes a model, refusing the one currently loaded |
-| `DELETE /api/models/job` | clears a finished download's result |
+| Endpoint                           |                                                                                                                                                                                                        |
+| :--------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/asset-version`           | the served page's own asset fingerprint — powers the Reload prompt shown when a newer build is running behind an already-open tab                                                                      |
+| `GET /api/system-report`           | plain-text hardware report (`system`'s own output) plus model/backend identity — what an error bubble's **Save** button bundles into its downloadable debug report, alongside the visible conversation |
+| `POST /api/sessions`               | creates a new, empty chat session, returning its id                                                                                                                                                    |
+| `GET /api/sessions`                | lists every non-empty session, newest-updated first                                                                                                                                                    |
+| `GET /api/sessions/{id}`           | one session's full message history, each assistant reply already rendered to HTML                                                                                                                      |
+| `POST /api/sessions/{id}/messages` | sends one chat turn against that session; streaming (SSE) reply, the same shape `/v1/chat/completions`' own stream uses                                                                                |
+| `DELETE /api/sessions/{id}`        | deletes one chat session, directory and all — History's per-row cross                                                                                                                                  |
+| `DELETE /api/sessions`             | deletes every chat session — History's **Clear all** footer                                                                                                                                            |
+| `GET /api/models`                  | the models directory as the manager panel draws it: `list`'s own table, which row is loaded, disk use, and any download in flight. Serves a cached scan; `?rescan=true` re-reads the directory         |
+| `GET /api/models/updates`          | which rows are behind their Hugging Face repo — `list`'s `(Refresh)` marker, one Hub request per distinct repo                                                                                         |
+| `GET /api/models/metadata?model=…` | a model's full GGUF metadata as plain text — `show`'s own output. `&tensors=true` and `&full=true` are `show --tensors`/`--full`                                                                       |
+| `POST /api/models/select`          | restarts the server on a different model, keeping both listening sockets and the pid; answers `202` before it acts, since `execve` leaves nothing to answer from                                       |
+| `POST /api/models/download`        | starts a Hugging Face download in the background, returning at once                                                                                                                                    |
+| `DELETE /api/models`               | deletes a model, refusing the one currently loaded                                                                                                                                                     |
+| `DELETE /api/models/job`           | clears a finished download's result                                                                                                                                                                    |
 
 The three that name a model take `{"model": "..."}` — an `NR`, a `MODEL`
 label, a bare filename, or a path, exactly as the matching subcommand's own
@@ -1871,7 +1906,7 @@ argument does. The panel sends the `NR`, since that is the only spelling
 that names one row exactly (a repo with several quantizations on disk prints
 the same bare `MODEL` on each of their rows), and for a load or a delete it
 also sends the `path` that row showed. Given both, the server checks they
-still agree before acting: an `NR` is a *position*, and a download finishing
+still agree before acting: an `NR` is a _position_, and a download finishing
 while a confirmation dialog is open re-sorts the listing underneath it.
 
 ## Scope
@@ -1879,7 +1914,7 @@ while a confirmation dialog is open re-sorts the listing underneath it.
 Text-in/text-out GGUF chat, completion, and embedding models, for sixteen
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
-*text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
+_text-only_ input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
 the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
 top-k experts per MoE layer — plus the bidirectional-attention,
 embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
@@ -1889,7 +1924,7 @@ layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing),
 Qwen3-Next (`qwen3next`), the Qwen4 preview (`qwen4exp`, e.g.
 `unsloth/Qwen3.8-Flash-Next-GGUF` — the same hybrid
 full-attention/gated-DeltaNet sub-layers and routed-plus-shared-expert MoE
-as `qwen35moe`, but with no residual *vector*: the state between sub-layers
+as `qwen35moe`, but with no residual _vector_: the state between sub-layers
 is `hyper_connection.count` parallel streams, and every layer norm is
 replaced by the gate that mixes them; full-attention layers additionally
 attend only the blocks a small indexer picks, and the layers named by
@@ -1905,7 +1940,7 @@ e.g. `unsloth/GLM-5.3-Flash-GGUF` — three-in-four Kimi Delta Attention
 layers alternating with that same absorbed latent attention, on a
 `hyper_connection.count`-stream residual bundle rather than a residual
 vector, over sigmoid-routed experts with a shared one. Nothing in it
-rotates, and its lightning indexer scores fixed *pools* of
+rotates, and its lightning indexer scores fixed _pools_ of
 `attention.indexer.kpool` positions rather than single positions, so the
 cut lands on pool boundaries), Kimi-K3 (`kimi-k3`, e.g.
 `unsloth/Kimi-K3-GGUF` — three-in-four delta-net layers alternating with
@@ -1932,11 +1967,11 @@ sliding-window and full attention, and the routed experts share their
 weight normalization with two always-on shared ones), and Nemotron-H
 (`nemotron_h_moe`, e.g.
 `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` — a hybrid whose
-blocks are a *single* sub-layer each rather than the usual
+blocks are a _single_ sub-layer each rather than the usual
 attention-plus-FFN pair: a selective state-space mixer, an unrotated
 attention, or a squared-ReLU mixture-of-experts FFN), and Ling 3.0
 (`bailingmoe3`, e.g. `bartowski/Ling-3.0-tiny-GGUF` — three-in-four Kimi
-Delta Attention layers alternating with gated, *rotated* absorbed latent
+Delta Attention layers alternating with gated, _rotated_ absorbed latent
 attention, over sigmoid-routed experts whose selection is group-limited:
 the experts form `expert_group_count` groups and only the best
 `expert_group_used_count` of them may serve a token) — using
@@ -1964,7 +1999,7 @@ its FFN is the same softmax-routed experts plus a sigmoid-gated shared
 expert as `qwen35moe`, here at 512 experts and top-10. Both are shared
 implementations, not copies. Three things around them are new.
 
-**Hyper-connections.** There is no residual *vector*. The state carried
+**Hyper-connections.** There is no residual _vector_. The state carried
 between sub-layers is `hyper_connection.count` (4) parallel streams,
 seeded as four copies of the token embedding, and there is no
 `output_norm.weight` in the file at all: every layer norm has been replaced
@@ -1999,7 +2034,7 @@ width, each of the sixteen hash heads looks that value up in its own slice
 of the table, and the sixteen 160-wide rows concatenate into a second
 `n_embd` vector. That vector is gated against the residual streams, run
 through a causal convolution dilated by the n-gram size, and added back.
-Because the hash is over *token ids*, the cache carries the last two ids of
+Because the hash is over _token ids_, the cache carries the last two ids of
 a sequence alongside its key/value and recurrent state, so a chunked
 prefill's seam and a decode step hash the same n-grams a single-shot
 prefill would.
@@ -2030,7 +2065,7 @@ restarts from that layer's attention output, with each half-layer re-mixing
 the stream against every banked checkpoint by a softmax over per-checkpoint
 scores. **Latent MoE**: the routed experts run at `expert_latent_length`
 rather than at `n_embd`, so the FFN input is projected down, run, normed and
-projected back up — while the *router* still scores the full-width input.
+projected back up — while the _router_ still scores the full-width input.
 **The situ activation** replaces SwiGLU throughout: a soft-clipped SiLU on
 the gate branch, and the same soft clip on the up branch when
 `activation.situ_linear_beta` is positive. **A full-rank KDA gate**, where
@@ -2045,7 +2080,7 @@ GLM with DeepSeek sparse attention (`glm-dsa`) runs on the CPU path only.
 Its block shape is an ordinary pre-norm transformer, and its FFN is the same
 routed-experts-plus-shared-expert MoE as `qwen35moe` (dense for the first
 `leading_dense_block_count` layers); what is different is the attention.
-Keys and values are stored *compressed*: one `attention.kv_lora_rank`-wide
+Keys and values are stored _compressed_: one `attention.kv_lora_rank`-wide
 vector per token plus a shared rotary part serves every head, so even
 GLM-5.2's 79 layers keep a small cache. Rather than decompressing that back into
 per-head keys, the query is pushed through the key-decompression matrix
@@ -2113,7 +2148,7 @@ other family here in four ways at once: the residual stream is
 `hyper_connection.count` parallel streams rather than one, mixed down and
 back out per half-layer by weights the model predicts per token (the
 out-mix is made doubly stochastic by a Sinkhorn normalization);
-`attention.head_count_kv` is 1 and the value *is* the key, so all 64 query
+`attention.head_count_kv` is 1 and the value _is_ the key, so all 64 query
 heads attend one shared vector per token, whose trailing RoPE dimensions are
 rotated back out of the attention output again; `attention.compress_ratios`
 gives each layer a sliding window plus either whole 128-token compressed
@@ -2148,7 +2183,7 @@ shipped beside the text weights (`mmproj-*.gguf`) is not used, as for
 every architecture here.
 
 This model's prompt format is worth knowing about, because an assistant
-turn is several *messages* rather than one. The chat template ends the
+turn is several _messages_ rather than one. The chat template ends the
 generation prompt at `<|start|>assistant` and leaves the model to write its
 own recipient — `to=self` for a reasoning message, `to=user` for the
 answer, `to=<tool>` for a tool call — before the `<|message|>` that starts
@@ -2175,7 +2210,7 @@ only, and is the first architecture here that **rotates nothing** — no
 layer applies a rotary embedding. Position reaches attention two other
 ways. The first is a learned relative-position bias: each layer projects
 its input to a small per-head vector and mixes it against a per-layer bank
-into one additive term per query/key *distance*, so a key further back than
+into one additive term per query/key _distance_, so a key further back than
 the bank is wide contributes no bias at all and a short bank still serves a
 long prefix. The second is a causal depthwise short convolution — four of
 them per layer, of the width `inkling.shortconv_kernel` gives: on the raw
@@ -2209,7 +2244,7 @@ scope, as multimodal input is for every architecture here: the
 server does not load, and the audio embedding table is not part of the text
 GGUF at all.
 
-This model's prompt format types each message *body* with a control token:
+This model's prompt format types each message _body_ with a control token:
 `<|content_thinking|>` opens the model's reasoning, `<|content_text|>` the
 answer, and `<|end_message|>` closes either. The markers are filtered out
 of the reply like any other control token, and which bodies you see is the
@@ -2286,7 +2321,7 @@ reasoning-suppressing role cannot separate the two.
 Ling 3.0 (`bailingmoe3`, e.g. `bartowski/Ling-3.0-tiny-GGUF` and
 `bartowski/Ling-3.0-flash-GGUF`) runs on the CPU path only. Its trunk is a
 hybrid, and the file says so per layer: `attention.head_count_kv` is an
-*array*, and a `0` entry marks a recurrent Kimi Delta Attention layer while
+_array_, and a `0` entry marks a recurrent Kimi Delta Attention layer while
 a nonzero one marks a full-attention layer. Three of the first for every one
 of the second, so on the 24-layer tiny model six layers carry a key/value
 cache and eighteen do not — a long conversation costs a quarter of the
@@ -2299,7 +2334,7 @@ uses, and they share one implementation with it: a short causal convolution
 `ssm.conv_kernel` taps wide over each of the query, key and value
 projections, then a delta rule whose state decays **per dimension** rather
 than by one scalar per head, then a gated per-head norm. What is specific
-here is the *safe gate* (`kda.safe_gate`): the log-decay is
+here is the _safe gate_ (`kda.safe_gate`): the log-decay is
 `kda.gate_lower_bound * sigmoid(..)` rather than an unbounded
 `-exp(A_log) * softplus(..)`, so the per-dimension decay lives strictly
 between `e^lower_bound` and 1 and cannot reach 0 and erase the state.
@@ -2319,7 +2354,7 @@ selection but never the weights, renormalization, then
 `expert_weights_scale` — plus **group-limited selection**, which no
 architecture here had before: the experts are cut into
 `expert_group_count` contiguous groups (8 on both released models), each
-group is scored by the sum of its *two* best members, only the best
+group is scored by the sum of its _two_ best members, only the best
 `expert_group_used_count` groups (4) survive, and the top-k then runs over
 those alone. A strong expert in a weak group is therefore not selected —
 which is the point, and which a router that quietly ignored the grouping
@@ -2328,7 +2363,7 @@ would get wrong while still producing fluent text.
 Tool calling works in the model's own format: it writes a call as
 `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`,
 which this server already parsed — with the wrinkle that this vocabulary
-spells all six of those delimiters as *tokens* rather than as text, so they
+spells all six of those delimiters as _tokens_ rather than as text, so they
 have to be exempted from the suppression that hides every other structural
 token. Without that exemption the call reaches the parser as loose prose
 and quietly becomes chat rather than an invocation.
@@ -2350,7 +2385,7 @@ DeepSeek-V4-Flash DSpark sidecar. A draft carries no token embeddings and no
 output projection — it reads the target model's hidden states (the layers
 `dflash.target_layers` names) and drafts through the target's own embedding
 table and LM head — so there is no standalone model in the file to serve.
-Selecting one therefore serves the *paired target model* from the same
+Selecting one therefore serves the _paired target model_ from the same
 Hugging Face repo, downloading it first if the models directory does not
 have it yet; the startup banner names the model actually being served.
 Running a draft as an actual draft would
@@ -2358,7 +2393,7 @@ need a second-model speculative path, which this server does not have: its
 speculative decoding drafts by prompt lookup against the served model
 itself.
 
-A quantization label names the file's *dominant* type, not its only one. A
+A quantization label names the file's _dominant_ type, not its only one. A
 K-quant block is 256 elements wide, so every tensor it covers needs a row
 length divisible by 256; where a model's rows aren't, upstream's quantizer
 substitutes a narrower type row by row. `unsloth/Qwen2.5-Coder-0.5B-Instruct-GGUF:Q2_K`
@@ -2389,7 +2424,7 @@ Six further types load that upstream cannot read at all: `Q4_0_4_4`,
 `Q4_0_4_8`, `Q4_0_8_8`, and the `IQ4_NL_4_4`/`_4_8`/`_8_8` equivalents.
 ggml retired those ids and `llama.cpp` refuses such a file outright
 ("TYPE_Q4_0_4_4 REMOVED, use Q4_0 with runtime repacking"). They are
-ARM-SIMD *pre-repacked* `Q4_0`/`IQ4_NL`: the packing interleaves 4 or 8
+ARM-SIMD _pre-repacked_ `Q4_0`/`IQ4_NL`: the packing interleaves 4 or 8
 rows, and for the `Q4_0` family also flips a bit per nibble. That is a
 lossless permutation, so orangu undoes it once when the model opens and
 serves the result as ordinary `Q4_0`/`IQ4_NL`. Quality is identical to a
@@ -2399,7 +2434,7 @@ those tensors are held in memory rather than read from the mapped file,
 because interleaving rows leaves no row with a contiguous range to be lazy
 about.
 
-Three further types are narrower still, and come from *outside* the type
+Three further types are narrower still, and come from _outside_ the type
 enum ggml maintains: `IQ1_XS`, `IQ1_XXS` and `IQ1_XXXS`, at 1.4375, 1.3125
 and 1.1875 bits per weight. They are how a "dynamic" 1-bit release of a
 very large mixture-of-experts model gets under its size target — the expert

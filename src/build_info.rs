@@ -40,6 +40,27 @@ pub const COMMIT: &str = match option_env!("ORANGU_BUILD_COMMIT") {
     None => "unknown",
 };
 
+/// The package name — `orangu`.
+pub const NAME: &str = env!("CARGO_PKG_NAME");
+
+/// The `rustc` version this was built with, or `unknown`. See `build.rs`.
+pub const RUSTC: &str = match option_env!("ORANGU_BUILD_RUSTC") {
+    Some(rustc) => rustc,
+    None => "unknown",
+};
+
+/// The Cargo profile — `release`, `debug`, or `unknown`.
+pub const PROFILE: &str = match option_env!("ORANGU_BUILD_PROFILE") {
+    Some(profile) => profile,
+    None => "unknown",
+};
+
+/// The target triple this was built for, or `unknown`.
+pub const TARGET: &str = match option_env!("ORANGU_BUILD_TARGET") {
+    Some(target) => target,
+    None => "unknown",
+};
+
 /// `1.2.0 (52c0443ab)` — the two together, as one string for a banner, a
 /// report header or a series label.
 ///

@@ -7,9 +7,9 @@ API — both the OpenAI-compatible endpoints (`/v1/chat/completions`,
 `/v1/completions`, `/v1/embeddings`, `/v1/models`) and its own
 native ones (`/health`, `/props`, `/slots`, `/metrics`, `/completion`,
 `/tokenize`, `/detokenize`, `/embedding`, `/apply-template`). Every one of
-them is documented, field by field, in the *HTTP endpoints* chapter.
+them is documented, field by field, in the _HTTP endpoints_ chapter.
 
-`orangu-server` *is* the inference engine: GGUF loading, tokenization, the
+`orangu-server` _is_ the inference engine: GGUF loading, tokenization, the
 transformer forward pass, sampling, and request scheduling are implemented
 directly in Rust, with no dependency on any C or C++ inference library.
 `orangu-coordinator` (see the Coordinator chapter) sits in front of it,
@@ -19,7 +19,7 @@ chapter covers `orangu-server` itself.
 
 It's also the machine's GGUF inventory tool — the `system`/`suggest`/
 `list`/`show`/`download`/`delete`/`refresh` subcommands (below) answer the
-questions that matter when *getting*, *choosing*, and *cleaning up* a model,
+questions that matter when _getting_, _choosing_, and _cleaning up_ a model,
 before or after serving. Those seven read (or write) GGUF files directly off
 disk and query the local machine, no model loaded and no HTTP listener bound;
 `download` and `refresh` talk to the Hugging Face Hub to fetch a model, and
@@ -61,7 +61,7 @@ NR  MODEL                            QUANT   SIZE        SUPPORTED
  2  unsloth/gemma-4-E2B-it-GGUF      Q4_K_M  2.89 GiB    Yes (gemma4)
 
 Select a model (NR): 2
-role [all]: 
+role [all]:
 ```
 
 When the directory holds exactly one model there is nothing to choose
@@ -74,7 +74,7 @@ NR  MODEL                            QUANT   SIZE        SUPPORTED
  1  Qwen/Qwen2.5-0.5B-Instruct-GGUF  Q4_K_M  468.64 MiB  Yes (qwen2)
 
 model: Qwen/Qwen2.5-0.5B-Instruct-GGUF:Q4_K_M
-role [all]: 
+role [all]:
 ```
 
 On startup, `orangu-server` prints the same OS/CPU/GPU report `system`
@@ -159,7 +159,7 @@ which on a machine with a discrete card and an integrated one is two lines
 saying the same thing, every time, whether or not the card in question was
 the one serving the model.
 
-`Note` lines are machine *conditions* that will hold throughput down,
+`Note` lines are machine _conditions_ that will hold throughput down,
 printed only when there is something to say — a clean, plugged-in, cool
 machine prints none. There are two: running on battery, and a component
 already close to its critical temperature before any work has started.
@@ -167,7 +167,7 @@ Neither has a command as a fix — one is answered by a cable and the other
 by airflow — and both are printed because they explain a slow number that
 would otherwise look like the engine's fault.
 
-Machine *settings* are not notes. They have a value on every start rather
+Machine _settings_ are not notes. They have a value on every start rather
 than only on the starts where they are wrong, so printing them as warnings
 meant the reader saw nothing on a well-configured machine and a wall of
 repeated text on a badly-configured one. The CPU governor is the
@@ -235,11 +235,11 @@ hundred kilobytes — is enough to answer the question. Only the headers are
 transferred; the rest of the connection is dropped. Planning a 1.3 TiB repo
 therefore takes seconds, not the download.
 
-The point of doing it *before* rather than after is that the answer can
+The point of doing it _before_ rather than after is that the answer can
 still change the decision. **Dense** is what every token touches, so it has
 to be resident; **Experts** are touched a handful at a time, so on a
 mixture-of-experts model they can stream from disk. A model whose experts
-don't fit is slow. A model whose *dense* part doesn't fit will not work at
+don't fit is slow. A model whose _dense_ part doesn't fit will not work at
 all, and that is the only case that stops to ask:
 
 ```
@@ -250,7 +250,7 @@ This model cannot run on this machine. Download anyway? [y/N]:
 
 Anything but `y`/`yes` — including an empty line, or no terminal at all —
 leaves the model unfetched. `-y`/`--yes` downloads without asking, for
-scripts and for the case where you're fetching a model for a *different*
+scripts and for the case where you're fetching a model for a _different_
 machine. A model that merely has to stream its experts never prompts: that
 is the workload the streaming path exists for, not a problem.
 
@@ -328,7 +328,7 @@ error: not enough free space in /mnt/ai/models/models--unsloth--Kimi-K3-GGUF/blo
        1.31 TiB needed, 103.08 GiB free (short by 1.21 TiB)
 ```
 
-The free space counted is what's available to *your* user, not counting the
+The free space counted is what's available to _your_ user, not counting the
 root-only reserve. There's no safety margin beyond that: the check catches
 the download that cannot fit, not the one that fits with little to spare,
 and it can't account for anything else writing to the same filesystem while
@@ -452,11 +452,11 @@ and `AVX512` on x86, `NEON`, `SVE`, `SVE2`, `DotProd`, `I8MM`, `FP16` and
 `BF16` on AArch64. Three `No` rows for AVX on an ARM board are not an
 inventory — they describe instruction sets that CPU could never have had —
 so they are omitted rather than answered. These rows report what the
-*hardware* offers, which is a wider question than what orangu's own kernels
+_hardware_ offers, which is a wider question than what orangu's own kernels
 will use: `engine::vecdot` has x86 paths and no AArch64 ones, so an ARM
 machine can honestly report `SVE2` here and still run the scalar matmul,
 and the startup banner's own instruction-set field (which reports
-*dispatch*, not capability) will say `scalar` there.
+_dispatch_, not capability) will say `scalar` there.
 
 GPU detection has no single cross-platform API, so it layers several
 best-effort sources: `nvidia-smi` for NVIDIA (Linux and Windows), Linux's
@@ -464,7 +464,7 @@ best-effort sources: `nvidia-smi` for NVIDIA (Linux and Windows), Linux's
 PCI display device), and native OS tools (`system_profiler`/PowerShell's
 `Win32_VideoController`) on macOS and Windows. When none of those finds
 anything, the Vulkan loader is asked directly, as a last resort — every
-source above it reads an *OS* description of a PCI device, and an SoC has
+source above it reads an _OS_ description of a PCI device, and an SoC has
 neither. On a CIX P1 board the `/sys/class/drm/cardN` nodes are ACPI
 display controllers with no `vendor` file and the Mali GPU has no DRM node
 at all, so the machine reported no GPU whatsoever and then ran the model on
@@ -550,9 +550,9 @@ NPU
   Inference        : precompiled graphs (not GGUF models)
 ```
 
-One family can be *run on*: an Arm China Zhouyi AIPU reached through CIX's
+One family can be _run on_: an Arm China Zhouyi AIPU reached through CIX's
 NOE user-mode driver, which is the stack shipped on CIX P1/CD8180 boards
-(kernel-side `aipu.ko` behind `/dev/aipu`). `libnoe` is opened at *runtime*
+(kernel-side `aipu.ko` behind `/dev/aipu`). `libnoe` is opened at _runtime_
 rather than linked — it ships with a board BSP, lives off the default loader
 path, and exists on approximately no other machine — so its absence is an
 ordinary "no NPU" answer and not an error. `ORANGU_NPU_LIB` points the probe
@@ -613,7 +613,7 @@ not have it — log out and back in, or use `sg render -c "sg video -c
 Without that access, `orangu-server` falls back to the CPU and says why
 (`present but unreachable (/dev/dri/renderD129 is not readable by this user)`).
 It does not fail: both vendor probes check the device node before loading the
-vendor library, which is not politeness — Arm's Mali blob *segmentation faults*
+vendor library, which is not politeness — Arm's Mali blob _segmentation faults_
 rather than returning an error when it cannot open `/dev/mali0`, and once that
 blob is installed as the system `libOpenCL.so` every process that enumerates
 OpenCL devices is exposed to it.
@@ -629,11 +629,11 @@ tries it before any GPU.
 (RK3588, 16 GiB) serving `gemma-4-E2B-it` at `Q4_K_M`, every configuration
 producing identical text:
 
-| backend | decode | prefill (fresh 1976-token prompt) |
-|---|---|---|
-| `cpu` | 5.27 tok/s | 16.4 tok/s |
-| `npu` | 5.12 tok/s | **21.2 tok/s** |
-| `opencl` (Mali-G610) | 0.82 tok/s | 9.3 tok/s |
+| backend              | decode     | prefill (fresh 1976-token prompt) |
+| -------------------- | ---------- | --------------------------------- |
+| `cpu`                | 5.27 tok/s | 16.4 tok/s                        |
+| `npu`                | 5.12 tok/s | **21.2 tok/s**                    |
+| `opencl` (Mali-G610) | 0.82 tok/s | 9.3 tok/s                         |
 
 Decode is bandwidth-bound and the device loses it outright: its fixed cost is
 about 0.4 ms per call against a decode step that is nothing but small
@@ -649,12 +649,12 @@ with a symmetric scale per output channel, until `ORANGU_NPU_WEIGHTS_GB`
 the biggest lever on what the backend is worth**, because the device stops
 handing out memory near 2 GiB across all contexts:
 
-| `ORANGU_NPU_WEIGHTS_GB` | prefill | vs `cpu` |
-|---|---|---|
-| 0 (control: every matmul on the CPU) | 16.3 tok/s | 0.99× |
-| 1.0 | 19.4 tok/s | 1.18× |
-| 1.5 (default) | 21.2 tok/s | 1.29× |
-| 1.75 | 22.2 tok/s | 1.35× |
+| `ORANGU_NPU_WEIGHTS_GB`              | prefill    | vs `cpu` |
+| ------------------------------------ | ---------- | -------- |
+| 0 (control: every matmul on the CPU) | 16.3 tok/s | 0.99×    |
+| 1.0                                  | 19.4 tok/s | 1.18×    |
+| 1.5 (default)                        | 21.2 tok/s | 1.29×    |
+| 1.75                                 | 22.2 tok/s | 1.35×    |
 
 `ORANGU_NPU_MODE=fp16` selects `float16 × float16 → float32` instead of int8.
 It needs no requantization of a GGUF weight at all, so it is the fallback if
@@ -667,7 +667,7 @@ would have given int8's density with fp16's activations does not exist here.
 
 Three things about this are worth knowing before trusting a number from it.
 
-A weight only reaches the device when its shape fits the *enforced* alignment
+A weight only reaches the device when its shape fits the _enforced_ alignment
 — `K` a multiple of 32 elements, `N` a multiple of 32 for int8 or 16 for fp16
 — which is not what the vendor header documents (it says 16 and 8, and states
 a maximum `K` of 10240 that the runtime does not enforce and that real weights
@@ -677,15 +677,15 @@ disagrees. Mixed residency is the normal case here, not a degraded one.
 
 Accuracy is two separate questions. The device computes what it is asked to
 within about 1e-6; quantizing the operands is the real cost and it is the
-backend's own choice. One scale per activation *tensor* was enough to stop
-this model being able to count to twenty — one per *token*, which is what it
+backend's own choice. One scale per activation _tensor_ was enough to stop
+this model being able to count to twenty — one per _token_, which is what it
 does, produces output identical to the CPU's.
 
 And measure prefill on a prompt the server has not seen. Warming up on the
 same text reads the prefix cache and reports about eight times what the cores
 can actually do, which made this very speed-up look like a regression.
 
-**The last line is the important one, and it is precise.** orangu *can*
+**The last line is the important one, and it is precise.** orangu _can_
 run work on the NPU, in two ways.
 
 `orangu::npu::NpuRuntime` loads a compiled graph, binds inputs, executes and
@@ -695,7 +695,7 @@ and an int8 face-embedding model at ~6.5 ms steady state. It accepts either
 a `.cix` container (`load_graph`) or a bare AIPU executable already in
 memory (`load_graph_bytes`).
 
-`orangu::npu_ort` *produces* such an executable. It emits a small ONNX model
+`orangu::npu_ort` _produces_ such an executable. It emits a small ONNX model
 for a linear projection — or a chain of them — compiles it through ONNX
 Runtime's Zhouyi execution provider, and extracts the compiled binary from
 the EPContext node the provider writes. Measured end to end, including the
@@ -722,7 +722,7 @@ orangu's per-matmul `Backend` seam is the wrong shape for it.
 There is no `Relu` node in a fused stack, and none is needed. A hidden
 layer's output is quantized over `[0, bound]`, which puts its zero point at
 zero, and `QuantizeLinear` into `uint8` clamps at zero — so the rectifier
-*is* the quantization. That is also the only form that compiles: an explicit
+_is_ the quantization. That is also the only form that compiles: an explicit
 `Relu` between a convolution and its `QuantizeLinear` makes the provider
 reject the convolution, because its QDQ node group no longer ends where the
 builder expects.
@@ -731,11 +731,11 @@ Both halves of a Gemma 4 pair have been run this way, from their own GGUF
 weights rather than synthetic ones — `orangu::gguf::GgufFile::read_tensor`
 dequantizes `Q8_0` straight out of the file:
 
-| work | shape | time | rate |
-| --- | --- | --- | --- |
-| `v.blk.0` FFN, fused (the projector) | 196 patches x 768 x 3072 | 3.53 ms | **~790 GFLOP/s** |
-| `blk.0.attn_output.weight` (the model) | 128 tok x 2048 x 2560 | 2.14 ms | ~625 GFLOP/s |
-| `v.blk.0.ffn_down.weight` (the projector) | 196 patches x 3072 x 768 | 2.79 ms | ~330 GFLOP/s |
+| work                                      | shape                    | time    | rate             |
+| ----------------------------------------- | ------------------------ | ------- | ---------------- |
+| `v.blk.0` FFN, fused (the projector)      | 196 patches x 768 x 3072 | 3.53 ms | **~790 GFLOP/s** |
+| `blk.0.attn_output.weight` (the model)    | 128 tok x 2048 x 2560    | 2.14 ms | ~625 GFLOP/s     |
+| `v.blk.0.ffn_down.weight` (the projector) | 196 patches x 3072 x 768 | 2.79 ms | ~330 GFLOP/s     |
 
 The projector is the better-shaped work of the two, for a reason worth
 stating: a vision encoder runs a **fixed** 196 patches every time, so one
@@ -873,12 +873,12 @@ also not in the `auto` order, so nothing selects it by accident.
 
 One more thing is worth knowing before the payoff is assumed. The NPU shares
 system DDR with the CPU and the GPU, so it has no bandwidth advantage for
-*decode*, which is bandwidth-bound; only prefill is compute-bound enough to
+_decode_, which is bandwidth-bound; only prefill is compute-bound enough to
 have headroom. The measurements agree: at a decode-sized projection (8
 tokens, 64x32) the NPU takes 0.111 ms against 0.034 ms for a naive scalar
 CPU loop, and only becomes worth the trip at prefill shapes.
 
-**`suggest`** estimates a GGUF model *size* (parameter count, not a
+**`suggest`** estimates a GGUF model _size_ (parameter count, not a
 specific model yet) likely to run comfortably on this machine, printed as a
 table — one row per context length, one column per quantization — sized
 against two budgets: dedicated GPU VRAM alone (its table is skipped
@@ -903,9 +903,9 @@ Suggested model size (Dedicated)
 Both budgets are a **largest single pool**, never a sum of pools: a model
 is loaded onto one device and runs on one backend, with no tensor split
 across two GPUs and no partial-offload split of layers between a GPU and
-the CPU, so no run can draw on a discrete card's VRAM *and* system RAM (or
+the CPU, so no run can draw on a discrete card's VRAM _and_ system RAM (or
 on two cards) at once. Dedicated VRAM is one of the
-candidates for it, which makes the `Dedicated` table above the *fast*
+candidates for it, which makes the `Dedicated` table above the _fast_
 subset of this one rather than a separate machine.
 
 Each budget names the pool it came from — `3.98 GiB (Navi 14 [Radeon RX
@@ -921,7 +921,7 @@ length × layers × hidden size, plus a small fixed runtime overhead. Both
 budgets are sized against total memory rather than what happens to be free
 right now, so treat them as hardware ceilings, not promises.
 
-Every figure in the table is *estimated*, and the report closes by saying
+Every figure in the table is _estimated_, and the report closes by saying
 so. No model has been chosen at this point, so there is no file to read:
 layer count and hidden size are themselves derived from the parameter count
 via the standard transformer approximation. This is a size class, not an
@@ -965,7 +965,7 @@ that has several, and to ask for one that isn't downloaded yet. The
 companion files `download` fetches beside a model — a multimodal projector
 (`mmproj-*.gguf`) and a multi-token-prediction head (`MTP/mtp-*.gguf`, see
 **Multi-token-prediction heads** below) — don't count as models of their own:
-each is meant to be loaded *alongside* a base model, not to stand in as one,
+each is meant to be loaded _alongside_ a base model, not to stand in as one,
 so neither gets a row, and both go with the repo once its last model is
 deleted.
 
@@ -1098,7 +1098,7 @@ line beside it, so counting it would both double-count and hide the real
 ceiling behind a number an order of magnitude too large. On a machine with
 no dedicated card there is no second ceiling and no `Device` line.
 
-What the `Device` figure weighs is not the `Dense` figure. Routed *and*
+What the `Device` figure weighs is not the `Dense` figure. Routed _and_
 shared experts have no GPU path, so on a mixture-of-experts model the card
 holds less than the dense part — shared experts run for every token and
 still live in host memory. The draft head, likewise, is charged to neither.
@@ -1182,7 +1182,7 @@ is what recovers from that.
 The argument resolves the way `delete`'s does, with one difference: a `MODEL`
 name that matches more than one row is an error rather than a first-match.
 Since `refresh` deletes what it then downloads, silently picking a row would
-refresh the wrong quantization *and* leave the one you meant untouched:
+refresh the wrong quantization _and_ leave the one you meant untouched:
 
 ```
 $ orangu-server refresh bartowski/Llama-3.2-1B-Instruct-GGUF
@@ -1190,7 +1190,7 @@ error: 'bartowski/Llama-3.2-1B-Instruct-GGUF' names 2 models on disk (Q4_K_M, Q6
 ```
 
 With no argument, `refresh` prints `list`'s table with every row that is
-*already* current greyed out — the inverse of what `list` greys — so the only
+_already_ current greyed out — the inverse of what `list` greys — so the only
 `NR`s standing out are the ones worth refreshing, and prompts for one. When
 nothing is behind, or the Hub couldn't be reached at all, it says so instead
 of opening a picker whose every choice would be a no-op. A model that didn't
@@ -1239,7 +1239,7 @@ Frequency  Performance
 ```
 
 One file to copy to a machine, and a working OpenAI-compatible server on it.
-The model is *inside* the binary — not downloaded on first run, not extracted
+The model is _inside_ the binary — not downloaded on first run, not extracted
 to a cache directory, not referenced from one — so the binary is as large as
 the model, and copying it copies everything.
 
@@ -1266,21 +1266,24 @@ The role prompt follows, exactly as at startup, unless
 `--all`/`--code`/`--review`/`--explorer`/`--embedding` was passed. Those work
 both after the subcommand (`bundle <model> --code`) and before it
 (`--code bundle <model>`). `-y`/`--yes` skips the role prompt as well as the
-confirmation, taking `all`. The role travels *with* the bundle: a `--code`
+confirmation, taking `all`. The role travels _with_ the bundle: a `--code`
 bundle comes up in the coding role wherever it's run, with no flag needed.
 
 `-o`/`--output` chooses where to write; the default is
 `./orangu-server-bundle-<arch>`, never the running binary's own name, so a
 `bundle` run in a directory holding one can't overwrite it. `--binary` names a
-*different* executable to bundle into — a build for another platform, which
+_different_ executable to bundle into — a build for another platform, which
 can't be run here to bundle itself.
 
 ### Baking in the address
 
-`bundle` takes `--host`, `--port` and `--web` too, and records them *in* the
-bundle — exactly as it records the role. A bundle is started without a config
-file, so where it listens has to be decidable when it is built, not only when
-it is run:
+`bundle` takes `--host`, `--port`, `--web` and `--metrics` too, and
+records them _in_ the bundle — exactly as it records the role. A bundle is
+started without a config file, so where it listens has to be decidable when
+it is built, not only when it is run. (The `Listen` summary line below
+reports only the API and console addresses; a baked-in `--metrics`
+still takes effect at startup, same as every other resolved setting — see
+its own `Metrics` banner line.)
 
 ```sh
 orangu-server bundle <model> --all --host all -y   # LAN-reachable wherever it lands
@@ -1301,8 +1304,9 @@ defaults included. Without any of these flags a bundle keeps the built-in
 The address is checked at build time rather than left for the target machine's
 `bind` to reject: `--host` accepts `all`, `*`, or a literal IP address, and a
 hostname or a typo is an error while there is still somebody to tell. Whatever
-is baked in is a *default*, not a lock — the same `--host`/`--port`/`--web`
-flags at run time still override it, and so does a config file.
+is baked in is a _default_, not a lock — the same
+`--host`/`--port`/`--web`/`--metrics` flags at run time still override
+it, and so does a config file.
 
 ### The architecture is in the name
 
@@ -1334,7 +1338,7 @@ Only what it has to:
   `--host`/`--port`/`--web` — plus the Hugging Face hub cache as its `models`
   directory, and the role the bundle was built with. Loopback rather than the usual `all`: a binary somebody
   downloaded and ran should not put itself on every interface of a network
-  it knows nothing about. An `orangu-server.conf` that *is* found is used in
+  it knows nothing about. An `orangu-server.conf` that _is_ found is used in
   full, exactly as for any other server — including `host = all` to opt back
   in.
 - **It serves its own model without asking.** There is nothing to choose
@@ -1353,25 +1357,26 @@ Only what it has to:
   the network for it.
 
 Everything else — endpoints, roles, backends, the web console, sessions — is
-the same server, because it *is* the same binary with bytes after it.
+the same server, because it _is_ the same binary with bytes after it.
 
 ### Overriding the address and ports
 
-`--host`, `--port` and `--web` override whatever the config file (or, for a
-bundle, the built-in defaults) resolved to:
+`--host`, `--port`, `--web` and `--metrics` override whatever the config
+file (or, for a bundle, the built-in defaults) resolved to:
 
 ```sh
 ./orangu-server-bundle-x86_64 --host all              # every interface, not just loopback
 ./orangu-server-bundle-x86_64 --host 0.0.0.0          # the same thing, spelled out
 ./orangu-server-bundle-x86_64 --port 9100 --web 9300  # both listeners moved
 ./orangu-server-bundle-x86_64 --web 0                 # web console off
+./orangu-server-bundle-x86_64 --metrics 9400     # dedicated, unauthenticated /metrics
 ```
 
 `--host` takes `all` (or `*`) for every network interface, or a literal
 address — the same values `[orangu-server].host` accepts. It is how a bundle
 that was not built with an address of its own gets exposed to the network for
 one run, without writing a config file for it; to make that a bundle's
-*default*, pass the same flags to `bundle` itself (see **Baking in the
+_default_, pass the same flags to `bundle` itself (see **Baking in the
 address** above).
 
 It moves the **web console with the API**, since the two share an address
@@ -1381,10 +1386,15 @@ from the console cannot be exposed in a way that quietly exposes the console
 too. Use `--web 0` to turn the console off entirely when only the API should be
 reachable.
 
-Where to listen is the setting that is routinely per-*run* rather than
+`--metrics` moves with `--host` the same way the API does — there is no
+separate metrics host to keep it on. It is `0` (disabled) unless a config file
+or this flag names a port, since that listener carries no `api_key` check at
+all — see **Monitoring: `/metrics` and `/ready`** above.
+
+Where to listen is the setting that is routinely per-_run_ rather than
 per-machine — a second server alongside one already on 8100, a port a firewall
 happens to allow, a bundle that should be reachable from the LAN for one
-afternoon — and a bundle may have no config file to edit. All three flags apply
+afternoon — and a bundle may have no config file to edit. All four flags apply
 to an ordinary `orangu-server` too.
 
 ### How it works
@@ -1414,7 +1424,7 @@ bundled again: `./orangu-server-bundle-x86_64 bundle <other-model>` replaces the
 model rather than stacking a second one behind the first.
 
 On macOS the copied program image is re-signed ad-hoc (`codesign --force
---sign -`) *before* the model is appended to it — `codesign` writes the new
+--sign -`) _before_ the model is appended to it — `codesign` writes the new
 signature at the end of the image it is given, so signing afterwards would
 write it straight over the payload. Signing first leaves the model outside
 the signed range, where the kernel never looks. If `codesign` isn't
@@ -1449,6 +1459,9 @@ log_type = console
 [web]
 port = 8101
 reexec = yes
+
+[prometheus]
+port = 8300
 ```
 
 - `models` — the base directory a model spec resolves into: what `list`/
@@ -1462,9 +1475,9 @@ reexec = yes
   full path typed out.
 - `model` — a model spec, the same shape as the CLI's positional argument
   (a local `.gguf` path, an `NR`/`MODEL` label, or a `<user>/<model>
-  [:quant]` Hugging Face repo). **Required by `--daemon`**, which has no
+[:quant]` Hugging Face repo). **Required by `--daemon`**, which has no
   terminal to prompt on — unless the binary is a bundle, which carries its
-  own model and so needs no key to name one. A `--daemon` run that *is* given
+  own model and so needs no key to name one. A `--daemon` run that _is_ given
   a positional model argument uses that instead of this key. An attached run
   still takes its model from the CLI argument when one is given; when none is, the interactive picker
   **pre-selects this one** — its `NR` is shown as the prompt's default and
@@ -1493,7 +1506,8 @@ reexec = yes
   belongs to. `--host` on the command line overrides this for one run
   (`--host all` exposes a server a config keeps on loopback, and moves
   `[web].host` with it unless that key was set explicitly), `-p`/`--port`
-  overrides `port`, and `--web` overrides `[web].port` — see **Overriding the
+  overrides `port`, `--web` overrides `[web].port`, and `--metrics`
+  overrides `[prometheus].port` — see **Overriding the
   address and ports** above.
 - `slots` — how many requests generate concurrently, each with its own KV
   cache (default `1`). Raise it to serve overlapping requests without
@@ -1502,7 +1516,7 @@ reexec = yes
   Both or neither: setting one alone is a startup error rather than a
   half-enabled server, because the alternative is serving in the clear while
   the config looks like it does not. The banner then reads `API
-  https://…` and `TLS Yes`, and a certificate that will not load is a
+https://…` and `TLS Yes`, and a certificate that will not load is a
   startup failure naming
   the file — a server that quietly fell back to plain HTTP because a key was
   unreadable is the failure worth being loud about. Any PEM key works
@@ -1511,11 +1525,12 @@ reexec = yes
   perfectly valid and is what most fleets do; this exists so that a single
   binary on one machine, with no package manager, is not forced into one.
 
-  ```sh
-  openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-    -subj "/CN=your-host" -addext "subjectAltName=DNS:your-host" \
-    -keyout key.pem -out cert.pem
-  ```
+    ```sh
+    openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+      -subj "/CN=your-host" -addext "subjectAltName=DNS:your-host" \
+      -keyout key.pem -out cert.pem
+    ```
+
 - `api_key` — the bearer token every request must carry. Unset by default,
   which leaves the server open; that is right for the loopback address it also
   defaults to, and becomes wrong the moment `host` is widened. Nothing about
@@ -1564,41 +1579,41 @@ reexec = yes
   positive multiple of `4`, because a read has to be a whole number of pages;
   anything else is refused rather than quietly rounded.
 
-  It exists because throughput on real storage is not proportional to how
-  much you ask for — it is closer to a step. Below some device-specific
-  request size every read costs a full round trip, and the device delivers a
-  small read and a large one in nearly the same time; above it the block
-  layer splits the request into several commands and issues them together,
-  and throughput jumps. On the storage this default was measured against the
-  step sits at 512 KiB: reads at or below it ran at 15–28 MB/s and reads from
-  1 MiB up ran at 206–214 MB/s, an eight-fold difference from request size
-  alone. Where that step falls depends on the controller, the bus, and any
-  bridge in front of it, which is why this is a key and not a constant.
+    It exists because throughput on real storage is not proportional to how
+    much you ask for — it is closer to a step. Below some device-specific
+    request size every read costs a full round trip, and the device delivers a
+    small read and a large one in nearly the same time; above it the block
+    layer splits the request into several commands and issues them together,
+    and throughput jumps. On the storage this default was measured against the
+    step sits at 512 KiB: reads at or below it ran at 15–28 MB/s and reads from
+    1 MiB up ran at 206–214 MB/s, an eight-fold difference from request size
+    alone. Where that step falls depends on the controller, the bus, and any
+    bridge in front of it, which is why this is a key and not a constant.
 
-  A span smaller than `read_size` is widened outward to it and the wanted
-  bytes taken from the middle — so neighbouring weights arrive with the one
-  that was asked for, at no extra cost on a device that charges per request.
-  A span larger than `read_size` is read as itself rather than being split.
+    A span smaller than `read_size` is widened outward to it and the wanted
+    bytes taken from the middle — so neighbouring weights arrive with the one
+    that was asked for, at no extra cost on a device that charges per request.
+    A span larger than `read_size` is read as itself rather than being split.
 
-  **The default widens, because widening was measured to win where it
-  matters.** On a mixture-of-experts model read cold — the case this key exists
-  for — 8 MiB gave **+36% decode tok/s** over not widening, and it made the
-  result far steadier: three runs spanning 7.89–8.44 tok/s against 2.25–8.65
-  without it. Large sequential reads hold the device in its fast regime;
-  scattered small ones let it drop out, and that variance costs more than the
-  wasted bytes. Warm, where nothing reaches the disk, the two are within noise.
+    **The default widens, because widening was measured to win where it
+    matters.** On a mixture-of-experts model read cold — the case this key exists
+    for — 8 MiB gave **+36% decode tok/s** over not widening, and it made the
+    result far steadier: three runs spanning 7.89–8.44 tok/s against 2.25–8.65
+    without it. Large sequential reads hold the device in its fast regime;
+    scattered small ones let it drop out, and that variance costs more than the
+    wasted bytes. Warm, where nothing reaches the disk, the two are within noise.
 
-  It does read more than it uses — an expert slice may be a few hundred KiB
-  inside an 8 MiB window — so on storage that charges per byte rather than per
-  request, lower it. Measure rather than assume, and **interleave the arms**:
-  run sequentially, this same comparison reported the opposite result, because
-  drives degrade measurably across a session and whichever arm goes second
-  loses.
+    It does read more than it uses — an expert slice may be a few hundred KiB
+    inside an 8 MiB window — so on storage that charges per byte rather than per
+    request, lower it. Measure rather than assume, and **interleave the arms**:
+    run sequentially, this same comparison reported the opposite result, because
+    drives degrade measurably across a session and whichever arm goes second
+    loses.
 
-  Only the **explicit** read routes use it (`ORANGU_EXPERT_READ=pread` or
-  `direct`). The default route is the memory mapping, where request size is
-  the kernel's readahead to decide, so on a default deployment this key
-  changes nothing.
+    Only the **explicit** read routes use it (`ORANGU_EXPERT_READ=pread` or
+    `direct`). The default route is the memory mapping, where request size is
+    the kernel's readahead to decide, so on a default deployment this key
+    changes nothing.
 
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `dx12`,
   `cuda`, `opencl`,
@@ -1612,7 +1627,7 @@ reexec = yes
   is tried behind Vulkan**, ahead of CUDA and OpenCL. Naming a
   backend explicitly fails to start instead of falling back, for when GPU
   inference was asked for specifically. See **GPU backend** below.
-- `device` — *which card*, when `backend` finds more than one: `auto` (the
+- `device` — _which card_, when `backend` finds more than one: `auto` (the
   default — every device on the machine, best first, one of which runs the
   model), an index as printed at startup, or any part of the device's name.
   Naming one makes it exclusive. See **Choosing a device** below.
@@ -1659,13 +1674,13 @@ reexec = yes
   `orangu-server` it starts (see the Coordinator chapter), and the two append
   to it line by line.
 
-  ```text
-  2026-09-16 23:36:41 INFO  Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (gemma4 arch, Vulkan, 30 layers, 32768 ctx)
-  2026-09-16 23:36:41 INFO  Mode       all
-  2026-09-16 23:36:41 INFO  API        http://0.0.0.0:8100
-  2026-09-16 23:37:02 INFO  orangu-server: [slot 0] prompt 41 tokens in 0.31s (132.26 tok/s), generated 64 tokens in 3.10s (20.65 tok/s)
-  2026-09-16 23:52:00 INFO  shutting down
-  ```
+    ```text
+    2026-09-16 23:36:41 INFO  Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (gemma4 arch, Vulkan, 30 layers, 32768 ctx)
+    2026-09-16 23:36:41 INFO  Mode       all
+    2026-09-16 23:36:41 INFO  API        http://0.0.0.0:8100
+    2026-09-16 23:37:02 INFO  orangu-server: [slot 0] prompt 41 tokens in 0.31s (132.26 tok/s), generated 64 tokens in 3.10s (20.65 tok/s)
+    2026-09-16 23:52:00 INFO  shutting down
+    ```
 
 ### Every key, in one place
 
@@ -1673,55 +1688,60 @@ The prose above explains the ones with real trade-offs; this is the reference.
 Every key is optional except `models`, and an unset key takes the default
 shown.
 
-| `[orangu-server]` | default | what it does |
-| :-- | :-- | :-- |
-| `models` | *required* | base directory model specs resolve against |
-| `model` | — | model to serve when none is given on the command line (required for `--daemon`) |
-| `host` | `127.0.0.1` | bind address; `all` means every interface |
-| `port` | `8100` | HTTP API port |
-| `slots` | per role | concurrent requests, each with its own KV cache |
-| `queue_limit` | `0` | requests allowed to wait for a slot before `503`; `0` is unbounded |
-| `api_key` | — | bearer token every request must carry; unset leaves the server open |
-| `tls_cert` / `tls_key` | — | PEM paths for serving HTTPS; both or neither |
-| `kv_cache` | `f16` | GPU KV mirror storage: `f16`, `q8_0`, or `f32` |
-| `read_size` | `8192` | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening |
-| `draft_model` | — | a second, smaller model whose guesses the served model verifies |
-| `draft_tokens` | `4` | tokens the draft proposes per verification |
-| `backend` | `auto` | `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm`, `npu` |
-| `device` | `auto` | which card: an index, part of a name, or `auto` |
-| `device_split` | `off` | spread one model across several devices |
-| `threads` | rayon's choice | CPU worker threads |
-| `role` | `all` | `all`, `code`, `review`, `explorer`, `embedding` |
-| `reasoning_effort` | `medium` | how hard a reasoning model is asked to think, in its own template's words |
-| `log_type` | `console` | where the server's output goes: `console`, or `file` to append it — stamped, and without the once-a-second progress line — to `log_path`; what a `--daemon` needs, since detached it otherwise logs nothing |
-| `log_path` | `orangu-server.log` in the start directory | the file `log_type = file` writes to; `~` is expanded, a missing directory created |
-| `web` | `0` | the pre-section spelling of `[web].port`, still honored when the file has no `[web]` section and ignored when it does |
+| `[orangu-server]`      | default                                    | what it does                                                                                                                                                                                                |
+| :--------------------- | :----------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `models`               | _required_                                 | base directory model specs resolve against                                                                                                                                                                  |
+| `model`                | —                                          | model to serve when none is given on the command line (required for `--daemon`)                                                                                                                             |
+| `host`                 | `127.0.0.1`                                | bind address; `all` means every interface                                                                                                                                                                   |
+| `port`                 | `8100`                                     | HTTP API port                                                                                                                                                                                               |
+| `slots`                | per role                                   | concurrent requests, each with its own KV cache                                                                                                                                                             |
+| `queue_limit`          | `0`                                        | requests allowed to wait for a slot before `503`; `0` is unbounded                                                                                                                                          |
+| `api_key`              | —                                          | bearer token every request must carry; unset leaves the server open                                                                                                                                         |
+| `tls_cert` / `tls_key` | —                                          | PEM paths for serving HTTPS; both or neither                                                                                                                                                                |
+| `kv_cache`             | `f16`                                      | GPU KV mirror storage: `f16`, `q8_0`, or `f32`                                                                                                                                                              |
+| `read_size`            | `8192`                                     | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening                                                                                                                  |
+| `draft_model`          | —                                          | a second, smaller model whose guesses the served model verifies                                                                                                                                             |
+| `draft_tokens`         | `4`                                        | tokens the draft proposes per verification                                                                                                                                                                  |
+| `backend`              | `auto`                                     | `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm`, `npu`                                                                                                                                           |
+| `device`               | `auto`                                     | which card: an index, part of a name, or `auto`                                                                                                                                                             |
+| `device_split`         | `off`                                      | spread one model across several devices                                                                                                                                                                     |
+| `threads`              | rayon's choice                             | CPU worker threads                                                                                                                                                                                          |
+| `role`                 | `all`                                      | `all`, `code`, `review`, `explorer`, `embedding`                                                                                                                                                            |
+| `reasoning_effort`     | `medium`                                   | how hard a reasoning model is asked to think, in its own template's words                                                                                                                                   |
+| `log_type`             | `console`                                  | where the server's output goes: `console`, or `file` to append it — stamped, and without the once-a-second progress line — to `log_path`; what a `--daemon` needs, since detached it otherwise logs nothing |
+| `log_path`             | `orangu-server.log` in the start directory | the file `log_type = file` writes to; `~` is expanded, a missing directory created                                                                                                                          |
+| `web`                  | `0`                                        | the pre-section spelling of `[web].port`, still honored when the file has no `[web]` section and ignored when it does                                                                                       |
 
-| `[web]` | default | what it does |
-| :-- | :-- | :-- |
-| `port` | `8101` | web console port; `0` disables it |
-| `host` | follows `[orangu-server].host` | bind address for the console alone |
-| `reexec` | `yes` | let the console switch the served model |
-| `delete` | `no` | let the console delete models from disk |
+| `[web]`  | default                        | what it does                            |
+| :------- | :----------------------------- | :-------------------------------------- |
+| `port`   | `8101`                         | web console port; `0` disables it       |
+| `host`   | follows `[orangu-server].host` | bind address for the console alone      |
+| `reexec` | `yes`                          | let the console switch the served model |
+| `delete` | `no`                           | let the console delete models from disk |
 
-Every section that is none of the above — not `[orangu-server]` and not
-`[web]` — is read as an **MCP server**, named after the section. These are an
+| `[prometheus]` | default                        | what it does                                                                                 |
+| :------------- | :----------------------------- | :------------------------------------------------------------------------------------------- |
+| `port`         | `8300`                         | dedicated, **unauthenticated** Prometheus `/metrics` port; the section's absence disables it |
+| `host`         | follows `[orangu-server].host` | bind address for the metrics listener alone                                                  |
+
+Every section that is none of the above — not `[orangu-server]`, `[web]`, or
+`[prometheus]` — is read as an **MCP server**, named after the section. These are an
 inventory for the web console's MCP panel, which lists them and
 shows one on request; the server itself neither connects to them nor calls
 them, so an entry here changes nothing about inference. A section with no
 `endpoint` is rejected at startup, which is also what a misspelled section
 name looks like.
 
-| `[<mcp-name>]` | default | what it does |
-| :-- | :-- | :-- |
-| `endpoint` | *required* | URL of the MCP service, as shown in the console |
-| `enabled` | `yes` | whether the console reports it as enabled |
-| `approval_mode` | `writes` | approval policy recorded for it: `auto`, `prompt`, `writes`, `deny` |
+| `[<mcp-name>]`  | default    | what it does                                                        |
+| :-------------- | :--------- | :------------------------------------------------------------------ |
+| `endpoint`      | _required_ | URL of the MCP service, as shown in the console                     |
+| `enabled`       | `yes`      | whether the console reports it as enabled                           |
+| `approval_mode` | `writes`   | approval policy recorded for it: `auto`, `prompt`, `writes`, `deny` |
 
 Environment variables override the file where one exists: `ORANGU_API_KEY` for
 `api_key` and `ORANGU_KV_CACHE` for `kv_cache`. Both exist so a secret or a
 sweep does not have to be written into a file — see the tuning-variable table
-in the *Inference server internals* chapter for the rest.
+in the _Inference server internals_ chapter for the rest.
 
 ### Monitoring: `/metrics` and `/ready`
 
@@ -1729,7 +1749,27 @@ in the *Inference server internals* chapter for the rest.
 histograms, and counters for requests by outcome and for prompt, cached and
 generated tokens. `/ready` is the readiness probe a load balancer wants, and
 is a different question from `/health`'s liveness. Both are documented, metric
-by metric, in the *HTTP endpoints* chapter.
+by metric, in the _HTTP endpoints_ chapter.
+
+**A dedicated metrics port.** A `[prometheus]` section — presence alone,
+same as `[web]` — binds a second listener that serves the identical
+Prometheus text on its own port: nothing new to scrape, just a second place
+to reach it from:
+
+```ini
+[prometheus]
+port = 8300
+```
+
+No `[prometheus]` section (default), and worth being deliberate about adding
+one: this listener carries **no `api_key` check**, even when one is
+configured for everything else — the point is a scrape target that doesn't
+need the bearer token. Bind it only where that is actually fine — behind a
+firewall, on an interface a scraper alone can reach, or on loopback for a
+local Prometheus. Its `host` defaults to `[orangu-server].host` (and follows
+`--host`); set `[prometheus].host` to bind it elsewhere, as `[web].host`
+does. `--metrics` overrides the config file's port for one run, the same way
+`--port`/`--web` do.
 
 ### Speculative decoding (`draft_model`)
 
@@ -1749,7 +1789,7 @@ label, or a Hugging Face repo. `draft_tokens` is how many tokens it proposes
 per verification; `ORANGU_SPEC_DRAFT` overrides it for one run.
 
 **Requirements, both checked at startup rather than discovered later.** The
-pair must share a vocabulary — speculation compares token *ids*, so two models
+pair must share a vocabulary — speculation compares token _ids_, so two models
 that disagree about what an id means produce wrong or needlessly slow output
 with nothing to see — and both must be an architecture with a multi-position
 forward (`gemma4`, `deepseek4`, `glm-dsa`, `muse-glimmer` today). Either
@@ -1765,14 +1805,14 @@ comparison has no meaning for a sampled or grammar-constrained request.
 Measured here on a 4 GiB card with a target that does not fit on it
 (`gemma-4-12B-it:Q4_K_M`, 1.43 tok/s unassisted):
 
-| drafter | tok/s | accepted per verification |
-| :-- | ---: | ---: |
-| none | 1.43 | — |
-| prompt-lookup (`ORANGU_SPECULATIVE=1`) | **3.01** | 1.67 |
-| `draft_model` (`gemma-4-E4B`), 4 tokens | 1.02 | 2.15 |
-| `draft_model` (`gemma-4-E4B`), 8 tokens | 0.67 | 2.56 |
+| drafter                                 |    tok/s | accepted per verification |
+| :-------------------------------------- | -------: | ------------------------: |
+| none                                    |     1.43 |                         — |
+| prompt-lookup (`ORANGU_SPECULATIVE=1`)  | **3.01** |                      1.67 |
+| `draft_model` (`gemma-4-E4B`), 4 tokens |     1.02 |                      2.15 |
+| `draft_model` (`gemma-4-E4B`), 8 tokens |     0.67 |                      2.56 |
 
-The draft model *predicts better* than prompt-lookup and still loses, because
+The draft model _predicts better_ than prompt-lookup and still loses, because
 each of its guesses costs a forward pass through a second set of weights
 competing for the same device memory the target already overflows. Prompt
 lookup — which copies a continuation out of the context and calls no model at
@@ -1785,13 +1825,13 @@ orangu-server: [speculative/draft model] 43 drafted tokens accepted over 20 step
 ```
 
 Prompt-lookup speculation needs no second model and stays behind
-`ORANGU_SPECULATIVE`; see the *Inference server internals* chapter. Setting
+`ORANGU_SPECULATIVE`; see the _Inference server internals_ chapter. Setting
 `draft_model` takes precedence over it.
 
 ### Multi-token-prediction heads
 
 Some models ship a **draft head** of their own: one decoder block, trained
-alongside the model, that predicts the token *after* the one just produced.
+alongside the model, that predicts the token _after_ the one just produced.
 `unsloth/Qwen3.8-Flash-Next-GGUF` carries several in an `MTP/` folder.
 
 There is nothing to configure. `orangu-server download` fetches the best head
@@ -1895,6 +1935,32 @@ works: a configuration written against it goes on serving the console on
 that port, with `host` and `reexec` at their defaults. A `[web]` section
 takes precedence over it wherever both appear.
 
+### The `[prometheus]` section
+
+A second, dedicated Prometheus listener, configured the same way as `[web]`
+above — **having this section at all is what enables it**. A config with no
+`[prometheus]` binds no third listener; `-i`/`--init` asks `Add a dedicated
+Prometheus metrics endpoint` and then `host` and `port`, or writes no section
+at all. See **Monitoring: `/metrics` and `/ready`** above for what it serves
+and why it carries no `api_key` check.
+
+```ini
+[prometheus]
+host = 127.0.0.1
+port = 8300
+```
+
+- `host` — the address it binds. **When the key is absent it falls back to
+  `[orangu-server].host`**, and `--host` moves it along with the API. Set it
+  explicitly to keep the keyless metrics port somewhere the API isn't — an
+  API on `all` with metrics on `127.0.0.1` or a private scrape interface. An
+  explicit `host` stands even under `--host`, the same as `[web].host`.
+- `port` — where the listener binds, alongside `[orangu-server].port` rather
+  than instead of it. Defaults to `8300` when the section is present but
+  says nothing. `GET /` on this
+  port serves a small static page linking to `/metrics`, so a browser
+  doesn't land on a 404; nothing else is served.
+
 `-c`/`--config` picks a config file explicitly; without it, `./orangu-server.conf`
 then `~/.orangu/orangu-server.conf` are tried, in that order — the same
 order every subcommand above resolves it in too, not just serving.
@@ -1906,8 +1972,12 @@ address then prompts for an `api_key`** — that is the question the wizard just
 created by widening the address, and asking it here is the difference between
 walking someone into an exposed server and letting them decide. Leaving it
 blank is still allowed and still writes no key; the prompt names the
-consequence rather than insisting. A `models` directory that doesn't exist yet
-is created, parents included, rather than refused. The last `[orangu-server]`
+consequence rather than insisting. It also asks `Add Prometheus
+metrics` — declining (the default)
+writes no `[prometheus]` section at all; accepting prompts for a `host`
+(defaulting to the API's) and a `port` (suggesting `8300`) and writes a `[prometheus]` section. A `models`
+directory that doesn't exist yet is created, parents included, rather than
+refused. The last `[orangu-server]`
 prompt is `log_type` (TAB-completing `console`/`file`, ghosting `console`),
 followed — only on `file` — by `log_path`, which TAB-completes real
 filesystem paths as you type and ghosts its default, `orangu-server.log` in
@@ -1917,7 +1987,7 @@ started from. `-d`/`--daemon` detaches
 from the terminal and runs in the background (Unix-only) — it requires
 `model` to be set in the config, since there's no attached terminal left to
 pass a CLI argument to or prompt on; the config and model are resolved, the
-log file opened, and both listeners bound, *before* detaching, so a bad
+log file opened, and both listeners bound, _before_ detaching, so a bad
 config, an unwritable `log_path` or a port already in use is still reported
 to the invoking terminal rather than silently lost. A daemon with the
 console as its log logs nothing at all — set `log_type = file` to keep its
@@ -1947,14 +2017,14 @@ the path is made absolute against the directory the server was started in
 and normalized (`.` and `..` segments folded away, symlinks left alone),
 then checked to be an existing directory — a typo fails at startup, while
 there's still a terminal to report it on, rather than at first use. With
-`--daemon` this all happens *before* detaching, so a relative path still
+`--daemon` this all happens _before_ detaching, so a relative path still
 means what it meant in the launching shell.
 
 The resolved path is printed on the startup banner, reported as
 `workspace` by `GET /props`, and included in the web UI's saved debug
 report. It is the root every workspace-scoped feature operates in: the
 file-lifecycle API (the five `*_file` and three `*_directory` endpoints —
-see the *HTTP endpoints* chapter) refuses any path that resolves outside it,
+see the _HTTP endpoints_ chapter) refuses any path that resolves outside it,
 and the features built on top of it later will do the same.
 
 ## Roles
@@ -1979,25 +2049,26 @@ that doesn't have `orangu-server`'s `--fit`/`--tools`/`--webui-mcp-proxy`/
   output); every other role keeps the engine's existing defaults
   (`temperature=0.8, top_k=40, top_p=0.95, min_p=0.05`).
 
-  The **repetition penalty is off by default** (`repeat_penalty=1.0`) for
-  every role. It is applied per token id, so it weighs most on whichever
-  token repeats most — and in source code that is the newline. Left on, it
-  pushes line breaks down far enough that the model substitutes whatever else
-  fits, which in a block comment is a rule of dashes or a `|`; the visible
-  result is code that comes back with `---------------` runs where its line
-  breaks should be. Ask for a penalty per request when a workload actually
-  needs one, rather than paying it on output whose whitespace carries
-  meaning.
+    The **repetition penalty is off by default** (`repeat_penalty=1.0`) for
+    every role. It is applied per token id, so it weighs most on whichever
+    token repeats most — and in source code that is the newline. Left on, it
+    pushes line breaks down far enough that the model substitutes whatever else
+    fits, which in a block comment is a rule of dashes or a `|`; the visible
+    result is code that comes back with `---------------` runs where its line
+    breaks should be. Ask for a penalty per request when a workload actually
+    needs one, rather than paying it on output whose whitespace carries
+    meaning.
 
-  All three generation endpoints — `/completion`, `/v1/completions` and
-  `/v1/chat/completions` — accept `temperature`, `top_p`, `top_k`, `min_p`,
-  `repeat_penalty` and `seed`, and an omitted field keeps the role's default
-  rather than resetting to zero. The two `/v1/` endpoints used to accept
-  fewer: a request naming one they lacked was **silently ignored**, since
-  unknown JSON keys are dropped rather than refused. That is worth knowing
-  even now it is fixed, because it is indistinguishable from a setting that
-  had no effect — if a knob appears to do nothing, check that the endpoint
-  names it before concluding anything about the knob.
+    All three generation endpoints — `/completion`, `/v1/completions` and
+    `/v1/chat/completions` — accept `temperature`, `top_p`, `top_k`, `min_p`,
+    `repeat_penalty` and `seed`, and an omitted field keeps the role's default
+    rather than resetting to zero. The two `/v1/` endpoints used to accept
+    fewer: a request naming one they lacked was **silently ignored**, since
+    unknown JSON keys are dropped rather than refused. That is worth knowing
+    even now it is fixed, because it is indistinguishable from a setting that
+    had no effect — if a knob appears to do nothing, check that the endpoint
+    names it before concluding anything about the knob.
+
 - **Whether the generation endpoints are served at all.** `embedding`
   disables `/v1/chat/completions`, `/v1/completions`, and `/completion` —
   a clear `501` instead of silently running text generation against a
@@ -2010,25 +2081,25 @@ that doesn't have `orangu-server`'s `--fit`/`--tools`/`--webui-mcp-proxy`/
   sent) passes `enable_thinking: false` into the chat template — the
   kwarg convention several reasoning-capable models' own templates check
   (Qwen3's among them) to skip whatever preamble tells the model to think
-  first — *and* appends an empty, already-closed `<think>\n\n</think>\n\n`
+  first — _and_ appends an empty, already-closed `<think>\n\n</think>\n\n`
   block right after the rendered prompt, so generation resumes immediately
   past any thinking phase rather than entering one. `<think>`/`</think>`
   is a near-universal convention (DeepSeek-R1, QwQ, Qwen3, GLM) but not a
   guaranteed one — a model using a different tag, or none at all, won't be
   affected by the prefill half of this.
 
-  A model whose format makes reasoning a *separate message* rather than a
-  tagged span — `muse-glimmer`, which addresses one message `to=self` and
-  the next `to=user`, and `inkling`, which opens one with
-  `<|content_thinking|>` and the next with `<|content_text|>` — is handled
-  exactly rather than approximated: the reasoning message is dropped from
-  the reply, and no `<think>` block is prefilled (that prefill would land
-  inside the message header the first format leaves open, or ahead of the
-  marker that types the body in the second, and the reply came back empty
-  when it did). A `<think>`-tagging model is now handled exactly too, as a
-  second line of defence behind the prefill: a block the model opens
-  anyway is recognised and its body dropped, rather than reaching the
-  caller because the tags around it were hidden.
+    A model whose format makes reasoning a _separate message_ rather than a
+    tagged span — `muse-glimmer`, which addresses one message `to=self` and
+    the next `to=user`, and `inkling`, which opens one with
+    `<|content_thinking|>` and the next with `<|content_text|>` — is handled
+    exactly rather than approximated: the reasoning message is dropped from
+    the reply, and no `<think>` block is prefilled (that prefill would land
+    inside the message header the first format leaves open, or ahead of the
+    marker that types the body in the second, and the reply came back empty
+    when it did). A `<think>`-tagging model is now handled exactly too, as a
+    second line of defence behind the prefill: a block the model opens
+    anyway is recognised and its body dropped, rather than reaching the
+    caller because the tags around it were hidden.
 
 **Reasoning is separated from the answer for every role.** Suppressing it
 is one question; telling the two apart is another, and it applies whether
@@ -2041,7 +2112,7 @@ endpoint does with it:
   when the response is whole, and on the delta while streaming — leaving
   `content` as the answer alone. A client that does not know the field
   ignores it and sees only the answer, which is the point.
-- The **web console** shows it in a collapsed *Thinking* pane above the
+- The **web console** shows it in a collapsed _Thinking_ pane above the
   answer, so the answer's code blocks are what the reader sees first.
 - `/completion` and `/v1/completions` are raw endpoints with one text
   field and no message shape to split across, so thinking stays in it —
@@ -2056,7 +2127,7 @@ its own index arithmetic — before writing a word of the answer.
 
 **`reasoning_effort`** is the other half of that. It is passed straight
 into the chat template as the same-named variable, and it defaults to
-`medium` rather than to nothing, because *nothing* is not neutral: it hands
+`medium` rather than to nothing, because _nothing_ is not neutral: it hands
 the choice to the template, and a template's own default can be the most
 expensive setting it has. Qwen3.x's asks for
 `reasoning_effort|default('xhigh')` and prepends a system message telling
@@ -2066,10 +2137,10 @@ alternatives.
 Measured on `Qwen3.8-27B`, same prompt ("implement a doubly linked list in
 C") and same machine, the difference is not a matter of degree:
 
-| `reasoning_effort` | thinking | answer |
-| :-- | --: | :-- |
-| left to the template (`xhigh`) | still going at **8192** tokens | never written |
-| `low` | **184** tokens | written in full |
+| `reasoning_effort`             |                       thinking | answer          |
+| :----------------------------- | -----------------------------: | :-------------- |
+| left to the template (`xhigh`) | still going at **8192** tokens | never written   |
+| `low`                          |                 **184** tokens | written in full |
 
 At `xhigh` the reply was the model talking to itself — drafting the program
 three times and checking its own index arithmetic — and the console showed
@@ -2089,7 +2160,7 @@ The levels are the template's vocabulary, not this server's — Qwen3.x
 accepts `xhigh`, `medium` and `low` and raises on anything else, other
 templates spell theirs `high`/`medium`/`low`. So the two cases are treated
 differently: a level **you** asked for that the template rejects comes back
-as a `400` carrying the template's own complaint, while the *default* is
+as a `400` carrying the template's own complaint, while the _default_ is
 simply dropped and the prompt rendered again without it — a default this
 server picked has no business breaking a model whose scale is spelled
 differently.
@@ -2118,7 +2189,7 @@ Five GPU backends are available, chosen via `backend` in the config (or
   pay for on every generated token. Reaches AMD GPUs through Mesa's RADV
   driver with no AMD-specific code needed, and reaches NVIDIA/Intel GPUs
   the same way, wherever a working Vulkan driver is installed — no Vulkan
-  SDK is needed to *build* `orangu-server`, only a Vulkan driver to *run*
+  SDK is needed to _build_ `orangu-server`, only a Vulkan driver to _run_
   it on a GPU. Verified end-to-end against real AMD hardware. Still
   meaningfully behind the reference implementation's tuned Vulkan backend on
   the same model and hardware — a real, ongoing, and openly tracked performance
@@ -2174,9 +2245,9 @@ above).
 
 ### Choosing a device
 
-`backend` picks the *API*. On a machine with more than one GPU — a laptop
+`backend` picks the _API_. On a machine with more than one GPU — a laptop
 with a discrete card beside the CPU's integrated one, or a workstation
-with two cards — something also has to pick the *device*, and `device`
+with two cards — something also has to pick the _device_, and `device`
 does.
 
 Startup prints every processor in the machine — the CPU and every device
@@ -2195,7 +2266,7 @@ the sampler and — on a split model — attention all run there, so its core
 count, instruction set and worker-thread count are part of what a
 throughput number means. `threads` sizes that worker pool.
 
-The number at the start of each line is the device's *enumeration* index —
+The number at the start of each line is the device's _enumeration_ index —
 the thing `device = <n>` names — which is why the lines are not in
 numerical order. Here the discrete card is device 1 and the iGPU is device
 0, and the ranking puts them the other way round.
@@ -2276,7 +2347,7 @@ The full device list is also in `GET /props`, so a benchmark result
 carries the machine's other cards alongside the one that produced it.
 
 By default one device still runs the whole model. `device` chooses
-*which*; **`device_split` is what spreads one model across several** — see
+_which_; **`device_split` is what spreads one model across several** — see
 **Splitting a model across devices** below.
 
 #### What the model puts on the device
@@ -2310,7 +2381,7 @@ broken, and refusing to start would turn a working (if slow)
 configuration into a failed one. The same numbers are in `GET /props`
 under `gpu.footprint`.
 
-What is deliberately *not* claimed: whether the model "fits". The KV cache
+What is deliberately _not_ claimed: whether the model "fits". The KV cache
 is allocated per request at that request's own size, the transient compute
 buffers grow to whatever the widest prefill needed, and weights reach the
 device lazily — so a yes/no verdict at startup would be a guess dressed as
@@ -2332,13 +2403,13 @@ orangu-server --device-split all model.gguf       # this run
 ORANGU_DEVICE_SPLIT=3,1 orangu-server model.gguf  # this run, for a sweep
 ```
 
-| Value | Meaning |
-| :-- | :-- |
-| `off` | One device runs the whole model. **The default.** |
-| `auto` | Split only when the weights do not fit the first device — the case where the alternative is the driver paging VRAM on every token. |
-| `all` | Always split across every selected device, in proportion to each one's memory. |
-| `cpu` | Fill the devices with as many layers as fit, in order, and run the rest **on the CPU**. llama.cpp's partial offload (`-ngl`), decided from capacity rather than typed by hand. |
-| `3,1` | Explicit proportions, one per selected device, in the order the inventory lists them. Relative, not absolute: `3,1` is three quarters and one quarter. `0` excludes a device. |
+| Value  | Meaning                                                                                                                                                                        |
+| :----- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `off`  | One device runs the whole model. **The default.**                                                                                                                              |
+| `auto` | Split only when the weights do not fit the first device — the case where the alternative is the driver paging VRAM on every token.                                             |
+| `all`  | Always split across every selected device, in proportion to each one's memory.                                                                                                 |
+| `cpu`  | Fill the devices with as many layers as fit, in order, and run the rest **on the CPU**. llama.cpp's partial offload (`-ngl`), decided from capacity rather than typed by hand. |
+| `3,1`  | Explicit proportions, one per selected device, in the order the inventory lists them. Relative, not absolute: `3,1` is three quarters and one quarter. `0` excludes a device.  |
 
 Startup says what it did, and what it cost:
 
@@ -2381,7 +2452,7 @@ than a placement to change.
 **A split model is slower**, though not as much as it once was. Work scoped
 to a single layer — fused attention, the fused FFN chain, the device-side
 KV cache — runs on the card that layer's weights are on. What a split gives
-up is the work that *spans* layers: the whole-step decode submission, which
+up is the work that _spans_ layers: the whole-step decode submission, which
 records every layer into one command buffer and takes a decode step from
 about 37 GPU submissions down to one. That cannot span devices.
 
@@ -2405,7 +2476,7 @@ Two things worth knowing before reaching for `all`:
 
 - **Shares follow reported memory**, and an integrated GPU reports the
   machine's whole system RAM. On a laptop with a 4 GiB discrete card beside
-  an iGPU claiming 21 GiB, `all` puts most of the model on the *slower*
+  an iGPU claiming 21 GiB, `all` puts most of the model on the _slower_
   device. What that costs depends on the model, and the range is wide: on a
   0.5B, `all` gave 18.5 tok/s against 20.3 for `--device-split 3,1` — about
   **10%**. On Llama-3.2-1B the same comparison was 24.2 against 35.2 — **45%**,
@@ -2416,26 +2487,27 @@ Two things worth knowing before reaching for `all`:
   the server now says so itself: when the largest share lands on an integrated
   device while a discrete one is present, it prints a line naming both.
 
-  **The gap widens with concurrency**, which the single-stream figures above
-  understate. On Qwen2.5-Coder-0.5B, `all` (4 layers discrete, 20 integrated)
-  against an explicit `20,4`:
+    **The gap widens with concurrency**, which the single-stream figures above
+    understate. On Qwen2.5-Coder-0.5B, `all` (4 layers discrete, 20 integrated)
+    against an explicit `20,4`:
 
-  | | `device_split = all` | `device_split = 20,4` | |
-  | :-- | ---: | ---: | ---: |
-  | 1 stream | 22.7 tok/s | 31.7 tok/s | 1.4x |
-  | 4 streams | 46.8 tok/s | 92.2 tok/s | **2.0x** |
+    |           | `device_split = all` | `device_split = 20,4` |          |
+    | :-------- | -------------------: | --------------------: | -------: |
+    | 1 stream  |           22.7 tok/s |            31.7 tok/s |     1.4x |
+    | 4 streams |           46.8 tok/s |            92.2 tok/s | **2.0x** |
 
-  The reason is that the integrated card is the bottleneck stage, and at one
-  stream it is only partly loaded; adding streams saturates it sooner than it
-  saturates the discrete card. So the worse the placement, the more concurrency
-  costs you.
+    The reason is that the integrated card is the bottleneck stage, and at one
+    stream it is only partly loaded; adding streams saturates it sooner than it
+    saturates the discrete card. So the worse the placement, the more concurrency
+    costs you.
+
 - **Layers are handed out in contiguous runs**, never interleaved, so the
   hidden state crosses the bus once per boundary — twice for three devices,
   not once per layer.
 
 #### Overflowing onto the CPU
 
-`device_split = cpu` is the one mode that is a *fill* rather than a share,
+`device_split = cpu` is the one mode that is a _fill_ rather than a share,
 and it has to be: the host's budget is system RAM, so giving it a
 proportional share would hand it most of the model. Instead each device
 takes as many layers as fit and the CPU takes what is left:
@@ -2483,7 +2555,7 @@ footprint above reports a 20 GiB MoE model as 2.26 GiB on a 4 GiB card. A
 hot subset is kept in owned RAM under a byte budget by orangu's own
 residency tier, which learns a routing profile that survives a restart.
 
-The obvious next step is a *device* expert tier — hot experts in spare
+The obvious next step is a _device_ expert tier — hot experts in spare
 VRAM. Whether that is worth anything depends entirely on how much of the
 routing it would actually serve, so on a MoE model a GPU backend prints
 what such a tier would hold:
@@ -2497,8 +2569,8 @@ what such a tier would hold:
 
 `ORANGU_GPU_EXPERTS=1` routes routed-expert matmuls to the GPU, batching
 them across experts. On this project's dev machine that measured **~1.55×
-faster** than the CPU path on a 35B-A3B model — but only *with* the
-batching; one dispatch per expert is 1.5× *slower*.
+faster** than the CPU path on a 35B-A3B model — but only _with_ the
+batching; one dispatch per expert is 1.5× _slower_.
 
 The tier is **bounded**: half the device's free memory after the dense
 weights, chosen up front, with everything else staying on the host path.
@@ -2525,7 +2597,7 @@ profile a small tier serves disproportionately more traffic: colibri, whose
 design this follows, measured the same 150 GB tier at 0.94–1.64 tok/s
 filled hottest-first against 0.29 tok/s filled without routing heat.
 
-Two things a large coverage number would *not* settle, and which is why
+Two things a large coverage number would _not_ settle, and which is why
 orangu is not building this on the strength of the projection alone:
 
 - an expert matmul dispatched per expert per layer is a GPU round trip per
@@ -2538,7 +2610,7 @@ orangu is not building this on the strength of the projection alone:
 
 A graphics driver can reset the device out from under a running process —
 a GPU hang, a compositor crash, `amdgpu` recovering a wedged queue. Vulkan
-(and Metal) surface this as a *lost device*: every buffer map, poll, and
+(and Metal) surface this as a _lost device_: every buffer map, poll, and
 submission on it fails from then on, and the API offers no way to
 re-create it in place. The weights uploaded to that device are gone with
 it, and no request in flight can finish correctly.
@@ -2549,9 +2621,9 @@ API reports it: as an error where `wgpu` returns one, and otherwise from
 `wgpu`'s own fatal panic, which is what `Device::poll` raises instead of
 returning:
 
-1. The request that hit it is failed with one sentence: *"the server lost
+1. The request that hit it is failed with one sentence: _"the server lost
    its GPU device (the graphics driver reset it) and is restarting; retry
-   in a moment"*. No panic text, no backtrace.
+   in a moment"_. No panic text, no backtrace.
 2. The real detail — which readback was in flight, the driver's own error
    — is written to `orangu-server`'s own log, which is where a diagnosis is
    made. Check `dmesg` there too; a device is rarely lost without the
@@ -2571,12 +2643,12 @@ proportional: a prefill chunk attends over everything before it, so the cost of
 a token climbs with how deep into the prompt it is. Measured on a 4 GiB
 RX 5500M, a fixed 512-token chunk took
 
-| position | chunk time |
-| ---: | ---: |
-| 512 | 2.3 s |
-| 3 584 | 5.1 s |
-| 6 656 | **10.1 s** |
-| 7 680 | **11.7 s** → device reset |
+| position |                chunk time |
+| -------: | ------------------------: |
+|      512 |                     2.3 s |
+|    3 584 |                     5.1 s |
+|    6 656 |                **10.1 s** |
+|    7 680 | **11.7 s** → device reset |
 
 so a token-count limit alone stops protecting anything past a few thousand
 tokens. Each chunk is now timed, and the next one is scaled by the rate just
@@ -2623,7 +2695,7 @@ systemd's `Restart=on-failure`, a container restart policy, or a shell
 loop — to come back on its own.
 
 Earlier versions had no such handling: a lost device surfaced as a Rust
-panic and backtrace *as the reply text*, and the process stayed up with a
+panic and backtrace _as the reply text_, and the process stayed up with a
 dead GPU, so every request after it failed the same way.
 
 ## Web UI
@@ -2655,14 +2727,14 @@ order:
 
 1. The fence's info string, in any of the three forms models use:
 
-   ````
-   ```rust src/main.rs
-   ```rust:src/main.rs
-   ```rust title="src/main.rs"
-   ````
+    ````
+    ```rust src/main.rs
+    ```rust:src/main.rs
+    ```rust title="src/main.rs"
+    ````
 
-   A fence that is *only* a file name (```` ```Makefile ````,
-   ```` ```main.rs ````) counts too.
+    A fence that is _only_ a file name (` ```Makefile `,
+    ` ```main.rs `) counts too.
 
 2. The block's first line, when it is a comment holding nothing but a
    name — `// src/lib.rs`, `# File: app/models.py`,
@@ -2792,15 +2864,15 @@ activity syntax. Cosmetic `skinparam` and direction hints are accepted where
 they do not change topology. Unsupported structural syntax stays an ordinary
 code block, so the console never substitutes an incomplete picture.
 
-| Syntax family | Status |
-| --- | --- |
-| Sequence: participants, aliases, messages, notes, `alt`/`opt`/`loop` groups | Supported |
-| Class, object and interface declarations; members and common UML relationships | Supported |
-| Component, deployment, use-case and state graphs | Supported |
-| Activity: `start`/`stop`, actions, branches, `while` and `repeat` loops | Supported |
-| Simple cosmetic `skinparam` blocks and layout direction hints | Accepted when they do not alter diagram topology |
-| Nested packages/components, multiline titles, stereotypes, activation bars, rich notes and common arrow modifiers | Supported |
-| Gantt, mindmap/WBS, timing, JSON/YAML, Salt and preprocessing/includes | Not supported (planned as separate follow-up work) |
+| Syntax family                                                                                                     | Status                                             |
+| ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| Sequence: participants, aliases, messages, notes, `alt`/`opt`/`loop` groups                                       | Supported                                          |
+| Class, object and interface declarations; members and common UML relationships                                    | Supported                                          |
+| Component, deployment, use-case and state graphs                                                                  | Supported                                          |
+| Activity: `start`/`stop`, actions, branches, `while` and `repeat` loops                                           | Supported                                          |
+| Simple cosmetic `skinparam` blocks and layout direction hints                                                     | Accepted when they do not alter diagram topology   |
+| Nested packages/components, multiline titles, stereotypes, activation bars, rich notes and common arrow modifiers | Supported                                          |
+| Gantt, mindmap/WBS, timing, JSON/YAML, Salt and preprocessing/includes                                            | Not supported (planned as separate follow-up work) |
 
 PlantUML diagrams provide both SVG and PNG downloads. Both formats are made
 locally from the same layout and have light and dark variants. They are
@@ -2814,11 +2886,11 @@ the explicit guards keep prose containing `A -> B` from becoming a diagram.
 Diagrams are also detected in files you attach, and drawn under that
 message's file chips. Two shapes are recognised:
 
-* **A file that is one diagram** — a `.mmd`/`.mermaid` or `.puml` export, or
+- **A file that is one diagram** — a `.mmd`/`.mermaid` or `.puml` export, or
   a plain text file holding nothing but diagram source. There is no fence to
   go on, so this is recognised from the diagram guards/header itself.
-* **A document containing diagrams** — a Markdown design doc with
-  ```` ```mermaid ```` or ```` ```plantuml ```` blocks in it. Untagged
+- **A document containing diagrams** — a Markdown design doc with
+  ` ```mermaid ` or ` ```plantuml ` blocks in it. Untagged
   blocks are checked the same way replies are; blocks tagged as another
   language are left alone.
 
@@ -2857,7 +2929,7 @@ no diagram of its own, the diagrams from that turn's attachments are shown
 beneath it, at full size, each captioned with the file it came from. You
 get the explanation and then the picture.
 
-If the model *does* write a Mermaid or PlantUML block, that is what you see and
+If the model _does_ write a Mermaid or PlantUML block, that is what you see and
 nothing is added — the answer is never second-guessed or duplicated. The
 caption exists so a picture drawn from your file never reads as one the
 model produced, and the reply's saved text stays exactly what the model
@@ -2887,13 +2959,13 @@ stays open, so several can be cleared in a row.
 The topbar's **Models** button opens a panel showing the models directory from
 the same scan as `orangu-server list`, with its core numbered inventory fields:
 
-| | |
-| :-- | :-- |
-| `NR` | the row number, the same one `list` gives the same model |
-| `MODEL` | what to pass to `show`/`delete`/`refresh` on the command line |
-| `QUANT` | the quantization the file is stored at, `-` when it says nothing |
-| `SIZE` | summed across every shard |
-| `SUPPORTED` | e.g. `Yes (llama)`, `No (glm4moe)`, `No (llama, TQ1_0)` |
+|             |                                                                  |
+| :---------- | :--------------------------------------------------------------- |
+| `NR`        | the row number, the same one `list` gives the same model         |
+| `MODEL`     | what to pass to `show`/`delete`/`refresh` on the command line    |
+| `QUANT`     | the quantization the file is stored at, `-` when it says nothing |
+| `SIZE`      | summed across every shard                                        |
+| `SUPPORTED` | e.g. `Yes (llama)`, `No (glm4moe)`, `No (llama, TQ1_0)`          |
 
 Those strings come from the same code that prints them in the terminal, so
 the two tables cannot end up saying different things about the same file. A
@@ -2910,11 +2982,11 @@ much of its filesystem is used and free.
 
 Two icon buttons per row — hover either for what it does:
 
-| Icon | Tooltip | |
-| :-- | :-- | :-- |
-| play triangle | **Load ...** | serve this model instead — see below. Absent entirely when `[web].reexec` is off |
-| document | **Show ...** | this file's full GGUF metadata — `orangu-server show` |
-| waste basket | **Delete ...** | remove every shard — `orangu-server delete`. Absent entirely when `[web].delete` is off |
+| Icon          | Tooltip        |                                                                                         |
+| :------------ | :------------- | :-------------------------------------------------------------------------------------- |
+| play triangle | **Load ...**   | serve this model instead — see below. Absent entirely when `[web].reexec` is off        |
+| document      | **Show ...**   | this file's full GGUF metadata — `orangu-server show`                                   |
+| waste basket  | **Delete ...** | remove every shard — `orangu-server delete`. Absent entirely when `[web].delete` is off |
 
 The loaded model's row shows a check mark where its **Load** button would
 be (and is named **loaded** beside its own name, which is what says so when
@@ -3025,7 +3097,7 @@ KV-cache file (`~/.orangu/server/<fingerprint>/slots/`, written by the
 `?action=save` endpoint) untouched for over 30 days, reporting the space
 reclaimed. Those slot files are a pure reprefill-avoidance cache, so an
 over-eager sweep only ever costs a one-time prefill; age is used rather than
-session-liveness because a slot file is named by the *client's* session id,
+session-liveness because a slot file is named by the _client's_ session id,
 which the server can't cross-reference. With no argument, it lists
 the rest as a numbered table, newest first, and prompts for an `NR` or
 `all`; `all` deletes every remaining session except **active** ones —
@@ -3049,13 +3121,13 @@ has to infer it from its own wall clock, which cannot separate prompt
 processing from generation, nor a cache hit from real work. Those objects,
 and the request fields that shape a turn (`cache_prompt`, `id_slot`,
 `timings_per_token`, `return_progress`, `response_format`, `tools`), are
-documented in the *HTTP endpoints* chapter.
+documented in the _HTTP endpoints_ chapter.
 
 ## Endpoint reference
 
 Every endpoint this server exposes — the OpenAI-compatible ones, the native
 ones, the diagnostic ones, the eight file-lifecycle ones, and the web
-console's own `/api/…` surface — is documented in the *HTTP endpoints*
+console's own `/api/…` surface — is documented in the _HTTP endpoints_
 chapter, field by field, alongside the rules (bearer token, queue `503`, TLS)
 that apply to all of them.
 
@@ -3064,7 +3136,7 @@ that apply to all of them.
 Text-in/text-out GGUF chat, completion, and embedding models, for sixteen
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
-*text-only* input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
+_text-only_ input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
 the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
 top-k experts per MoE layer — plus the bidirectional-attention,
 embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
@@ -3074,7 +3146,7 @@ layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing),
 Qwen3-Next (`qwen3next`), the Qwen4 preview (`qwen4exp`, e.g.
 `unsloth/Qwen3.8-Flash-Next-GGUF` — the same hybrid
 full-attention/gated-DeltaNet sub-layers and routed-plus-shared-expert MoE
-as `qwen35moe`, but with no residual *vector*: the state between sub-layers
+as `qwen35moe`, but with no residual _vector_: the state between sub-layers
 is `hyper_connection.count` parallel streams, and every layer norm is
 replaced by the gate that mixes them; full-attention layers additionally
 attend only the blocks a small indexer picks, and the layers named by
@@ -3090,7 +3162,7 @@ e.g. `unsloth/GLM-5.3-Flash-GGUF` — three-in-four Kimi Delta Attention
 layers alternating with that same absorbed latent attention, on a
 `hyper_connection.count`-stream residual bundle rather than a residual
 vector, over sigmoid-routed experts with a shared one. Nothing in it
-rotates, and its lightning indexer scores fixed *pools* of
+rotates, and its lightning indexer scores fixed _pools_ of
 `attention.indexer.kpool` positions rather than single positions, so the
 cut lands on pool boundaries), Kimi-K3 (`kimi-k3`, e.g.
 `unsloth/Kimi-K3-GGUF` — three-in-four delta-net layers alternating with
@@ -3117,11 +3189,11 @@ sliding-window and full attention, and the routed experts share their
 weight normalization with two always-on shared ones), and Nemotron-H
 (`nemotron_h_moe`, e.g.
 `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` — a hybrid whose
-blocks are a *single* sub-layer each rather than the usual
+blocks are a _single_ sub-layer each rather than the usual
 attention-plus-FFN pair: a selective state-space mixer, an unrotated
 attention, or a squared-ReLU mixture-of-experts FFN), and Ling 3.0
 (`bailingmoe3`, e.g. `bartowski/Ling-3.0-tiny-GGUF` — three-in-four Kimi
-Delta Attention layers alternating with gated, *rotated* absorbed latent
+Delta Attention layers alternating with gated, _rotated_ absorbed latent
 attention, over sigmoid-routed experts whose selection is group-limited:
 the experts form `expert_group_count` groups and only the best
 `expert_group_used_count` of them may serve a token) — using
@@ -3138,13 +3210,13 @@ DeepSeek-V4-Flash DSpark sidecar. A draft carries no token embeddings and no
 output projection — it reads the target model's hidden states (the layers
 `dflash.target_layers` names) and drafts through the target's own embedding
 table and LM head — so there is no standalone model in the file to serve.
-Selecting one therefore serves the *paired target model* from the same
+Selecting one therefore serves the _paired target model_ from the same
 Hugging Face repo, downloading it first if the models directory does not
 have it yet; the startup banner names the model actually being served.
 Running a `dflash` draft as an actual draft would need it to read the target's
-hidden states from *inside* the target's own layers, which the speculative
+hidden states from _inside_ the target's own layers, which the speculative
 path here does not offer — unlike a multi-token-prediction head, which reads
-one state at the end of the trunk and *is* run (see **Multi-token-prediction
+one state at the end of the trunk and _is_ run (see **Multi-token-prediction
 heads** above).
 
 The Qwen4 preview (`qwen4exp`, e.g. `unsloth/Qwen3.8-Flash-Next-GGUF`) runs
@@ -3160,7 +3232,7 @@ folder, and this engine runs them — see **Multi-token-prediction heads**
 above. A head is one more block of exactly this shape with a small pre-mix in
 front of it, so it reuses everything below.
 
-**Hyper-connections.** There is no residual *vector*. The state carried
+**Hyper-connections.** There is no residual _vector_. The state carried
 between sub-layers is `hyper_connection.count` (4) parallel streams,
 seeded as four copies of the token embedding, and there is no
 `output_norm.weight` in the file at all: every layer norm has been replaced
@@ -3195,7 +3267,7 @@ width, each of the sixteen hash heads looks that value up in its own slice
 of the table, and the sixteen 160-wide rows concatenate into a second
 `n_embd` vector. That vector is gated against the residual streams, run
 through a causal convolution dilated by the n-gram size, and added back.
-Because the hash is over *token ids*, the cache carries the last two ids of
+Because the hash is over _token ids_, the cache carries the last two ids of
 a sequence alongside its key/value and recurrent state, so a chunked
 prefill's seam and a decode step hash the same n-grams a single-shot
 prefill would.
@@ -3226,7 +3298,7 @@ restarts from that layer's attention output, with each half-layer re-mixing
 the stream against every banked checkpoint by a softmax over per-checkpoint
 scores. **Latent MoE**: the routed experts run at `expert_latent_length`
 rather than at `n_embd`, so the FFN input is projected down, run, normed and
-projected back up — while the *router* still scores the full-width input.
+projected back up — while the _router_ still scores the full-width input.
 **The situ activation** replaces SwiGLU throughout: a soft-clipped SiLU on
 the gate branch, and the same soft clip on the up branch when
 `activation.situ_linear_beta` is positive. **A full-rank KDA gate**, where
@@ -3241,7 +3313,7 @@ GLM with DeepSeek sparse attention (`glm-dsa`) runs on the CPU path only.
 Its block shape is an ordinary pre-norm transformer, and its FFN is the same
 routed-experts-plus-shared-expert MoE as `qwen35moe` (dense for the first
 `leading_dense_block_count` layers); what is different is the attention.
-Keys and values are stored *compressed*: one `attention.kv_lora_rank`-wide
+Keys and values are stored _compressed_: one `attention.kv_lora_rank`-wide
 vector per token plus a shared rotary part serves every head, so even
 GLM-5.2's 79 layers keep a small cache. Rather than decompressing that back into
 per-head keys, the query is pushed through the key-decompression matrix
@@ -3297,7 +3369,7 @@ inside a `<think>` block that the model closes itself — so a
 reasoning-suppressing role (`--review`) separates reasoning from answer
 here exactly as it does for the other `<think>`-marked families, and every
 other role reports the reasoning apart from the answer (`reasoning_content`
-on the chat endpoints, a collapsed *Thinking* pane in the console). Tool calls
+on the chat endpoints, a collapsed _Thinking_ pane in the console). Tool calls
 come back in the
 `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
 form GLM and Ling 3.0 share, already parsed. Like every recurrent family
@@ -3310,7 +3382,7 @@ other family here in four ways at once: the residual stream is
 `hyper_connection.count` parallel streams rather than one, mixed down and
 back out per half-layer by weights the model predicts per token (the
 out-mix is made doubly stochastic by a Sinkhorn normalization);
-`attention.head_count_kv` is 1 and the value *is* the key, so all 64 query
+`attention.head_count_kv` is 1 and the value _is_ the key, so all 64 query
 heads attend one shared vector per token, whose trailing RoPE dimensions are
 rotated back out of the attention output again; `attention.compress_ratios`
 gives each layer a sliding window plus either whole 128-token compressed
@@ -3345,7 +3417,7 @@ shipped beside the text weights (`mmproj-*.gguf`) is not used, as for
 every architecture here.
 
 This model's prompt format is worth knowing about, because an assistant
-turn is several *messages* rather than one. The chat template ends the
+turn is several _messages_ rather than one. The chat template ends the
 generation prompt at `<|start|>assistant` and leaves the model to write its
 own recipient — `to=self` for a reasoning message, `to=user` for the
 answer, `to=<tool>` for a tool call — before the `<|message|>` that starts
@@ -3372,7 +3444,7 @@ only, and is the first architecture here that **rotates nothing** — no
 layer applies a rotary embedding. Position reaches attention two other
 ways. The first is a learned relative-position bias: each layer projects
 its input to a small per-head vector and mixes it against a per-layer bank
-into one additive term per query/key *distance*, so a key further back than
+into one additive term per query/key _distance_, so a key further back than
 the bank is wide contributes no bias at all and a short bank still serves a
 long prefix. The second is a causal depthwise short convolution — four of
 them per layer, of the width `inkling.shortconv_kernel` gives: on the raw
@@ -3406,7 +3478,7 @@ scope, as multimodal input is for every architecture here: the
 server does not load, and the audio embedding table is not part of the text
 GGUF at all.
 
-This model's prompt format types each message *body* with a control token:
+This model's prompt format types each message _body_ with a control token:
 `<|content_thinking|>` opens the model's reasoning, `<|content_text|>` the
 answer, and `<|end_message|>` closes either. The markers are filtered out
 of the reply like any other control token, and which bodies you see is the
@@ -3486,7 +3558,7 @@ reasoning-suppressing role cannot separate the two.
 Ling 3.0 (`bailingmoe3`, e.g. `bartowski/Ling-3.0-tiny-GGUF` and
 `bartowski/Ling-3.0-flash-GGUF`) runs on the CPU path only. Its trunk is a
 hybrid, and the file says so per layer: `attention.head_count_kv` is an
-*array*, and a `0` entry marks a recurrent Kimi Delta Attention layer while
+_array_, and a `0` entry marks a recurrent Kimi Delta Attention layer while
 a nonzero one marks a full-attention layer. Three of the first for every one
 of the second, so on the 24-layer tiny model six layers carry a key/value
 cache and eighteen do not — a long conversation costs a quarter of the
@@ -3499,7 +3571,7 @@ uses, and they share one implementation with it: a short causal convolution
 `ssm.conv_kernel` taps wide over each of the query, key and value
 projections, then a delta rule whose state decays **per dimension** rather
 than by one scalar per head, then a gated per-head norm. What is specific
-here is the *safe gate* (`kda.safe_gate`): the log-decay is
+here is the _safe gate_ (`kda.safe_gate`): the log-decay is
 `kda.gate_lower_bound * sigmoid(..)` rather than an unbounded
 `-exp(A_log) * softplus(..)`, so the per-dimension decay lives strictly
 between `e^lower_bound` and 1 and cannot reach 0 and erase the state.
@@ -3519,7 +3591,7 @@ selection but never the weights, renormalization, then
 `expert_weights_scale` — plus **group-limited selection**, which no
 architecture here had before: the experts are cut into
 `expert_group_count` contiguous groups (8 on both released models), each
-group is scored by the sum of its *two* best members, only the best
+group is scored by the sum of its _two_ best members, only the best
 `expert_group_used_count` groups (4) survive, and the top-k then runs over
 those alone. A strong expert in a weak group is therefore not selected —
 which is the point, and which a router that quietly ignored the grouping
@@ -3528,7 +3600,7 @@ would get wrong while still producing fluent text.
 Tool calling works in the model's own format: it writes a call as
 `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`,
 which this server already parsed — with the wrinkle that this vocabulary
-spells all six of those delimiters as *tokens* rather than as text, so they
+spells all six of those delimiters as _tokens_ rather than as text, so they
 have to be exempted from the suppression that hides every other structural
 token. Without that exemption the call reaches the parser as loose prose
 and quietly becomes chat rather than an invocation.
@@ -3545,7 +3617,7 @@ Not implemented for this model: embeddings requests, and the trailing
 multi-token-prediction head `Ling-3.0-flash` carries inside its
 `block_count`, which is trimmed exactly as every other draft head here is.
 
-A quantization label names the file's *dominant* type, not its only one. A
+A quantization label names the file's _dominant_ type, not its only one. A
 K-quant block is 256 elements wide, so every tensor it covers needs a row
 length divisible by 256; where a model's rows aren't, upstream's quantizer
 substitutes a narrower type row by row. `unsloth/Qwen2.5-Coder-0.5B-Instruct-GGUF:Q2_K`
@@ -3576,7 +3648,7 @@ Six further types load that upstream cannot read at all: `Q4_0_4_4`,
 `Q4_0_4_8`, `Q4_0_8_8`, and the `IQ4_NL_4_4`/`_4_8`/`_8_8` equivalents.
 ggml retired those ids and upstream refuses such a file outright
 ("TYPE_Q4_0_4_4 REMOVED, use Q4_0 with runtime repacking"). They are
-ARM-SIMD *pre-repacked* `Q4_0`/`IQ4_NL`: the packing interleaves 4 or 8
+ARM-SIMD _pre-repacked_ `Q4_0`/`IQ4_NL`: the packing interleaves 4 or 8
 rows, and for the `Q4_0` family also flips a bit per nibble. That is a
 lossless permutation, so orangu undoes it once when the model opens and
 serves the result as ordinary `Q4_0`/`IQ4_NL`. Quality is identical to a
@@ -3586,7 +3658,7 @@ those tensors are held in memory rather than read from the mapped file,
 because interleaving rows leaves no row with a contiguous range to be lazy
 about.
 
-Three further types are narrower still, and come from *outside* the
+Three further types are narrower still, and come from _outside_ the
 upstream type numbering: `IQ1_XS`, `IQ1_XXS` and `IQ1_XXXS`, at 1.4375,
 1.3125 and 1.1875 bits per weight. They are how a "dynamic" 1-bit release of a
 very large mixture-of-experts model gets under its size target — the expert

@@ -601,13 +601,14 @@ costs a one-time prefill.
 
 #### `GET /metrics`
 
-Prometheus text (`text/plain; version=0.0.4`). Four gauges describe the
+Prometheus text (`text/plain; version=0.0.4`). Five gauges describe the
 scheduler right now:
 
 | gauge | |
 | :-- | :-- |
 | `orangu_server_slots_total` | configured concurrent request slots |
 | `orangu_server_slots_busy` | slots currently generating |
+| `orangu_server_slots_idle` | slots free to take a request |
 | `orangu_server_queue_depth` | requests waiting for a slot |
 | `orangu_server_queue_limit` | waiting requests allowed before refusing; `0` is unbounded |
 
@@ -650,6 +651,30 @@ less room than the model wants. `outcome="cancelled"` counts clients that
 disconnected mid-generation; the server stops within a token of noticing and
 frees the slot, so a rate here is not a fault, but one that climbs usually
 means a client-side timeout set below what this server can deliver.
+
+**About the process itself.** Related figures are folded into a few metrics
+that carry a label, rather than one metric each. All of them are gauges.
+
+| metric | notes |
+| :-- | :-- |
+| `orangu_server_host_info{name,version,commit,rustc,profile,target,os,os_version,kernel,arch}` | constant `1`; the build and the host are in the labels. `commit` and `rustc` read `unknown` when the build could not resolve them |
+| `orangu_server_uptime{start_time}` | the value is seconds since the server started; the `start_time` label is when, as a Unix timestamp |
+| `orangu_server_cpu{stat}` | `process_seconds` is CPU time this process has used so far (cumulative, so `rate()` gives cores busy); `load1`, `load5`, `load15` are the host's load averages (not reported on Windows); `logical_cores` is what the process may use |
+| `orangu_server_http_requests{stat}` | `in_flight` is requests being handled right now on the API and web console listeners, and a streamed answer counts until its last byte is sent; scrapes of the dedicated metrics port are not counted, though a scrape through the API port counts itself; `total`, `client_errors` (4xx) and `server_errors` (5xx) count responses since start |
+| `process_resident_memory_bytes`, `process_virtual_memory_bytes` | this process's memory |
+| `process_open_fds` | open file descriptors (Linux only) |
+| `orangu_server_host_memory_total_bytes`, `orangu_server_host_memory_available_bytes` | the host's physical memory |
+
+**A second, unauthenticated copy of this endpoint.** Adding a `[prometheus]`
+section (or passing `--metrics`) binds this exact response on a port of
+its own, with no `api_key` check even when one is configured for
+everything above — see **Monitoring: `/metrics` and `/ready`** in the
+*Running the server* chapter. No section (absent) disables it; there is no
+difference in content between the two, only in where each is reachable from.
+That includes the build and host labels above, so on the dedicated port they
+are visible to anyone who can reach it.
+That port also answers `GET /` with a small static HTML page linking to
+`/metrics`; every other path is a `404`.
 
 #### `POST /completion`
 
