@@ -136,6 +136,30 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/committer" => Some(LocalCommand::Mode(crate::mode::PromptMode::Committer)),
         "/graph" => Some(LocalCommand::Graph),
         _ => {
+            if let Some(args) = input.strip_prefix("/graph ") {
+                let words = match shell_words(args) {
+                    Ok(words) => words,
+                    Err(_) => return None,
+                };
+                return match words.first().map(String::as_str) {
+                    Some("explain") if words.len() == 2 => {
+                        Some(LocalCommand::GraphExplain(Cow::Owned(words[1].clone())))
+                    }
+                    Some("path") if (words.len() == 3 || words.len() == 4) => {
+                        let undirected = words.get(3).is_some_and(|arg| arg == "--undirected");
+                        if words.len() == 4 && !undirected {
+                            None
+                        } else {
+                            Some(LocalCommand::GraphPath(
+                                Cow::Owned(words[1].clone()),
+                                Cow::Owned(words[2].clone()),
+                                undirected,
+                            ))
+                        }
+                    }
+                    _ => None,
+                };
+            }
             if let Some(args) = input.strip_prefix("/mcp ") {
                 let args = args.trim();
                 if args.eq_ignore_ascii_case("refresh") {

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use super::extract::{Confidence, ExtractedEdge, ExtractedNode};
 use super::store::{GraphNode, GraphStore};
 
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 // ── On-disk format ────────────────────────────────────────────────────────────
 
@@ -31,6 +31,7 @@ struct CachedEdge {
     target: String,
     relation: String,
     confidence: Confidence,
+    source_location: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,6 +93,7 @@ impl GraphCache {
                 target: edge.target,
                 relation: edge.relation,
                 confidence: edge.confidence,
+                source_location: edge.source_location,
             });
         }
 
@@ -121,6 +123,7 @@ impl GraphCache {
                 target,
                 relation: edge.relation.clone(),
                 confidence: edge.confidence.clone(),
+                source_location: edge.source_location.clone(),
             })
             .collect();
 

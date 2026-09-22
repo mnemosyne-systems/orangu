@@ -47,6 +47,9 @@ pub struct ExtractedEdge {
     pub target: String,
     pub relation: String,
     pub confidence: Confidence,
+    /// The source location of the relationship itself (for example, the call
+    /// expression), rather than the definition location of either endpoint.
+    pub source_location: String,
 }
 
 // ── Language-specific query strings ──────────────────────────────────────────
@@ -998,10 +1001,12 @@ struct RawDef {
 struct RawCall {
     callee_name: String,
     callee_byte_range: (usize, usize),
+    location: String,
 }
 
 struct RawImport {
     import_text: String,
+    location: String,
 }
 
 // ── GraphExtractor ────────────────────────────────────────────────────────────
@@ -1135,6 +1140,7 @@ impl GraphExtractor {
                     acc.push(RawCall {
                         callee_name: node_text(cap.node, bytes),
                         callee_byte_range: (cap.node.start_byte(), cap.node.end_byte()),
+                        location: location_str(cap.node),
                     });
                 }
             }
@@ -1154,6 +1160,7 @@ impl GraphExtractor {
                 if let Some(cap) = import_cap {
                     acc.push(RawImport {
                         import_text: node_text(cap.node, bytes),
+                        location: location_str(cap.node),
                     });
                 }
             }
@@ -1181,6 +1188,19 @@ impl GraphExtractor {
             });
         }
 
+        // A file-level node makes imports first-class graph structure.  The
+        // old extractor emitted import edges from a synthetic module id but
+        // never emitted that module node, so GraphStore correctly discarded
+        // every import edge as dangling.
+        let file_module_id = format!("{}::__module__", file_stem);
+        nodes.push(ExtractedNode {
+            id: file_module_id.clone(),
+            label: file_str.clone(),
+            source_file: file_str.clone(),
+            source_location: "L1".to_string(),
+            kind: "module".to_string(),
+        });
+
         for call in raw_calls {
             if LANGUAGE_BUILTIN_GLOBALS.contains(&call.callee_name.as_str()) {
                 continue;
@@ -1205,17 +1225,29 @@ impl GraphExtractor {
                     } else {
                         Confidence::Inferred
                     },
+                    source_location: call.location,
                 });
             }
         }
 
-        let file_module_id = format!("{}::__module__", file_stem);
         for import in raw_imports {
+            // Keep the imported item scoped to the importing file. This avoids
+            // incorrectly merging same-named third-party modules, and lets an
+            // incremental rescan remove obsolete imports with its source file.
+            let import_id = format!("{}::import::{}", file_stem, import.import_text);
+            nodes.push(ExtractedNode {
+                id: import_id.clone(),
+                label: import.import_text,
+                source_file: file_str.clone(),
+                source_location: import.location.clone(),
+                kind: "import".to_string(),
+            });
             edges.push(ExtractedEdge {
                 source: file_module_id.clone(),
-                target: format!("import::{}", import.import_text),
+                target: import_id,
                 relation: "imports".to_string(),
                 confidence: Confidence::Extracted,
+                source_location: import.location,
             });
         }
 
@@ -1388,7 +1420,7 @@ function process(key) { return fetch(key); }
     #[test]
     fn rust_extracts_call_and_import_edges() {
         let ex = extractor();
-        let (_, edges) = ex
+        let (nodes, edges) = ex
             .extract_from_file(&PathBuf::from("a.rs"), "a.rs", RUST_SAMPLE)
             .unwrap();
         assert!(edges.iter().any(|e| e.relation == "calls"), "no call edge");
@@ -1396,6 +1428,11 @@ function process(key) { return fetch(key); }
             edges.iter().any(|e| e.relation == "imports"),
             "no import edge"
         );
+        assert!(nodes.iter().any(|n| n.id == "a::__module__"));
+        assert!(nodes.iter().any(|n| n.kind == "import"));
+        let import = edges.iter().find(|e| e.relation == "imports").unwrap();
+        assert!(nodes.iter().any(|n| n.id == import.source));
+        assert!(nodes.iter().any(|n| n.id == import.target));
     }
 
     #[test]

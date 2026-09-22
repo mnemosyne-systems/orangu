@@ -2386,6 +2386,38 @@ pub(crate) fn handle_command(
             "Usage: /pending delete <number>. Use /pending to list.".to_string(),
         )),
         LocalCommand::PendingDelete(Some(index)) => Ok(CommandOutcome::PendingDelete(index)),
+        LocalCommand::GraphExplain(symbol) => {
+            tools.ensure_graph()?;
+            let guard = tools
+                .graph_store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("graph store mutex poisoned"))?;
+            match &*guard {
+                None => Ok(CommandOutcome::OutputError(
+                    "Could not build the Knowledge Graph for this workspace.".to_string(),
+                )),
+                Some(store) => match store.explain(&symbol) {
+                    Ok(explanation) => Ok(CommandOutcome::Output(explanation.format())),
+                    Err(message) => Ok(CommandOutcome::OutputError(message)),
+                },
+            }
+        }
+        LocalCommand::GraphPath(source, target, undirected) => {
+            tools.ensure_graph()?;
+            let guard = tools
+                .graph_store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("graph store mutex poisoned"))?;
+            match &*guard {
+                None => Ok(CommandOutcome::OutputError(
+                    "Could not build the Knowledge Graph for this workspace.".to_string(),
+                )),
+                Some(store) => match store.shortest_path(&source, &target, undirected, 8) {
+                    Ok(path) => Ok(CommandOutcome::Output(path.format())),
+                    Err(message) => Ok(CommandOutcome::OutputError(message)),
+                },
+            }
+        }
         LocalCommand::Graph => {
             // `/graph` produces a file, so it waits for the graph instead of
             // handing back a "try again" — see `ToolExecutor::ensure_graph`.
@@ -3262,8 +3294,12 @@ mod tests {
         }
     }
 
-    /// Runs `/graph` against `tools`, returning the outcome.
-    fn run_graph_command(tools: &ToolExecutor, workspace: &std::path::Path) -> CommandOutcome {
+    /// Runs a `/graph` command against `tools`, returning the outcome.
+    fn run_graph_command(
+        tools: &ToolExecutor,
+        workspace: &std::path::Path,
+        input: &str,
+    ) -> CommandOutcome {
         let llms = HashMap::from([(
             "llama".to_string(),
             test_profile("http://localhost:8100/v1", "gemma"),
@@ -3274,7 +3310,7 @@ mod tests {
         let mut session = ChatSession::new("system");
 
         handle_command(
-            "/graph",
+            input,
             CommandState {
                 active_model: &mut active_model,
                 active_model_id: &mut active_model_id,
@@ -3345,7 +3381,7 @@ mod tests {
         let tools = ToolExecutor::new(workspace.path());
         assert!(tools.graph_store.lock().expect("store").is_none());
 
-        let outcome = run_graph_command(&tools, workspace.path());
+        let outcome = run_graph_command(&tools, workspace.path(), "/graph");
         forget_scan(workspace.path());
 
         let CommandOutcome::MarkdownOutput(message) = outcome else {
@@ -3364,6 +3400,30 @@ mod tests {
         );
         // The scan it ran is left behind for `graph_lookup` and the next
         // `/graph`, and is no longer registered as running.
+        assert!(tools.graph_store.lock().expect("store").is_some());
+        assert!(!tools.graph_scans.is_scanning());
+    }
+
+    /// A one-shot `/graph explain` has no startup scan, so it builds the graph
+    /// before resolving the requested symbol.
+    #[test]
+    fn graph_explain_scans_the_workspace_when_nothing_else_is_building_it() {
+        let workspace = tempdir().expect("workspace");
+        fs::create_dir_all(workspace.path().join("src")).expect("src dir");
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            "pub fn graphed_symbol() {}\n",
+        )
+        .expect("src file");
+        let tools = ToolExecutor::new(workspace.path());
+
+        let outcome = run_graph_command(&tools, workspace.path(), "/graph explain graphed_symbol");
+        forget_scan(workspace.path());
+
+        let CommandOutcome::Output(message) = outcome else {
+            panic!("expected graph explanation output");
+        };
+        assert!(message.contains("Node: graphed_symbol"), "{message}");
         assert!(tools.graph_store.lock().expect("store").is_some());
         assert!(!tools.graph_scans.is_scanning());
     }
@@ -3406,7 +3466,7 @@ mod tests {
         });
 
         let started = std::time::Instant::now();
-        let outcome = run_graph_command(&tools, workspace.path());
+        let outcome = run_graph_command(&tools, workspace.path(), "/graph");
         let waited = started.elapsed();
         scanner.join().expect("scanner");
 
