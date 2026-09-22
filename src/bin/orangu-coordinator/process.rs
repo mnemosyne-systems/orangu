@@ -48,7 +48,13 @@ use tokio::{
 /// there is both cheaper and more truthful.
 enum ServerHandle {
     /// Started by this coordinator, and reaped by it.
-    Spawned(tokio::process::Child),
+    ///
+    /// Boxed because the two variants are otherwise wildly different sizes:
+    /// a `Child` is 272 bytes on Windows against this one's four, and every
+    /// `ServerHandle` — one per running profile, moved around by value —
+    /// would carry that whole footprint. One allocation per server started
+    /// is nothing beside forking the process it describes.
+    Spawned(Box<tokio::process::Child>),
     /// Already serving this profile when the coordinator looked. Held by pid
     /// alone: there is no `Child` to wait on for a process this one did not
     /// fork, so liveness is a signal probe and stopping is a signal.
@@ -513,7 +519,7 @@ impl Coordinator {
         *guard = Some(ActiveProcess {
             entry_name: entry.name.clone(),
             entry_at_start: entry.clone(),
-            child: ServerHandle::Spawned(child),
+            child: ServerHandle::Spawned(Box::new(child)),
             tail,
         });
         Ok(entry.origin())
@@ -616,7 +622,7 @@ impl Coordinator {
         *guard = Some(ActiveProcess {
             entry_name: entry.name.clone(),
             entry_at_start: entry.clone(),
-            child: ServerHandle::Spawned(child),
+            child: ServerHandle::Spawned(Box::new(child)),
             tail,
         });
         Ok(entry.origin())
@@ -1181,6 +1187,8 @@ pub(crate) fn fake_server_script(body: &str) -> PathBuf {
 /// Spawns one of these scripts, waiting out a kernel that still considers
 /// the file to be open for writing.
 ///
+/// Unix-only for the same reason the script is.
+///
 /// A test binary is many threads and every `Command::spawn` forks the lot of
 /// them: a child forked while this script was still being written inherits a
 /// duplicate of that write descriptor and keeps it until it execs, and an
@@ -1191,7 +1199,7 @@ pub(crate) fn fake_server_script(body: &str) -> PathBuf {
 /// broken script, and the answer is to try again rather than to report it.
 /// Seen once on a CI runner and not on this project's own machines, which is
 /// the shape of a race that is scheduling-dependent.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn spawn_fake_server(path: &Path) -> std::process::Child {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
