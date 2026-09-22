@@ -15985,11 +15985,17 @@ fn every_integer_dot_pipeline_builds() {
         eprintln!("{NO_GPU_SKIP}");
         return;
     };
-    let built = vulkan.build_every_mmq_pipeline_for_test();
+    let Some(built) = vulkan.build_every_mmq_pipeline_for_test() else {
+        eprintln!(
+            "this adapter has no accelerated integer dot, so the whole family \
+             is switched off and there is nothing to build"
+        );
+        return;
+    };
     eprintln!("built {built} integer-dot GEMM pipelines on this backend");
     assert!(
         built > 0,
-        "no integer-dot pipeline was built at all — either the backend has \
-         them switched off, or every one of them was refused"
+        "the family is switched on and yet not one kernel built — every one \
+         of them was refused by this platform's shader compiler"
     );
 }

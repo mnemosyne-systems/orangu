@@ -60,9 +60,65 @@ struct LlamaLayer {
     q_norm: Option<Vec<f32>>,
     k_norm: Option<Vec<f32>>,
     ffn_norm: Vec<f32>,
-    w_gate: QuantMatrix,
-    w_up: QuantMatrix,
-    w_down: QuantMatrix,
+    ffn: Ffn,
+}
+
+/// What a layer's feed-forward is: one SwiGLU network, or a mixture of
+/// them chosen per token.
+///
+/// The same block otherwise. `qwen3moe` (Qwen3-MoE, e.g.
+/// `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`) is `qwen3` node for node —
+/// the per-head Q/K norms this module already carries for it, GQA with
+/// NEOX RoPE, the same norms and residuals — with `build_moe_ffn` where
+/// the dense `build_ffn` would be (confirmed against upstream's
+/// `src/models/qwen3moe.cpp`, read rather than guessed). So it is this
+/// module's block with one substitution, not a family of its own: the
+/// attention half, the KV cache, the split placement and the tail are
+/// shared, and only the twelve lines that project the feed-forward differ.
+enum Ffn {
+    /// `ffn_gate`/`ffn_up`/`ffn_down` — every architecture here but
+    /// `qwen3moe`.
+    Dense {
+        w_gate: QuantMatrix,
+        w_up: QuantMatrix,
+        w_down: QuantMatrix,
+    },
+    /// `ffn_gate_inp` routing to `ffn_*_exps` stacks. No shared expert and
+    /// no selection bias: Qwen3-MoE has neither, and the file says so by
+    /// carrying no `ffn_*_shexp` or `exp_probs_b` tensor.
+    Moe(Box<MoeFfn>),
+}
+
+impl LlamaLayer {
+    /// This layer's dense projections, or `None` where the feed-forward is
+    /// a mixture.
+    ///
+    /// Every path that fuses the feed-forward onto the device — the decode
+    /// chain, the resident prefill chain, the post-attention chain — asks
+    /// through this and declines when it answers `None`: those chains
+    /// compute a dense SwiGLU network themselves and have nowhere to put a
+    /// per-token expert choice. A mixture layer takes the step-by-step
+    /// route, where the routed feed-forward is one call
+    /// (`arch::swiglu_moe_ffn`), exactly as the other mixture
+    /// architectures do.
+    fn dense(&self) -> Option<(&QuantMatrix, &QuantMatrix, &QuantMatrix)> {
+        match &self.ffn {
+            Ffn::Dense {
+                w_gate,
+                w_up,
+                w_down,
+            } => Some((w_gate, w_up, w_down)),
+            Ffn::Moe(_) => None,
+        }
+    }
+}
+
+/// One layer's routed feed-forward.
+struct MoeFfn {
+    gate_inp: QuantMatrix,
+    gate_exps: crate::engine::loader::ExpertQuantMatrix,
+    up_exps: crate::engine::loader::ExpertQuantMatrix,
+    down_exps: crate::engine::loader::ExpertQuantMatrix,
 }
 
 /// The scalar multipliers an IBM Granite checkpoint sprinkles through an
@@ -124,6 +180,11 @@ pub struct LlamaModel {
     output_norm: Vec<f32>,
     output_weight: QuantMatrix,
     layers: Vec<LlamaLayer>,
+    /// How a mixture layer picks its experts — `expert_used_count` of them
+    /// by a softmax over the router's logits, renormalized. Read from the
+    /// file for a `qwen3moe`, and the defaults for every dense
+    /// architecture here, which never ask.
+    routing: super::ExpertRouting,
     /// `rope_freqs.weight` (`[rope_dim / 2]`) — the per-pair frequency
     /// divisor a Llama-3.1/3.2 checkpoint carries because its RoPE uses
     /// Meta's `"llama3"` scaling, which `convert_hf_to_gguf.py` bakes into
@@ -242,6 +303,13 @@ impl LlamaModel {
                     .matrix(&name)
                     .with_context(|| format!("loading {name}"))
             };
+            let get_expert_matrix =
+                |suffix: &str| -> Result<crate::engine::loader::ExpertQuantMatrix> {
+                    let name = format!("blk.{i}.{suffix}");
+                    loaded
+                        .expert_matrix(&name)
+                        .with_context(|| format!("loading {name}"))
+                };
             let get_optional = |suffix: &str| -> Result<Option<Vec<f32>>> {
                 let name = format!("blk.{i}.{suffix}");
                 if !loaded.has_tensor(&name) {
@@ -266,11 +334,45 @@ impl LlamaModel {
                 q_norm: get_optional("attn_q_norm.weight")?,
                 k_norm: get_optional("attn_k_norm.weight")?,
                 ffn_norm: get("ffn_norm.weight")?,
-                w_gate: get_matrix("ffn_gate.weight")?,
-                w_up: get_matrix("ffn_up.weight")?,
-                w_down: get_matrix("ffn_down.weight")?,
+                // The router is what says this layer is a mixture: a dense
+                // file has no `ffn_gate_inp` at all.
+                ffn: if loaded.has_tensor(&format!("blk.{i}.ffn_gate_inp.weight")) {
+                    Ffn::Moe(Box::new(MoeFfn {
+                        gate_inp: get_matrix("ffn_gate_inp.weight")?,
+                        gate_exps: get_expert_matrix("ffn_gate_exps.weight")?,
+                        up_exps: get_expert_matrix("ffn_up_exps.weight")?,
+                        down_exps: get_expert_matrix("ffn_down_exps.weight")?,
+                    }))
+                } else {
+                    Ffn::Dense {
+                        w_gate: get_matrix("ffn_gate.weight")?,
+                        w_up: get_matrix("ffn_up.weight")?,
+                        w_down: get_matrix("ffn_down.weight")?,
+                    }
+                },
             });
         }
+
+        // Only a mixture reads these, and only a mixture file carries
+        // them: `build_moe_ffn`'s softmax gating with the selected weights
+        // renormalized, which is what upstream's `qwen3moe` graph asks for
+        // (`LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX`, `norm_w = true`). A
+        // file that declares its own gating function is believed instead.
+        let routing = super::ExpertRouting {
+            n_expert_used: loaded.metadata_u64("expert_used_count").unwrap_or(0) as usize,
+            gating: match loaded.metadata_u64("expert_gating_func") {
+                Some(value) => super::ExpertGating::from_gguf(value)?,
+                None => super::ExpertGating::Softmax,
+            },
+            weights_norm: loaded
+                .metadata_u64("expert_weights_norm")
+                .is_none_or(|v| v != 0),
+            weights_scale: loaded.metadata_f32("expert_weights_scale").unwrap_or(1.0),
+            groups: super::ExpertGroups::from_gguf(
+                loaded,
+                loaded.metadata_u64("expert_count").unwrap_or(0) as usize,
+            )?,
+        };
 
         let rope_freq_factors = if loaded.has_tensor("rope_freqs.weight") {
             let (factors, _) = loaded
@@ -295,6 +397,28 @@ impl LlamaModel {
             layout: rope_layout,
             ..tensor::RopeParams::default()
         };
+        // The streaming region the grouped expert GEMM will need, ahead of
+        // the weights — see `super::reserve_expert_region`. A mixture whose
+        // region is missing declines the grouped path and walks the groups
+        // one at a time instead, which is slower than never having asked;
+        // a file with no mixture layer reserves nothing.
+        super::reserve_expert_region(
+            backend.as_ref(),
+            layers
+                .iter()
+                .filter_map(|l| match &l.ffn {
+                    Ffn::Dense { .. } => None,
+                    Ffn::Moe(moe) => Some(moe),
+                })
+                .flat_map(|moe| {
+                    [
+                        (moe.gate_exps.stack_matrix().raw_bytes().len()
+                            + moe.up_exps.stack_matrix().raw_bytes().len())
+                            as u64,
+                        moe.down_exps.stack_matrix().raw_bytes().len() as u64,
+                    ]
+                }),
+        );
         Ok(Self {
             config,
             backend,
@@ -302,6 +426,7 @@ impl LlamaModel {
             output_norm,
             output_weight,
             layers,
+            routing,
             rope_freq_factors,
             rope,
             mul,
@@ -733,7 +858,8 @@ impl LlamaModel {
                     None => GpuInput::Cpu(x_in),
                 }
             };
-            let ffn_gate_up = super::ffn_gate_up_pair(&layer.w_gate, &layer.w_up);
+            let (w_gate, w_up, w_down) = layer.dense()?;
+            let ffn_gate_up = super::ffn_gate_up_pair(w_gate, w_up);
             let out = vulkan.record_fused_layer(
                 &mut cursor,
                 FusedLayerInput {
@@ -786,10 +912,10 @@ impl LlamaModel {
                     wo: &layer.wo,
                     attn_post_norm: None,
                     ffn_norm: &layer.ffn_norm,
-                    ffn_gate: &layer.w_gate,
-                    ffn_up: &layer.w_up,
+                    ffn_gate: w_gate,
+                    ffn_up: w_up,
                     ffn_gate_up: ffn_gate_up.as_ref(),
-                    ffn_down: &layer.w_down,
+                    ffn_down: w_down,
                     ffn_post_norm: None,
                     ple: None,
                     layer_output_scale: None,
@@ -864,9 +990,9 @@ impl LlamaModel {
                         &mut ffn_scratch,
                         &ffn_normed,
                         1,
-                        &layer.w_gate,
-                        &layer.w_up,
-                        &layer.w_down,
+                        w_gate,
+                        w_up,
+                        w_down,
                     );
                     if checked {
                         report_npu_block_error(il, 1, &ffn_normed, &ffn_device, &ffn_out);
@@ -1127,6 +1253,12 @@ impl LlamaModel {
         Ok(x)
     }
 
+    /// Whether any layer of this file routes its feed-forward — what
+    /// separates a mixture from the dense models that share this block.
+    fn is_moe(&self) -> bool {
+        self.layers.iter().any(|l| l.dense().is_none())
+    }
+
     /// Whether a prefill chunk of `n_tokens` runs on the device-resident
     /// stream (`run_layers_resident`): every layer's chains on one card,
     /// nothing of the layer on the host, and no diagnostic that wants the
@@ -1141,6 +1273,10 @@ impl LlamaModel {
             && !no_fused_qkv()
             && !no_fused_post_attention()
             && !resident_prefill_off()
+            // The stream records a dense feed-forward per layer; a mixture
+            // chooses its experts per token, which nothing in the chain can
+            // express. See `LlamaLayer::dense`.
+            && self.layers.iter().all(|layer| layer.dense().is_some())
             && self.mul.residual == 1.0
             && crate::engine::dump_ffn_dir().is_none()
             && orangu::npu_ffn::service().is_none()
@@ -1187,6 +1323,9 @@ impl LlamaModel {
             self.layers.len(),
             |il| {
                 let layer = &self.layers[il];
+                let dense = layer
+                    .dense()
+                    .expect("resident_prefill_serves admits dense models only");
                 super::ResidentLayer {
                     attn_norm: &layer.attn_norm,
                     wq: &layer.wq,
@@ -1204,9 +1343,11 @@ impl LlamaModel {
                     scale: self.attn_scale(),
                     wo: &layer.wo,
                     ffn_norm: &layer.ffn_norm,
-                    ffn_gate: &layer.w_gate,
-                    ffn_up: &layer.w_up,
-                    ffn_down: &layer.w_down,
+                    // `resident_prefill_serves` admitted this model, so
+                    // every layer of it is dense.
+                    ffn_gate: dense.0,
+                    ffn_up: dense.1,
+                    ffn_down: dense.2,
                     activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
                 }
             },
@@ -1544,10 +1685,15 @@ impl LlamaModel {
                 // chain does both adds internally, so Granite declines it.
                 .filter(|_| !no_fused_post_attention() && self.mul.residual == 1.0)
                 .filter(|_| !ffn_on_npu)
+                // A mixture layer's feed-forward is not a network this
+                // chain can record — see `LlamaLayer::dense`. Zipped rather
+                // than filtered so the projections the chain needs come
+                // from the same answer that admitted it.
+                .zip(layer.dense())
                 // The chain never forms `normed2` on the host, so a run that
                 // is capturing activations takes the slow arm instead.
                 .filter(|_| crate::engine::dump_ffn_dir().is_none())
-                .and_then(|vulkan| {
+                .and_then(|(vulkan, dense_ffn)| {
                     vulkan.fused_post_attention_prefill(
                         match &attn_on_device {
                             Some(buf) => {
@@ -1562,9 +1708,9 @@ impl LlamaModel {
                         // and no norm is not a norm with weights of one.
                         None,
                         &layer.ffn_norm,
-                        &layer.w_gate,
-                        &layer.w_up,
-                        &layer.w_down,
+                        dense_ffn.0,
+                        dense_ffn.1,
+                        dense_ffn.2,
                         None,
                         cfg.rms_eps,
                         crate::engine::backend::vulkan::FfnActivation::Swiglu,
@@ -1621,16 +1767,47 @@ impl LlamaModel {
                 // family (Llama, Mistral, Qwen2, Qwen3) and that one run the
                 // same one.
                 if !from_npu {
-                    super::swiglu_ffn_into(
-                        self.backend.as_ref(),
-                        &mut ffn_out,
-                        &mut ffn_scratch,
-                        &normed2,
-                        n_tokens,
-                        &layer.w_gate,
-                        &layer.w_up,
-                        &layer.w_down,
-                    );
+                    match &layer.ffn {
+                        Ffn::Dense {
+                            w_gate,
+                            w_up,
+                            w_down,
+                        } => super::swiglu_ffn_into(
+                            self.backend.as_ref(),
+                            &mut ffn_out,
+                            &mut ffn_scratch,
+                            &normed2,
+                            n_tokens,
+                            w_gate,
+                            w_up,
+                            w_down,
+                        ),
+                        // The routed feed-forward, shared with every other
+                        // mixture here: one router matmul for the batch,
+                        // then each token's chosen experts. No shared
+                        // expert and no selection bias — Qwen3-MoE has
+                        // neither.
+                        Ffn::Moe(moe) => {
+                            ffn_out = super::swiglu_moe_ffn(
+                                self.backend.as_ref(),
+                                &self.routing,
+                                &normed2,
+                                n_tokens,
+                                cfg.n_embd,
+                                &super::SwigluMoe {
+                                    gate_inp: &moe.gate_inp,
+                                    exp_probs_b: None,
+                                    gate_exps: &moe.gate_exps,
+                                    up_exps: &moe.up_exps,
+                                    down_exps: &moe.down_exps,
+                                    shared: None,
+                                    clamp_exp: super::SwigluLimit::None,
+                                    clamp_shexp: super::SwigluLimit::None,
+                                },
+                                layer_idx,
+                            );
+                        }
+                    }
                     if checked {
                         report_npu_block_error(
                             layer_idx,
@@ -1678,6 +1855,14 @@ impl ModelForward for LlamaModel {
         // exactly what it costs. A prefill runs through here too and is
         // not a step of this kind.
         let at = (tokens.len() == 1).then(std::time::Instant::now);
+        // A mixture's decode step alternates between the card and the
+        // host's expert turns, and the card drops to its parked clock on
+        // every one of them; it is held up across the step. A dense
+        // model's step never leaves the card and arms nothing.
+        let _clock = self
+            .is_moe()
+            .then(|| super::hold_clock_for_step(self.backend.as_ref(), tokens.len()))
+            .flatten();
         let outcome = (|| -> Result<super::ForwardOutcome> {
             if tokens.len() == 1
                 && self.mul.is_identity()
@@ -1927,7 +2112,7 @@ mod real_model_tests {
         assert!(
             matches!(
                 loaded.config.architecture.as_str(),
-                "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3vl"
+                "llama" | "mistral" | "qwen2" | "qwen3" | "qwen3vl" | "qwen3moe"
             ),
             "unexpected architecture {}",
             loaded.config.architecture
@@ -1991,6 +2176,79 @@ mod real_model_tests {
         assert!(
             text.contains("Paris"),
             "expected the answer to name Paris, got {text:?}"
+        );
+    }
+
+    /// **The mixture of this family**, end to end on real weights:
+    /// `qwen3moe` is this module's block with routed experts in place of
+    /// the dense feed-forward, and what that replacement has to get right
+    /// is a per-token choice of eight experts out of 128 — a router read
+    /// the wrong way round, a softmax taken per logit, or weights left
+    /// unnormalized all produce fluent text rather than an error.
+    ///
+    /// A one-word factual answer is the check for the same reason the test
+    /// above gives, and this one is stricter than it looks: every layer of
+    /// this model is a mixture, so an expert path that is wrong anywhere
+    /// cannot be hidden by the ones that are right.
+    ///
+    /// Verified against real `llama.cpp` on the same file before this test
+    /// was written: `llama-server` and this engine produce **byte-identical
+    /// greedy continuations** for "The capital of France is" and "def
+    /// fibonacci(n):" at `temperature = 0`.
+    ///
+    /// Run with `ORANGU_TEST_QWEN3MOE_MODEL=/path/to/Qwen3-Coder-30B-A3B-
+    /// Instruct-Q4_K_M.gguf cargo test --release --bin orangu-server
+    /// real_model_tests -- --ignored`.
+    #[test]
+    #[ignore]
+    fn qwen3moe_answers_a_factual_question() {
+        let path =
+            std::env::var("ORANGU_TEST_QWEN3MOE_MODEL").expect("set ORANGU_TEST_QWEN3MOE_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        assert_eq!(
+            loaded.config.architecture, "qwen3moe",
+            "this test is about the routed feed-forward"
+        );
+        let gguf = orangu::gguf::GgufFile::open(std::path::Path::new(&path)).expect("open gguf");
+        let tokenizer =
+            crate::engine::tokenizer::Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        let model =
+            LlamaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
+                .expect("build model");
+        // Every layer routes: the file carries no dense feed-forward at
+        // all, and reading one as dense would have failed to load rather
+        // than answered anything.
+        assert!(
+            model.layers.iter().all(|layer| layer.dense().is_none()),
+            "every qwen3moe layer is a mixture"
+        );
+        assert_eq!(
+            model.routing.gating,
+            crate::engine::arch::ExpertGating::Softmax
+        );
+        assert!(model.routing.weights_norm, "top-k weights are renormalized");
+        assert_eq!(model.routing.n_expert_used, 8);
+
+        let tokens = tokenizer.encode("The capital of France is", true);
+        let mut cache = model.new_kv_cache(tokens.len() + 8);
+        let mut logits = model.forward(&mut cache, &tokens, 0, 0).expect("prefill");
+        let mut generated = Vec::new();
+        for step in 0..4 {
+            let next = logits
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).expect("logits are finite"))
+                .expect("non-empty logits")
+                .0 as u32;
+            generated.push(next);
+            logits = model
+                .forward(&mut cache, &[next], tokens.len() + step, 0)
+                .expect("decode");
+        }
+        let text = tokenizer.decode(&generated);
+        assert!(
+            text.contains("Paris"),
+            "expected the continuation to name Paris, got {text:?}"
         );
     }
 

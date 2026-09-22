@@ -230,8 +230,18 @@ pub enum ArchFamily {
 /// pipeline (`engine::image`) encodes prompts with — the picture is
 /// conditioned on this model's final hidden states, read through the same
 /// `ModelForward::forward_hidden_states` an embeddings request uses.
-const LLAMA_STYLE_ARCHITECTURES: &[&str] =
-    &["llama", "qwen2", "qwen3", "mistral", "qwen3vl", "qwen2vl"];
+///
+/// `qwen3moe` (e.g. `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`) is here
+/// rather than in a family of its own because it *is* `qwen3` node for
+/// node — the same per-head Q/K norms, GQA with NEOX RoPE, norms and
+/// residuals — with `build_moe_ffn` where the dense feed-forward would be
+/// (upstream's `src/models/qwen3moe.cpp`, read rather than guessed). The
+/// one substitution lives in `arch::llama`'s `Ffn`; everything else about
+/// the block, its KV cache and its placement is shared with the dense
+/// architectures beside it.
+const LLAMA_STYLE_ARCHITECTURES: &[&str] = &[
+    "llama", "qwen2", "qwen3", "qwen3moe", "mistral", "qwen3vl", "qwen2vl",
+];
 /// `mistral3` (e.g. `unsloth/Ministral-3-3B-Instruct-2512-GGUF`) — see
 /// [`ArchFamily::Mistral3`] and `engine::arch::mistral`.
 const MISTRAL_ARCHITECTURES: &[&str] = &["mistral3"];

@@ -3523,86 +3523,83 @@ that apply to all of them.
 Text-in/text-out GGUF chat, completion, and embedding models — and one
 text-to-image model — for seventeen
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
-<<<<<<< HEAD
 `qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
-_text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
-=======
-`qwen2`, `qwen3`, `mistral`, and `qwen3vl` — Qwen3-VL's text backbone,
-_text-only_ input), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
-
-> > > > > > > 57d6857 ([#264] orangu-server: Add dedicated Prometheus metrics port)
-> > > > > > > the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
-> > > > > > > top-k experts per MoE layer — plus the bidirectional-attention,
-> > > > > > > embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
-> > > > > > > `unsloth/Qwen3.6-35B-A3B-GGUF`), Qwen3.5-family dense (`qwen35`, e.g.
-> > > > > > > `unsloth/Qwen3.8-27B-GGUF` — the same hybrid full-attention/gated-DeltaNet
-> > > > > > > layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing — and
-> > > > > > > Prism's Hadamard-folded ternary `Ternary-Bonsai-2-27B`, see below),
-> > > > > > > Qwen3-Next (`qwen3next`), the Qwen4 preview (`qwen4exp`, e.g.
-> > > > > > > `unsloth/Qwen3.8-Flash-Next-GGUF` — the same hybrid
-> > > > > > > full-attention/gated-DeltaNet sub-layers and routed-plus-shared-expert MoE
-> > > > > > > as `qwen35moe`, but with no residual _vector_: the state between sub-layers
-> > > > > > > is `hyper_connection.count` parallel streams, and every layer norm is
-> > > > > > > replaced by the gate that mixes them; full-attention layers additionally
-> > > > > > > attend only the blocks a small indexer picks, and the layers named by
-> > > > > > > `ple.layers` inject a second embedding read from an n-gram hash table),
-> > > > > > > DeepSeek-V4 (`deepseek4`, e.g.
-> > > > > > > `unsloth/DeepSeek-V4-Flash-0731-GGUF` — four parallel residual streams mixed
-> > > > > > > per token, one shared key/value vector serving every query head, compressed
-> > > > > > > attention blocks on top of a sliding window, and hash-routed experts),
-> > > > > > > GLM-5 (`glm-dsa`, e.g. `unsloth/GLM-5.2-GGUF` — absorbed multi-head latent
-> > > > > > > attention over a compressed key/value cache, with a lightning indexer
-> > > > > > > choosing which positions each layer attends), GLM-5.3-Flash (`glm5next`,
-> > > > > > > e.g. `unsloth/GLM-5.3-Flash-GGUF` — three-in-four Kimi Delta Attention
-> > > > > > > layers alternating with that same absorbed latent attention, on a
-> > > > > > > `hyper_connection.count`-stream residual bundle rather than a residual
-> > > > > > > vector, over sigmoid-routed experts with a shared one. Nothing in it
-> > > > > > > rotates, and its lightning indexer scores fixed _pools_ of
-> > > > > > > `attention.indexer.kpool` positions rather than single positions, so the
-> > > > > > > cut lands on pool boundaries), Kimi-K3 (`kimi-k3`, e.g.
-> > > > > > > `unsloth/Kimi-K3-GGUF` — three-in-four delta-net layers alternating with
-> > > > > > > latent attention, cross-layer residuals, and experts running in a latent
-> > > > > > > space), and
-> > > > > > > Phi-3
-> > > > > > > (`phi3`, covering Phi-3 and Phi-4-mini — Llama-style attention and SwiGLU,
-> > > > > > > but with the query/key/value projections fused into one `attn_qkv` tensor,
-> > > > > > > the FFN gate and up projections fused into one `ffn_up` tensor, and LongRoPE
-> > > > > > > frequency factors on a partially-rotated head), and Mistral 3 (`mistral3`,
-> > > > > > > e.g. Ministral-3 — `llama`'s block shape plus YaRN RoPE scaling, a head
-> > > > > > > width read from `attention.key_length` rather than derived from
-> > > > > > > `n_embd / n_head`, and an attention temperature scale), and Muse-Glimmer
-> > > > > > > (`muse-glimmer`, e.g. `unsloth/Muse-Glimmer-30B-GGUF` — a dense GQA block
-> > > > > > > with a norm on both sides of each sub-layer, per-head query/key norms, a
-> > > > > > > sigmoid gate on the attention output, three rotated sliding-window layers
-> > > > > > > to every unrotated full-attention one, and both a logit scale and final
-> > > > > > > logit softcapping on the output), and Inkling (`inkling`, e.g.
-> > > > > > > `unsloth/Inkling-Small-GGUF` — a mixture-of-experts decoder that rotates
-> > > > > > > nothing at all: position arrives through a learned per-head
-> > > > > > > relative-position bias and a causal short convolution on the key/value
-> > > > > > > projections and on each sub-layer's output, layers alternate
-> > > > > > > sliding-window and full attention, and the routed experts share their
-> > > > > > > weight normalization with two always-on shared ones), and Nemotron-H
-> > > > > > > (`nemotron_h_moe`, e.g.
-> > > > > > > `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` — a hybrid whose
-> > > > > > > blocks are a _single_ sub-layer each rather than the usual
-> > > > > > > attention-plus-FFN pair: a selective state-space mixer, an unrotated
-> > > > > > > attention, or a squared-ReLU mixture-of-experts FFN), and Ling 3.0
-> > > > > > > (`bailingmoe3`, e.g. `bartowski/Ling-3.0-tiny-GGUF` — three-in-four Kimi
-> > > > > > > Delta Attention layers alternating with gated, _rotated_ absorbed latent
-> > > > > > > attention, over sigmoid-routed experts whose selection is group-limited:
-> > > > > > > the experts form `expert_group_count` groups and only the best
-> > > > > > > `expert_group_used_count` of them may serve a token), and Qwen-Image
-> > > > > > > (`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF` — not a language model:
-> > > > > > > a dual-stream diffusion transformer that denoises a latent picture under a
-> > > > > > > prompt's hidden states, served with a `qwen2vl` text encoder and the
-> > > > > > > Qwen-Image VAE beside it; see **Image generation**) — using
-> > > > > > > `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
-> > > > > > > `IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
-> > > > > > > memory-mapped file (dequantized one row at a time, on demand) rather than
-> > > > > > > eagerly resident, so even large models fit in modest RAM. A model split
-> > > > > > > across several files (`<name>-00001-of-000NN.gguf` …) is loaded from every
-> > > > > > > shard — the shard count comes from the `split.count` metadata key, and each
-> > > > > > > shard is mapped separately.
+_text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way; and
+`qwen3moe`, Qwen3-MoE (e.g. `unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF`),
+which is the `qwen3` block with softmax top-k routed experts in place of
+the dense feed-forward and no shared expert), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
+the `gemma-4-26B-A4B` routed-expert MoE — a dense shared MLP plus softmax
+top-k experts per MoE layer — plus the bidirectional-attention,
+embeddings-only `gemma-embedding`), Qwen3.5/3.6-MoE (`qwen35moe`, e.g.
+`unsloth/Qwen3.6-35B-A3B-GGUF`), Qwen3.5-family dense (`qwen35`, e.g.
+`unsloth/Qwen3.8-27B-GGUF` — the same hybrid full-attention/gated-DeltaNet
+layer shape as `qwen35moe`, plain SwiGLU FFN instead of MoE routing — and
+Prism's Hadamard-folded ternary `Ternary-Bonsai-2-27B`, see below),
+Qwen3-Next (`qwen3next`), the Qwen4 preview (`qwen4exp`, e.g.
+`unsloth/Qwen3.8-Flash-Next-GGUF` — the same hybrid
+full-attention/gated-DeltaNet sub-layers and routed-plus-shared-expert MoE
+as `qwen35moe`, but with no residual _vector_: the state between sub-layers
+is `hyper_connection.count` parallel streams, and every layer norm is
+replaced by the gate that mixes them; full-attention layers additionally
+attend only the blocks a small indexer picks, and the layers named by
+`ple.layers` inject a second embedding read from an n-gram hash table),
+DeepSeek-V4 (`deepseek4`, e.g.
+`unsloth/DeepSeek-V4-Flash-0731-GGUF` — four parallel residual streams mixed
+per token, one shared key/value vector serving every query head, compressed
+attention blocks on top of a sliding window, and hash-routed experts),
+GLM-5 (`glm-dsa`, e.g. `unsloth/GLM-5.2-GGUF` — absorbed multi-head latent
+attention over a compressed key/value cache, with a lightning indexer
+choosing which positions each layer attends), GLM-5.3-Flash (`glm5next`,
+e.g. `unsloth/GLM-5.3-Flash-GGUF` — three-in-four Kimi Delta Attention
+layers alternating with that same absorbed latent attention, on a
+`hyper_connection.count`-stream residual bundle rather than a residual
+vector, over sigmoid-routed experts with a shared one. Nothing in it
+rotates, and its lightning indexer scores fixed _pools_ of
+`attention.indexer.kpool` positions rather than single positions, so the
+cut lands on pool boundaries), Kimi-K3 (`kimi-k3`, e.g.
+`unsloth/Kimi-K3-GGUF` — three-in-four delta-net layers alternating with
+latent attention, cross-layer residuals, and experts running in a latent
+space), and
+Phi-3
+(`phi3`, covering Phi-3 and Phi-4-mini — Llama-style attention and SwiGLU,
+but with the query/key/value projections fused into one `attn_qkv` tensor,
+the FFN gate and up projections fused into one `ffn_up` tensor, and LongRoPE
+frequency factors on a partially-rotated head), and Mistral 3 (`mistral3`,
+e.g. Ministral-3 — `llama`'s block shape plus YaRN RoPE scaling, a head
+width read from `attention.key_length` rather than derived from
+`n_embd / n_head`, and an attention temperature scale), and Muse-Glimmer
+(`muse-glimmer`, e.g. `unsloth/Muse-Glimmer-30B-GGUF` — a dense GQA block
+with a norm on both sides of each sub-layer, per-head query/key norms, a
+sigmoid gate on the attention output, three rotated sliding-window layers
+to every unrotated full-attention one, and both a logit scale and final
+logit softcapping on the output), and Inkling (`inkling`, e.g.
+`unsloth/Inkling-Small-GGUF` — a mixture-of-experts decoder that rotates
+nothing at all: position arrives through a learned per-head
+relative-position bias and a causal short convolution on the key/value
+projections and on each sub-layer's output, layers alternate
+sliding-window and full attention, and the routed experts share their
+weight normalization with two always-on shared ones), and Nemotron-H
+(`nemotron_h_moe`, e.g.
+`bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` — a hybrid whose
+blocks are a _single_ sub-layer each rather than the usual
+attention-plus-FFN pair: a selective state-space mixer, an unrotated
+attention, or a squared-ReLU mixture-of-experts FFN), and Ling 3.0
+(`bailingmoe3`, e.g. `bartowski/Ling-3.0-tiny-GGUF` — three-in-four Kimi
+Delta Attention layers alternating with gated, _rotated_ absorbed latent
+attention, over sigmoid-routed experts whose selection is group-limited:
+the experts form `expert_group_count` groups and only the best
+`expert_group_used_count` of them may serve a token), and Qwen-Image
+(`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF` — not a language model:
+a dual-stream diffusion transformer that denoises a latent picture under a
+prompt's hidden states, served with a `qwen2vl` text encoder and the
+Qwen-Image VAE beside it; see **Image generation**) — using
+`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
+`IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
+memory-mapped file (dequantized one row at a time, on demand) rather than
+eagerly resident, so even large models fit in modest RAM. A model split
+across several files (`<name>-00001-of-000NN.gguf` …) is loaded from every
+shard — the shard count comes from the `split.count` metadata key, and each
+shard is mapped separately.
 
 `orangu-server list` also recognizes `dflash` draft GGUFs such as the
 DeepSeek-V4-Flash DSpark sidecar. A draft carries no token embeddings and no

@@ -10645,6 +10645,22 @@ impl VulkanBackend {
     /// handle, so the clone is cheap; the byte-unpacked ones are built here
     /// on first use.
     fn mmq_pipeline(&self, kernel: MmqKernel) -> Option<wgpu::ComputePipeline> {
+        // **No kernel without the quantizer that feeds it.** Every one of
+        // these reads activations already quantized to `q8` by
+        // `record_mmq_quantize`, and that dispatch exists only where
+        // `prefill_mmq` does — an adapter whose integer dot is emulated
+        // rather than accelerated keeps the whole family switched off.
+        //
+        // Checked here rather than in each caller because the lazily built
+        // tables are the hole: the fixed pipelines are all `None` without
+        // `prefill_mmq`, so `mmq_kernel_for` refused them for free, but the
+        // `Toks` table is built on demand and answered whoever asked. That
+        // is the narrow kernel the byte-unpacked types take, so on a device
+        // with no accelerated integer dot a `Q8_0` model admitted a GEMM and
+        // then panicked reaching for a quantizer that was never built —
+        // reported from an `M2 Max`, and reproducible anywhere with
+        // `ORANGU_PREFILL_MMQ=0`.
+        self.quantize_q8_rows_pipeline.as_ref()?;
         match kernel {
             MmqKernel::Q4k => self.mmq_q4k_pipeline.clone(),
             MmqKernel::Q4kWide => self.mmq_q4k_wide_pipeline.clone(),
@@ -12559,8 +12575,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     /// Builds every integer-dot GEMM pipeline this backend can build, and
-    /// answers how many — for the test that runs on each platform's own
-    /// backend.
+    /// answers how many — or `None` where this adapter has the family
+    /// switched off, which is not a kernel that failed to build. For the
+    /// test that runs on each platform's own backend.
     ///
     /// A kernel is written once in WGSL and translated per backend, so one
     /// that every other platform accepts can still be refused by this one's
@@ -12568,7 +12585,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// the refusal arrives on a request rather than at startup because these
     /// pipelines are built on first use.
     #[cfg(test)]
-    pub(crate) fn build_every_mmq_pipeline_for_test(&self) -> usize {
+    pub(crate) fn build_every_mmq_pipeline_for_test(&self) -> Option<usize> {
+        // An adapter whose integer dot is emulated rather than accelerated
+        // runs no `q8` quantizer and therefore no integer-dot GEMM at all —
+        // see `mmq_pipeline`. Nothing to build, and nothing wrong.
+        self.quantize_q8_rows_pipeline.as_ref()?;
         let mut built = 0;
         for rows in [
             vulkan_shaders::MMQ_TILE_ROWS,
@@ -12617,7 +12638,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ] {
             built += usize::from(self.mmq_pipeline(kernel).is_some());
         }
-        built
+        Some(built)
     }
 
     /// The integer-dot GEMM on its own — `x` rows in, `[n_tokens, out_dim]`

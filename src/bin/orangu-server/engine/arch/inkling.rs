@@ -723,10 +723,7 @@ impl InklingModel {
             super::moe_router_logits(self.backend.as_ref(), normed, n_tokens, &moe.gate_inp);
         let n_logit = logits.len() / n_tokens.max(1);
         for t in 0..n_tokens {
-            let probs: Vec<f32> = logits[t * n_logit..(t + 1) * n_logit]
-                .iter()
-                .map(|&l| self.gating.apply(l))
-                .collect();
+            let probs: Vec<f32> = self.gating.probs(&logits[t * n_logit..(t + 1) * n_logit]);
             let mut choice = probs[..self.n_expert].to_vec();
             tensor::add_inplace(&mut choice, &moe.exp_probs_b);
             let selected = super::top_k_indices(&choice, self.n_expert_used);

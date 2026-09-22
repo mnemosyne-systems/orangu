@@ -189,6 +189,12 @@ pub(crate) fn attend(
 /// `llama_expert_gating_func_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpertGating {
+    /// `1` — a `softmax` over **all** the experts' logits, which Qwen3-MoE
+    /// and most of the older mixtures use. The only one of these that is
+    /// not element-wise: every expert's probability depends on all the
+    /// others, so it is applied to the whole row at once
+    /// ([`ExpertGating::probs`]) rather than to a logit at a time.
+    Softmax,
     /// `2` — GLM's `sigmoid`.
     Sigmoid,
     /// `4` — DeepSeek-V4's `sqrt(softplus(x))`.
@@ -198,18 +204,32 @@ pub(crate) enum ExpertGating {
 impl ExpertGating {
     pub(crate) fn from_gguf(value: u64) -> Result<Self> {
         match value {
+            1 => Ok(Self::Softmax),
             2 => Ok(Self::Sigmoid),
             4 => Ok(Self::SqrtSoftplus),
             other => anyhow::bail!(
-                "expert_gating_func {other} is not implemented (2 = sigmoid, 4 = sqrt-softplus)"
+                "expert_gating_func {other} is not implemented \
+                 (1 = softmax, 2 = sigmoid, 4 = sqrt-softplus)"
             ),
         }
     }
 
-    fn apply(self, x: f32) -> f32 {
+    /// One token's router logits as expert probabilities.
+    ///
+    /// A whole row at a time because [`ExpertGating::Softmax`] is a
+    /// function of the row and the other two are functions of one logit:
+    /// written per logit, softmax would have to normalize by a sum it
+    /// cannot see, and the result would be fluent, subtly wrong output
+    /// rather than an error.
+    pub(crate) fn probs(self, logits: &[f32]) -> Vec<f32> {
         match self {
-            Self::Sigmoid => tensor::sigmoid(x),
-            Self::SqrtSoftplus => tensor::softplus(x).sqrt(),
+            Self::Softmax => {
+                let mut probs = logits.to_vec();
+                tensor::softmax_inplace(&mut probs);
+                probs
+            }
+            Self::Sigmoid => logits.iter().map(|&l| tensor::sigmoid(l)).collect(),
+            Self::SqrtSoftplus => logits.iter().map(|&l| tensor::softplus(l).sqrt()).collect(),
         }
     }
 }
@@ -329,7 +349,7 @@ impl ExpertRouting {
         bias: Option<&[f32]>,
         forced: Option<&[i32]>,
     ) -> (Vec<usize>, Vec<f32>) {
-        let probs: Vec<f32> = logits.iter().map(|&l| self.gating.apply(l)).collect();
+        let probs: Vec<f32> = self.gating.probs(logits);
         let selected: Vec<usize> = match forced {
             Some(experts) => experts.iter().map(|&e| e as usize).collect(),
             None => {
@@ -1877,17 +1897,28 @@ pub(crate) fn swiglu_moe_ffn(
 
     // The GPU expert path batches the three projections across experts —
     // see `evaluate_routed_experts_batched`.
+    //
+    // A batch wide enough to pay for streaming the expert stacks takes the
+    // grouped device GEMM (`expert_gemm_wide`), as gemma's and the Qwen 3.5
+    // hybrid's mixtures already do: the whole routed feed-forward as one
+    // submission per layer. The activation is fused onto the card only for
+    // plain SwiGLU — a clamp is not one of the forms the card runs, so a
+    // clamped mixture keeps the host's activation between the projections
+    // and still gets the two GEMMs.
+    let fused = matches!(moe.clamp_exp, SwigluLimit::None).then_some(FusedActivation::Swiglu);
     let routed_branch = || {
         let _span = MoeSpan::routed();
-        if gpu_experts() && backend.as_wgpu().is_some() {
-            evaluate_routed_experts_batched(
+        if (gpu_experts() || expert_gemm_wide(selection.len())) && backend.as_wgpu().is_some() {
+            evaluate_routed_experts_batched_views(
                 backend,
                 &selection,
                 normed,
                 n_embd,
-                moe.gate_exps,
-                moe.up_exps,
-                moe.down_exps,
+                Some(&ExpertProjection::whole(moe.gate_exps)),
+                &ExpertProjection::whole(moe.up_exps),
+                &ExpertProjection::whole(moe.down_exps),
+                None,
+                fused,
                 |gate, up| swiglu_limited(gate, up, moe.clamp_exp),
             )
         } else {
@@ -4121,12 +4152,58 @@ mod tests {
 
     #[test]
     fn only_the_implemented_gating_functions_load() {
+        assert_eq!(ExpertGating::from_gguf(1).unwrap(), ExpertGating::Softmax);
         assert_eq!(ExpertGating::from_gguf(2).unwrap(), ExpertGating::Sigmoid);
         assert_eq!(
             ExpertGating::from_gguf(4).unwrap(),
             ExpertGating::SqrtSoftplus
         );
-        assert!(ExpertGating::from_gguf(1).is_err());
+        assert!(ExpertGating::from_gguf(3).is_err());
+    }
+
+    /// Softmax is a function of the whole row and the other two are
+    /// functions of one logit — which is the reason the gating takes a row
+    /// at all. A per-logit softmax would divide by a sum it cannot see, and
+    /// the weights would be wrong by a constant factor per token: fluent,
+    /// subtly wrong output rather than an error.
+    #[test]
+    fn softmax_gating_normalizes_across_the_row() {
+        let logits = [1.0f32, 2.0, 3.0];
+        let probs = ExpertGating::Softmax.probs(&logits);
+        assert!(
+            (probs.iter().sum::<f32>() - 1.0).abs() < 1e-6,
+            "softmax must sum to one: {probs:?}"
+        );
+        assert!(probs[2] > probs[1] && probs[1] > probs[0], "{probs:?}");
+        // The element-wise pair do not, and must not, depend on the row.
+        assert_eq!(
+            ExpertGating::Sigmoid.probs(&logits)[0],
+            ExpertGating::Sigmoid.probs(&logits[..1])[0]
+        );
+        assert_ne!(
+            ExpertGating::Softmax.probs(&logits)[0],
+            ExpertGating::Softmax.probs(&logits[..1])[0]
+        );
+    }
+
+    /// The whole point of softmax routing for Qwen3-MoE: the top-k weights
+    /// are renormalized after selection, so eight of 128 experts still
+    /// contribute weights summing to one.
+    #[test]
+    fn softmax_routing_renormalizes_the_selected_weights() {
+        let routing = ExpertRouting {
+            n_expert_used: 2,
+            gating: ExpertGating::Softmax,
+            weights_norm: true,
+            weights_scale: 1.0,
+            groups: None,
+        };
+        let (selected, weights) = routing.route(&[0.1, 3.0, 2.0, -1.0], None, None);
+        assert_eq!(selected, vec![1, 2]);
+        assert!(
+            (weights.iter().sum::<f32>() - 1.0).abs() < 1e-5,
+            "{weights:?}"
+        );
     }
 }
 
