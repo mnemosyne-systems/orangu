@@ -14865,6 +14865,14 @@ fn mmq_q4k_gemm_matches_the_cpu_product() {
         // `Q4_K` does, with a partial token tile and both block parities.
         (crate::engine::quant::GGML_TYPE_Q4_1, 1536, 256, 90),
         (crate::engine::quant::GGML_TYPE_Q4_0, 1536, 256, 90),
+        // Rows that are not whole super-blocks (960 = 3.75 × 256), which
+        // the byte-unpacked kernels take in sub-block pairs: the last
+        // super-block of the quantized activation is partial, and a
+        // 1020-byte `Q8_0` row puts odd rows two bytes into a word.
+        (crate::engine::quant::GGML_TYPE_Q8_0, 960, 2560, 200),
+        (crate::engine::quant::GGML_TYPE_Q8_0, 960, 320, 90),
+        (crate::engine::quant::GGML_TYPE_Q4_0, 960, 960, 128),
+        (crate::engine::quant::GGML_TYPE_Q5_1, 960, 2560, 200),
         (crate::engine::quant::GGML_TYPE_Q8_0, 1536, 256, 40),
         (crate::engine::quant::GGML_TYPE_Q5_K, 1536, 256, 90),
         (crate::engine::quant::GGML_TYPE_Q3_K, 1536, 256, 90),
@@ -14890,6 +14898,21 @@ fn mmq_q4k_gemm_matches_the_cpu_product() {
         (GGML_TYPE_Q4_K, 3840, 512, 128),
         (GGML_TYPE_Q4_K, 3840, 15360, 128),
         (crate::engine::quant::GGML_TYPE_Q6_K, 15360, 3840, 128),
+        // Rows the device pads off the memory interleave
+        // (`VulkanBackend::device_row_stride`): a stride that is a multiple
+        // of 512 bytes gets one 256-byte gap per row, so every kernel that
+        // walks these rows must take its stride from the meta rather than
+        // from the type and the width. `Q4_1` at 12288 (7680 = 512 · 15) is
+        // the shape that found this, `Q5_1` at 12288 (9216) and `Q8_0` at
+        // 8192 (8704) are its twins, and `Q4_K` at 8192 (4608) is a
+        // super-block type at the same fault. Each is also a row the CPU
+        // reference still reads unpadded, which is the half of the check
+        // that bites.
+        (crate::engine::quant::GGML_TYPE_Q4_1, 12288, 1536, 200),
+        (crate::engine::quant::GGML_TYPE_Q4_1, 12288, 256, 90),
+        (crate::engine::quant::GGML_TYPE_Q5_1, 12288, 1536, 128),
+        (crate::engine::quant::GGML_TYPE_Q8_0, 8192, 1536, 200),
+        (GGML_TYPE_Q4_K, 8192, 1536, 200),
     ] {
         let mut bytes = Vec::new();
         let (_, block_elems) =
@@ -15939,4 +15962,34 @@ fn the_fused_routed_ffn_without_a_gate_matches_the_cpu_computation() {
             );
         }
     }
+}
+
+/// **Every integer-dot GEMM pipeline, built on this platform's own
+/// backend.**
+///
+/// The kernels are generated as WGSL and translated by `wgpu` into SPIR-V
+/// here, Metal on Apple and DXIL on Windows — and a kernel the SPIR-V path
+/// accepts can still be refused by another. One was: an `M2 Max` rejected
+/// the byte-unpacked GEMM because the Metal translation declared the same
+/// polyfill temporary twice in a block, and since these pipelines are built
+/// on first *use*, the refusal arrived on a user's first prompt rather than
+/// at startup.
+///
+/// `vulkan_shaders::msl_tests` checks the translation itself and needs no
+/// device; this builds them, which is the half only a device can answer.
+/// Skips itself where there is no adapter.
+#[test]
+fn every_integer_dot_pipeline_builds() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let built = vulkan.build_every_mmq_pipeline_for_test();
+    eprintln!("built {built} integer-dot GEMM pipelines on this backend");
+    assert!(
+        built > 0,
+        "no integer-dot pipeline was built at all — either the backend has \
+         them switched off, or every one of them was refused"
+    );
 }

@@ -132,7 +132,7 @@ and so on. What each script completes:
 | --- | --- |
 | `orangu-server` | every flag, the subcommand names, and the positional `model` argument plus `show`'s, `plan`'s, `delete`'s, `refresh`'s and `bundle`'s own arguments (by shelling back out to `orangu-server list`); `prune`'s session UUIDs; `-w` directories, `-c` files — see the Server chapter |
 | `orangu-coordinator` | `-c`/`--config` (files), `-i`/`--init`, `-q`/`--quiet`, `-d`/`--daemon`, `-s`, `-h`, `-V` — see the Coordinator chapter |
-| `orangu-bench` | every flag; the path-taking ones (`--history`, `--chart`, `--storage-file`, `--flamegraph`, `--compare-profiles`, `--bundle`, `--read-bundle`, `--render-profile`, `--report`) complete files, `--flamegraph-call-graph` its two modes and `--host` the usual bind addresses — see the Benchmarking chapter |
+| `orangu-bench` | every flag; the path-taking ones (`--history`, `--chart`, `--storage-file`, `--flamegraph`, `--compare-profiles`, `--bundle`, `--read-bundle`, `--render-profile`, `--report`) complete files, `--flamegraph-call-graph` its three modes and `--host` the usual bind addresses — see the Benchmarking chapter |
 | `orangu-gguf` | the positional manifest (`.json` files), `-m`/`--model` (`.gguf` files), `-q`/`--quantization` (the weight formats, by shelling back out to `orangu-gguf --list-quantizations`), `-o`/`--output` and `--flamegraph` (files), `--flamegraph-call-graph` (`fp`/`dwarf`), and the two-letter `-ts`/`-cs` alongside their long forms — see the Building a model chapter |
 
 With an unsupported `$SHELL` every binary fails the same way, naming the

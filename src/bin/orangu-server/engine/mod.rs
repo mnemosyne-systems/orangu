@@ -46,6 +46,7 @@ pub mod route_ahead;
 pub mod sampling;
 pub mod scheduler;
 pub mod slot_store;
+pub mod step_probe;
 pub mod tensor;
 pub mod tokenizer;
 pub mod tool_calls;

@@ -2712,6 +2712,10 @@ impl ModelForward for GemmaModel {
         self.backend.as_wgpu()
     }
 
+    fn decode_step_is_chunked(&self) -> bool {
+        true
+    }
+
     fn config(&self) -> &ModelConfig {
         &self.config
     }

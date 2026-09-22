@@ -165,6 +165,11 @@ fn props_json(state: &AppState) -> serde_json::Value {
         // having remembered to write it down.
         "version": orangu::build_info::VERSION,
         "commit": orangu::build_info::COMMIT,
+        // Whether this build keeps frame pointers. A profiler asks before it
+        // chooses how to unwind: `perf --call-graph fp` needs them, `dwarf`
+        // does not — see `orangu::build_info::FRAME_POINTERS`. Reported here
+        // so no one has to remember which directory holds which build.
+        "frame_pointers": orangu::build_info::frame_pointers(),
         // `null` on a backend with no kernel selection to report — see
         // `AppState::gpu_tuning`.
         "gpu": state.gpu_tuning,

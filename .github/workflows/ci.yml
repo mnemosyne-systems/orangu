@@ -25,27 +25,48 @@ jobs:
           components: rustfmt, clippy
       - name: Run cargo fmt
         run: cargo fmt --all --check
+  # `check` and `lint` run on all three platforms, not just ubuntu: what
+  # they judge is per-platform. Half of this project's backend code is
+  # behind `cfg(target_os)`, so a module that only Windows or macOS compiles
+  # is invisible to an ubuntu-only gate — a macOS user reported dead-code
+  # warnings from a `cfg`-gated helper that no ubuntu run could have seen.
   check:
-    runs-on: ubuntu-latest
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
     - uses: actions/checkout@v5
-    - uses: Swatinem/rust-cache@v2
     - name: Install stable toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt, clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: check-${{ matrix.os }}
     - name: Run cargo check
       run: cargo check
 
   lint:
-    runs-on: ubuntu-latest
+    name: lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
     - uses: actions/checkout@v5
-    - uses: Swatinem/rust-cache@v2
     - name: Install stable toolchain
       uses: dtolnay/rust-toolchain@stable
       with:
         components: clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: lint-${{ matrix.os }}
     # `--all-targets` so test code is linted too, not just what ships. It
     # is the larger half of some modules, and was going unchecked.
     - name: Run cargo clippy
@@ -98,6 +119,26 @@ jobs:
       # So run it once more with `--nocapture` purely to surface the answer.
       # Not a gate — the test itself is already the gate, and it is in the
       # ordinary suite above. This step only makes what it learned readable.
+      # The kernels are written once in WGSL and translated per backend, so a
+      # kernel that is valid WGSL and valid SPIR-V can still be rejected by
+      # the Metal or DirectX compiler — and only building it on a real device
+      # of that backend finds out. This runs the pipeline builds that the
+      # translation test cannot: every integer-dot GEMM, on whatever adapter
+      # the runner has, and it skips itself where there is none.
+      #
+      # It is separate from `cargo test` above only so that a failure reads
+      # as "this platform rejects a kernel" rather than as one line in a
+      # thousand-test run.
+      - name: Build every GPU kernel on this platform's own backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --bin orangu-server -- --nocapture \
+            engine::backend::vulkan::tests::every_integer_dot_pipeline_builds \
+            | tee kernels.log
+          grep -q '^test result: ok\.' kernels.log
+          rm -f kernels.log
+
       - name: Report Metal shared-memory store behaviour
         if: matrix.os == 'macos-latest'
         shell: bash

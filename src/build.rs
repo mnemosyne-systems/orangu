@@ -57,6 +57,20 @@ fn main() {
         "cargo:rustc-env=ORANGU_BUILD_TARGET={}",
         std::env::var("TARGET").unwrap_or_else(|_| "unknown".to_string())
     );
+
+    // The flags this crate is being compiled with, forwarded so the built
+    // binary can say whether it keeps frame pointers — which decides how a
+    // profile of it can be unwound. The flag is not a profile setting
+    // (stable cargo has no per-profile `rustflags`), so it arrives through
+    // the environment, and while it is being built is the only moment the
+    // binary can see it. Parsed in `orangu::build_info`, where it can be
+    // tested; this only carries it across.
+    println!("cargo:rerun-if-env-changed=CARGO_ENCODED_RUSTFLAGS");
+    println!("cargo:rerun-if-env-changed=RUSTFLAGS");
+    println!(
+        "cargo:rustc-env=ORANGU_BUILD_RUSTFLAGS={}",
+        std::env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default()
+    );
 }
 
 /// `1.91.0` from `rustc 1.91.0 (f8297e351 2025-10-28)`.

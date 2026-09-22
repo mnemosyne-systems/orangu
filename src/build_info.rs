@@ -76,6 +76,98 @@ pub fn id() -> String {
     }
 }
 
+/// Whether this build keeps frame pointers.
+///
+/// What it decides is how a profile of this process can be unwound: `perf
+/// --call-graph fp` walks the frame-pointer chain and needs them, and a
+/// build without them loses the call chain for most samples in the hot leaf,
+/// which renders as a flamegraph of a process doing nothing. `dwarf` works
+/// on either kind, from the unwind tables every build carries.
+///
+/// Reported rather than assumed because the flag is not part of the build
+/// profile: stable cargo has no per-profile `rustflags`, so whether a
+/// `release-with-debug` binary has them depends on how it was invoked. A
+/// profiler that asks the process it is about to sample needs no convention
+/// about which directory holds which kind of build — `orangu-server` answers
+/// this on `GET /props` and `orangu-bench --flamegraph-call-graph auto` asks.
+///
+/// They are not simply always on because they are not free: measured on this
+/// project's own hardware, the same source built with them is 9% slower at a
+/// small model's decode and 5% at a prefill.
+pub fn frame_pointers() -> bool {
+    frame_pointers_in(option_env!("ORANGU_BUILD_RUSTFLAGS").unwrap_or_default())
+}
+
+/// [`frame_pointers`] over the flags cargo passed to `rustc`, as
+/// `CARGO_ENCODED_RUSTFLAGS` holds them: the arguments separated by a unit
+/// separator, so `-C force-frame-pointers=yes` may arrive either as one
+/// argument or as `-C` followed by the rest.
+///
+/// Split out to be tested. The obvious reading — "an argument beginning
+/// `-C`, then look at the next one" — reports every build as having frame
+/// pointers, because `[target.'cfg(...)'] rustflags = ["-C",
+/// "target-feature=..."]` in `.cargo/config.toml` is exactly that shape.
+fn frame_pointers_in(flags: &str) -> bool {
+    let args: Vec<&str> = flags.split('\u{1f}').filter(|a| !a.is_empty()).collect();
+    let mut i = 0;
+    while i < args.len() {
+        // `-C name=value` and `-Cname=value` are the same flag to `rustc`.
+        let flag = match args[i] {
+            "-C" => {
+                i += 1;
+                args.get(i).copied().unwrap_or_default()
+            }
+            arg => arg.strip_prefix("-C").unwrap_or_default(),
+        };
+        i += 1;
+        let Some(rest) = flag.strip_prefix("force-frame-pointers") else {
+            continue;
+        };
+        // No value means yes, as it does to `rustc` itself.
+        return match rest.strip_prefix('=') {
+            None | Some("") => true,
+            Some(value) => !matches!(value, "no" | "n" | "off" | "false"),
+        };
+    }
+    false
+}
+
+#[cfg(test)]
+mod frame_pointer_tests {
+    use super::frame_pointers_in;
+
+    /// The flag in every spelling cargo can deliver it in, and — the case
+    /// that made this a function with a test — the flags this project
+    /// actually builds with, which have a bare `-C` in them and no frame
+    /// pointers at all.
+    #[test]
+    fn frame_pointers_are_read_from_the_flags_cargo_passed() {
+        let sep = '\u{1f}';
+        let joined = |args: &[&str]| args.join(&sep.to_string());
+
+        assert!(frame_pointers_in(&joined(&["-Cforce-frame-pointers=yes"])));
+        assert!(frame_pointers_in(&joined(&[
+            "-C",
+            "force-frame-pointers=yes"
+        ])));
+        assert!(frame_pointers_in(&joined(&["-Cforce-frame-pointers"])));
+        assert!(frame_pointers_in(&joined(&[
+            "-C",
+            "target-feature=+avx2,+fma",
+            "-C",
+            "force-frame-pointers=yes",
+        ])));
+
+        assert!(!frame_pointers_in(""));
+        assert!(!frame_pointers_in(&joined(&["-C", "target-feature=+avx2"])));
+        assert!(!frame_pointers_in(&joined(&["-Ctarget-cpu=native"])));
+        assert!(!frame_pointers_in(&joined(&[
+            "-C",
+            "force-frame-pointers=no"
+        ])));
+    }
+}
+
 /// Whether the commit is a real one. Kept as a function rather than left to
 /// each caller to compare against the magic string.
 pub fn is_known() -> bool {

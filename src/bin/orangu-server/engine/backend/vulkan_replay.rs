@@ -2192,7 +2192,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             mb[0..4].copy_from_slice(&(IN_DIM as u32).to_ne_bytes());
             mb[4..8].copy_from_slice(&(OUT_DIM as u32).to_ne_bytes());
             mb[8..12].copy_from_slice(&(N_TOKENS as u32).to_ne_bytes());
-            mb[12..16].copy_from_slice(&(w.row_bytes() as u32).to_ne_bytes());
+            mb[12..16].copy_from_slice(
+                &(crate::engine::backend::vulkan::VulkanBackend::device_row_stride(w.row_bytes())
+                    as u32)
+                    .to_ne_bytes(),
+            );
             meta.write(&mb);
 
             let w_raw = raw_vk_buffer(&weight_chunk);
@@ -2716,7 +2720,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             mmb[0..4].copy_from_slice(&(IN_DIM as u32).to_ne_bytes());
             mmb[4..8].copy_from_slice(&(FFN as u32).to_ne_bytes());
             mmb[8..12].copy_from_slice(&1u32.to_ne_bytes());
-            mmb[12..16].copy_from_slice(&(gate_qm.row_bytes() as u32).to_ne_bytes());
+            mmb[12..16].copy_from_slice(
+                &(crate::engine::backend::vulkan::VulkanBackend::device_row_stride(
+                    gate_qm.row_bytes(),
+                ) as u32)
+                    .to_ne_bytes(),
+            );
             mm_meta.write(&mmb);
             // ElemMeta {len, _, _, _} for gelu/mul over FFN elements.
             let elem_meta = MappedBuffer::new(&ctx, 16, vk::BufferUsageFlags::UNIFORM_BUFFER)
@@ -3054,7 +3063,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             mmb[0..4].copy_from_slice(&(N_EMBD as u32).to_ne_bytes());
             mmb[4..8].copy_from_slice(&(OUT_DIM as u32).to_ne_bytes());
             mmb[8..12].copy_from_slice(&1u32.to_ne_bytes());
-            mmb[12..16].copy_from_slice(&(wq_qm.row_bytes() as u32).to_ne_bytes());
+            mmb[12..16].copy_from_slice(
+                &(crate::engine::backend::vulkan::VulkanBackend::device_row_stride(
+                    wq_qm.row_bytes(),
+                ) as u32)
+                    .to_ne_bytes(),
+            );
             mm_meta.write(&mmb);
 
             let x_raw = raw_vk_buffer(&cap.x_buf);

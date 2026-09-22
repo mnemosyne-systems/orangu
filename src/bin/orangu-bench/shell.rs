@@ -19,7 +19,7 @@
 //! offer those, and complete the values that have a finite or filesystem
 //! answer: the path-taking flags (`--history`, `--chart`, `--flamegraph`,
 //! `--bundle`, `--report`, ...) complete files, `--flamegraph-call-graph`
-//! its two modes, and `--host` the usual bind addresses. The rest — token
+//! its three modes, and `--host` the usual bind addresses. The rest — token
 //! counts, URLs, a model id — are typed. No clap-generated completion
 //! machinery is involved. The PowerShell script is kept to ASCII: Windows
 //! PowerShell decodes a native command's output in the console's code
@@ -49,7 +49,7 @@ _orangu_bench() {
             return 0
             ;;
         --flamegraph-call-graph)
-            COMPREPLY=( $(compgen -W "fp dwarf" -- "$cur") )
+            COMPREPLY=( $(compgen -W "auto fp dwarf" -- "$cur") )
             return 0
             ;;
         --host)
@@ -134,7 +134,7 @@ _orangu_bench() {
         '--flamegraph[Record a CPU flamegraph of the server over the measured window]:path:_files' \
         '--flamegraph-pid[Process to profile (default: the server'"'"'s own, else the URL port'"'"'s owner)]:pid:' \
         '--flamegraph-freq[Sampling frequency in Hz for --flamegraph]:hz:' \
-        '--flamegraph-call-graph[Call-graph mode for --flamegraph]:mode:(fp dwarf)' \
+        '--flamegraph-call-graph[Call-graph mode for --flamegraph]:mode:(auto fp dwarf)' \
         '--flamegraph-png[Also render a PNG beside the flamegraph SVG]' \
         '--flamegraph-layers[Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR]:dir:_files -/' \
         '--flamegraph-duration[Seconds to keep sampling under --flamegraph-layers]:seconds:' \
@@ -213,7 +213,7 @@ complete -c orangu-bench -l chart-panels           -x -d 'Draw only these modes\
 complete -c orangu-bench -l flamegraph             -r -d 'Record a CPU flamegraph of the server over the measured window'
 complete -c orangu-bench -l flamegraph-pid         -x -d 'Process to profile (default: the server\'s own, else the URL port\'s owner)'
 complete -c orangu-bench -l flamegraph-freq        -x -d 'Sampling frequency in Hz for --flamegraph'
-complete -c orangu-bench -l flamegraph-call-graph  -x -a 'fp dwarf' -d 'Call-graph mode for --flamegraph'
+complete -c orangu-bench -l flamegraph-call-graph  -x -a 'auto fp dwarf' -d 'Call-graph mode for --flamegraph'
 complete -c orangu-bench -l flamegraph-png            -d 'Also render a PNG beside the flamegraph SVG'
 complete -c orangu-bench -l flamegraph-layers      -r -d 'Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR'
 complete -c orangu-bench -l flamegraph-duration    -x -d 'Seconds to keep sampling under --flamegraph-layers'

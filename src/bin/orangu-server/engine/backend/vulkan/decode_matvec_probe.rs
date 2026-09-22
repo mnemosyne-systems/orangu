@@ -763,41 +763,58 @@ fn prefill_gemm_probe() {
                 "{:>6} {:>22} {:>11} {:>10} {:>10}",
                 "tokens", "kernel", "kernel us", "GFLOP/s", "us/token"
             );
+            // `ORANGU_SWEEP_SKIP_FLOAT=1`: the integer-dot kernel alone,
+            // without the float baseline at the same shape. The baseline is
+            // the slower kernel by several times, and at a wide shape
+            // (`12288 × 1536` at 512 tokens) a burst of it overruns the
+            // device's watchdog and takes the whole device down with it —
+            // so a sweep that only wants the integer-dot kernels has to be
+            // able to say so.
+            let skip_float = crate::engine::env::flag_on("ORANGU_SWEEP_SKIP_FLOAT");
             for &n in &widths {
                 let x = vec![0.05f32; in_dim * n];
-                let Some((us, name)) = gpu.matmul_kernel_us_tokens(&x, n, &w, reps) else {
-                    println!("  (no timestamp query on this adapter)");
-                    return;
-                };
                 let flops = 2.0 * (n * in_dim * out_dim) as f64;
-                // `ORANGU_SWEEP_GAP_MS=<ms>`: the same dispatch, one per
-                // submission, with the device left idle that long between
-                // them — a prefill's own rhythm, where every chain waits for
-                // a readback before the next is recorded. The difference
-                // between this column and the burst is what idling costs the
-                // clock.
-                let gapped = std::env::var("ORANGU_SWEEP_GAP_MS")
-                    .ok()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|gap| {
-                        let mut samples: Vec<f64> = (0..9)
-                            .filter_map(|_| {
-                                std::thread::sleep(std::time::Duration::from_millis(gap));
-                                gpu.matmul_kernel_us_tokens(&x, n, &w, 1).map(|(us, _)| us)
-                            })
-                            .collect();
-                        samples.sort_by(|a, b| a.total_cmp(b));
-                        samples[samples.len() / 2]
-                    });
-                println!(
-                    "{n:>6} {name:>22} {us:>11.1} {:>10.0} {:>10.2}{}",
-                    flops / us / 1e3,
-                    us / n as f64,
-                    gapped.map_or(String::new(), |g| format!(
-                        "   gapped {g:>9.1} us ({:.0} GFLOP/s)",
-                        flops / g / 1e3
-                    ))
-                );
+                let baseline = if skip_float {
+                    None
+                } else {
+                    match gpu.matmul_kernel_us_tokens(&x, n, &w, reps) {
+                        Some(v) => Some(v),
+                        None => {
+                            println!("  (no timestamp query on this adapter)");
+                            return;
+                        }
+                    }
+                };
+                if let Some((us, name)) = baseline {
+                    // `ORANGU_SWEEP_GAP_MS=<ms>`: the same dispatch, one per
+                    // submission, with the device left idle that long between
+                    // them — a prefill's own rhythm, where every chain waits for
+                    // a readback before the next is recorded. The difference
+                    // between this column and the burst is what idling costs the
+                    // clock.
+                    let gapped = std::env::var("ORANGU_SWEEP_GAP_MS")
+                        .ok()
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .map(|gap| {
+                            let mut samples: Vec<f64> = (0..9)
+                                .filter_map(|_| {
+                                    std::thread::sleep(std::time::Duration::from_millis(gap));
+                                    gpu.matmul_kernel_us_tokens(&x, n, &w, 1).map(|(us, _)| us)
+                                })
+                                .collect();
+                            samples.sort_by(|a, b| a.total_cmp(b));
+                            samples[samples.len() / 2]
+                        });
+                    println!(
+                        "{n:>6} {name:>22} {us:>11.1} {:>10.0} {:>10.2}{}",
+                        flops / us / 1e3,
+                        us / n as f64,
+                        gapped.map_or(String::new(), |g| format!(
+                            "   gapped {g:>9.1} us ({:.0} GFLOP/s)",
+                            flops / g / 1e3
+                        ))
+                    );
+                }
                 // The integer-dot GEMM at the same shape, where it applies.
                 let rotation: Vec<_> = (0..rotate)
                     .map(|i| weight_of_seeded(ggml_type, in_dim, out_dim, 0x42 + i as u8))

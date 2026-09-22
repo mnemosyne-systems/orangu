@@ -42,13 +42,19 @@
 //! flamegraph::render                 > FILE.svg
 //! ```
 //!
-//! **Frame pointers.** `--call-graph fp` needs them. A stock release build of
-//! `orangu-server` drops them and the call chain is lost for most samples in
-//! the hot leaf, which renders as a flamegraph of a process doing nothing:
-//! build the profiled server with
-//! `RUSTFLAGS="-C force-frame-pointers=yes"`. A binary you do not control —
-//! a server from a distribution package — needs `--call-graph dwarf`
-//! instead, which is why the mode is an option rather than a constant.
+//! **How the stack is recovered.** `fp` walks the frame-pointer chain and
+//! needs a binary built with `-C force-frame-pointers=yes`; without them the
+//! chain is lost for most samples in the hot leaf and the graph renders as a
+//! process doing nothing. `dwarf` copies a slice of each sampled stack and
+//! unwinds it with the tables every build carries, so it works on the
+//! ordinary build and on a binary nobody here controls.
+//!
+//! Which one is not a constant and not a convention about build directories:
+//! the mode defaults to `auto` and `orangu-bench` asks the server how it was
+//! built (`GET /props`, `frame_pointers` — see
+//! `orangu::build_info::frame_pointers`). Frame pointers cost real
+//! throughput on this project's own hardware, so the build that a benchmark
+//! measures does not carry them, and that is the build a profile reads.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

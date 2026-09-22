@@ -291,8 +291,8 @@ struct Args {
     #[arg(long, default_value_t = 999, value_name = "HZ")]
     flamegraph_freq: u32,
 
-    /// Call-graph mode for `--flamegraph`: `fp` or `dwarf`.
-    #[arg(long, default_value = "fp", value_name = "MODE")]
+    /// Call-graph mode for `--flamegraph`: `auto`, `fp` or `dwarf`.
+    #[arg(long, default_value = "auto", value_name = "MODE")]
     flamegraph_call_graph: String,
 
     /// Also render a PNG beside the flamegraph SVG.
@@ -3506,12 +3506,16 @@ fn profile_layers(args: &Args, dir: &std::path::Path) -> anyhow::Result<()> {
             args.flamegraph_duration
         );
     }
-    let recorder = profile::SystemRecorder::start(
-        dir,
-        args.flamegraph_freq,
-        &args.flamegraph_call_graph,
-        args.flamegraph_png,
-    )?;
+    // Every orangu process on the machine, built however each was: no one
+    // of them answers for the others, so `auto` takes the mode that works on
+    // either kind.
+    let call_graph = if args.flamegraph_call_graph == "auto" {
+        "dwarf"
+    } else {
+        &args.flamegraph_call_graph
+    };
+    let recorder =
+        profile::SystemRecorder::start(dir, args.flamegraph_freq, call_graph, args.flamegraph_png)?;
     std::thread::sleep(std::time::Duration::from_secs(args.flamegraph_duration));
     let mut profiles = recorder.finish(layer_of_comm)?;
     if profiles.is_empty() {
@@ -3576,6 +3580,37 @@ fn profile_layers(args: &Args, dir: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The call-graph mode a capture of this server takes.
+///
+/// `fp` walks the frame-pointer chain: cheap, shallow stack copies, and it
+/// needs a binary built with `-C force-frame-pointers=yes`. Without them the
+/// chain is lost for most samples in the hot leaf and the graph renders as a
+/// process doing nothing — a wrong answer that looks like a real one, which
+/// is why the default asks rather than assumes.
+///
+/// `auto` asks the server how it was built (`/props.frame_pointers`) and
+/// takes `fp` when it says yes, `dwarf` otherwise. `dwarf` copies a slice of
+/// each sampled stack and unwinds it afterwards with the unwind tables every
+/// build carries, so it works on the ordinary `release-with-debug` binary —
+/// and on a server from a distribution package, which no convention about
+/// build directories can cover. A server too old to answer, or one this
+/// benchmark cannot reach, gets `dwarf` for the same reason.
+///
+/// Anything else is passed to `perf` as given, including `dwarf,<bytes>`.
+fn resolve_call_graph(client: &reqwest::blocking::Client, args: &Args) -> String {
+    if args.flamegraph_call_graph != "auto" {
+        return args.flamegraph_call_graph.clone();
+    }
+    let frame_pointers = client
+        .get(format!("{}/props", args.url))
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|p| p.get("frame_pointers").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false);
+    if frame_pointers { "fp" } else { "dwarf" }.to_string()
+}
+
 /// Begin a flamegraph capture of whichever process is answering `--url`.
 fn start_profile(
     client: &reqwest::blocking::Client,
@@ -3587,14 +3622,18 @@ fn start_profile(
         Some(pid) => pid,
         None => resolve_server_pid(client, args)?,
     };
+    let call_graph = resolve_call_graph(client, args);
     if !args.json {
-        println!("  profiling pid {pid} at {} Hz", args.flamegraph_freq);
+        println!(
+            "  profiling pid {pid} at {} Hz (--call-graph {call_graph})",
+            args.flamegraph_freq
+        );
     }
     profile::Recorder::start(profile::Options {
         svg: std::path::PathBuf::from(svg),
         pid,
         freq: args.flamegraph_freq,
-        call_graph: args.flamegraph_call_graph.clone(),
+        call_graph,
         png: args.flamegraph_png,
         title: format!("{label} · {}", workload_name(args)),
     })

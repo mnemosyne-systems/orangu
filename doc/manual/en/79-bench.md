@@ -1082,7 +1082,7 @@ Options:
       --flamegraph <PATH>              Record a CPU flamegraph of the server over the measured window
       --flamegraph-pid <PID>           Process to profile (default: the server's own, else the URL port's owner)
       --flamegraph-freq <HZ>           Sampling frequency in Hz for `--flamegraph` [default: 999]
-      --flamegraph-call-graph <MODE>   Call-graph mode for `--flamegraph`: `fp` or `dwarf` [default: fp]
+      --flamegraph-call-graph <MODE>   Call-graph mode for `--flamegraph`: `auto`, `fp` or `dwarf` [default: auto]
       --flamegraph-png                 Also render a PNG beside the flamegraph SVG
       --flamegraph-layers <DIR>        Profile every running orangu, orangu-coordinator and orangu-server for `--flamegraph-duration` while you drive the workload; one flamegraph per process in DIR. Measures nothing itself.
       --flamegraph-duration <SECONDS>  Seconds to keep sampling under `--flamegraph-layers` [default: 60]
@@ -1117,7 +1117,7 @@ shell detected from `$SHELL` and exits — the same switch every orangu binary
 has (see the Shell completions chapter). It offers every flag above; the
 path-taking ones (`--history`, `--chart`, `--storage-file`, `--flamegraph`,
 `--compare-profiles`, `--bundle`, `--read-bundle`, `--render-profile`,
-`--report`) complete files, `--flamegraph-call-graph` its two modes and
+`--report`) complete files, `--flamegraph-call-graph` its three modes and
 `--host` the usual bind addresses:
 
 ```sh
@@ -1484,18 +1484,33 @@ answer. Merging them would charge a threading problem to the GPU.
   font or image.
 - `rsvg-convert`, **only** for the optional `--flamegraph-png`. Missing, the SVG
   is still written and the run still succeeds.
-- **Frame pointers in the profiled binary.** `--call-graph fp` is the default
-  and needs them; a stock `--release` build of `orangu-server` drops them and
-  loses the call chain for most samples in the hot leaf, which renders as a
-  flamegraph of a process doing nothing. Build the server being profiled with:
+- **Nothing. The ordinary build is profiled.** `--flamegraph-call-graph`
+  defaults to `auto`: the benchmark asks the server whether it kept frame
+  pointers (`GET /props`, `frame_pointers`) and unwinds with `fp` when it did
+  and `dwarf` when it did not. So `target/release-with-debug/orangu-server` —
+  the binary a sweep measures — is also the binary a profile reads, and the
+  rate and the graph describe the same thing.
+
+  The two modes differ in how the stack is recovered, not in what they show.
+  `fp` walks the frame-pointer chain and is cheaper, but needs a binary built
+  with `-C force-frame-pointers=yes`; without them the chain is lost for most
+  samples in the hot leaf, which renders as a flamegraph of a process doing
+  nothing. `dwarf` copies a slice of each sampled stack and unwinds it with
+  the tables every build carries, which costs more per sample and can truncate
+  a very deep stack, but asks nothing of the build — including a server from a
+  distribution package, where no build convention can help.
+
+  Frame pointers are not on by default because they are not free: measured on
+  this project's own hardware, the same source built with them is **9% slower
+  at a small model's decode and 5% at a prefill**. They are also not a profile
+  setting — stable cargo has no per-profile `rustflags` — so a build that
+  wants them says so, and then `auto` picks `fp` for it:
   ```sh
-  CARGO_TARGET_DIR=target-fp RUSTFLAGS="-C force-frame-pointers=yes" \
+  RUSTFLAGS="-C force-frame-pointers=yes -C target-feature=+avx2,+fma,+sse4.2" \
     cargo build --profile release-with-debug --bin orangu-server
   ```
-  A binary you do not control needs `--flamegraph-call-graph dwarf` instead.
-  (Some third-party builds keep frame pointers, so `fp` works for them too —
-  worth checking rather than assuming, since a broken unwind looks like a real
-  result.)
+  `--flamegraph-call-graph fp` or `dwarf` overrides the question entirely, and
+  `dwarf,<bytes>` passes a stack-dump size through to `perf`.
 
 `--flamegraph-pid` is only needed when neither route to the pid works. The tool
 asks the server for its own pid first (`orangu-server` reports one), and

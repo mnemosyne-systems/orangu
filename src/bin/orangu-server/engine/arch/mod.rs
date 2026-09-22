@@ -3063,6 +3063,13 @@ pub trait ModelForward: Send + Sync {
         self.config().n_layer
     }
 
+    /// Whether this model's decode step is recorded in the chunks
+    /// [`decode_chunk_ends`] hands out — the families whose steps are timed
+    /// against those plans (`note_decode_step`).
+    fn decode_step_is_chunked(&self) -> bool {
+        false
+    }
+
     /// This model's Vulkan backend, when it has one.
     ///
     /// Exists for cross-architecture *instrumentation* rather than for work:
@@ -4269,6 +4276,112 @@ mod scratch_ffn_cost {
     }
 }
 
+/// How a decode step's recording is split into submissions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ChunkPlan {
+    /// A first chunk of `first` layers, each next chunk `ratio` times the
+    /// last.
+    Geometric { first: usize, ratio: usize },
+    /// Chunks of `layers` layers each.
+    Equal { layers: usize },
+}
+
+impl ChunkPlan {
+    /// The layer counts after which the step submits what it has recorded.
+    pub(crate) fn ends(self, n_layers: usize) -> Vec<usize> {
+        let mut ends = Vec::new();
+        match self {
+            ChunkPlan::Geometric { first, ratio } => {
+                let mut end = first.max(1).min(n_layers);
+                let mut width = first.max(1);
+                while end < n_layers {
+                    ends.push(end);
+                    width *= ratio.max(1);
+                    end += width;
+                }
+            }
+            ChunkPlan::Equal { layers } => {
+                let per = layers.max(1);
+                let mut end = per;
+                while end < n_layers {
+                    ends.push(end);
+                    end += per;
+                }
+            }
+        }
+        ends
+    }
+}
+
+/// The plans the step is timed on, the default first. The default was
+/// tuned on one model and holds on the larger dense files; a model whose
+/// layers are quick on the card next to their recording wants the device
+/// closer behind the host, which the smaller ratio and the equal split
+/// give it (measured: a 360M file +11% at ratio 2 and +20% in fours, a
+/// 2B +13% at ratio 2, while a 1B lost 7% at ratio 2 — and no rule read
+/// off the file told them apart).
+const CHUNK_PLANS: [ChunkPlan; 3] = [
+    ChunkPlan::Geometric { first: 2, ratio: 3 },
+    ChunkPlan::Geometric { first: 2, ratio: 2 },
+    ChunkPlan::Equal { layers: 4 },
+];
+
+/// The experiment over [`CHUNK_PLANS`] — see `step_probe`. Another plan
+/// is taken when it beats the default by 5%.
+static CHUNK_PROBE: std::sync::Mutex<crate::engine::step_probe::ArmProbe> = std::sync::Mutex::new(
+    crate::engine::step_probe::ArmProbe::new(CHUNK_PLANS.len(), 5),
+);
+
+/// Whether [`chunk_plan_forced`] answers — the plan is pinned from
+/// outside and the probe stands down.
+fn chunk_plan_pinned() -> bool {
+    static PINNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PINNED.get_or_init(|| {
+        [
+            "ORANGU_DECODE_CHUNKS",
+            "ORANGU_DECODE_FIRST_CHUNK",
+            "ORANGU_DECODE_CHUNK_RATIO",
+        ]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some())
+    })
+}
+
+/// The plan pinned from outside, if any: `ORANGU_DECODE_CHUNKS` (equal
+/// chunks, that many), `ORANGU_DECODE_FIRST_CHUNK` (`0` = equal chunks)
+/// and `ORANGU_DECODE_CHUNK_RATIO` fix the plan and stop the probe.
+fn chunk_plan_forced(n_layers: usize) -> Option<ChunkPlan> {
+    if !chunk_plan_pinned() {
+        return None;
+    }
+    static FIRST: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    static RATIO: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let first = *FIRST.get_or_init(|| {
+        std::env::var("ORANGU_DECODE_FIRST_CHUNK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    let ratio = *RATIO.get_or_init(|| {
+        std::env::var("ORANGU_DECODE_CHUNK_RATIO")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&r| r >= 1)
+    });
+    if first == Some(0) || std::env::var_os("ORANGU_DECODE_CHUNKS").is_some() {
+        let chunks = decode_submit_chunks(n_layers);
+        return Some(ChunkPlan::Equal {
+            layers: n_layers.div_ceil(chunks.max(1)),
+        });
+    }
+    if first.is_none() && ratio.is_none() {
+        return None;
+    }
+    Some(ChunkPlan::Geometric {
+        first: first.unwrap_or(2),
+        ratio: ratio.unwrap_or(3),
+    })
+}
+
 /// The layer counts after which the decode step submits what it has
 /// recorded so far — see `GemmaModel::record_decode_forward` and
 /// `LlamaModel::record_decode_run`.
@@ -4278,39 +4391,71 @@ mod scratch_ffn_cost {
 /// device runs what came before. Equal chunks (`ORANGU_DECODE_CHUNKS`)
 /// expose a third of the token's recording, which at a few
 /// microseconds a dispatch is measurable against a token of a few
-/// milliseconds. So by default the first chunk is two layers and each
+/// milliseconds. So the default plan's first chunk is two layers and each
 /// next chunk is three times the last (`ORANGU_DECODE_FIRST_CHUNK` sets
-/// the first; `0` keeps the equal split): the device starts after two
-/// layers' recording, and the submissions stay few. Two rather than one:
-/// a single-layer first submission is a burst too short for a card that
-/// has parked its clocks between requests, and a request that started
-/// that way was seen running its whole length at the parked rate; two
-/// layers never did.
+/// the first, `ORANGU_DECODE_CHUNK_RATIO` the growth; `0` keeps the equal
+/// split): the device starts after two layers' recording, and the
+/// submissions stay few. Two rather than one: a single-layer first
+/// submission is a burst too short for a card that has parked its clocks
+/// between requests, and a request that started that way was seen running
+/// its whole length at the parked rate; two layers never did.
+///
+/// Unpinned, the plan is whichever of [`CHUNK_PLANS`] the step is fastest
+/// on here, timed on the machine's own steps ([`note_decode_step`]).
 pub(crate) fn decode_chunk_ends(n_layers: usize) -> Vec<usize> {
-    static FIRST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let first = *FIRST.get_or_init(|| {
-        std::env::var("ORANGU_DECODE_FIRST_CHUNK")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(2)
+    let plan = chunk_plan_forced(n_layers).unwrap_or_else(|| {
+        CHUNK_PLANS[CHUNK_PROBE.lock().unwrap_or_else(|p| p.into_inner()).arm()]
     });
-    if first == 0 || std::env::var_os("ORANGU_DECODE_CHUNKS").is_some() {
-        let chunks = decode_submit_chunks(n_layers);
-        let per = n_layers.div_ceil(chunks.max(1));
-        return (1..chunks)
-            .map(|c| c * per)
-            .filter(|&e| e < n_layers)
-            .collect();
+    plan.ends(n_layers)
+}
+
+/// Records how long a decode step took, against the chunk plan
+/// [`decode_chunk_ends`] handed out for it. Called once per single-token
+/// step by every family that records its step in chunks; a prefill is not
+/// a step of this kind and the callers check.
+///
+/// The tail experiment (`backend::tail_prefers_host`) times the same
+/// steps; while it is timing, its arms shape the step and this one stands
+/// aside, dropping any round it had in progress.
+pub(crate) fn note_decode_step(elapsed: std::time::Duration) {
+    if chunk_plan_pinned() {
+        return;
     }
-    let mut ends = Vec::new();
-    let mut end = first.min(n_layers);
-    let mut width = first.max(1);
-    while end < n_layers {
-        ends.push(end);
-        width *= 3;
-        end += width;
+    let mut probe = CHUNK_PROBE.lock().unwrap_or_else(|p| p.into_inner());
+    if crate::engine::backend::tail_probe_is_timing() {
+        probe.pause();
+        return;
     }
-    ends
+    let noted = probe.note(elapsed);
+    drop(probe);
+    if crate::engine::env::flag_on("ORANGU_CHUNK_TRACE") {
+        use crate::engine::step_probe::{Noted, Round};
+        let print_round = |r: &Round| {
+            let arms: Vec<String> = r
+                .medians
+                .iter()
+                .zip(CHUNK_PLANS.iter())
+                .map(|(m, plan)| format!("{plan:?} {:.2} ms", *m as f64 / 1e6))
+                .collect();
+            eprintln!(
+                "orangu-server: [chunks] round {}: {} — {:?}",
+                r.number,
+                arms.join(", "),
+                CHUNK_PLANS[r.winner]
+            );
+        };
+        match &noted {
+            Noted::Nothing => {}
+            Noted::Round(r) => print_round(r),
+            Noted::Decided(r, v) => {
+                print_round(r);
+                eprintln!(
+                    "orangu-server: [chunks] rounds won {:?} — {:?}",
+                    v.wins, CHUNK_PLANS[v.arm]
+                );
+            }
+        }
+    }
 }
 
 /// How many `queue.submit()` calls one decode step's layer loop is

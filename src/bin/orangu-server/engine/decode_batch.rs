@@ -144,8 +144,17 @@ impl DecodeBatcher {
         greedy: Option<GreedySampleParams<'_>>,
         slot: usize,
     ) -> Result<ForwardOutcome> {
-        let solo =
-            |cache: &mut KvCache| model.forward_maybe_sampling(cache, &[token], pos, greedy, slot);
+        let solo = |cache: &mut KvCache| {
+            // Timed, for the chunk-plan experiment: the whole step, which is
+            // the only comparison that charges each plan for exactly what
+            // it costs.
+            let at = model.decode_step_is_chunked().then(std::time::Instant::now);
+            let outcome = model.forward_maybe_sampling(cache, &[token], pos, greedy, slot);
+            if let Some(at) = at {
+                crate::engine::arch::note_decode_step(at.elapsed());
+            }
+            outcome
+        };
         if registration.is_none() {
             return solo(cache);
         }

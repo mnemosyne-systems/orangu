@@ -3745,9 +3745,9 @@ the norms, the recurrent sub-layer (projections, conv step, delta rule,
 gated norm, fold, `ssm_out`; the state and conv history resident between
 tokens), the attention sub-layer and the dense FFN all recorded on the
 device, one readback for the head — and the kernels are ~80% of it.
-`ORANGU_BUSY_POLL=1` matters more than before, not less: one long wait a
-token lets the core clock down for the head and the sampling that
-follow. Prefill on the device is
+`ORANGU_BUSY_POLL=1` (now the default) matters more than before, not
+less: one long wait a token lets the core clock down for the head and
+the sampling that follow. Prefill on the device is
 bounded at ~150 GFLOP/s by its GEMMs, so for prompts the CPU backend is
 the faster one on this board. `doc/PERF-BONSAI.md` has the profiles, the
 numbers behind each step and the task list. On a big.LITTLE board set

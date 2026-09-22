@@ -341,7 +341,8 @@ pub(crate) fn tail_prefers_host() -> bool {
     if let Some(forced) = tail_forced() {
         return forced;
     }
-    TAIL_PROBE.lock().expect("tail probe poisoned").arm()
+    TAIL_PROBE_USED.store(true, std::sync::atomic::Ordering::Relaxed);
+    TAIL_PROBE.lock().expect("tail probe poisoned").arm() == TAIL_HOST
 }
 
 /// Records how long a decode step took, against whichever arm
@@ -353,10 +354,44 @@ pub(crate) fn note_tail_step(elapsed: std::time::Duration) {
     if tail_forced().is_some() {
         return;
     }
-    TAIL_PROBE
+    let noted = TAIL_PROBE
         .lock()
         .expect("tail probe poisoned")
         .note(elapsed);
+    if crate::engine::env::flag_on("ORANGU_TAIL_TRACE") {
+        let arm = |a: usize| if a == TAIL_HOST { "host" } else { "device" };
+        let print_round = |r: &crate::engine::step_probe::Round| {
+            eprintln!(
+                "orangu-server: [tail] round {}: device {:.1} ms vs host {:.1} ms per step — {}",
+                r.number,
+                r.medians[0] as f64 / 1e6,
+                r.medians[TAIL_HOST] as f64 / 1e6,
+                arm(r.winner)
+            );
+        };
+        match &noted {
+            crate::engine::step_probe::Noted::Nothing => {}
+            crate::engine::step_probe::Noted::Round(r) => print_round(r),
+            crate::engine::step_probe::Noted::Decided(r, v) => {
+                print_round(r);
+                eprintln!(
+                    "orangu-server: [tail] host won {} of {} rounds — {}",
+                    v.wins[TAIL_HOST],
+                    v.wins.iter().sum::<usize>(),
+                    arm(v.arm)
+                );
+            }
+        }
+    }
+}
+
+/// Whether the tail is being timed right now — its arms shape the step,
+/// and another experiment over the same steps must stand aside while
+/// they do. See `arch::note_decode_step`.
+pub(crate) fn tail_probe_is_timing() -> bool {
+    TAIL_PROBE_USED.load(std::sync::atomic::Ordering::Relaxed)
+        && tail_forced().is_none()
+        && !TAIL_PROBE.lock().expect("tail probe poisoned").is_decided()
 }
 
 /// `ORANGU_TAIL_HOST=0|1` pins the answer, for measuring one arm against the
@@ -370,106 +405,25 @@ fn tail_forced() -> Option<bool> {
     })
 }
 
-static TAIL_PROBE: std::sync::Mutex<TailProbe> = std::sync::Mutex::new(TailProbe::new());
+/// The A/B behind [`tail_prefers_host`]: arm 0 the device, arm 1 the
+/// host, the host taken only when it is 10% faster — the device answer
+/// keeps the host free and the card busy, and a near-tie is noise. The
+/// shape of the experiment (blocks, settling, rounds, windows) is
+/// `step_probe`'s, and each part of it was a wrong answer here first: arms
+/// alternating step by step let a host step park the card's clock and the
+/// device step after it was timed at the parked clock, so the host won by
+/// its own presence; one pair of blocks timed on a process's first tokens
+/// saw the device arm at twice its settled step and lost to the host one
+/// start in six, and that process then ran 40% behind for its whole window.
+static TAIL_PROBE: std::sync::Mutex<crate::engine::step_probe::ArmProbe> =
+    std::sync::Mutex::new(crate::engine::step_probe::ArmProbe::new(2, 10));
 
-/// The A/B behind [`tail_prefers_host`].
-///
-/// Each arm is timed over a **block** of consecutive steps, the device's
-/// first, rather than the two alternating step by step. Alternating was
-/// the bias that decided wrong: a host-arm step leaves the card idle while
-/// the host multiplies, the card parks its clock, and the device-arm step
-/// after it is timed at the parked clock — so the device arm lost to the
-/// host arm's own presence, on small models most of all, and the whole
-/// process then ran the host tail with the card idling between tokens.
-/// The host arm has to beat the device by a margin to be taken, and the
-/// answer is revisited every `REPROBE` steps, so one wrong call costs a
-/// window rather than the process's life.
-struct TailProbe {
-    /// The arm the current step is running, and the one [`TailProbe::note`]
-    /// will credit. Latched rather than recomputed because a single step asks
-    /// twice — once where the device-sampling path decides whether to stand
-    /// down, once where the tail is recorded — and the two must agree.
-    arm: bool,
-    /// Step times for the device arm and the host arm.
-    samples: [Vec<u64>; 2],
-    /// The answer, once both arms have enough steps to compare.
-    decided: Option<bool>,
-    /// Steps taken under the current answer.
-    settled_steps: usize,
-}
+/// The tail probe's host arm.
+const TAIL_HOST: usize = 1;
 
-impl TailProbe {
-    const fn new() -> Self {
-        Self {
-            arm: false,
-            samples: [Vec::new(), Vec::new()],
-            decided: None,
-            settled_steps: 0,
-        }
-    }
-
-    /// Steps to time per arm before deciding, past the discarded ones.
-    const TIMED: usize = 6;
-
-    /// Steps to discard per arm. The first steps on either arm pay for
-    /// whatever that path touches for the first time — a weight the device
-    /// has not uploaded, a thread pool that has not run — and for the
-    /// card's clock settling to the arm's own rhythm.
-    const WARMUP: usize = 4;
-
-    /// Steps under one answer before the arms are timed again.
-    const REPROBE: usize = 2048;
-
-    /// The host arm is taken only when it is this much faster: the device
-    /// answer keeps the host free and the card busy, and a near-tie is
-    /// noise.
-    const HOST_MARGIN_PERCENT: u64 = 10;
-
-    fn arm(&self) -> bool {
-        self.decided.unwrap_or(self.arm)
-    }
-
-    fn note(&mut self, elapsed: std::time::Duration) {
-        if self.decided.is_some() {
-            self.settled_steps += 1;
-            if self.settled_steps >= Self::REPROBE {
-                self.decided = None;
-                self.settled_steps = 0;
-                self.samples = [Vec::new(), Vec::new()];
-                self.arm = false;
-            }
-            return;
-        }
-        let side = usize::from(self.arm);
-        self.samples[side].push(elapsed.as_nanos() as u64);
-        let enough = Self::WARMUP + Self::TIMED;
-        // The device's block first, then the host's; the arm changes only
-        // when a block is complete.
-        if self.samples[side].len() >= enough {
-            self.arm = true;
-        }
-        if self.samples.iter().any(|s| s.len() < enough) {
-            return;
-        }
-        let median = |side: usize| {
-            let mut steps: Vec<u64> = self.samples[side][Self::WARMUP..].to_vec();
-            steps.sort_unstable();
-            steps[steps.len() / 2]
-        };
-        let (there, host) = (median(0), median(1));
-        let host_wins = host * 100 < there * (100 - Self::HOST_MARGIN_PERCENT);
-        self.decided = Some(host_wins);
-        self.arm = host_wins;
-        if crate::engine::env::flag_on("ORANGU_TAIL_TRACE") {
-            eprintln!(
-                "orangu-server: [tail] device {:.1} ms vs host {:.1} ms per step — {}",
-                there as f64 / 1e6,
-                host as f64 / 1e6,
-                if host_wins { "host" } else { "device" }
-            );
-        }
-    }
-}
+/// Whether anything has asked [`tail_prefers_host`] — a family that never
+/// does has no tail experiment for another to wait on.
+static TAIL_PROBE_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// [`prefers_host_matmul`] against an explicit threshold.
 ///
@@ -1024,72 +978,6 @@ mod tests {
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{GGML_TYPE_F32, GGML_TYPE_IQ1_S, GGML_TYPE_IQ4_NL, GGML_TYPE_MXFP4};
     use std::sync::Mutex;
-
-    fn ms(n: u64) -> std::time::Duration {
-        std::time::Duration::from_millis(n)
-    }
-
-    /// The device arm is timed over a block of consecutive steps before the
-    /// host arm takes any — the arms never alternate.
-    #[test]
-    fn tail_probe_times_each_arm_in_a_block() {
-        let mut probe = TailProbe::new();
-        let block = TailProbe::WARMUP + TailProbe::TIMED;
-        let mut arms = Vec::new();
-        for _ in 0..2 * block {
-            arms.push(probe.arm());
-            probe.note(ms(10));
-        }
-        assert_eq!(&arms[..block], &vec![false; block][..]);
-        assert_eq!(&arms[block..], &vec![true; block][..]);
-        assert!(probe.decided.is_some());
-    }
-
-    /// A near-tie keeps the device; the host has to win by the margin.
-    #[test]
-    fn tail_probe_needs_a_margin_to_leave_the_device() {
-        let block = TailProbe::WARMUP + TailProbe::TIMED;
-        let decide = |device_ms: u64, host_ms: u64| {
-            let mut probe = TailProbe::new();
-            for _ in 0..block {
-                probe.note(ms(device_ms));
-            }
-            for _ in 0..block {
-                probe.note(ms(host_ms));
-            }
-            probe.arm()
-        };
-        assert!(!decide(100, 95), "a 5% edge is noise");
-        assert!(decide(100, 80), "a clear host win is taken");
-        assert!(!decide(100, 120));
-    }
-
-    /// The answer is revisited: after `REPROBE` settled steps the arms are
-    /// timed again, and a different outcome replaces the old one.
-    #[test]
-    fn tail_probe_revisits_its_answer() {
-        let block = TailProbe::WARMUP + TailProbe::TIMED;
-        let mut probe = TailProbe::new();
-        for _ in 0..block {
-            probe.note(ms(100));
-        }
-        for _ in 0..block {
-            probe.note(ms(50));
-        }
-        assert!(probe.arm(), "host won the first window");
-        for _ in 0..TailProbe::REPROBE {
-            probe.note(ms(50));
-        }
-        assert!(probe.decided.is_none(), "the window is open again");
-        assert!(!probe.arm(), "and it starts on the device");
-        for _ in 0..block {
-            probe.note(ms(40));
-        }
-        for _ in 0..block {
-            probe.note(ms(50));
-        }
-        assert!(!probe.arm(), "the device won the second window");
-    }
 
     /// A `[in, out]` F32 weight of exactly `bytes` bytes, for the routing
     /// tests — only its size matters to the decision under test.

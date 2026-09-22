@@ -805,6 +805,11 @@ pub struct VulkanBackend {
     heater_pipeline: std::sync::OnceLock<wgpu::ComputePipeline>,
     /// The clock holder (`vulkan_clock`), opened on first use.
     clock_hold: std::sync::OnceLock<Option<super::vulkan_clock::ClockHold>>,
+    /// How long each kind of readback wait has been taking — see
+    /// [`WaitMode::Predicted`].
+    wait_predictor: WaitPredictor,
+    /// The shapes `ORANGU_MMQ_TRACE` has already reported.
+    mmq_traced: Mutex<HashSet<MmqShape>>,
     /// The SwiGLU twin of [`Self::gelu_mul_pipeline`], for the
     /// Llama/Qwen2/Mistral/Phi families. Same bindings and same workgroup
     /// size, so [`Self::ffn_activation_pipeline`] selects between them and
@@ -1161,15 +1166,15 @@ pub struct VulkanBackend {
     /// carries two or three types, not six, and a kernel nobody dispatches
     /// costs nothing at start-up. `None` when the integer-dot GEMMs are off
     /// (`prefill_mmq`), or `Some(empty)` before any is built.
-    mmq_bytes_pipelines: Option<Mutex<HashMap<(u32, u32), wgpu::ComputePipeline>>>,
+    mmq_bytes_pipelines: Option<Mutex<MmqPipelines<(u32, u32)>>>,
     /// [`MmqKernel::Toks`] pipelines by `(type, rows, toks)`, built on
     /// first use like the byte-unpacked ones.
-    mmq_toks_pipelines: Mutex<HashMap<(u32, u32, u32), wgpu::ComputePipeline>>,
+    mmq_toks_pipelines: Mutex<MmqPipelines<(u32, u32, u32)>>,
     /// The **indexed** form of the wide integer-dot kernels
     /// (`vulkan_shaders::shader_source_mmq_indexed`), one per wide kernel,
     /// built on first use: a stack of expert matrices against the rows
     /// routed to each, in one dispatch — see [`Self::matmul_experts`].
-    mmq_indexed_pipelines: Mutex<HashMap<MmqKernel, wgpu::ComputePipeline>>,
+    mmq_indexed_pipelines: Mutex<MmqPipelines<MmqKernel>>,
     indexed_bind_group_layout: wgpu::BindGroupLayout,
     /// Whether the integer-dot kernels keep the injected bounds clamps —
     /// see `ORANGU_CHECKED_MMQ`; a lazily built one has to know too.
@@ -2159,10 +2164,18 @@ fn expert_prefetch() -> bool {
 
 /// Whether the streaming region is given back to the card after each
 /// prompt and taken again at the next — `ORANGU_EXPERT_REGION_RELEASE`,
-/// on unless `0`. See `VulkanBackend::prompt_prefilled`.
+/// off unless set. See `VulkanBackend::prompt_prefilled`.
+///
+/// Off since the KV pool has been sized from the driver's budget with the
+/// region left out of it: the pool never needed the region's bytes, and
+/// releasing them only put the region's return at the mercy of what the
+/// card had left — which, with the pool holding its full share, was less
+/// than the region plus its headroom, so from the second prompt on every
+/// routed-expert batch ran on the host and the 26B's prefill lost the
+/// card it had been measured on.
 fn expert_region_release() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_EXPERT_REGION_RELEASE"))
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_EXPERT_REGION_RELEASE"))
 }
 
 /// What the card must have left, beyond the region itself, before the
@@ -2251,6 +2264,22 @@ fn add_norm_pair() -> bool {
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_ADD_NORM_PAIR"))
 }
 
+/// The row tile every dense integer-dot call takes, pinned
+/// (`ORANGU_MMQ_ROWS=64|128`) — `0`/unset leaves the rule in
+/// `mmq_kernel_for`. For sweeping a shape's tile in situ; a pin the shape
+/// cannot take (an `out_dim` that is not a multiple of it) falls through to
+/// the narrow kernel as an unpinned call would.
+fn mmq_rows_pinned() -> u32 {
+    static R: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *R.get_or_init(|| {
+        std::env::var("ORANGU_MMQ_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .filter(|r: &u32| [64, 128].contains(r))
+            .unwrap_or(0)
+    })
+}
+
 /// Tokens per tile of the indexed expert GEMM — `ORANGU_EXPERT_GEMM_TOKS`
 /// (16, 32, 64 or 128), default 32. See `mmq_indexed_kernel_for`.
 fn expert_gemm_toks() -> u32 {
@@ -2273,6 +2302,16 @@ fn mmq_wide_min_workgroups() -> usize {
             .unwrap_or(32)
     })
 }
+
+/// The integer-dot GEMM pipelines built on first use, by whatever names
+/// that family of kernels: `None` for one this backend's shader compiler
+/// refused, so it is asked for once and answered from here afterwards.
+type MmqPipelines<K> = HashMap<K, Option<wgpu::ComputePipeline>>;
+
+/// One shape the integer-dot GEMM has served, as `ORANGU_MMQ_TRACE` keys
+/// its report: the weight type, `in_dim`, `out_dim`, the batch width, and
+/// the tile's rows and tokens.
+type MmqShape = (u32, usize, usize, usize, u32, u32);
 
 /// A pipeline cache key's two bits for how a kernel addresses the cache —
 /// see `vulkan_shaders::KvPaging`.
@@ -2681,19 +2720,93 @@ const ATTN_SPLIT_K_DEFAULT: u32 = 8;
 // `(n_head, k_num, 1)` grid, the per-head partial-`(m,l,acc)` buffer sizes, and
 // phase-2's merge count together.
 
-/// Whether the decode-path GPU-readback wait spins (`ORANGU_BUSY_POLL`)
-/// instead of blocking. The blocking wait (`PollType::wait_indefinitely()`)
-/// parks the thread while the GPU runs, so the CPU core it was on can drop
-/// its clock or be migrated off — leaving the next token's CPU-side
-/// recording/submission to start on a cold core. A spin keeps that core at
-/// 100% utilisation (so the frequency governor holds it at its boost clock)
-/// and returns within microseconds of the GPU finishing rather than after a
-/// scheduler wake-up, at the cost of pinning one core busy for the wait.
-/// Off by default — it trades power for latency, worth it only when decode
-/// throughput is the priority.
-fn busy_poll() -> bool {
-    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *B.get_or_init(|| crate::engine::env::flag_on("ORANGU_BUSY_POLL"))
+/// How the readback wait passes the time the device needs
+/// (`ORANGU_BUSY_POLL`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WaitMode {
+    /// Block on the fence for the whole wait (`0`).
+    Block,
+    /// Spin on a non-blocking poll for the whole wait (`1`).
+    Spin,
+    /// Block for most of the wait as the last waits of the same kind
+    /// measured it, then spin through its end (`auto`).
+    Predicted,
+}
+
+/// The blocking wait (`PollType::wait_indefinitely()`) parks the thread
+/// while the device runs, so the core it was on drops into a deep idle
+/// state (hundreds of microseconds to leave, on a laptop part) or the
+/// thread is migrated off it, and the fence's completion reaches the
+/// thread through an interrupt and a scheduler wake-up — the next
+/// token's recording starts late and cold, and the card, idle between
+/// tokens for that long, is held below its top clock by its own
+/// governor. A spin returns within microseconds of the device finishing
+/// and keeps the core hot, at the price of a core busy for the whole
+/// wait; it is the default (`1`), measured on every dense model tried
+/// and level on the mixtures whose experts run on the host. `auto` blocks
+/// for most of the predicted wait and spins only through its last part,
+/// which was measured at about half the spin's gain for a quarter of its
+/// core time — the core kept awake through the wait is most of it, not
+/// the wake-up at its end. `0` blocks throughout.
+fn wait_mode() -> WaitMode {
+    static M: std::sync::OnceLock<WaitMode> = std::sync::OnceLock::new();
+    *M.get_or_init(|| match std::env::var("ORANGU_BUSY_POLL") {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "" | "0" | "false" | "off" | "no" => WaitMode::Block,
+            "auto" | "predict" | "predicted" => WaitMode::Predicted,
+            _ => WaitMode::Spin,
+        },
+        Err(_) => WaitMode::Spin,
+    })
+}
+
+/// The share of a predicted wait that [`WaitMode::Predicted`] blocks
+/// through before it starts spinning, in percent (`ORANGU_BUSY_POLL_BLOCK`,
+/// default 75). The rest, and any overrun, is spun.
+fn predicted_block_percent() -> u64 {
+    static P: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *P.get_or_init(|| {
+        std::env::var("ORANGU_BUSY_POLL_BLOCK")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|p| (0..=100).contains(p))
+            .unwrap_or(75)
+    })
+}
+
+/// The last waits of each kind, for [`WaitMode::Predicted`]: an
+/// exponential average of the wait's length in nanoseconds, keyed by the
+/// caller's context string, which names the readback (a decode token's
+/// tail, a prefill chunk's rows, an expert GEMM …) and so the population
+/// whose length repeats.
+#[derive(Default)]
+struct WaitPredictor {
+    by_context: Mutex<HashMap<String, u64>>,
+}
+
+impl WaitPredictor {
+    /// The predicted length of the next wait of `context`'s kind, if any
+    /// has been measured.
+    fn predict(&self, context: &str) -> Option<std::time::Duration> {
+        let map = self.by_context.lock().unwrap_or_else(|p| p.into_inner());
+        map.get(context)
+            .map(|&ns| std::time::Duration::from_nanos(ns))
+    }
+
+    /// Records a wait that took `took`, weighting it a quarter against
+    /// the average so far — a wait that lengthens (a deeper context) is
+    /// followed within a few tokens, one that is an outlier (a paused
+    /// process) does not stretch the next block past its fence.
+    fn record(&self, context: &str, took: std::time::Duration) {
+        let ns = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+        let mut map = self.by_context.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get_mut(context) {
+            Some(avg) => *avg = (*avg * 3 + ns) / 4,
+            None => {
+                map.insert(context.to_string(), ns);
+            }
+        }
+    }
 }
 
 /// How long [`VulkanBackend::wait_mapped`] keeps polling for a buffer's map
@@ -3029,6 +3142,33 @@ fn dump_shaders_if_requested(
     ] {
         if let Some(src) = vulkan_shaders::shader_source_coop_tiled(ggml_type, vec4_tiles) {
             shaders.push((format!("{name}_matmul_tiled_prefill.wgsl"), src));
+        }
+    }
+    // The integer-dot prefill GEMM, per type and row tile — the kernel a
+    // prefill chunk spends most of its device time in, and the one whose
+    // occupancy (shared memory and registers, which only the ISA reports)
+    // decides whether a dispatch's workgroups fill the card. The
+    // byte-unpacked types share one generator but compile to their own
+    // kernel each, so a type that is slower in situ than another at the
+    // same shape is answered here.
+    for rows in [
+        vulkan_shaders::MMQ_MID_TILE_ROWS,
+        vulkan_shaders::MMQ_WIDE_TILE_ROWS,
+    ] {
+        shaders.push((
+            format!("mmq_q4k_rows{rows}.wgsl"),
+            vulkan_shaders::shader_source_mmq_q4k_wide(rows),
+        ));
+        shaders.push((
+            format!("mmq_q6k_rows{rows}.wgsl"),
+            vulkan_shaders::shader_source_mmq_q6k_wide(rows),
+        ));
+        for &ggml_type in vulkan_shaders::mmq_wide_bytes_types() {
+            let name = orangu::gguf::ggml_type_name(ggml_type).to_lowercase();
+            shaders.push((
+                format!("mmq_bytes_{name}_rows{rows}.wgsl"),
+                vulkan_shaders::shader_source_mmq_wide_bytes(ggml_type, rows),
+            ));
         }
     }
     // The GQA prefill kernel is generated per (head_dim, group), and its
@@ -5437,6 +5577,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             moe_combine_pipeline,
             heater_pipeline: std::sync::OnceLock::new(),
             clock_hold: std::sync::OnceLock::new(),
+            wait_predictor: WaitPredictor::default(),
+            mmq_traced: Mutex::new(HashSet::new()),
             silu_mul_pipeline,
             sigmoid_gate_pipeline,
             bias_add_pipeline,
@@ -6633,6 +6775,32 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         }
     }
 
+    /// The byte stride a weight's rows take **on the device**, which is its own
+    /// row length unless that length is a multiple of 512, in which case one
+    /// 256-byte gap is added per row.
+    ///
+    /// A row's start address decides which memory channel serves it, and the
+    /// integer-dot GEMM stages 64 rows of one column slice at a time: 64
+    /// addresses one stride apart, issued together. When the stride is an even
+    /// multiple of the 256-byte interleave those addresses walk only half the
+    /// channels — measured at `[512 × 12288] × [12288 × 1536]`, where `Q4_1`
+    /// (stride 7680 = 512·15) took 7.4 ms against `Q4_0`'s 4.7 (6912 = 256·27)
+    /// and `Q8_0`'s 5.1 (13056 = 256·51) for the same work, and at `in_dim`
+    /// 8192, where `Q8_0`'s 8704 = 512·17 halved its own rate against the same
+    /// kernel at 12288. One gap per row moves the stride to an odd multiple of
+    /// 256 and the addresses back across every channel.
+    ///
+    /// The padding is never read: every kernel addresses a row through this
+    /// same stride and stops at the row's real bytes. It costs one 256-byte gap
+    /// per row — 1.5% of a 12288-wide `Q4_1` row, less of anything wider.
+    pub(crate) fn device_row_stride(row_bytes: usize) -> usize {
+        if row_bytes != 0 && row_bytes.is_multiple_of(512) {
+            row_bytes + 256
+        } else {
+            row_bytes
+        }
+    }
+
     /// Uploads a tensor's raw bytes, padding the *copy* out to
     /// `COPY_BUFFER_ALIGNMENT`.
     ///
@@ -6675,6 +6843,28 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             tail[..bytes.len() - head].copy_from_slice(&bytes[head..]);
             self.queue.write_buffer(buffer, offset + head as u64, &tail);
         }
+    }
+
+    /// [`Self::write_weight_bytes`] for a tensor whose device rows are
+    /// farther apart than the file's (`Self::device_row_stride`): one copy
+    /// per row, into a scratch laid out at the device stride so the upload
+    /// is still one `write_buffer` per piece rather than one per row.
+    ///
+    /// The gap bytes are written as zeros and never read.
+    fn write_weight_rows(
+        &self,
+        buffer: &wgpu::Buffer,
+        offset: u64,
+        w: &QuantMatrix,
+        stride: usize,
+    ) {
+        let row_bytes = w.row_bytes();
+        let bytes = w.raw_bytes();
+        let mut staged = vec![0u8; stride * w.out_dim];
+        for (row, dst) in staged.chunks_exact_mut(stride).enumerate() {
+            dst[..row_bytes].copy_from_slice(&bytes[row * row_bytes..(row + 1) * row_bytes]);
+        }
+        self.write_weight_bytes(buffer, offset, &staged);
     }
 
     /// Drops every cached weight upload and returns the device memory.
@@ -6721,6 +6911,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         let (waddr, wlen) = w.cache_key();
         let bytes = w.raw_bytes();
         let key = (waddr, wlen, w.ggml_type(), bytes.len());
+        // The device's own row stride, which the padded types do not share
+        // with the file's (`Self::device_row_stride`).
+        let stride = Self::device_row_stride(w.row_bytes());
+        let padded = stride != w.row_bytes();
         let mut arena = self.weight_cache.lock().expect("weight cache poisoned");
         if let Some(&(chunk, offset, size)) = arena.slots.get(&key) {
             return (arena.chunks[chunk].clone(), offset, size);
@@ -6732,14 +6926,22 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // Inside a range already placed — a member of a pair placed as one
         // (`QuantMatrix::adjacent_pair`): bound as a sub-range of it rather
         // than uploaded again, when the device can bind at that offset.
-        let within = arena
-            .slots
-            .iter()
-            .find_map(|(&(addr, len, ty, _), &(chunk, offset, _))| {
-                let sub = (ty == w.ggml_type() && addr <= waddr && waddr + wlen <= addr + len)
-                    .then(|| offset + (waddr - addr) as u64)?;
-                sub.is_multiple_of(align).then_some((chunk, sub))
-            });
+        // A padded tensor's rows are not where the file put them, so an
+        // offset into an already-placed range would land in the wrong row:
+        // it is placed on its own.
+        let within = (!padded)
+            .then(|| {
+                arena
+                    .slots
+                    .iter()
+                    .find_map(|(&(addr, len, ty, _), &(chunk, offset, _))| {
+                        let sub =
+                            (ty == w.ggml_type() && addr <= waddr && waddr + wlen <= addr + len)
+                                .then(|| offset + (waddr - addr) as u64)?;
+                        sub.is_multiple_of(align).then_some((chunk, sub))
+                    })
+            })
+            .flatten();
         if let Some((chunk, offset)) = within {
             let size = (bytes.len() as u64).next_multiple_of(16);
             arena.slots.insert(key, (chunk, offset, size));
@@ -6764,7 +6966,11 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // own real byte range — it only needs to exist so the bound
         // region's *allocated* size covers both binding types' alignment
         // requirements.
-        let size = (bytes.len() as u64).next_multiple_of(16);
+        let size = if padded {
+            (stride * w.out_dim) as u64
+        } else {
+            (bytes.len() as u64).next_multiple_of(16)
+        };
 
         let chunk_index = match arena
             .fill
@@ -6815,7 +7021,11 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         };
 
         let offset = arena.fill[chunk_index].1.next_multiple_of(align);
-        self.write_weight_bytes(&arena.chunks[chunk_index], offset, bytes);
+        if padded {
+            self.write_weight_rows(&arena.chunks[chunk_index], offset, w, stride);
+        } else {
+            self.write_weight_bytes(&arena.chunks[chunk_index], offset, bytes);
+        }
         arena.fill[chunk_index].1 = offset + size;
         arena.placed_bytes += size;
         if arena
@@ -7004,7 +7214,7 @@ impl VulkanBackend {
             in_dim: in_dim as u32,
             out_dim: out_dim as u32,
             n_tokens: n_tokens as u32,
-            row_bytes: w.row_bytes() as u32,
+            row_bytes: Self::device_row_stride(w.row_bytes()) as u32,
         };
         let meta_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("orangu-server mmvq meta"),
@@ -7196,7 +7406,7 @@ impl VulkanBackend {
                         *w,
                         entries
                             .iter()
-                            .map(|e| e.lock().expect("op cache entry poisoned"))
+                            .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()))
                             .collect(),
                     )
                 })
@@ -7389,7 +7599,7 @@ impl VulkanBackend {
         };
         let _region_guard = self.prefill_region_guard();
         let entry = self.op_entry_streamed(&op, 0, ROLE_BATCH, false);
-        let guard = entry.lock().expect("op cache entry poisoned");
+        let guard = entry.lock().unwrap_or_else(|p| p.into_inner());
         self.queue
             .write_buffer(&guard.x_buffer, guard.x_offset, bytemuck::cast_slice(x));
         let us = self.dispatch_kernel_us(pipeline, &guard.bind_group, guard.workgroups, reps)?;
@@ -7625,9 +7835,9 @@ impl VulkanBackend {
             );
         }
 
-        let mut guards: Vec<MutexGuard<'_, CachedOpResources>> = entries
+        let guards: Vec<MutexGuard<'_, CachedOpResources>> = entries
             .iter()
-            .map(|entry| entry.lock().expect("op cache entry poisoned"))
+            .map(|entry| entry.lock().unwrap_or_else(|p| p.into_inner()))
             .collect();
 
         // Every real call site batches independent projections of *one* input
@@ -7753,23 +7963,27 @@ impl VulkanBackend {
         }
         // Every op in this batch is actually read back (this is the
         // CPU-orchestrated path — unlike `record_full_matmul`'s GPU-
-        // resident callers, every result here has to reach the CPU), so
-        // `ensure_readback_buffer` allocates one for each; still lazy in
-        // principle (skips it for every *other* caller), just never
-        // skipped here.
-        for guard in guards.iter_mut() {
-            let output_buffer = guard.output_buffer.clone();
-            let output_offset = guard.output_offset;
-            let output_len = guard.output_len;
-            let readback_buffer = self.ensure_readback_buffer(guard).clone();
-            encoder.copy_buffer_to_buffer(
-                &output_buffer,
-                output_offset,
-                &readback_buffer,
-                0,
-                output_len,
-            );
-        }
+        // resident callers, every result here has to reach the CPU). The
+        // staging comes from the bounded readback pool, not from the
+        // entry: an entry is keyed by its width, a prompt's tail chunk has
+        // whatever width the sizer left it, and a readback kept per entry
+        // was a buffer per (weight, width) for the process — 3.3 GiB in
+        // three thousand of them after two prompts on a hybrid model,
+        // most of it paged off the card.
+        let readbacks: Vec<wgpu::Buffer> = guards
+            .iter()
+            .map(|guard| {
+                let readback_buffer = self.take_readback(guard.output_len);
+                encoder.copy_buffer_to_buffer(
+                    &guard.output_buffer,
+                    guard.output_offset,
+                    &readback_buffer,
+                    0,
+                    guard.output_len,
+                );
+                readback_buffer
+            })
+            .collect();
         self.queue.submit(Some(encoder.finish()));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7782,11 +7996,8 @@ impl VulkanBackend {
         // single `check` after that poll covers every buffer in the batch.
         const CONTEXT: &str = "reading back a matmul batch";
         let wait = MapWait::new();
-        for guard in &guards {
-            guard
-                .readback_buffer
-                .as_ref()
-                .expect("ensured above")
+        for readback_buffer in &readbacks {
+            readback_buffer
                 .slice(..)
                 .map_async(wgpu::MapMode::Read, wait.callback());
         }
@@ -7798,18 +8009,13 @@ impl VulkanBackend {
         let t_copy = std::time::Instant::now();
         let out: Vec<Vec<f32>> = guards
             .iter()
-            .map(|guard| {
-                let data = self.mapped_bytes(
-                    guard.readback_buffer.as_ref().expect("ensured above"),
-                    CONTEXT,
-                );
+            .zip(readbacks)
+            .map(|(guard, readback_buffer)| {
+                let data = self.mapped_bytes(&readback_buffer, CONTEXT);
                 let result: Vec<f32> = bytemuck::cast_slice(&data).to_vec();
                 drop(data);
-                guard
-                    .readback_buffer
-                    .as_ref()
-                    .expect("ensured above")
-                    .unmap();
+                readback_buffer.unmap();
+                self.put_readback(guard.output_len, readback_buffer);
                 result
             })
             .collect();
@@ -8419,7 +8625,7 @@ impl VulkanBackend {
                 // The entry outlives the region its weights sat in last call.
                 // Follow the move; the borrow ends before the caller takes its
                 // own guard.
-                self.rebind_weight(&mut entry.lock().expect("op cache entry poisoned"), weight);
+                self.rebind_weight(&mut entry.lock().unwrap_or_else(|p| p.into_inner()), weight);
             }
             return entry;
         }
@@ -8441,7 +8647,10 @@ impl VulkanBackend {
             // shape-keyed entry is a different tensor, not an equivalent copy.
             // Rebinding here is what makes the race benign; it costs nothing
             // when this thread's own entry is the one that landed.
-            self.rebind_weight(&mut stored.lock().expect("op cache entry poisoned"), weight);
+            self.rebind_weight(
+                &mut stored.lock().unwrap_or_else(|p| p.into_inner()),
+                weight,
+            );
         }
         stored
     }
@@ -8638,8 +8847,18 @@ impl VulkanBackend {
         // streamed`, which needs the region to decide whether an existing
         // entry can be rebound rather than rebuilt); everything else takes
         // the permanent arena.
+        // The streaming region places a weight's rows as the file has them;
+        // only the permanent arena pads the stride
+        // (`Self::device_row_stride`), so the meta's stride follows which of
+        // the two this op is bound to.
+        let streamed = streamed_weight.is_some();
         let (weight_chunk, weight_offset, weight_size) =
             streamed_weight.unwrap_or_else(|| self.weight_buffer(w));
+        let row_stride = if streamed {
+            w.row_bytes()
+        } else {
+            Self::device_row_stride(w.row_bytes())
+        };
 
         // `x_buffer`/`output_buffer` are placed in `Self::x_arena`/
         // `Self::output_arena` — see `ScratchArena`'s own doc comment for
@@ -8696,7 +8915,7 @@ impl VulkanBackend {
             in_dim: in_dim as u32,
             out_dim: out_dim as u32,
             n_tokens: n_tokens as u32,
-            row_bytes: w.row_bytes() as u32,
+            row_bytes: row_stride as u32,
         };
         // Meta is write-once (its dims are fixed for this cache key's whole
         // life), so it lives in the shared uniform arena — one BO for every
@@ -10322,8 +10541,25 @@ impl VulkanBackend {
     /// weight whose shape fits the kernel's tiles (see
     /// `vulkan_shaders::shader_source_mmq_q4k`), with the kernel built.
     fn mmq_for(&self, w: &QuantMatrix, n_tokens: usize) -> bool {
+        // The `Q4_K`/`Q6_K` kernels walk whole super-blocks; the
+        // byte-unpacked ones walk 32-element sub-blocks two at a time and
+        // take any row that is whole sub-block pairs — the rule the expert
+        // GEMM already applies (`serves_experts`). A 960-wide row had no
+        // integer-dot kernel on the dense path at all, which put every
+        // projection of a small model but its `down` on the float kernel.
+        // Only the 32-element block types can have such a row at all: a
+        // 256-block type's row is whole super-blocks by construction.
+        let small_blocks = vulkan_shaders::mmq_wide_bytes_types().contains(&w.ggml_type())
+            && crate::engine::quant::block_layout(w.ggml_type())
+                .is_some_and(|(_, elems)| elems == 32);
+        let row_fits = if small_blocks {
+            w.in_dim
+                .is_multiple_of(32 * vulkan_shaders::MMQ_WIDE_KS as usize)
+        } else {
+            w.in_dim.is_multiple_of(256)
+        };
         !MMQ_OFF_ON_THIS_THREAD.with(|c| c.get())
-            && w.in_dim.is_multiple_of(256)
+            && row_fits
             && w.out_dim
                 .is_multiple_of(vulkan_shaders::MMQ_TILE_ROWS as usize)
             && n_tokens >= vulkan_shaders::MMQ_Q4K_TILE_TOKENS as usize
@@ -10372,7 +10608,15 @@ impl VulkanBackend {
         // ones) the half tile was 1.4× faster on `Q6_K` and level on `Q4_K`.
         let floor = mmq_wide_min_workgroups();
         let toks = Self::mmq_toks_for(n_tokens);
+        // `ORANGU_MMQ_ROWS=64|128` pins the row tile for a sweep, the twin
+        // of `ORANGU_MMQ_TOKS`: the two together fix the whole tile, so a
+        // shape's geometry can be measured in situ rather than only in the
+        // probe.
+        let rows_pinned = mmq_rows_pinned();
         for (kernel, min) in [(wide, 2 * floor), (mid, floor)] {
+            if rows_pinned != 0 && kernel.tile().0 != rows_pinned {
+                continue;
+            }
             let (rows, full) = kernel.tile();
             let workgroups = (w.out_dim / rows as usize) * n_tokens.div_ceil(toks as usize);
             if w.out_dim.is_multiple_of(rows as usize)
@@ -10412,16 +10656,14 @@ impl VulkanBackend {
             MmqKernel::Bytes { ggml_type, rows } => {
                 let table = self.mmq_bytes_pipelines.as_ref()?;
                 let mut table = table.lock().unwrap_or_else(|p| p.into_inner());
-                Some(
-                    table
-                        .entry((ggml_type, rows))
-                        .or_insert_with(|| {
-                            self.build_mmq_pipeline_lazily(
-                                vulkan_shaders::shader_source_mmq_wide_bytes(ggml_type, rows),
-                            )
-                        })
-                        .clone(),
-                )
+                table
+                    .entry((ggml_type, rows))
+                    .or_insert_with(|| {
+                        self.build_mmq_pipeline_lazily(
+                            vulkan_shaders::shader_source_mmq_wide_bytes(ggml_type, rows),
+                        )
+                    })
+                    .clone()
             }
             MmqKernel::Toks {
                 ggml_type,
@@ -10433,25 +10675,21 @@ impl VulkanBackend {
                     .mmq_toks_pipelines
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
-                Some(
-                    table
-                        .entry((ggml_type, rows, toks))
-                        .or_insert_with(|| {
-                            let source = match ggml_type {
-                                GGML_TYPE_Q4_K => {
-                                    vulkan_shaders::shader_source_mmq_q4k_wide_toks(rows, toks)
-                                }
-                                GGML_TYPE_Q6_K => {
-                                    vulkan_shaders::shader_source_mmq_q6k_wide_toks(rows, toks)
-                                }
-                                t => {
-                                    vulkan_shaders::shader_source_mmq_wide_bytes_toks(t, rows, toks)
-                                }
-                            };
-                            self.build_mmq_pipeline_lazily(source)
-                        })
-                        .clone(),
-                )
+                table
+                    .entry((ggml_type, rows, toks))
+                    .or_insert_with(|| {
+                        let source = match ggml_type {
+                            GGML_TYPE_Q4_K => {
+                                vulkan_shaders::shader_source_mmq_q4k_wide_toks(rows, toks)
+                            }
+                            GGML_TYPE_Q6_K => {
+                                vulkan_shaders::shader_source_mmq_q6k_wide_toks(rows, toks)
+                            }
+                            t => vulkan_shaders::shader_source_mmq_wide_bytes_toks(t, rows, toks),
+                        };
+                        self.build_mmq_pipeline_lazily(source)
+                    })
+                    .clone()
             }
         }
     }
@@ -10490,7 +10728,7 @@ impl VulkanBackend {
     /// start-up: the matmul bind-group layout, and the integer-dot kernels'
     /// unchecked indexing unless `ORANGU_CHECKED_MMQ` asked for the clamps
     /// (the argument is in `new`, beside the start-up builder).
-    fn build_mmq_pipeline_lazily(&self, source: String) -> wgpu::ComputePipeline {
+    fn build_mmq_pipeline_lazily(&self, source: String) -> Option<wgpu::ComputePipeline> {
         self.build_mmq_pipeline_lazily_on(source, &self.bind_group_layout)
     }
 
@@ -10500,7 +10738,15 @@ impl VulkanBackend {
         &self,
         source: String,
         bind_group_layout: &wgpu::BindGroupLayout,
-    ) -> wgpu::ComputePipeline {
+    ) -> Option<wgpu::ComputePipeline> {
+        // Under an error scope, because this is the one pipeline built on
+        // **first use** rather than at startup: a shader the platform's
+        // compiler refuses would otherwise reach `wgpu`'s default handler,
+        // which panics — on a request, in the middle of a prefill, taking
+        // the op-cache lock with it. Reported and refused instead, so the
+        // caller falls back to the float kernel and the request is answered.
+        // An `M2 Max` refused the byte-unpacked GEMM this way.
+        let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let desc = wgpu::ShaderModuleDescriptor {
             label: Some("orangu-server integer-dot GEMM shader"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -10521,7 +10767,8 @@ impl VulkanBackend {
                 bind_group_layouts: &[Some(bind_group_layout)],
                 immediate_size: 0,
             });
-        self.device
+        let pipeline = self
+            .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("orangu-server integer-dot GEMM pipeline"),
                 layout: Some(&layout),
@@ -10529,7 +10776,20 @@ impl VulkanBackend {
                 entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: None,
-            })
+            });
+        match pollster::block_on(scope.pop()) {
+            None => Some(pipeline),
+            Some(err) => {
+                // Once per process per kernel: the caller asks again for
+                // every op of that shape, and a refusal that printed each
+                // time would bury the answer it is reporting.
+                eprintln!(
+                    "orangu-server: [vulkan] this backend's shader compiler refused an \
+                     integer-dot GEMM kernel; those matmuls take the float kernel instead. {err}"
+                );
+                None
+            }
+        }
     }
 
     /// The indexed integer-dot kernel for a stack of expert matrices of
@@ -10590,17 +10850,15 @@ impl VulkanBackend {
             .mmq_indexed_pipelines
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        Some(
-            table
-                .entry(kernel)
-                .or_insert_with(|| {
-                    self.build_mmq_pipeline_lazily_on(
-                        vulkan_shaders::shader_source_mmq_indexed(source),
-                        &self.indexed_bind_group_layout,
-                    )
-                })
-                .clone(),
-        )
+        table
+            .entry(kernel)
+            .or_insert_with(|| {
+                self.build_mmq_pipeline_lazily_on(
+                    vulkan_shaders::shader_source_mmq_indexed(source),
+                    &self.indexed_bind_group_layout,
+                )
+            })
+            .clone()
     }
 
     /// Whether [`Self::matmul_experts`] can run these projections: every
@@ -11658,16 +11916,28 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         if declined {
             return false;
         }
-        let device = self.device_in_use();
-        let fits = match (device.vram_total_bytes, device.vram_used_bytes()) {
-            (Some(total), Some(used)) => {
-                total.saturating_sub(used) >= bytes + stream_region_headroom_bytes()
+        // The driver's budget for this process, the figure the KV pool was
+        // sized against with the region left out of it — not the card's raw
+        // used bytes, which count other tenants the budget already excludes
+        // and refused a region the pool had made room for.
+        let fits = match self.device_local_budget() {
+            Some((budget, usage)) => {
+                budget.saturating_sub(usage) >= bytes + stream_region_headroom_bytes()
             }
-            _ => true,
+            None => {
+                let device = self.device_in_use();
+                match (device.vram_total_bytes, device.vram_used_bytes()) {
+                    (Some(total), Some(used)) => {
+                        total.saturating_sub(used) >= bytes + stream_region_headroom_bytes()
+                    }
+                    _ => true,
+                }
+            }
         };
         if !fits {
             log::info!(
-                "orangu-server: [vulkan] the expert streaming region ({}) does not fit what the                  card has left; this prompt's routed experts run on the host",
+                "orangu-server: [vulkan] the expert streaming region ({}) does not fit what the \
+                 card has left; this prompt's routed experts run on the host",
                 orangu::format::format_bytes(bytes)
             );
             self.stream_region.lock().expect("stream region poisoned").1 = true;
@@ -11711,7 +11981,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .retain(|_, entry| {
                 entry
                     .lock()
-                    .expect("op cache entry poisoned")
+                    .unwrap_or_else(|p| p.into_inner())
                     .weight_binding
                     .0
                     != arena.buffer
@@ -11877,6 +12147,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             (entry.n_tokens as u32).div_ceil(toks),
             1,
         );
+        // `ORANGU_MMQ_TRACE=1`: one line per distinct shape the integer-dot
+        // GEMM serves, naming the kernel it picked and the grid — the answer
+        // to "which kernel is this op actually running", which a device
+        // timestamp alone cannot give.
+        if crate::engine::env::flag_on("ORANGU_MMQ_TRACE") {
+            let key: MmqShape = (
+                w.ggml_type(),
+                w.in_dim,
+                w.out_dim,
+                entry.n_tokens,
+                rows,
+                toks,
+            );
+            let mut seen = self.mmq_traced.lock().unwrap_or_else(|p| p.into_inner());
+            if seen.insert(key) {
+                eprintln!(
+                    "orangu-server: [mmq] {} [{} x {}] x {} tokens -> {kernel:?}, grid {}x{}",
+                    orangu::gguf::ggml_type_name(w.ggml_type()),
+                    w.in_dim,
+                    w.out_dim,
+                    entry.n_tokens,
+                    grid.0,
+                    grid.1,
+                );
+            }
+        }
         (bg, grid, kernel)
     }
 
@@ -11922,7 +12218,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .collect();
         let guards: Vec<_> = entries
             .iter()
-            .map(|e| e.lock().expect("op cache entry poisoned"))
+            .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()))
             .collect();
         let guard = &guards[0];
         let x_buf = self.upload_new(x);
@@ -12047,7 +12343,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             w: wq,
         };
         let q_entry = self.op_entry_at(&q_op, 0, ROLE_ATTN_QKV);
-        let q_g = q_entry.lock().expect("op cache entry poisoned");
+        let q_g = q_entry.lock().unwrap_or_else(|p| p.into_inner());
         let kv_entries = input.kv.as_ref().map(|proj| {
             let k_entry = self.op_entry_at(
                 &MatmulOp {
@@ -12074,9 +12370,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let kv_guards = kv_entries.as_ref().map(|(proj, k, v)| {
             (
                 *proj,
-                k.lock().expect("op cache entry poisoned"),
+                k.lock().unwrap_or_else(|p| p.into_inner()),
                 v.as_ref()
-                    .map(|v| v.lock().expect("op cache entry poisoned")),
+                    .map(|v| v.lock().unwrap_or_else(|p| p.into_inner())),
             )
         });
 
@@ -12169,7 +12465,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // attention chain below locks them itself.
             {
                 let sq = self.op_entry_for(wq, slot);
-                let sq_g = sq.lock().expect("op cache entry poisoned");
+                let sq_g = sq.lock().unwrap_or_else(|p| p.into_inner());
                 encoder.copy_buffer_to_buffer(
                     &q_rows,
                     (i * q_dim) as u64 * 4,
@@ -12179,7 +12475,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 );
                 if let (Some((proj, ..)), Some((k_rows, v_rows))) = (&kv_guards, &kv_rows) {
                     let sk = self.op_entry_for(proj.wk, slot);
-                    let sk_g = sk.lock().expect("op cache entry poisoned");
+                    let sk_g = sk.lock().unwrap_or_else(|p| p.into_inner());
                     encoder.copy_buffer_to_buffer(
                         k_rows,
                         (i * kv_dim) as u64 * 4,
@@ -12189,7 +12485,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     );
                     if let (Some(wv), Some(v_rows)) = (proj.wv, v_rows) {
                         let sv = self.op_entry_for(wv, slot);
-                        let sv_g = sv.lock().expect("op cache entry poisoned");
+                        let sv_g = sv.lock().unwrap_or_else(|p| p.into_inner());
                         encoder.copy_buffer_to_buffer(
                             v_rows,
                             (i * kv_dim) as u64 * 4,
@@ -12262,6 +12558,68 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         Some(out)
     }
 
+    /// Builds every integer-dot GEMM pipeline this backend can build, and
+    /// answers how many — for the test that runs on each platform's own
+    /// backend.
+    ///
+    /// A kernel is written once in WGSL and translated per backend, so one
+    /// that every other platform accepts can still be refused by this one's
+    /// shader compiler. Only a real device of that backend finds out, and
+    /// the refusal arrives on a request rather than at startup because these
+    /// pipelines are built on first use.
+    #[cfg(test)]
+    pub(crate) fn build_every_mmq_pipeline_for_test(&self) -> usize {
+        let mut built = 0;
+        for rows in [
+            vulkan_shaders::MMQ_TILE_ROWS,
+            vulkan_shaders::MMQ_MID_TILE_ROWS,
+            vulkan_shaders::MMQ_WIDE_TILE_ROWS,
+        ] {
+            for &ggml_type in vulkan_shaders::mmq_wide_bytes_types() {
+                built += usize::from(
+                    self.mmq_pipeline(MmqKernel::Bytes { ggml_type, rows })
+                        .is_some(),
+                );
+                for toks in [16, 32, 64, 128] {
+                    built += usize::from(
+                        self.mmq_pipeline(MmqKernel::Toks {
+                            ggml_type,
+                            rows,
+                            toks,
+                        })
+                        .is_some(),
+                    );
+                }
+            }
+            for ggml_type in [
+                crate::engine::quant::GGML_TYPE_Q4_K,
+                crate::engine::quant::GGML_TYPE_Q6_K,
+            ] {
+                for toks in [16, 32, 64, 128] {
+                    built += usize::from(
+                        self.mmq_pipeline(MmqKernel::Toks {
+                            ggml_type,
+                            rows,
+                            toks,
+                        })
+                        .is_some(),
+                    );
+                }
+            }
+        }
+        for kernel in [
+            MmqKernel::Q4k,
+            MmqKernel::Q4kMid,
+            MmqKernel::Q4kWide,
+            MmqKernel::Q6k,
+            MmqKernel::Q6kMid,
+            MmqKernel::Q6kWide,
+        ] {
+            built += usize::from(self.mmq_pipeline(kernel).is_some());
+        }
+        built
+    }
+
     /// The integer-dot GEMM on its own — `x` rows in, `[n_tokens, out_dim]`
     /// out — for the cross-check tests and the probe. `None` where the
     /// kernel does not serve the shape.
@@ -12278,7 +12636,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let op = MatmulOp { x, n_tokens, w };
         let _region_guard = self.prefill_region_guard();
         let entry = self.op_entry_streamed(&op, 0, ROLE_BATCH, false);
-        let guard = entry.lock().expect("op cache entry poisoned");
+        let guard = entry.lock().unwrap_or_else(|p| p.into_inner());
         let x_buf = self.upload_new(x);
         let (q8, qbg, qwg, _qmeta) = self.mmq_stage(BindSrc::Whole(&x_buf), n_tokens, w.in_dim);
         let (bg, grid, kernel) = self.mmq_op(w, &guard, &q8);
@@ -12628,25 +12986,76 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// one wait sufficed and tripped intermittently under exactly that
     /// contention.)
     ///
-    /// The blocking path parks the thread on `PollType::Wait`; the
-    /// `ORANGU_BUSY_POLL` path spins on non-blocking `PollType::Poll` to keep
-    /// the calling core hot (see [`busy_poll`]). Either way the loop is
+    /// The blocking path parks the thread on `PollType::Wait`; the spinning
+    /// path polls non-blocking `PollType::Poll` to keep the calling core
+    /// hot, and the default does the first for most of the wait and the
+    /// second for its end (see [`wait_mode`]). Either way the loop is
     /// bounded by [`READBACK_WAIT_TIMEOUT`], and every way out that isn't a
     /// completed map — a failed map, a failed poll, or that deadline —
     /// reports a lost device through [`crate::device_lost::fail`] rather
     /// than hanging the request forever.
     fn wait_mapped(&self, wait: &MapWait, context: &str) {
-        let spin = busy_poll();
-        let deadline = std::time::Instant::now() + READBACK_WAIT_TIMEOUT;
+        let mode = wait_mode();
+        let started = std::time::Instant::now();
+        let deadline = started + READBACK_WAIT_TIMEOUT;
+        // Under `Predicted`, the moment the block gives way to the spin:
+        // most of the last waits' length. Before the first wait of a kind
+        // has been measured there is nothing to block through, and the
+        // whole wait spins — one token's core time, then the average.
+        let spin_from = match mode {
+            WaitMode::Block => None,
+            WaitMode::Spin => Some(started),
+            WaitMode::Predicted => Some(
+                started
+                    + self
+                        .wait_predictor
+                        .predict(context)
+                        .map_or(std::time::Duration::ZERO, |d| {
+                            d * u32::try_from(predicted_block_percent()).unwrap_or(75) / 100
+                        }),
+            ),
+        };
+        let trace = crate::engine::env::flag_on("ORANGU_WAIT_TRACE");
+        let (mut blocks, mut polls, mut blocked) = (0u32, 0u32, std::time::Duration::ZERO);
         loop {
-            let poll_type = if spin {
-                wgpu::PollType::Poll
-            } else {
-                wgpu::PollType::wait_indefinitely()
+            let now = std::time::Instant::now();
+            let spin = spin_from.is_some_and(|from| now >= from);
+            let poll_type = match spin_from {
+                _ if spin => wgpu::PollType::Poll,
+                // A bounded block: to the spin's start, never past it.
+                Some(from) => wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(from - now),
+                },
+                None => wgpu::PollType::wait_indefinitely(),
             };
-            self.poll_blocking_with(poll_type, context);
+            self.poll_until(poll_type, context);
+            if trace {
+                if spin {
+                    polls += 1;
+                } else {
+                    blocks += 1;
+                    blocked += now.elapsed();
+                }
+            }
             wait.check(context);
             if wait.is_done() {
+                if mode == WaitMode::Predicted {
+                    self.wait_predictor.record(context, started.elapsed());
+                }
+                if trace {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .is_multiple_of(32)
+                    {
+                        eprintln!(
+                            "orangu-server: [wait] {context}: {:.3}ms total, predicted {:?}, blocked {:.3}ms in {blocks}, {polls} polls",
+                            started.elapsed().as_secs_f64() * 1e3,
+                            spin_from.map(|f| f.saturating_duration_since(started)),
+                            blocked.as_secs_f64() * 1e3,
+                        );
+                    }
+                }
                 return;
             }
             if std::time::Instant::now() >= deadline {
@@ -12665,6 +13074,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 // yield so a co-scheduled poller isn't starved between passes.
                 std::thread::yield_now();
             }
+        }
+    }
+
+    /// [`Self::poll_blocking_with`] for a wait that may carry a timeout:
+    /// running out of it is the caller's cue to poll again, not a lost
+    /// device.
+    fn poll_until(&self, poll_type: wgpu::PollType, context: &str) {
+        match self.device.poll(poll_type) {
+            Ok(_) | Err(wgpu::PollError::Timeout) => {}
+            Err(err) => crate::device_lost::fail(context, err),
         }
     }
 
@@ -12706,7 +13125,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     /// [`Self::poll_blocking`] with the poll mode chosen by the caller —
-    /// [`Self::wait_mapped`]'s busy-poll path needs `PollType::Poll`.
+    /// a staging map's spin needs `PollType::Poll`.
     fn poll_blocking_with(&self, poll_type: wgpu::PollType, context: &str) {
         if let Err(err) = self.device.poll(poll_type) {
             crate::device_lost::fail(context, err);
@@ -14240,17 +14659,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             )
         });
 
-        let wo_g = wo_entry.lock().expect("op cache entry poisoned");
+        let wo_g = wo_entry.lock().unwrap_or_else(|p| p.into_inner());
         let gate_up_g = gate_up_entry
             .as_ref()
-            .map(|e| e.lock().expect("op cache entry poisoned"));
-        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
-        let up_g = up_entry.lock().expect("op cache entry poisoned");
-        let down_g = down_entry.lock().expect("op cache entry poisoned");
+            .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()));
+        let gate_g = gate_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let up_g = up_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let down_g = down_entry.lock().unwrap_or_else(|p| p.into_inner());
         let ple_g = ple_entries.as_ref().map(|(g, p)| {
             (
-                g.lock().expect("op cache entry poisoned"),
-                p.lock().expect("op cache entry poisoned"),
+                g.lock().unwrap_or_else(|p| p.into_inner()),
+                p.lock().unwrap_or_else(|p| p.into_inner()),
             )
         });
         let ple_g_refs = ple_g.as_ref().map(|(g, p)| (&**g, &**p));
@@ -15338,7 +15757,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         );
         // The tail's bind groups, once per (layer, output buffer).
         let wo_entry = self.op_entry_for(wo, batch_slot);
-        let wo_g = wo_entry.lock().expect("op cache entry poisoned");
+        let wo_g = wo_entry.lock().unwrap_or_else(|p| p.into_inner());
         let tail = {
             let key = (wo.cache_key(), out_buf.clone(), rotation_key(o_rotation));
             let mut cache = self
@@ -15437,9 +15856,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_FFN);
         let up_entry = self.op_entry_at(&up_op, 0, ROLE_FFN + 1);
         let down_entry = self.op_entry_at(&down_op, 0, ROLE_FFN + 2);
-        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
-        let up_g = up_entry.lock().expect("op cache entry poisoned");
-        let down_g = down_entry.lock().expect("op cache entry poisoned");
+        let gate_g = gate_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let up_g = up_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let down_g = down_entry.lock().unwrap_or_else(|p| p.into_inner());
         let bgs = {
             let key = (
                 gate.cache_key(),
@@ -16027,7 +16446,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     ) -> (wgpu::Buffer, u64, usize) {
         let res = tok.res.clone();
         let entry = self.op_entry_for(w, 0);
-        let g = entry.lock().expect("op cache entry poisoned");
+        let g = entry.lock().unwrap_or_else(|p| p.into_inner());
         let (float_bg, q8_bg) = {
             let mut bgs = res
                 .head_bind_groups
@@ -16412,10 +16831,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let gate_entry = self.op_entry_for(wgate, batch_slot);
         let beta_entry = self.op_entry_for(wbeta, batch_slot);
         let alpha_entry = self.op_entry_for(walpha, batch_slot);
-        let qkv_g = qkv_entry.lock().expect("op cache entry poisoned");
-        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
-        let beta_g = beta_entry.lock().expect("op cache entry poisoned");
-        let alpha_g = alpha_entry.lock().expect("op cache entry poisoned");
+        let qkv_g = qkv_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let gate_g = gate_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let beta_g = beta_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let alpha_g = alpha_entry.lock().unwrap_or_else(|p| p.into_inner());
         let normed_src = |dst: &wgpu::Buffer,
                           dst_offset: u64,
                           encoder: &mut wgpu::CommandEncoder| {
@@ -16838,7 +17257,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             cache
                 .entry(key)
                 .or_insert_with(|| {
-                    let g = entry.lock().expect("op cache entry poisoned");
+                    let g = entry.lock().unwrap_or_else(|p| p.into_inner());
                     let tail_bytes = (out_len as u64) * 4;
                     let tail_off = (layout.tail_off() as u64) * 4;
                     Arc::new(MirrorBindGroups {
@@ -16913,7 +17332,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.queue
             .write_buffer(&core.res.meta, 0, bytemuck::bytes_of(&meta));
         let tail_off = (l.tail_off() as u64) * 4;
-        let g = core.entry.lock().expect("op cache entry poisoned");
+        let g = core.entry.lock().unwrap_or_else(|p| p.into_inner());
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("orangu-server recurrent delta pass"),
             timestamp_writes: None,
@@ -16952,7 +17371,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// The recorded step's output region, with the state marked current on
     /// the device — for a caller that submits later.
     fn finish_recurrent_recorded(&self, core: RecurrentPrepared<'_>) -> (wgpu::Buffer, u64, usize) {
-        let g = core.entry.lock().expect("op cache entry poisoned");
+        let g = core.entry.lock().unwrap_or_else(|p| p.into_inner());
         *core.fresh = crate::engine::kv_cache::Fresh::Device;
         (g.output_buffer.clone(), g.output_offset, core.n_embd)
     }
@@ -17273,9 +17692,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_FFN);
         let up_entry = self.op_entry_at(&up_op, 0, ROLE_FFN + 1);
         let down_entry = self.op_entry_at(&down_op, 0, ROLE_FFN + 2);
-        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
-        let up_g = up_entry.lock().expect("op cache entry poisoned");
-        let down_g = down_entry.lock().expect("op cache entry poisoned");
+        let gate_g = gate_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let up_g = up_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let down_g = down_entry.lock().unwrap_or_else(|p| p.into_inner());
         let t1 = std::time::Instant::now();
 
         self.queue
@@ -17935,7 +18354,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // pooled-region slot (see `pooled_regions`).
         let _region_guard = self.prefill_region_guard();
         let q_entry = self.op_entry_at(&q_op, 0, ROLE_ATTN_QKV);
-        let q_g = q_entry.lock().expect("op cache entry poisoned");
+        let q_g = q_entry.lock().unwrap_or_else(|p| p.into_inner());
 
         let kv_entries = kv.as_ref().map(|proj| {
             let k_entry = self.op_entry_at(
@@ -17961,10 +18380,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             (k_entry, v_entry)
         });
         let kv_guards = kv_entries.as_ref().map(|(k_entry, v_entry)| {
-            let k_g = k_entry.lock().expect("op cache entry poisoned");
+            let k_g = k_entry.lock().unwrap_or_else(|p| p.into_inner());
             let v_g = v_entry
                 .as_ref()
-                .map(|e| e.lock().expect("op cache entry poisoned"));
+                .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()));
             (k_g, v_g)
         });
         // The attention gate's projection, live beside Q/K/V in the same
@@ -17982,7 +18401,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         });
         let gate_g = gate_entry
             .as_ref()
-            .map(|e| e.lock().expect("op cache entry poisoned"));
+            .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()));
 
         let ff_buf = self.upload_new(ff);
         // Projection biases, applied before anything reads the projections.
@@ -18936,10 +19355,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_POST_ATTN + 1);
         let up_entry = self.op_entry_at(&up_op, 0, ROLE_POST_ATTN + 2);
         let down_entry = self.op_entry_at(&down_op, 0, ROLE_POST_ATTN + 3);
-        let wo_g = wo_entry.lock().expect("op cache entry poisoned");
-        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
-        let up_g = up_entry.lock().expect("op cache entry poisoned");
-        let down_g = down_entry.lock().expect("op cache entry poisoned");
+        let wo_g = wo_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let gate_g = gate_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let up_g = up_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let down_g = down_entry.lock().unwrap_or_else(|p| p.into_inner());
         let entry_ms = t_entry.ms();
 
         let t_upload = TraceClock::start();
@@ -19323,11 +19742,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let gate_entry = self.op_entry_at(&empty(gate), 0, ROLE_MOE_HEAD + 2);
         let up_entry = self.op_entry_at(&empty(up), 0, ROLE_MOE_HEAD + 3);
         let down_entry = self.op_entry_at(&empty(down), 0, ROLE_MOE_HEAD + 4);
-        let wo_g = wo_entry.lock().expect("op cache entry poisoned");
-        let router_g = router_entry.lock().expect("op cache entry poisoned");
-        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
-        let up_g = up_entry.lock().expect("op cache entry poisoned");
-        let down_g = down_entry.lock().expect("op cache entry poisoned");
+        let wo_g = wo_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let router_g = router_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let gate_g = gate_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let up_g = up_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let down_g = down_entry.lock().unwrap_or_else(|p| p.into_inner());
 
         if let AttnOutSrc::Host(a) = attn_out {
             self.queue
@@ -19633,7 +20052,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         };
         let _region_guard = self.prefill_region_guard();
         let entry = self.op_entry_streamed(&op, 0, ROLE_BATCH, false);
-        let g = entry.lock().expect("op cache entry poisoned");
+        let g = entry.lock().unwrap_or_else(|p| p.into_inner());
         // Fresh buffers, not pooled regions: a `write_buffer` lands at the
         // submission's start, and inside a group that is before the earlier
         // chains' dispatches — safe only for memory nothing else reads.
@@ -19815,8 +20234,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let _region_guard = self.prefill_region_guard();
         let gate_entry = self.op_entry_at(&gate_op, 0, ROLE_PLE);
         let proj_entry = self.op_entry_at(&proj_op, 0, ROLE_PLE + 1);
-        let gate_g = gate_entry.lock().expect("op cache entry poisoned");
-        let proj_g = proj_entry.lock().expect("op cache entry poisoned");
+        let gate_g = gate_entry.lock().unwrap_or_else(|p| p.into_inner());
+        let proj_g = proj_entry.lock().unwrap_or_else(|p| p.into_inner());
         let entry_ms = t_bind.ms();
 
         let t_upload = TraceClock::start();
@@ -21353,13 +21772,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .and_then(|p| p.wv)
             .map(|w| self.op_entry_for(w, input.batch_slot));
 
-        let wq_g = wq_entry.lock().expect("op cache entry poisoned");
+        let wq_g = wq_entry.lock().unwrap_or_else(|p| p.into_inner());
         let wk_g = wk_entry
             .as_ref()
-            .map(|e| e.lock().expect("op cache entry poisoned"));
+            .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()));
         let wv_g = wv_entry
             .as_ref()
-            .map(|e| e.lock().expect("op cache entry poisoned"));
+            .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()));
 
         // When the Q/K/V matmuls read `normed` directly (shared-input,
         // built in the cached layer resources on the non-MMVQ GPU path), skip
@@ -21379,7 +21798,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .map(|w| self.op_entry_for(w, input.batch_slot));
         let gate_g = gate_entry
             .as_ref()
-            .map(|e| e.lock().expect("op cache entry poisoned"));
+            .map(|e| e.lock().unwrap_or_else(|p| p.into_inner()));
 
         let layer = self.fused_attn_layer_entry_for(
             &input,
@@ -23210,7 +23629,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         batch_slot: usize,
     ) -> (wgpu::Buffer, u64) {
         let entry = self.op_entry_for(w, batch_slot);
-        let g = entry.lock().expect("op cache entry poisoned");
+        let g = entry.lock().unwrap_or_else(|p| p.into_inner());
         self.upload_or_copy(encoder, &g.x_buffer, g.x_offset, x, w.in_dim);
         if self.mmvq_chain() {
             let mut qpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -23332,7 +23751,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let fine = *FINE.get_or_init(|| std::env::var("ORANGU_CPU_TIMESTAMPS").is_ok());
 
         let entry = self.op_entry_for(w, batch_slot);
-        let mut g = entry.lock().expect("op cache entry poisoned");
+        let mut g = entry.lock().unwrap_or_else(|p| p.into_inner());
         let output_buffer = g.output_buffer.clone();
         let output_offset = g.output_offset;
         let output_len = g.output_len;
@@ -23955,7 +24374,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         debug_assert_eq!(gathered.len(), total);
 
         let proj_entry = self.op_entry_for(proj_w, batch_slot);
-        let proj_g = proj_entry.lock().expect("op cache entry poisoned");
+        let proj_g = proj_entry.lock().unwrap_or_else(|p| p.into_inner());
         self.upload_or_copy(encoder, &proj_g.x_buffer, proj_g.x_offset, x, proj_w.in_dim);
 
         let res = {
@@ -25459,7 +25878,7 @@ impl VulkanBackend {
     /// through orangu's own arena buffers.
     pub(crate) fn test_op_buffers(&self, w: &QuantMatrix) -> OpCaptureBuffers {
         let entry = self.op_entry_for(w, 0);
-        let g = entry.lock().expect("op cache entry poisoned");
+        let g = entry.lock().unwrap_or_else(|p| p.into_inner());
         OpCaptureBuffers {
             x_buffer: g.x_buffer.clone(),
             x_offset: g.x_offset,

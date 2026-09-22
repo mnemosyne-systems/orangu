@@ -104,17 +104,8 @@ tree-sitter-java = "0.23.5"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-typescript = "0.23.2"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system", "component"] }
-# `loop_controls` is `{% break %}` / `{% continue %}`, which minijinja gates
-# behind a feature (it is not in its default set) and real chat templates use:
-# GLM-5.3-Flash breaks out of a scan over `messages` as soon as it has seen a
-# duplicate tool-call id. Without it the template does not *parse*, so every
-# chat request against such a model fails outright — and on a plain
-# `/v1/completions`, which applies no template, the same model answers fine.
 minijinja = { version = "2.24", features = ["loop_controls"] }
 minijinja-contrib = { version = "2.24", features = ["pycompat"] }
-# Corpus sources `orangu-gguf` reads that are not Git repositories: bzip2
-# for the Wikipedia dumps and `.tar.bz2`, flate2 for `.tar.gz`, tar for
-# what is inside both. The bzip2 backend is the pure-Rust one.
 bzip2 = "0.6.1"
 flate2 = "1.1"
 tar = "0.4"
@@ -134,9 +125,6 @@ ratatui = "0.30.2"
 ansi-to-tui = "8.0.1"
 unicode-width = "0.2.2"
 if-addrs = "0.15.0"
-# `dlopen` for the NPU inventory probe in `npu`: the vendor NOE driver ships
-# with a board BSP, lives off the default loader path, and is absent from
-# nearly every machine, so it is resolved at runtime rather than linked.
 libloading = "0.9"
 fern = "0.7"
 log = "0.4"
@@ -149,6 +137,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+naga = { version = "30.0.1", features = ["wgsl-in", "msl-out"] }
 
 [profile.release-with-debug]
 inherits = "release"

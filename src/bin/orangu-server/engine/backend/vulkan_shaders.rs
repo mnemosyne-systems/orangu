@@ -6893,7 +6893,7 @@ fn main(
                     .collect::<Vec<_>>()
                     .join(" + ");
                 src.push_str(&format!(
-                    "            a{cr}_{t} = a{cr}_{t} + fma(sc{cr} * d, f32({dot}), -mn{cr} * dq);\n"
+                    "            {{ a{cr}_{t} = a{cr}_{t} + fma(sc{cr} * d, f32({dot}), -mn{cr} * dq); }}\n"
                 ));
             }
             src.push_str("            }\n");
@@ -7156,7 +7156,7 @@ fn main(
                     .collect::<Vec<_>>()
                     .join(" + ");
                 src.push_str(&format!(
-                    "            a{cr}_{t} = a{cr}_{t} + fma(s{cr}a, fma(d, f32({dlo}), -lo), s{cr}b * fma(d, f32({dhi}), -hi));\n"
+                    "            {{ a{cr}_{t} = a{cr}_{t} + fma(s{cr}a, fma(d, f32({dlo}), -lo), s{cr}b * fma(d, f32({dhi}), -hi)); }}\n"
                 ));
             }
             src.push_str("            }\n");
@@ -7769,7 +7769,7 @@ fn main(
                         .collect::<Vec<_>>()
                         .join(" + ");
                     src.push_str(&format!(
-                        "            a{cr}_{t} = a{cr}_{t} + fma(sa{cr} * d, f32({lo}), sb{cr} * dqlo) + fma(sc{cr} * d, f32({hi}), sd{cr} * dqhi);\n"
+                        "            {{ a{cr}_{t} = a{cr}_{t} + fma(sa{cr} * d, f32({lo}), sb{cr} * dqlo) + fma(sc{cr} * d, f32({hi}), sd{cr} * dqhi); }}\n"
                     ));
                 }
             } else {
@@ -7782,7 +7782,7 @@ fn main(
                         .collect::<Vec<_>>()
                         .join(" + ");
                     src.push_str(&format!(
-                        "            a{cr}_{t} = a{cr}_{t} + fma(sa{cr} * d, f32({dot}), sb{cr} * dq);\n"
+                        "            {{ a{cr}_{t} = a{cr}_{t} + fma(sa{cr} * d, f32({dot}), sb{cr} * dq); }}\n"
                     ));
                 }
             }
@@ -16567,5 +16567,190 @@ mod iq_grid_offset_tests {
         }
         // And the packing really is that long, so the last table is whole.
         assert_eq!(packed::words().len(), packed::WORDS);
+    }
+}
+
+/// **Every generated kernel, translated to Metal.**
+///
+/// The kernels are written once in WGSL and translated per backend by the
+/// same library `wgpu` uses, so a kernel that is valid WGSL and valid SPIR-V
+/// can still be rejected by the Metal compiler — and on a machine without a
+/// Metal device nothing here would ever notice. These tests run the
+/// translation itself, which needs no GPU at all.
+#[cfg(test)]
+mod msl_tests {
+    use super::*;
+
+    /// The `dot4I8Packed` polyfill the Metal backend writes: one
+    /// `packed_char4 <name> = as_type<packed_char4>(arg);` per call, named
+    /// after the **argument**. Two calls on the same argument in one block
+    /// therefore declare the same name twice, which the Metal compiler
+    /// rejects as a redefinition — while WGSL, SPIR-V and every test on a
+    /// non-Apple machine are perfectly happy.
+    ///
+    /// Reported from an `M2 Max`: the integer-dot GEMM failed to compile and
+    /// took the request with it. A kernel's accumulate statements each sit in
+    /// their own block for this reason; this test is what keeps them there.
+    fn msl_of(label: &str, wgsl: &str) -> String {
+        let module = naga::front::wgsl::parse_str(wgsl)
+            .unwrap_or_else(|e| panic!("{label}: not valid WGSL: {e:?}"));
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("{label}: did not validate: {e:?}"));
+        let mut out = String::new();
+        // Metal 2.4, which is what this project's own Apple machines report
+        // and what `wgpu` then asks for. The version matters: below 2.1 the
+        // backend expands `dot4I8Packed` inline, and at or above it writes a
+        // `packed_char4` temporary per call — the form that collides.
+        let options = naga::back::msl::Options {
+            lang_version: (2, 4),
+            ..naga::back::msl::Options::default()
+        };
+        let pipeline = naga::back::msl::PipelineOptions::default();
+        let mut writer = naga::back::msl::Writer::new(&mut out);
+        writer
+            .write(&module, &info, &options, &pipeline)
+            .unwrap_or_else(|e| panic!("{label}: no Metal translation: {e:?}"));
+        out
+    }
+
+    /// The names declared twice **in one scope** in `msl`, with the lines
+    /// they were declared on.
+    ///
+    /// Scope matters and is the whole point: the backend derives these names
+    /// from an expression, so two statements that share an argument get the
+    /// same name. In sibling blocks that is ordinary shadowing and Metal
+    /// accepts it; in one block it is a redefinition and Metal refuses the
+    /// kernel.
+    fn redeclared(msl: &str) -> Vec<(String, Vec<usize>)> {
+        let mut clashes: Vec<(String, Vec<usize>)> = Vec::new();
+        let mut scopes: Vec<std::collections::HashMap<String, usize>> = vec![Default::default()];
+        for (n, line) in msl.lines().enumerate() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("packed_char4 ")
+                && let Some(name) = rest.split_whitespace().next()
+                && let Some(scope) = scopes.last_mut()
+                && let Some(first) = scope.insert(name.to_string(), n + 1)
+            {
+                clashes.push((name.to_string(), vec![first, n + 1]));
+            }
+            for c in trimmed.chars() {
+                match c {
+                    '{' => scopes.push(Default::default()),
+                    '}' => {
+                        scopes.pop();
+                        if scopes.is_empty() {
+                            scopes.push(Default::default());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        clashes
+    }
+
+    /// The check above, on what the backend writes either way: two
+    /// declarations in one block are the defect, the same two in sibling
+    /// blocks are not. Without this the check passed on a kernel Metal
+    /// rejects, which is how the defect reached a user.
+    #[test]
+    fn the_redefinition_check_reads_scopes() {
+        let same_block = "\
+fn() {
+    packed_char4 reinterpreted_packed_char4_e1 = as_type<packed_char4>(q0);
+    a = dot(...);
+    packed_char4 reinterpreted_packed_char4_e1 = as_type<packed_char4>(q0);
+    b = dot(...);
+}";
+        assert_eq!(
+            redeclared(same_block)
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            ["reinterpreted_packed_char4_e1"],
+        );
+        let sibling_blocks = "\
+fn() {
+    {
+        packed_char4 reinterpreted_packed_char4_e1 = as_type<packed_char4>(q0);
+        a = dot(...);
+    }
+    {
+        packed_char4 reinterpreted_packed_char4_e1 = as_type<packed_char4>(q0);
+        b = dot(...);
+    }
+}";
+        assert!(redeclared(sibling_blocks).is_empty());
+    }
+
+    /// Writes the Metal translation of one kernel to
+    /// `ORANGU_MSL_OUT=<path>` — for reading what the backend actually
+    /// emitted, next to the WGSL `ORANGU_DUMP_SHADERS` writes.
+    #[test]
+    #[ignore]
+    fn dump_one_kernel_as_metal() {
+        let Ok(path) = std::env::var("ORANGU_MSL_OUT") else {
+            eprintln!("set ORANGU_MSL_OUT=<path> and ORANGU_MSL_TYPE=<ggml type>");
+            return;
+        };
+        let ggml_type: u32 = std::env::var("ORANGU_MSL_TYPE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(crate::engine::quant::GGML_TYPE_Q8_0);
+        let src = shader_source_mmq_wide_bytes(ggml_type, MMQ_MID_TILE_ROWS);
+        std::fs::write(&path, msl_of("dump", &src)).expect("write the translation");
+        eprintln!("wrote {path}");
+    }
+
+    /// Writes the Metal translation of the `Q4_K` wide kernel to
+    /// `ORANGU_MSL_OUT2`.
+    #[test]
+    #[ignore]
+    fn dump_q4k_as_metal() {
+        let Ok(path) = std::env::var("ORANGU_MSL_OUT2") else {
+            return;
+        };
+        let src = shader_source_mmq_q4k_wide(MMQ_MID_TILE_ROWS);
+        std::fs::write(&path, msl_of("q4k", &src)).expect("write the translation");
+    }
+
+    /// The integer-dot prefill GEMM, per type and row tile: the kernel the
+    /// Metal compiler rejected.
+    #[test]
+    fn the_integer_dot_gemm_translates_to_metal() {
+        for rows in [MMQ_MID_TILE_ROWS, MMQ_WIDE_TILE_ROWS] {
+            let mut sources = vec![
+                (
+                    format!("mmq_q4k_rows{rows}"),
+                    shader_source_mmq_q4k_wide(rows),
+                ),
+                (
+                    format!("mmq_q6k_rows{rows}"),
+                    shader_source_mmq_q6k_wide(rows),
+                ),
+            ];
+            for &ggml_type in mmq_wide_bytes_types() {
+                sources.push((
+                    format!("mmq_bytes_{ggml_type}_rows{rows}"),
+                    shader_source_mmq_wide_bytes(ggml_type, rows),
+                ));
+            }
+            for (label, wgsl) in sources {
+                let msl = msl_of(&label, &wgsl);
+                let clashes = redeclared(&msl);
+                assert!(
+                    clashes.is_empty(),
+                    "{label}: Metal would reject these redefinitions: {:?}",
+                    clashes
+                        .iter()
+                        .map(|(n, at)| format!("{n} at {at:?}"))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 }

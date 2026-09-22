@@ -3573,6 +3573,7 @@ dependencies = [
  "mime_guess",
  "minijinja",
  "minijinja-contrib",
+ "naga",
  "opencl3",
  "pdf-extract",
  "petgraph 0.8.3",
