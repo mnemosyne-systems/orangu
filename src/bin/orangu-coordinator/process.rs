@@ -1178,6 +1178,36 @@ pub(crate) fn fake_server_script(body: &str) -> PathBuf {
     path
 }
 
+/// Spawns one of these scripts, waiting out a kernel that still considers
+/// the file to be open for writing.
+///
+/// A test binary is many threads and every `Command::spawn` forks the lot of
+/// them: a child forked while this script was still being written inherits a
+/// duplicate of that write descriptor and keeps it until it execs, and an
+/// `exec` of the file during that window fails with `ETXTBSY` however
+/// carefully the writing thread closed its own handle. `O_CLOEXEC` does not
+/// close it either — it closes at `exec`, which is the far end of the
+/// window. So it is a race against whatever else the suite is doing, not a
+/// broken script, and the answer is to try again rather than to report it.
+/// Seen once on a CI runner and not on this project's own machines, which is
+/// the shape of a race that is scheduling-dependent.
+#[cfg(test)]
+pub(crate) fn spawn_fake_server(path: &Path) -> std::process::Child {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match std::process::Command::new(path).spawn() {
+            Ok(child) => return child,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(e) => panic!("spawning {}: {e}", path.display()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1754,7 +1784,7 @@ mod tests {
         let incumbent_bin = fake_server_script("sleep 30");
         let renamed = incumbent_bin.with_file_name("orangu-server");
         std::fs::rename(&incumbent_bin, &renamed).unwrap();
-        let mut incumbent = std::process::Command::new(&renamed).spawn().unwrap();
+        let mut incumbent = spawn_fake_server(&renamed);
         let pid = incumbent.id();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

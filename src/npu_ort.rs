@@ -146,6 +146,17 @@
 //! has, and it is why a GGUF K-quant (a scale per 32-256 element block)
 //! cannot be handed over unchanged.
 
+// **Off a Unix, every item below is unreachable, and that is the design.**
+// The provider ships as ELF shared objects opened by absolute path with
+// flags only the dynamic loader defines, so `NpuOrt::open` answers `None`
+// there and nothing constructs the API table, reads its slots or calls
+// through it. The bindings are still compiled: one description of the
+// runtime's interface that every platform's build type-checks beats a
+// second one behind a `cfg`, kept in step by hand. Scoped to the platform
+// where it is true, so a genuinely dead item on Linux or macOS is still a
+// lint error there.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::ffi::{CStr, CString, c_char, c_void};
 
 #[cfg(unix)]
