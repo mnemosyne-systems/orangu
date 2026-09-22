@@ -482,15 +482,7 @@ impl ProcessMetrics {
             ("process_seconds".to_string(), cpu_seconds.to_string()),
             ("logical_cores".to_string(), self.logical_cores.to_string()),
         ];
-        // `sysinfo` reports zeros for the load average on Windows, so it
-        // reports nothing there rather than three convincing-looking zeros.
-        #[cfg(not(target_os = "windows"))]
-        {
-            let load = System::load_average();
-            cpu.push(("load1".to_string(), load.one.to_string()));
-            cpu.push(("load5".to_string(), load.five.to_string()));
-            cpu.push(("load15".to_string(), load.fifteen.to_string()));
-        }
+        cpu.extend(load_average_stats());
         labelled_gauge(
             &mut out,
             "orangu_server_cpu",
@@ -611,6 +603,31 @@ fn escape_label(value: &str) -> String {
         }
     }
     out
+}
+
+/// The host's one-, five- and fifteen-minute load averages, or nothing where
+/// the platform has none.
+///
+/// `sysinfo` answers zeros on Windows rather than failing, so reporting them
+/// would put three convincing-looking numbers on a scrape that mean nothing.
+/// A platform difference in one place, and a value the caller always has to
+/// append, so the `cpu` list is built the same way everywhere — a `cfg` block
+/// that pushed into it left the binding unused on Windows, which is a lint
+/// error there and invisible on any other machine.
+fn load_average_stats() -> Vec<(String, String)> {
+    #[cfg(target_os = "windows")]
+    {
+        Vec::new()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let load = System::load_average();
+        vec![
+            ("load1".to_string(), load.one.to_string()),
+            ("load5".to_string(), load.five.to_string()),
+            ("load15".to_string(), load.fifteen.to_string()),
+        ]
+    }
 }
 
 #[cfg(test)]
