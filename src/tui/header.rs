@@ -210,6 +210,8 @@ pub fn help_text() -> &'static str {
 /get_comments -i <number>|-p <number>           List comments on a GitHub/GitLab issue or pull request with gh/glab
 /grep <pattern>                                 Search the workspace with git grep
 /graph                                          Write an HTML visualization of the codebase Knowledge Graph
+/graph explain <symbol>                         Explain a graph symbol, its degree, community, and evidence-tagged connections
+/graph path <source> <target> [--undirected]    Show the shortest graph path; directional unless --undirected is supplied
 /issue <reviewer|assignee|label> <number> <value> Add a reviewer, assignee, or label to a GitHub/GitLab issue or pull request
 /init_repo                                      Initialize a Git repository in the workspace
 /log [number]                                   Show commit log (optionally the latest number of commits) plus a count of uncommitted/untracked changes

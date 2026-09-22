@@ -648,6 +648,10 @@ pub enum LocalCommand<'a> {
     /// landing a reviewed pull request. Only the prompt's own suggestions
     /// change; every command stays available in both (see [`crate::mode`]).
     Mode(crate::mode::PromptMode),
+    /// `/graph explain <symbol>`: explain one graph node and its evidence.
+    GraphExplain(Cow<'a, str>),
+    /// `/graph path <source> <target> [--undirected]`: trace a shortest path.
+    GraphPath(Cow<'a, str>, Cow<'a, str>, bool),
     Graph,
 }
 

@@ -181,7 +181,7 @@ complete -c orangu -s i -l init                                           -d 'In
 complete -c orangu -s s -l shell-completions                              -d 'Print shell completion script for the detected shell and exit'
 complete -c orangu -s h -l help                                           -d 'Print help'
 complete -c orangu -s V -l version                                        -d 'Print version'
-complete -c orangu -f -a 'status pause resume clear'                      -d 'Manage the saved workflow loops'
+complete -c orangu -f -a 'status pause resume clear'                      -d 'Manage workflow loops'
 "#;
 
 pub const POWERSHELL: &str = r#"# PowerShell completion for orangu

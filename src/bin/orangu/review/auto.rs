@@ -4480,6 +4480,7 @@ mod tests {
             target: "a::changed".to_string(),
             relation: "calls".to_string(),
             confidence: Confidence::Extracted,
+            source_location: "L2".to_string(),
         });
         let store = std::sync::Mutex::new(Some(graph));
         let workspace = std::path::Path::new("/repo");

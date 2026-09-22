@@ -18,7 +18,7 @@ use petgraph::graph::NodeIndex;
 use petgraph::stable_graph::StableDiGraph;
 use petgraph::visit::{EdgeRef, IntoEdgeReferences};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::extract::{Confidence, ExtractedEdge, ExtractedNode};
 
@@ -35,6 +35,7 @@ pub struct GraphNode {
 pub struct GraphEdge {
     pub relation: String,
     pub confidence: Confidence,
+    pub source_location: String,
 }
 
 /// The central in-memory knowledge graph.
@@ -123,6 +124,7 @@ impl GraphStore {
                     GraphEdge {
                         relation: edge.relation,
                         confidence: edge.confidence,
+                        source_location: edge.source_location,
                     },
                 );
             }
@@ -200,6 +202,258 @@ impl GraphStore {
     /// A cycle in a dependency/call graph signals a circular dependency.
     pub fn has_cycles(&self) -> bool {
         is_cyclic_directed(&self.graph)
+    }
+
+    /// Explain one unambiguous symbol with the same evidence kept on the graph
+    /// edges. Exact id/label matches win; prefix and substring matches are only
+    /// used when no exact match exists. Ties are reported instead of choosing a
+    /// random same-named symbol from another file.
+    pub fn explain(&self, symbol: &str) -> Result<GraphExplanation, String> {
+        let idx = self.resolve_node(symbol)?;
+        let (callers, callees) = self.neighbours(idx);
+        let mut connections = Vec::with_capacity(callers.len() + callees.len());
+        connections.extend(callers.into_iter().map(|edge| GraphConnection {
+            direction: ConnectionDirection::Incoming,
+            edge,
+        }));
+        connections.extend(callees.into_iter().map(|edge| GraphConnection {
+            direction: ConnectionDirection::Outgoing,
+            edge,
+        }));
+        connections.sort_by(|a, b| {
+            self.node_degree_by_id(&b.edge.node_id)
+                .cmp(&self.node_degree_by_id(&a.edge.node_id))
+                .then_with(|| a.edge.node_label.cmp(&b.edge.node_label))
+        });
+
+        Ok(GraphExplanation {
+            node: self.graph[idx].clone(),
+            community: self.community_for(idx),
+            degree: connections.len(),
+            connections,
+        })
+    }
+
+    /// Find the shortest relationship path between two unambiguous symbols.
+    /// Traversal follows call/import direction by default; `undirected` is for
+    /// architectural discovery where callers and callees are equally useful.
+    pub fn shortest_path(
+        &self,
+        source: &str,
+        target: &str,
+        undirected: bool,
+        max_hops: usize,
+    ) -> Result<GraphPath, String> {
+        let start = self.resolve_node(source)?;
+        let goal = self.resolve_node(target)?;
+        if start == goal {
+            return Err(format!(
+                "\"{source}\" and \"{target}\" resolve to the same node; use a more specific symbol or id"
+            ));
+        }
+
+        let mut queue = VecDeque::from([start]);
+        let mut visited = HashSet::from([start]);
+        let mut previous: HashMap<NodeIndex, NodeIndex> = HashMap::new();
+
+        while let Some(current) = queue.pop_front() {
+            let neighbours: Vec<NodeIndex> = if undirected {
+                self.graph.neighbors_undirected(current).collect()
+            } else {
+                self.graph
+                    .neighbors_directed(current, petgraph::Direction::Outgoing)
+                    .collect()
+            };
+            for next in neighbours {
+                if visited.insert(next) {
+                    previous.insert(next, current);
+                    if next == goal {
+                        queue.clear();
+                        break;
+                    }
+                    queue.push_back(next);
+                }
+            }
+        }
+
+        if !visited.contains(&goal) {
+            let direction = if undirected { "" } else { "directed " };
+            return Err(format!(
+                "No {direction}path found between \"{source}\" and \"{target}\".{}",
+                if undirected {
+                    String::new()
+                } else {
+                    " Try again with undirected=true to ignore relationship direction.".to_string()
+                }
+            ));
+        }
+
+        let mut nodes = vec![goal];
+        let mut cursor = goal;
+        while let Some(&parent) = previous.get(&cursor) {
+            nodes.push(parent);
+            cursor = parent;
+        }
+        nodes.reverse();
+        let hops = nodes.len() - 1;
+        if hops > max_hops {
+            return Err(format!(
+                "Path exceeds max_hops={max_hops} ({hops} hops found)."
+            ));
+        }
+
+        let mut path_hops = Vec::with_capacity(hops);
+        for pair in nodes.windows(2) {
+            let from = pair[0];
+            let to = pair[1];
+            let (edge, forward) = self.path_edge(from, to).ok_or_else(|| {
+                "graph traversal selected nodes without a relationship edge".to_string()
+            })?;
+            path_hops.push(GraphPathHop {
+                from: self.graph[from].clone(),
+                to: self.graph[to].clone(),
+                relation: edge.relation.clone(),
+                confidence: edge.confidence.clone(),
+                source_location: edge.source_location.clone(),
+                forward,
+            });
+        }
+
+        Ok(GraphPath { path_hops })
+    }
+
+    fn resolve_node(&self, symbol: &str) -> Result<NodeIndex, String> {
+        let needle = symbol.trim().to_lowercase();
+        if needle.is_empty() {
+            return Err("symbol must not be empty".to_string());
+        }
+        let indices: Vec<NodeIndex> = self.graph.node_indices().collect();
+        let tiers = [
+            indices
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    let node = &self.graph[idx];
+                    node.id.eq_ignore_ascii_case(symbol) || node.label.eq_ignore_ascii_case(symbol)
+                })
+                .collect::<Vec<_>>(),
+            indices
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    let node = &self.graph[idx];
+                    node.id.to_lowercase().starts_with(&needle)
+                        || node.label.to_lowercase().starts_with(&needle)
+                })
+                .collect::<Vec<_>>(),
+            indices
+                .iter()
+                .copied()
+                .filter(|&idx| {
+                    let node = &self.graph[idx];
+                    node.id.to_lowercase().contains(&needle)
+                        || node.label.to_lowercase().contains(&needle)
+                })
+                .collect::<Vec<_>>(),
+        ];
+        let matches = tiers
+            .into_iter()
+            .find(|tier| !tier.is_empty())
+            .ok_or_else(|| {
+                format!("No node matching \"{symbol}\" found in the Knowledge Graph.")
+            })?;
+        if matches.len() == 1 {
+            return Ok(matches[0]);
+        }
+        let mut candidates: Vec<String> = matches
+            .iter()
+            .map(|&idx| {
+                let node = &self.graph[idx];
+                format!("{} ({})", node.id, node.source_file)
+            })
+            .collect();
+        candidates.sort();
+        Err(format!(
+            "Ambiguous symbol \"{symbol}\"; use an exact id. Candidates: {}",
+            candidates.join(", ")
+        ))
+    }
+
+    fn path_edge(&self, from: NodeIndex, to: NodeIndex) -> Option<(&GraphEdge, bool)> {
+        let mut forward: Vec<&GraphEdge> = self
+            .graph
+            .edges_directed(from, petgraph::Direction::Outgoing)
+            .filter(|edge| edge.target() == to)
+            .map(|edge| edge.weight())
+            .collect();
+        forward.sort_by(|a, b| a.relation.cmp(&b.relation));
+        if let Some(edge) = forward.first() {
+            return Some((*edge, true));
+        }
+        let mut backward: Vec<&GraphEdge> = self
+            .graph
+            .edges_directed(to, petgraph::Direction::Outgoing)
+            .filter(|edge| edge.target() == from)
+            .map(|edge| edge.weight())
+            .collect();
+        backward.sort_by(|a, b| a.relation.cmp(&b.relation));
+        backward.first().map(|edge| (*edge, false))
+    }
+
+    fn node_degree_by_id(&self, id: &str) -> usize {
+        self.node_map.get(id).map_or(0, |&idx| {
+            self.graph.edges(idx).count()
+                + self
+                    .graph
+                    .edges_directed(idx, petgraph::Direction::Incoming)
+                    .count()
+        })
+    }
+
+    /// A deterministic, dependency-free structural partition. The graph is
+    /// projected to undirected edges and label propagation is run in stable id
+    /// order, so a cached graph gets the same community number across queries.
+    fn community_for(&self, target: NodeIndex) -> usize {
+        let mut nodes: Vec<NodeIndex> = self.graph.node_indices().collect();
+        nodes.sort_by(|a, b| self.graph[*a].id.cmp(&self.graph[*b].id));
+        let mut labels: HashMap<NodeIndex, String> = nodes
+            .iter()
+            .map(|&idx| (idx, self.graph[idx].id.clone()))
+            .collect();
+        for _ in 0..24 {
+            let prior = labels.clone();
+            let mut changed = false;
+            for &idx in &nodes {
+                let mut counts: HashMap<&str, usize> = HashMap::new();
+                for neighbour in self.graph.neighbors_undirected(idx) {
+                    if let Some(label) = prior.get(&neighbour) {
+                        *counts.entry(label.as_str()).or_default() += 1;
+                    }
+                }
+                if let Some((winner, _)) = counts.into_iter().max_by(
+                    |(left_label, left_count), (right_label, right_count)| {
+                        left_count
+                            .cmp(right_count)
+                            .then_with(|| right_label.cmp(left_label))
+                    },
+                ) && labels.get(&idx).is_some_and(|current| current != winner)
+                {
+                    labels.insert(idx, winner.to_string());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let mut groups: Vec<String> = labels.values().cloned().collect();
+        groups.sort();
+        groups.dedup();
+        let label = labels.get(&target).expect("target graph node has a label");
+        groups
+            .binary_search(label)
+            .expect("label appears in community list")
+            + 1
     }
 
     /// The callers (in-edges) and callees (out-edges) of the node at `idx`, as
@@ -383,6 +637,7 @@ impl GraphStore {
             target: &'a str,
             relation: &'a str,
             confidence: &'a Confidence,
+            source_location: &'a str,
         }
 
         let edges: Vec<ExportEdge> = self
@@ -393,6 +648,7 @@ impl GraphStore {
                 target: &self.graph[e.target()].id,
                 relation: &e.weight().relation,
                 confidence: &e.weight().confidence,
+                source_location: &e.weight().source_location,
             })
             .collect();
 
@@ -419,6 +675,110 @@ pub struct GodNodeEntry {
 pub struct GraphStats {
     pub node_count: usize,
     pub edge_count: usize,
+}
+
+/// One relationship displayed by [`GraphExplanation`].
+#[derive(Debug, Clone)]
+pub struct GraphConnection {
+    pub direction: ConnectionDirection,
+    pub edge: NeighbourEdge,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionDirection {
+    Incoming,
+    Outgoing,
+}
+
+/// A concise, evidence-preserving view of a single graph symbol.
+#[derive(Debug, Clone)]
+pub struct GraphExplanation {
+    pub node: GraphNode,
+    /// A deterministic structural cluster id derived from graph connectivity.
+    pub community: usize,
+    pub degree: usize,
+    pub connections: Vec<GraphConnection>,
+}
+
+impl GraphExplanation {
+    pub fn format(&self) -> String {
+        let mut out = format!(
+            "Node: {}\nSource: {} {}\nKind: {}\nCommunity: {}\nDegree: {}\n",
+            self.node.label,
+            self.node.source_file,
+            self.node.source_location,
+            self.node.kind,
+            self.community,
+            self.degree,
+        );
+        if self.connections.is_empty() {
+            out.push_str("Connections: none\n");
+            return out;
+        }
+        out.push_str(&format!("Connections ({}):\n", self.connections.len()));
+        for connection in self.connections.iter().take(20) {
+            let arrow = match connection.direction {
+                ConnectionDirection::Incoming => "<--",
+                ConnectionDirection::Outgoing => "-->",
+            };
+            out.push_str(&format!(
+                "{arrow} {} [{}] [{:?}]\n",
+                connection.edge.node_label, connection.edge.relation, connection.edge.confidence
+            ));
+        }
+        if self.connections.len() > 20 {
+            out.push_str(&format!("... and {} more\n", self.connections.len() - 20));
+        }
+        out
+    }
+}
+
+/// A single hop in a shortest path. `forward` records whether graph direction
+/// agrees with the displayed traversal (false only for an undirected search).
+#[derive(Debug, Clone)]
+pub struct GraphPathHop {
+    pub from: GraphNode,
+    pub to: GraphNode,
+    pub relation: String,
+    pub confidence: Confidence,
+    pub source_location: String,
+    pub forward: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GraphPath {
+    pub path_hops: Vec<GraphPathHop>,
+}
+
+impl GraphPath {
+    pub fn format(&self) -> String {
+        let mut out = format!("Shortest path ({} hops):\n  ", self.path_hops.len());
+        if let Some(first) = self.path_hops.first() {
+            out.push_str(&first.from.label);
+        }
+        for hop in &self.path_hops {
+            if hop.forward {
+                out.push_str(&format!(
+                    " --{} [{:?}] @{}:{}--> {}",
+                    hop.relation,
+                    hop.confidence,
+                    hop.from.source_file,
+                    hop.source_location,
+                    hop.to.label
+                ));
+            } else {
+                out.push_str(&format!(
+                    " <--{} [{:?}] @{}:{}-- {}",
+                    hop.relation,
+                    hop.confidence,
+                    hop.to.source_file,
+                    hop.source_location,
+                    hop.to.label
+                ));
+            }
+        }
+        out
+    }
 }
 
 /// A single edge in a lookup result — either a caller or a callee of the matched node.
@@ -505,6 +865,7 @@ mod tests {
             target: tgt.to_string(),
             relation: relation.to_string(),
             confidence: Confidence::Extracted,
+            source_location: "L1".to_string(),
         }
     }
 
@@ -541,6 +902,49 @@ mod tests {
         assert!(store.has_cycles());
     }
 
+    #[test]
+    fn explain_reports_evidence_and_rejects_ambiguous_names() {
+        let mut store = GraphStore::new();
+        store.add_node(make_extracted_node(
+            "routing::router",
+            "router",
+            "routing.rs",
+        ));
+        store.add_node(make_extracted_node("api::router", "router", "api.rs"));
+        store.add_node(make_extracted_node("main::serve", "serve", "main.rs"));
+        store.add_edge(make_edge("main::serve", "routing::router", "calls"));
+
+        let explanation = store.explain("routing::router").unwrap();
+        assert_eq!(explanation.degree, 1);
+        assert_eq!(
+            explanation.connections[0].direction,
+            ConnectionDirection::Incoming
+        );
+        assert!(store.explain("router").unwrap_err().contains("Ambiguous"));
+    }
+
+    #[test]
+    fn shortest_path_is_directed_by_default_and_can_be_undirected() {
+        let mut store = GraphStore::new();
+        for (id, label) in [
+            ("a::start", "start"),
+            ("b::middle", "middle"),
+            ("c::end", "end"),
+        ] {
+            store.add_node(make_extracted_node(id, label, "test.rs"));
+        }
+        store.add_edge(make_edge("a::start", "b::middle", "calls"));
+        store.add_edge(make_edge("b::middle", "c::end", "uses"));
+
+        let path = store.shortest_path("start", "end", false, 8).unwrap();
+        assert_eq!(path.path_hops.len(), 2);
+        assert_eq!(path.path_hops[0].relation, "calls");
+        assert!(store.shortest_path("end", "start", false, 8).is_err());
+        let reverse = store.shortest_path("end", "start", true, 8).unwrap();
+        assert_eq!(reverse.path_hops.len(), 2);
+        assert!(!reverse.path_hops[0].forward);
+    }
+
     /// A node as `GraphExtractor::extract_from_file` actually produces one:
     /// `id` is `<file_stem>::<name>` (qualified) but `label` is the bare
     /// symbol name alone — the distinction `resolve_external_target` (and
@@ -570,6 +974,7 @@ mod tests {
             target: "external::changed".to_string(),
             relation: "calls".to_string(),
             confidence: Confidence::Inferred,
+            source_location: "L4".to_string(),
         });
 
         let context = store.cross_file_context("a.rs");
@@ -592,6 +997,7 @@ mod tests {
             target: "external::changed".to_string(),
             relation: "calls".to_string(),
             confidence: Confidence::Inferred,
+            source_location: "L4".to_string(),
         });
 
         assert!(store.cross_file_context("a.rs").is_empty());
