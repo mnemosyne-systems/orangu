@@ -15,6 +15,7 @@ Nishant raj Jha <nishantrajx924@gmail.com>
 Adesh Deshmukh <adeshkd123@gmail.com>
 Bassam Adnan <mailbassam@gmail.com>
 Saleh Enab <salehenab850@gmail.com>
+Tejas Tyagi <tejastyagi.tt@gmail.com>
 ```
 
 ## Committers
