@@ -30,6 +30,22 @@ fn parses_copy_as_a_local_command() {
 }
 
 #[test]
+fn parses_graph_explain_and_path_commands() {
+    match parse_local_command("/graph explain APIRouter") {
+        Some(LocalCommand::GraphExplain(symbol)) => assert_eq!(symbol, "APIRouter"),
+        _ => panic!("expected graph explain command"),
+    }
+    match parse_local_command("/graph path FastAPI ModelField --undirected") {
+        Some(LocalCommand::GraphPath(source, target, true)) => {
+            assert_eq!(source, "FastAPI");
+            assert_eq!(target, "ModelField");
+        }
+        _ => panic!("expected undirected graph path command"),
+    }
+    assert!(parse_local_command("/graph path only-one").is_none());
+}
+
+#[test]
 fn parses_the_prompt_modes() {
     use crate::mode::PromptMode;
 

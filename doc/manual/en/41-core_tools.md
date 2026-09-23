@@ -1484,10 +1484,24 @@ Inside the visualization you can:
 
 Nodes are automatically clustered and color-coded based on the file they belong to, helping you easily visualize architectural boundaries and module dependencies.
 
+### Inspecting nodes and paths
+
+`/graph explain <symbol>` describes one unambiguous graph node: its source location, kind, structural community, degree, and incoming and outgoing relationships. Each connection includes the extracted or inferred relation and its evidence location when available.
+
+`/graph path <source> <target>` finds the shortest directed path between two graph nodes. Add `--undirected` when you want to explore a relationship in either direction. A path is limited to eight hops by default.
+
+For a one-shot query, pass either command with `-p`; Orangu prints the result and exits.
+
 **Examples**
 
 ```text
 /graph
+/graph explain shortest_path
+/graph path shortest_path resolve_node
+/graph path resolve_node shortest_path --undirected
+
+orangu -p "/graph explain shortest_path"
+orangu -p "/graph path shortest_path resolve_node"
 ```
 
 Natural-language forms:

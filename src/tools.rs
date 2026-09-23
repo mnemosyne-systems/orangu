@@ -441,6 +441,34 @@ impl ToolExecutor {
                 "required": ["symbol"]
             }),
         ));
+        defs.push(tool(
+            "graph_explain",
+            "Explain one unambiguous workspace symbol from the Knowledge Graph. Returns its source, structural community, degree, and incoming/outgoing relationships with extracted or inferred evidence.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "symbol": {
+                        "type": "string",
+                        "description": "Exact symbol id or name; ambiguous names return candidate ids rather than guessing"
+                    }
+                },
+                "required": ["symbol"]
+            }),
+        ));
+        defs.push(tool(
+            "graph_path",
+            "Find the shortest relationship path between two unambiguous workspace symbols. Follows relationship direction by default; set undirected=true for architectural discovery across callers and callees.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "target": {"type": "string"},
+                    "undirected": {"type": "boolean", "default": false},
+                    "max_hops": {"type": "integer", "minimum": 1, "maximum": 64, "default": 8}
+                },
+                "required": ["source", "target"]
+            }),
+        ));
 
         if let Some(mcp) = &self.mcp {
             defs.extend(mcp.definitions());
@@ -510,6 +538,8 @@ impl ToolExecutor {
             "run_shell_command" => self.run_shell_command(arguments).await,
             "expand_context" => self.expand_context(arguments).await,
             "graph_lookup" => self.graph_lookup(arguments),
+            "graph_explain" => self.graph_explain(arguments),
+            "graph_path" => self.graph_path(arguments),
             _ if self.mcp.as_ref().is_some_and(|mcp| mcp.contains(name)) => {
                 self.mcp
                     .as_ref()
@@ -620,6 +650,63 @@ impl ToolExecutor {
                         .join("\n---\n"))
                 }
             }
+        }
+    }
+
+    fn graph_explain(&self, arguments: &Map<String, Value>) -> Result<String> {
+        let symbol = arguments
+            .get("symbol")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing 'symbol' argument"))?;
+        self.ensure_graph()?;
+        let guard = self
+            .graph_store
+            .lock()
+            .map_err(|_| anyhow!("graph_store mutex poisoned"))?;
+        match &*guard {
+            None => Ok(
+                "[graph_explain] No Knowledge Graph could be built for this workspace.".to_string(),
+            ),
+            Some(store) => store
+                .explain(symbol)
+                .map(|explanation| explanation.format())
+                .map_err(anyhow::Error::msg),
+        }
+    }
+
+    fn graph_path(&self, arguments: &Map<String, Value>) -> Result<String> {
+        let source = arguments
+            .get("source")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing 'source' argument"))?;
+        let target = arguments
+            .get("target")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing 'target' argument"))?;
+        let undirected = arguments
+            .get("undirected")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let max_hops = arguments
+            .get("max_hops")
+            .and_then(Value::as_u64)
+            .unwrap_or(8);
+        if !(1..=64).contains(&max_hops) {
+            return Err(anyhow!("'max_hops' must be between 1 and 64"));
+        }
+        self.ensure_graph()?;
+        let guard = self
+            .graph_store
+            .lock()
+            .map_err(|_| anyhow!("graph_store mutex poisoned"))?;
+        match &*guard {
+            None => Ok(
+                "[graph_path] No Knowledge Graph could be built for this workspace.".to_string(),
+            ),
+            Some(store) => store
+                .shortest_path(source, target, undirected, max_hops as usize)
+                .map(|path| path.format())
+                .map_err(anyhow::Error::msg),
         }
     }
 
