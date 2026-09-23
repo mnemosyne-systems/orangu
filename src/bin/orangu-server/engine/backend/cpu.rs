@@ -511,6 +511,12 @@ impl CpuBackend {
     /// own kernel to run — this is an optimization, never the only path to
     /// an answer.
     ///
+    /// **It does not read `ORANGU_PACKED_GEMM`**; the caller does. The
+    /// shape rules and the policy are different questions, and folding the
+    /// knob in here made the test of the rules a test of the default —
+    /// which passed until the default changed, and then failed on every
+    /// platform at once.
+    ///
     /// **Not for one token.** A mat-vec has no reuse to block for, and the
     /// packing is then pure overhead: measured level at one token and 6x
     /// worse once the weight is quantized, where reading the packed bytes
@@ -526,8 +532,7 @@ impl CpuBackend {
         use rten_gemm::{GemmInputA, GemmInputB, GemmOptions};
         use rten_tensor::NdTensorView;
 
-        if !packed_gemm_enabled()
-            || n_tokens < 2
+        if n_tokens < 2
             || rows.len() < in_dim * out_dim
             || x.len() < n_tokens * in_dim
             || out.len() < n_tokens * out_dim
@@ -630,7 +635,9 @@ impl CpuBackend {
             // when asked for — see `packed_gemm_enabled` for what it is
             // worth here, which is not much. The weight goes over as a
             // transposed *view* of the rows above, so nothing is copied.
-            if Self::packed_gemm_f32(out, x, rows, n_tokens, in_dim, out_dim) {
+            if packed_gemm_enabled()
+                && Self::packed_gemm_f32(out, x, rows, n_tokens, in_dim, out_dim)
+            {
                 return true;
             }
             let wanted = 4 * rayon::current_num_threads();
