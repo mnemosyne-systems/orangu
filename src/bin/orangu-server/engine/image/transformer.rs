@@ -962,6 +962,9 @@ const ATTN_QUERIES: usize = 24;
 fn convert_scores(scores: &mut [f32], ints: &[i32], key_scales: &[f32], sq: f32) -> f32 {
     debug_assert!(ints.len() == scores.len() && key_scales.len() == scores.len());
     let n = scores.len();
+    #[cfg(not(target_arch = "aarch64"))]
+    let i = 0;
+    #[cfg(target_arch = "aarch64")]
     let mut i = 0;
     #[cfg(not(target_arch = "aarch64"))]
     let mut max = f32::NEG_INFINITY;

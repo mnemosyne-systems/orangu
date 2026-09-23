@@ -2705,6 +2705,7 @@ impl PairedI8 {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn pair(&self, p: usize) -> &[i8] {
         &self.data[p * 2 * self.dim..(p + 1) * 2 * self.dim]
     }
