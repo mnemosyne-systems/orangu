@@ -66,12 +66,30 @@ struct SharedOut(*mut f32);
 unsafe impl Send for SharedOut {}
 unsafe impl Sync for SharedOut {}
 
-/// `ORANGU_PACKED_GEMM=0` puts the float prefill path back on this
-/// engine's own tiled kernel — the control arm, so both can be compared in
-/// one binary rather than in two builds.
+/// `ORANGU_PACKED_GEMM=1` runs the float prefill path through the packed,
+/// cache-blocked GEMM in `rten-gemm` instead of this engine's own tiled
+/// kernel. **Off by default, because it is not faster here.**
+///
+/// Measured at every shape a forward pass runs, with normal float values:
+/// the two are level — between 0.92x and 1.28x depending on the shape, and
+/// the spread between repeats of one shape is wider than the difference
+/// between the two kernels at that shape. End to end on a mixture prefill
+/// it is worth about 1% at a 624-token prompt and nothing at 2236, where an
+/// interleaved A/B's closing control came back at the treatment's rate.
+///
+/// It is kept, and kept switchable, for two reasons. The packed kernel's
+/// advantage is a property of the host: this one has `AVX2` and neither
+/// `AVX-512` nor `VNNI`, so the crate selects its weakest x86 kernel, and
+/// the comparison is worth repeating where it can select its best. And
+/// re-answering the question costs one sweep with this variable rather than
+/// a branch.
+///
+/// It does not apply to quantized weights at all. This engine multiplies
+/// the packed bytes directly; a GEMM has to dequantize first, and the
+/// dequantize alone costs more than the whole product.
 fn packed_gemm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_PACKED_GEMM"))
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_PACKED_GEMM"))
 }
 impl CpuBackend {
     /// The fused path: quantize each token's activations to `int8` **once**,
@@ -494,8 +512,8 @@ impl CpuBackend {
     /// an answer.
     ///
     /// **Not for one token.** A mat-vec has no reuse to block for, and the
-    /// packing is then pure overhead: measured level at one token and worse
-    /// once the weight is quantized, where reading the packed bytes
+    /// packing is then pure overhead: measured level at one token and 6x
+    /// worse once the weight is quantized, where reading the packed bytes
     /// directly beats widening them first.
     fn packed_gemm_f32(
         out: &mut [f32],
@@ -608,16 +626,10 @@ impl CpuBackend {
             };
             let row = |o: usize| &rows[o * in_dim..(o + 1) * in_dim];
             out.resize(n_tokens * out_dim, 0.0);
-            // A packed GEMM, where one is available for this element type.
-            // The kernel below is a rank-four row group over token blocks
-            // and blocks on neither of the other two axes, so it re-reads
-            // the activation band once per four output rows — at a few
-            // hundred rows that is two orders of magnitude of traffic the
-            // arithmetic never asked for. A packing GEMM copies both
-            // operands into cache-sized tiles and reads each about once.
-            // Measured at every shape a forward pass runs: 14–21x, and the
-            // weight is handed over as a transposed *view* of the rows
-            // above, so nothing is copied to get there.
+            // A packed, cache-blocked GEMM instead of the kernel below,
+            // when asked for — see `packed_gemm_enabled` for what it is
+            // worth here, which is not much. The weight goes over as a
+            // transposed *view* of the rows above, so nothing is copied.
             if Self::packed_gemm_f32(out, x, rows, n_tokens, in_dim, out_dim) {
                 return true;
             }

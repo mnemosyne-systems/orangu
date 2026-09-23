@@ -100,6 +100,35 @@ const SHAPES: &[Shape] = &[
         k: 2048,
         n: 128,
     },
+    // The output-width sweep. A router is the narrowest product a forward
+    // pass runs, and narrow output is where this engine's row grouping has
+    // the fewest groups to spread across the machine — so if the two
+    // kernels cross anywhere, they cross here. Where they cross is what
+    // decides which shapes are worth handing over.
+    Shape {
+        what: "narrow out, n=32",
+        m: 2048,
+        k: 2048,
+        n: 32,
+    },
+    Shape {
+        what: "narrow out, n=64",
+        m: 2048,
+        k: 2048,
+        n: 64,
+    },
+    Shape {
+        what: "narrow out, n=256",
+        m: 2048,
+        k: 2048,
+        n: 256,
+    },
+    Shape {
+        what: "narrow out, n=512",
+        m: 2048,
+        k: 2048,
+        n: 512,
+    },
 ];
 
 /// Repetitions per point. Enough that the median is not one scheduling
@@ -118,7 +147,19 @@ fn weights(ggml_type: u32, in_dim: usize, out_dim: usize) -> QuantMatrix {
         GGML_TYPE_F32 => in_dim * out_dim * 4,
         _ => q4k_bytes(in_dim, out_dim),
     };
-    let bytes: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+    // **Normal floats, not a byte pattern.** Bytes reinterpreted as `f32`
+    // are overwhelmingly denormal, and denormal arithmetic on x86 runs at a
+    // fraction of the normal rate — which would be measured as a property
+    // of whichever kernel is being timed. The quantized types cannot have
+    // this problem (their values come back through a scale), so a byte
+    // pattern there is harmless and only the float case is built by value.
+    let bytes: Vec<u8> = if ggml_type == GGML_TYPE_F32 {
+        (0..in_dim * out_dim)
+            .flat_map(|i| (((i % 17) as f32 - 8.0) * 0.125).to_le_bytes())
+            .collect()
+    } else {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    };
     test_quant_matrix(&bytes, ggml_type, in_dim, out_dim)
 }
 

@@ -1994,7 +1994,7 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
     }
 
     println!(
-        "\nswept {} — mean tok/s, against {}",
+        "\nswept {} — mean tok/s per point in run order, against {}",
         spec.var,
         sweep_point_label(args, &spec, &spec.values[0])
     );
@@ -2170,18 +2170,54 @@ fn bundle_point_path(stem: &str, label: &str) -> String {
     format!("{}-{}.{ext}", base.display(), slug(label))
 }
 
-/// The sweep's answer, as one row per measured point and one column per value.
+/// One row of the sweep table: the mean for each swept point, in the order
+/// the points ran.
+///
+/// **The `occurrence`-th record with a value, not the first.** An
+/// interleaved A/B repeats its arms — `VAR=old,new,new,old` is the shape
+/// this harness exists for — and every occurrence of a value carries the
+/// same label. Taking the first match printed the opening point under both
+/// of its columns and dropped the closing one, which is the single
+/// measurement that says whether a difference belonged to the variable or
+/// to the run: a control that comes back changed at the end was invisible,
+/// and the table read as a clean effect.
+fn sweep_row(
+    args: &Args,
+    spec: &sweep::Spec,
+    records: &[history::Record],
+    mode: &str,
+    n: u32,
+) -> Vec<Option<f64>> {
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    spec.values
+        .iter()
+        .map(|value| {
+            let occurrence = seen.entry(value.as_str()).or_default();
+            let label = sweep_point_label(args, spec, value);
+            let got = records
+                .iter()
+                .filter(|r| r.label == label && r.mode == mode && r.n == n)
+                .nth(*occurrence)
+                .map(|r| r.mean);
+            *occurrence += 1;
+            got
+        })
+        .collect()
+}
+
+/// The sweep's answer, as one row per measured point and one column per
+/// swept point, **in the order they ran**.
+///
+/// A repeated value gets a column each, not one shared column. That is the
+/// whole value of interleaving the arms: `VAR=old,new,new,old` says whether
+/// a difference belongs to the variable or to the run, and it says it by
+/// whether the *closing* control comes back where the opening one was. One
+/// column per distinct value cannot express that, and printed the opening
+/// point twice instead.
 fn print_sweep_table(args: &Args, spec: &sweep::Spec, records: &[history::Record]) {
     let mut points: Vec<(String, u32)> = records.iter().map(|r| (r.mode.clone(), r.n)).collect();
     points.sort_unstable();
     points.dedup();
-    let at = |value: &str, mode: &str, n: u32| -> Option<f64> {
-        let label = sweep_point_label(args, spec, value);
-        records
-            .iter()
-            .find(|r| r.label == label && r.mode == mode && r.n == n)
-            .map(|r| r.mean)
-    };
     print!("  {:<12}", "point");
     for v in &spec.values {
         print!("  {:>18}", if v.is_empty() { "<unset>" } else { v });
@@ -2189,9 +2225,10 @@ fn print_sweep_table(args: &Args, spec: &sweep::Spec, records: &[history::Record
     println!();
     for (mode, n) in &points {
         print!("  {:<12}", format!("{mode} {n}"));
-        let base = at(&spec.values[0], mode, *n);
-        for v in &spec.values {
-            match (at(v, mode, *n), base) {
+        let row = sweep_row(args, spec, records, mode, *n);
+        let base = row.first().copied().flatten();
+        for this in row {
+            match (this, base) {
                 (Some(got), Some(b)) if b > 0.0 => {
                     print!("  {got:>11.2} {:>+5.1}%", (got / b - 1.0) * 100.0);
                 }
@@ -5461,6 +5498,48 @@ fn run_curve(
 
 #[cfg(test)]
 mod tests {
+
+    /// An interleaved A/B repeats its arms, and every occurrence of a value
+    /// carries the same label. The row must carry each point in run order —
+    /// taking the first match for both of a value's columns printed the
+    /// opening measurement twice and threw away the closing control, which
+    /// is the one that separates the variable from the run drifting.
+    ///
+    /// Measured case this is taken from: arms `0,1,1,0` returned 96.2, 99.5,
+    /// 99.4 and 99.5, where the closing control says the difference was
+    /// drift. The old row reported 96.2 for both controls and read as a
+    /// clean +3.4%.
+    #[test]
+    fn a_repeated_arm_reports_each_of_its_points_not_the_first_twice() {
+        let spec = sweep::Spec {
+            var: "VAR".into(),
+            values: vec!["0".into(), "1".into(), "1".into(), "0".into()],
+        };
+        let args = Args::parse_from(["orangu-bench"]);
+        let record = |value: &str, mean: f64| history::Record {
+            date: "2026-09-23".into(),
+            label: sweep_point_label(&args, &spec, value),
+            mode: "pp".into(),
+            n: 2236,
+            best: mean,
+            mean,
+            sd: 0.0,
+            sd_sample: None,
+            device: None,
+        };
+        let records = [
+            record("0", 96.2),
+            record("1", 99.5),
+            record("1", 99.4),
+            record("0", 99.5),
+        ];
+        let row = sweep_row(&args, &spec, &records, "pp", 2236);
+        assert_eq!(
+            row,
+            vec![Some(96.2), Some(99.5), Some(99.4), Some(99.5)],
+            "each swept point gets its own measurement, in run order"
+        );
+    }
     /// Every flag clap parses is offered by all three hand-written
     /// completion scripts — see `orangu::shell_completions::unoffered`.
     #[test]
