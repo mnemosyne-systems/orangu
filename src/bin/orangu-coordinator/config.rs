@@ -79,9 +79,7 @@ pub fn resolve_connect_host(host: &str) -> &str {
 /// validate a profile's `role` key at load time — a role has to map to one
 /// of `orangu-server`'s own `--all`/`--code`/`--review`/`--explorer`/
 /// `--embedding` flags (see [`role_server_flag`]) for the profile to be
-/// startable at all, so an unrecognized role is now a load-time error
-/// rather than something that silently just never matches
-/// [`CoordinatorConfiguration::models_by_role`]'s reporting.
+/// startable at all, so an unrecognized role is a load-time error.
 pub const KNOWN_ROLES: &[&str] = &["all", "code", "review", "explorer", "embeddings"];
 
 /// The `orangu-server` CLI flag a coordinator-profile `role` maps to. Note
@@ -265,12 +263,8 @@ impl CoordinatorLlmEntry {
     /// else here *is* baked into the process: the model it loaded, the address
     /// it bound, the backend it chose, the slots it sized its pools for.
     ///
-    /// What this saves is not a nicety. A `code` and a `review` profile that
-    /// name the same file used to cost a full stop-and-reload to move between
-    /// — gigabytes of identical weights re-read, ~11s each way on a small
-    /// model — and every cached prefix on the old process died with it. An
-    /// `/auto_review` run alternating with ordinary chat paid that twice per
-    /// turn, for nothing that changes an answer.
+    /// Moving between two such profiles keeps the running process: no
+    /// identical weights are re-read, and its cached prefixes survive.
     pub fn serves_same_process_as(&self, other: &Self) -> bool {
         roles_share_a_process(&self.role, &other.role)
             && self.model == other.model
@@ -476,11 +470,26 @@ fn parse_llm_profiles(
     sections
         .into_iter()
         .map(|(name, values)| {
-            let role = values
+            // A section named after a role (`[code]`) is that role; any other
+            // name takes its `role` key, defaulting to `all`.
+            let named_role = KNOWN_ROLES
+                .iter()
+                .find(|role| name.eq_ignore_ascii_case(role))
+                .map(|role| role.to_string());
+            let role_key = values
                 .get("role")
                 .map(|value| value.trim().to_lowercase())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "all".to_string());
+                .filter(|value| !value.is_empty());
+            let role = match (named_role, role_key) {
+                (Some(named), Some(key)) if named != key => {
+                    return Err(anyhow!(
+                        "[{name}].role '{key}' contradicts the section name; remove the role key or rename the section"
+                    ));
+                }
+                (Some(named), _) => named,
+                (None, Some(key)) => key,
+                (None, None) => "all".to_string(),
+            };
             if role_server_flag(&role).is_none() {
                 return Err(anyhow!(
                     "[{name}].role '{role}' is not a known role (expected one of: {})",
@@ -762,6 +771,46 @@ mod tests {
         assert_eq!(conf.default_entry, "main");
     }
 
+    fn load(contents: &str) -> Result<CoordinatorConfiguration> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "{contents}").unwrap();
+        load_coordinator_configuration(file.path())
+    }
+
+    #[test]
+    fn a_section_named_after_a_role_is_that_role() {
+        let conf = load(
+            "[orangu-coordinator]\nmodels = /srv/models\n\n[all]\nmodel = org/gemma\n\n[code]\nmodel = org/gemma\n\n[Embeddings]\nmodel = org/embed\n\n[qwen]\nrole = explorer\nmodel = org/qwen\n",
+        )
+        .unwrap();
+        assert_eq!(conf.llms["all"].role, "all");
+        assert_eq!(conf.llms["code"].role, "code");
+        assert_eq!(conf.llms["Embeddings"].role, "embeddings");
+        assert_eq!(conf.llms["qwen"].role, "explorer");
+        assert_eq!(conf.default_entry, "all");
+    }
+
+    #[test]
+    fn a_role_key_matching_its_section_name_is_accepted() {
+        let conf = load(
+            "[orangu-coordinator]\nmodels = /srv/models\n\n[all]\nmodel = org/gemma\n\n[code]\nrole = code\nmodel = org/gemma\n",
+        )
+        .unwrap();
+        assert_eq!(conf.llms["code"].role, "code");
+    }
+
+    #[test]
+    fn a_role_key_contradicting_its_section_name_is_rejected() {
+        let err = load(
+            "[orangu-coordinator]\nmodels = /srv/models\n\n[all]\nmodel = org/gemma\n\n[code]\nrole = review\nmodel = org/gemma\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("contradicts the section name"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn rejects_an_unknown_role() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -946,7 +995,7 @@ mod tests {
         assert_eq!(models["embeddings"], "org/gemma");
     }
 
-    /// The distinction the coordinator now turns a model reload on: two
+    /// The distinction the coordinator turns a model reload on: two
     /// profiles that differ only in role are one process, and anything that
     /// changes what the process *is* — the model above all — is not.
     #[test]

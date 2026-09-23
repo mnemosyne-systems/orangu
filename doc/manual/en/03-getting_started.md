@@ -46,7 +46,7 @@ The script installs to `~/.local/bin` (Linux/macOS) or `%USERPROFILE%\.local\bin
 orangu-server -i
 ```
 
-Each prompt shows its default in brackets; Enter accepts it.
+The wizard asks for every `[orangu-server]` key. Each prompt shows its default in brackets; Enter accepts it. The language-model keys (`context` to `reasoning_effort`, `prefill_backend`, `mlp_unroll`) are not asked for a picture model, which is asked its own keys instead.
 
 | Prompt | Default | Notes |
 | --- | --- | --- |
@@ -55,7 +55,26 @@ Each prompt shows its default in brackets; Enter accepts it.
 | `role` | `all` | One of `all`, `code`, `review`, `explorer`, `embedding`. |
 | `host` | `all` | `all` for every interface, or a literal address such as `127.0.0.1`. Tab-completes the machine's own interfaces. |
 | `port` | `8100` | The HTTP API port. |
+| `api_key` | *(none)* | Bearer token every request must carry; blank leaves the server open. On an address other than loopback the prompt says the server is then reachable off the machine. |
+| `tls_cert` | *(none)* | PEM certificate for HTTPS; blank serves plain HTTP. A certificate asks for its `tls_key`. |
+| `slots` | `1` (`8` for `embedding`) | Concurrent requests, each with its own KV cache. |
+| `queue_limit` | `0` | Requests allowed to wait for a slot before `503`; `0` is unbounded. |
+| `context` | *(none)* | Tokens one request must be able to hold on the card; blank takes whatever the card has left. |
+| `kv_cache` | `f16` | `f16`, `q8_0`, or `f32`. |
+| `draft_model` | *(none)* | A smaller model for speculative decoding. Naming one asks `draft_tokens` (`4`). |
+| `reasoning_effort` | *(none)* | Passed to the chat template; blank leaves the template's own default. |
+| `backend` | `auto` | `auto`, `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm`, or `npu`. |
+| `device` | `auto` | An index, part of a device name, or `auto`. |
+| `device_split` | `off` | `off`, `auto`, `all`, or ratios such as `3,1`. |
+| `threads` | *(none)* | CPU worker threads; blank is one per logical core. |
+| `prefill_backend` | `device` | `device`, `cpu`, or `auto`. |
+| `mlp_unroll` | `auto` | `auto`, `yes`, or `no`. |
+| `npu_cache_gb` | a quarter of RAM, 1–16 | GiB compiled NPU blocks may occupy. |
+| `npu_precompile` | `Y` | Whether this model may use the NPU. |
+| `read_size` | `8192` | KiB per model-file read. |
+| `log_type` | `console` | `console` or `file`; `file` asks for `log_path`. |
 | `Add web console` | `Y` | `n` writes no `[web]` section and serves no console. Accepting asks four more: the console's `host` (defaulting to the API's), `port` (`8101`), `reexec` (may it load a different model), and `delete` (may it delete models). |
+| `Add Prometheus metrics` | `N` | Accepting asks for its `host` and `port` (`8300`). |
 
 The wizard prints the file before writing it and asks `Write this configuration? [Y/n]`; anything but Enter/`y`/`yes` aborts with nothing written. Only non-defaults are written, so a minimal run yields:
 
@@ -127,7 +146,7 @@ With the server from step 3 running:
 orangu -i
 ```
 
-The first prompt is `LLM URL`: enter `http://localhost:8100/v1` (a bare `http://localhost:8100` is accepted too). The wizard queries that server's `/v1/models` and offers the first model it advertises as the default for the `Model` prompt — if the server cannot be reached it says so and asks for the name manually, which is why it is worth starting the server first.
+The first prompt is `Endpoint`: press Enter to accept the default `http://localhost:8100` (`http://localhost:8100/v1` is accepted too). The wizard queries that server's `/v1/models` and offers the first model it advertises as the default for the `Model` prompt — if the server cannot be reached the prompt has no default and you type the name yourself, which is why it is worth starting the server first.
 
 It then walks every remaining option showing its default, so a full run is a row of Enters, and omits from the file anything left at its default. It finishes by reporting which optional tools it detected (`git lg`, `delta`, `bat`, `gh`, `glab`), printing the configuration, and asking `Write this configuration? (Yes/No) [Yes]`. On confirmation it writes `~/.orangu/orangu.conf` — ignoring `-c`/`--config`, like the server wizard — and installs any bundled skills into `~/.orangu/skills/` that are not already present:
 

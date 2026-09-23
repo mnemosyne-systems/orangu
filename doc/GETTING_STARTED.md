@@ -27,8 +27,10 @@ Missing config file; pass --config or add ./orangu-server.conf or ~/.orangu/oran
 orangu-server -i
 ```
 
-The wizard asks, in order, each prompt showing its default in brackets — press
-Enter to keep it:
+The wizard asks, in order, for every `[orangu-server]` key, each prompt showing
+its default in brackets — press Enter to keep it. The language-model keys
+(`context` to `reasoning_effort`, `prefill_backend`, `mlp_unroll`) are not
+asked for a picture model, which is asked its own keys instead:
 
 | Prompt | Default | Notes |
 | --- | --- | --- |
@@ -37,7 +39,26 @@ Enter to keep it:
 | `role` | `all` | `all`, `code`, `review`, `explorer`, or `embedding`. |
 | `host` | `all` | `all` (every interface) or a literal address such as `127.0.0.1`. Tab-completes this machine's interfaces. |
 | `port` | `8100` | The HTTP API port. |
+| `api_key` | *(none)* | Bearer token every request must carry; blank leaves the server open. On an address other than loopback the prompt says the server is then reachable off the machine. |
+| `tls_cert` | *(none)* | PEM certificate for HTTPS; blank serves plain HTTP. A certificate asks for its `tls_key`. |
+| `slots` | `1` (`8` for `embedding`) | Concurrent requests, each with its own KV cache. |
+| `queue_limit` | `0` | Requests allowed to wait for a slot before `503`; `0` is unbounded. |
+| `context` | *(none)* | Tokens one request must be able to hold on the card; blank takes whatever the card has left. |
+| `kv_cache` | `f16` | `f16`, `q8_0`, or `f32`. |
+| `draft_model` | *(none)* | A smaller model for speculative decoding. Naming one asks `draft_tokens` (`4`). |
+| `reasoning_effort` | *(none)* | Passed to the chat template; blank leaves the template's own default. |
+| `backend` | `auto` | `auto`, `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm`, or `npu`. |
+| `device` | `auto` | An index, part of a device name, or `auto`. |
+| `device_split` | `off` | `off`, `auto`, `all`, or ratios such as `3,1`. |
+| `threads` | *(none)* | CPU worker threads; blank is one per logical core. |
+| `prefill_backend` | `device` | `device`, `cpu`, or `auto`. |
+| `mlp_unroll` | `auto` | `auto`, `yes`, or `no`. |
+| `npu_cache_gb` | a quarter of RAM, 1–16 | GiB compiled NPU blocks may occupy. |
+| `npu_precompile` | `Y` | Whether this model may use the NPU. |
+| `read_size` | `8192` | KiB per model-file read. |
+| `log_type` | `console` | `console` or `file`; `file` asks for `log_path`. |
 | `Add web console` | `Y` | Answering `n` writes no `[web]` section, and no console is served. |
+| `Add Prometheus metrics` | `N` | Accepting asks for its `host` and `port` (`8300`). |
 
 Accepting the web console asks four more: its `host` (defaulting to the address
 the API just took), `port` (`8101`), `reexec` (`Y` — may the console load a
@@ -145,11 +166,12 @@ With the server from step 3 still running:
 orangu -i
 ```
 
-The wizard first asks for `LLM URL` — enter the endpoint from step 3,
-`http://localhost:8100/v1` (a bare `http://localhost:8100` works too). It then
+The wizard first asks for the `Endpoint` — press Enter to accept the default
+`http://localhost:8100`, the server from step 3 (`http://localhost:8100/v1`
+works too). It then
 queries that server's `/v1/models` and offers the first model it advertises as
-the default for the `Model` prompt; if the server is unreachable it says so and
-asks you to type the model name yourself.
+the default for the `Model` prompt; if the server is unreachable the prompt has
+no default and you type the model name yourself.
 
 From there it walks every remaining option showing its default — `timeout`,
 `max_tool_rounds`, `review_max_tokens`, `code_max_tokens`, `compile_workers`,

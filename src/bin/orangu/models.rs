@@ -309,7 +309,7 @@ pub(crate) fn idle_model_switch_target(
 
 /// If the active server is not serving the configured model at startup, switch
 /// to a model the server actually advertises. Returns `(old, new)` model ids
-/// when a switch happened. The server (endpoint, provider, system prompt) is
+/// when a switch happened. The server (endpoint, system prompt) is
 /// unchanged — only the wire model id moves.
 pub(crate) async fn try_startup_model_switch(
     http_client: &reqwest::Client,

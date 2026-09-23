@@ -310,7 +310,7 @@ The quickest way to get a working configuration is the interactive wizard:
 orangu --init
 ```
 
-It asks for the **LLM URL**, auto-detects a model the server advertises (and
+It asks for the **Endpoint** (default `http://localhost:8100`), auto-detects a model the server advertises (and
 pre-fills it as the **Model**), then walks every option showing its default.
 Anything left at its default is omitted from the file, and the result is shown
 for confirmation before being written to `~/.orangu/orangu.conf` (creating the

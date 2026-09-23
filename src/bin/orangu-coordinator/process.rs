@@ -487,10 +487,9 @@ impl Coordinator {
             // Serving something else. This is a *swap*, and the fact that
             // this coordinator did not start the incumbent changes nothing
             // about it: the same act is already performed on every adopted
-            // server whose profile is swapped away from. Refusing it instead
-            // — which this used to do — left a leftover from an earlier run
-            // able to block every profile indefinitely, with the operator
-            // told to go and find it by hand.
+            // server whose profile is swapped away from. Refusing it would
+            // let a leftover from an earlier run block every profile
+            // indefinitely.
             //
             // Only against a pid the kernel agrees is an `orangu-server`.
             // Everything else falls through to the start below, which reports
@@ -861,16 +860,11 @@ impl Coordinator {
                 .http_client
                 .get(&probe_url)
                 .timeout(HEALTH_CHECK_TIMEOUT);
-            // An answer means *a* listener is up on that address. Whether it
-            // is the one just spawned is a different question, and it used to
-            // go unasked: a leftover `orangu-server` still holding the port
-            // answers instantly, so the coordinator called the swap done while
-            // its own child was still loading, recorded it as active, and
-            // proxied every request to a process it did not start — serving
-            // whatever model *that* one had. The child then failed to bind and
-            // exited, and the next request found it dead, restarted it, and
-            // did the whole thing again. Nothing in that loop is visible as an
-            // error; the model is simply not the one that was asked for.
+            // An answer means *a* listener is up on that address, not that it
+            // is the one just spawned: a leftover `orangu-server` still holding
+            // the port answers instantly, and trusting it would proxy every
+            // request to a process this coordinator did not start, serving
+            // whatever model *that* one has. So the answering pid is checked.
             if let Ok(response) = request.send().await {
                 match (answering_pid(response).await, spawned_pid) {
                     // Someone else's listener. Retrying cannot help — the port
@@ -1236,14 +1230,10 @@ mod tests {
 
     #[tokio::test]
     async fn http_client_has_no_default_timeout_for_proxied_requests() {
-        // Regression test: the coordinator's shared HTTP client used to
-        // have a hardcoded 5s timeout meant only for the health-check probe
-        // in `wait_until_healthy`, but the same client also proxies real
-        // requests to the active backend — any generation slower than 5s
-        // got its connection killed mid-stream, surfacing to the caller as
-        // a bare "unexpected EOF during chunk size line" rather than a
-        // clear timeout. The client itself must have no default timeout;
-        // only the health check applies one explicitly (`HEALTH_CHECK_TIMEOUT`).
+        // The coordinator's shared HTTP client also proxies real requests to
+        // the active backend, so a default timeout would kill any slower
+        // generation mid-stream. The client itself has none; only the health
+        // check applies one explicitly (`HEALTH_CHECK_TIMEOUT`).
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1584,12 +1574,10 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn shutdown_kills_a_process_still_waiting_on_its_health_check() {
-        // Regression test: a real `orangu-server` that takes a long time to
-        // load was leaked (orphaned, still running) if the coordinator was
-        // shut down while `ensure_active` was still awaiting its health
-        // check — `active` isn't populated until that check succeeds, so
-        // `shutdown`'s old `active`-only cleanup had nothing to kill. The
-        // `sleep 30` here stands in for a slow model load: nothing ever
+        // A process still loading when the coordinator shuts down must be
+        // killed, even though `active` isn't populated until its health
+        // check succeeds. The `sleep 30` here stands in for a slow model
+        // load: nothing ever
         // listens on the configured port, so the health check keeps
         // failing (not timing out) until `shutdown` intervenes.
         let config = minimal_config(
@@ -1636,10 +1624,9 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn start_error_includes_captured_output_when_the_process_crashes() {
-        // Regression coverage for a real report: a backend aborting used to
-        // surface only a bare "status: signal: 6 (SIGABRT)" with no way to
-        // tell why. The process's own stderr/stdout is now captured and
-        // appended, so the actual diagnostic ends up in the same error.
+        // A backend that aborts has its own stderr/stdout captured and
+        // appended, so the actual diagnostic ends up in the start error
+        // rather than a bare "status: signal: 6 (SIGABRT)".
         let config = minimal_config(
             "startup_timeout = 5",
             "[main]\nrole = all\nmodel = org/gemma\nport = 65534\n",

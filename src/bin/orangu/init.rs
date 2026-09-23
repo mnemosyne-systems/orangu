@@ -15,11 +15,11 @@
 
 //! Interactive `--init` flow that writes `~/.orangu/orangu.conf`.
 //!
-//! It asks for the LLM URL, auto-detects a model the server advertises, and
+//! It asks for the endpoint, auto-detects a model the server advertises, and
 //! then walks every `[orangu]` and server option, showing its default. A value
 //! left at its default is omitted from the file, so the generated config stays
 //! minimal; only what the user changed (plus the always-required keys) is
-//! written. The server is always `orangu-server`, so no provider or server-type
+//! written. The server is always `orangu-server`, so no server type
 //! selection is asked for.
 
 use crate::quotes::QUOTE_OPTIONS;
@@ -43,6 +43,7 @@ use rustyline::{
 };
 use serde::Deserialize;
 use std::{
+    borrow::Cow,
     io::{self, Write},
     time::Duration,
 };
@@ -108,21 +109,26 @@ struct ModelEntry {
     name: String,
 }
 
+/// Offered at the `Endpoint` prompt: a local `orangu-server` on its default port.
+const DEFAULT_ENDPOINT: &str = "http://localhost:8100";
+
+/// Grey ANSI truecolor for inline ghost-text hints, the same color the chat
+/// REPL and the coordinator's wizard use.
+const GHOST_TEXT: &str = "\x1b[38;2;120;120;120m";
+const ANSI_RESET: &str = "\x1b[0m";
+
 /// Run the interactive configuration wizard and write `~/.orangu/orangu.conf`.
 pub async fn run_init() -> Result<()> {
     println!("orangu configuration");
     println!("====================\n");
 
-    let url = prompt_required("LLM URL: ")?;
+    let url = with_http_scheme(&prompt_ghosted("Endpoint", DEFAULT_ENDPOINT)?);
 
     // Ask the server which models it serves and pre-fill the first one. The
     // user can accept it or type a different identifier.
     let model = match detect_model(&url).await {
-        Some(detected) => prompt_with_default("Model", &detected)?,
-        None => {
-            println!("Could not auto-detect a model from {url}; please enter it manually.");
-            prompt_required("Model: ")?
-        }
+        Some(detected) => prompt_ghosted("Model", &detected)?,
+        None => prompt_required("Model: ")?,
     };
 
     // `[orangu]` client-wide options. Each carries the default the loader would
@@ -404,6 +410,17 @@ fn pager_executable(command: &str) -> &str {
     first.rsplit(['/', '\\']).next().unwrap_or(first)
 }
 
+/// Prefix `http://` onto an endpoint entered without a scheme
+/// (`localhost:8100`); one that already names `http://` or `https://` is kept.
+fn with_http_scheme(endpoint: &str) -> String {
+    let lower = endpoint.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
 /// Query the server's `/v1/models` endpoint and return the first advertised
 /// model id. Any failure (unreachable host, non-success status, empty list) is
 /// reported as `None` so the caller can fall back to a manual prompt.
@@ -495,6 +512,21 @@ where
     }
 }
 
+/// Like [`prompt_with_default`], but ghosts `default` on the empty line; Tab
+/// accepts it, and an empty entry keeps it. Any other value is taken as typed.
+fn prompt_ghosted(label: &str, default: &str) -> Result<String> {
+    let mut editor = option_editor(&[default])?;
+    if let Some(helper) = editor.helper_mut() {
+        helper.default = Some(default.to_string());
+    }
+    let value = read_line(&mut editor, &format!("{label} [{default}]: "))?;
+    Ok(if value.is_empty() {
+        default.to_string()
+    } else {
+        value
+    })
+}
+
 /// Build a line editor that offers TAB completion over `options`.
 fn option_editor(options: &[&str]) -> Result<Editor<OptionCompleter, DefaultHistory>> {
     let config = Config::builder()
@@ -503,6 +535,7 @@ fn option_editor(options: &[&str]) -> Result<Editor<OptionCompleter, DefaultHist
     let mut editor: Editor<OptionCompleter, DefaultHistory> = Editor::with_config(config)?;
     editor.set_helper(Some(OptionCompleter {
         options: options.iter().map(|s| s.to_string()).collect(),
+        default: None,
     }));
     Ok(editor)
 }
@@ -545,8 +578,10 @@ fn prompt_with_options(label: &str, default: &str, options: &[&str]) -> Result<S
 
 /// A rustyline helper that completes the whole line against a fixed option set,
 /// matching the typed prefix case-insensitively (so `y` completes to `Yes`).
+/// `default`, when set, is ghosted on the empty line.
 struct OptionCompleter {
     options: Vec<String>,
+    default: Option<String>,
 }
 
 impl Completer for OptionCompleter {
@@ -576,8 +611,11 @@ impl Hinter for OptionCompleter {
     type Hint = String;
 
     fn hint(&self, line: &str, pos: usize, _ctx: &RlContext<'_>) -> Option<Self::Hint> {
-        if pos != line.len() || line.is_empty() {
+        if pos != line.len() {
             return None;
+        }
+        if line.is_empty() {
+            return self.default.clone();
         }
         let prefix = line.to_lowercase();
         self.options
@@ -590,7 +628,11 @@ impl Hinter for OptionCompleter {
     }
 }
 
-impl Highlighter for OptionCompleter {}
+impl Highlighter for OptionCompleter {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Cow::Owned(format!("{GHOST_TEXT}{hint}{ANSI_RESET}"))
+    }
+}
 impl Validator for OptionCompleter {}
 impl Helper for OptionCompleter {}
 
@@ -617,7 +659,31 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{THEME_SELECTOR, WORKSPACE_OPTIONS, pager_executable, theme_options, tool_status};
+    use super::{
+        THEME_SELECTOR, WORKSPACE_OPTIONS, pager_executable, theme_options, tool_status,
+        with_http_scheme,
+    };
+
+    #[test]
+    fn endpoint_without_a_scheme_gets_http() {
+        assert_eq!(with_http_scheme("localhost:8100"), "http://localhost:8100");
+        assert_eq!(
+            with_http_scheme("10.0.0.2:8100/v1"),
+            "http://10.0.0.2:8100/v1"
+        );
+        assert_eq!(
+            with_http_scheme("http://localhost:8100"),
+            "http://localhost:8100"
+        );
+        assert_eq!(
+            with_http_scheme("https://example.com/v1"),
+            "https://example.com/v1"
+        );
+        assert_eq!(
+            with_http_scheme("HTTPS://example.com"),
+            "HTTPS://example.com"
+        );
+    }
 
     #[test]
     fn workspace_options_are_all_valid_placements() {
@@ -668,6 +734,7 @@ mod tests {
     fn option_completer_ghosts_matching_suffix() {
         let completer = super::OptionCompleter {
             options: theme_options(),
+            default: None,
         };
         let history = rustyline::history::DefaultHistory::new();
         let ctx = rustyline::Context::new(&history);
@@ -677,6 +744,28 @@ mod tests {
         );
         assert_eq!(
             rustyline::hint::Hinter::hint(&completer, "random", 6, &ctx),
+            None
+        );
+    }
+
+    #[test]
+    fn option_completer_ghosts_the_default_on_an_empty_line() {
+        let completer = super::OptionCompleter {
+            options: vec![super::DEFAULT_ENDPOINT.to_string()],
+            default: Some(super::DEFAULT_ENDPOINT.to_string()),
+        };
+        let history = rustyline::history::DefaultHistory::new();
+        let ctx = rustyline::Context::new(&history);
+        assert_eq!(
+            rustyline::hint::Hinter::hint(&completer, "", 0, &ctx),
+            Some("http://localhost:8100".to_string())
+        );
+        assert_eq!(
+            rustyline::hint::Hinter::hint(&completer, "http://loc", 10, &ctx),
+            Some("alhost:8100".to_string())
+        );
+        assert_eq!(
+            rustyline::hint::Hinter::hint(&completer, "10.0.0.2", 8, &ctx),
             None
         );
     }

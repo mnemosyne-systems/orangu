@@ -15,10 +15,12 @@ orangu --init
 
 The wizard:
 
-1. Asks for the **LLM URL** (the server `endpoint`).
+1. Asks for the **Endpoint** (the server `endpoint`, default
+   `http://localhost:8100`). An entry without a scheme, such as
+   `localhost:8100`, gets `http://` prepended.
 2. Queries the server's `/v1/models` endpoint and pre-fills the first
-   advertised model as the **Model** value; if no model can be detected, you
-   enter one manually.
+   advertised model as the **Model** value; if no model can be detected, the
+   prompt has no default and you enter one yourself.
 3. Walks every `[orangu]` and server option, showing its default in
    `[brackets]`. Press Enter to keep the default. Boolean options accept
    `Yes`/`Y`/`No`/`N` (case-insensitive).

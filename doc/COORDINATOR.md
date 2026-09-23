@@ -204,11 +204,9 @@ models = /srv/models
 startup_timeout = 180
 
 [main]
-role = all
 model = ggml-org/gemma-4-E4B-it-GGUF
 
 [explorer]
-role = explorer
 model = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
 backend = vulkan
 slots = 4
@@ -229,7 +227,7 @@ below); set them explicitly only if a profile needs something different.
 | `shutdown_token` | `[orangu-coordinator]` | No | Shared secret that enables the `GET /v1/coordinator/shutdown` endpoint. The caller must pass `?token=<value>` and connect from localhost. Disabled by default when absent. |
 | `log_type` | `[orangu-coordinator]` | No | Where the coordinator's output goes: `console` (the default — exactly what it printed before the key existed) or `file`, which appends every line to `log_path` instead, with a timestamp and level in front. See [Logging to a file](#logging-to-a-file) |
 | `log_path` | `[orangu-coordinator]` | No | The file `log_type = file` writes to. Defaults to `orangu-coordinator.log` in the directory the coordinator was started from; a leading `~` is expanded. Ignored under `log_type = console` |
-| `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. At least one profile must resolve to `all` — it's the fallback profile. Maps to `orangu-server`'s own `--all`/`--code`/`--review`/`--explorer`/`--embedding` flag; anything else is rejected at load time |
+| `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. A section named after a role (`[code]`) is that role and needs no `role` key; set it only on a section with another name (`[qwen]`), and a value contradicting a role-named section is rejected. At least one profile must resolve to `all` — it's the fallback profile. Maps to `orangu-server`'s own `--all`/`--code`/`--review`/`--explorer`/`--embedding` flag; anything else is rejected at load time |
 | `model` | profile | Yes | A model spec in the same shape `orangu-server`'s own positional `MODEL` argument accepts: a local `.gguf` path, an `NR`/`MODEL` label already under the shared `models` directory, or a `<user>/<model>[:quant]` Hugging Face repo (fetched on first start if not already cached). This is the model id a client request's `model` field matches against — profiles *may* share one, e.g. the same model configured once per role; `resolve_entry` breaks any resulting tie by profile name |
 | `host` | profile | No | Host this profile's `orangu-server` listens on, written verbatim into its generated config so it takes the same `all`/`*`/address spellings. Defaults to `all`. The coordinator reaches a wildcard-bound profile over loopback |
 | `port` | profile | No | Port this profile's `orangu-server` listens on. Defaults to `8100` — the same default `orangu-server` itself uses |
@@ -329,8 +327,7 @@ a second on a terminal (`\r`, no newline) is not written; a file gets each
 request's completed line and nothing in between. The keys are read once, at
 startup: a reload that changes them takes effect on the next start.
 
-`log_type = console` (or no `log_type` at all) is exactly the output the
-coordinator has always produced, on the same streams.
+`log_type = console` (or no `log_type` at all) prints to the terminal.
 
 Pass `-s`/`--shell-completions` to print a bash/zsh/fish/PowerShell completion script
 for the shell detected from `$SHELL` and exit — the same switch every orangu
@@ -466,27 +463,19 @@ case the others cannot:
   earlier is the usual cause — or give this profile its own `port`.
   ```
 
-The third exists because of what its absence looked like. The probe used to
-be "does anything answer at this address", which a leftover server satisfies
-instantly — so the coordinator recorded a swap that never happened and
-proxied every request to a process it had not started, serving whatever model
-*that* one held. Its own child failed to bind and exited; the next request
-found it dead, restarted it, and repeated, one model load per attempt, with
-nothing in the log saying anything was wrong beyond a stray `Address already
-in use`.
+A leftover server answers at the address instantly, so a probe that only
+asked whether anything answers would proxy every request to a process the
+coordinator did not start, serving whatever model *that* one holds. Checking
+the pid is what rules this out.
 
 ## Roles share a process
 
 A common configuration gives `all`, `code`, `review` and `explorer` the same
 model file, differing only in `role`. Three of them share a process; **`review`
 does not** — a review is run by an `orangu-server --review`, so the `Mode` row
-on its banner says what is serving it. Moving between them used to stop the
-`orangu-server` and start another one on the identical weights: a full model
-load in each direction, and every cached prefix on the old process died with
-it. An `/auto_review` run alternating with ordinary chat paid that twice per
-turn.
+on its banner says what is serving it.
 
-It no longer does. `ensure_active` keeps the running process whenever the
+`ensure_active` keeps the running process whenever the
 requested profile differs from it in nothing but `role`, and the proxy sends
 the resolved role along with each request as `x-orangu-role`.
 `orangu-server` reads that header for the two things a role actually decides
@@ -496,7 +485,7 @@ the resolved role along with each request as `x-orangu-role`.
 of the model that was loaded.
 
 Anything else — a different model, port, backend, `slots` or `web` — is a
-different process and still swaps. So is `review`, so that a review always runs
+different process and swaps. So is `review`, so that a review always runs
 on a server started in that role. So is `embeddings`, in either direction,
 however identical the rest of the profile: an `--embedding` server refuses the
 generation endpoints outright, so sharing a process with a chat role would

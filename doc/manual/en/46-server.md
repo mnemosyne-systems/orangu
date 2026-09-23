@@ -2108,12 +2108,16 @@ prompts for `role` (TAB-completing over the five names a language model
 can take, defaulting to `all`), right after `model`, and only writes the
 `role =` line when a non-default value was chosen; an image model answers
 `image` on its own and is then asked the picture pipeline's keys, each
-written only when it differs from the default (see **Image generation**). **Answering `host` with anything but a loopback
-address then prompts for an `api_key`** — that is the question the wizard just
-created by widening the address, and asking it here is the difference between
-walking someone into an exposed server and letting them decide. Leaving it
-blank is still allowed and still writes no key; the prompt names the
-consequence rather than insisting. It also asks `Add Prometheus
+written only when it differs from the default (see **Image generation**). It then
+asks for every other `[orangu-server]` key with the default the server applies
+without it — `api_key`, `tls_cert` (and, with one, `tls_key`), `slots`,
+`queue_limit`, `context`, `kv_cache`, `draft_model` (and, with one,
+`draft_tokens`), `reasoning_effort`, `backend`, `device`, `device_split`,
+`threads`, `prefill_backend`, `mlp_unroll`, `npu_cache_gb`, `npu_precompile`,
+`read_size` — and writes only the ones answered with something else. **On
+an address other than loopback the `api_key` prompt says that a blank
+answer leaves the server reachable off this machine**; blank writes no key.
+It also asks `Add Prometheus
 metrics` — declining (the default)
 writes no `[prometheus]` section at all; accepting prompts for a `host`
 (defaulting to the API's) and a `port` (suggesting `8300`) and writes a `[prometheus]` section. A `models`
@@ -3321,10 +3325,11 @@ An image model is not served in a role you pick: it is always `image`, and
 
 `--init` follows the same rule. Picking an image model at its `model`
 prompt answers `role: image` on its own, and then asks for every key of
-the picture pipeline — `text_encoder`, `vae`, `image_lora` (and, with an
-adapter, `image_lora_merge`), `vae_precision`, `image_size`,
+the picture pipeline — `text_encoder`, `vision` (Qwen-Image 2.1), `vae`,
+`image_lora` (and, with an adapter, `image_lora_merge`), `vae_precision`,
+`image_weights` (Qwen-Image 2.1), `image_cache`, `image_size`,
 `image_steps`, `image_cfg_scale`, `image_negative_prompt`,
-`image_strength`, `image_format` — each defaulting to what the server does
+`image_strength`, `image_format`, `image_reference_size` — each defaulting to what the server does
 without it;
 Enter on all of them writes none of them, like every other default the
 wizard leaves out. `image_lora` offers `auto` and says which Lightning

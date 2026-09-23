@@ -170,10 +170,8 @@ fn render_config(
 
     let mut contents = format!("[orangu-coordinator]\n{}\n", client.join("\n"));
     for (role, model, host, port) in roles {
+        // The section name is the role, so no `role` key is written.
         let mut section = format!("\n[{role}]\n");
-        if role.as_str() != "all" {
-            section.push_str(&format!("role = {role}\n"));
-        }
         section.push_str(&format!("model = {model}\n"));
         if host != &default_host() {
             section.push_str(&format!("host = {host}\n"));
@@ -1039,10 +1037,10 @@ mod tests {
         assert!(contents.contains("model = org/gemma\n"));
         assert!(contents.contains("host = 192.168.1.1\n"));
         assert!(contents.contains("port = 9999\n"));
-        assert!(contents.contains("[explorer]\nrole = explorer\nmodel = org/qwen\n"));
-        // `all`'s own role and `explorer`'s own host/port all match their
-        // defaults and must not be written.
-        assert!(!contents.contains("role = all"));
+        assert!(contents.contains("[explorer]\nmodel = org/qwen\n"));
+        // The section name carries the role, and `explorer`'s own host/port
+        // match their defaults, so none of them is written.
+        assert!(!contents.contains("role ="));
         assert!(!contents.contains(&format!("host = {}", default_host())));
         assert!(!contents.contains(&format!("port = {}\n", default_profile_port())));
     }

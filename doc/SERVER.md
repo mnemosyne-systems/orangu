@@ -1463,11 +1463,16 @@ is then asked the picture pipeline's keys — see **Image generation**),
 then `host` (TAB-completing — and previewing as an inline grey
 ghost — `all`, `*`, and every address this machine's network interfaces
 actually have, each listed with the interface it belongs to), then
-`port`/`web`/`prometheus`, then `log_type` (TAB-completing `console`/`file`, ghosting
+`port`, then every other `[orangu-server]` key with the default the server
+applies without it (`api_key`, `tls_cert`/`tls_key`, `slots`,
+`queue_limit`, `context`, `kv_cache`, `draft_model`/`draft_tokens`,
+`reasoning_effort`, `backend`, `device`, `device_split`, `threads`,
+`prefill_backend`, `mlp_unroll`, `npu_cache_gb`, `npu_precompile`,
+`read_size`), then `log_type` (TAB-completing `console`/`file`, ghosting
 `console`) and — only on `file` — `log_path` (TAB-completing real
 filesystem paths as you type, and ghosting its default,
-`orangu-server.log` in the current directory, on the empty line), shows the
-resulting file, and asks for confirmation before writing (creating the
+`orangu-server.log` in the current directory, on the empty line), then
+`Add web console` and `Add Prometheus metrics`, shows the resulting file, and asks for confirmation before writing (creating the
 directory if needed, and overwriting any existing file). Only writes the
 `role =` line when a non-default value was chosen; a `file` log's
 `log_path` is always written, since its default moves with the directory
@@ -1915,10 +1920,11 @@ An image model is not served in a role you pick: it is always `image`, and
 
 `--init` follows the same rule. Picking an image model at its `model`
 prompt answers `role: image` on its own, and then asks for every key of
-the picture pipeline — `text_encoder`, `vae`, `image_lora` (and, with an
-adapter, `image_lora_merge`), `vae_precision`, `image_size`,
+the picture pipeline — `text_encoder`, `vision` (Qwen-Image 2.1), `vae`,
+`image_lora` (and, with an adapter, `image_lora_merge`), `vae_precision`,
+`image_weights` (Qwen-Image 2.1), `image_cache`, `image_size`,
 `image_steps`, `image_cfg_scale`, `image_negative_prompt`,
-`image_strength`, `image_format` — each defaulting to what the server does
+`image_strength`, `image_format`, `image_reference_size` — each defaulting to what the server does
 without it;
 Enter on all of them writes none of them, like every other default the
 wizard leaves out. `image_lora` offers `auto` and says which Lightning

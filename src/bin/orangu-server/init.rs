@@ -16,9 +16,9 @@
 //! Interactive `--init` flow that writes `~/.orangu/orangu-server.conf`.
 
 use crate::config::{
-    DEFAULT_READ_SIZE, HOST_ALL, HOST_ALL_ALIAS, PROMETHEUS_SECTION, Role, WEB_SECTION,
-    default_delete, default_host, default_port, default_prometheus_port, default_reexec,
-    default_web_port,
+    DEFAULT_DRAFT_TOKENS, DEFAULT_READ_SIZE, HOST_ALL, HOST_ALL_ALIAS, KvCache, PROMETHEUS_SECTION,
+    Role, WEB_SECTION, default_delete, default_host, default_npu_cache_gb, default_npu_precompile,
+    default_port, default_prometheus_port, default_reexec, default_web_port,
 };
 use anyhow::{Context, Result, anyhow};
 use orangu::logging::{LOG_TYPES, LogTarget, default_log_path};
@@ -89,21 +89,18 @@ pub fn run_init() -> Result<()> {
     };
     let host = prompt_host(&default_host())?;
     let port = prompt_line("port", &default_port().to_string())?;
-    // Asked only when the answer above made it matter. On loopback the server
-    // is reachable by whoever is already on the machine and a key buys
-    // nothing; the moment the address is widened it is the difference between
-    // a private tool and a published inference engine — and this wizard is
-    // where that decision is actually being made, so it is the place to ask.
-    // Empty leaves the server open, which stays the default rather than
-    // becoming a thing you have to know to ask for.
+    // Empty leaves the server open. On a widened address the label says what
+    // that means: a key is the difference between a private tool and a
+    // published inference engine.
     let api_key = if is_public_host(&host) {
         prompt_line(
             "api_key (blank = no authentication, and the server is reachable off this machine)",
             "",
         )?
     } else {
-        String::new()
+        prompt_line("api_key (blank = no authentication)", "")?
     };
+    let serving = prompt_serving_keys(role)?;
     // A storage knob rather than a deployment one, so it is asked after
     // everything that decides *what* is served and *where*, and answered by
     // pressing Enter unless the operator has measured their own drive. The
@@ -158,6 +155,7 @@ pub fn run_init() -> Result<()> {
     if !api_key.trim().is_empty() {
         contents.push_str(&format!("api_key = {}\n", api_key.trim()));
     }
+    contents.push_str(&serving.render());
     // Written only when it differs from the default, the same rule `role`
     // and the `[web]` booleans follow — a config file full of restated
     // defaults hides the two lines that were actually chosen.
@@ -993,8 +991,8 @@ fn host_completion_options(interfaces: &[(String, IpAddr)]) -> Vec<HostOption> {
 /// `all` and `0.0.0.0`/`::` obviously do; a literal address that is not a
 /// loopback one does too, and answering `192.168.1.10` is a perfectly ordinary
 /// way to reach this state. Anything unparseable is treated as public, because
-/// the failure of guessing wrong in that direction is one extra question,
-/// where guessing wrong the other way is silence about an exposed server.
+/// guessing wrong in that direction costs a longer label, where guessing wrong
+/// the other way is silence about an exposed server.
 fn is_public_host(host: &str) -> bool {
     let host = host.trim();
     if host.eq_ignore_ascii_case(HOST_ALL) || host.eq_ignore_ascii_case(HOST_ALL_ALIAS) {
@@ -1037,6 +1035,9 @@ pub(crate) struct ImageKeys {
     /// `text_encoder`: the `qwen2vl` GGUF, when not the one found under
     /// `models`.
     pub text_encoder: Option<String>,
+    /// `vision`: the projector, or `none`, when not the one found beside the
+    /// text encoder.
+    pub vision: Option<String>,
     /// `vae`: the `.safetensors`, when not the one found under `models`.
     pub vae: Option<String>,
     /// `image_lora`: `none`, or an adapter named instead of the one found
@@ -1046,6 +1047,10 @@ pub(crate) struct ImageKeys {
     pub image_lora_merge: Option<bool>,
     /// `vae_precision`, when `f32` (the default is `int8`).
     pub vae_precision: Option<String>,
+    /// `image_weights`, when not `auto`.
+    pub image_weights: Option<String>,
+    /// `image_cache`, when not `easy`.
+    pub image_cache: Option<String>,
     /// `image_size`, as typed (`WIDTHxHEIGHT` or one side).
     pub size: Option<String>,
     pub steps: Option<usize>,
@@ -1054,6 +1059,8 @@ pub(crate) struct ImageKeys {
     pub strength: Option<f32>,
     /// `image_format`, when not `png`.
     pub format: Option<String>,
+    /// `image_reference_size`, when not `source`.
+    pub reference_size: Option<String>,
 }
 
 impl ImageKeys {
@@ -1064,6 +1071,9 @@ impl ImageKeys {
         let mut out = String::new();
         if let Some(path) = &self.text_encoder {
             out.push_str(&format!("text_encoder = {path}\n"));
+        }
+        if let Some(path) = &self.vision {
+            out.push_str(&format!("vision = {path}\n"));
         }
         if let Some(path) = &self.vae {
             out.push_str(&format!("vae = {path}\n"));
@@ -1079,6 +1089,12 @@ impl ImageKeys {
         }
         if let Some(precision) = &self.vae_precision {
             out.push_str(&format!("vae_precision = {precision}\n"));
+        }
+        if let Some(weights) = &self.image_weights {
+            out.push_str(&format!("image_weights = {weights}\n"));
+        }
+        if let Some(cache) = &self.image_cache {
+            out.push_str(&format!("image_cache = {cache}\n"));
         }
         if let Some(size) = &self.size {
             out.push_str(&format!("image_size = {size}\n"));
@@ -1097,6 +1113,9 @@ impl ImageKeys {
         }
         if let Some(format) = &self.format {
             out.push_str(&format!("image_format = {format}\n"));
+        }
+        if let Some(size) = &self.reference_size {
+            out.push_str(&format!("image_reference_size = {size}\n"));
         }
         out
     }
@@ -1121,6 +1140,15 @@ fn prompt_image_keys(
         &format!("text_encoder (blank = the {encoder_arch} GGUF found under models)"),
         "",
     )?;
+    // Only Qwen-Image 2.1 reads attached pictures through a projector.
+    let vision = if variant == Variant::QwenImage21 {
+        prompt_line(
+            "vision (blank = the mmproj found beside the text encoder; none = draw over attached pictures)",
+            "",
+        )?
+    } else {
+        String::new()
+    };
     let vae = prompt_line("vae (blank = the .safetensors VAE found under models)", "")?;
     // `auto` is the Lightning adapter under `models` — fetched with the
     // model, and what the server serves when the key is absent — so the
@@ -1178,6 +1206,16 @@ fn prompt_image_keys(
             .map(|_| ())
             .ok_or_else(|| anyhow!("expected int8 or f32"))
     })?;
+    let image_weights = if variant == Variant::QwenImage21 {
+        prompt_choice("image_weights", "auto", &["auto", "int8", "file"])?
+    } else {
+        "auto".to_string()
+    };
+    let image_cache = prompt_checked(
+        "image_cache (easy, easy:<threshold> or off)",
+        "easy",
+        |value| crate::engine::image::stepcache::ImageCache::parse(value).map(|_| ()),
+    )?;
     let default_size = format!("{}x{}", defaults.width, defaults.height);
     let unit = variant.size_unit();
     let size = prompt_checked("image_size", &default_size, |value| {
@@ -1236,9 +1274,22 @@ fn prompt_image_keys(
                 .ok_or_else(|| anyhow!("expected png, jpeg, gif, webp or svg"))
         },
     )?;
+    let reference_size = prompt_checked(
+        "image_reference_size (source, output or WIDTHxHEIGHT)",
+        "source",
+        |value| {
+            crate::engine::image::ReferenceCap::parse(value)
+                .map(|_| ())
+                .ok_or_else(|| anyhow!("expected source, output or WIDTHxHEIGHT"))
+        },
+    )?;
     Ok(ImageKeys {
         text_encoder: Some(text_encoder).filter(|value| !value.is_empty()),
+        vision: Some(vision).filter(|value| !value.is_empty()),
         vae: Some(vae).filter(|value| !value.is_empty()),
+        image_weights: Some(image_weights.to_lowercase()).filter(|value| value != "auto"),
+        image_cache: Some(image_cache.to_lowercase()).filter(|value| value != "easy"),
+        reference_size: Some(reference_size.to_lowercase()).filter(|value| value != "source"),
         image_lora: Some(image_lora).filter(|value| !value.is_empty()),
         image_lora_merge: Some(image_lora_merge).filter(|merge| !merge),
         vae_precision: Some(vae_precision).filter(|value| {
@@ -1260,6 +1311,223 @@ fn prompt_image_keys(
             .filter(|format| *format != defaults.format)
             .map(|format| format.name().to_string()),
     })
+}
+
+/// The `[orangu-server]` keys that decide how requests are served and on
+/// what hardware, as answered: each `Some` only when it differs from the
+/// loader's default, so the file names only what was chosen.
+#[derive(Debug, Default, PartialEq)]
+pub struct ServingKeys {
+    pub tls_cert: Option<String>,
+    pub tls_key: Option<String>,
+    pub slots: Option<String>,
+    pub queue_limit: Option<String>,
+    pub context: Option<String>,
+    pub kv_cache: Option<String>,
+    pub draft_model: Option<String>,
+    pub draft_tokens: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub backend: Option<String>,
+    pub device: Option<String>,
+    pub device_split: Option<String>,
+    pub threads: Option<String>,
+    pub prefill_backend: Option<String>,
+    pub mlp_unroll: Option<String>,
+    pub npu_cache_gb: Option<String>,
+    pub npu_precompile: Option<String>,
+}
+
+impl ServingKeys {
+    /// The lines for the config file, in the order the wizard asks them.
+    pub fn render(&self) -> String {
+        [
+            ("tls_cert", &self.tls_cert),
+            ("tls_key", &self.tls_key),
+            ("slots", &self.slots),
+            ("queue_limit", &self.queue_limit),
+            ("context", &self.context),
+            ("kv_cache", &self.kv_cache),
+            ("draft_model", &self.draft_model),
+            ("draft_tokens", &self.draft_tokens),
+            ("reasoning_effort", &self.reasoning_effort),
+            ("backend", &self.backend),
+            ("device", &self.device),
+            ("device_split", &self.device_split),
+            ("threads", &self.threads),
+            ("prefill_backend", &self.prefill_backend),
+            ("mlp_unroll", &self.mlp_unroll),
+            ("npu_cache_gb", &self.npu_cache_gb),
+            ("npu_precompile", &self.npu_precompile),
+        ]
+        .into_iter()
+        .filter_map(|(key, value)| value.as_ref().map(|value| format!("{key} = {value}\n")))
+        .collect()
+    }
+}
+
+/// Backends `[orangu-server].backend` accepts.
+const BACKENDS: &[&str] = &[
+    "auto", "cpu", "vulkan", "metal", "dx12", "cuda", "opencl", "rocm", "npu",
+];
+/// `[orangu-server].prefill_backend` values.
+const PREFILL_BACKENDS: &[&str] = &["device", "cpu", "auto"];
+/// `[orangu-server].mlp_unroll`: `auto` leaves the key out and lets the
+/// backend decide per quantized type.
+const MLP_UNROLL: &[&str] = &["auto", "yes", "no"];
+
+/// `Some(value)` unless `value` is `default` (or blank, when the default is
+/// the key being absent).
+fn changed(value: String, default: &str) -> Option<String> {
+    Some(value).filter(|value| !value.is_empty() && value != default)
+}
+
+/// Asks for the serving and hardware keys, each with the default the loader
+/// applies when it is absent. A picture model is asked only the keys that
+/// apply to it; its own keys come from [`prompt_image_keys`].
+fn prompt_serving_keys(role: Role) -> Result<ServingKeys> {
+    let text = role != Role::Image;
+    let tls_cert = prompt_line("tls_cert (blank = plain HTTP)", "")?;
+    let tls_key = if tls_cert.is_empty() {
+        String::new()
+    } else {
+        prompt_required("tls_key")?
+    };
+    let default_slots = role.default_slots().to_string();
+    let slots = prompt_checked("slots", &default_slots, |value| {
+        match value.parse::<usize>() {
+            Ok(slots) if slots > 0 => Ok(()),
+            _ => Err(anyhow!("expected a whole number of 1 or more")),
+        }
+    })?;
+    let queue_limit = prompt_checked("queue_limit (0 = unbounded)", "0", |value| {
+        value
+            .parse::<usize>()
+            .map(|_| ())
+            .map_err(|_| anyhow!("expected a whole number"))
+    })?;
+    let mut keys = ServingKeys {
+        tls_cert: changed(tls_cert, ""),
+        tls_key: changed(tls_key, ""),
+        slots: changed(slots, &default_slots),
+        queue_limit: changed(queue_limit, "0"),
+        ..ServingKeys::default()
+    };
+    if text {
+        let context = prompt_checked(
+            "context (blank = whatever the card has left)",
+            "",
+            |value| match value.parse::<usize>() {
+                _ if value.is_empty() => Ok(()),
+                Ok(context) if context > 0 => Ok(()),
+                _ => Err(anyhow!("expected a whole number of tokens, 1 or more")),
+            },
+        )?;
+        let kv_tags: Vec<&str> = KvCache::ALL.iter().map(|kv| kv.tag()).collect();
+        let kv_cache = prompt_choice("kv_cache", KvCache::default().tag(), &kv_tags)?;
+        let draft_model = prompt_line("draft_model (blank = no speculative decoding)", "")?;
+        let default_draft_tokens = DEFAULT_DRAFT_TOKENS.to_string();
+        let draft_tokens = if draft_model.is_empty() {
+            String::new()
+        } else {
+            prompt_checked("draft_tokens", &default_draft_tokens, |value| {
+                match value.parse::<usize>() {
+                    Ok(tokens) if tokens > 0 => Ok(()),
+                    _ => Err(anyhow!("expected a whole number of 1 or more")),
+                }
+            })?
+        };
+        let reasoning_effort =
+            prompt_line("reasoning_effort (blank = the chat template's own)", "")?;
+        keys.context = changed(context, "");
+        keys.kv_cache = changed(kv_cache, KvCache::default().tag());
+        keys.draft_model = changed(draft_model, "");
+        keys.draft_tokens = changed(draft_tokens, &default_draft_tokens);
+        keys.reasoning_effort = changed(reasoning_effort, "");
+    }
+    let backend = prompt_choice("backend", "auto", BACKENDS)?;
+    let device = prompt_line("device (an index, part of a name, or auto)", "auto")?;
+    let device_split = prompt_checked(
+        "device_split (off, auto, all, or ratios such as 3,1)",
+        "off",
+        |value| {
+            crate::engine::placement::SplitMode::parse(value)
+                .map(|_| ())
+                .map_err(|err| anyhow!("{err}"))
+        },
+    )?;
+    let threads = prompt_checked(
+        "threads (blank = one per logical core)",
+        "",
+        |value| match value.parse::<usize>() {
+            _ if value.is_empty() => Ok(()),
+            Ok(threads) if threads > 0 => Ok(()),
+            _ => Err(anyhow!("expected a whole number of 1 or more")),
+        },
+    )?;
+    keys.backend = changed(backend, "auto");
+    keys.device = changed(device, "auto");
+    keys.device_split = changed(device_split, "off");
+    keys.threads = changed(threads, "");
+    if text {
+        let prefill_backend = prompt_choice("prefill_backend", "device", PREFILL_BACKENDS)?;
+        let mlp_unroll = prompt_choice("mlp_unroll", "auto", MLP_UNROLL)?;
+        keys.prefill_backend = changed(prefill_backend, "device");
+        keys.mlp_unroll = changed(mlp_unroll, "auto");
+    }
+    let default_cache_gb = format!("{:.1}", default_npu_cache_gb());
+    let npu_cache_gb = prompt_checked(
+        "npu_cache_gb (GiB)",
+        &default_cache_gb,
+        |value| match value.parse::<f64>() {
+            Ok(gb) if gb >= 0.0 => Ok(()),
+            _ => Err(anyhow!("expected a number of GiB, 0 or more")),
+        },
+    )?;
+    let npu_precompile = prompt_bool("npu_precompile", default_npu_precompile())?;
+    keys.npu_cache_gb = changed(npu_cache_gb, &default_cache_gb);
+    keys.npu_precompile = (npu_precompile != default_npu_precompile())
+        .then(|| if npu_precompile { "yes" } else { "no" }.to_string());
+    Ok(keys)
+}
+
+/// Asks for one of `options` (case-insensitively), ghosting `default` on the
+/// empty line and TAB-completing the rest; anything else re-asks.
+fn prompt_choice(label: &str, default: &str, options: &[&str]) -> Result<String> {
+    let config = Config::builder()
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+    let mut editor: Editor<OptionCompleter, DefaultHistory> = Editor::with_config(config)?;
+    editor.set_helper(Some(OptionCompleter {
+        options: options.iter().map(|option| option.to_string()).collect(),
+        default: Some(default.to_string()),
+    }));
+    loop {
+        let value = match editor.readline(&format!("{label} [{default}]: ")) {
+            Ok(line) => line.trim().to_lowercase(),
+            Err(ReadlineError::Eof | ReadlineError::Interrupted) => {
+                return Err(anyhow!("aborted: reached end of input"));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        if value.is_empty() {
+            return Ok(default.to_string());
+        }
+        if options.contains(&value.as_str()) {
+            return Ok(value);
+        }
+        println!("'{value}' is not one of: {}.", options.join(", "));
+    }
+}
+
+/// Asks until a non-empty value is entered.
+fn prompt_required(label: &str) -> Result<String> {
+    loop {
+        let value = prompt_line(label, "")?;
+        if !value.is_empty() {
+            return Ok(value);
+        }
+        println!("{label} is required.");
+    }
 }
 
 /// [`prompt_line`] that keeps asking until `check` accepts the answer —
@@ -1334,14 +1602,10 @@ fn prompt_bool_yes_default(label: &str) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    /// The wizard asks for a key exactly when the address it just wrote makes
-    /// one matter.
-    ///
-    /// Getting this wrong in one direction costs a question nobody needed; in
-    /// the other it means the wizard walked an operator into an exposed server
-    /// without mentioning it, which is the whole reason the prompt exists.
+    /// The `api_key` prompt warns exactly when the address it just wrote
+    /// makes the server reachable off this machine.
     #[test]
-    fn a_key_is_offered_only_for_an_address_reachable_off_this_machine() {
+    fn the_key_prompt_warns_only_for_an_address_reachable_off_this_machine() {
         for public in [
             "all",
             "0.0.0.0",
@@ -1350,10 +1614,10 @@ mod tests {
             "10.0.0.1",
             "nonsense",
         ] {
-            assert!(is_public_host(public), "{public:?} should prompt for a key");
+            assert!(is_public_host(public), "{public:?} should warn");
         }
         for private in ["127.0.0.1", "::1", "  127.0.0.1  "] {
-            assert!(!is_public_host(private), "{private:?} should not prompt");
+            assert!(!is_public_host(private), "{private:?} should not warn");
         }
     }
 
@@ -1713,12 +1977,17 @@ mod tests {
             negative_prompt: Some("blurry".to_string()),
             strength: Some(0.8),
             format: Some("webp".to_string()),
+            vision: Some("none".to_string()),
+            image_weights: Some("int8".to_string()),
+            image_cache: Some("off".to_string()),
+            reference_size: Some("output".to_string()),
         };
         assert_eq!(
             keys.render(),
-            "vae = /srv/vae/qwen_image_vae.safetensors\nvae_precision = f32\nimage_size = 512x512\n\
+            "vision = none\nvae = /srv/vae/qwen_image_vae.safetensors\nvae_precision = f32\n\
+             image_weights = int8\nimage_cache = off\nimage_size = 512x512\n\
              image_steps = 20\nimage_negative_prompt = blurry\nimage_strength = 0.8\n\
-             image_format = webp\n"
+             image_format = webp\nimage_reference_size = output\n"
         );
         let keys = ImageKeys {
             image_lora: Some("lightx2v/Qwen-Image-2512-Lightning:x-8steps.safetensors".to_string()),
@@ -1732,6 +2001,92 @@ mod tests {
             "image_lora = lightx2v/Qwen-Image-2512-Lightning:x-8steps.safetensors\n\
              image_lora_merge = no\nimage_steps = 8\nimage_cfg_scale = 1\n"
         );
+    }
+
+    /// Enter through every serving prompt writes nothing.
+    #[test]
+    fn serving_keys_left_at_their_defaults_write_nothing() {
+        assert_eq!(ServingKeys::default().render(), "");
+        assert_eq!(changed("auto".to_string(), "auto"), None);
+        assert_eq!(changed(String::new(), ""), None);
+        assert_eq!(
+            changed("vulkan".to_string(), "auto"),
+            Some("vulkan".to_string())
+        );
+    }
+
+    /// The defaults the prompts offer are the ones the loader applies, and
+    /// every value they write loads.
+    #[test]
+    fn serving_keys_the_wizard_writes_load_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orangu-server.conf");
+        let models = dir.path().display().to_string();
+
+        std::fs::write(&path, format!("[orangu-server]\nmodels = {models}\n")).unwrap();
+        let defaults = crate::config::load_server_configuration(&path, None, false).unwrap();
+        assert_eq!(defaults.slots, Role::default().default_slots());
+        assert_eq!(defaults.queue_limit, 0);
+        assert_eq!(defaults.context, None);
+        assert_eq!(defaults.kv_cache.tag(), KvCache::default().tag());
+        assert_eq!(defaults.draft_tokens, DEFAULT_DRAFT_TOKENS);
+        assert_eq!(defaults.reasoning_effort, None);
+        assert_eq!(defaults.threads, None);
+        assert_eq!(defaults.npu_precompile, default_npu_precompile());
+        assert_eq!(
+            format!("{:.1}", defaults.npu_cache_gb),
+            format!("{:.1}", default_npu_cache_gb())
+        );
+
+        let keys = ServingKeys {
+            slots: Some("2".to_string()),
+            queue_limit: Some("8".to_string()),
+            context: Some("16384".to_string()),
+            kv_cache: Some("q8_0".to_string()),
+            draft_model: Some("org/draft".to_string()),
+            draft_tokens: Some("6".to_string()),
+            reasoning_effort: Some("low".to_string()),
+            backend: Some("cpu".to_string()),
+            device: Some("1".to_string()),
+            device_split: Some("3,1".to_string()),
+            threads: Some("4".to_string()),
+            prefill_backend: Some("auto".to_string()),
+            mlp_unroll: Some("no".to_string()),
+            npu_cache_gb: Some("2.5".to_string()),
+            npu_precompile: Some("no".to_string()),
+            ..ServingKeys::default()
+        };
+        std::fs::write(
+            &path,
+            format!("[orangu-server]\nmodels = {models}\n{}", keys.render()),
+        )
+        .unwrap();
+        let loaded = crate::config::load_server_configuration(&path, None, false).unwrap();
+        assert_eq!(loaded.slots, 2);
+        assert_eq!(loaded.queue_limit, 8);
+        assert_eq!(loaded.context, Some(16384));
+        assert_eq!(loaded.kv_cache.tag(), "q8_0");
+        assert_eq!(loaded.draft_tokens, 6);
+        assert_eq!(loaded.threads, Some(4));
+        assert_eq!(loaded.mlp_unroll, Some(false));
+        assert!(!loaded.npu_precompile);
+
+        for backend in BACKENDS {
+            std::fs::write(
+                &path,
+                format!("[orangu-server]\nmodels = {models}\nbackend = {backend}\n"),
+            )
+            .unwrap();
+            crate::config::load_server_configuration(&path, None, false).unwrap();
+        }
+        for prefill in PREFILL_BACKENDS {
+            std::fs::write(
+                &path,
+                format!("[orangu-server]\nmodels = {models}\nprefill_backend = {prefill}\n"),
+            )
+            .unwrap();
+            crate::config::load_server_configuration(&path, None, false).unwrap();
+        }
     }
 
     /// Two models — or none at all — still go to the prompt: picking one of

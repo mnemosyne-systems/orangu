@@ -86,11 +86,9 @@ models = /srv/models
 startup_timeout = 180
 
 [main]
-role = all
 model = ggml-org/gemma-4-E4B-it-GGUF
 
 [explorer]
-role = explorer
 model = unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF
 ```
 
@@ -115,7 +113,7 @@ only.
 | `shutdown_token` | `[orangu-coordinator]` | No | Shared secret that enables the `GET /v1/coordinator/shutdown` endpoint. The caller must pass `?token=<value>` and connect from localhost. Disabled by default when absent. |
 | `log_type` | `[orangu-coordinator]` | No | Where the coordinator's output goes: `console` (the default — exactly what it printed before the key existed) or `file`, which appends every line to `log_path` instead, stamped with a time and a level. Forwarded to every profile's `orangu-server`, which then logs into the same file — without the once-a-second progress line a request rewrites on a terminal, which a file has no use for |
 | `log_path` | `[orangu-coordinator]` | No | The file `log_type = file` writes to. Defaults to `orangu-coordinator.log` in the directory the coordinator was started from; a leading `~` is expanded. Ignored under `log_type = console` |
-| `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. At least one profile must resolve to `all` — it's the fallback profile. Maps to `orangu-server`'s own `--all`/`--code`/`--review`/`--explorer`/`--embedding` flag |
+| `role` | profile | No | Same roles as `orangu.conf`: `all` (default), `code`, `review`, `explorer`, `embeddings`. A section named after a role (`[code]`) is that role and needs no `role` key; set it only on a section with another name (`[qwen]`), and a value contradicting a role-named section is rejected. At least one profile must resolve to `all` — it's the fallback profile. Maps to `orangu-server`'s own `--all`/`--code`/`--review`/`--explorer`/`--embedding` flag |
 | `model` | profile | Yes | A model spec — local `.gguf` path, `NR`/`MODEL` label, or `<user>/<model>[:quant]` Hugging Face repo — the same shape `orangu-server`'s own positional `MODEL` argument accepts |
 | `host` | profile | No | Host this profile's `orangu-server` listens on — written straight into its generated config, so it takes the same `all`/`*`/address spellings. Defaults to `all` |
 | `port` | profile | No | Port this profile's `orangu-server` listens on. Defaults to `8100` — the same default `orangu-server` itself uses |
