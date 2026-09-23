@@ -313,15 +313,17 @@ pub struct Tokenizer {
     /// immediately end generation, which is never what a chat/completion
     /// caller wants.
     add_eos_token: bool,
-    /// `tokenizer.ggml.add_bos_token` — only consulted by [`Tokenizer::
-    /// encode_for_embedding`], same reasoning as `add_eos_token`: a chat/
-    /// completion caller decides whether it wants BOS for itself (via
-    /// [`Tokenizer::encode`]'s own `add_bos` parameter), independent of
-    /// what this metadata says. Defaults to `true` when the key is absent
-    /// — most decoder-LM GGUFs this engine has been tested against want
-    /// BOS by default and simply don't bother setting the key; `qwen3vl`
-    /// (`ADD_BOS_TOKEN` explicitly `false`) is the one real counter-
-    /// example found so far, which is exactly why this isn't hardcoded.
+    /// `tokenizer.ggml.add_bos_token`, read by [`Tokenizer::wants_bos`] and
+    /// by [`Tokenizer::encode_for_embedding`]. Defaults to `true` when the
+    /// key is absent — most decoder-LM GGUFs want BOS and don't bother
+    /// setting it.
+    ///
+    /// **A completion asks this rather than assuming.** It used to be
+    /// consulted only for embeddings, on the reasoning that a chat or
+    /// completion caller decides BOS for itself; every such caller then
+    /// passed `true`, which is wrong for a file that says `false` and wrong
+    /// in a way nothing reports. `qwen3vl` and `bailingmoe3` both set it
+    /// `false`.
     add_bos_token: bool,
     vocab_kind: VocabKind,
     /// Token id -> raw byte value, for `<0xXX>`-format byte-fallback tokens
@@ -596,6 +598,22 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.id_to_token.len()
+    }
+
+    /// Whether this file asks for a BOS token in front of a prompt —
+    /// `tokenizer.ggml.add_bos_token`, `true` where the key is absent.
+    ///
+    /// **What a completion should pass to [`Self::encode`].** Hardcoding
+    /// `true` there puts a BOS in front of every prompt for a model trained
+    /// without one, and nothing about that is visible as an error: the
+    /// prompt is one token longer than the same text is anywhere else, and
+    /// the continuation is merely different. Measured on a `bailingmoe3`
+    /// file, which sets the key to `false`: 907 tokens against the
+    /// reference's 906 for the same text, and a greedy continuation that
+    /// diverged from it while every other model in the set matched byte for
+    /// byte.
+    pub fn wants_bos(&self) -> bool {
+        self.add_bos_token
     }
 
     /// Encodes `text` to token ids, prefixed with the model's BOS token if
@@ -1807,6 +1825,38 @@ mod tests {
         let mut out: String = ids.iter().map(|&id| decoder.push(tok, id)).collect();
         out.push_str(&decoder.flush());
         out
+    }
+
+    /// `wants_bos` is what a completion passes to `encode`, so it has to
+    /// be the file's answer and not a constant. Both directions: a file
+    /// that says `false` gets no BOS, and a file that says nothing keeps
+    /// the default that every other model in the set relies on.
+    ///
+    /// The bug this guards: every chat and completion call site hardcoded
+    /// `true`, which put a BOS in front of a `bailingmoe3` prompt — 907
+    /// tokens where the reference made 906 of the same text — and showed
+    /// up only as a continuation that quietly disagreed with it.
+    #[test]
+    fn a_completion_takes_bos_from_the_file_not_from_a_constant() {
+        let mut gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert!(
+            tok.wants_bos(),
+            "absent metadata keeps the default every other model relies on"
+        );
+        assert_eq!(tok.encode("hi", tok.wants_bos())[0], tok.bos_token.unwrap());
+
+        gguf.metadata.push((
+            "tokenizer.ggml.add_bos_token".to_string(),
+            GgufValue::Bool(false),
+        ));
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert!(!tok.wants_bos(), "the file said not to");
+        assert_ne!(
+            tok.encode("hi", tok.wants_bos()).first().copied(),
+            tok.bos_token,
+            "a completion must not prefix BOS for this file"
+        );
     }
 
     #[test]

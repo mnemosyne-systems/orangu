@@ -270,6 +270,42 @@ pub fn scope<T>(stage: Stage, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// [`scope`] as a guard, for a stage that spans statements rather than one
+/// expression — a loop in the middle of a function, where wrapping the
+/// whole thing in a closure would mean restructuring the code around the
+/// measurement.
+///
+/// The stage closes when the guard drops, so a guard must be dropped where
+/// the stage really ends and not merely at the end of the function: a stage
+/// that runs long swallows its siblings, and the breakdown stops summing to
+/// the pass.
+pub fn enter(stage: Stage) -> Option<StageGuard> {
+    if !enabled() {
+        return None;
+    }
+    Some(StageGuard {
+        stage,
+        start: Instant::now(),
+        outer: CURRENT.with(|c| c.replace(Some(stage))),
+    })
+}
+
+/// See [`enter`].
+pub struct StageGuard {
+    stage: Stage,
+    start: Instant,
+    outer: Option<Stage>,
+}
+
+impl Drop for StageGuard {
+    fn drop(&mut self) {
+        CURRENT.with(|c| c.set(self.outer));
+        let elapsed = self.start.elapsed().as_nanos() as u64;
+        NANOS[self.stage.index()].fetch_add(elapsed, Ordering::Relaxed);
+        CALLS[self.stage.index()].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Charges one device submission to whichever stage this thread is inside.
 ///
 /// Called from the backend's `queue.submit` sites, so the breakdown can say

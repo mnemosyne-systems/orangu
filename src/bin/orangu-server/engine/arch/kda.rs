@@ -54,7 +54,6 @@
 use anyhow::{Context, Result};
 use rayon::prelude::*;
 
-use super::attend;
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::{KvCache, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, QuantMatrix};
@@ -293,7 +292,11 @@ impl KdaLayer {
         let q_scale = 1.0 / (head_dim as f32).sqrt();
 
         // Token-independent projections, batched over the whole chunk. The
-        // three conv inputs are concatenated to match `conv_kernel`.
+        // three conv inputs are concatenated to match `conv_kernel`. Timed
+        // as `recurrent.project`, and dropped where the scan starts.
+        let _project = crate::engine::decode_stages::enter(
+            crate::engine::decode_stages::Stage::RecurrentProject,
+        );
         let KdaScratch {
             q,
             k,
@@ -324,10 +327,18 @@ impl KdaLayer {
         }
         let (q, k, v, f, beta, gate) = (&*q, &*k, &*v, &*f, &*beta, &*gate);
 
+        drop(_project);
         // The scan output, before the output projection. Every element is
         // written by the loop below, so `resize` without a `clear`.
         let mut scan = vec![0f32; n_tokens * d_inner];
         let state = &mut cache.recurrent[self.cache_index];
+        // The state update, timed apart from the projections either side of
+        // it: it is scalar and sequential by construction, so its elapsed
+        // time and its share of the machine are different numbers — which
+        // is the whole reason these counters measure elapsed time.
+        let _delta = crate::engine::decode_stages::enter(
+            crate::engine::decode_stages::Stage::RecurrentDelta,
+        );
         for t in 0..n_tokens {
             let mut qkv = Vec::with_capacity(3 * d_inner);
             qkv.extend_from_slice(&q[t * d_inner..(t + 1) * d_inner]);
@@ -388,7 +399,11 @@ impl KdaLayer {
             }
         }
 
-        backend.matmul_into(out, &scan, n_tokens, &self.wo);
+        drop(_delta);
+        crate::engine::decode_stages::scope(
+            crate::engine::decode_stages::Stage::RecurrentOut,
+            || backend.matmul_into(out, &scan, n_tokens, &self.wo),
+        );
     }
 }
 
@@ -631,10 +646,15 @@ impl MlaLayer {
         n_tokens: usize,
         start_pos: usize,
     ) {
-        self.project_query_into(backend, scratch, shape, normed, n_tokens);
-        self.attend_into(
-            backend, out, scratch, shape, cache, normed, n_tokens, start_pos, None,
+        crate::engine::decode_stages::scope(
+            crate::engine::decode_stages::Stage::AttnProject,
+            || self.project_query_into(backend, scratch, shape, normed, n_tokens),
         );
+        crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::Attn, || {
+            self.attend_into(
+                backend, out, scratch, shape, cache, normed, n_tokens, start_pos, None,
+            )
+        });
     }
 
     /// The query half: the LoRA bottleneck (or the one-matrix projection)
@@ -784,6 +804,41 @@ impl MlaLayer {
         let wk_b = hoist.then(|| absorb(&self.wk_b, shape.kv_lora_rank));
         let wv_b = hoist.then(|| absorb(&self.wv_b, shape.head_v_mla));
 
+        // **Head outer, token inner.** Absorbing a query reads the whole of
+        // this head's `wk_b` block, and doing it inside the token loop read
+        // that block again for every token — at a prompt's length, the same
+        // hundreds of kilobytes over and over. Hoisted here the block is
+        // read once per head and stays in cache across every token that
+        // uses it. Held head-major for the same reason; the token loop
+        // gathers its own `[n_head, absorbed_dim]` row out of these, which
+        // is tens of kilobytes against the key buffer it is about to scan.
+        let qs_by_head: Vec<Vec<f32>> = (0..n_head)
+            .into_par_iter()
+            .map(|h| {
+                let mut per_token = vec![0f32; n_tokens * absorbed_dim];
+                for t in 0..n_tokens {
+                    let q_t =
+                        &q[t * n_head * shape.head_k_mla..(t + 1) * n_head * shape.head_k_mla];
+                    let q_nope = &q_t[h * shape.head_k_mla..h * shape.head_k_mla + nope];
+                    let dst = &mut per_token[t * absorbed_dim..(t + 1) * absorbed_dim];
+                    project_rows(
+                        &self.wk_b,
+                        wk_b.as_deref(),
+                        h,
+                        q_nope,
+                        nope,
+                        &mut dst[..shape.kv_lora_rank],
+                    );
+                    dst[shape.kv_lora_rank..].copy_from_slice(
+                        &q_t[h * shape.head_k_mla + nope..(h + 1) * shape.head_k_mla],
+                    );
+                }
+                per_token
+            })
+            .collect();
+        // Every token's compressed attention output, kept until the value
+        // decompression below can run head-outer for the same reason.
+        let mut compressed_all = vec![0f32; n_tokens * n_head * shape.kv_lora_rank];
         let mut attn_out = vec![0f32; n_tokens * n_head * shape.head_v_mla];
         for t in 0..n_tokens {
             let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
@@ -809,49 +864,55 @@ impl MlaLayer {
                 }
             }
 
-            let q_t = &q[t * n_head * shape.head_k_mla..(t + 1) * n_head * shape.head_k_mla];
-            let heads: Vec<Vec<f32>> = (0..n_head)
-                .into_par_iter()
-                .map(|h| {
-                    // Absorb the query through this head's key
-                    // decompression, then carry its second half unchanged.
-                    let q_nope = &q_t[h * shape.head_k_mla..h * shape.head_k_mla + nope];
-                    let mut q_h = vec![0f32; absorbed_dim];
-                    project_rows(
-                        &self.wk_b,
-                        wk_b.as_deref(),
-                        h,
-                        q_nope,
-                        nope,
-                        &mut q_h[..shape.kv_lora_rank],
-                    );
-                    q_h[shape.kv_lora_rank..].copy_from_slice(
-                        &q_t[h * shape.head_k_mla + nope..(h + 1) * shape.head_k_mla],
-                    );
+            // This token's queries, gathered out of the head-major
+            // absorption above, then **one** pass of attention for all of
+            // them: latent attention's keys are shared across heads, so
+            // scoring a head at a time read the whole cache `n_head` times
+            // over — see `super::attend_shared`.
+            let mut qs = vec![0f32; n_head * absorbed_dim];
+            for h in 0..n_head {
+                qs[h * absorbed_dim..(h + 1) * absorbed_dim]
+                    .copy_from_slice(&qs_by_head[h][t * absorbed_dim..(t + 1) * absorbed_dim]);
+            }
+            let compressed = super::attend_shared(
+                &qs,
+                n_head,
+                &keys,
+                shape.kv_row,
+                shape.kv_lora_rank,
+                shape.kq_scale,
+            );
+            compressed_all[t * n_head * shape.kv_lora_rank..(t + 1) * n_head * shape.kv_lora_rank]
+                .copy_from_slice(&compressed);
+        }
 
-                    let compressed = attend(
-                        &q_h,
-                        &keys,
-                        shape.kv_row,
-                        shape.kv_lora_rank,
-                        shape.kq_scale,
-                        None,
-                    );
-                    let mut head = vec![0f32; shape.head_v_mla];
+        // The value decompression, head outer for the same reason the
+        // absorption above is: each head's `wv_b` block is read once rather
+        // than once per token. Written head-major and scattered after,
+        // because a head's outputs are strided in `attn_out`.
+        let by_head: Vec<Vec<f32>> = (0..n_head)
+            .into_par_iter()
+            .map(|h| {
+                let mut per_token = vec![0f32; n_tokens * shape.head_v_mla];
+                for t in 0..n_tokens {
+                    let at = (t * n_head + h) * shape.kv_lora_rank;
                     project_rows(
                         &self.wv_b,
                         wv_b.as_deref(),
                         h,
-                        &compressed,
+                        &compressed_all[at..at + shape.kv_lora_rank],
                         shape.kv_lora_rank,
-                        &mut head,
+                        &mut per_token[t * shape.head_v_mla..(t + 1) * shape.head_v_mla],
                     );
-                    head
-                })
-                .collect();
-            for (h, head) in heads.iter().enumerate() {
+                }
+                per_token
+            })
+            .collect();
+        for (h, head) in by_head.iter().enumerate() {
+            for t in 0..n_tokens {
                 let at = (t * n_head + h) * shape.head_v_mla;
-                attn_out[at..at + shape.head_v_mla].copy_from_slice(head);
+                attn_out[at..at + shape.head_v_mla]
+                    .copy_from_slice(&head[t * shape.head_v_mla..(t + 1) * shape.head_v_mla]);
             }
         }
 

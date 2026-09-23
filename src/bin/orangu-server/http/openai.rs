@@ -925,7 +925,13 @@ pub async fn completions(
     if let Some(rejection) = reject_unknown_slot(&state, req.id_slot) {
         return rejection;
     }
-    let tokens = state.engine.tokenizer.encode(&req.prompt, true);
+    // The file's own answer, not `true`: a model trained without a
+    // BOS gets a prompt one token longer than the same text is
+    // anywhere else, and only the continuation shows it.
+    let tokens = state
+        .engine
+        .tokenizer
+        .encode(&req.prompt, state.engine.tokenizer.wants_bos());
     let sampling = sampling_for(
         role,
         RequestSampling {

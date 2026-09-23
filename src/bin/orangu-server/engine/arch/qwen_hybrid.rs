@@ -1191,6 +1191,19 @@ pub(crate) type DenseParts<'a> = (
 );
 
 pub(crate) trait HybridFfn: Send + Sync {
+    /// Whether this feed-forward times its own per-stage breakdown, and so
+    /// must **not** be wrapped in one by its caller.
+    ///
+    /// A mixture does: the shared helpers it routes through report
+    /// `ffn.router`, `ffn.routed`, `ffn.shared` and `ffn.combine`. Wrapping
+    /// those in `ffn.dense` as well made that stage their parent, and every
+    /// stage but the pass is supposed to be a disjoint sibling — the
+    /// breakdown then summed past the pass it was a breakdown of (111.5 ms
+    /// reported against a 76.5 ms token) and `other` clamped to zero.
+    fn times_its_own_stages(&self) -> bool {
+        false
+    }
+
     /// The dense SwiGLU parts for a decode chain that records the FFN on
     /// the device; `None` for a feed-forward the chain cannot record (MoE).
     fn dense_parts(&self) -> Option<DenseParts<'_>> {
@@ -1429,6 +1442,10 @@ impl MoeFfn {
 }
 
 impl HybridFfn for MoeFfn {
+    fn times_its_own_stages(&self) -> bool {
+        true
+    }
+
     /// Standard top-k softmax MoE routing (renormalized over the selected
     /// experts) plus a separately-`sigmoid`-gated shared expert — see
     /// `llm_graph_context::build_moe_ffn` (the `LLAMA_EXPERT_GATING_FUNC_
@@ -2331,9 +2348,13 @@ impl<F: HybridFfn> Trunk<F> {
             n_embd,
             self.dims.rms_eps,
         );
-        decode_stages::scope(Stage::FfnDense, || {
-            ffn.forward_into(backend, out, work, n_embd, normed, n_tokens, il)
-        });
+        if ffn.times_its_own_stages() {
+            ffn.forward_into(backend, out, work, n_embd, normed, n_tokens, il);
+        } else {
+            decode_stages::scope(Stage::FfnDense, || {
+                ffn.forward_into(backend, out, work, n_embd, normed, n_tokens, il)
+            });
+        }
         tensor::add_inplace(x, out);
     }
 }

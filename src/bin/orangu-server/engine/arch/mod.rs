@@ -184,6 +184,93 @@ pub(crate) fn attend(
     out
 }
 
+/// [`attend`] for **many queries against one shared key/value set** — what
+/// latent attention actually is, where every head scores against the same
+/// compressed row.
+///
+/// The per-head form reads the whole key buffer twice, once for the scores
+/// and once for the weighted sum, so `n_q` heads read it `2 * n_q` times.
+/// At a deep context that buffer is megabytes and the re-reads are the
+/// cost: measured on a 23-layer latent model at 4096 positions, this stage
+/// was 76 ms of a 128 ms token with nothing else on the card. Here each key
+/// row is read twice in total, whatever `n_q` is, and the queries — `n_q *
+/// key_dim` floats, tens of kilobytes — are what stays resident instead.
+///
+/// `qs` is `[n_q, key_dim]`, the result `[n_q, value_dim]`, and the values
+/// are each key row's first `value_dim` elements exactly as [`attend`]
+/// takes them.
+pub(crate) fn attend_shared(
+    qs: &[f32],
+    n_q: usize,
+    keys: &[f32],
+    key_dim: usize,
+    value_dim: usize,
+    scale: f32,
+) -> Vec<f32> {
+    debug_assert!(value_dim <= key_dim);
+    debug_assert_eq!(qs.len(), n_q * key_dim);
+    let n_keys = keys.len() / key_dim;
+    if n_q == 0 || n_keys == 0 {
+        return vec![0.0; n_q * value_dim];
+    }
+    // Scores, key-major: one pass over the keys, every head scored against
+    // the row while it is in cache.
+    let mut scores = vec![0f32; n_keys * n_q];
+    scores
+        .par_chunks_mut(n_q)
+        .zip(keys.par_chunks(key_dim))
+        .for_each(|(dst, key)| {
+            for (h, slot) in dst.iter_mut().enumerate() {
+                *slot = tensor::dot(&qs[h * key_dim..(h + 1) * key_dim], key) * scale;
+            }
+        });
+    // Softmax per head, down the stride. Written back in place so the
+    // weighted sum below reads the same layout the scores were produced in.
+    for h in 0..n_q {
+        let mut max = f32::NEG_INFINITY;
+        for k in 0..n_keys {
+            max = max.max(scores[k * n_q + h]);
+        }
+        let mut sum = 0.0;
+        for k in 0..n_keys {
+            let e = (scores[k * n_q + h] - max).exp();
+            scores[k * n_q + h] = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum;
+        for k in 0..n_keys {
+            scores[k * n_q + h] *= inv;
+        }
+    }
+    // The weighted sum, one more pass over the keys. Blocked so each task
+    // accumulates into its own `[n_q, value_dim]` partial — tens of
+    // kilobytes — and the reduction is over those rather than over the
+    // cache.
+    let block = 64;
+    keys.par_chunks(key_dim * block)
+        .zip(scores.par_chunks(n_q * block))
+        .map(|(keys, scores)| {
+            let mut partial = vec![0f32; n_q * value_dim];
+            for (key, ws) in keys.chunks(key_dim).zip(scores.chunks(n_q)) {
+                for (h, &w) in ws.iter().enumerate() {
+                    tensor::axpy_inplace(
+                        &mut partial[h * value_dim..(h + 1) * value_dim],
+                        &key[..value_dim],
+                        w,
+                    );
+                }
+            }
+            partial
+        })
+        .reduce(
+            || vec![0f32; n_q * value_dim],
+            |mut a, b| {
+                tensor::add_inplace(&mut a, &b);
+                a
+            },
+        )
+}
+
 /// How a MoE layer turns its router's logits into probabilities —
 /// `<arch>.expert_gating_func`, upstream's
 /// `llama_expert_gating_func_type`.
@@ -3415,8 +3502,56 @@ pub struct MtpStep {
 
 #[cfg(test)]
 mod tests {
+
+    /// `attend_shared` must agree with the per-head `attend` it replaces at
+    /// every head, including the awkward shapes: a value width narrower
+    /// than the key width (which is the whole point of the latent form), a
+    /// key count that does not divide the blocking, and one head.
+    ///
+    /// They are independent implementations of the same function — one
+    /// scores a head at a time over the whole buffer, the other scores
+    /// every head against a row while it is in cache — so this is a real
+    /// cross-check and not a restatement. The tolerance is for the
+    /// summation order, which differs by construction.
+    #[test]
+    fn attend_shared_agrees_with_attend_per_head() {
+        for (n_q, n_keys, key_dim, value_dim) in [
+            (4usize, 7usize, 6usize, 4usize),
+            (1, 1, 3, 3),
+            (16, 130, 8, 5),
+        ] {
+            let qs: Vec<f32> = (0..n_q * key_dim)
+                .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.05)
+                .collect();
+            let keys: Vec<f32> = (0..n_keys * key_dim)
+                .map(|i| ((i * 17 % 29) as f32 - 14.0) * 0.03)
+                .collect();
+            let scale = 0.35;
+            let got = attend_shared(&qs, n_q, &keys, key_dim, value_dim, scale);
+            for h in 0..n_q {
+                let want = attend(
+                    &qs[h * key_dim..(h + 1) * key_dim],
+                    &keys,
+                    key_dim,
+                    value_dim,
+                    scale,
+                    None,
+                );
+                for (i, (g, e)) in got[h * value_dim..(h + 1) * value_dim]
+                    .iter()
+                    .zip(&want)
+                    .enumerate()
+                {
+                    assert!(
+                        (g - e).abs() <= 1e-5 * e.abs().max(1.0),
+                        "n_q {n_q} keys {n_keys} head {h} at {i}: {g} vs {e}"
+                    );
+                }
+            }
+        }
+    }
     use super::{
-        ExpertGating, ExpertProjection, ExpertRouting, SwigluLimit, attend,
+        ExpertGating, ExpertProjection, ExpertRouting, SwigluLimit, attend, attend_shared,
         device_expert_admissible, evaluate_routed_experts, evaluate_routed_experts_batched_views,
         flag_is_on, matmul_host_fallback, project_expert, restore_order, top_k_indices,
     };
