@@ -197,6 +197,12 @@ pub enum ArchFamily {
     /// [`ArchFamily::LlamaStyle`] load, whose hidden states condition the
     /// picture) and the Qwen-Image VAE (`safetensors`) that turns latents
     /// into pixels. See `engine::image::transformer` for the graph.
+    ///
+    /// Qwen-Image 2.1 (`qwen_image_2_1`, `unsloth/Qwen-Image-2.1-GGUF`) is
+    /// this family too: a single-stream, block-causal transformer with a
+    /// Qwen3-VL-8B (`qwen3vl`) text encoder and its own RGBA VAE — see
+    /// `engine::image::transformer21` and `engine::image::vae21`. Its GGUFs
+    /// carry no metadata at all; the architecture is read off the tensors.
     QwenImage,
 }
 
@@ -329,7 +335,7 @@ const BAILINGMOE3_ARCHITECTURES: &[&str] = &["bailingmoe3"];
 /// `qwen_image` (e.g. `unsloth/Qwen-Image-2512-GGUF`,
 /// `unsloth/Qwen-Image-Edit-2511-GGUF`) — see [`ArchFamily::QwenImage`] and
 /// `engine::image`. The only family here that is not a language model.
-const QWEN_IMAGE_ARCHITECTURES: &[&str] = &["qwen_image"];
+const QWEN_IMAGE_ARCHITECTURES: &[&str] = orangu::model_spec::IMAGE_ARCHITECTURES;
 
 /// Architectures this engine recognises by name and deliberately does **not**
 /// serve, with the reason.
@@ -531,11 +537,12 @@ fn supported_architecture_names() -> Vec<&'static str> {
 /// (`main::build_model`), not something the header alone decides.
 ///
 /// Returns `(architecture, unsupported_quant)`. `architecture` is `None`
-/// only when the file has no `general.architecture` at all;
+/// only when the file has no `general.architecture` at all and its tensors
+/// name no architecture either;
 /// `unsupported_quant` names the first tensor type this build can't decode
 /// (or the fold it can't run), and is `None` when every type is readable.
 pub fn model_load_support(gguf: &GgufFile) -> (Option<String>, Option<String>) {
-    let architecture = metadata_string(gguf, "general.architecture");
+    let architecture = orangu::model_spec::architecture_of(gguf);
     let unsupported = gguf
         .tensors
         .iter()
@@ -1824,6 +1831,14 @@ impl LoadedModel {
         Self::open_shards(&shard_sources(path)?)
     }
 
+    /// Opens a multimodal projector (`general.architecture = clip`, an
+    /// `mmproj-*.gguf`) for its tensors alone: it is not a model any
+    /// architecture family serves, so no configuration is read beyond its
+    /// width — `engine::image::qwen3vl` reads the rest itself.
+    pub fn open_projector(path: &Path) -> Result<Self> {
+        Self::open_shards_as(&shard_sources(path)?, true)
+    }
+
     /// Loads a model whose shards are byte ranges inside one file that is
     /// not itself a `.gguf` — a bundled `orangu-server`, where the model was
     /// appended to the executable (see `crate::bundle`). Every shard names
@@ -1845,15 +1860,40 @@ impl LoadedModel {
     }
 
     fn open_shards(shards: &[ShardSource]) -> Result<Self> {
+        Self::open_shards_as(shards, false)
+    }
+
+    fn open_shards_as(shards: &[ShardSource], projector: bool) -> Result<Self> {
         let first = shards
             .first()
             .ok_or_else(|| anyhow!("a model needs at least one shard"))?;
         let gguf = GgufFile::open_at(&first.path, first.offset)?;
-        let architecture = metadata_string(&gguf, "general.architecture")
+        // A file with no metadata is named by its tensors — see
+        // `orangu::model_spec::architecture_from_tensors`.
+        let architecture = orangu::model_spec::architecture_of(&gguf)
             .ok_or_else(|| anyhow!("GGUF file is missing general.architecture"))?;
-        resolve_arch_family(&architecture)?;
-
-        let config = if resolve_arch_family(&architecture)? == ArchFamily::QwenImage {
+        let config = if projector {
+            anyhow::ensure!(
+                architecture == "clip",
+                "{} is a {architecture} model, not a multimodal projector",
+                first.path.display()
+            );
+            let n_embd = metadata_u64(&gguf, "clip.vision.embedding_length").unwrap_or(0) as usize;
+            ModelConfig {
+                architecture,
+                n_vocab: 0,
+                n_embd,
+                n_layer: metadata_u64(&gguf, "clip.vision.block_count").unwrap_or(0) as usize,
+                n_head: 1,
+                n_head_kv: 1,
+                head_dim: n_embd.max(1),
+                n_ctx_train: 0,
+                rope_dim: n_embd.max(1),
+                rope_freq_base: 10000.0,
+                rms_eps: 1e-6,
+                pooling_type: PoolingType::Mean,
+            }
+        } else if resolve_arch_family(&architecture)? == ArchFamily::QwenImage {
             read_image_model_config(&gguf, &architecture)?
         } else {
             read_model_config(&gguf, &architecture)?
@@ -1911,8 +1951,15 @@ impl LoadedModel {
                     );
                 }
                 total_tensors += 1;
+                // A diffusion model converted by the ComfyUI tooling puts
+                // `model.diffusion_model.` before every name; the engine
+                // reads them as diffusers wrote them.
+                let name = tensor
+                    .name
+                    .strip_prefix(orangu::model_spec::DIFFUSION_MODEL_PREFIX)
+                    .unwrap_or(&tensor.name);
                 tensors.insert(
-                    tensor.name.clone(),
+                    name.to_string(),
                     TensorLocation {
                         ggml_type: tensor.ggml_type,
                         dims: tensor.dims.clone(),
@@ -2212,15 +2259,6 @@ impl LoadedModel {
     }
 }
 
-fn metadata_string(gguf: &GgufFile, key: &str) -> Option<String> {
-    gguf.metadata.iter().find_map(|(k, v)| {
-        (k == key).then_some(v).and_then(|v| match v {
-            GgufValue::String(s) => Some(s.clone()),
-            _ => None,
-        })
-    })
-}
-
 fn metadata_u64(gguf: &GgufFile, key: &str) -> Option<u64> {
     gguf.metadata
         .iter()
@@ -2307,8 +2345,9 @@ fn read_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig>
     })
 }
 
-/// [`ModelConfig`] for a `qwen_image` file, whose metadata is three keys and
-/// no hyperparameters: everything is read off tensor shapes.
+/// [`ModelConfig`] for a `qwen_image` or `qwen_image_2_1` file, whose
+/// metadata is three keys (or none) and no hyperparameters: everything is
+/// read off tensor shapes, which both transformers name alike.
 ///
 /// The diffusion transformer has no vocabulary, context length or KV heads.
 /// The fields that mean nothing for it are set to what keeps every generic
@@ -2317,10 +2356,16 @@ fn read_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig>
 /// shape — and `engine::image::transformer` reads its own real dimensions
 /// directly, so nothing downstream computes with these.
 fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig> {
+    // As the loader names them: without the ComfyUI tooling's prefix.
+    let plain = |name: &str| -> String {
+        name.strip_prefix(orangu::model_spec::DIFFUSION_MODEL_PREFIX)
+            .unwrap_or(name)
+            .to_string()
+    };
     let dims = |name: &str| -> Result<&[u64]> {
         gguf.tensors
             .iter()
-            .find(|t| t.name == name)
+            .find(|t| plain(&t.name) == name)
             .map(|t| t.dims.as_slice())
             .ok_or_else(|| anyhow!("{architecture}: model is missing tensor '{name}'"))
     };
@@ -2339,7 +2384,7 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
         .tensors
         .iter()
         .filter_map(|t| {
-            t.name
+            plain(&t.name)
                 .strip_prefix("transformer_blocks.")?
                 .split('.')
                 .next()?

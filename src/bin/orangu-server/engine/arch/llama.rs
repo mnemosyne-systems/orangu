@@ -2126,8 +2126,7 @@ impl ModelForward for LlamaModel {
     }
 
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let mut cache = self.new_kv_cache(tokens.len().max(1));
-        let mut x = self.run_layers(&mut cache, tokens, 0)?;
+        let mut x = self.forward_hidden_states_pre_norm(tokens)?;
         tensor::rmsnorm_inplace(
             &mut x,
             &self.output_norm,
@@ -2136,6 +2135,11 @@ impl ModelForward for LlamaModel {
             self.config.rms_eps,
         );
         Ok(x)
+    }
+
+    fn forward_hidden_states_pre_norm(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let mut cache = self.new_kv_cache(tokens.len().max(1));
+        self.run_layers(&mut cache, tokens, 0)
     }
 }
 

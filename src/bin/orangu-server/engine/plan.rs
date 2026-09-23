@@ -203,15 +203,8 @@ where
         .next()
         .ok_or_else(|| anyhow!("a model needs at least one shard to plan"))??;
 
-    let architecture = first
-        .metadata
-        .iter()
-        .find(|(k, _)| k == "general.architecture")
-        .and_then(|(_, v)| match v {
-            orangu::gguf::GgufValue::String(s) => Some(s.clone()),
-            _ => None,
-        })
-        .unwrap_or_else(|| "unknown".to_string());
+    let architecture =
+        orangu::model_spec::architecture_of(&first).unwrap_or_else(|| "unknown".to_string());
     let (n_expert, n_expert_used) = {
         let meta_u64 = |suffix: &str| -> Option<u64> {
             let key = format!("{architecture}.{suffix}");

@@ -99,8 +99,18 @@ pub fn props_json(pipeline: &Pipeline) -> serde_json::Value {
         })
     };
     json!({
+        // `qwen_image` or `qwen_image_2_1`, and the pixels a side must be a
+        // multiple of for it.
+        "architecture": pipeline.variant.architecture(),
+        "size_unit": pipeline.size_unit(),
         "text_encoder": pipeline.companions.text_encoder.display().to_string(),
         "vae": pipeline.companions.vae.display().to_string(),
+        // The projector an attached picture is edited with — `null` when an
+        // attachment is a starting point instead.
+        "vision": pipeline
+            .edits()
+            .then(|| pipeline.companions.vision.as_ref().map(|p| p.display().to_string()))
+            .flatten(),
         // The adapter in the weights, with the step count its name says it
         // was distilled for — `null` for the base model.
         "lora": pipeline.adapter.as_ref().map(|path| json!({
@@ -116,10 +126,11 @@ pub fn props_json(pipeline: &Pipeline) -> serde_json::Value {
         // The last measured rate and what the defaults cost at it, for a
         // client that wants to say how long before it sends; `rate` is the
         // model behind both, so a client can cost any settings it is about
-        // to choose: seconds = encode + steps × n × passes × (linear +
+        // to choose: seconds = encode + steps × step_share × n × passes × (linear +
         // attention × n / attention_tokens) + decode_per_pixel × pixels,
         // with n the latent tokens (width/16 × height/16) and passes 2 under
-        // guidance, 1 without.
+        // guidance, 1 without. An edit attends over n + r keys (r the
+        // reference's tokens) and encodes in edit_encode_per_token × r.
         "token_passes_per_second": pipeline.token_passes_per_second(),
         "estimated_default_seconds": pipeline.estimated_default_seconds(),
         "rate": pipeline.rate_model().map(|m| json!({
@@ -128,6 +139,8 @@ pub fn props_json(pipeline: &Pipeline) -> serde_json::Value {
             "attention_per_token_pass": m.attention_per_token_pass,
             "attention_tokens": m.attention_tokens,
             "decode_per_pixel": m.decode_per_pixel,
+            "edit_encode_per_token": m.edit_encode_per_token,
+            "step_share": m.step_share(),
         })),
     })
 }
@@ -154,7 +167,8 @@ pub struct ImageSettings {
 }
 
 /// Applies `settings` to the pipeline's defaults, checked as the config
-/// loader checks the same keys — a size that is not multiples of 16, zero
+/// loader checks the same keys — a size that is not multiples of the
+/// model's unit (16, or 32 for Qwen-Image 2.1), zero
 /// steps, a negative guidance, a strength outside 0–1 are refused whole,
 /// so the defaults never hold a value a request could not be built from.
 pub fn apply_settings(pipeline: &Pipeline, settings: &ImageSettings) -> Result<(), String> {
@@ -164,8 +178,10 @@ pub fn apply_settings(pipeline: &Pipeline, settings: &ImageSettings) -> Result<(
         pipeline.defaults()
     };
     if let Some(size) = settings.size.as_deref().map(str::trim) {
+        let unit = pipeline.size_unit();
         let (width, height) = crate::config::parse_image_size(size)
-            .ok_or_else(|| format!("size '{size}' is not WIDTHxHEIGHT in multiples of 16"))?;
+            .filter(|(w, h)| w.is_multiple_of(unit) && h.is_multiple_of(unit))
+            .ok_or_else(|| format!("size '{size}' is not WIDTHxHEIGHT in multiples of {unit}"))?;
         d.width = width;
         d.height = height;
     }
@@ -242,8 +258,11 @@ pub fn decode_image_payload(payload: &str) -> Result<(String, Vec<u8>), String> 
 }
 
 /// Resolves the parameters into a request, or the reason they cannot be.
+/// `unit` is the pixels a side must be a multiple of — the pipeline's
+/// [`Pipeline::size_unit`].
 pub fn build_request(
     defaults: &ImageDefaults,
+    unit: usize,
     params: ImageParams<'_>,
 ) -> Result<ImageRequest, String> {
     if params.prompt.trim().is_empty() {
@@ -273,13 +292,18 @@ pub fn build_request(
     let (width, height) = match params.size.map(str::trim) {
         Some(size) if !size.is_empty() && !size.eq_ignore_ascii_case("auto") => {
             crate::config::parse_image_size(size)
-                .ok_or_else(|| format!("size '{size}' is not WIDTHxHEIGHT in multiples of 16"))?
+                .filter(|(w, h)| w.is_multiple_of(unit) && h.is_multiple_of(unit))
+                .ok_or_else(|| {
+                    format!("size '{size}' is not WIDTHxHEIGHT in multiples of {unit}")
+                })?
         }
         _ => match &init {
             // A picture to start from sets the proportions; the server's
             // configured size bounds the longer side.
             Some(init) => codec::dimensions(&init.bytes)
-                .map(|dims| codec::fit_generation_size(dims, defaults.width.max(defaults.height)))
+                .map(|dims| {
+                    codec::fit_generation_size(dims, defaults.width.max(defaults.height), unit)
+                })
                 .map_err(|err| format!("{err:#}"))?,
             None => (defaults.width, defaults.height),
         },
@@ -400,6 +424,7 @@ pub async fn generations(
     };
     let request = match build_request(
         &pipeline.defaults(),
+        pipeline.size_unit(),
         ImageParams {
             prompt: &req.prompt,
             negative_prompt: req.negative_prompt.as_deref(),
@@ -473,7 +498,7 @@ pub async fn generations(
             let Some(event) = rx.recv().await else { break };
             match event {
                 ImageEvent::Progress(p) => {
-                    let eta = p.seconds_per_step * (p.steps.saturating_sub(p.step)) as f64;
+                    let eta = p.eta_seconds();
                     let chunk = json!({
                         "type": "image_generation.progress",
                         "created": created, "model": model,
@@ -550,7 +575,7 @@ mod tests {
             strength: 0.7,
             format: ImageFormat::Webp,
         };
-        let request = build_request(&defaults, params("a cat")).unwrap();
+        let request = build_request(&defaults, 16, params("a cat")).unwrap();
         assert_eq!((request.width, request.height), (512, 256));
         assert_eq!(request.steps, 8);
         assert_eq!(request.cfg_scale, 2.5);
@@ -563,7 +588,7 @@ mod tests {
         p.size = Some("768x512");
         p.steps = Some(4);
         p.output_format = Some("jpeg");
-        let request = build_request(&defaults, p).unwrap();
+        let request = build_request(&defaults, 16, p).unwrap();
         assert_eq!((request.width, request.height), (768, 512));
         assert_eq!(request.steps, 4);
         assert_eq!(request.format, ImageFormat::Jpeg);
@@ -572,17 +597,25 @@ mod tests {
     #[test]
     fn bad_parameters_are_named() {
         let defaults = ImageDefaults::default();
-        assert!(build_request(&defaults, params("  ")).is_err());
+        assert!(build_request(&defaults, 16, params("  ")).is_err());
         let mut p = params("x");
         p.size = Some("100x100");
-        assert!(build_request(&defaults, p).unwrap_err().contains("size"));
+        assert!(
+            build_request(&defaults, 16, p)
+                .unwrap_err()
+                .contains("size")
+        );
         let mut p = params("x");
         p.steps = Some(0);
-        assert!(build_request(&defaults, p).unwrap_err().contains("steps"));
+        assert!(
+            build_request(&defaults, 16, p)
+                .unwrap_err()
+                .contains("steps")
+        );
         let mut p = params("x");
         p.output_format = Some("bmp");
         assert!(
-            build_request(&defaults, p)
+            build_request(&defaults, 16, p)
                 .unwrap_err()
                 .contains("output_format")
         );
@@ -603,7 +636,7 @@ mod tests {
         let jpeg = codec::encode(&feature, ImageFormat::Jpeg).unwrap();
         let mut p = params("brighter");
         p.init = Some(("image/jpeg".into(), jpeg));
-        let request = build_request(&defaults, p).unwrap();
+        let request = build_request(&defaults, 16, p).unwrap();
         assert_eq!(request.format, ImageFormat::Jpeg);
         assert_eq!((request.width, request.height), (400, 208));
         assert_eq!(request.init.as_ref().unwrap().strength, defaults.strength);
@@ -613,7 +646,7 @@ mod tests {
         let png = codec::encode(&feature, ImageFormat::Png).unwrap();
         let mut p = params("brighter");
         p.init = Some(("image/png".into(), png));
-        let request = build_request(&defaults, p).unwrap();
+        let request = build_request(&defaults, 16, p).unwrap();
         assert_eq!(request.format, ImageFormat::Png);
         assert_eq!((request.width, request.height), (512, 256));
     }

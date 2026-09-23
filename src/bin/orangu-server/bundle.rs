@@ -592,7 +592,7 @@ pub fn run(request: Request) -> Result<()> {
     }
     if role.fixed_by_model() {
         bail!(
-            "--{} serves picture generators (qwen_image) only, and {label} is a {} model",
+            "--{} serves picture generators (qwen_image, qwen_image_2_1) only, and {label} is a {} model",
             role.label(),
             architecture.as_deref().unwrap_or("language")
         );

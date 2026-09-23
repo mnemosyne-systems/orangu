@@ -2663,6 +2663,110 @@ unsafe fn mmla_2x8(
     acc
 }
 
+/// `int8` rows laid out for `smmla`, two at a time: for each 8-element chunk
+/// the pair's two rows sit side by side (16 bytes), which is the operand
+/// `smmla` takes. Each row keeps its own scale (`max |x| / 127`). An odd
+/// row count is padded with a zero row. What the picture transformers'
+/// attention scores are computed from — see `image::transformer`.
+pub struct PairedI8 {
+    pub data: Vec<i8>,
+    pub scales: Vec<f32>,
+    pub dim: usize,
+    pub pairs: usize,
+}
+
+impl PairedI8 {
+    /// `n` rows of `dim` (a multiple of 8), row `i` read through `row(i)`.
+    pub fn quantize<'a>(n: usize, dim: usize, row: impl Fn(usize) -> &'a [f32]) -> Self {
+        debug_assert!(dim.is_multiple_of(8));
+        let pairs = n.div_ceil(2);
+        let mut data = vec![0i8; pairs * 2 * dim];
+        let mut scales = vec![0f32; pairs * 2];
+        for (i, slot) in scales.iter_mut().enumerate().take(n) {
+            let r = &row(i)[..dim];
+            let max = r.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let scale = max / 127.0;
+            let inv = if max > 0.0 { 1.0 / scale } else { 0.0 };
+            *slot = scale;
+            let (pair, half) = (i / 2, i % 2);
+            let base = pair * 2 * dim;
+            for (c, chunk) in r.as_chunks::<8>().0.iter().enumerate() {
+                let dst = &mut data[base + c * 16 + half * 8..][..8];
+                for (d, v) in dst.iter_mut().zip(chunk) {
+                    *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                }
+            }
+        }
+        Self {
+            data,
+            scales,
+            dim,
+            pairs,
+        }
+    }
+
+    fn pair(&self, p: usize) -> &[i8] {
+        &self.data[p * 2 * self.dim..(p + 1) * 2 * self.dim]
+    }
+}
+
+/// Integer dot products of four query rows — query pairs `qa` and `qb` of
+/// `q` — against every key row of `k`: `out[r][j] = q_r · k_j` as `i32`
+/// (`out` rows at least `2 * k.pairs` long). Needs [`have_i8mm`] on
+/// `aarch64`; elsewhere, or without it, the scalar definition.
+pub fn i8_scores_4rows(q: &PairedI8, qa: usize, qb: usize, k: &PairedI8, out: [&mut [i32]; 4]) {
+    debug_assert_eq!(q.dim, k.dim);
+    let dim = q.dim;
+    #[cfg(target_arch = "aarch64")]
+    if have_i8mm() {
+        use std::arch::aarch64::*;
+        let (a, b) = (q.pair(qa), q.pair(qb));
+        let [o0, o1, o2, o3] = out;
+        for p in 0..k.pairs {
+            let kp = k.pair(p);
+            // Safety: `i8mm` was verified; every load is 16 bytes inside a
+            // `2 * dim` pair, `dim` a multiple of 8.
+            let (x, y) = unsafe {
+                let mut x = vdupq_n_s32(0);
+                let mut y = vdupq_n_s32(0);
+                let mut c = 0;
+                while c < 2 * dim {
+                    let kv = vld1q_s8(kp.as_ptr().add(c));
+                    x = mmla_2x8(x, vld1q_s8(a.as_ptr().add(c)), kv);
+                    y = mmla_2x8(y, vld1q_s8(b.as_ptr().add(c)), kv);
+                    c += 16;
+                }
+                let mut xs = [0i32; 4];
+                let mut ys = [0i32; 4];
+                vst1q_s32(xs.as_mut_ptr(), x);
+                vst1q_s32(ys.as_mut_ptr(), y);
+                (xs, ys)
+            };
+            // Lanes: [row0.key0, row0.key1, row1.key0, row1.key1].
+            o0[2 * p] = x[0];
+            o0[2 * p + 1] = x[1];
+            o1[2 * p] = x[2];
+            o1[2 * p + 1] = x[3];
+            o2[2 * p] = y[0];
+            o2[2 * p + 1] = y[1];
+            o3[2 * p] = y[2];
+            o3[2 * p + 1] = y[3];
+        }
+        return;
+    }
+    let unpaired = |m: &PairedI8, row: usize, c: usize| -> i32 {
+        m.data[(row / 2) * 2 * dim + (c / 8) * 16 + (row % 2) * 8 + c % 8] as i32
+    };
+    let rows = [2 * qa, 2 * qa + 1, 2 * qb, 2 * qb + 1];
+    for (o, &r) in out.into_iter().zip(&rows) {
+        for (j, slot) in o.iter_mut().enumerate().take(2 * k.pairs) {
+            *slot = (0..dim)
+                .map(|c| unpaired(q, r, c) * unpaired(k, j, c))
+                .sum();
+        }
+    }
+}
+
 /// How many rows [`dot_k_rows`] is handed per rayon task — a multiple of
 /// [`ROW_QUAD`]. More rows per task means each activation tile is read from
 /// L2 once and reused across more row quads while it sits in L1; fewer
@@ -3066,11 +3170,23 @@ impl PairedRows {
         let mut sc = vec![[0i32; 4]; n_pair * groups];
         let mut d = vec![[0f32; 4]; n_pair * n_super];
         for (p, [r0, r1]) in rows.as_chunks::<2>().0.iter().enumerate() {
-            for b in 0..n_block {
-                let dst = &mut q[(p * n_block + b) * 64..][..64];
-                for c in 0..4 {
-                    dst[c * 16..c * 16 + 8].copy_from_slice(&r0.q[b * 32 + c * 8..][..8]);
-                    dst[c * 16 + 8..c * 16 + 16].copy_from_slice(&r1.q[b * 32 + c * 8..][..8]);
+            let dst = &mut q[p * n_block * 64..][..n_block * 64];
+            debug_assert!(r0.q.len() >= n_block * 32 && r1.q.len() >= n_block * 32);
+            // Each 8-byte chunk of the two rows side by side: a 64-bit
+            // zip of two 16-byte loads, two chunks a store.
+            // Safety: NEON is baseline on aarch64; block `b` reads
+            // `r*.q[32b..32b + 32]` and writes `dst[64b..64b + 64]`.
+            unsafe {
+                use std::arch::aarch64::*;
+                for b in 0..n_block {
+                    let (a, c) = (r0.q.as_ptr().add(b * 32), r1.q.as_ptr().add(b * 32));
+                    let o = dst.as_mut_ptr().add(b * 64);
+                    for h in 0..2 {
+                        let x0 = vreinterpretq_u64_s8(vld1q_s8(a.add(h * 16)));
+                        let x1 = vreinterpretq_u64_s8(vld1q_s8(c.add(h * 16)));
+                        vst1q_s8(o.add(h * 32), vreinterpretq_s8_u64(vzip1q_u64(x0, x1)));
+                        vst1q_s8(o.add(h * 32 + 16), vreinterpretq_s8_u64(vzip2q_u64(x0, x1)));
+                    }
                 }
             }
             for g in 0..groups {
@@ -3107,56 +3223,100 @@ unsafe fn gemm_k_rows_mmla<const MINS: bool, const SC16: bool>(
     let n_groups = a.n_block * groups_per_block;
     let n_quad = rows.len() / ROW_QUAD;
     unsafe {
+        // Each super-block's activation scales in the accumulators' lane
+        // order, `[ad[2tp], ad[2tp+1], ad[2tp], ad[2tp+1]]` per token pair:
+        // built once a tile for all its row quads rather than lane by lane
+        // in every quad's epilogue.
+        let mut adl = vec![[vdupq_n_f32(0.0); 4]; a.n_super];
+        // For `Q4_K`: each row pair's mins per super-block as `smmla`'s row
+        // operand (`[r0 m0..8, r1 m0..8]`, all in `0..64`) with its
+        // `[dmin0, dmin0, dmin1, dmin1]`; and a tile's sub-block sums per
+        // token pair split for it, low seven bits and the rest.
+        let mins: Vec<([i8; 16], [f32; 4])> = if MINS {
+            (0..rows.len() / 2)
+                .flat_map(|p| (0..a.n_super).map(move |s| (p, s)))
+                .map(|(p, s)| {
+                    let (r0, r1) = (rows[2 * p], rows[2 * p + 1]);
+                    let mut m = [0i8; 16];
+                    for j in 0..SUBS {
+                        m[j] = r0.mins[s * SUBS + j] as i8;
+                        m[8 + j] = r1.mins[s * SUBS + j] as i8;
+                    }
+                    (m, [r0.dmin[s], r0.dmin[s], r1.dmin[s], r1.dmin[s]])
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut bsplit =
+            vec![([vdupq_n_s8(0); 4], [vdupq_n_s8(0); 4]); if MINS { a.n_super } else { 0 }];
         for tl in tiles {
             let qtile = a.q.as_ptr().add(tl * a.n_block * MM_TILE * 32);
             let dtile = &a.d[tl * a.n_super * MM_TILE..][..a.n_super * MM_TILE];
+            for (s, lanes) in adl.iter_mut().enumerate() {
+                let ad = &dtile[s * MM_TILE..];
+                for (tp, v) in lanes.iter_mut().enumerate() {
+                    let l = [ad[tp * 2], ad[tp * 2 + 1], ad[tp * 2], ad[tp * 2 + 1]];
+                    *v = vld1q_f32(l.as_ptr());
+                }
+            }
+            if MINS {
+                let btile = &a.bsum[tl * a.n_super * MM_TILE * SUBS..];
+                for (s, (lo, hi)) in bsplit.iter_mut().enumerate() {
+                    for tp in 0..4 {
+                        let b0 = vld1q_s16(btile.as_ptr().add((s * MM_TILE + 2 * tp) * SUBS));
+                        let b1 = vld1q_s16(btile.as_ptr().add((s * MM_TILE + 2 * tp + 1) * SUBS));
+                        let mask = vdupq_n_s16(0x7F);
+                        lo[tp] = vcombine_s8(
+                            vmovn_s16(vandq_s16(b0, mask)),
+                            vmovn_s16(vandq_s16(b1, mask)),
+                        );
+                        hi[tp] = vcombine_s8(
+                            vmovn_s16(vshrq_n_s16::<7>(b0)),
+                            vmovn_s16(vshrq_n_s16::<7>(b1)),
+                        );
+                    }
+                }
+            }
             for quad in 0..n_quad {
                 // Pass 1: `Q4_K`'s `-dmin*m` correction per (row, token),
                 // `sum_j m[j]*bsum[j]` over the eight sub-blocks of each
-                // super-block. Integer and exact, so the wider multiply
-                // changes nothing; the `f32` step is the scalar kernel's.
-                let mut acc = [[0f32; MM_TILE]; ROW_QUAD];
+                // super-block — itself a 2 × 8 by 8 × 2 product per row
+                // pair and token pair, so `smmla` takes it: the mins as the
+                // row operand, the sub-block sums split into their low
+                // seven bits and the rest (two `smmla`, recombined exactly
+                // in `i32`). Lanes `[r0t0, r0t1, r1t0, r1t1]` as the
+                // accumulators', and per lane the scalar kernel's `f32`
+                // expression in its order: `acc -= (ad * dm) * sum`.
+                let pair0 = quad * 2;
+                let mut facc = [[vdupq_n_f32(0.0); 4]; 2];
                 if MINS {
-                    let btile = &a.bsum[tl * a.n_super * MM_TILE * SUBS..];
                     for s in 0..a.n_super {
-                        let ad = &dtile[s * MM_TILE..];
-                        for (r, row) in rows[quad * ROW_QUAD..][..ROW_QUAD].iter().enumerate() {
-                            let m = vld1q_s16(row.mins.as_ptr().add(s * SUBS));
-                            let dm = row.dmin[s];
-                            for k in 0..MM_TILE {
-                                let bs = vld1q_s16(btile.as_ptr().add((s * MM_TILE + k) * SUBS));
-                                let prod = vaddq_s32(
-                                    vmull_s16(vget_low_s16(m), vget_low_s16(bs)),
-                                    vmull_high_s16(m, bs),
-                                );
-                                let i = vaddvq_s32(prod);
-                                acc[r][k] -= ad[k] * dm * i as f32;
+                        let (lo, hi) = &bsplit[s];
+                        for (rp, facc_rp) in facc.iter_mut().enumerate() {
+                            let (mv, dml) = &mins[(pair0 + rp) * a.n_super + s];
+                            let mv = vld1q_s8(mv.as_ptr());
+                            let dml = vld1q_f32(dml.as_ptr());
+                            for (tp, f) in facc_rp.iter_mut().enumerate() {
+                                let il = mmla_2x8(vdupq_n_s32(0), mv, lo[tp]);
+                                let ih = mmla_2x8(vdupq_n_s32(0), mv, hi[tp]);
+                                let sum = vaddq_s32(il, vshlq_n_s32::<7>(ih));
+                                let corr =
+                                    vmulq_f32(vmulq_f32(adl[s][tp], dml), vcvtq_f32_s32(sum));
+                                *f = vsubq_f32(*f, corr);
                             }
                         }
                     }
                 }
-                // `[row pair][token pair]`, lanes `[r0t0, r0t1, r1t0, r1t1]`.
-                let mut facc = [[vdupq_n_f32(0.0); 4]; 2];
-                for (rp, facc_rp) in facc.iter_mut().enumerate() {
-                    for (tp, f) in facc_rp.iter_mut().enumerate() {
-                        let lanes = [
-                            acc[rp * 2][tp * 2],
-                            acc[rp * 2][tp * 2 + 1],
-                            acc[rp * 2 + 1][tp * 2],
-                            acc[rp * 2 + 1][tp * 2 + 1],
-                        ];
-                        *f = vld1q_f32(lanes.as_ptr());
-                    }
-                }
+                let mut acc = [[0f32; MM_TILE]; ROW_QUAD];
 
-                let pair0 = quad * 2;
                 let wq0 = paired.q.as_ptr().add(pair0 * a.n_block * 64);
                 let wq1 = paired.q.as_ptr().add((pair0 + 1) * a.n_block * 64);
                 let sc0 = paired.sc.as_ptr().add(pair0 * n_groups);
                 let sc1 = paired.sc.as_ptr().add((pair0 + 1) * n_groups);
 
                 // Pass 2: the symmetric dot.
-                for s in 0..a.n_super {
+                for (s, adl_s) in adl.iter().enumerate() {
                     let mut isum = [[vdupq_n_s32(0); 4]; 2];
                     for j in 0..SUBS {
                         let b = s * SUBS + j;
@@ -3193,12 +3353,10 @@ unsafe fn gemm_k_rows_mmla<const MINS: bool, const SC16: bool>(
                     }
                     // `acc += ad * (d * isum)`, per lane — the scalar
                     // kernel's expression, operation for operation.
-                    let ad = &dtile[s * MM_TILE..];
                     for rp in 0..2 {
                         let dv = vld1q_f32(paired.d[(pair0 + rp) * a.n_super + s].as_ptr());
                         for tp in 0..4 {
-                            let adl = [ad[tp * 2], ad[tp * 2 + 1], ad[tp * 2], ad[tp * 2 + 1]];
-                            let adv = vld1q_f32(adl.as_ptr());
+                            let adv = adl_s[tp];
                             let f = vcvtq_f32_s32(isum[rp][tp]);
                             facc[rp][tp] =
                                 vaddq_f32(facc[rp][tp], vmulq_f32(adv, vmulq_f32(dv, f)));
@@ -3222,6 +3380,595 @@ unsafe fn gemm_k_rows_mmla<const MINS: bool, const SC16: bool>(
                     let base = tl * MM_TILE;
                     let n = MM_TILE.min(dst.len().saturating_sub(base));
                     dst[base..base + n].copy_from_slice(&row_acc[..n]);
+                }
+            }
+        }
+    }
+}
+
+/// Whether [`bf16_tiles`] may use `bfmmla` (ARMv8.6 `bf16`): the CPU says
+/// so and the instruction agrees with the scalar definition on known
+/// operands — the [`have_i8mm`] contract.
+#[cfg(target_arch = "aarch64")]
+pub fn have_bf16mm() -> bool {
+    use std::sync::OnceLock;
+    static USABLE: OnceLock<bool> = OnceLock::new();
+    *USABLE.get_or_init(|| {
+        if !std::arch::is_aarch64_feature_detected!("bf16") {
+            return false;
+        }
+        let a: [f32; 8] = [1.0, -2.0, 0.5, 3.0, 4.0, 0.25, -1.0, 2.0];
+        let b: [f32; 8] = [2.0, 1.0, -4.0, 0.5, -1.0, 3.0, 2.0, 0.75];
+        let (ab, bb) = (a.map(to_bf16), b.map(to_bf16));
+        let mut expect = [0f32; 4];
+        for i in 0..2 {
+            for j in 0..2 {
+                expect[i * 2 + j] = (0..4).map(|k| a[i * 4 + k] * b[j * 4 + k]).sum();
+            }
+        }
+        // Safety: `bf16` was detected; both arrays are 16 bytes.
+        let got = unsafe {
+            use std::arch::aarch64::*;
+            let acc = bfmmla(
+                vdupq_n_f32(0.0),
+                vld1q_u16(ab.as_ptr()),
+                vld1q_u16(bb.as_ptr()),
+            );
+            let mut out = [0f32; 4];
+            vst1q_f32(out.as_mut_ptr(), acc);
+            out
+        };
+        got == expect
+    })
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+pub fn have_bf16mm() -> bool {
+    false
+}
+
+/// `bfmmla`: `acc += a (2x4 bf16, rows in each 8-byte half) . b^T (2x4)`,
+/// lanes `[a0.b0, a0.b1, a1.b0, a1.b1]`, products summed in `f32`.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bfmmla(
+    acc: std::arch::aarch64::float32x4_t,
+    a: std::arch::aarch64::uint16x8_t,
+    b: std::arch::aarch64::uint16x8_t,
+) -> std::arch::aarch64::float32x4_t {
+    let mut acc = acc;
+    unsafe {
+        std::arch::asm!(
+            ".arch_extension bf16",
+            "bfmmla {acc:v}.4s, {a:v}.8h, {b:v}.8h",
+            acc = inout(vreg) acc,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack)
+        );
+    }
+    acc
+}
+
+/// `f32` to `bf16`, rounded to nearest even (NaN is not expected here).
+#[inline]
+pub fn to_bf16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    ((bits + 0x7FFF + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+#[inline]
+fn from_bf16(v: u16) -> f32 {
+    f32::from_bits((v as u32) << 16)
+}
+
+/// Rows of `bf16` for [`bf16_tiles`], two at a time: for each chunk of four
+/// `k`, a pair's two rows side by side (`[pair][chunk][2][4]`) — `bfmmla`'s
+/// operand. Rows are padded to a multiple of eight and `k` to four, with
+/// zeros.
+pub struct PackedBf16 {
+    data: Vec<u16>,
+    /// Padded to a multiple of 8.
+    pub rows: usize,
+    /// `k` padded to a multiple of 4, over 4.
+    chunks: usize,
+}
+
+impl PackedBf16 {
+    /// `n_rows` rows of `k` values, element `(r, i)` read through `get`.
+    // The reference the fast packers are tested against.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn pack(n_rows: usize, k: usize, get: impl Fn(usize, usize) -> f32) -> Self {
+        let rows = n_rows.div_ceil(8) * 8;
+        let chunks = k.div_ceil(4);
+        let mut data = vec![0u16; rows * chunks * 4];
+        for r in 0..n_rows {
+            let (pair, half) = (r / 2, r % 2);
+            let base = pair * chunks * 8;
+            for i in 0..k {
+                data[base + (i / 4) * 8 + half * 4 + i % 4] = to_bf16(get(r, i));
+            }
+        }
+        Self { data, rows, chunks }
+    }
+
+    /// The transpose of `k` source rows of `n_rows` values each — row `j`
+    /// is `src[j * stride..][..n_rows]` — so that packed row `r` is column
+    /// `r` of the source: a head's values `[keys][head_dim]` read in place,
+    /// row by row, rather than a strided element at a time.
+    pub fn pack_transposed(n_rows: usize, k: usize, src: &[f32], stride: usize) -> Self {
+        let rows = n_rows.div_ceil(8) * 8;
+        let chunks = k.div_ceil(4);
+        let mut data = vec![0u16; rows * chunks * 4];
+        for j in 0..k {
+            let row = &src[j * stride..j * stride + n_rows];
+            let at = (j / 4) * 8 + j % 4;
+            for (r, pair) in row.chunks(2).enumerate() {
+                let base = r * chunks * 8 + at;
+                data[base] = to_bf16(pair[0]);
+                if let Some(&v) = pair.get(1) {
+                    data[base + 4] = to_bf16(v);
+                }
+            }
+        }
+        Self { data, rows, chunks }
+    }
+
+    /// Row `r` as `e^(values − shift)` (the rest of the row zeros), returning
+    /// the sum of the exponentials — a softmax row's exponentials, their
+    /// denominator and its `bf16` packing in one pass, the rounding
+    /// [`to_bf16`]'s, four lanes at a time.
+    pub fn set_row_exp(&mut self, r: usize, values: &[f32], shift: f32) -> f32 {
+        let (pair, half) = (r / 2, r % 2);
+        let base = pair * self.chunks * 8 + half * 4;
+        debug_assert!(r < self.rows && values.len() <= self.chunks * 4);
+        let row = &mut self.data[base..base + (self.chunks - 1) * 8 + 4];
+        let whole = values.len() / 4;
+        #[cfg(not(target_arch = "aarch64"))]
+        let mut sum = 0f32;
+        #[cfg(target_arch = "aarch64")]
+        // Safety: NEON is baseline on aarch64; chunk `c < whole` reads
+        // `values[4c..4c + 4]` and writes `row[8c..8c + 4]`, both in bounds.
+        let mut sum = unsafe {
+            use std::arch::aarch64::*;
+            let s = vdupq_n_f32(shift);
+            let round = vdupq_n_u32(0x7FFF);
+            let one = |c: usize, acc: &mut float32x4_t, row: &mut [u16]| {
+                let e = crate::engine::tensor::exp_neon(vsubq_f32(
+                    vld1q_f32(values.as_ptr().add(c * 4)),
+                    s,
+                ));
+                *acc = vaddq_f32(*acc, e);
+                let bits = vreinterpretq_u32_f32(e);
+                let odd = vandq_u32(vshrq_n_u32::<16>(bits), vdupq_n_u32(1));
+                let rounded = vaddq_u32(vaddq_u32(bits, round), odd);
+                vst1_u16(row.as_mut_ptr().add(c * 8), vshrn_n_u32::<16>(rounded));
+            };
+            // Four chunks an iteration: each exponential is one long
+            // dependent chain, and four of them side by side keep the
+            // pipes busy where one ran at its latency.
+            let mut acc = [vdupq_n_f32(0.0); 4];
+            let mut c = 0;
+            while c + 4 <= whole {
+                for (l, a) in acc.iter_mut().enumerate() {
+                    one(c + l, a, row);
+                }
+                c += 4;
+            }
+            while c < whole {
+                one(c, &mut acc[0], row);
+                c += 1;
+            }
+            vaddvq_f32(vaddq_f32(
+                vaddq_f32(acc[0], acc[1]),
+                vaddq_f32(acc[2], acc[3]),
+            ))
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        for c in 0..whole {
+            for e in 0..4 {
+                let v = (values[c * 4 + e] - shift).exp();
+                sum += v;
+                row[c * 8 + e] = to_bf16(v);
+            }
+        }
+        for c in whole..self.chunks {
+            for e in 0..4 {
+                row[c * 8 + e] = match values.get(c * 4 + e) {
+                    Some(&x) => {
+                        let v = (x - shift).exp();
+                        sum += v;
+                        to_bf16(v)
+                    }
+                    None => 0,
+                };
+            }
+        }
+        sum
+    }
+
+    /// Room for `n_rows` rows of `k`, all zero, to be filled by
+    /// [`PackedBf16::set_row`] — kept across calls of one shape.
+    pub fn zeroed(n_rows: usize, k: usize) -> Self {
+        let (rows, chunks) = (n_rows.div_ceil(8) * 8, k.div_ceil(4));
+        Self {
+            data: vec![0u16; rows * chunks * 4],
+            rows,
+            chunks,
+        }
+    }
+
+    /// Row `r` from `values` (at most `k` long; the rest of the row, its
+    /// padding included, zeros) — a softmax row written straight into
+    /// `bfmmla`'s layout.
+    // The reference the fast packers are tested against.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn set_row(&mut self, r: usize, values: &[f32]) {
+        let (pair, half) = (r / 2, r % 2);
+        let base = pair * self.chunks * 8 + half * 4;
+        debug_assert!(r < self.rows && values.len() <= self.chunks * 4);
+        let row = &mut self.data[base..base + (self.chunks - 1) * 8 + 4];
+        let whole = values.len() / 4;
+        for (c, v) in values.as_chunks::<4>().0.iter().enumerate() {
+            let slot = &mut row[c * 8..c * 8 + 4];
+            for (s, &x) in slot.iter_mut().zip(v) {
+                *s = to_bf16(x);
+            }
+        }
+        for c in whole..self.chunks {
+            for e in 0..4 {
+                let i = c * 4 + e;
+                row[c * 8 + e] = values.get(i).map_or(0, |&x| to_bf16(x));
+            }
+        }
+    }
+}
+
+/// `out[i][j] = a_i · b_j` for every row of `a` and of `b` (both packed
+/// over the same `k`), `out` row-major `[a.rows][b.rows]` — 8 × 8 tiles of
+/// sixteen `bfmmla` per eight loads, `f32` sums. The value product of the
+/// picture transformers' attention (`doc/PERF-IMAGE.md`, task 5b): `a` the
+/// block's probabilities, `b` a head's values transposed.
+pub fn bf16_tiles(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
+    debug_assert_eq!(a.chunks, b.chunks);
+    debug_assert_eq!(out.len(), a.rows * b.rows);
+    #[cfg(target_arch = "aarch64")]
+    if have_bf16mm() {
+        // Safety: `bf16` was verified.
+        unsafe { bf16_tiles_mmla(a, b, out) };
+        return;
+    }
+    bf16_tiles_portable(a, b, out)
+}
+
+/// The definition [`bf16_tiles_mmla`] is held to.
+pub fn bf16_tiles_portable(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
+    let at = |m: &PackedBf16, r: usize, c: usize, i: usize| -> f32 {
+        from_bf16(m.data[(r / 2) * m.chunks * 8 + c * 8 + (r % 2) * 4 + i])
+    };
+    for i in 0..a.rows {
+        for j in 0..b.rows {
+            let mut acc = 0f32;
+            for c in 0..a.chunks {
+                for e in 0..4 {
+                    acc += at(a, i, c, e) * at(b, j, c, e);
+                }
+            }
+            out[i * b.rows + j] = acc;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn bf16_tiles_mmla(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
+    use std::arch::aarch64::*;
+    let chunks = a.chunks;
+    unsafe {
+        for it in 0..a.rows / 8 {
+            for jt in 0..b.rows / 8 {
+                let mut acc = [[vdupq_n_f32(0.0); 4]; 4];
+                let ap = a.data.as_ptr().add(it * 4 * chunks * 8);
+                let bp = b.data.as_ptr().add(jt * 4 * chunks * 8);
+                for c in 0..chunks {
+                    let av: [uint16x8_t; 4] =
+                        std::array::from_fn(|p| vld1q_u16(ap.add(p * chunks * 8 + c * 8)));
+                    let bv: [uint16x8_t; 4] =
+                        std::array::from_fn(|p| vld1q_u16(bp.add(p * chunks * 8 + c * 8)));
+                    for (ap_, row) in av.iter().zip(acc.iter_mut()) {
+                        for (bp_, cell) in bv.iter().zip(row.iter_mut()) {
+                            *cell = bfmmla(*cell, *ap_, *bp_);
+                        }
+                    }
+                }
+                for (pi, row) in acc.iter().enumerate() {
+                    for (pj, &v4) in row.iter().enumerate() {
+                        let mut lanes = [0f32; 4];
+                        vst1q_f32(lanes.as_mut_ptr(), v4);
+                        for (lane, v) in lanes.iter().enumerate() {
+                            let i = it * 8 + pi * 2 + lane / 2;
+                            let j = jt * 8 + pj * 2 + lane % 2;
+                            out[i * b.rows + j] = *v;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Rows per [`RowI8`] group — the 8 × 8 `smmla` tile's height.
+pub const ROW_OCT: usize = 8;
+
+/// Weights as `int8` with **one `f32` scale per row**, packed eight rows at
+/// a time in [`ActQ8Mm`]'s block layout (`[group][block][pair][chunk][2][8]`,
+/// a pair's two rows side by side per 8-element chunk) — what
+/// [`matmul_rowi8`] multiplies (`doc/PERF-IMAGE.md`, task 10).
+///
+/// Unlike a K-quant row there is no per-block weight scale, so the tile
+/// accumulates in `i32` over a whole 256-element super-block and folds into
+/// `f32` once per super-block with the *activation's* scale; the activations
+/// keep their per-256 scale, which is what confines an outlier channel.
+/// About a byte a weight, resident: built at load from any weight type.
+pub struct RowI8 {
+    pub in_dim: usize,
+    pub out_dim: usize,
+    groups: usize,
+    q: Vec<i8>,
+    /// `[groups * 8]`, the padding rows' 1.0.
+    scale: Vec<f32>,
+}
+
+impl RowI8 {
+    /// `out_dim` rows of `in_dim` (a multiple of [`SUPER_BLOCK`]), row `o`
+    /// produced by `row(o)` in `f32`.
+    pub fn quantize(out_dim: usize, in_dim: usize, row: impl Fn(usize) -> Vec<f32> + Sync) -> Self {
+        assert!(
+            in_dim.is_multiple_of(SUPER_BLOCK),
+            "RowI8 rows are whole super-blocks"
+        );
+        let groups = out_dim.div_ceil(ROW_OCT);
+        let n_block = in_dim / 32;
+        let mut q = vec![0i8; groups * n_block * ROW_OCT * 32];
+        let mut scale = vec![1f32; groups * ROW_OCT];
+        q.par_chunks_mut(n_block * ROW_OCT * 32)
+            .zip(scale.par_chunks_mut(ROW_OCT))
+            .enumerate()
+            .for_each(|(g, (qg, sg))| {
+                for (r, slot) in sg.iter_mut().enumerate() {
+                    let o = g * ROW_OCT + r;
+                    if o >= out_dim {
+                        break;
+                    }
+                    let values = row(o);
+                    debug_assert_eq!(values.len(), in_dim);
+                    let max = values.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let s = if max > 0.0 { max / 127.0 } else { 1.0 };
+                    *slot = s;
+                    let inv = 1.0 / s;
+                    let (rp, half) = (r / 2, r % 2);
+                    for b in 0..n_block {
+                        for c in 0..4 {
+                            let dst =
+                                &mut qg[b * ROW_OCT * 32 + ((rp * 4 + c) * 2 + half) * 8..][..8];
+                            for (d, v) in dst.iter_mut().zip(&values[b * 32 + c * 8..][..8]) {
+                                *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+                            }
+                        }
+                    }
+                }
+            });
+        Self {
+            in_dim,
+            out_dim,
+            groups,
+            q,
+            scale,
+        }
+    }
+
+    /// Resident bytes.
+    pub fn bytes(&self) -> usize {
+        self.q.len() + self.scale.len() * 4
+    }
+
+    fn group(&self, g: usize) -> &[i8] {
+        let n = self.in_dim / 32 * ROW_OCT * 32;
+        &self.q[g * n..(g + 1) * n]
+    }
+}
+
+/// `x · wᵀ` for `x` `[n_tokens][in_dim]`: the activations quantized per
+/// 256 ([`ActQ8Mm`]), then row groups × token blocks in parallel, each an
+/// 8 × 8 tile product ([`rowi8_tiles`]). `[n_tokens][out_dim]` out.
+pub fn matmul_rowi8(x: &[f32], n_tokens: usize, w: &RowI8) -> Vec<f32> {
+    debug_assert_eq!(x.len(), n_tokens * w.in_dim);
+    let acts = ActQ8Mm::quantize(x, w.in_dim, n_tokens);
+    matmul_rowi8_acts(&acts, n_tokens, w)
+}
+
+/// The weight bytes a [`matmul_rowi8_acts`] task keeps hot while an
+/// activation tile passes over them: L2-sized, so each 8-token tile is read
+/// from memory once per chunk of row groups rather than once per group.
+/// Measured best of 128 KB–1.5 MB at a 1024² step's three shapes.
+const ROWI8_CHUNK_BYTES: usize = 384 << 10;
+
+/// [`matmul_rowi8`] on activations already quantized.
+///
+/// Tasks are chunks of row groups × blocks of token tiles; inside one, each
+/// 8-token tile (`in_dim` bytes a token, L1) meets every group of the chunk
+/// (`ROWI8_CHUNK_BYTES`, L2) before the next tile is read. One task per row
+/// group streamed every activation once per group — at a 1024² step's 4,096
+/// × 4,096, 16 MB read 512 times a linear.
+pub fn matmul_rowi8_acts(acts: &ActQ8Mm, n_tokens: usize, w: &RowI8) -> Vec<f32> {
+    let out_dim = w.out_dim;
+    let mut out = vec![0f32; n_tokens * out_dim];
+    let n_tiles = acts.n_tiles();
+    let chunk = (ROWI8_CHUNK_BYTES / (w.in_dim * ROW_OCT)).clamp(1, w.groups);
+    let n_chunks = w.groups.div_ceil(chunk);
+    // Token blocks only when the chunks alone cannot occupy the pool.
+    let wanted = 4 * rayon::current_num_threads();
+    let n_blocks = if n_chunks >= wanted {
+        1
+    } else {
+        wanted.div_ceil(n_chunks).min(n_tiles).max(1)
+    };
+    let tiles_per_block = n_tiles.div_ceil(n_blocks).max(1);
+    let n_blocks = n_tiles.div_ceil(tiles_per_block);
+    #[derive(Clone, Copy)]
+    struct Sink(*mut f32);
+    unsafe impl Send for Sink {}
+    unsafe impl Sync for Sink {}
+    let sink = Sink(out.as_mut_ptr());
+    (0..n_chunks * n_blocks).into_par_iter().for_each_init(
+        || vec![0f32; ROW_OCT * n_tokens],
+        move |yt, task| {
+            let sink = sink;
+            let (c, b) = (task / n_blocks, task % n_blocks);
+            let groups = c * chunk..((c + 1) * chunk).min(w.groups);
+            let tiles = b * tiles_per_block..((b + 1) * tiles_per_block).min(n_tiles);
+            let mut rows: Vec<&mut [f32]> = yt.chunks_mut(n_tokens).collect();
+            for tl in tiles {
+                let (t0, t1) = (tl * MM_TILE, ((tl + 1) * MM_TILE).min(n_tokens));
+                for g in groups.clone() {
+                    rowi8_tiles(w, g, acts, tl..tl + 1, &mut rows);
+                    let n_rows = ROW_OCT.min(out_dim - g * ROW_OCT);
+                    for t in t0..t1 {
+                        for (r, row) in rows.iter().enumerate().take(n_rows) {
+                            // Safety: task `task` alone writes columns of
+                            // its groups for token rows of its tiles, in a
+                            // buffer sized `n_tokens * out_dim` that
+                            // outlives the parallel loop.
+                            unsafe {
+                                *sink.0.add(t * out_dim + g * ROW_OCT + r) = row[t];
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    );
+    out
+}
+
+/// Group `g`'s eight rows against the tokens of `tiles`: `yt[r][t]`, each of
+/// the eight slices `n_tokens` long (tokens outside `tiles` untouched).
+pub fn rowi8_tiles(
+    w: &RowI8,
+    g: usize,
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    yt: &mut [&mut [f32]],
+) {
+    debug_assert_eq!(yt.len(), ROW_OCT);
+    #[cfg(target_arch = "aarch64")]
+    if have_i8mm() {
+        // Safety: `i8mm` was verified.
+        unsafe { rowi8_tiles_mmla(w, g, a, tiles, yt) };
+        return;
+    }
+    rowi8_tiles_portable(w, g, a, tiles, yt)
+}
+
+/// The definition [`rowi8_tiles_mmla`] is held to: `i32` sums per
+/// super-block, folded with the activation's scale, times the row's.
+pub fn rowi8_tiles_portable(
+    w: &RowI8,
+    g: usize,
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    yt: &mut [&mut [f32]],
+) {
+    let wq = w.group(g);
+    for tl in tiles {
+        let qtile = &a.q[tl * a.n_block * MM_TILE * 32..][..a.n_block * MM_TILE * 32];
+        let dtile = &a.d[tl * a.n_super * MM_TILE..][..a.n_super * MM_TILE];
+        for k in 0..MM_TILE {
+            let t = tl * MM_TILE + k;
+            if t >= a.n_tokens {
+                break;
+            }
+            let (tp, th) = (k / 2, k % 2);
+            for (r, row_out) in yt.iter_mut().enumerate() {
+                let (rp, rh) = (r / 2, r % 2);
+                let mut acc = 0f32;
+                for s in 0..a.n_super {
+                    let mut isum = 0i32;
+                    for b in s * SUBS..(s + 1) * SUBS {
+                        for c in 0..4 {
+                            let wo = b * ROW_OCT * 32 + ((rp * 4 + c) * 2 + rh) * 8;
+                            let xo = b * MM_TILE * 32 + ((tp * 4 + c) * 2 + th) * 8;
+                            for e in 0..8 {
+                                isum += wq[wo + e] as i32 * qtile[xo + e] as i32;
+                            }
+                        }
+                    }
+                    acc += isum as f32 * dtile[s * MM_TILE + k];
+                }
+                row_out[t] = acc * w.scale[g * ROW_OCT + r];
+            }
+        }
+    }
+}
+
+/// The 8 × 8 tile: per 8-element chunk, four row pairs and four token pairs
+/// loaded and sixteen `smmla` issued into sixteen `i32` accumulators (the
+/// K-quant tile is 4 × 8: eight per six loads, and a scale per sub-block).
+/// One `f32` fold per 256 elements.
+#[cfg(target_arch = "aarch64")]
+unsafe fn rowi8_tiles_mmla(
+    w: &RowI8,
+    g: usize,
+    a: &ActQ8Mm,
+    tiles: std::ops::Range<usize>,
+    yt: &mut [&mut [f32]],
+) {
+    use std::arch::aarch64::*;
+    let wq = w.group(g).as_ptr();
+    let scale = &w.scale[g * ROW_OCT..(g + 1) * ROW_OCT];
+    unsafe {
+        for tl in tiles {
+            let qtile = a.q.as_ptr().add(tl * a.n_block * MM_TILE * 32);
+            let dtile = &a.d[tl * a.n_super * MM_TILE..][..a.n_super * MM_TILE];
+            // `[row pair][token pair]`, lanes `[r0t0, r0t1, r1t0, r1t1]`.
+            let mut facc = [[vdupq_n_f32(0.0); 4]; 4];
+            for s in 0..a.n_super {
+                let mut acc = [[vdupq_n_s32(0); 4]; 4];
+                for b in s * SUBS..(s + 1) * SUBS {
+                    let x = qtile.add(b * MM_TILE * 32);
+                    let wb = wq.add(b * ROW_OCT * 32);
+                    for c in 0..4 {
+                        let wv: [int8x16_t; 4] =
+                            std::array::from_fn(|rp| vld1q_s8(wb.add(rp * 64 + c * 16)));
+                        let xv: [int8x16_t; 4] =
+                            std::array::from_fn(|tp| vld1q_s8(x.add(tp * 64 + c * 16)));
+                        for rp in 0..4 {
+                            for tp in 0..4 {
+                                acc[rp][tp] = mmla_2x8(acc[rp][tp], wv[rp], xv[tp]);
+                            }
+                        }
+                    }
+                }
+                let ad = &dtile[s * MM_TILE..s * MM_TILE + MM_TILE];
+                for tp in 0..4 {
+                    let adl = [ad[tp * 2], ad[tp * 2 + 1], ad[tp * 2], ad[tp * 2 + 1]];
+                    let adv = vld1q_f32(adl.as_ptr());
+                    for rp in 0..4 {
+                        facc[rp][tp] = vfmaq_f32(facc[rp][tp], vcvtq_f32_s32(acc[rp][tp]), adv);
+                    }
+                }
+            }
+            let base = tl * MM_TILE;
+            let n = MM_TILE.min(a.n_tokens.saturating_sub(base));
+            for (rp, row) in facc.iter().enumerate() {
+                for (tp, &v4) in row.iter().enumerate() {
+                    let mut lanes = [0f32; 4];
+                    vst1q_f32(lanes.as_mut_ptr(), v4);
+                    for (lane, v) in lanes.iter().enumerate() {
+                        let (r, t) = (rp * 2 + lane / 2, tp * 2 + lane % 2);
+                        if t < n {
+                            yt[r][base + t] = v * scale[r];
+                        }
+                    }
                 }
             }
         }
@@ -7396,5 +8143,271 @@ mod tests {
         assert!(!supports_flat(GGML_TYPE_Q6_K, 2048));
         // A row that is not a whole number of 32-element blocks.
         assert!(!supports_flat(GGML_TYPE_Q8_0, 100));
+    }
+}
+
+#[cfg(test)]
+mod rowi8_tests {
+    use super::*;
+
+    fn data(n: usize, salt: u64) -> Vec<f32> {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64 ^ salt;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s >> 11) as f32 / (1u64 << 53) as f32 * 2.0 - 1.0
+            })
+            .collect()
+    }
+
+    /// The `smmla` tile and its portable twin agree, and both track the exact
+    /// `f32` product to the quantization — with three activation channels at
+    /// 300× the rest, the case one scale per token (`rten-gemm`) cannot
+    /// carry. Awkward shapes: rows not a multiple of eight, tokens not of
+    /// the tile.
+    #[test]
+    fn the_rowi8_product_tracks_the_f32_one_with_outliers() {
+        // Eight 256-element super-blocks, two of them carrying the outliers:
+        // the activations' scale is per super-block (as for every K-quant
+        // product), so an outlier's block is coarse and the others are not.
+        let (in_dim, out_dim, n) = (2048usize, 21usize, 13usize);
+        let w = data(in_dim * out_dim, 1);
+        let mut x = data(n * in_dim, 2);
+        for t in 0..n {
+            for c in [7usize, 300, 511] {
+                x[t * in_dim + c] *= 300.0;
+            }
+        }
+        let rows = RowI8::quantize(out_dim, in_dim, |o| {
+            w[o * in_dim..(o + 1) * in_dim].to_vec()
+        });
+        let got = matmul_rowi8(&x, n, &rows);
+        let acts = ActQ8Mm::quantize(&x, in_dim, n);
+        let mut portable = vec![0f32; n * out_dim];
+        for g in 0..rows.groups {
+            let mut yt = vec![0f32; ROW_OCT * n];
+            {
+                let mut slices: Vec<&mut [f32]> = yt.chunks_mut(n).collect();
+                rowi8_tiles_portable(&rows, g, &acts, 0..acts.n_tiles(), &mut slices);
+            }
+            for r in 0..ROW_OCT.min(out_dim - g * ROW_OCT) {
+                for t in 0..n {
+                    portable[t * out_dim + g * ROW_OCT + r] = yt[r * n + t];
+                }
+            }
+        }
+        // The activations as `ActQ8Mm` quantizes them — per 256, the part of
+        // the error every K-quant product shares — so what is measured
+        // against it is this format's own: the weights' per-row `int8`.
+        let mut xq = x.clone();
+        for row in xq.chunks_mut(SUPER_BLOCK) {
+            let scale = row.iter().fold(0f32, |m, v| m.max(v.abs())) / 127.0;
+            for v in row.iter_mut() {
+                *v = if scale > 0.0 {
+                    (*v / scale).round().clamp(-127.0, 127.0) * scale
+                } else {
+                    0.0
+                };
+            }
+        }
+        let (mut se, mut ss, mut se_full, mut worst_twin) = (0f64, 0f64, 0f64, 0f32);
+        for t in 0..n {
+            for o in 0..out_dim {
+                let dot = |a: &[f32]| -> f32 {
+                    (0..in_dim)
+                        .map(|k| a[t * in_dim + k] * w[o * in_dim + k])
+                        .sum()
+                };
+                let (want_q, want) = (dot(&xq), dot(&x));
+                let g = got[t * out_dim + o];
+                se += ((g - want_q) as f64).powi(2);
+                ss += (want_q as f64).powi(2);
+                se_full += ((g - want) as f64).powi(2);
+                let p = portable[t * out_dim + o];
+                worst_twin = worst_twin.max((g - p).abs() / p.abs().max(1.0));
+            }
+        }
+        let rel = (se / ss).sqrt();
+        let rel_full = (se_full / ss).sqrt();
+        assert!(worst_twin < 1e-4, "tile vs portable {worst_twin}");
+        assert!(rel < 0.01, "the weights' own relative RMS error {rel}");
+        assert!(rel_full < 0.05, "against exact f32 {rel_full}");
+    }
+
+    /// `matmul_rowi8` at a Qwen-Image 2.1 step's shapes, against
+    /// `k_gemm_throughput`'s `Q4_K` numbers:
+    ///
+    /// ```text
+    /// ORANGU_BENCH_SHAPE=4096,24576,4096 cargo test --profile release-with-debug \
+    ///     --bin orangu-server rowi8_throughput -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn rowi8_throughput() {
+        let (in_dim, out_dim, n_tokens) = std::env::var("ORANGU_BENCH_SHAPE")
+            .ok()
+            .and_then(|v| {
+                let mut it = v.split(',').map(|p| p.trim().parse::<usize>().ok());
+                Some((it.next()??, it.next()??, it.next()??))
+            })
+            .unwrap_or((4096, 4096, 4096));
+        let w = data(in_dim * out_dim, 3);
+        let rows = RowI8::quantize(out_dim, in_dim, |o| {
+            w[o * in_dim..(o + 1) * in_dim].to_vec()
+        });
+        drop(w);
+        let x = data(n_tokens * in_dim, 4);
+        let _ = matmul_rowi8(&x, n_tokens, &rows);
+        let reps = 3;
+        let started = std::time::Instant::now();
+        for _ in 0..reps {
+            let _ = matmul_rowi8(&x, n_tokens, &rows);
+        }
+        let secs = started.elapsed().as_secs_f64() / reps as f64;
+        eprintln!(
+            "rowi8 {in_dim}x{out_dim} x {n_tokens} tokens: {:.1} ms, {:.1} G MAC/s",
+            secs * 1e3,
+            (in_dim * out_dim * n_tokens) as f64 / secs / 1e9
+        );
+    }
+}
+
+#[cfg(test)]
+mod bf16_tests {
+    use super::*;
+
+    /// The `bfmmla` tiles match their portable twin exactly (both sum
+    /// `bf16` products in `f32`; the order differs only within a lane's
+    /// four) to rounding, and the exact `f32` product to `bf16`'s eight bits.
+    #[test]
+    fn bf16_tiles_match_the_twin_and_the_f32_product() {
+        let (n_a, n_b, k) = (13usize, 11usize, 37usize);
+        let a: Vec<f32> = (0..n_a * k)
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) * 0.05)
+            .collect();
+        let b: Vec<f32> = (0..n_b * k)
+            .map(|i| ((i * 5 % 19) as f32 - 9.0) * 0.07)
+            .collect();
+        let pa = PackedBf16::pack(n_a, k, |r, i| a[r * k + i]);
+        let pb = PackedBf16::pack(n_b, k, |r, i| b[r * k + i]);
+        let mut got = vec![0f32; pa.rows * pb.rows];
+        bf16_tiles(&pa, &pb, &mut got);
+        let mut twin = vec![0f32; pa.rows * pb.rows];
+        bf16_tiles_portable(&pa, &pb, &mut twin);
+        for i in 0..n_a {
+            for j in 0..n_b {
+                let (g, t) = (got[i * pb.rows + j], twin[i * pb.rows + j]);
+                assert!(
+                    (g - t).abs() <= 1e-4 * t.abs().max(1.0),
+                    "{i},{j}: {g} vs {t}"
+                );
+                let exact: f32 = (0..k).map(|e| a[i * k + e] * b[j * k + e]).sum();
+                assert!(
+                    (g - exact).abs() <= 0.02 * exact.abs().max(0.5),
+                    "{i},{j}: {g} vs {exact}"
+                );
+            }
+        }
+        eprintln!("bfmmla in use: {}", have_bf16mm());
+    }
+
+    /// `pack_transposed` is `pack` of the transpose, strided source and
+    /// odd sizes included.
+    #[test]
+    fn pack_transposed_is_pack_of_the_transpose() {
+        let (n_rows, k, stride) = (13usize, 11usize, 20usize);
+        let src: Vec<f32> = (0..k * stride).map(|i| (i as f32 * 0.21).cos()).collect();
+        let want = PackedBf16::pack(n_rows, k, |r, j| src[j * stride + r]);
+        let got = PackedBf16::pack_transposed(n_rows, k, &src, stride);
+        assert_eq!(got.data, want.data);
+    }
+
+    /// `set_row_exp` is `set_row` of the exponentials, and returns their
+    /// sum.
+    #[test]
+    fn set_row_exp_is_set_row_of_the_exponentials() {
+        let k = 37usize;
+        let x: Vec<f32> = (0..k).map(|i| (i as f32 * 0.7).sin() * 3.0).collect();
+        for len in [k, k - 1, k - 3, 4, 1] {
+            let max = x[..len].iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut want = PackedBf16::zeroed(3, k);
+            let mut e: Vec<f32> = x[..len].to_vec();
+            let sum = crate::engine::tensor::exp_shifted_sum(&mut e, max);
+            want.set_row(1, &e);
+            let mut got = PackedBf16::pack(3, k, |_, _| 5.0);
+            got.set_row(0, &[0.0; 0]);
+            got.set_row(2, &[0.0; 0]);
+            let got_sum = got.set_row_exp(1, &x[..len], max);
+            assert!(
+                (got_sum - sum).abs() <= 1e-5 * sum,
+                "{len}: {got_sum} vs {sum}"
+            );
+            for (i, (&a, &b)) in got.data.iter().zip(&want.data).enumerate() {
+                // The tail's exponentials are `libm`'s, the body's the
+                // polynomial's: one `bf16` unit apart at most.
+                assert!(a.abs_diff(b) <= 1, "{len} at {i}: {a:#x} vs {b:#x}");
+            }
+        }
+    }
+
+    /// Issue rates of `bfmmla` against `smmla` (sixteen independent
+    /// accumulators, registers only) on the calling core:
+    ///
+    /// ```text
+    /// taskset -c 0 <test binary> mmla_issue_rates --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "aarch64")]
+    fn mmla_issue_rates() {
+        use std::arch::aarch64::*;
+        let reps = 20_000_000u64;
+        unsafe {
+            let mut f = [vdupq_n_f32(0.0); 16];
+            let a = vdupq_n_u16(0x3f80);
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                for x in f.iter_mut() {
+                    *x = bfmmla(*x, a, a);
+                }
+            }
+            let bf = t.elapsed().as_secs_f64();
+            std::hint::black_box(&f);
+            let mut s = [vdupq_n_s32(0); 16];
+            let b = vdupq_n_s8(1);
+            let t = std::time::Instant::now();
+            for _ in 0..reps {
+                for x in s.iter_mut() {
+                    *x = mmla_2x8(*x, b, b);
+                }
+            }
+            let sm = t.elapsed().as_secs_f64();
+            std::hint::black_box(&s);
+            let n = (reps * 16) as f64;
+            eprintln!(
+                "bfmmla {:.2} G/s ({:.1} G MAC/s), smmla {:.2} G/s ({:.1} G MAC/s)",
+                n / bf / 1e9,
+                16.0 * n / bf / 1e9,
+                n / sm / 1e9,
+                32.0 * n / sm / 1e9
+            );
+        }
+    }
+
+    /// A row written with `set_row` over whatever was there is the row
+    /// `pack` makes, shorter rows padded with zeros.
+    #[test]
+    fn set_row_is_pack_row_by_row() {
+        let (rows, k) = (9usize, 37usize);
+        let a: Vec<f32> = (0..rows * k).map(|i| (i as f32 * 0.37).sin()).collect();
+        let lens = |r: usize| k - (r * 5) % 13;
+        let want = PackedBf16::pack(rows, k, |r, i| if i < lens(r) { a[r * k + i] } else { 0.0 });
+        let mut got = PackedBf16::pack(rows, k, |_, _| 7.0);
+        for r in 0..rows {
+            got.set_row(r, &a[r * k..r * k + lens(r)]);
+        }
+        assert_eq!(got.data, want.data);
     }
 }

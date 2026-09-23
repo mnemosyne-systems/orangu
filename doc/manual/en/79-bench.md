@@ -547,6 +547,22 @@ the number is the kernel and the cores it runs on (a GPU backend, or the
 four idle cores), not the pipeline around it; what moves the *wait* is
 `image_size`, `image_steps` and `image_cfg_scale = 1`, in that order.
 
+`--image-init <PATH>` attaches a picture to every request. On a Qwen-Image
+2.1 server with its vision projector that is an **edit**, and its
+`encode_s` then holds the vision tower, the text encoder reading the
+picture and the transformer's prompt prefix — minutes at 1024 pixels,
+which the server log splits (`[image] reference …`, `[image] edit prompt
+…`); elsewhere it is a start picture. Give it an instruction:
+
+```sh
+orangu-bench --image 1024 --image-steps 1 --reps 1 \
+    --image-init apple.png --image-prompt "Make the apple green." \
+    --flamegraph /mnt/fast/edit.svg --flamegraph-freq 199
+```
+
+`doc/PERF-IMAGE.md` is where these measurements are kept and turned into
+tasks.
+
 `tokens` is the transformer's sequence: one latent token per 16×16 pixels
 (the VAE's 8× compression times the transformer's 2×2 patch), so a 256-pixel
 square is 256 tokens and a 1024-pixel one is 4096. `steps` says how many
@@ -1054,6 +1070,7 @@ Options:
       --image-steps <N>                Denoising steps per picture for `--image` [default: 2]
       --image-cfg <SCALE>              Guidance scale for `--image`; 1 runs the prompt alone. Default: the server's
       --image-prompt <TEXT>            The prompt every `--image` picture is drawn from [default: "Create an image of a cat"]
+      --image-init <PATH>              A picture attached to every `--image` request: an edit on a Qwen-Image 2.1 server with its vision projector, a start picture otherwise
       --gen <N>                        Number of tokens to generate per timed run [default: 128]
       --curve <N>                      Curve mode: one generation of this many tokens, bucketed by context; 0 disables [default: 0]
       --bucket <N>                     Bucket width (in context tokens) for `--curve` [default: 256]

@@ -820,6 +820,72 @@ pub fn softmax_inplace(x: &mut [f32]) {
     }
 }
 
+/// The largest element of `x` (`-inf` for an empty slice), four lanes at a
+/// time on aarch64 — a softmax's first pass over an attention row.
+pub fn max_f32(x: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64; the loop reads only within `x`.
+    unsafe {
+        use std::arch::aarch64::*;
+        let n = x.len();
+        let mut acc = [vdupq_n_f32(f32::NEG_INFINITY); 4];
+        let mut i = 0;
+        while i + 16 <= n {
+            for (l, a) in acc.iter_mut().enumerate() {
+                *a = vmaxq_f32(*a, vld1q_f32(x.as_ptr().add(i + 4 * l)));
+            }
+            i += 16;
+        }
+        let v = vmaxq_f32(vmaxq_f32(acc[0], acc[1]), vmaxq_f32(acc[2], acc[3]));
+        let mut max = vmaxvq_f32(v);
+        for &e in &x[i..] {
+            max = max.max(e);
+        }
+        max
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    x.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+}
+
+/// `x = e^(x − shift)` in place, returning the sum — a softmax's
+/// exponentials and its denominator in one pass, on [`exp_inplace`]'s
+/// approximation.
+pub fn exp_shifted_sum(x: &mut [f32], shift: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: NEON is baseline on aarch64; the loop reads and writes only
+    // within `x`.
+    unsafe {
+        use std::arch::aarch64::*;
+        let n = x.len();
+        let s = vdupq_n_f32(shift);
+        let mut acc = [vdupq_n_f32(0.0); 2];
+        let mut i = 0;
+        while i + 8 <= n {
+            for (l, a) in acc.iter_mut().enumerate() {
+                let p = x.as_mut_ptr().add(i + 4 * l);
+                let e = exp_neon(vsubq_f32(vld1q_f32(p), s));
+                vst1q_f32(p, e);
+                *a = vaddq_f32(*a, e);
+            }
+            i += 8;
+        }
+        let mut sum = vaddvq_f32(vaddq_f32(acc[0], acc[1]));
+        for v in x[i..].iter_mut() {
+            *v = (*v - shift).exp();
+            sum += *v;
+        }
+        sum
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for v in x.iter_mut() {
+            *v -= shift;
+        }
+        exp_inplace(x);
+        x.iter().sum()
+    }
+}
+
 /// Elementwise `e^x` in place, four or eight lanes at a time where the
 /// hardware has it — the same [`exp_neon`]/[`exp_avx2`] approximation
 /// `gelu_inplace` runs on, so a softmax over a large attention block pays
@@ -828,6 +894,7 @@ pub fn softmax_inplace(x: &mut [f32]) {
 /// probability; the scalar [`softmax_inplace`] above keeps `libm`'s `exp`
 /// for the sampler and the language models' attention, whose references
 /// are bit-exact.
+#[cfg_attr(all(target_arch = "aarch64", not(test)), allow(dead_code))]
 pub fn exp_inplace(x: &mut [f32]) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: NEON is baseline on aarch64; the loop reads and writes only
@@ -1447,7 +1514,9 @@ fn gelu_slice(x: &mut [f32]) {
 /// clamp bites, so the bound costs nothing real.
 #[cfg(target_arch = "aarch64")]
 #[inline]
-unsafe fn exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+pub(crate) unsafe fn exp_neon(
+    x: std::arch::aarch64::float32x4_t,
+) -> std::arch::aarch64::float32x4_t {
     use std::arch::aarch64::*;
     unsafe {
         let x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.0)), vdupq_n_f32(88.0));
@@ -1993,6 +2062,34 @@ mod tests {
                 "len {len}: a previous call's values survived"
             );
         }
+    }
+
+    /// The vector max and the fused shifted exponential agree with their
+    /// scalar forms, tails included.
+    #[test]
+    fn max_and_exp_shifted_sum_match_the_scalar_forms() {
+        let x: Vec<f32> = (0..1037)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.13)
+            .collect();
+        let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        assert_eq!(max_f32(&x), max);
+        assert_eq!(
+            max_f32(&x[..3]),
+            x[..3].iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        );
+        assert_eq!(max_f32(&[]), f32::NEG_INFINITY);
+        let mut y = x.clone();
+        let sum = exp_shifted_sum(&mut y, max);
+        let mut want = 0f64;
+        for (a, &b) in y.iter().zip(&x) {
+            let e = ((b - max) as f64).exp();
+            want += e;
+            assert!(
+                (*a as f64 - e).abs() <= 1e-5 * e.max(1e-30) + 1e-12,
+                "{a} vs {e}"
+            );
+        }
+        assert!((sum as f64 - want).abs() < 1e-4 * want);
     }
 
     /// The vector exponential agrees with `libm` to `1e-5` relative over the

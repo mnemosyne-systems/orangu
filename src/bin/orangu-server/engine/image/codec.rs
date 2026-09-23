@@ -25,10 +25,10 @@
 //! use, and then treated as the raster it became. An animated GIF or WebP
 //! is read as its first frame.
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::io::Cursor;
 
-use super::vae::{Feature, SPATIAL_COMPRESSION};
+use super::vae::Feature;
 
 /// A container the server can write: four rasters, and SVG — a document
 /// that carries the picture as an embedded PNG, there being no
@@ -137,6 +137,32 @@ pub fn is_readable_image(name: &str, mime: &str) -> bool {
 /// which is what a browser shows for a transparent picture on this
 /// console's light theme and the only fixed choice that is never black.
 pub fn decode_to_feature(bytes: &[u8], width: usize, height: usize) -> Result<Feature> {
+    let resized = decode_resized(bytes, width, height)?;
+    let mut data = Vec::with_capacity(width * height * 3);
+    for px in resized.pixels() {
+        let a = px[3] as f32 / 255.0;
+        for c in 0..3 {
+            let v = px[c] as f32 / 255.0 * a + (1.0 - a);
+            data.push(v * 2.0 - 1.0);
+        }
+    }
+    Ok(Feature::new(height, width, 3, data))
+}
+
+/// [`decode_to_feature`] keeping the alpha channel: RGBA in `[-1, 1]`, a
+/// picture without one fully opaque — what the Qwen-Image 2.1 VAE reads
+/// (diffusers converts every picture to `RGBA` before encoding it).
+pub fn decode_to_rgba_feature(bytes: &[u8], width: usize, height: usize) -> Result<Feature> {
+    let resized = decode_resized(bytes, width, height)?;
+    let data = resized
+        .as_raw()
+        .iter()
+        .map(|&v| v as f32 / 255.0 * 2.0 - 1.0)
+        .collect();
+    Ok(Feature::new(height, width, 4, data))
+}
+
+fn decode_resized(bytes: &[u8], width: usize, height: usize) -> Result<image::RgbaImage> {
     let rgba = if looks_like_svg(bytes) {
         rasterize_svg(bytes)?
     } else {
@@ -154,15 +180,7 @@ pub fn decode_to_feature(bytes: &[u8], width: usize, height: usize) -> Result<Fe
             image::imageops::FilterType::Lanczos3,
         )
     };
-    let mut data = Vec::with_capacity(width * height * 3);
-    for px in resized.pixels() {
-        let a = px[3] as f32 / 255.0;
-        for c in 0..3 {
-            let v = px[c] as f32 / 255.0 * a + (1.0 - a);
-            data.push(v * 2.0 - 1.0);
-        }
-    }
-    Ok(Feature::new(height, width, 3, data))
+    Ok(resized)
 }
 
 /// The pixel size of a picture without decoding all of it, for choosing a
@@ -216,15 +234,32 @@ fn rasterize_svg(bytes: &[u8]) -> Result<image::RgbaImage> {
         .ok_or_else(|| anyhow!("the rasterized SVG has the wrong size"))
 }
 
-/// Encodes an RGB `[-1, 1]` feature as `format`.
-pub fn encode(rgb: &Feature, format: ImageFormat) -> Result<Vec<u8>> {
-    let pixels: Vec<u8> = rgb
+/// Encodes an RGB or RGBA `[-1, 1]` feature as `format`. Alpha is kept by
+/// every format that has it (PNG, GIF, WebP, and SVG's embedded PNG) and
+/// composited on white for JPEG, which has none.
+pub fn encode(picture: &Feature, format: ImageFormat) -> Result<Vec<u8>> {
+    ensure!(
+        picture.channels == 3 || picture.channels == 4,
+        "a picture has 3 or 4 channels, not {}",
+        picture.channels
+    );
+    let pixels: Vec<u8> = picture
         .data
         .iter()
         .map(|v| ((v / 2.0 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8)
         .collect();
-    let img = image::RgbImage::from_raw(rgb.width as u32, rgb.height as u32, pixels)
-        .ok_or_else(|| anyhow!("the picture's data does not match its size"))?;
+    let (w, h) = (picture.width as u32, picture.height as u32);
+    let img = if picture.channels == 4 {
+        image::DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(w, h, pixels)
+                .ok_or_else(|| anyhow!("the picture's data does not match its size"))?,
+        )
+    } else {
+        image::DynamicImage::ImageRgb8(
+            image::RgbImage::from_raw(w, h, pixels)
+                .ok_or_else(|| anyhow!("the picture's data does not match its size"))?,
+        )
+    };
     let mut out = Cursor::new(Vec::new());
     match format {
         ImageFormat::Png => img
@@ -232,16 +267,16 @@ pub fn encode(rgb: &Feature, format: ImageFormat) -> Result<Vec<u8>> {
             .context("encoding PNG")?,
         ImageFormat::Jpeg => {
             let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92);
-            encoder.encode_image(&img).context("encoding JPEG")?;
+            encoder
+                .encode_image(&on_white(&img))
+                .context("encoding JPEG")?;
         }
         // One frame on a 256-colour palette: GIF's own limit, so a
         // photograph comes back posterized. It is what was asked for.
         ImageFormat::Gif => {
             let mut encoder = image::codecs::gif::GifEncoder::new(&mut out);
             encoder
-                .encode_frame(image::Frame::new(
-                    image::DynamicImage::ImageRgb8(img).into_rgba8(),
-                ))
+                .encode_frame(image::Frame::new(img.to_rgba8()))
                 .context("encoding GIF")?;
         }
         // Lossless: the `image` crate writes no lossy WebP, and a picture
@@ -249,13 +284,13 @@ pub fn encode(rgb: &Feature, format: ImageFormat) -> Result<Vec<u8>> {
         ImageFormat::Webp => {
             use image::ImageEncoder as _;
             let encoder = image::codecs::webp::WebPEncoder::new_lossless(&mut out);
+            let color = if picture.channels == 4 {
+                image::ExtendedColorType::Rgba8
+            } else {
+                image::ExtendedColorType::Rgb8
+            };
             encoder
-                .write_image(
-                    img.as_raw(),
-                    img.width(),
-                    img.height(),
-                    image::ExtendedColorType::Rgb8,
-                )
+                .write_image(img.as_bytes(), w, h, color)
                 .context("encoding WebP")?;
         }
         // The picture as PNG inside an SVG element of its own size — a
@@ -267,7 +302,6 @@ pub fn encode(rgb: &Feature, format: ImageFormat) -> Result<Vec<u8>> {
                 .context("encoding PNG")?;
             use base64::Engine as _;
             let data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
-            let (w, h) = (img.width(), img.height());
             let svg = format!(
                 "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" \
                  viewBox=\"0 0 {w} {h}\"><image width=\"{w}\" height=\"{h}\" \
@@ -279,12 +313,31 @@ pub fn encode(rgb: &Feature, format: ImageFormat) -> Result<Vec<u8>> {
     Ok(out.into_inner())
 }
 
+/// A picture's RGB with its alpha composited on white — the JPEG a
+/// transparent picture becomes, as [`decode_to_feature`] reads one.
+fn on_white(img: &image::DynamicImage) -> image::RgbImage {
+    let rgba = img.to_rgba8();
+    let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+    for (out, px) in rgb.pixels_mut().zip(rgba.pixels()) {
+        let a = px[3] as f32 / 255.0;
+        for c in 0..3 {
+            out[c] = (px[c] as f32 * a + 255.0 * (1.0 - a)).round() as u8;
+        }
+    }
+    rgb
+}
+
 /// A generation size from a picture's size: the same aspect ratio, scaled
 /// down so the longer side is at most `max_side` (never up — a small
-/// picture is redrawn at its own size), and both sides multiples of 16
-/// (the VAE's 8 times the transformer's 2x2 patch).
-pub fn fit_generation_size((width, height): (usize, usize), max_side: usize) -> (usize, usize) {
-    let unit = 2 * SPATIAL_COMPRESSION;
+/// picture is redrawn at its own size), and both sides multiples of `unit`
+/// — the pixels one latent token covers along a side, 16 for Qwen-Image
+/// (the VAE's 8 times the transformer's 2x2 patch) and 32 for Qwen-Image
+/// 2.1 (see `Pipeline::size_unit`).
+pub fn fit_generation_size(
+    (width, height): (usize, usize),
+    max_side: usize,
+    unit: usize,
+) -> (usize, usize) {
     let longest = width.max(height).max(1) as f64;
     let scale = (max_side as f64 / longest).min(1.0);
     let round = |v: f64| ((v * scale / unit as f64).round().max(1.0) as usize) * unit;
@@ -356,6 +409,39 @@ mod tests {
         );
     }
 
+    /// A picture with transparency — what Qwen-Image 2.1 draws — keeps its
+    /// alpha through PNG and WebP, and JPEG shows it on white.
+    #[test]
+    fn an_rgba_picture_keeps_its_alpha_where_the_format_has_one() {
+        // Left half opaque black, right half fully transparent black.
+        let mut data = Vec::new();
+        for _y in 0..8 {
+            for x in 0..8 {
+                data.extend_from_slice(&[-1.0, -1.0, -1.0, if x < 4 { 1.0 } else { -1.0 }]);
+            }
+        }
+        let feature = Feature::new(8, 8, 4, data);
+        for format in [ImageFormat::Png, ImageFormat::Webp] {
+            let bytes = encode(&feature, format).unwrap();
+            let back = decode_to_rgba_feature(&bytes, 8, 8).unwrap();
+            assert_eq!(back.data, feature.data, "{format:?}");
+            // Composited, the transparent half is white.
+            let rgb = decode_to_feature(&bytes, 8, 8).unwrap();
+            assert_eq!(&rgb.data[..3], &[-1.0, -1.0, -1.0]);
+            assert_eq!(&rgb.data[7 * 3..8 * 3], &[1.0, 1.0, 1.0]);
+        }
+        let jpeg = decode_to_feature(&encode(&feature, ImageFormat::Jpeg).unwrap(), 8, 8).unwrap();
+        assert!(
+            jpeg.data[7 * 3] > 0.8,
+            "the transparent half is white in a JPEG"
+        );
+        // A picture without alpha reads back fully opaque.
+        let opaque = Feature::new(1, 1, 3, vec![0.0, 0.0, 0.0]);
+        let back =
+            decode_to_rgba_feature(&encode(&opaque, ImageFormat::Png).unwrap(), 1, 1).unwrap();
+        assert_eq!(back.data[3], 1.0);
+    }
+
     #[test]
     fn an_svg_is_drawn_then_read_like_a_raster() {
         let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\">\
@@ -400,10 +486,13 @@ mod tests {
 
     #[test]
     fn generation_sizes_keep_the_aspect_and_snap_to_sixteen() {
-        assert_eq!(fit_generation_size((1024, 1024), 1024), (1024, 1024));
-        assert_eq!(fit_generation_size((4000, 3000), 1024), (1024, 768));
-        assert_eq!(fit_generation_size((300, 200), 1024), (304, 208));
-        assert_eq!(fit_generation_size((1, 1), 1024), (16, 16));
+        assert_eq!(fit_generation_size((1024, 1024), 1024, 16), (1024, 1024));
+        assert_eq!(fit_generation_size((4000, 3000), 1024, 16), (1024, 768));
+        assert_eq!(fit_generation_size((300, 200), 1024, 16), (304, 208));
+        assert_eq!(fit_generation_size((1, 1), 1024, 16), (16, 16));
+        // Qwen-Image 2.1's token is 32 pixels on a side.
+        assert_eq!(fit_generation_size((300, 200), 1024, 32), (288, 192));
+        assert_eq!(fit_generation_size((1, 1), 1024, 32), (32, 32));
     }
 
     #[test]

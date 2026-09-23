@@ -179,6 +179,14 @@ struct Args {
     #[arg(long, default_value = image::DEFAULT_PROMPT, value_name = "TEXT")]
     image_prompt: String,
 
+    /// A picture (PNG, JPEG, GIF, WebP or SVG) attached to every `--image`
+    /// request: an edit on a Qwen-Image 2.1 server with its vision
+    /// projector, a start picture (image-to-image) otherwise — so the
+    /// vision tower, the reference-reading encoder and the longer prefix
+    /// are measured too. Pair it with an instruction in `--image-prompt`.
+    #[arg(long, value_name = "PATH")]
+    image_init: Option<std::path::PathBuf>,
+
     /// Number of tokens to generate per timed run.
     #[arg(long = "gen", default_value_t = 128, value_name = "N")]
     n_gen: u32,
@@ -1423,6 +1431,7 @@ fn write_bundle(
         "image": args.image,
         "image_steps": args.image_steps,
         "image_cfg": args.image_cfg,
+        "image_init": args.image_init,
         "streams": args.streams,
         "n_gen": args.n_gen,
         "reps": args.reps,
@@ -1793,12 +1802,16 @@ fn workload_detail(args: &Args) -> String {
         format!("prompt lengths {}", list(&args.embed))
     } else if !args.image.is_empty() {
         format!(
-            "square pictures of {} pixels, {} step(s){}",
+            "square pictures of {} pixels, {} step(s){}{}",
             list(&args.image),
             args.image_steps,
             match args.image_cfg {
                 Some(cfg) => format!(", guidance {cfg}"),
                 None => ", the server's guidance".to_string(),
+            },
+            match &args.image_init {
+                Some(path) => format!(", attached {}", path.display()),
+                None => String::new(),
             }
         )
     } else if !args.streams.is_empty() {
@@ -3718,12 +3731,17 @@ fn workload_name(args: &Args) -> String {
     let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
     if !args.image.is_empty() {
         format!(
-            "image {} steps {}{}",
+            "image {} steps {}{}{}",
             list(&args.image),
             args.image_steps,
             match args.image_cfg {
                 Some(cfg) => format!(" cfg {cfg}"),
                 None => String::new(),
+            },
+            if args.image_init.is_some() {
+                " edit"
+            } else {
+                ""
             }
         )
     } else if !args.pg.is_empty() {

@@ -120,12 +120,58 @@ pub fn scan_models_dir(dir: &Path) -> Result<Vec<ModelSummary>> {
     Ok(summaries)
 }
 
-/// `general.architecture` of an opened header, when it has one.
+/// `general.architecture` of an opened header, when it has one — or, for a
+/// file with no metadata at all, the architecture its tensor names spell
+/// out (see [`architecture_from_tensors`]).
 pub fn architecture_of(gguf: &GgufFile) -> Option<String> {
-    gguf.metadata.iter().find_map(|(k, v)| match v {
-        crate::gguf::GgufValue::String(s) if k == "general.architecture" => Some(s.clone()),
-        _ => None,
-    })
+    gguf.metadata
+        .iter()
+        .find_map(|(k, v)| match v {
+            crate::gguf::GgufValue::String(s) if k == "general.architecture" => Some(s.clone()),
+            _ => None,
+        })
+        .or_else(|| architecture_from_tensors(gguf).map(str::to_string))
+}
+
+/// `general.architecture` of a Qwen-Image 2.1 diffusion transformer — a
+/// name this project gives it, since its GGUFs carry none (below).
+pub const QWEN_IMAGE_21_ARCHITECTURE: &str = "qwen_image_2_1";
+
+/// The prefix the ComfyUI/stable-diffusion.cpp GGUF tooling writes before
+/// every tensor of a diffusion model (`model.diffusion_model.img_in.weight`)
+/// — the `unsloth/Qwen-Image-2.1-GGUF` files keep it.
+pub const DIFFUSION_MODEL_PREFIX: &str = "model.diffusion_model.";
+
+/// The architecture of a GGUF that has **no metadata at all**, read off its
+/// tensor names. `unsloth/Qwen-Image-2.1-GGUF` is such a file: 265 tensors
+/// and zero keys — not even `general.architecture` — so without this it is
+/// `No (unknown)` in `list` and unloadable. Only an exact, distinctive shape
+/// is recognised: Qwen-Image 2.1's single-stream transformer has a
+/// zero-centred `txt_in.text_norm` and blocks without the dual-stream
+/// `img_mod`/`txt_mod` that Qwen-Image (`qwen_image`) has.
+pub fn architecture_from_tensors(gguf: &GgufFile) -> Option<&'static str> {
+    let has = |name: &str| {
+        gguf.tensors.iter().any(|t| {
+            t.name == name
+                || t.name
+                    .strip_prefix(DIFFUSION_MODEL_PREFIX)
+                    .is_some_and(|rest| rest == name)
+        })
+    };
+    (has("txt_in.text_norm.weight")
+        && has("modulation.1.weight")
+        && has("transformer_blocks.0.attn.to_q.weight")
+        && !has("transformer_blocks.0.img_mod.1.weight"))
+    .then_some(QWEN_IMAGE_21_ARCHITECTURE)
+}
+
+/// The architectures that are picture generators rather than language
+/// models: served in the `image` role only, and through `engine::image`.
+pub const IMAGE_ARCHITECTURES: &[&str] = &["qwen_image", QWEN_IMAGE_21_ARCHITECTURE];
+
+/// Whether `architecture` is one of [`IMAGE_ARCHITECTURES`].
+pub fn is_image_architecture(architecture: &str) -> bool {
+    IMAGE_ARCHITECTURES.contains(&architecture)
 }
 
 /// Whether `path` is the text encoder a `qwen_image` model needs — a
@@ -150,22 +196,7 @@ pub fn is_qwen_image_text_encoder(path: &Path) -> bool {
 /// largest file first — so a directory holding several quantizations
 /// offers the best one, and the choice is the same on every run.
 pub fn find_qwen_image_text_encoder(dir: &Path) -> Option<PathBuf> {
-    let mut candidates: Vec<(u64, PathBuf)> = walkdir::WalkDir::new(dir)
-        .follow_links(true)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-        .map(walkdir::DirEntry::into_path)
-        .filter(|path| {
-            path.extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-        })
-        .filter(|path| is_qwen_image_text_encoder(path))
-        .map(|path| (std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0), path))
-        .collect();
-    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    candidates.into_iter().next().map(|(_, path)| path)
+    largest_gguf(dir, is_qwen_image_text_encoder)
 }
 
 /// Whether `path` is the Qwen-Image VAE: a `safetensors` whose header
@@ -174,39 +205,65 @@ pub fn find_qwen_image_text_encoder(dir: &Path) -> Option<PathBuf> {
 /// Judged from the header — the first few tens of kilobytes — never the
 /// file name, which a download can change and a copy can lose.
 pub fn is_qwen_image_vae(path: &Path) -> bool {
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Some(header) = safetensors_header(path) else {
         return false;
     };
-    use std::io::Read;
-    let mut len = [0u8; 8];
-    if file.read_exact(&mut len).is_err() {
-        return false;
-    }
-    let len = u64::from_le_bytes(len);
-    // A real header is under 100 KiB; anything larger is not this file.
-    if len == 0 || len > 4 << 20 {
-        return false;
-    }
-    let mut header = vec![0u8; len as usize];
-    if file.read_exact(&mut header).is_err() {
-        return false;
-    }
-    let Ok(header) = serde_json::from_slice::<serde_json::Value>(&header) else {
-        return false;
-    };
-    header
-        .get("decoder.head.2.weight")
-        .and_then(|t| t.get("shape"))
-        .and_then(|s| s.as_array())
-        .is_some_and(|shape| {
-            shape.iter().map(|v| v.as_u64()).collect::<Vec<_>>()
-                == [Some(3), Some(96), Some(3), Some(3), Some(3)]
-        })
+    shape_of(&header, "decoder.head.2.weight").is_some_and(|shape| shape == [3, 96, 3, 3, 3])
         && header.get("conv2.weight").is_some()
 }
 
 /// The first Qwen-Image VAE under `dir`, in path order.
 pub fn find_qwen_image_vae(dir: &Path) -> Option<PathBuf> {
+    first_safetensors(dir, is_qwen_image_vae)
+}
+
+/// The JSON header of a `safetensors` file, or `None` when `path` is not
+/// one (or its header is implausibly large for a VAE).
+fn safetensors_header(path: &Path) -> Option<serde_json::Value> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len).ok()?;
+    let len = u64::from_le_bytes(len);
+    if len == 0 || len > 4 << 20 {
+        return None;
+    }
+    let mut header = vec![0u8; len as usize];
+    file.read_exact(&mut header).ok()?;
+    serde_json::from_slice(&header).ok()
+}
+
+fn shape_of(header: &serde_json::Value, name: &str) -> Option<Vec<u64>> {
+    header
+        .get(name)?
+        .get("shape")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_u64())
+        .collect()
+}
+
+/// Whether `path` is the Qwen-Image 2.1 VAE — diffusers'
+/// `AutoencoderKLQwenImage21` in its own naming: a decoder that reads 64
+/// latent channels (`decoder.conv_in.weight`, `[1152, 64, 3, 3]`) and
+/// writes four, RGBA (`decoder.conv_out.weight`, `[4, 144, 3, 3]`). Judged
+/// from the header, like [`is_qwen_image_vae`]; the two never match the
+/// same file.
+pub fn is_qwen_image21_vae(path: &Path) -> bool {
+    let Some(header) = safetensors_header(path) else {
+        return false;
+    };
+    shape_of(&header, "decoder.conv_in.weight").is_some_and(|s| s.len() == 4 && s[1] == 64)
+        && shape_of(&header, "decoder.conv_out.weight").is_some_and(|s| s.len() == 4 && s[0] == 4)
+        && header.get("post_quant_conv.weight").is_some()
+}
+
+/// The first Qwen-Image 2.1 VAE under `dir`, in path order.
+pub fn find_qwen_image21_vae(dir: &Path) -> Option<PathBuf> {
+    first_safetensors(dir, is_qwen_image21_vae)
+}
+
+fn first_safetensors(dir: &Path, accept: fn(&Path) -> bool) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = walkdir::WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
@@ -218,10 +275,91 @@ pub fn find_qwen_image_vae(dir: &Path) -> Option<PathBuf> {
                 .and_then(|ext| ext.to_str())
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
         })
-        .filter(|path| is_qwen_image_vae(path))
+        .filter(|path| accept(path))
         .collect();
     candidates.sort();
     candidates.into_iter().next()
+}
+
+/// Whether `path` is the text encoder a `qwen_image_2_1` model needs — a
+/// `qwen3vl` GGUF of Qwen3-VL-8B's width (4096) that is a chat model and
+/// not the embedding fine-tune of the same shape (which declares a
+/// `pooling_type`). Judged from its header alone.
+pub fn is_qwen_image21_text_encoder(path: &Path) -> bool {
+    let Ok(gguf) = GgufFile::open_summary(path) else {
+        return false;
+    };
+    let key = |name: &str| {
+        gguf.metadata
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+    };
+    architecture_of(&gguf).as_deref() == Some("qwen3vl")
+        && key("qwen3vl.embedding_length").and_then(|v| v.as_u64()) == Some(4096)
+        && key("qwen3vl.pooling_type").is_none()
+}
+
+/// Every Qwen-Image 2.1 text encoder under `dir` (see
+/// [`is_qwen_image21_text_encoder`]), largest file first.
+pub fn find_qwen_image21_text_encoder(dir: &Path) -> Option<PathBuf> {
+    largest_gguf(dir, is_qwen_image21_text_encoder)
+}
+
+/// Whether `path` is the vision half of Qwen3-VL-8B — the `mmproj-*.gguf`
+/// llama.cpp writes beside the language model (`general.architecture =
+/// clip`, `clip.projector_type = qwen3vl_merger`, projecting to 4096) —
+/// what lets a `qwen_image_2_1` model read a reference picture.
+pub fn is_qwen3vl_8b_projector(path: &Path) -> bool {
+    let Ok(gguf) = GgufFile::open_summary(path) else {
+        return false;
+    };
+    let key = |name: &str| {
+        gguf.metadata
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+    };
+    architecture_of(&gguf).as_deref() == Some("clip")
+        && matches!(
+            key("clip.projector_type"),
+            Some(crate::gguf::GgufValue::String(s)) if s == "qwen3vl_merger"
+        )
+        && key("clip.vision.projection_dim").and_then(|v| v.as_u64()) == Some(4096)
+}
+
+/// The Qwen3-VL-8B vision projector for the text encoder at `encoder`:
+/// one in the encoder's own directory first (the one `download` fetched
+/// with it), else the largest anywhere under `dir`.
+pub fn find_qwen3vl_8b_projector(dir: &Path, encoder: &Path) -> Option<PathBuf> {
+    encoder
+        .parent()
+        .and_then(|beside| largest_gguf_in(beside, 1, is_qwen3vl_8b_projector))
+        .or_else(|| largest_gguf(dir, is_qwen3vl_8b_projector))
+}
+
+fn largest_gguf(dir: &Path, accept: fn(&Path) -> bool) -> Option<PathBuf> {
+    largest_gguf_in(dir, usize::MAX, accept)
+}
+
+fn largest_gguf_in(dir: &Path, depth: usize, accept: fn(&Path) -> bool) -> Option<PathBuf> {
+    let mut candidates: Vec<(u64, PathBuf)> = walkdir::WalkDir::new(dir)
+        .follow_links(true)
+        .max_depth(depth)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        })
+        .filter(|path| accept(path))
+        .map(|path| (std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0), path))
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.into_iter().next().map(|(_, path)| path)
 }
 
 /// The step-distilled adapter under `dir` a `qwen_image` model is served

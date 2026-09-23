@@ -61,9 +61,13 @@ pub fn run_init() -> Result<()> {
     // Whether it is one is read off the same `SUPPORTED` column the
     // server's own picker shows, so a spec that isn't installed yet (no
     // row) is asked for a role like any language model.
-    let image_model = nr_of(&groups, &model)
-        .and_then(|nr| crate::model_support(&groups).into_iter().nth(nr - 1))
-        .is_some_and(|support| support.image);
+    let support =
+        nr_of(&groups, &model).and_then(|nr| crate::model_support(&groups).into_iter().nth(nr - 1));
+    let image_model = support.as_ref().is_some_and(|support| support.image);
+    let image_variant = support
+        .and_then(|support| support.architecture)
+        .and_then(|arch| crate::engine::image::Variant::from_architecture(&arch))
+        .unwrap_or(crate::engine::image::Variant::QwenImage);
     let role = if image_model {
         println!("role: {}", Role::Image.label());
         Role::Image
@@ -79,7 +83,7 @@ pub fn run_init() -> Result<()> {
     // wants something other than Qwen-Image's release settings, and written
     // only then, like every other default below.
     let image = if role == Role::Image {
-        Some(prompt_image_keys(Path::new(&models))?)
+        Some(prompt_image_keys(Path::new(&models), image_variant)?)
     } else {
         None
     };
@@ -1103,31 +1107,47 @@ impl ImageKeys {
 /// (`engine::image::ImageDefaults`, and auto-detection under `models` for
 /// the two companion files). A value that would not load is re-asked, with
 /// the same wording the config loader would have rejected it with.
-fn prompt_image_keys(models_dir: &Path) -> Result<ImageKeys> {
+///
+/// A Qwen-Image 2.1 model (`variant`) has its own encoder, no adapter to
+/// ask about, and its own release steps and guidance to offer.
+fn prompt_image_keys(
+    models_dir: &Path,
+    variant: crate::engine::image::Variant,
+) -> Result<ImageKeys> {
+    use crate::engine::image::Variant;
     let defaults = crate::engine::image::ImageDefaults::default();
+    let (encoder_arch, _) = variant.text_encoder();
     let text_encoder = prompt_line(
-        "text_encoder (blank = the qwen2vl GGUF found under models)",
+        &format!("text_encoder (blank = the {encoder_arch} GGUF found under models)"),
         "",
     )?;
     let vae = prompt_line("vae (blank = the .safetensors VAE found under models)", "")?;
     // `auto` is the Lightning adapter under `models` — fetched with the
     // model, and what the server serves when the key is absent — so the
     // prompt says which file that is, or that there is none to find.
-    let found = orangu::model_spec::find_qwen_image_lightning(models_dir);
-    let image_lora = prompt_line(
-        &match &found {
-            Some(path) => format!(
-                "image_lora (auto = {}; none = the base model, 50 guided steps)",
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("the adapter")
-            ),
-            None => "image_lora (auto = the Lightning adapter under models — none there yet, \
+    // Qwen-Image 2.1 has none: nothing to ask.
+    let found = match variant {
+        Variant::QwenImage => orangu::model_spec::find_qwen_image_lightning(models_dir),
+        Variant::QwenImage21 => None,
+    };
+    let image_lora = if variant == Variant::QwenImage21 {
+        "auto".to_string()
+    } else {
+        prompt_line(
+            &match &found {
+                Some(path) => format!(
+                    "image_lora (auto = {}; none = the base model, 50 guided steps)",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("the adapter")
+                ),
+                None => "image_lora (auto = the Lightning adapter under models — none there yet, \
                      `orangu-server download` of the model fetches it; none = the base model)"
-                .to_string(),
-        },
-        "auto",
-    )?;
+                    .to_string(),
+            },
+            "auto",
+        )?
+    };
     let image_lora = if image_lora == "auto" {
         String::new()
     } else {
@@ -1159,10 +1179,12 @@ fn prompt_image_keys(models_dir: &Path) -> Result<ImageKeys> {
             .ok_or_else(|| anyhow!("expected int8 or f32"))
     })?;
     let default_size = format!("{}x{}", defaults.width, defaults.height);
+    let unit = variant.size_unit();
     let size = prompt_checked("image_size", &default_size, |value| {
         crate::config::parse_image_size(value)
+            .filter(|(w, h)| w.is_multiple_of(unit) && h.is_multiple_of(unit))
             .map(|_| ())
-            .ok_or_else(|| anyhow!("expected WIDTHxHEIGHT or one side, multiples of 16"))
+            .ok_or_else(|| anyhow!("expected WIDTHxHEIGHT or one side, multiples of {unit}"))
     })?;
     // A step-distilled adapter is made for a step count and no guidance,
     // and says the count in its file name (`…-8steps-…`): the server takes
@@ -1173,7 +1195,7 @@ fn prompt_image_keys(models_dir: &Path) -> Result<ImageKeys> {
         .and_then(orangu::model_spec::lightning_steps)
     {
         Some(steps) => (steps, 1.0),
-        None => (defaults.steps, defaults.cfg_scale),
+        None => variant.release_steps_and_cfg(),
     };
     let steps = prompt_checked(
         "image_steps",

@@ -2340,7 +2340,10 @@
     const passes = settings.cfg_scale > 1 ? 2 : 1;
     const attention = rate.attention_per_token_pass * tokens / Math.max(rate.attention_tokens, 1);
     const step = tokens * passes * (rate.linear_per_token_pass + attention);
-    const seconds = rate.encode + step * settings.steps + rate.decode_per_pixel * width * height;
+    // `step_share`: the steps that run the transformer (the step cache
+    // reuses the rest), 1 from a server without the field.
+    const share = Number.isFinite(rate.step_share) ? rate.step_share : 1;
+    const seconds = rate.encode + step * settings.steps * share + rate.decode_per_pixel * width * height;
     imageEstimate.textContent = `About ${formatCountdown(Math.round(seconds))} a picture at these settings on this server.`;
   }
 
@@ -2362,6 +2365,15 @@
       imageModelEl.textContent = props.model || "";
       return;
     }
+    // Presets the model cannot draw — a side that is not a multiple of its
+    // unit (32 for Qwen-Image 2.1) — are offered greyed rather than
+    // refused on Save.
+    const unit = image.size_unit || 16;
+    for (const option of imageSize.options) {
+      const match = /^(\d+)x(\d+)$/.exec(option.value);
+      option.disabled = !!match && (Number(match[1]) % unit !== 0 || Number(match[2]) % unit !== 0);
+    }
+    imageSizeCustom.placeholder = `WIDTHxHEIGHT, multiples of ${unit}`;
     const lora = image.lora;
     imageModelEl.textContent = lora
       ? `${props.model} · ${lora.path.split(/[\\/]/).pop()}${lora.steps ? ` (${lora.steps}-step)` : ""}`

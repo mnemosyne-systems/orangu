@@ -948,6 +948,7 @@ async fn send_image_message(
     };
     let request = match crate::http::images::build_request(
         &pipeline.defaults(),
+        pipeline.size_unit(),
         crate::http::images::ImageParams {
             prompt: &user_message,
             negative_prompt: None,
@@ -983,7 +984,7 @@ async fn send_image_message(
             let Some(event) = rx.recv().await else { break };
             match event {
                 ImageEvent::Progress(p) => {
-                    let eta = p.seconds_per_step * (p.steps.saturating_sub(p.step)) as f64;
+                    let eta = p.eta_seconds();
                     yield Ok(axum::response::sse::Event::default().data(
                         json!({"type": "progress", "step": p.step, "steps": p.steps, "eta_seconds": eta}).to_string(),
                     ));

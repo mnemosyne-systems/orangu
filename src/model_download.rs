@@ -287,9 +287,10 @@ pub fn download_model_reporting(
     // a failed companion (the VAE repository being down) leaves what was
     // downloaded usable by anything that does not need it.
     if let Ok(gguf) = GgufFile::open_summary(&path)
-        && crate::model_spec::architecture_of(&gguf).as_deref() == Some(QWEN_IMAGE_ARCHITECTURE)
+        && let Some(architecture) = crate::model_spec::architecture_of(&gguf)
+        && crate::model_spec::is_image_architecture(&architecture)
     {
-        download_image_companions(models_dir, progress)?;
+        download_image_companions(models_dir, &architecture, progress)?;
     }
     Ok(path)
 }
@@ -313,20 +314,80 @@ pub const QWEN_IMAGE_LIGHTNING_REPO: &str = "lightx2v/Qwen-Image-2512-Lightning"
 pub const QWEN_IMAGE_LIGHTNING_FILE: &str =
     "Qwen-Image-2512-Lightning-8steps-V1.0-bf16.safetensors";
 
-/// Fetches what a `qwen_image` model needs beside it and does not carry:
-/// the Qwen2.5-VL-7B text encoder (a `qwen2vl` GGUF, itself a model
-/// `list` shows and the server can serve on its own), the VAE, and the
-/// Lightning adapter the server uses by default. Each is skipped when the
-/// models directory already holds one — a second quantization of the
-/// encoder is a choice, not a default — so a re-download, or a second
-/// Qwen-Image checkpoint, fetches nothing twice.
+/// The text encoder a `qwen_image_2_1` model conditions on: Qwen3-VL-8B,
+/// whose last decoder layer's hidden states (before the final norm) the
+/// transformer reads. `UD-Q4_K_XL` is the one the model's publishers
+/// measured it with; any quantization serves.
+pub const QWEN_IMAGE_21_TEXT_ENCODER_REPO: &str = "unsloth/Qwen3-VL-8B-Instruct-GGUF";
+pub const QWEN_IMAGE_21_TEXT_ENCODER_TAG: &str = "UD-Q4_K_XL";
+/// The text encoder's vision half, for editing a picture: fetched with the
+/// encoder by [`download_model_reporting`] (its best-matching `mmproj`
+/// sibling), and on its own when the encoder is already there without one.
+pub const QWEN_IMAGE_21_VISION_FILE: &str = "mmproj-F16.gguf";
+/// The Qwen-Image 2.1 VAE — its own, RGBA and 64 latent channels; the
+/// Qwen-Image VAE above does not fit it.
+pub const QWEN_IMAGE_21_VAE_REPO: &str = "unsloth/Qwen-Image-2.1-FP8";
+pub const QWEN_IMAGE_21_VAE_FILE: &str = "vae/qwen_image_2.1_vae_bf16.safetensors";
+
+/// Fetches what a picture model (`architecture`, one of
+/// [`crate::model_spec::IMAGE_ARCHITECTURES`]) needs beside it and does not
+/// carry. For `qwen_image`: the Qwen2.5-VL-7B text encoder (a `qwen2vl`
+/// GGUF, itself a model `list` shows and the server can serve on its own),
+/// the VAE, and the Lightning adapter the server uses by default. For
+/// `qwen_image_2_1`: the Qwen3-VL-8B text encoder with its vision projector
+/// (`mmproj`, for editing a picture) and its own VAE — there is no adapter
+/// for it. Each is skipped when the models directory already
+/// holds one — a second quantization of the encoder is a choice, not a
+/// default — so a re-download, or a second checkpoint, fetches nothing
+/// twice.
 ///
 /// Public so `orangu-server` can offer the same fetch to a directory that
 /// has the model and lacks a companion.
 pub fn download_image_companions(
     models_dir: &Path,
+    architecture: &str,
     progress: Option<Arc<DownloadProgress>>,
 ) -> Result<()> {
+    if architecture == crate::model_spec::QWEN_IMAGE_21_ARCHITECTURE {
+        if crate::model_spec::find_qwen_image21_text_encoder(models_dir).is_none() {
+            eprintln!(
+                "Fetching the text encoder a {architecture} model needs \
+                 ({QWEN_IMAGE_21_TEXT_ENCODER_REPO}:{QWEN_IMAGE_21_TEXT_ENCODER_TAG})"
+            );
+            download_model_reporting(
+                models_dir,
+                &format!("{QWEN_IMAGE_21_TEXT_ENCODER_REPO}:{QWEN_IMAGE_21_TEXT_ENCODER_TAG}"),
+                progress.clone(),
+            )
+            .with_context(|| format!("downloading the {architecture} text encoder"))?;
+        }
+        if let Some(encoder) = crate::model_spec::find_qwen_image21_text_encoder(models_dir)
+            && crate::model_spec::find_qwen3vl_8b_projector(models_dir, &encoder).is_none()
+        {
+            eprintln!(
+                "Fetching the text encoder's vision half, for editing pictures \
+                 ({QWEN_IMAGE_21_TEXT_ENCODER_REPO}:{QWEN_IMAGE_21_VISION_FILE})"
+            );
+            download_repo_file(
+                models_dir,
+                QWEN_IMAGE_21_TEXT_ENCODER_REPO,
+                QWEN_IMAGE_21_VISION_FILE,
+                progress.clone(),
+            )
+            .with_context(|| format!("downloading the {architecture} vision projector"))?;
+        }
+        if crate::model_spec::find_qwen_image21_vae(models_dir).is_none() {
+            eprintln!("Fetching the VAE a {architecture} model needs ({QWEN_IMAGE_21_VAE_REPO})");
+            download_repo_file(
+                models_dir,
+                QWEN_IMAGE_21_VAE_REPO,
+                QWEN_IMAGE_21_VAE_FILE,
+                progress,
+            )
+            .with_context(|| format!("downloading the {architecture} VAE"))?;
+        }
+        return Ok(());
+    }
     if crate::model_spec::find_qwen_image_text_encoder(models_dir).is_none() {
         eprintln!(
             "Fetching the text encoder a qwen_image model needs \

@@ -1719,8 +1719,12 @@ shown.
 | `read_size`             | `8192`                                     | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening                                                                                                                                |
 | `draft_model`           | —                                          | a second, smaller model whose guesses the served model verifies                                                                                                                                                           |
 | `draft_tokens`          | `4`                                        | tokens the draft proposes per verification                                                                                                                                                                                |
-| `text_encoder`          | largest found                              | the `qwen2vl` GGUF a `qwen_image` model encodes prompts with                                                                                                                                                              |
-| `vae`                   | first found                                | the Qwen-Image VAE (`.safetensors`) a `qwen_image` model decodes with                                                                                                                                                     |
+| `text_encoder`          | largest found                              | the text encoder GGUF: `qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`                                                                                                                                                               |
+| `vae`                   | first found                                | the model's VAE (`.safetensors`): Qwen-Image's, or Qwen-Image 2.1's own                                                                                                                                                           |
+| `image_weights`         | `auto`                                     | how a `qwen_image_2_1` transformer's linears are held: `auto` per-row `int8` on the 8 × 8 `smmla` tile when total memory is at least three times the 7 GB copy, `int8` always, `file` the file's K-quants (no copy); ~1.4–1.9× a step |
+| `image_cache`           | `easy`                                     | whether a step may reuse the last transformer pass rather than run one (EasyCache): `easy` (the default, threshold 0.08) or `easy:<threshold>` a step whose predicted change since the last pass stays under the threshold takes the last two passes' residual extrapolated to it, and `off` runs every step; at 0.08 about 2.4× a 40-step 1024² picture and 3.6× a 512² edit, the picture close to the uncached one but not identical; 0.05 is closer at 2×, 0.1 and above start to ghost lettering |
+| `image_reference_size`  | `source`                                   | the area an edit reads its reference at: `source` the picture's area but never more than the attached picture's own (upsampling adds nothing but tokens), `output` the picture's area (diffusers reads 1024²), or `WIDTHxHEIGHT` a cap; a 256² picture edited at 1024² encodes in 6 s rather than 84 and steps in 50 s rather than 79 |
+| `vision`                | found beside the text encoder              | the vision projector (`mmproj-*.gguf`) a `qwen_image_2_1` model edits attached pictures with; `none` draws over them instead                                                                                                       |
 | `image_lora`            | `auto`                                     | the adapter applied to the picture transformer: `auto` the Lightning file under `models` (fetched with the model; a picture in 8 unguided steps), `none` the base model, or a `.safetensors` (or 4-step variant, rougher) |
 | `vae_precision`         | `int8`                                     | the VAE's convolutions as `Q6_K` on the `int8` kernel (3–4× faster decode), or `f32` as stored (exact)                                                                                                                    |
 | `image_lora_merge`      | `yes`                                      | fold the adapter into the weights at startup (a few minutes once, then no cost per pass); `no` applies it in `f32` every pass                                                                                             |
@@ -3056,6 +3060,39 @@ the server at it exactly as at a language model — `orangu-server 16`, or
 `model = unsloth/Qwen-Image-2512-GGUF:Q4_K_M` — and every chat turn is
 answered with a picture instead of text.
 
+**Qwen-Image 2.1** — the recommended model — is served the same way:
+`unsloth/Qwen-Image-2.1-GGUF` (`list`'s `Yes (qwen_image_2_1)`), whose
+GGUFs carry no metadata at all and are recognised by their tensors. It is
+a 7-billion-parameter single-stream transformer that draws with an alpha
+channel, and it has its own two companions, found the same way as below:
+
+- **The text encoder** — Qwen3-VL-8B-Instruct, a `qwen3vl` GGUF of width
+  4096 (any quantization; `download` fetches
+  `unsloth/Qwen3-VL-8B-Instruct-GGUF:UD-Q4_K_XL`, and an embedding model
+  of the same shape is never picked). The transformer reads its last
+  layer *before* the final norm.
+- **The VAE** — `vae/qwen_image_2.1_vae_bf16.safetensors` from
+  `unsloth/Qwen-Image-2.1-FP8` (the same file as
+  `Comfy-Org/Qwen-Image-2.1`'s): RGBA, 64 latent channels at a sixteenth
+  of the picture's side. Qwen-Image's VAE does not fit it.
+- **The vision projector** — an `mmproj-*.gguf` from
+  `unsloth/Qwen3-VL-8B-Instruct-GGUF` (`download` of the encoder brings
+  the one matching its quantization; `mmproj-F16.gguf` is fetched when the
+  encoder is there without one). With it, a picture attached to a request
+  is **edited**: the encoder reads it with the prompt (through its vision
+  tower, `engine::image::qwen3vl`), and its latents stand in the
+  transformer's prompt where the encoder read it. Found beside the text
+  encoder first; `vision = <path>` names one, `vision = none` turns
+  editing off (an attachment is then a starting point, as for
+  Qwen-Image).
+
+There is no adapter for 2.1 (`image_lora = auto` finds none; naming one is
+an error), and none is needed: its release settings — the defaults when
+the config leaves them out — are forty steps without guidance. Sizes are
+multiples of 32. `orangu-server download unsloth/Qwen-Image-2.1-GGUF:Q4_K_M`
+fetches the three files. Everything below applies to both models except
+where it names Qwen-Image's own files.
+
 A `qwen_image` file is one third of the model, and the other two thirds
 are found beside it in the models directory:
 
@@ -3218,16 +3255,17 @@ is asked none of these.
 ### What a request gets
 
 Six keys set what a picture request gets when it does not say. The
-defaults are Qwen-Image's own release settings, except that under a
+defaults are the model's own release settings — Qwen-Image 2.1's forty
+unguided steps, Qwen-Image's fifty at guidance 4 — except that under a
 Lightning adapter — the default, when one is under `models` — `image_steps`
 and `image_cfg_scale` follow the adapter (its step count, guidance off)
 unless the file sets them:
 
 | `[orangu-server]`       | default                             |                                                                                                                                                                                                                                                                                      |
 | :---------------------- | :---------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `image_size`            | `1024x1024`                         | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch                                                                                                                                                                          |
-| `image_steps`           | `50`; the adapter's (`8`) under one | denoising steps; the time a picture takes is close to linear in this                                                                                                                                                                                                                 |
-| `image_cfg_scale`       | `4`; `1` under an adapter           | classifier-free guidance: how far the picture is pushed towards the prompt and away from the negative one. `1` turns guidance off, which halves the work per step                                                                                                                    |
+| `image_size`            | `1024x1024`                         | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch; 32 for Qwen-Image 2.1                                                                                                                                                                       |
+| `image_steps`           | `50` (2.1: `40`); the adapter's (`8`) under one | denoising steps; the time a picture takes is close to linear in this                                                                                                                                                                                                                 |
+| `image_cfg_scale`       | `4` (2.1: `1`); `1` under an adapter | classifier-free guidance: how far the picture is pushed towards the prompt and away from the negative one. `1` turns guidance off, which halves the work per step                                                                                                                    |
 | `image_negative_prompt` | a single space                      | what the picture is pushed away from; only read when guidance is on                                                                                                                                                                                                                  |
 | `image_strength`        | `0.6`                               | for a picture started from an attached one: how much of the schedule to run — `1` ignores the attachment's content, `0` returns it unchanged                                                                                                                                         |
 | `image_format`          | `png`                               | the container a picture comes back in when the request names none: `png`, `jpeg`, `gif` (one frame, 256 colours), `webp` (lossless) or `svg` (a document of the picture's size with the pixels inside as PNG — there is no pixels-to-vector) — an attached picture's own format wins |
@@ -3284,9 +3322,10 @@ countdown — _Starting · 22s_, then _Step 2/4 · 11s_ — the server's own
 estimate, corrected at every step.
 
 **Settings › Image** (the gear in the topbar) is where the picture's
-settings live: the size (256 × 256 up to 1280 × 720, or any `WIDTHxHEIGHT`
-in multiples of 16), the steps (4, 8, 20, 50, or a number), the guidance
-(off, Qwen-Image's 4, or a value), the negative prompt, the strength an
+settings live: the size (256 × 256 up to 2048 × 2048, or any `WIDTHxHEIGHT`
+in multiples of 16 — 32 for Qwen-Image 2.1, which greys the presets it
+cannot draw), the steps (4, 8, 20, 40, 50, or a number), the guidance
+(off, Qwen-Image's 4, 6, or a value), the negative prompt, the strength an
 attached picture is followed at, and the format the picture comes back
 in (PNG, JPEG, GIF, WebP or SVG) — each with an (i) that explains it on
 hover, under a line that says what a picture at those settings costs on
@@ -3589,7 +3628,8 @@ Delta Attention layers alternating with gated, _rotated_ absorbed latent
 attention, over sigmoid-routed experts whose selection is group-limited:
 the experts form `expert_group_count` groups and only the best
 `expert_group_used_count` of them may serve a token), and Qwen-Image
-(`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF` — not a language model:
+(`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF`, and `qwen_image_2_1`,
+`unsloth/Qwen-Image-2.1-GGUF` with a `qwen3vl` encoder — not a language model:
 a dual-stream diffusion transformer that denoises a latent picture under a
 prompt's hidden states, served with a `qwen2vl` text encoder and the
 Qwen-Image VAE beside it; see **Image generation**) — using

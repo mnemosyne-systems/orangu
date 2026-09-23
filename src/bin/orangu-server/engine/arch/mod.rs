@@ -3367,6 +3367,16 @@ pub trait ModelForward: Send + Sync {
     /// pools over. A one-shot call: no KV cache reuse across calls.
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>>;
 
+    /// [`Self::forward_hidden_states`] without the final `output_norm`: the
+    /// last decoder layer's output as it leaves the residual stream. What
+    /// Qwen-Image 2.1 is conditioned on (diffusers hooks the Qwen3-VL text
+    /// model's `norm` away for exactly this). The default errors; an
+    /// architecture opts in by overriding it.
+    fn forward_hidden_states_pre_norm(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let _ = tokens;
+        anyhow::bail!("this architecture does not expose its hidden states before the final norm")
+    }
+
     /// Applied to the pooled embedding vector (`[n_embd]`, after mean/CLS/
     /// last-token pooling) before L2 normalization. The default is the
     /// identity — most architectures have nothing here — but a model

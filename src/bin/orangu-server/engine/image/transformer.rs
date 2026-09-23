@@ -167,7 +167,7 @@ impl Stages {
         self.modulation + self.qkv + self.attention + self.out + self.mlp + self.other + self.lora
     }
 
-    fn add(&mut self, other: &Stages) {
+    pub(super) fn add(&mut self, other: &Stages) {
         self.modulation += other.modulation;
         self.qkv += other.qkv;
         self.attention += other.attention;
@@ -180,13 +180,13 @@ impl Stages {
 }
 
 /// Times the span from the last mark to now into one of a pass's stages.
-struct StageClock {
-    stages: Stages,
+pub(super) struct StageClock {
+    pub(super) stages: Stages,
     last: Instant,
 }
 
 impl StageClock {
-    fn start() -> Self {
+    pub(super) fn start() -> Self {
         Self {
             stages: Stages {
                 passes: 1,
@@ -196,7 +196,7 @@ impl StageClock {
         }
     }
 
-    fn lap(&mut self, into: fn(&mut Stages) -> &mut Duration) {
+    pub(super) fn lap(&mut self, into: fn(&mut Stages) -> &mut Duration) {
         let now = Instant::now();
         *into(&mut self.stages) += now - self.last;
         self.last = now;
@@ -590,8 +590,9 @@ impl QwenImageTransformer {
             let joint_k = concat_rows(&tk, &k);
             let joint_v = concat_rows(&tv, &v);
             drop((q, k, v, tq, tk, tv));
-            let attn =
-                joint_attention(&joint_q, &joint_k, &joint_v, n, c.n_head, c.head_dim, scale);
+            let attn = step_attention(
+                &joint_q, n, &joint_k, &joint_v, n, c.n_head, c.head_dim, scale, None,
+            );
             drop((joint_q, joint_k, joint_v));
             clock.lap(|s| &mut s.attention);
 
@@ -652,9 +653,9 @@ impl QwenImageTransformer {
 /// The 256-wide sinusoidal timestep projection: diffusers' `Timesteps(256,
 /// flip_sin_to_cos=True, downscale_freq_shift=0, scale=1000)` applied to
 /// `sigma` — `[cos(1000 σ ω_i) | sin(1000 σ ω_i)]` for `ω_i = 10000^(-i/128)`.
-const TIMESTEP_FREQUENCIES: usize = 256;
+pub(super) const TIMESTEP_FREQUENCIES: usize = 256;
 
-fn timestep_embedding(sigma: f32) -> Vec<f32> {
+pub(super) fn timestep_embedding(sigma: f32) -> Vec<f32> {
     let half = TIMESTEP_FREQUENCIES / 2;
     let t = sigma as f64 * 1000.0;
     let mut out = vec![0.0f32; TIMESTEP_FREQUENCIES];
@@ -675,7 +676,7 @@ fn split_modulation(m: &[f32], dim: usize) -> [&[f32]; 6] {
 }
 
 /// Weightless LayerNorm over each `dim`-wide row of `src` into `dst`.
-fn layer_norm_into(dst: &mut Vec<f32>, src: &[f32], dim: usize, eps: f32) {
+pub(super) fn layer_norm_into(dst: &mut Vec<f32>, src: &[f32], dim: usize, eps: f32) {
     dst.resize(src.len(), 0.0);
     dst.par_chunks_mut(dim)
         .zip(src.par_chunks(dim))
@@ -711,7 +712,7 @@ fn gated_add(x: &mut [f32], y: &[f32], gate: &[f32], dim: usize) {
 
 /// RMSNorm over every `head_dim`-wide head of every row, one weight vector
 /// shared by all heads — `attn.norm_q` and its siblings.
-fn head_rms_norm(x: &mut [f32], weight: &[f32], head_dim: usize, eps: f32) {
+pub(super) fn head_rms_norm(x: &mut [f32], weight: &[f32], head_dim: usize, eps: f32) {
     x.par_chunks_mut(head_dim).for_each(|head| {
         let mean_sq = head.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
         let scale = 1.0 / (mean_sq + eps).sqrt();
@@ -721,7 +722,7 @@ fn head_rms_norm(x: &mut [f32], weight: &[f32], head_dim: usize, eps: f32) {
     });
 }
 
-fn silu_inplace(x: &mut [f32]) {
+pub(super) fn silu_inplace(x: &mut [f32]) {
     for v in x.iter_mut() {
         *v = tensor::silu(*v);
     }
@@ -845,7 +846,110 @@ pub(crate) fn joint_attention(
     head_dim: usize,
     scale: f32,
 ) -> Vec<f32> {
-    joint_attention_blocked(q, k, v, n, n_head, head_dim, scale)
+    attention_blocked(q, n, k, v, n, n_head, head_dim, scale, None, false)
+}
+
+/// Multi-head attention of `n_q` query rows over `n_kv` key/value rows —
+/// the same blocked kernel as [`joint_attention`], for Qwen-Image 2.1's
+/// sequences, where the queries are a suffix of the keys: the picture's
+/// tokens attend over the cached prompt prefix and themselves.
+///
+/// With `limits`, query `i` sees only the first `limits[i]` keys — the
+/// prompt prefix's block-causal mask: a text token sees the keys up to its
+/// own, a reference picture's token every key up to the end of its picture
+/// (see [`causal_limits`]).
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn attention(
+    q: &[f32],
+    n_q: usize,
+    k: &[f32],
+    v: &[f32],
+    n_kv: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    limits: Option<&[usize]>,
+) -> Vec<f32> {
+    attention_blocked(q, n_q, k, v, n_kv, n_head, head_dim, scale, limits, false)
+}
+
+/// [`attention`] for a denoising step's picture tokens, where attention is
+/// the part of a pass that grows with the square of the picture (39% of a
+/// Qwen-Image 2.1 step at 1024 x 1024, against 14% at 512): the scores
+/// `q · k` are computed in `int8` on the `smmla` kernel — eight times the
+/// multiply-adds per instruction of the `f32` path — while the softmax and
+/// the value product stay `f32`. Each query and key row is quantized with
+/// its own scale after the keys' per-channel mean over the sequence is
+/// taken out (which moves every score of a query by the same amount, so the
+/// softmax is unchanged, and leaves the rows centred for `int8`): the
+/// SageAttention recipe. The heads are RMS-normed before this, so their
+/// rows are well-conditioned.
+///
+/// The `f32` path runs instead without `i8mm`, for a head width that is not
+/// a multiple of 8, or with `ORANGU_IMAGE_ATTENTION=f32`, which is the
+/// switch for comparing the two on one binary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_attention(
+    q: &[f32],
+    n_q: usize,
+    k: &[f32],
+    v: &[f32],
+    n_kv: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+    limits: Option<&[usize]>,
+) -> Vec<f32> {
+    let int8 = int8_step_attention() && head_dim.is_multiple_of(8);
+    attention_blocked(q, n_q, k, v, n_kv, n_head, head_dim, scale, limits, int8)
+}
+
+/// Where attention's value product `P · V` runs (`doc/PERF-IMAGE.md`,
+/// task 5), `ORANGU_IMAGE_PV` choosing for an A/B.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ValueProduct {
+    /// `bfmmla` on `bf16` probabilities and values, summed in `f32`
+    /// (`vecdot::bf16_tiles`) — the default where the CPU has `bf16`.
+    Bf16,
+    /// `rten-gemm`'s `f32` kernel: its 4 × 16 packed tile does ~150 G
+    /// MAC/s at the block shape (24 queries × 4,096 keys × 128) where
+    /// `gemm_f32_rows` does ~100 (`ORANGU_IMAGE_PV=rten`).
+    Rten,
+    /// This crate's own `f32` tile (`ORANGU_IMAGE_PV=orangu`).
+    Orangu,
+}
+
+pub(crate) fn value_product() -> ValueProduct {
+    static CHOICE: std::sync::OnceLock<ValueProduct> = std::sync::OnceLock::new();
+    *CHOICE.get_or_init(|| {
+        let bf16 = crate::engine::vecdot::have_bf16mm();
+        match std::env::var("ORANGU_IMAGE_PV")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Ok("orangu") => ValueProduct::Orangu,
+            Ok("rten") => ValueProduct::Rten,
+            _ if bf16 => ValueProduct::Bf16,
+            _ => ValueProduct::Rten,
+        }
+    })
+}
+
+/// See [`step_attention`].
+pub(crate) fn int8_step_attention() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        crate::engine::vecdot::have_i8mm()
+            && !std::env::var("ORANGU_IMAGE_ATTENTION")
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("f32"))
+    })
+}
+
+/// The key limits of a plain causal mask over `n` positions: position `i`
+/// sees keys `0..=i`.
+pub(crate) fn causal_limits(n: usize) -> Vec<usize> {
+    (1..=n).collect()
 }
 
 /// Queries per [`joint_attention_blocked`] task: six tiles of four, so a
@@ -853,18 +957,61 @@ pub(crate) fn joint_attention(
 /// L2 through the softmax and the value product.
 const ATTN_QUERIES: usize = 24;
 
-fn joint_attention_blocked(
+/// `scores[j] = ints[j] × sq × key_scales[j]`, returning the largest — the
+/// `int8` scores to `f32` and the softmax's max in one pass.
+fn convert_scores(scores: &mut [f32], ints: &[i32], key_scales: &[f32], sq: f32) -> f32 {
+    debug_assert!(ints.len() == scores.len() && key_scales.len() == scores.len());
+    let n = scores.len();
+    let mut i = 0;
+    #[cfg(not(target_arch = "aarch64"))]
+    let mut max = f32::NEG_INFINITY;
+    #[cfg(target_arch = "aarch64")]
+    // Safety: NEON is baseline on aarch64; every access is below `n`.
+    let mut max = unsafe {
+        use std::arch::aarch64::*;
+        let q = vdupq_n_f32(sq);
+        let mut m = [vdupq_n_f32(f32::NEG_INFINITY); 2];
+        while i + 8 <= n {
+            for (l, m) in m.iter_mut().enumerate() {
+                let at = i + 4 * l;
+                let v = vmulq_f32(
+                    vmulq_f32(vcvtq_f32_s32(vld1q_s32(ints.as_ptr().add(at))), q),
+                    vld1q_f32(key_scales.as_ptr().add(at)),
+                );
+                vst1q_f32(scores.as_mut_ptr().add(at), v);
+                *m = vmaxq_f32(*m, v);
+            }
+            i += 8;
+        }
+        vmaxvq_f32(vmaxq_f32(m[0], m[1]))
+    };
+    for j in i..n {
+        let v = ints[j] as f32 * sq * key_scales[j];
+        scores[j] = v;
+        max = max.max(v);
+    }
+    max
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_blocked(
     q: &[f32],
+    n_q: usize,
     k: &[f32],
     v: &[f32],
     n: usize,
     n_head: usize,
     head_dim: usize,
     scale: f32,
+    limits: Option<&[usize]>,
+    int8: bool,
 ) -> Vec<f32> {
-    use crate::engine::vecdot::{F32_ROWS, gemm_f32_rows};
+    use crate::engine::vecdot::{F32_ROWS, PairedI8, gemm_f32_rows, i8_scores_4rows};
     let dim = n_head * head_dim;
-    debug_assert_eq!(q.len(), n * dim);
+    debug_assert_eq!(q.len(), n_q * dim);
+    debug_assert_eq!(k.len(), n * dim);
+    debug_assert!(n_q <= n);
+    debug_assert!(limits.is_none_or(|l| l.len() == n_q && l.iter().all(|&m| m >= 1 && m <= n)));
     debug_assert_eq!(head_dim % F32_ROWS, 0);
     // Keys head-major, `[n_head][n][head_dim]`.
     let mut k_heads = vec![0.0f32; n * dim];
@@ -876,9 +1023,54 @@ fn joint_attention_blocked(
                 row.copy_from_slice(&k[i * dim + h * head_dim..i * dim + (h + 1) * head_dim]);
             }
         });
-    // Values head-major and transposed, `[n_head][head_dim][n]`, so the
-    // value product is a GEMM over `n` with each output dimension a row.
-    let mut vt_heads = vec![0.0f32; n * dim];
+    // The value product on `rten-gemm`'s `f32` kernel (see
+    // [`rten_value_product`]): each head's values `[n, head_dim]`, read in
+    // place through strides and packed once for every query block.
+    let pv = match value_product() {
+        // `bfmmla` takes the head in pairs of four: every head width here
+        // is a multiple of eight, but a fallback costs nothing.
+        ValueProduct::Bf16 if !head_dim.is_multiple_of(8) => ValueProduct::Rten,
+        pv => pv,
+    };
+    let rten = pv == ValueProduct::Rten;
+    let bf16 = pv == ValueProduct::Bf16;
+    // For `bfmmla`: each head's values transposed (`[head_dim][n]`), in
+    // `bf16`, packed once for every query block.
+    let vt_bf16: Vec<crate::engine::vecdot::PackedBf16> = if bf16 {
+        (0..n_head)
+            .into_par_iter()
+            .map(|h| {
+                crate::engine::vecdot::PackedBf16::pack_transposed(
+                    head_dim,
+                    n,
+                    &v[h * head_dim..],
+                    dim,
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let v_packed: Vec<rten_gemm::PackedBMatrix<f32>> = if rten {
+        (0..n_head)
+            .into_par_iter()
+            .map(|h| {
+                let view = rten_tensor::NdTensorView::from_data_with_strides(
+                    [n, head_dim],
+                    &v[h * head_dim..],
+                    [dim, 1],
+                )
+                .expect("a head's values fit the rows");
+                rten_gemm::GemmExecutor::<f32>::new().prepack_b(view)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Otherwise values head-major and transposed, `[n_head][head_dim][n]`,
+    // so the value product is a GEMM over `n` with each output dimension a
+    // row.
+    let mut vt_heads = vec![0.0f32; if rten || bf16 { 0 } else { n * dim }];
     vt_heads
         .par_chunks_mut(n * head_dim)
         .enumerate()
@@ -890,28 +1082,107 @@ fn joint_attention_blocked(
             }
         });
 
-    let n_blocks = n.div_ceil(ATTN_QUERIES);
-    let mut out = vec![0.0f32; n * dim];
+    // For the `int8` scores: every head's keys, less their mean over the
+    // sequence, quantized per row and paired for `smmla`.
+    let k_i8: Vec<PairedI8> = if int8 {
+        (0..n_head)
+            .into_par_iter()
+            .map(|h| {
+                let keys = &k_heads[h * n * head_dim..(h + 1) * n * head_dim];
+                let mut mean = vec![0.0f32; head_dim];
+                for row in keys.chunks(head_dim) {
+                    for (m, v) in mean.iter_mut().zip(row) {
+                        *m += v;
+                    }
+                }
+                for m in mean.iter_mut() {
+                    *m /= n as f32;
+                }
+                let centred: Vec<f32> = keys
+                    .chunks(head_dim)
+                    .flat_map(|row| row.iter().zip(&mean).map(|(v, m)| v - m))
+                    .collect();
+                PairedI8::quantize(n, head_dim, |i| &centred[i * head_dim..(i + 1) * head_dim])
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let zeros = vec![0.0f32; head_dim];
+
+    let n_blocks = n_q.div_ceil(ATTN_QUERIES);
+    let mut out = vec![0.0f32; n_q * dim];
     let sink = SharedOut(out.as_mut_ptr());
+    let k_pairs = n.div_ceil(2);
     (0..n_head * n_blocks).into_par_iter().for_each_init(
         || {
             (
                 vec![0.0f32; ATTN_QUERIES * n],
-                vec![0.0f32; F32_ROWS * ATTN_QUERIES],
+                // Four output dimensions of a query block for this crate's
+                // tile, a whole block's `[queries, head_dim]` for `rten`'s.
+                vec![0.0f32; (F32_ROWS * ATTN_QUERIES).max(ATTN_QUERIES * head_dim)],
+                vec![0i32; F32_ROWS * 2 * k_pairs],
+                rten.then(rten_gemm::GemmExecutor::<f32>::new),
+                // The block's probabilities in `bfmmla`'s layout, each row
+                // written by the softmax that makes it.
+                bf16.then(|| crate::engine::vecdot::PackedBf16::zeroed(ATTN_QUERIES, n)),
             )
         },
-        move |(scores, tile), task| {
+        move |(scores, tile, iscores, gemm, packed), task| {
             let sink = sink;
             let (h, b) = (task / n_blocks, task % n_blocks);
             let q0 = b * ATTN_QUERIES;
-            let nq = ATTN_QUERIES.min(n - q0);
+            let nq = ATTN_QUERIES.min(n_q - q0);
             let keys = &k_heads[h * n * head_dim..(h + 1) * n * head_dim];
-            let values_t = &vt_heads[h * n * head_dim..(h + 1) * n * head_dim];
+            let values_t = if rten || bf16 {
+                &[][..]
+            } else {
+                &vt_heads[h * n * head_dim..(h + 1) * n * head_dim]
+            };
+
+            // Each row's maximum, taken as the `int8` scores are converted.
+            let mut row_max = [f32::NEG_INFINITY; ATTN_QUERIES];
+            if int8 {
+                // The block's queries for this head, padded to a whole
+                // quad with zero rows whose scores are never read.
+                let padded = nq.div_ceil(F32_ROWS) * F32_ROWS;
+                let qs = PairedI8::quantize(padded, head_dim, |r| {
+                    if r < nq {
+                        let i = q0 + r;
+                        &q[i * dim + h * head_dim..i * dim + (h + 1) * head_dim]
+                    } else {
+                        &zeros
+                    }
+                });
+                let kq = &k_i8[h];
+                for quad in 0..padded / F32_ROWS {
+                    let (i0, rest) = iscores.split_at_mut(2 * k_pairs);
+                    let (i1, rest) = rest.split_at_mut(2 * k_pairs);
+                    let (i2, i3) = rest.split_at_mut(2 * k_pairs);
+                    i8_scores_4rows(&qs, 2 * quad, 2 * quad + 1, kq, [i0, i1, i2, i3]);
+                    for r in 0..F32_ROWS {
+                        let row = quad * F32_ROWS + r;
+                        if row >= nq {
+                            break;
+                        }
+                        // The softmax's `scale` folded in here.
+                        let sq = qs.scales[row] * scale;
+                        let limit = limits.map_or(n, |l| l[q0 + row]);
+                        let ints = &iscores[r * 2 * k_pairs..r * 2 * k_pairs + limit];
+                        row_max[row] = convert_scores(
+                            &mut scores[row * n..row * n + limit],
+                            ints,
+                            &kq.scales[..limit],
+                            sq,
+                        );
+                    }
+                }
+            }
 
             // Scores, four queries at a time against every key: the tile's
             // "rows" are queries, its "tokens" the keys, `in_dim` the head.
             let mut qi = 0;
-            while qi < nq {
+            while qi < nq && !int8 {
                 let quad = F32_ROWS.min(nq - qi);
                 let row = |r: usize| {
                     let i = q0 + qi + r.min(quad - 1);
@@ -929,30 +1200,88 @@ fn joint_attention_blocked(
                 );
                 qi += quad;
             }
-            // Softmax per query row: the same `scale, max, exp, normalise`
-            // as the per-query form, the exponentials through
-            // `tensor::exp_inplace` four lanes at a time — a third of the
-            // blocked kernel's time was `expf`, one call per score.
-            for row in scores[..nq * n].chunks_mut(n) {
-                let mut max = f32::NEG_INFINITY;
-                for s in row.iter_mut() {
-                    *s *= scale;
-                    max = max.max(*s);
+            // Softmax per query row: `scale` (folded into the `int8`
+            // scores already), max, then the exponentials and their sum in
+            // one pass (`tensor::exp_shifted_sum`, four lanes at a time — a
+            // third of the blocked kernel's time was `expf`, one call per
+            // score). Keys past a query's limit are masked: never read.
+            // Under `bfmmla` a row goes straight into its packed operand
+            // unnormalised and the output row is divided by the sum
+            // instead — `head_dim` multiplies, not `n`.
+            let mut inv = [0f32; ATTN_QUERIES];
+            for (r, row) in scores[..nq * n].chunks_mut(n).enumerate() {
+                let limit = limits.map_or(n, |l| l[q0 + r]);
+                let live = &mut row[..limit];
+                if !int8 {
+                    for s in live.iter_mut() {
+                        *s *= scale;
+                    }
                 }
-                for s in row.iter_mut() {
-                    *s -= max;
-                }
-                tensor::exp_inplace(row);
-                let sum: f32 = row.iter().sum();
-                let inv = 1.0 / sum;
-                for s in row.iter_mut() {
-                    *s *= inv;
+                let max = if int8 {
+                    row_max[r]
+                } else {
+                    tensor::max_f32(live)
+                };
+                match packed.as_mut() {
+                    Some(packed) => {
+                        inv[r] = 1.0 / packed.set_row_exp(r, live, max);
+                    }
+                    None => {
+                        let sum = tensor::exp_shifted_sum(live, max);
+                        let inv = 1.0 / sum;
+                        for s in live.iter_mut() {
+                            *s *= inv;
+                        }
+                        row[limit..].fill(0.0);
+                    }
                 }
             }
             // The value product: rows are four output dimensions of the
             // transposed values, tokens the block's queries, `in_dim` the
             // keys. Written straight to each query's output row.
             let probs = &scores[..nq * n];
+            if let Some(packed) = packed.as_ref() {
+                let block = &mut tile[..packed.rows * head_dim];
+                crate::engine::vecdot::bf16_tiles(packed, &vt_bf16[h], block);
+                for (t, row) in block.chunks_mut(head_dim).take(nq).enumerate() {
+                    for v in row.iter_mut() {
+                        *v *= inv[t];
+                    }
+                    // Safety: as below — this task's rectangle alone.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            row.as_ptr(),
+                            sink.0.add((q0 + t) * dim + h * head_dim),
+                            head_dim,
+                        );
+                    }
+                }
+                return;
+            }
+            if let Some(gemm) = gemm.as_ref() {
+                let block = &mut tile[..nq * head_dim];
+                gemm.gemm(
+                    block,
+                    rten_gemm::GemmInputA::Unpacked(rten_tensor::NdTensorView::from_data(
+                        [nq, n],
+                        probs,
+                    )),
+                    rten_gemm::GemmInputB::Packed(&v_packed[h]),
+                    rten_gemm::GemmOptions::default(),
+                )
+                .expect("the value product's shapes agree");
+                for (t, row) in block.chunks(head_dim).enumerate() {
+                    // Safety: as below — this task's rectangle alone.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            row.as_ptr(),
+                            sink.0.add((q0 + t) * dim + h * head_dim),
+                            head_dim,
+                        );
+                    }
+                }
+                return;
+            }
             for d0 in (0..head_dim).step_by(F32_ROWS) {
                 let vt = |r: usize| &values_t[(d0 + r) * n..(d0 + r + 1) * n];
                 let (t0, rest) = tile.split_at_mut(nq);
@@ -1046,6 +1375,17 @@ pub(crate) fn joint_attention_per_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What the value product's arithmetic allows against an exact `f32`
+    /// reference: `f32` rounding for the `f32` paths, `bf16`'s eight
+    /// mantissa bits on the probabilities and the values for `bfmmla`
+    /// (`ORANGU_IMAGE_PV` picks the path under test).
+    fn pv_tolerance() -> f32 {
+        match value_product() {
+            ValueProduct::Bf16 => 3e-3,
+            ValueProduct::Rten | ValueProduct::Orangu => 1e-5,
+        }
+    }
 
     #[test]
     fn the_timestep_embedding_is_cos_then_sin_of_the_scaled_step() {
@@ -1176,13 +1516,148 @@ mod tests {
             .map(|i| ((i * 3 % 17) as f32 - 8.0) * 0.25)
             .collect();
         let want = joint_attention_per_query(&q, &k, &v, n, n_head, head_dim, 0.35);
-        let got = joint_attention_blocked(&q, &k, &v, n, n_head, head_dim, 0.35);
+        let got = attention_blocked(&q, n, &k, &v, n, n_head, head_dim, 0.35, None, false);
         for (i, (g, e)) in got.iter().zip(&want).enumerate() {
             assert!(
-                (g - e).abs() <= 1e-5 * e.abs().max(1.0),
+                (g - e).abs() <= pv_tolerance() * e.abs().max(1.0),
                 "at {i}: {g} vs {e}"
             );
         }
+    }
+
+    /// The blocked attention at a 1024² step's shape (4,096 tokens, 32
+    /// heads of 128), `int8` scores and the default value product:
+    ///
+    /// ```text
+    /// cargo test --profile release-with-debug --bin orangu-server \
+    ///     attention_throughput -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn attention_throughput() {
+        let (n, n_head, head_dim) = (4096usize, 32usize, 128usize);
+        let dim = n_head * head_dim;
+        let data = |seed: usize| -> Vec<f32> {
+            (0..n * dim)
+                .map(|i| ((i * 2654435761 + seed) % 1000) as f32 / 500.0 - 1.0)
+                .collect()
+        };
+        let (q, k, v) = (data(1), data(2), data(3));
+        let run = || attention_blocked(&q, n, &k, &v, n, n_head, head_dim, 0.088, None, true);
+        let _ = run();
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            let _ = run();
+        }
+        let secs = started.elapsed().as_secs_f64() / 3.0;
+        eprintln!(
+            "attention {n} x {n} x {n_head} heads of {head_dim}: {:.1} ms (x 32 blocks = {:.1} s a step)",
+            secs * 1e3,
+            secs * 32.0
+        );
+    }
+
+    /// A suffix of the queries over every key is the same as those rows of
+    /// the square attention, and the causal form is the square attention
+    /// with each row limited to the keys up to its own position.
+    #[test]
+    fn suffix_and_causal_attention_match_the_direct_forms() {
+        let n = ATTN_QUERIES + 9;
+        let (n_head, head_dim) = (2, 8);
+        let dim = n_head * head_dim;
+        let q: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 7 % 11) as f32 - 5.0) * 0.1)
+            .collect();
+        let k: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 5 % 13) as f32 - 6.0) * 0.1)
+            .collect();
+        let v: Vec<f32> = (0..n * dim)
+            .map(|i| ((i * 3 % 17) as f32 - 8.0) * 0.25)
+            .collect();
+        let full = joint_attention_per_query(&q, &k, &v, n, n_head, head_dim, 0.4);
+        let n_q = 11;
+        let suffix = attention(
+            &q[(n - n_q) * dim..],
+            n_q,
+            &k,
+            &v,
+            n,
+            n_head,
+            head_dim,
+            0.4,
+            None,
+        );
+        for (g, e) in suffix.iter().zip(&full[(n - n_q) * dim..]) {
+            assert!(
+                (g - e).abs() <= pv_tolerance() * e.abs().max(1.0),
+                "{g} vs {e}"
+            );
+        }
+        let limits = causal_limits(n);
+        let causal = attention(&q, n, &k, &v, n, n_head, head_dim, 0.4, Some(&limits));
+        for i in [0, 1, ATTN_QUERIES, n - 1] {
+            let m = i + 1;
+            let want = joint_attention_per_query(
+                &q[..m * dim],
+                &k[..m * dim],
+                &v[..m * dim],
+                m,
+                n_head,
+                head_dim,
+                0.4,
+            );
+            for (g, e) in causal[i * dim..(i + 1) * dim].iter().zip(&want[i * dim..]) {
+                assert!(
+                    (g - e).abs() <= pv_tolerance() * e.abs().max(1.0),
+                    "row {i}: {g} vs {e}"
+                );
+            }
+        }
+    }
+
+    /// The `int8` scores agree with the `f32` attention to within their
+    /// quantization, on RMS-normed rows like the transformers' heads, and
+    /// with a key offset shared by every key (which the mean-centring takes
+    /// out exactly).
+    #[test]
+    fn int8_scores_track_the_f32_attention() {
+        let n = ATTN_QUERIES * 2 + 5;
+        let (n_head, head_dim) = (2, 16);
+        let dim = n_head * head_dim;
+        let unit = |i: usize, salt: usize| ((i * 31 + salt * 17) % 29) as f32 / 14.0 - 1.0;
+        let q: Vec<f32> = (0..n * dim).map(|i| unit(i, 1)).collect();
+        let k: Vec<f32> = (0..n * dim)
+            .map(|i| unit(i, 2) + 3.0 * ((i % 7) == 0) as u8 as f32)
+            .collect();
+        let v: Vec<f32> = (0..n * dim).map(|i| unit(i, 3)).collect();
+        let want = attention_blocked(&q, n, &k, &v, n, n_head, head_dim, 0.5, None, false);
+        let got = attention_blocked(&q, n, &k, &v, n, n_head, head_dim, 0.5, None, true);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 0.02, "worst {worst}");
+        let limits = causal_limits(n);
+        let want = attention_blocked(
+            &q,
+            n,
+            &k,
+            &v,
+            n,
+            n_head,
+            head_dim,
+            0.5,
+            Some(&limits),
+            false,
+        );
+        let got = attention_blocked(&q, n, &k, &v, n, n_head, head_dim, 0.5, Some(&limits), true);
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 0.02, "causal worst {worst}");
     }
 
     /// One query identical to one key attends almost entirely to it under a

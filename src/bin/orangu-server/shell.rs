@@ -197,7 +197,7 @@ _orangu_server() {
         '(--all --code --review --explorer --embedding --image)--review[Code review role]' \
         '(--all --code --review --explorer --embedding --image)--explorer[Exploration role]' \
         '(--all --code --review --explorer --embedding --image)--embedding[Embeddings-only role]' \
-        '(--all --code --review --explorer --embedding --image)--image[Image generation role (qwen_image models)]' \
+        '(--all --code --review --explorer --embedding --image)--image[Image generation role (qwen_image, qwen_image_2_1 models)]' \
         '(-o --output)'{-o,--output}'[Where bundle writes the bundled executable]:output:_files' \
         '--binary[The executable bundle embeds the model into]:binary:_files' \
         '--deep[Also verify plan'"'"'s shards and architecture]' \
@@ -291,7 +291,7 @@ complete -c orangu-server      -l code                    -d 'Coding role'
 complete -c orangu-server      -l review                  -d 'Code review role'
 complete -c orangu-server      -l explorer                -d 'Exploration role'
 complete -c orangu-server      -l embedding               -d 'Embeddings-only role'
-complete -c orangu-server      -l image                   -d 'Image generation role (qwen_image models)'
+complete -c orangu-server      -l image                   -d 'Image generation role (qwen_image, qwen_image_2_1 models)'
 complete -c orangu-server -s o -l output              -r -d 'Where bundle writes the bundled executable'
 complete -c orangu-server      -l binary              -r -d 'The executable bundle embeds the model into'
 complete -c orangu-server -l deep                         -d 'Also verify plan\'s shards and architecture'
@@ -340,7 +340,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-server' -ScriptBlock {
         @('--review', 'Code review role'),
         @('--explorer', 'Exploration role'),
         @('--embedding', 'Embeddings-only role'),
-        @('--image', 'Image generation role (qwen_image models)'),
+        @('--image', 'Image generation role (qwen_image, qwen_image_2_1 models)'),
         @('-o', '--output', 'Where bundle writes the bundled executable'),
         @('--binary', 'The executable bundle embeds the model into'),
         @('--deep', 'Also verify plan''s shards and architecture'),

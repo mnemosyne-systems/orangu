@@ -112,8 +112,8 @@ pick from a table of installed models interactively.
 output), and `--embedding` (embeddings only — chat and completion endpoints are
 disabled). They are mutually exclusive, and `all` is the default, so passing
 `--all` is a statement of intent rather than a change of behaviour. A sixth,
-`--image`, is not picked: a Qwen-Image (`qwen_image`) picture generator
-always comes up in it, and no other model can.
+`--image`, is not picked: a Qwen-Image (`qwen_image` or `qwen_image_2_1`)
+picture generator always comes up in it, and no other model can.
 
 The server comes up on the host and port from step 1, serving an
 OpenAI-compatible API — this is the URL step 4 asks for:

@@ -43,7 +43,7 @@ _orangu_bench() {
     COMPREPLY=()
 
     case "$prev" in
-        --history|--chart|--table|--storage-file|--flamegraph|--compare-profiles|--bundle|--read-bundle|--render-profile|--report)
+        --history|--chart|--table|--storage-file|--flamegraph|--image-init|--compare-profiles|--bundle|--read-bundle|--render-profile|--report)
             COMPREPLY=( $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
@@ -64,7 +64,7 @@ _orangu_bench() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
             "--url --depths --pp --pp-continue --pg --decode-cpu --streams --shared-prefix --shared-prefix-tokens \
-             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --gen --curve --bucket --reps --drop-model-cache --no-warmup --per-rep \
+             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png \
@@ -106,6 +106,7 @@ _orangu_bench() {
         '--image-steps[Denoising steps per picture for --image]:n:' \
         '--image-cfg[Guidance scale for --image; 1 runs the prompt alone]:scale:' \
         '--image-prompt[The prompt every --image picture is drawn from]:text:' \
+        '--image-init[A picture attached to every --image request (an edit)]:file:_files' \
         '--gen[Number of tokens to generate per timed run]:n:' \
         '--curve[Curve mode: one generation of this many tokens, bucketed by context; 0 disables]:n:' \
         '--bucket[Bucket width (in context tokens) for --curve]:n:' \
@@ -185,6 +186,7 @@ complete -c orangu-bench -l image                  -x -d 'Image mode: square pic
 complete -c orangu-bench -l image-steps            -x -d 'Denoising steps per picture for --image'
 complete -c orangu-bench -l image-cfg              -x -d 'Guidance scale for --image; 1 runs the prompt alone'
 complete -c orangu-bench -l image-prompt           -x -d 'The prompt every --image picture is drawn from'
+complete -c orangu-bench -l image-init             -r -F -d 'A picture attached to every --image request (an edit)'
 complete -c orangu-bench -l gen                    -x -d 'Number of tokens to generate per timed run'
 complete -c orangu-bench -l curve                  -x -d 'Curve mode: one generation of this many tokens, bucketed by context; 0 disables'
 complete -c orangu-bench -l bucket                 -x -d 'Bucket width (in context tokens) for --curve'
@@ -273,6 +275,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--image-steps', 'Denoising steps per picture for --image'),
         @('--image-cfg', 'Guidance scale for --image; 1 runs the prompt alone'),
         @('--image-prompt', 'The prompt every --image picture is drawn from'),
+        @('--image-init', 'A picture attached to every --image request (an edit)'),
         @('--gen', 'Number of tokens to generate per timed run'),
         @('--curve', 'Curve mode: one generation of this many tokens, bucketed by context; 0 disables'),
         @('--bucket', 'Bucket width (in context tokens) for --curve'),
@@ -334,7 +337,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
 
     switch ($prev) {
         # A path: PowerShell's own completion takes over.
-        { $_ -in '--history', '--chart', '--table', '--storage-file', '--flamegraph', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
+        { $_ -in '--history', '--chart', '--table', '--storage-file', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
         { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature' } { return }

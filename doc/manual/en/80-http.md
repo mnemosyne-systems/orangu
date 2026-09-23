@@ -152,7 +152,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `POST /v1/chat/completions` | streaming (SSE) and non-streaming; `tools`/`tool_calls` and `response_format`; `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; needs a chat template; disabled under `--embedding` |
 | `POST /v1/completions` | legacy completion, no chat template needed; `cache_prompt`/`id_slot`/`response_format`/`ignore_eos`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled and L2-normalized; carries OpenAI's `usage` |
-| `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image` model; `501` on a language model |
+| `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image` or `qwen_image_2_1` model; `501` on a language model |
 | `GET /health` | liveness: is this process up. Stays `200` while the server is merely busy |
 | `GET /ready` | readiness: would a request sent now be served |
 | `GET /props` | model and server metadata: backend, devices, build, slot count, workspace |
@@ -471,7 +471,8 @@ tagged `role = embeddings` exists to serve.
 
 #### `POST /v1/images/generations`
 
-Only on a server whose model is a `qwen_image` diffusion transformer (see
+Only on a server whose model is a `qwen_image` or `qwen_image_2_1`
+diffusion transformer (see
 the *Image generation* section of the server chapter); a language model
 answers `501`.
 
@@ -492,8 +493,8 @@ curl -s localhost:8100/v1/images/generations -H 'Content-Type: application/json'
 | `seed` | drawn | reproduces a picture on the same build; the reply reports the one used |
 | `steps` | `image_steps` | denoising steps |
 | `cfg_scale` | `image_cfg_scale` | classifier-free guidance; `1` runs the prompt alone, half the work |
-| `image` | — | a picture to start from — a `data:image/…;base64,…` URL or bare base64 of a PNG, JPEG, GIF, WebP or SVG. Resized to `size` |
-| `strength` | `image_strength` | with `image`: how much of the schedule to run, `0` (unchanged) to `1` (the picture's content is ignored) |
+| `image` | — | a picture to start from — a `data:image/…;base64,…` URL or bare base64 of a PNG, JPEG, GIF, WebP or SVG. Resized to `size`. On a `qwen_image_2_1` server with a vision projector (`/props`' `image.vision`), the picture is **edited** by the prompt instead: read by the text encoder and kept wherever the prompt does not ask for a change |
+| `strength` | `image_strength` | with `image`: how much of the schedule to run, `0` (unchanged) to `1` (the picture's content is ignored). Not read for an edit |
 | `stream` | `false` | server-sent events instead of one body |
 
 The reply is OpenAI's: `{"created", "model", "data": [{"b64_json", …}]}`,
@@ -514,7 +515,10 @@ the estimate from a rate model — the linears' cost per token and
 attention's, which grows with the token count, learned from each finished
 picture's own stage timings and seeded at startup by a calibration
 matmul; within about 20% across a fourfold change of size, closer at the
-size last measured. A client can show the wait the moment it
+size last measured. Its `eta_seconds` also counts the encode ahead of
+the first step — for an edit, the reference through the vision tower, the
+VAE and the prefix, and every step attending to the reference's tokens as
+well as the picture's. A client can show the wait the moment it
 sends; the real steps follow from `1`. Closing the stream cancels the
 work at the next step. `GET /props` carries the same figures under `image`
 as `token_passes_per_second` (at the defaults' size) and
@@ -632,18 +636,21 @@ Hardware-only startup flags — thread count, GPU layer count, batch size — ar
 not exposed here or anywhere else over HTTP; they appear only in the server's
 own startup log.
 
-On a `qwen_image` model, `image` is what a client needs to know how a
+On a picture model, `image` is what a client needs to know how a
 picture will come out, and how long it will take, before asking for one:
 
 | `image.` | |
 | :-- | :-- |
+| `architecture` | `qwen_image` or `qwen_image_2_1` |
+| `size_unit` | the pixels each side of a picture must be a multiple of: `16`, or `32` for Qwen-Image 2.1 |
 | `text_encoder`, `vae` | the companion files the pipeline was loaded with |
+| `vision` | the vision projector a `qwen_image_2_1` pipeline edits attached pictures with, or `null` — an attached picture is then a starting point |
 | `lora` | the adapter in the weights — `path`, and `steps`, the count a Lightning file's name says it was distilled for — or `null` for the base model |
 | `n_layer`, `n_head`, `head_dim`, `dim` | the transformer's shape |
 | `defaults` | what a request gets when it does not say: `size`, `steps`, `cfg_scale`, `negative_prompt`, `strength`, `format` — as they stand now |
 | `configured` | the same six as the server came up, from the configuration |
 | `token_passes_per_second`, `estimated_default_seconds` | the last measured rate at the defaults' size, and what a picture at the defaults costs at it — `null` before anything was measured |
-| `rate` | the model behind both: `encode` (seconds per picture), `linear_per_token_pass` and `attention_per_token_pass` (seconds per latent-token pass, attention's measured at `attention_tokens` tokens and growing with the count), `decode_per_pixel`. Seconds for any settings = `encode + steps × n × passes × (linear + attention × n / attention_tokens) + decode_per_pixel × pixels`, `n` the latent tokens (`width/16 × height/16`) and `passes` 2 under guidance, 1 without. `null` before anything was measured |
+| `rate` | the model behind both: `encode` (seconds per picture), `linear_per_token_pass` and `attention_per_token_pass` (seconds per latent-token pass, attention's measured at `attention_tokens` tokens and growing with the count), `decode_per_pixel`, `edit_encode_per_token` (an edit's encode per reference latent token, `null` until an edit ran), and `step_share` (the share of steps that run the transformer — the step cache, `image_cache`, reuses the rest; `1` with it off). Seconds for any settings = `encode + steps × step_share × n × passes × (linear + attention × n / attention_tokens) + decode_per_pixel × pixels`, `n` the latent tokens (`width/16 × height/16`) and `passes` 2 under guidance, 1 without; an edit attends over `n + r` keys in place of `n`, `r` the reference's tokens. `null` before anything was measured |
 
 #### `POST /props`
 

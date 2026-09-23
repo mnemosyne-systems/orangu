@@ -709,6 +709,7 @@ async fn image_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::r
     };
     let request = match super::images::build_request(
         &pipeline.defaults(),
+        pipeline.size_unit(),
         super::images::ImageParams {
             prompt: &turn.content,
             negative_prompt: None,
@@ -788,7 +789,7 @@ async fn image_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::r
                         "image_progress": {
                             "step": p.step, "steps": p.steps,
                             "seconds_per_step": p.seconds_per_step,
-                            "eta_seconds": p.seconds_per_step * (p.steps.saturating_sub(p.step)) as f64,
+                            "eta_seconds": p.eta_seconds(),
                         },
                     });
                     yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));

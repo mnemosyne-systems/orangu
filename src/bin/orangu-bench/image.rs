@@ -149,6 +149,9 @@ impl ImageSample {
 /// asked about unless told to change it. `seed` is fixed so every repetition
 /// draws the same noise: the picture is not the point, and a varying one
 /// would only add a question.
+// Eight parameters: the request's own fields, each from a different flag;
+// a struct would only move the same names one line down.
+#[allow(clippy::too_many_arguments)]
 pub fn run_image_once(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -156,6 +159,7 @@ pub fn run_image_once(
     side: u32,
     steps: u32,
     cfg_scale: Option<f64>,
+    init: Option<&str>,
     model: &Option<String>,
 ) -> anyhow::Result<ImageSample> {
     let mut body = serde_json::json!({
@@ -168,6 +172,9 @@ pub fn run_image_once(
     });
     if let Some(cfg) = cfg_scale {
         body["cfg_scale"] = serde_json::json!(cfg);
+    }
+    if let Some(init) = init {
+        body["image"] = serde_json::Value::String(init.to_string());
     }
     if let Some(m) = model {
         body["model"] = serde_json::Value::String(m.clone());
@@ -286,9 +293,9 @@ pub fn run_image_once(
         steps,
         // What the server did rather than what was asked: with no
         // `cfg_scale` in the request the server's default decides, and the
-        // reply does not say — so it is read off the request, and the
-        // server's default is taken to be Qwen-Image's own (guided).
-        guided: cfg_scale.is_none_or(|cfg| cfg > 1.0),
+        // reply does not say — so it is read off the request, or else the
+        // server's default from `/props`.
+        guided: cfg_scale.unwrap_or_else(|| image_props(client, url).1) > 1.0,
         encode_s: ms("encode_ms"),
         denoise_s: ms("steps_ms"),
         decode_s: ms("decode_ms"),
@@ -303,14 +310,37 @@ pub fn run_image_once(
 
 /// The smallest picture there is, once: a warmup through the endpoint the
 /// run will use, so the pipeline's threads exist before `perf` attaches and
-/// the first measured picture pays no first-use cost. 16 pixels is one
-/// latent token; one step, unguided, is one transformer pass over it.
+/// the first measured picture pays no first-use cost. One side of the
+/// server's `size_unit` (16 pixels, 32 for Qwen-Image 2.1) is the fewest
+/// latent tokens; one step, unguided, is one transformer pass over them.
 pub fn warmup(
     client: &reqwest::blocking::Client,
     url: &str,
     model: &Option<String>,
 ) -> anyhow::Result<()> {
-    run_image_once(client, url, DEFAULT_PROMPT, 16, 1, Some(1.0), model).map(|_| ())
+    let side = image_props(client, url).0;
+    run_image_once(client, url, DEFAULT_PROMPT, side, 1, Some(1.0), None, model).map(|_| ())
+}
+
+/// The server's picture `size_unit` and default guidance, from `/props`
+/// (16 and guided when it does not say — a server from before either).
+pub fn image_props(client: &reqwest::blocking::Client, url: &str) -> (u32, f64) {
+    let image = client
+        .get(format!("{}/props", url.trim_end_matches('/')))
+        .send()
+        .ok()
+        .and_then(|r| r.json::<serde_json::Value>().ok())
+        .and_then(|v| v.get("image").cloned())
+        .unwrap_or_default();
+    let unit = image
+        .get("size_unit")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(16) as u32;
+    let cfg = image
+        .pointer("/defaults/cfg_scale")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(4.0);
+    (unit, cfg)
 }
 
 /// `--image`: one row per size, each the best of `--reps` pictures.
@@ -336,6 +366,31 @@ pub fn run_image(
         println!("{}", "-".repeat(104));
     }
 
+    // The attachment as a data URL, read once.
+    let init = match &args.image_init {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("reading --image-init {}: {e}", path.display()))?;
+            let mime = match path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("jpg" | "jpeg") => "image/jpeg",
+                Some("gif") => "image/gif",
+                Some("webp") => "image/webp",
+                Some("svg") => "image/svg+xml",
+                _ => "image/png",
+            };
+            use base64::Engine as _;
+            Some(format!(
+                "data:{mime};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            ))
+        }
+        None => None,
+    };
     for (point, &side) in args.image.iter().enumerate() {
         if point > 0 {
             args.settle();
@@ -350,6 +405,7 @@ pub fn run_image(
                 side,
                 args.image_steps,
                 args.image_cfg,
+                init.as_deref(),
                 &args.model,
             )?;
             rates.push(s.token_passes_per_s());

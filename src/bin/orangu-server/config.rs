@@ -236,10 +236,14 @@ pub fn bundled_configuration(
         // A bundle carries one model and no companions, so it can never be
         // a qwen_image model; these are never read.
         text_encoder: None,
+        vision: None,
         vae: None,
         image_lora: ImageLora::Auto,
         image_lora_merge: true,
         vae_precision: crate::engine::image::vae::VaePrecision::default(),
+        image_weights: crate::engine::image::transformer21::ImageWeights::default(),
+        image_cache: crate::engine::image::stepcache::ImageCache::default(),
+        image_reference: crate::engine::image::ReferenceCap::Source,
         image: crate::engine::image::ImageDefaults::default(),
         image_steps_set: false,
         image_cfg_scale_set: false,
@@ -344,7 +348,9 @@ impl Role {
     /// — `Some(Role::Image)` for a picture generator, `None` for a language
     /// model, whose role is the operator's choice.
     pub fn required_by(architecture: Option<&str>) -> Option<Role> {
-        (architecture == Some("qwen_image")).then_some(Role::Image)
+        architecture
+            .is_some_and(orangu::model_spec::is_image_architecture)
+            .then_some(Role::Image)
     }
 
     /// Default request-queue depth per slot before a new request is
@@ -802,6 +808,12 @@ pub struct ServerConfiguration {
     /// [`model`](Self::model). `None` (the default) finds the largest such
     /// file in the models directory. Ignored for every other architecture.
     pub text_encoder: Option<String>,
+    /// `[orangu-server].vision`: the text encoder's vision projector (an
+    /// `mmproj-*.gguf`) a `qwen_image_2_1` model reads a reference picture
+    /// with — a path, absolute or relative to the models directory, or
+    /// `none` to draw attached pictures over instead of editing them.
+    /// `None` finds one beside the text encoder, or under `models`.
+    pub vision: Option<String>,
     /// `[orangu-server].vae`: the Qwen-Image VAE (`.safetensors`) a
     /// `qwen_image` model decodes pictures with, absolute or relative to
     /// the models directory. `None` finds it by its tensors.
@@ -819,6 +831,23 @@ pub struct ServerConfiguration {
     /// transformer's kernel, about three times faster on an `i8mm` core) or
     /// `f32` (as the file has them; exact).
     pub vae_precision: crate::engine::image::vae::VaePrecision,
+    /// `[orangu-server].image_weights`: how a Qwen-Image 2.1 transformer's
+    /// linears are held — `auto` (the default: per-row `int8` for the 8 × 8
+    /// `smmla` tile when total memory is at least three times the 7 GB
+    /// copy), `int8`, or `file` (the file's K-quants, no copy).
+    pub image_weights: crate::engine::image::transformer21::ImageWeights,
+    /// `[orangu-server].image_cache`: `easy` (the default) or
+    /// `easy:<threshold>` (EasyCache — a step whose predicted change is
+    /// small reuses the last passes' residual), or `off` (every step runs
+    /// the transformer).
+    pub image_cache: crate::engine::image::stepcache::ImageCache,
+    /// `[orangu-server].image_reference_size`: `source` (the default: an
+    /// edit reads its reference at the picture's area but no larger than
+    /// the attached picture itself), `output` (the picture's area) or
+    /// `WIDTHxHEIGHT`, the
+    /// largest area it is read at — a smaller reference is a shorter
+    /// prefix and fewer keys in every step.
+    pub image_reference: crate::engine::image::ReferenceCap,
     /// `[orangu-server].image_*`: what a picture request gets when it does
     /// not say — size, steps, guidance, the negative prompt, and how far
     /// from an attached picture to start. The web console's chat sends none
@@ -1195,6 +1224,10 @@ pub fn load_server_configuration(
         .get("text_encoder")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let vision = section
+        .get("vision")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
     let vae = section
         .get("vae")
         .map(|value| value.trim().to_string())
@@ -1218,6 +1251,33 @@ pub fn load_server_configuration(
             )
         })?,
         None => crate::engine::image::vae::VaePrecision::default(),
+    };
+    let image_weights = match section.get("image_weights") {
+        Some(value) => {
+            crate::engine::image::transformer21::ImageWeights::parse(value).ok_or_else(|| {
+                anyhow!(
+                    "invalid value for [{SERVER_SECTION}].image_weights: '{}' (expected auto, \
+                     int8 or file)",
+                    value.trim()
+                )
+            })?
+        }
+        None => crate::engine::image::transformer21::ImageWeights::default(),
+    };
+    let image_cache = match section.get("image_cache") {
+        Some(value) => crate::engine::image::stepcache::ImageCache::parse(value)
+            .map_err(|e| anyhow!("invalid value for [{SERVER_SECTION}].image_cache: {e}"))?,
+        None => crate::engine::image::stepcache::ImageCache::default(),
+    };
+    let image_reference = match section.get("image_reference_size") {
+        None => crate::engine::image::ReferenceCap::Source,
+        Some(value) => crate::engine::image::ReferenceCap::parse(value).ok_or_else(|| {
+            anyhow!(
+                "invalid value for [{SERVER_SECTION}].image_reference_size: '{}' (expected \
+                 output, source or WIDTHxHEIGHT)",
+                value.trim()
+            )
+        })?,
     };
     let image = parse_image_defaults(&section)?;
 
@@ -1393,10 +1453,14 @@ pub fn load_server_configuration(
         draft_model,
         draft_tokens,
         text_encoder,
+        vision,
         vae,
         image_lora,
         image_lora_merge,
         vae_precision,
+        image_weights,
+        image_cache,
+        image_reference,
         image,
         image_steps_set,
         image_cfg_scale_set,
@@ -1428,17 +1492,27 @@ pub enum ImageLora {
 }
 
 impl ServerConfiguration {
-    /// The picture defaults with `adapter` in place: `image_steps` and
-    /// `image_cfg_scale` as configured, or — left out under a Lightning
-    /// adapter — the step count its name carries and guidance off, which is
-    /// what it was trained for (the base model's fifty guided steps under
-    /// it, or eight unguided steps without it, are noise). Any other
-    /// adapter, or none, leaves Qwen-Image's release settings.
+    /// The picture defaults for a `variant` model with `adapter` in place:
+    /// `image_steps` and `image_cfg_scale` as configured, or — left out —
+    /// the model's own release settings (Qwen-Image's fifty steps at
+    /// guidance 4, Qwen-Image 2.1's forty unguided ones), except under a
+    /// Lightning adapter, where they are the step count its name carries
+    /// and guidance off, which is what it was trained for (the base model's
+    /// fifty guided steps under it, or eight unguided steps without it, are
+    /// noise).
     pub fn image_defaults_under(
         &self,
+        variant: crate::engine::image::Variant,
         adapter: Option<&std::path::Path>,
     ) -> crate::engine::image::ImageDefaults {
         let mut defaults = self.image.clone();
+        let (release_steps, release_cfg) = variant.release_steps_and_cfg();
+        if !self.image_steps_set {
+            defaults.steps = release_steps;
+        }
+        if !self.image_cfg_scale_set {
+            defaults.cfg_scale = release_cfg;
+        }
         let steps = adapter
             .and_then(|path| path.file_name())
             .and_then(|name| name.to_str())
@@ -1721,6 +1795,7 @@ fn parse_mcp_configuration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::image::Variant;
     use std::io::Write;
 
     #[test]
@@ -2070,11 +2145,14 @@ mod tests {
         let conf = load("");
         assert_eq!(conf.image_lora, ImageLora::Auto);
         assert!(!conf.image_steps_set && !conf.image_cfg_scale_set);
-        let under = conf.image_defaults_under(Some(eight));
+        let under = conf.image_defaults_under(Variant::QwenImage, Some(eight));
         assert_eq!((under.steps, under.cfg_scale), (8, 1.0));
-        let base = conf.image_defaults_under(None);
+        let base = conf.image_defaults_under(Variant::QwenImage, None);
         assert_eq!((base.steps, base.cfg_scale), (50, 4.0));
-        let other = conf.image_defaults_under(Some(Path::new("/srv/models/style.safetensors")));
+        let other = conf.image_defaults_under(
+            Variant::QwenImage,
+            Some(Path::new("/srv/models/style.safetensors")),
+        );
         assert_eq!((other.steps, other.cfg_scale), (50, 4.0));
 
         assert_eq!(load("image_lora = none").image_lora, ImageLora::None);
@@ -2086,8 +2164,95 @@ mod tests {
 
         let conf = load("image_steps = 4\nimage_cfg_scale = 2");
         assert!(conf.image_steps_set && conf.image_cfg_scale_set);
-        let under = conf.image_defaults_under(Some(eight));
+        let under = conf.image_defaults_under(Variant::QwenImage, Some(eight));
         assert_eq!((under.steps, under.cfg_scale), (4, 2.0));
+        let v21 = conf.image_defaults_under(Variant::QwenImage21, None);
+        assert_eq!((v21.steps, v21.cfg_scale), (4, 2.0));
+    }
+
+    /// `image_weights` defaults to `auto`, takes `int8` and `file`, and
+    /// refuses anything else at startup.
+    #[test]
+    fn image_weights_parses_its_three_values() {
+        use crate::engine::image::transformer21::ImageWeights;
+        let load = |keys: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /srv/models\n{keys}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+        assert_eq!(load("").unwrap().image_weights, ImageWeights::Auto);
+        assert_eq!(
+            load("image_weights = int8").unwrap().image_weights,
+            ImageWeights::Int8
+        );
+        assert_eq!(
+            load("image_weights = File").unwrap().image_weights,
+            ImageWeights::File
+        );
+        assert!(load("image_weights = q4").is_err());
+    }
+
+    /// `image_cache` defaults to `easy`, takes a threshold after it, and
+    /// `off`.
+    #[test]
+    fn image_cache_parses() {
+        use crate::engine::image::stepcache::ImageCache;
+        let load = |keys: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /srv/models\n{keys}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+        assert_eq!(
+            load("").unwrap().image_cache,
+            ImageCache::Easy(ImageCache::EASY)
+        );
+        assert_eq!(
+            load("image_cache = off").unwrap().image_cache,
+            ImageCache::Off
+        );
+        assert_eq!(
+            load("image_cache = easy:0.1").unwrap().image_cache,
+            ImageCache::Easy(0.1)
+        );
+        assert!(load("image_cache = fast").is_err());
+    }
+
+    /// `image_reference_size` is `source` by default, `output`, or an area
+    /// cap.
+    #[test]
+    fn image_reference_size_parses() {
+        let load = |keys: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /srv/models\n{keys}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+        use crate::engine::image::ReferenceCap;
+        assert_eq!(load("").unwrap().image_reference, ReferenceCap::Source);
+        assert_eq!(
+            load("image_reference_size = Output")
+                .unwrap()
+                .image_reference,
+            ReferenceCap::Output
+        );
+        assert_eq!(
+            load("image_reference_size = 512x512")
+                .unwrap()
+                .image_reference,
+            ReferenceCap::Area(512 * 512)
+        );
+        assert!(load("image_reference_size = big").is_err());
+    }
+
+    /// Qwen-Image 2.1's own settings — forty steps, no guidance — are what
+    /// it gets when the config leaves them out.
+    #[test]
+    fn qwen_image_2_1_defaults_to_its_release_settings() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        let d = conf.image_defaults_under(Variant::QwenImage21, None);
+        assert_eq!((d.steps, d.cfg_scale), (40, 1.0));
+        assert_eq!((d.width, d.height), (1024, 1024));
     }
 
     /// NPU precompilation is on unless it is turned off, and a start with
@@ -2770,6 +2935,7 @@ mod tests {
     #[test]
     fn the_image_role_is_fixed_by_a_qwen_image_architecture() {
         assert_eq!(Role::required_by(Some("qwen_image")), Some(Role::Image));
+        assert_eq!(Role::required_by(Some("qwen_image_2_1")), Some(Role::Image));
         assert_eq!(Role::required_by(Some("llama")), None);
         assert_eq!(Role::required_by(None), None);
         assert!(Role::Image.fixed_by_model());

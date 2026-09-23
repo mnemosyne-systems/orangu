@@ -190,10 +190,10 @@
          are the server's. -->
     <section id="image-panel" class="settings-pane" aria-labelledby="image-title" hidden>
       <header id="image-header"><h2 id="image-title">Image</h2><span id="image-model" class="models-subtle"></span></header>
-      <p id="image-none" class="mcps-note" hidden>The served model is a language model; picture settings apply to a <code>qwen_image</code> model.</p>
+      <p id="image-none" class="mcps-note" hidden>The served model is a language model; picture settings apply to a <code>qwen_image</code> or <code>qwen_image_2_1</code> model.</p>
       <form id="image-form" hidden>
         <label class="image-field">
-          <span>Size <button type="button" class="info-btn" aria-label="What this setting does" data-tip="The picture's width × height in pixels, both multiples of 16. The time grows a little faster than the pixel count. 1024 × 1024 is the model's native size; 512 × 512 is the smallest that still follows the prompt reliably — a preview in a couple of minutes; at 256 × 256 the model wanders (a cat asked for, a man drawn)."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span>Size <button type="button" class="info-btn" aria-label="What this setting does" data-tip="The picture's width × height in pixels, both multiples of 16 — 32 for Qwen-Image 2.1, whose presets that do not fit are greyed out. The time grows a little faster than the pixel count. 1024 × 1024 is the model's native size; 512 × 512 is the smallest that still follows the prompt reliably — a preview in a couple of minutes; at 256 × 256 the model wanders (a cat asked for, a man drawn)."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
           <span class="image-controls">
             <select id="image-size">
               <option value="256x256">256 × 256 — smallest</option>
@@ -203,30 +203,34 @@
               <option value="1024x768">1024 × 768 — landscape</option>
               <option value="768x1024">768 × 1024 — portrait</option>
               <option value="1280x720">1280 × 720 — wide</option>
+              <option value="1280x704">1280 × 704 — wide, Qwen-Image 2.1</option>
+              <option value="2048x2048">2048 × 2048 — Qwen-Image 2.1's native</option>
               <option value="custom">Other…</option>
             </select>
             <input id="image-size-custom" type="text" inputmode="numeric" placeholder="WIDTHxHEIGHT" spellcheck="false" hidden>
           </span>
         </label>
         <label class="image-field">
-          <span>Steps <button type="button" class="info-btn" aria-label="What this setting does" data-tip="Denoising steps — the time is linear in them. A Lightning adapter is made for its own count (the 8-step file for 8, the 4-step file for 4); the base model without an adapter needs 50."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span>Steps <button type="button" class="info-btn" aria-label="What this setting does" data-tip="Denoising steps — the time is linear in them. A Lightning adapter is made for its own count (the 8-step file for 8, the 4-step file for 4); Qwen-Image without an adapter needs 50, Qwen-Image 2.1 is made for 40 (20 is a usable draft)."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
           <span class="image-controls">
             <select id="image-steps">
               <option value="4">4 — quick</option>
               <option value="8">8</option>
               <option value="20">20</option>
-              <option value="50">50</option>
+              <option value="40">40 — Qwen-Image 2.1's</option>
+              <option value="50">50 — Qwen-Image's</option>
               <option value="custom">Other…</option>
             </select>
             <input id="image-steps-custom" type="number" min="1" step="1" hidden>
           </span>
         </label>
         <label class="image-field">
-          <span>Guidance <button type="button" class="info-btn" aria-label="What this setting does" data-tip="Classifier-free guidance: how hard the picture is pushed towards the prompt and away from the negative prompt. Off under a Lightning adapter, which was trained without it; Qwen-Image's own setting is 4. Guidance doubles the work of every step."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span>Guidance <button type="button" class="info-btn" aria-label="What this setting does" data-tip="Classifier-free guidance: how hard the picture is pushed towards the prompt and away from the negative prompt. Off under a Lightning adapter, which was trained without it; Qwen-Image's own setting is 4; Qwen-Image 2.1 is released to run with it off, and 6 is what stable-diffusion.cpp's examples use. Guidance doubles the work of every step."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
           <span class="image-controls">
             <select id="image-cfg">
               <option value="1">Off</option>
               <option value="4">4 — Qwen-Image's</option>
+              <option value="6">6</option>
               <option value="custom">Other…</option>
             </select>
             <input id="image-cfg-custom" type="number" min="0" step="0.5" hidden>
@@ -237,7 +241,7 @@
           <span class="image-controls"><input id="image-negative" type="text" placeholder="what the picture is pushed away from (guidance on)"></span>
         </label>
         <label class="image-field">
-          <span>Strength <button type="button" class="info-btn" aria-label="What this setting does" data-tip="For a picture started from an attached one: how much of the schedule to run over it. 1 ignores the attachment's content and keeps only its size, 0 returns it unchanged; 0.6 keeps the composition and redraws the rest."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span>Strength <button type="button" class="info-btn" aria-label="What this setting does" data-tip="For a picture started from an attached one: how much of the schedule to run over it. Not used when Qwen-Image 2.1 edits the attachment (it has its vision projector): the prompt then says what to change. 1 ignores the attachment's content and keeps only its size, 0 returns it unchanged; 0.6 keeps the composition and redraws the rest."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
           <span class="image-controls"><input id="image-strength" type="range" min="0" max="1" step="0.05"><output id="image-strength-value"></output></span>
         </label>
         <label class="image-field">

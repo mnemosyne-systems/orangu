@@ -1255,6 +1255,32 @@ tokens). `ORANGU_EXPERT_I8MM=0` turns it off for an A/B on one binary;
 of 4–64 on that core: more rows reuse each activation tile from L1 across
 more `smmla` tiles, until the unpacked rows crowd it out).
 
+**A picture's attention scores run on `smmla` too.** Attention is the part
+of a denoising step that grows with the square of the picture: profiled
+with `orangu-bench --image … --flamegraph`, a Qwen-Image 2.1 step spends
+14% of its time there at 512 × 512 and 39% at 1024 × 1024, almost all of
+it in the `f32` tile (`gemm_f32_rows`) — while the linears around it run
+on the `int8` kernel. So a step's `q · k` is now `int8`
+(`image::transformer::step_attention`, `vecdot::i8_scores_4rows`): each
+head's keys lose their mean over the sequence (every score of a query
+moves by the same amount, which the softmax does not see) and each query
+and key row is quantized with its own scale; the softmax and the value
+product stay `f32`. A 1024 × 1024 Qwen-Image 2.1 step went 122 → 104 s
+(attention 39% → 29%), a 512 × 512 one 21.6 → 20.7 s; Qwen-Image 2512,
+whose joint attention takes the same path, 139.7 → 119.8 s at 1024 × 1024
+and 24.7 → 23.7 s at 512 × 512. The picture is the same picture: the
+same seed drew the same composition and lettering, differing in fine
+detail (30.6 dB PSNR against the `f32` one; 29.1 dB for 2512) — the size of difference
+diffusers itself documents between two equally valid samples.
+`ORANGU_IMAGE_ATTENTION=f32` keeps the exact path, for an A/B on one
+binary. The value product itself runs on `bfmmla` where the CPU has `bf16`
+(probabilities and values rounded to `bf16`, summed in `f32`, sixteen
+multiply-adds an instruction; 1024² step 72.4 → 63.0 s), else on
+`rten-gemm`'s `f32` kernel (a packed 4 × 16 tile, ~150 G MAC/s at its
+shape against ~100 for `gemm_f32_rows`); `ORANGU_IMAGE_PV=rten|orangu`
+picks the `f32` paths. The prompt prefix, the vision tower and the VAE keep `f32`
+attention; they run once a picture.
+
 **Every one of these kernels exists on every architecture.** The
 `smmla` tile product has a portable twin (`vecdot::dot_k_rows_portable`,
 the same arithmetic in `i32` and `f32` scalars, bit-identical to the pair

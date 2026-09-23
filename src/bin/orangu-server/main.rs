@@ -170,7 +170,7 @@ struct RoleFlags {
     /// Embedding only.
     #[arg(long)]
     embedding: bool,
-    /// Picture generation — a qwen_image model, the only kind this role
+    /// Picture generation — a qwen_image or qwen_image_2_1 model, the only kind this role
     /// serves and the only role such a model is served in.
     #[arg(long)]
     image: bool,
@@ -1098,7 +1098,8 @@ fn prepare(args: Args) -> Result<Prepared> {
     // — backend selection, placement, the footprint report — runs on the
     // encoder, which is the part of the pipeline that is a language model.
     // See `engine::image` for the whole shape.
-    let architecture_key = metadata_string(&gguf, "general.architecture");
+    // A file without metadata (Qwen-Image 2.1's) is named by its tensors.
+    let architecture_key = orangu::model_spec::architecture_of(&gguf);
     role = fix_role_for_model(
         role,
         cli_role,
@@ -1111,31 +1112,51 @@ fn prepare(args: Args) -> Result<Prepared> {
         // so the transcript still says which role the server came up in.
         println!("Role: {}", role.label());
     }
-    let image_companions = match architecture_key.as_deref() {
-        Some("qwen_image") => {
+    let image_variant = architecture_key
+        .as_deref()
+        .and_then(engine::image::Variant::from_architecture);
+    let image_companions = match image_variant {
+        Some(variant) => {
+            let arch = variant.architecture();
             if let ModelSource::Embedded(_) = &source {
                 bail!(
-                    "a qwen_image model cannot be bundled: it needs its text encoder and VAE \
+                    "a {arch} model cannot be bundled: it needs its text encoder and VAE \
                      beside it, and a bundle carries one file"
                 );
             }
             let companions = engine::image::Companions::locate(
                 &conf.models,
+                variant,
                 conf.text_encoder.as_deref(),
                 conf.vae.as_deref(),
+                conf.vision.as_deref(),
             )?;
             log::info!(
-                "orangu-server: qwen_image text encoder {}",
+                "orangu-server: {arch} text encoder {}",
                 companions.text_encoder.display()
             );
             log::info!(
-                "orangu-server: qwen_image VAE {} ({})",
+                "orangu-server: {arch} VAE {} ({})",
                 companions.vae.display(),
                 conf.vae_precision.label()
             );
+            if variant == engine::image::Variant::QwenImage21 {
+                match &companions.vision {
+                    Some(path) => log::info!(
+                        "orangu-server: {arch} vision {} — an attached picture is edited",
+                        path.display()
+                    ),
+                    None => log::info!(
+                        "orangu-server: {arch} has no vision projector — an attached picture is \
+                         drawn over, not edited; `orangu-server download {}:{}` fetches one",
+                        orangu::model_download::QWEN_IMAGE_21_TEXT_ENCODER_REPO,
+                        orangu::model_download::QWEN_IMAGE_21_VISION_FILE,
+                    ),
+                }
+            }
             Some(companions)
         }
-        _ => None,
+        None => None,
     };
     // What the language-model engine loads: the text encoder for an image
     // model, the model itself otherwise.
@@ -1182,6 +1203,9 @@ fn prepare(args: Args) -> Result<Prepared> {
     // and `build_global` can only be called once.
     let threads = configure_cpu_threads(threads_flag.as_deref(), conf.threads)?;
     engine::prefill_backend::set(conf.prefill_backend);
+    engine::image::transformer21::set_weights(conf.image_weights);
+    engine::image::stepcache::set(conf.image_cache);
+    engine::image::set_reference_cap(conf.image_reference);
     // Before the model is opened, because the loader is the first thing that
     // can read a weight through an explicit route.
     engine::expert_read::set_read_size(conf.read_size);
@@ -1206,7 +1230,8 @@ fn prepare(args: Args) -> Result<Prepared> {
     let mut transformer_opened = None;
     let mut image_rate = None;
     if image_companions.is_some() {
-        let transformer = LoadedModel::open(&path).context("loading the qwen_image weights")?;
+        let transformer =
+            LoadedModel::open(&path).context("loading the picture model's weights")?;
         // The device half only under `auto` with a device in hand; the CPU
         // half always, since it also seeds the wait estimate.
         let candidate = match conf.backend {
@@ -1555,8 +1580,8 @@ fn prepare(args: Args) -> Result<Prepared> {
             unsupported.join(", ")
         );
     }
-    let architecture = match &image_companions {
-        Some(_) => "qwen_image".to_string(),
+    let architecture = match image_variant {
+        Some(variant) => variant.architecture().to_string(),
         None => loaded.config.architecture.clone(),
     };
     // The device's weight arena cuts its chunks to what is coming.
@@ -1586,13 +1611,13 @@ fn prepare(args: Args) -> Result<Prepared> {
         Some(companions) => {
             let transformer = match transformer_opened.take() {
                 Some(transformer) => transformer,
-                None => LoadedModel::open(&path).context("loading the qwen_image weights")?,
+                None => LoadedModel::open(&path).context("loading the picture model's weights")?,
             };
             let unsupported =
                 engine::backend::unsupported_tensor_types(transformer.tensor_types(), &*backend);
             if !unsupported.is_empty() {
                 bail!(
-                    "backend {backend_label} has no kernel for the qwen_image model's tensor \
+                    "backend {backend_label} has no kernel for the picture model's tensor \
                      type(s) {}; only backend = cpu reads every type this build supports",
                     unsupported.join(", ")
                 );
@@ -1616,7 +1641,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                 );
             let image_backend: Arc<dyn Backend> = if too_large_for_device {
                 log::warn!(
-                    "orangu-server: the qwen_image transformer ({}) and its text encoder ({}) \
+                    "orangu-server: the picture transformer ({}) and its text encoder ({}) \
                      together exceed the selected device — the transformer and VAE run on the \
                      CPU. Choose a device explicitly with `--device` to override.",
                     orangu::format::format_bytes(transformer_device_bytes),
@@ -1631,10 +1656,15 @@ fn prepare(args: Args) -> Result<Prepared> {
             // own fifty guided steps are hours on a CPU), or none. With one,
             // the steps and guidance the config leaves unset are the
             // adapter's, so the picture is the one it was made to draw.
+            let variant = image_variant.expect("companions are found for a picture model");
             let lora_path = match &conf.image_lora {
                 config::ImageLora::Spec(spec) => {
                     Some(engine::image::resolve_lora(&conf.models, spec)?)
                 }
+                // No step distillation is published for Qwen-Image 2.1,
+                // and Qwen-Image's Lightning adapters do not fit its
+                // transformer: `auto` finds nothing to serve.
+                config::ImageLora::Auto if variant == engine::image::Variant::QwenImage21 => None,
                 config::ImageLora::Auto => {
                     let found = orangu::model_spec::find_qwen_image_lightning(&conf.models);
                     if found.is_none() {
@@ -1672,7 +1702,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                 }
                 None => (None, None),
             };
-            let image_defaults = conf.image_defaults_under(lora_path.as_deref());
+            let image_defaults = conf.image_defaults_under(variant, lora_path.as_deref());
             let mut pipeline = engine::image::Pipeline::load(
                 &transformer,
                 companions.clone(),
@@ -1727,8 +1757,9 @@ fn prepare(args: Args) -> Result<Prepared> {
             }
             let tc = pipeline.transformer_config();
             log::info!(
-                "orangu-server: qwen_image transformer: {} blocks, {} heads of {}, {} wide; \
+                "orangu-server: {} transformer: {} blocks, {} heads of {}, {} wide; \
                  defaults {}x{}, {} steps, cfg {}",
+                variant.architecture(),
                 tc.n_layer,
                 tc.n_head,
                 tc.head_dim,
@@ -3980,7 +4011,7 @@ fn fix_role_for_model(
                 None => format!("[{}].role = {}", config::SERVER_SECTION, role.label()),
             };
             bail!(
-                "{how} serves picture generators (qwen_image) only, and {model_label} is a {} \
+                "{how} serves picture generators (qwen_image, qwen_image_2_1) only, and {model_label} is a {} \
                  model; pick an image model or another role",
                 architecture.unwrap_or("language")
             )

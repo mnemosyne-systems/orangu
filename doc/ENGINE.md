@@ -262,6 +262,28 @@ builds the served `Engine` from the encoder and hangs the pipeline on
 `Engine::image`; `build_model` refuses the family, since nothing else may
 reach it.
 
+`qwen_image_2_1`, Qwen-Image 2.1, is the same family with its own three
+parts: a single-stream, block-causal transformer (`image::transformer21`)
+whose prompt is run through every block once per picture and kept as
+per-layer keys and values — the prompt is causal and modulated at `t = 0`,
+so a step only runs the picture's tokens, attending over `[prompt | picture]`
+(`image::transformer::attention` is the rectangular, optionally causal
+form of the blocked kernel); a Qwen3-VL-8B encoder read through
+`ModelForward::forward_hidden_states_pre_norm`, since the model was trained
+on the last layer before the final norm; and an RGBA VAE with
+parameter-free resampling shortcuts (`image::vae21`), which reuses
+`image::vae`'s convolution machinery. Editing adds `image::qwen3vl`: the
+Qwen3-VL vision tower from the encoder's `mmproj-*.gguf` (opened with
+`LoadedModel::open_projector`), and a reference forward of the `qwen3vl`
+text model with the picture's tokens in it — interleaved M-RoPE and the
+DeepStack additions, which the served `arch::llama` path has no use for;
+on text alone it agrees with that path and with llama.cpp. The reference
+picture's latents then enter `transformer21::prefill_segments` as a
+bidirectional block inside the causal prompt. Its GGUFs carry no metadata, so
+`orangu::model_spec::architecture_of` names the file from its tensors, and
+the loader strips the `model.diffusion_model.` prefix they are written
+under. `image::Variant` is what the pipeline switches on.
+
 Backends, and they are not six of a kind:
 
 - `cpu` — the reference implementation, and what every other backend is

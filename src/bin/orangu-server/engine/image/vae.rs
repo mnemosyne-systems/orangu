@@ -89,7 +89,7 @@ impl Feature {
 
 /// How a 3x3 convolution reads past its input's edges.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Padding {
+pub(super) enum Padding {
     /// One zero on every side, stride one — the ordinary `padding=1` conv.
     Same,
     /// A zero on the right and bottom only, stride two — the encoder's
@@ -98,17 +98,20 @@ enum Padding {
     HalveDownRight,
 }
 
-struct Conv {
+pub(super) struct Conv {
     /// `[out, cols]`, each row laid out `(ky, kx, in)` so a tap's channel
     /// vector is one contiguous copy from a channel-last row; `cols` is
     /// `k * k * in` rounded up to the weight type's block (a multiple of
     /// 256 for the `int8` kernel), the padding zero on both sides.
-    w: QuantMatrix,
-    bias: Vec<f32>,
-    cin: usize,
-    cout: usize,
-    kernel: usize,
-    padding: Padding,
+    pub(super) w: QuantMatrix,
+    /// The same rows as per-row `int8` for the 8 × 8 `smmla` tile
+    /// ([`row_matrix`]), which a CPU with `i8mm` runs instead of `w`.
+    pub(super) rowi8: Option<crate::engine::vecdot::RowI8>,
+    pub(super) bias: Vec<f32>,
+    pub(super) cin: usize,
+    pub(super) cout: usize,
+    pub(super) kernel: usize,
+    pub(super) padding: Padding,
 }
 
 struct ResBlock {
@@ -125,6 +128,8 @@ struct AttnBlock {
     proj: Conv,
 }
 
+// A few dozen layers per VAE: their size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 enum Layer {
     Res(ResBlock),
     Attn(AttnBlock),
@@ -164,57 +169,7 @@ impl QwenImageVae {
         backend: Arc<dyn Backend>,
         precision: VaePrecision,
     ) -> Result<Self> {
-        let conv = |name: &str, padding: Padding| -> Result<Conv> {
-            let (w, shape) = file.tensor(&format!("{name}.weight"))?;
-            let (bias, _) = file.tensor(&format!("{name}.bias"))?;
-            let (cout, cin, kernel, rows) = match shape {
-                // A causal 3-D kernel: keep the last temporal slice only.
-                [cout, cin, kt, kh, kw] => {
-                    ensure!(kh == kw, "{name}: kernel is {kh}x{kw}, not square");
-                    let per_slice = kh * kw;
-                    let mut rows = Vec::with_capacity(cout * per_slice * cin);
-                    for o in 0..*cout {
-                        for ky in 0..*kh {
-                            for kx in 0..*kw {
-                                for i in 0..*cin {
-                                    let idx = (((o * cin + i) * kt + (kt - 1)) * kh + ky) * kw + kx;
-                                    rows.push(w[idx]);
-                                }
-                            }
-                        }
-                    }
-                    (*cout, *cin, *kh, rows)
-                }
-                [cout, cin, kh, kw] => {
-                    ensure!(kh == kw, "{name}: kernel is {kh}x{kw}, not square");
-                    let mut rows = Vec::with_capacity(cout * kh * kw * cin);
-                    for o in 0..*cout {
-                        for ky in 0..*kh {
-                            for kx in 0..*kw {
-                                for i in 0..*cin {
-                                    rows.push(w[((o * cin + i) * kh + ky) * kw + kx]);
-                                }
-                            }
-                        }
-                    }
-                    (*cout, *cin, *kh, rows)
-                }
-                other => anyhow::bail!("{name}: unexpected kernel shape {other:?}"),
-            };
-            ensure!(
-                bias.len() == cout,
-                "{name}: bias has {} values for {cout} outputs",
-                bias.len()
-            );
-            Ok(Conv {
-                w: conv_matrix(rows, kernel * kernel * cin, cout, precision),
-                bias,
-                cin,
-                cout,
-                kernel,
-                padding,
-            })
-        };
+        let conv = |name: &str, padding: Padding| load_conv(file, name, padding, precision);
         let gamma = |name: &str| -> Result<Vec<f32>> {
             let (g, _) = file.tensor(&format!("{name}.gamma"))?;
             Ok(g)
@@ -309,13 +264,8 @@ impl QwenImageVae {
     }
 
     /// Pixels from a latent: `[h/8 * w/8, 16]` in VAE space (already
-    /// de-normalised) to `[h * w, 3]` RGB in `[-1, 1]`.
-    pub fn decode(&self, latent: &Feature) -> Result<Feature> {
-        self.decode_unless(latent, None)
-    }
-
-    /// [`decode`](Self::decode), stopping between layers once `cancel` is
-    /// set (or the server is shutting down).
+    /// de-normalised) to `[h * w, 3]` RGB in `[-1, 1]`, stopping between
+    /// layers once `cancel` is set (or the server is shutting down).
     pub fn decode_unless(
         &self,
         latent: &Feature,
@@ -432,33 +382,103 @@ impl QwenImageVae {
 
     /// One convolution, as a matmul over unrolled neighbourhoods.
     fn conv(&self, conv: &Conv, x: &Feature) -> Feature {
-        debug_assert_eq!(x.channels, conv.cin);
-        let (out_h, out_w) = match conv.padding {
-            Padding::Same => (x.height, x.width),
-            Padding::HalveDownRight => (x.height / 2, x.width / 2),
-        };
-        let cols = conv.w.in_dim;
-        let mut out = vec![0.0f32; out_h * out_w * conv.cout];
-        // Row bands, sized so the unrolled table stays around 64 MiB.
-        let band_rows = ((64usize << 20) / (cols * out_w * 4).max(1)).clamp(1, out_h);
-        // On the CPU with `int8` weights, the window of each pixel is
-        // gathered straight into the quantizer's scratch row and the
-        // `int8` kernel run on the result — the `f32` `im2col` band (9× the
-        // feature map, 268 MiB at full resolution) never exists. Any other
-        // backend, or `f32` weights, get the band through `matmul_batch`.
-        let gathered = self.backend.is_cpu()
-            && crate::engine::vecdot::have_i8mm()
-            && crate::engine::vecdot::supports_k(conv.w.ggml_type(), cols);
-        let mut patches = Vec::new();
-        let mut y = Vec::new();
-        let mut start = 0;
-        while start < out_h {
-            let end = (start + band_rows).min(out_h);
-            let n = (end - start) * out_w;
-            if gathered {
-                let acts = crate::engine::vecdot::ActQ8Mm::quantize_with(cols, n, |t, row| {
-                    gather_window(x, conv, start + t / out_w, t % out_w, row);
-                });
+        run_conv(&*self.backend, conv, x)
+    }
+}
+
+/// A convolution from `file`: `{name}.weight` and `{name}.bias`, a 2-D
+/// kernel as it is or a causal 3-D one read through its last temporal
+/// slice (see the module doc), laid out for [`run_conv`].
+pub(super) fn load_conv(
+    file: &SafeTensors,
+    name: &str,
+    padding: Padding,
+    precision: VaePrecision,
+) -> Result<Conv> {
+    let (w, shape) = file.tensor(&format!("{name}.weight"))?;
+    let (bias, _) = file.tensor(&format!("{name}.bias"))?;
+    let (cout, cin, kernel, rows) = match shape {
+        // A causal 3-D kernel: keep the last temporal slice only.
+        [cout, cin, kt, kh, kw] => {
+            ensure!(kh == kw, "{name}: kernel is {kh}x{kw}, not square");
+            let per_slice = kh * kw;
+            let mut rows = Vec::with_capacity(cout * per_slice * cin);
+            for o in 0..*cout {
+                for ky in 0..*kh {
+                    for kx in 0..*kw {
+                        for i in 0..*cin {
+                            let idx = (((o * cin + i) * kt + (kt - 1)) * kh + ky) * kw + kx;
+                            rows.push(w[idx]);
+                        }
+                    }
+                }
+            }
+            (*cout, *cin, *kh, rows)
+        }
+        [cout, cin, kh, kw] => {
+            ensure!(kh == kw, "{name}: kernel is {kh}x{kw}, not square");
+            let mut rows = Vec::with_capacity(cout * kh * kw * cin);
+            for o in 0..*cout {
+                for ky in 0..*kh {
+                    for kx in 0..*kw {
+                        for i in 0..*cin {
+                            rows.push(w[((o * cin + i) * kh + ky) * kw + kx]);
+                        }
+                    }
+                }
+            }
+            (*cout, *cin, *kh, rows)
+        }
+        other => anyhow::bail!("{name}: unexpected kernel shape {other:?}"),
+    };
+    ensure!(
+        bias.len() == cout,
+        "{name}: bias has {} values for {cout} outputs",
+        bias.len()
+    );
+    Ok(Conv {
+        rowi8: row_matrix(&rows, kernel * kernel * cin, cout, precision),
+        w: conv_matrix(rows, kernel * kernel * cin, cout, precision),
+        bias,
+        cin,
+        cout,
+        kernel,
+        padding,
+    })
+}
+
+/// One convolution, as a matmul over unrolled neighbourhoods, on `backend`.
+pub(super) fn run_conv(backend: &dyn Backend, conv: &Conv, x: &Feature) -> Feature {
+    debug_assert_eq!(x.channels, conv.cin);
+    let (out_h, out_w) = match conv.padding {
+        Padding::Same => (x.height, x.width),
+        Padding::HalveDownRight => (x.height / 2, x.width / 2),
+    };
+    let cols = conv.w.in_dim;
+    let mut out = vec![0.0f32; out_h * out_w * conv.cout];
+    // Row bands, sized so the unrolled table stays around 64 MiB.
+    let band_rows = ((64usize << 20) / (cols * out_w * 4).max(1)).clamp(1, out_h);
+    // On the CPU with `int8` weights, the window of each pixel is
+    // gathered straight into the quantizer's scratch row and the
+    // `int8` kernel run on the result — the `f32` `im2col` band (9× the
+    // feature map, 268 MiB at full resolution) never exists. Any other
+    // backend, or `f32` weights, get the band through `matmul_batch`.
+    let gathered = backend.is_cpu()
+        && crate::engine::vecdot::have_i8mm()
+        && (conv.rowi8.is_some() || crate::engine::vecdot::supports_k(conv.w.ggml_type(), cols));
+    let mut patches = Vec::new();
+    let mut y = Vec::new();
+    let mut start = 0;
+    while start < out_h {
+        let end = (start + band_rows).min(out_h);
+        let n = (end - start) * out_w;
+        if gathered {
+            let acts = crate::engine::vecdot::ActQ8Mm::quantize_with(cols, n, |t, row| {
+                gather_window(x, conv, start + t / out_w, t % out_w, row);
+            });
+            if let Some(rows) = &conv.rowi8 {
+                y = crate::engine::vecdot::matmul_rowi8_acts(&acts, n, rows);
+            } else {
                 crate::engine::backend::CpuBackend::matmul_k_mm_into(
                     &mut y,
                     &acts,
@@ -469,24 +489,23 @@ impl QwenImageVae {
                     cols,
                     conv.cout,
                 );
-            } else {
-                unroll(x, conv, start, end, out_w, &mut patches);
-                y = self
-                    .backend
-                    .matmul_batch(&[MatmulOp {
-                        x: &patches,
-                        n_tokens: n,
-                        w: &conv.w,
-                    }])
-                    .pop()
-                    .expect("one op in, one result out");
             }
-            tensor::add_bias_per_row(&mut y, &conv.bias, n);
-            out[start * out_w * conv.cout..end * out_w * conv.cout].copy_from_slice(&y);
-            start = end;
+        } else {
+            unroll(x, conv, start, end, out_w, &mut patches);
+            y = backend
+                .matmul_batch(&[MatmulOp {
+                    x: &patches,
+                    n_tokens: n,
+                    w: &conv.w,
+                }])
+                .pop()
+                .expect("one op in, one result out");
         }
-        Feature::new(out_h, out_w, conv.cout, out)
+        tensor::add_bias_per_row(&mut y, &conv.bias, n);
+        out[start * out_w * conv.cout..end * out_w * conv.cout].copy_from_slice(&y);
+        start = end;
     }
+    Feature::new(out_h, out_w, conv.cout, out)
 }
 
 /// How the VAE's convolution weights are stored and multiplied.
@@ -521,10 +540,41 @@ impl VaePrecision {
     }
 }
 
+/// `rows` (`[cout][cols]`, `f32`) as per-row `int8` for the 8 × 8 `smmla`
+/// tile, padded as [`conv_matrix`] pads them — about four times the
+/// `Q6_K` kernel's rate at the VAE's shapes (`doc/PERF-IMAGE.md`, task 12).
+/// `None` under `F32`, on a CPU without `i8mm`, or with
+/// `ORANGU_IMAGE_ROWI8_CONV=off` (an A/B against `Q6_K`).
+pub(super) fn row_matrix(
+    rows: &[f32],
+    cols: usize,
+    cout: usize,
+    precision: VaePrecision,
+) -> Option<crate::engine::vecdot::RowI8> {
+    if precision != VaePrecision::Int8
+        || !crate::engine::vecdot::have_i8mm()
+        || std::env::var("ORANGU_IMAGE_ROWI8_CONV").is_ok_and(|v| v == "off")
+    {
+        return None;
+    }
+    let padded =
+        cols.div_ceil(crate::engine::vecdot::SUPER_BLOCK) * crate::engine::vecdot::SUPER_BLOCK;
+    Some(crate::engine::vecdot::RowI8::quantize(cout, padded, |o| {
+        let mut row = vec![0f32; padded];
+        row[..cols].copy_from_slice(&rows[o * cols..(o + 1) * cols]);
+        row
+    }))
+}
+
 /// The matrix a convolution runs as: `rows` is `[cout][cols]` in `f32`.
 /// `Int8` pads each row to a multiple of 256 with zeros and encodes it as
 /// `Q6_K` with the library's own GGUF encoder.
-fn conv_matrix(rows: Vec<f32>, cols: usize, cout: usize, precision: VaePrecision) -> QuantMatrix {
+pub(super) fn conv_matrix(
+    rows: Vec<f32>,
+    cols: usize,
+    cout: usize,
+    precision: VaePrecision,
+) -> QuantMatrix {
     match precision {
         VaePrecision::F32 => QuantMatrix::from_f32_rows(rows, cols, cout),
         VaePrecision::Int8 => {
@@ -617,7 +667,7 @@ fn unroll(
 
 /// Wan's `RMS_norm`: each pixel's channel vector scaled to length
 /// `sqrt(channels)`, times a per-channel `gamma`.
-fn rms_norm(x: &Feature, gamma: &[f32]) -> Feature {
+pub(super) fn rms_norm(x: &Feature, gamma: &[f32]) -> Feature {
     let c = x.channels;
     debug_assert_eq!(gamma.len(), c);
     let scale = (c as f32).sqrt();
@@ -634,7 +684,7 @@ fn rms_norm(x: &Feature, gamma: &[f32]) -> Feature {
     Feature::new(x.height, x.width, c, out)
 }
 
-fn silu_inplace(x: &mut [f32]) {
+pub(super) fn silu_inplace(x: &mut [f32]) {
     x.par_chunks_mut(4096).for_each(|chunk| {
         for v in chunk.iter_mut() {
             *v = tensor::silu(*v);
@@ -643,7 +693,7 @@ fn silu_inplace(x: &mut [f32]) {
 }
 
 /// `nearest-exact` at exactly 2x: every pixel becomes a 2x2 block.
-fn nearest_upsample(x: &Feature) -> Feature {
+pub(super) fn nearest_upsample(x: &Feature) -> Feature {
     let c = x.channels;
     let (h, w) = (x.height * 2, x.width * 2);
     let mut out = vec![0.0f32; h * w * c];
@@ -663,6 +713,7 @@ mod tests {
 
     fn conv_with(rows: Vec<f32>, cin: usize, cout: usize, kernel: usize, padding: Padding) -> Conv {
         Conv {
+            rowi8: None,
             w: QuantMatrix::from_f32_rows(rows, kernel * kernel * cin, cout),
             bias: vec![0.0; cout],
             cin,
@@ -757,22 +808,29 @@ mod tests {
         let vae = vae_shell();
         for padding in [Padding::Same, Padding::HalveDownRight] {
             let exact = vae.conv(&conv_with(rows.clone(), cin, cout, k, padding), &x);
-            let int8 = Conv {
-                w: conv_matrix(rows.clone(), k * k * cin, cout, VaePrecision::Int8),
-                bias: vec![0.0; cout],
-                cin,
-                cout,
-                kernel: k,
-                padding,
-            };
-            let fast = vae.conv(&int8, &x);
-            assert_eq!(fast.data.len(), exact.data.len());
-            let scale = exact.data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-            for (i, (f, e)) in fast.data.iter().zip(&exact.data).enumerate() {
-                assert!(
-                    (f - e).abs() <= 0.02 * scale,
-                    "{padding:?} at {i}: {f} vs {e}"
-                );
+            // `Q6_K` on the K-quant kernel, and per-row `int8` on the
+            // `smmla` tile.
+            for rowi8 in [false, true] {
+                let int8 = Conv {
+                    rowi8: rowi8
+                        .then(|| row_matrix(&rows, k * k * cin, cout, VaePrecision::Int8))
+                        .flatten(),
+                    w: conv_matrix(rows.clone(), k * k * cin, cout, VaePrecision::Int8),
+                    bias: vec![0.0; cout],
+                    cin,
+                    cout,
+                    kernel: k,
+                    padding,
+                };
+                let fast = vae.conv(&int8, &x);
+                assert_eq!(fast.data.len(), exact.data.len());
+                let scale = exact.data.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                for (i, (f, e)) in fast.data.iter().zip(&exact.data).enumerate() {
+                    assert!(
+                        (f - e).abs() <= 0.02 * scale,
+                        "{padding:?} rowi8 {rowi8} at {i}: {f} vs {e}"
+                    );
+                }
             }
         }
     }
