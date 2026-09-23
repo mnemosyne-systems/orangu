@@ -109,6 +109,20 @@ pub enum Stage {
     /// (`qwen_hybrid::DenseFfn`), so a device backend's one-submission FFN
     /// has a line of its own.
     FfnDense,
+    /// The attention block's input side: the q/k/v projections. On a model
+    /// whose weights sit under the host-matmul crossover these run on the
+    /// CPU, and at decode that is most of what the host does before it
+    /// waits for attention.
+    AttnProject,
+    /// Waiting for attention's own submission and bringing its output
+    /// home — the readback a layer pays when the work after attention is
+    /// not in the same submission. The ceiling on what fusing that work in
+    /// could remove.
+    AttnRead,
+    /// The attention block's output side, as the architecture submits it:
+    /// the `wo` projection, the residual add and the feed-forward norm.
+    /// One device submission per layer where those are fused.
+    AttnOut,
     /// The final norm and the output projection over the vocabulary.
     Head,
     /// Recording one token's layer loop into a device submission
@@ -122,7 +136,7 @@ pub enum Stage {
 
 impl Stage {
     /// Every stage, in report order.
-    pub const ALL: [Stage; 15] = [
+    pub const ALL: [Stage; 18] = [
         Stage::Forward,
         Stage::Embed,
         Stage::RecurrentProject,
@@ -135,6 +149,9 @@ impl Stage {
         Stage::FfnShared,
         Stage::FfnCombine,
         Stage::FfnDense,
+        Stage::AttnProject,
+        Stage::AttnRead,
+        Stage::AttnOut,
         Stage::Head,
         Stage::DeviceRecord,
         Stage::DeviceSubmit,
@@ -156,6 +173,9 @@ impl Stage {
             Stage::FfnShared => "ffn.shared",
             Stage::FfnCombine => "ffn.combine",
             Stage::FfnDense => "ffn.dense",
+            Stage::AttnProject => "attn.project",
+            Stage::AttnRead => "attn.read",
+            Stage::AttnOut => "attn.out",
             Stage::Head => "head",
             Stage::DeviceRecord => "device.record",
             Stage::DeviceSubmit => "device.submit",
@@ -184,9 +204,12 @@ impl Stage {
             Stage::FfnShared => 9,
             Stage::FfnCombine => 10,
             Stage::FfnDense => 11,
-            Stage::Head => 12,
-            Stage::DeviceRecord => 13,
-            Stage::DeviceSubmit => 14,
+            Stage::AttnProject => 12,
+            Stage::AttnRead => 13,
+            Stage::AttnOut => 14,
+            Stage::Head => 15,
+            Stage::DeviceRecord => 16,
+            Stage::DeviceSubmit => 17,
         }
     }
 }
@@ -276,19 +299,84 @@ pub fn submissions_so_far() -> u64 {
     ALL_SUBMITS.load(Ordering::Relaxed)
 }
 
-/// Times one whole forward pass, and counts it.
+/// Times one whole **decode** forward pass, and counts it.
 ///
 /// The generation loop's own wrapper: this is what makes the breakdown
 /// generic. Every architecture is driven through here, so `forward` — the
 /// denominator — is measured whether or not that architecture's file has been
 /// given any of the finer stages.
 pub fn pass<T>(f: impl FnOnce() -> T) -> T {
+    pass_of(1, f)
+}
+
+/// [`pass`] for a pass of known width. **A pass wider than one token leaves
+/// these counters exactly as it found them.**
+///
+/// A request measured at depth prefills its prompt before it generates
+/// anything, and those chunks are forward passes through this same wrapper.
+/// Counted in, a multi-second prefill is averaged into the per-pass
+/// breakdown of a 90 ms decode step: measured on a mixture at depth 1024,
+/// the window reported **251.5 ms a pass against a token that took 92.3** —
+/// nearly two thirds of the breakdown belonging to work the reader is not
+/// looking at, distributed across the stages in prefill's proportions rather
+/// than decode's.
+///
+/// So a wide pass snapshots every counter on the way in and restores it on
+/// the way out. Subtracting the delta rather than suppressing the writes is
+/// what makes it complete: a stage that ran on a `rayon` worker inside the
+/// pass is still removed, where a flag on the calling thread would have
+/// missed it.
+///
+/// **The one thing this cannot separate is a genuinely concurrent decode**
+/// on another request, whose contribution is subtracted along with the
+/// prefill's. That is a measurement run with one stream, which is what a
+/// breakdown is read from anyway.
+pub fn pass_of<T>(n_tokens: usize, f: impl FnOnce() -> T) -> T {
     if !enabled() {
         return f();
+    }
+    if n_tokens > 1 {
+        let before = CounterSnapshot::take();
+        let out = scope(Stage::Forward, f);
+        before.restore();
+        return out;
     }
     let out = scope(Stage::Forward, f);
     PASSES.fetch_add(1, Ordering::Relaxed);
     out
+}
+
+/// Every counter as it stood, so a pass whose contribution is not wanted can
+/// put them back — see [`pass_of`].
+struct CounterSnapshot {
+    nanos: Vec<u64>,
+    calls: Vec<u64>,
+    submits: Vec<u64>,
+    all_submits: u64,
+}
+
+impl CounterSnapshot {
+    fn take() -> Self {
+        Self {
+            nanos: NANOS.iter().map(|v| v.load(Ordering::Relaxed)).collect(),
+            calls: CALLS.iter().map(|v| v.load(Ordering::Relaxed)).collect(),
+            submits: SUBMITS.iter().map(|v| v.load(Ordering::Relaxed)).collect(),
+            all_submits: ALL_SUBMITS.load(Ordering::Relaxed),
+        }
+    }
+
+    fn restore(self) {
+        for (slot, was) in NANOS.iter().zip(self.nanos) {
+            slot.store(was, Ordering::Relaxed);
+        }
+        for (slot, was) in CALLS.iter().zip(self.calls) {
+            slot.store(was, Ordering::Relaxed);
+        }
+        for (slot, was) in SUBMITS.iter().zip(self.submits) {
+            slot.store(was, Ordering::Relaxed);
+        }
+        ALL_SUBMITS.store(self.all_submits, Ordering::Relaxed);
+    }
 }
 
 /// One stage's window.
@@ -346,6 +434,40 @@ pub fn take_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A wide pass restores every counter it found, which is what keeps a
+    /// request's prompt out of the breakdown of its decode steps. Asserted
+    /// on the mechanism rather than through `pass_of`, because the counters
+    /// are off unless the process was started with the variable set and a
+    /// test that quietly returns when they are is a test that never fails.
+    ///
+    /// The case this exists for, measured: at depth 1024 the window
+    /// reported 251.5 ms a pass against a token that took 92.3, the excess
+    /// being a multi-second prefill spread over 64 decode steps.
+    #[test]
+    fn a_snapshot_restores_every_counter_it_found() {
+        let attn = Stage::Attn.index();
+        let head = Stage::Head.index();
+        // Whatever a neighbouring test left behind is the starting state;
+        // this asserts a delta, so it does not care what that is.
+        NANOS[attn].store(1_000, Ordering::Relaxed);
+        CALLS[attn].store(7, Ordering::Relaxed);
+        SUBMITS[head].store(3, Ordering::Relaxed);
+        ALL_SUBMITS.store(11, Ordering::Relaxed);
+
+        let before = CounterSnapshot::take();
+        // What a prefill pass would have added.
+        NANOS[attn].fetch_add(5_000_000, Ordering::Relaxed);
+        CALLS[attn].fetch_add(48, Ordering::Relaxed);
+        SUBMITS[head].fetch_add(96, Ordering::Relaxed);
+        ALL_SUBMITS.fetch_add(96, Ordering::Relaxed);
+        before.restore();
+
+        assert_eq!(NANOS[attn].load(Ordering::Relaxed), 1_000);
+        assert_eq!(CALLS[attn].load(Ordering::Relaxed), 7);
+        assert_eq!(SUBMITS[head].load(Ordering::Relaxed), 3);
+        assert_eq!(ALL_SUBMITS.load(Ordering::Relaxed), 11);
+    }
 
     /// Every stage must have a distinct index and a distinct name, or two of
     /// them would silently share a counter — a bug that would look like one

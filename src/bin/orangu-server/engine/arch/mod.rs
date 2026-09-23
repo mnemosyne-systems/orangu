@@ -2133,6 +2133,41 @@ pub(crate) fn expert_streaming() -> bool {
     *ON.get_or_init(|| env_flag("ORANGU_EXPERT_STREAM"))
 }
 
+/// Opens a per-dispatch device-timing span over a forward pass that spans
+/// submissions, and closes it when dropped.
+///
+/// The chains that record a whole step into one encoder resolve their own
+/// timestamps; the **step-by-step** path does not, because no single
+/// encoder covers it. Every mixture takes that path — a routed
+/// feed-forward is a per-token choice no chain can record — so the
+/// per-op device table was blank for exactly the models whose kernels most
+/// need reading, at prefill and at decode alike.
+///
+/// Nothing without the timer (`ORANGU_GPU_TIMESTAMPS=ops`): both calls are
+/// no-ops, and closing one costs a submission and a wait, which is why it
+/// is opt-in rather than always on.
+pub(crate) struct OpSpan<'a> {
+    vulkan: &'a crate::engine::backend::vulkan::VulkanBackend,
+    start_pos: usize,
+}
+
+impl<'a> OpSpan<'a> {
+    pub(crate) fn open(
+        backend: &'a dyn crate::engine::backend::Backend,
+        start_pos: usize,
+    ) -> Option<Self> {
+        let vulkan = backend.as_wgpu()?;
+        vulkan.begin_op_span();
+        Some(Self { vulkan, start_pos })
+    }
+}
+
+impl Drop for OpSpan<'_> {
+    fn drop(&mut self) {
+        self.vulkan.finish_op_span(self.start_pos);
+    }
+}
+
 /// Holds the card's clock up across a decode step whose turns alternate
 /// between the host and the card (`ORANGU_CLOCK_HOLD`, on unless `0`) —
 /// see `backend::vulkan_clock`. Returns a guard that releases the hold

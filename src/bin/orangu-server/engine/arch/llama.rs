@@ -666,6 +666,18 @@ fn report_npu_block_error(
     );
 }
 
+/// `ORANGU_MOE_DECODE_CHAIN=0` sends a mixture's decode step back to the
+/// step-by-step path, where attention, `wo` and the residual add are three
+/// host turns instead of one submission.
+///
+/// The control arm, and the only way to compare the two on one binary: a
+/// mixture either has the seam or it does not, so without this the
+/// comparison would be two builds — and two builds differ by more than the
+/// thing under test.
+fn moe_decode_chain() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_MOE_DECODE_CHAIN"))
+}
 impl LlamaModel {
     /// One decode step as a single GPU submission, or `None` when this model or
     /// this step is not one the fused chain can describe.
@@ -842,7 +854,21 @@ impl LlamaModel {
         // chunk rather than per layer — nothing between two layers needs
         // the encoder, and a pass boundary is device time. The NPU seam
         // submits per layer on its own and keeps the single pass.
-        let chunk_ends = if npu.is_some() {
+        // A mixture's experts are a per-token choice this chain cannot
+        // record, so it stops at the norm on every layer and runs them at
+        // the seam — the same shape the NPU seam uses, and with the same
+        // consequence for chunking: a seam submits per layer already.
+        // **Declined outright when the seam is off**, not half-taken: the
+        // chain would still stop at the norm on a mixture layer (it has no
+        // dense network to record) while the loop fed the next layer from a
+        // device buffer the seam never wrote. That is not the step path,
+        // it is a third thing that reads a stale residual — measured at a
+        // third of the rate and emitting a stop token after nineteen.
+        if self.is_moe() && !moe_decode_chain() {
+            return None;
+        }
+        let moe_seam = self.is_moe();
+        let chunk_ends = if npu.is_some() || moe_seam {
             Vec::new()
         } else {
             super::decode_chunk_ends(layers.len())
@@ -850,7 +876,7 @@ impl LlamaModel {
         let mut cursor = PassCursor::new(&mut encoder);
         for il in layers.clone() {
             let layer = &self.layers[il];
-            let x_input = if npu.is_some() && !host_x.is_empty() {
+            let x_input = if (npu.is_some() || moe_seam) && !host_x.is_empty() {
                 GpuInput::Cpu(&host_x)
             } else {
                 match bufs.last() {
@@ -858,12 +884,14 @@ impl LlamaModel {
                     None => GpuInput::Cpu(x_in),
                 }
             };
-            let (w_gate, w_up, w_down) = layer.dense()?;
-            let ffn_gate_up = super::ffn_gate_up_pair(w_gate, w_up);
+            // `None` on a mixture layer, which is what tells the chain to
+            // stop at the norm and hand back the post-attention residual.
+            let dense = layer.dense();
+            let ffn_gate_up = dense.and_then(|(gate, up, _)| super::ffn_gate_up_pair(gate, up));
             let out = vulkan.record_fused_layer(
                 &mut cursor,
                 FusedLayerInput {
-                    stop_at_ffn_norm: npu.is_some(),
+                    stop_at_ffn_norm: npu.is_some() || dense.is_none(),
                     x: x_input,
                     // `llama`/`mistral` are NORM; `qwen2` and the rest NEOX.
                     pairing: self.rope.layout,
@@ -912,10 +940,10 @@ impl LlamaModel {
                     wo: &layer.wo,
                     attn_post_norm: None,
                     ffn_norm: &layer.ffn_norm,
-                    ffn_gate: w_gate,
-                    ffn_up: w_up,
+                    ffn_gate: dense.map(|(gate, _, _)| gate),
+                    ffn_up: dense.map(|(_, up, _)| up),
                     ffn_gate_up: ffn_gate_up.as_ref(),
-                    ffn_down: w_down,
+                    ffn_down: dense.map(|(_, _, down)| down),
                     ffn_post_norm: None,
                     ple: None,
                     layer_output_scale: None,
@@ -944,7 +972,11 @@ impl LlamaModel {
             // With the FFN on the device, `out` is `x1` — the post-attention
             // residual — rather than the layer's output. Finish the layer
             // here: normalise, run the network, add the residual back.
-            if let Some(npu) = npu {
+            // The NPU seam runs the *dense* network at the seam, so it
+            // needs this layer's three projections; a mixture never reaches
+            // here, because `npu` is only set for a model whose blocks the
+            // device holds and those are dense.
+            if let (Some(npu), Some((w_gate, w_up, w_down))) = (npu, dense) {
                 drop(cursor);
                 let finished = std::mem::replace(
                     &mut encoder,
@@ -1018,6 +1050,51 @@ impl LlamaModel {
                 }
                 continue;
             }
+            // The mixture seam: the chain stopped at the norm because a
+            // routed feed-forward is a per-token choice it cannot record,
+            // so `out` is `x1`. Normalise it, route it, add the result
+            // back — the same three steps the step-by-step path takes,
+            // with attention, `wo` and the residual add already done in
+            // one submission rather than three host turns around them.
+            if let Ffn::Moe(moe) = &layer.ffn {
+                drop(cursor);
+                let finished = std::mem::replace(
+                    &mut encoder,
+                    vulkan.new_encoder("orangu-server llama decode moe layer"),
+                );
+                host_x = vulkan.submit_and_read_at(finished, &out.0, out.1, n_embd);
+                cursor = PassCursor::new(&mut encoder);
+
+                ffn_normed.clear();
+                ffn_normed.extend_from_slice(&host_x);
+                crate::engine::tensor::rmsnorm_inplace(
+                    &mut ffn_normed,
+                    &layer.ffn_norm,
+                    1,
+                    n_embd,
+                    cfg.rms_eps,
+                );
+                let routed = super::swiglu_moe_ffn(
+                    self.backend.as_ref(),
+                    &self.routing,
+                    &ffn_normed,
+                    1,
+                    n_embd,
+                    &super::SwigluMoe {
+                        gate_inp: &moe.gate_inp,
+                        exp_probs_b: None,
+                        gate_exps: &moe.gate_exps,
+                        up_exps: &moe.up_exps,
+                        down_exps: &moe.down_exps,
+                        shared: None,
+                        clamp_exp: super::SwigluLimit::None,
+                        clamp_shexp: super::SwigluLimit::None,
+                    },
+                    il,
+                );
+                crate::engine::tensor::add_inplace(&mut host_x, &routed);
+                continue;
+            }
             bufs.push(out);
         }
         drop(cursor);
@@ -1025,7 +1102,7 @@ impl LlamaModel {
         // On the NPU path the layer loop ends with the hidden state on the
         // host, not in `bufs` — every layer was finished there. Hand it to
         // the tail as a CPU input; `record_output_norm` takes either.
-        if npu.is_some() {
+        if npu.is_some() || moe_seam {
             // `Tail::None` wants this run's *pre-norm* hidden state, and on
             // this path it is on the host rather than in any buffer — there
             // is nothing to hand back. Declining sends the caller to the
@@ -1368,6 +1445,11 @@ impl LlamaModel {
         let n_head_kv = cfg.n_head_kv;
         let kv_dim = n_head_kv * head_dim;
 
+        // The per-dispatch device table over this whole pass — see
+        // `super::OpSpan`. Nothing unless the timer is on; it is what makes
+        // `perf/llamacpp/ops.sh` able to see a mixture at all, since a
+        // mixture never takes the chains that resolve their own stamps.
+        let _ops = super::OpSpan::open(self.backend.as_ref(), start_pos);
         // Rows a resident chunk parked for the chunk after it are brought
         // home before anything here pushes past them.
         if let Some(vulkan) = self.backend.as_wgpu() {
@@ -1514,45 +1596,54 @@ impl LlamaModel {
                 // one call for all three, answered as `q|k|v` back to back.
                 // Falls through to the backend on any refusal, with the same
                 // result and only slower.
-                let mut qkv = attn_on_npu
-                    .then(|| {
-                        let mut packed = Vec::new();
-                        let served = orangu::npu_ffn::service().is_some_and(|npu| {
-                            npu.forward_attn_into(layer_idx, n_tokens, &normed, &mut packed)
-                        });
-                        let q_len = n_tokens * cfg.n_head * head_dim;
-                        let kv_len = n_tokens * cfg.n_head_kv * head_dim;
-                        (served && packed.len() == q_len + 2 * kv_len).then(|| {
-                            let v = packed[q_len + kv_len..].to_vec();
-                            let k = packed[q_len..q_len + kv_len].to_vec();
-                            packed.truncate(q_len);
-                            vec![packed, k, v]
-                        })
-                    })
-                    .flatten()
-                    .unwrap_or_else(|| {
-                        // Independent given the same normed input — one
-                        // batched dispatch instead of three sequential round
-                        // trips (matters most for a GPU backend; see
-                        // `Backend::matmul_batch`).
-                        self.backend.matmul_batch(&[
-                            MatmulOp {
-                                x: &normed,
-                                n_tokens,
-                                w: &layer.wq,
-                            },
-                            MatmulOp {
-                                x: &normed,
-                                n_tokens,
-                                w: &layer.wk,
-                            },
-                            MatmulOp {
-                                x: &normed,
-                                n_tokens,
-                                w: &layer.wv,
-                            },
-                        ])
-                    });
+                // Timed: at decode these three are host matmuls on any
+                // model whose projections sit under the host-matmul
+                // crossover, and they are most of what the host does
+                // before it waits for attention.
+                let mut qkv = crate::engine::decode_stages::scope(
+                    crate::engine::decode_stages::Stage::AttnProject,
+                    || {
+                        attn_on_npu
+                            .then(|| {
+                                let mut packed = Vec::new();
+                                let served = orangu::npu_ffn::service().is_some_and(|npu| {
+                                    npu.forward_attn_into(layer_idx, n_tokens, &normed, &mut packed)
+                                });
+                                let q_len = n_tokens * cfg.n_head * head_dim;
+                                let kv_len = n_tokens * cfg.n_head_kv * head_dim;
+                                (served && packed.len() == q_len + 2 * kv_len).then(|| {
+                                    let v = packed[q_len + kv_len..].to_vec();
+                                    let k = packed[q_len..q_len + kv_len].to_vec();
+                                    packed.truncate(q_len);
+                                    vec![packed, k, v]
+                                })
+                            })
+                            .flatten()
+                            .unwrap_or_else(|| {
+                                // Independent given the same normed input — one
+                                // batched dispatch instead of three sequential round
+                                // trips (matters most for a GPU backend; see
+                                // `Backend::matmul_batch`).
+                                self.backend.matmul_batch(&[
+                                    MatmulOp {
+                                        x: &normed,
+                                        n_tokens,
+                                        w: &layer.wq,
+                                    },
+                                    MatmulOp {
+                                        x: &normed,
+                                        n_tokens,
+                                        w: &layer.wk,
+                                    },
+                                    MatmulOp {
+                                        x: &normed,
+                                        n_tokens,
+                                        w: &layer.wv,
+                                    },
+                                ])
+                            })
+                    },
+                );
                 let mut v = qkv.pop().unwrap();
                 let mut k = qkv.pop().unwrap();
                 let mut q = qkv.pop().unwrap();
@@ -1722,23 +1813,49 @@ impl LlamaModel {
                 // The fused chain declined after attention had already left its
                 // output on the device, so bring it back — the CPU sequence
                 // below reads `attn_out`, and it would otherwise read zeros.
-                if let (Some(buf), Some(vulkan)) =
-                    (&attn_on_device, self.backend.as_wgpu_on(layer.wo.device()))
-                {
-                    attn_out = vulkan.read_buffer_f32(buf, n_tokens * n_head * head_dim);
-                }
-                self.backend
-                    .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
-                self.scale_residual(&mut attn_proj);
-                tensor::add_inplace(&mut x, &attn_proj);
+                //
+                // Timed as `attn.out`, and it is not only arithmetic: the
+                // readback below is where a caller first *waits* for the
+                // attention kernel it dispatched. On the device path the
+                // dispatch is recorded under `attn` and costs almost
+                // nothing; what the context length actually buys is paid
+                // here, and attributing it anywhere else leaves a stage
+                // that grows with depth for no visible reason.
+                // **Beside `attn.out`, not inside it.** This is where the
+                // layer waits for the attention it dispatched, and it is the
+                // only part of the block that recording `wo` into
+                // attention's own submission could remove — so it earns a
+                // line of its own. Nested it would be counted twice: every
+                // stage but the pass itself is a disjoint sibling, and the
+                // first version of this left `other` clamped at zero and the
+                // reported stages summing past the pass.
+                crate::engine::decode_stages::scope(
+                    crate::engine::decode_stages::Stage::AttnRead,
+                    || {
+                        if let (Some(buf), Some(vulkan)) =
+                            (&attn_on_device, self.backend.as_wgpu_on(layer.wo.device()))
+                        {
+                            attn_out = vulkan.read_buffer_f32(buf, n_tokens * n_head * head_dim);
+                        }
+                    },
+                );
+                crate::engine::decode_stages::scope(
+                    crate::engine::decode_stages::Stage::AttnOut,
+                    || {
+                        self.backend
+                            .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
+                        self.scale_residual(&mut attn_proj);
+                        tensor::add_inplace(&mut x, &attn_proj);
 
-                tensor::rmsnorm_into(
-                    &mut normed2,
-                    &x,
-                    &layer.ffn_norm,
-                    n_tokens,
-                    n_embd,
-                    cfg.rms_eps,
+                        tensor::rmsnorm_into(
+                            &mut normed2,
+                            &x,
+                            &layer.ffn_norm,
+                            n_tokens,
+                            n_embd,
+                            cfg.rms_eps,
+                        );
+                    },
                 );
                 // The NPU, when this model's block was compiled for exactly
                 // this width. It runs the three projections and applies

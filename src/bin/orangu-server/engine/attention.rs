@@ -185,6 +185,13 @@ pub enum Ran {
 /// chain does not pay a readback and an upload to do it. The decision stays here
 /// rather than in the architecture module, for the reason this module exists at
 /// all: there must be exactly one place that decides where attention runs.
+///
+/// **Timed as `attn`, like [`attention`] is.** The two are the same stage
+/// taking different routes, and counting only one of them made attention
+/// disappear from a breakdown exactly where it mattered: this path declines
+/// at a shallow context and takes over as the context grows, so a decode
+/// profile at depth attributed none of its attention and reported the
+/// growth under `other`.
 pub fn attention_decode_on_device(
     q: &[f32],
     cache: &mut LayerCache,
@@ -194,6 +201,19 @@ pub fn attention_decode_on_device(
     if params.n_tokens != 1 || crate::engine::env::flag_on("ORANGU_NO_ATTN_ON_DEVICE") {
         return None;
     }
+    crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::Attn, || {
+        attention_decode_on_device_timed(q, cache, params, window)
+    })
+}
+
+/// The body of [`attention_decode_on_device`], split out so the timing scope
+/// above wraps it without re-indenting the whole function.
+fn attention_decode_on_device_timed(
+    q: &[f32],
+    cache: &mut LayerCache,
+    params: &Params<'_>,
+    window: impl Fn(usize) -> (usize, usize) + Sync,
+) -> Option<wgpu::Buffer> {
     // The same guard `attention` applies, so the two cannot disagree about the
     // window for a shape they both accept.
     debug_assert!(

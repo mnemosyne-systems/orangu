@@ -2096,14 +2096,16 @@ fn prefill_in_chunks(
             // A chunk before the last produces logits nobody reads; the
             // architecture is told so and may skip the work that makes them.
             if !last {
-                crate::engine::decode_stages::pass(|| {
+                crate::engine::decode_stages::pass_of(part.len(), || {
                     model.forward_no_logits(cache, part, pos, slot_id)
                 })?;
                 return Ok(Vec::new());
             }
-            return crate::engine::decode_stages::pass(|| model.forward(cache, part, pos, slot_id));
+            return crate::engine::decode_stages::pass_of(part.len(), || {
+                model.forward(cache, part, pos, slot_id)
+            });
         };
-        let (logits, states) = crate::engine::decode_stages::pass(|| {
+        let (logits, states) = crate::engine::decode_stages::pass_of(part.len(), || {
             model.forward_with_states(cache, part, pos, slot_id)
         })?;
         drafter.observe_states(pos, &states);

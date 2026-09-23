@@ -9653,14 +9653,18 @@ pub struct FusedPostAttentionInput<'a> {
     /// one — that would still normalize.
     pub attn_post_norm: Option<&'a [f32]>,
     pub ffn_norm: &'a [f32],
-    pub ffn_gate: &'a QuantMatrix,
-    pub ffn_up: &'a QuantMatrix,
+    /// `None` on a layer whose feed-forward this chain cannot record — a
+    /// mixture, whose expert choice is per token. Only legal together with
+    /// [`Self::stop_at_ffn_norm`], which returns before the network.
+    pub ffn_gate: Option<&'a QuantMatrix>,
+    pub ffn_up: Option<&'a QuantMatrix>,
     /// `ffn_gate` and `ffn_up` as one matrix (`QuantMatrix::adjacent_pair`)
     /// where the checkpoint lays them out that way: the decode chain then
     /// runs the two projections as one dispatch over `[in, 2 * ff]`,
     /// gate's rows first. `None` runs them as two.
     pub ffn_gate_up: Option<&'a QuantMatrix>,
-    pub ffn_down: &'a QuantMatrix,
+    /// `None` with [`Self::ffn_gate`] — see there.
+    pub ffn_down: Option<&'a QuantMatrix>,
     /// `None` on an architecture with no post-norm on the FFN residual — see
     /// [`Self::attn_post_norm`].
     pub ffn_post_norm: Option<&'a [f32]>,
@@ -9681,6 +9685,26 @@ pub struct FusedPostAttentionInput<'a> {
     /// its own slot id in to keep concurrent requests off each other's
     /// cached buffers.
     pub batch_slot: usize,
+}
+
+impl<'a> FusedPostAttentionInput<'a> {
+    /// The three feed-forward projections, for a path that is going to
+    /// record the network.
+    ///
+    /// They are absent only on a layer this chain stops short of — a
+    /// mixture, whose expert choice is per token — and every caller that
+    /// asks for them has already established it is not that case, either by
+    /// not setting [`Self::stop_at_ffn_norm`] or by having been routed past
+    /// the short path that handles it.
+    fn ffn_weights(&self) -> (&'a QuantMatrix, &'a QuantMatrix, &'a QuantMatrix) {
+        match (self.ffn_gate, self.ffn_up, self.ffn_down) {
+            (Some(gate), Some(up), Some(down)) => (gate, up, down),
+            _ => unreachable!(
+                "a layer with no feed-forward weights must stop at the norm \
+                 before anything asks for them"
+            ),
+        }
+    }
 }
 
 /// [`VulkanBackend::gpu_attention`]'s parameters, grouped into one struct
@@ -10165,11 +10189,15 @@ pub struct FusedLayerInput<'a> {
     pub wo: &'a QuantMatrix,
     pub attn_post_norm: Option<&'a [f32]>,
     pub ffn_norm: &'a [f32],
-    pub ffn_gate: &'a QuantMatrix,
-    pub ffn_up: &'a QuantMatrix,
+    /// `None` on a layer whose feed-forward this chain cannot record — a
+    /// mixture, whose expert choice is per token. Only legal together with
+    /// [`Self::stop_at_ffn_norm`], which returns before the network.
+    pub ffn_gate: Option<&'a QuantMatrix>,
+    pub ffn_up: Option<&'a QuantMatrix>,
     /// See [`FusedPostAttentionInput::ffn_gate_up`].
     pub ffn_gate_up: Option<&'a QuantMatrix>,
-    pub ffn_down: &'a QuantMatrix,
+    /// `None` with [`Self::ffn_gate`] — see there.
+    pub ffn_down: Option<&'a QuantMatrix>,
     pub ffn_post_norm: Option<&'a [f32]>,
     /// See [`FusedPostAttentionInput::activation`].
     pub activation: FfnActivation,
@@ -14195,7 +14223,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ple_g: Option<(&CachedOpResources, &CachedOpResources)>,
     ) -> FusedResources {
         let n_embd = input.wo.out_dim;
-        let ffn_len = input.ffn_gate.out_dim;
+        // Present on every path that reaches here: the chain only builds
+        // feed-forward resources for a layer it is going to record one for.
+        let (ffn_gate, ffn_up, ffn_down) = input.ffn_weights();
+        let ffn_len = ffn_gate.out_dim;
         // Where the gate and up projections land: the pair's output, gate's
         // rows then up's, when the pair serves; each half's own otherwise.
         // Everything downstream reads through these two, so it does not
@@ -14336,9 +14367,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 mapped_at_creation: false,
             });
             let meta = self.elem_meta_buffer_aux_extra(n_embd as u32, 1, input.eps);
-            let bg_gate =
-                self.matmul_bind_group_with_input(input.ffn_gate, &buffer, 0, q8_len, gate_g);
-            let bg_up = self.matmul_bind_group_with_input(input.ffn_up, &buffer, 0, q8_len, up_g);
+            let bg_gate = self.matmul_bind_group_with_input(ffn_gate, &buffer, 0, q8_len, gate_g);
+            let bg_up = self.matmul_bind_group_with_input(ffn_up, &buffer, 0, q8_len, up_g);
             let bg_gate_up = match (gate_up_g, input.ffn_gate_up) {
                 (Some(g), Some(w)) if g.mmvq.is_some() => {
                     Some(self.matmul_bind_group_with_input(w, &buffer, 0, q8_len, g))
@@ -14391,14 +14421,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         } else {
             (
                 Some(self.matmul_bind_group_with_input(
-                    input.ffn_gate,
+                    ffn_gate,
                     &ffn_normed,
                     ffn_normed_offset,
                     n_embd_bytes,
                     gate_g,
                 )),
                 Some(self.matmul_bind_group_with_input(
-                    input.ffn_up,
+                    ffn_up,
                     &ffn_normed,
                     ffn_normed_offset,
                     n_embd_bytes,
@@ -14471,8 +14501,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 &meta_ffn_plain,
                 &self.q8_placeholder,
             );
-            let bg_down =
-                self.matmul_bind_group_with_input(input.ffn_down, &buffer, 0, q8_len, down_g);
+            let bg_down = self.matmul_bind_group_with_input(ffn_down, &buffer, 0, q8_len, down_g);
             DownQ8 {
                 buffer,
                 bg_activation,
@@ -14615,6 +14644,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         ple_g: Option<(&CachedOpResources, &CachedOpResources)>,
     ) -> Arc<FusedResources> {
         let (waddr, wlen) = input.wo.cache_key();
+        let (ffn_gate, _, _) = input.ffn_weights();
         let per_layer_dim = input.ple.as_ref().map_or(0, |p| p.per_layer_dim);
         // NOTE: this key does **not** include whether the post-norms are
         // present or which activation is used, though both change the bind
@@ -14627,7 +14657,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let key: FusedCacheKey = (
             waddr,
             wlen,
-            input.ffn_gate.out_dim,
+            ffn_gate.out_dim,
             per_layer_dim,
             input.layer_output_scale.is_some(),
             input.batch_slot,
@@ -14645,6 +14675,87 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         cache.entry(key).or_insert(resources).clone()
     }
 
+    /// [`Self::record_fused_post_attention`] for a layer whose feed-forward
+    /// this chain cannot record — a mixture, whose choice of experts is per
+    /// token.
+    ///
+    /// Records `wo` over attention's output and the residual add, and hands
+    /// back `x1` exactly as the full chain's
+    /// [`FusedPostAttentionInput::stop_at_ffn_norm`] does: the caller
+    /// normalizes it, runs its own network and adds the result back. What
+    /// this buys is that attention, `wo` and the add are **one submission**,
+    /// so the layer waits once instead of waiting for attention, bringing
+    /// its output home and then projecting it on the host.
+    ///
+    /// It builds its bind groups per call rather than caching a
+    /// `FusedResources`, because that structure is shaped around the
+    /// feed-forward this layer does not have. A bind group is a few
+    /// microseconds against a layer that is about to wait for a device
+    /// submission, and the prefill chain builds its own the same way.
+    fn record_attn_out_only(
+        &self,
+        cursor: &mut PassCursor<'_>,
+        input: &FusedPostAttentionInput<'_>,
+        n_embd: usize,
+    ) -> (wgpu::Buffer, u64) {
+        debug_assert!(
+            input.stop_at_ffn_norm,
+            "a layer with no feed-forward weights must ask to stop at the norm"
+        );
+        debug_assert!(
+            input.ple.is_none(),
+            "the per-layer-embedding projection is recorded after the network, \
+             which this path does not reach"
+        );
+        let wo_entry = self.op_entry_for(input.wo, input.batch_slot);
+        let wo_g = wo_entry.lock().unwrap_or_else(|p| p.into_inner());
+        self.upload_or_copy(
+            cursor.encoder(),
+            &wo_g.x_buffer,
+            wo_g.x_offset,
+            input.attn_out,
+            input.wo.in_dim,
+        );
+        let residual = self.scratch_buffer(n_embd);
+        self.upload_or_copy(cursor.encoder(), &residual, 0, input.residual, n_embd);
+        let x1 = self.scratch_buffer(n_embd);
+        // The post-norm's own epsilon where the architecture gives the two
+        // norms different ones; `0.0` is the plain add's length-only meta.
+        let post_norm_w = input.attn_post_norm.map(|w| self.upload_new(w));
+        let meta = match post_norm_w {
+            Some(_) => {
+                self.elem_meta_buffer(n_embd as u32, input.post_norm_eps.unwrap_or(input.eps))
+            }
+            None => self.elem_meta_buffer(n_embd as u32, 0.0),
+        };
+        let bind_group = match &post_norm_w {
+            Some(w) => self.elem5_bind_group(wo_g.output_src(), w, &residual, &x1, &meta),
+            None => self.elem4_bind_group(wo_g.output_src(), &residual, &x1, &meta),
+        };
+        if self.mmvq_chain() {
+            let qpass = cursor.pass();
+            self.record_mmvq_quantize(qpass, &wo_g);
+            self.op_stamp(qpass, "attn.wo_quantize");
+        }
+        let pass = cursor.pass();
+        self.record_matmul(pass, input.wo, &wo_g);
+        self.op_stamp(pass, "attn.wo");
+        match &post_norm_w {
+            Some(_) => {
+                pass.set_pipeline(self.rmsnorm_add_for(n_embd));
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            None => {
+                pass.set_pipeline(&self.add_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups((n_embd as u32).div_ceil(64), 1, 1);
+            }
+        }
+        self.op_stamp(pass, "attn.residual_add");
+        (x1, 0)
+    }
+
     /// Records `wo` through this layer's `layer_output_scale` into
     /// `encoder` (does **not** submit) and returns the GPU buffer holding
     /// the layer's final `[n_embd]` result — the recording half of
@@ -14657,10 +14768,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         input: FusedPostAttentionInput<'_>,
     ) -> (wgpu::Buffer, u64) {
         let n_embd = input.wo.out_dim;
-        let ffn_len = input.ffn_gate.out_dim;
-        debug_assert_eq!(input.ffn_up.out_dim, ffn_len);
-        debug_assert_eq!(input.ffn_down.in_dim, ffn_len);
-        debug_assert_eq!(input.ffn_down.out_dim, n_embd);
+        // A layer with no dense feed-forward to record takes the short
+        // path — see `record_attn_out_only`. Checked before anything asks
+        // for the projections, which that layer does not have.
+        if input.ffn_gate.is_none() {
+            return self.record_attn_out_only(cursor, &input, n_embd);
+        }
+        let (ffn_gate, ffn_up, ffn_down) = input.ffn_weights();
+        let ffn_len = ffn_gate.out_dim;
+        debug_assert_eq!(ffn_up.out_dim, ffn_len);
+        debug_assert_eq!(ffn_down.in_dim, ffn_len);
+        debug_assert_eq!(ffn_down.out_dim, n_embd);
 
         let wo_entry = self.op_entry_for(input.wo, input.batch_slot);
         // The pair's entry ahead of its halves': placing the pair first is
@@ -14668,11 +14786,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // rather than as uploads of their own.
         let gate_up_entry = input
             .ffn_gate_up
-            .filter(|pair| self.ffn_gate_up_serves(pair, input.ffn_gate, input.ffn_up))
+            .filter(|pair| self.ffn_gate_up_serves(pair, ffn_gate, ffn_up))
             .map(|w| self.op_entry_for(w, input.batch_slot));
-        let gate_entry = self.op_entry_for(input.ffn_gate, input.batch_slot);
-        let up_entry = self.op_entry_for(input.ffn_up, input.batch_slot);
-        let down_entry = self.op_entry_for(input.ffn_down, input.batch_slot);
+        let gate_entry = self.op_entry_for(ffn_gate, input.batch_slot);
+        let up_entry = self.op_entry_for(ffn_up, input.batch_slot);
+        let down_entry = self.op_entry_for(ffn_down, input.batch_slot);
         let ple_entries = input.ple.as_ref().map(|ple| {
             (
                 self.op_entry_for(ple.gate_w, input.batch_slot),
@@ -15052,15 +15170,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 // wrote it.
                 (Some(_), Some(_)) if res.ffn_q8.is_some() && took_norm_pair => {
                     let q = res.ffn_q8.as_ref().expect("checked above");
-                    self.record_mmvq_matmul_shared(pass, input.ffn_gate, &gate_g, &q.bg_gate);
+                    self.record_mmvq_matmul_shared(pass, ffn_gate, &gate_g, &q.bg_gate);
                     self.op_stamp(pass, "ffn.gate");
-                    self.record_mmvq_matmul_shared(pass, input.ffn_up, &up_g, &q.bg_up);
+                    self.record_mmvq_matmul_shared(pass, ffn_up, &up_g, &q.bg_up);
                     self.op_stamp(pass, "ffn.up");
                 }
                 (Some(bg_gate), Some(bg_up)) => {
                     self.record_matmul_shared_input(
                         pass,
-                        input.ffn_gate,
+                        ffn_gate,
                         &gate_g,
                         bg_gate,
                         &res.ffn_normed,
@@ -15069,7 +15187,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     self.op_stamp(pass, "ffn.gate");
                     self.record_matmul_shared_input(
                         pass,
-                        input.ffn_up,
+                        ffn_up,
                         &up_g,
                         bg_up,
                         &res.ffn_normed,
@@ -15078,9 +15196,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                     self.op_stamp(pass, "ffn.up");
                 }
                 _ => {
-                    self.record_matmul(pass, input.ffn_gate, &gate_g);
+                    self.record_matmul(pass, ffn_gate, &gate_g);
                     self.op_stamp(pass, "ffn.gate");
-                    self.record_matmul(pass, input.ffn_up, &up_g);
+                    self.record_matmul(pass, ffn_up, &up_g);
                     self.op_stamp(pass, "ffn.up");
                 }
             }
@@ -15203,10 +15321,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         {
             let pass = cursor.pass();
             match res.down_q8.as_ref().filter(|_| !Self::capture_active()) {
-                Some(q) => {
-                    self.record_mmvq_matmul_shared(pass, input.ffn_down, &down_g, &q.bg_down)
-                }
-                None => self.record_matmul(pass, input.ffn_down, &down_g),
+                Some(q) => self.record_mmvq_matmul_shared(pass, ffn_down, &down_g, &q.bg_down),
+                None => self.record_matmul(pass, ffn_down, &down_g),
             }
             self.op_stamp(pass, "ffn.down");
 
@@ -20881,6 +20997,15 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 label: Some("orangu-server attention split pass"),
                 timestamp_writes: None,
             });
+            // The boundary, before any dispatch. A label's reported time is
+            // the interval from the *previous* stamp, so without this the
+            // attention line covers everything the host did since the last
+            // layer's attention — its `wo`, its residual, its norm and, on
+            // a mixture, the whole routed feed-forward. Read that way the
+            // kernel appears to take the entire token divided by the layer
+            // count, which is how a perfectly ordinary kernel reads as
+            // running at a few percent of the card's bandwidth.
+            self.op_stamp(&mut pass, "pp.gap");
             pass.set_pipeline(&split_pipeline);
             pass.set_bind_group(0, &split_bind_group, &[]);
             pass.dispatch_workgroups(phase1_x, k_num, 1);
