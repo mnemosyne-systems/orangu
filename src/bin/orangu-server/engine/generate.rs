@@ -1612,7 +1612,32 @@ impl MessageHeader {
 /// default [`PREFILL_BATCH_DEFAULT`]. `0` means no limit: the whole prompt in
 /// one pass, which is what this code did unconditionally before.
 fn prefill_batch() -> usize {
-    prefill_batch_override().unwrap_or(PREFILL_BATCH_DEFAULT)
+    prefill_batch_override().unwrap_or_else(|| PREFILL_BATCH_DEFAULT.max(chunk_ceiling()))
+}
+
+/// The widest chunk this model wants, recorded once at startup by
+/// [`set_chunk_ceiling`] — `0` unless the model has a reason to be prefilled
+/// wider than [`PREFILL_BATCH_DEFAULT`].
+///
+/// A mixture whose routed experts run on the card has one. Every pass
+/// streams the layer's whole expert stack across the bus, which is a cost
+/// per *pass* and not per token, so a prompt taken in five passes pays it
+/// five times — the same shape as a streamed model's re-reads, one level
+/// down the memory hierarchy. It is answered from the file, before the
+/// layers are placed, because the KV estimate and the sliding-window ring
+/// are both sized from this width.
+///
+/// The larger of its callers wins, as with [`CHUNK_FLOOR`], and an
+/// `ORANGU_PREFILL_BATCH` written by hand overrules it entirely.
+static CHUNK_CEILING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// See [`CHUNK_CEILING`].
+pub fn set_chunk_ceiling(ceiling: usize) {
+    CHUNK_CEILING.fetch_max(ceiling, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn chunk_ceiling() -> usize {
+    CHUNK_CEILING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The widest prefill chunk the sizer will choose, as configured — what a
@@ -1881,15 +1906,39 @@ static CHUNK_POLICY: std::sync::OnceLock<ChunkPolicy> = std::sync::OnceLock::new
 /// went in 47 chunks of ~24 tokens at 5.6 tok/s where 512-token chunks
 /// run at 17. With the floor at the streaming width the probe itself is
 /// measured on the fast path.
-static CHUNK_FLOOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+///
+/// A mixture whose routed experts run on the card has the same shape: below
+/// the grouped GEMM's threshold the chunk takes the host's per-expert path,
+/// which is slower, which sizes the next chunk narrower still.
+///
+/// Two callers can each have a reason, so the larger of them wins — both are
+/// "never narrower than", and honouring only the first one recorded would
+/// leave a split mixture prefilled below one of its two floors.
+static CHUNK_FLOOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// See [`CHUNK_FLOOR`].
 pub fn set_chunk_floor(floor: usize) {
-    let _ = CHUNK_FLOOR.set(floor);
+    CHUNK_FLOOR.fetch_max(floor, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn chunk_floor() -> usize {
-    CHUNK_FLOOR.get().copied().unwrap_or(0)
+    chunk_floor_override().unwrap_or_else(|| CHUNK_FLOOR.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// `ORANGU_PREFILL_CHUNK_FLOOR`, the override that puts both settings of the
+/// floor on one binary — `0` is "no floor", which is what this did before a
+/// model could ask for one.
+///
+/// A floor is chosen by what the model is, so without this the two arms of
+/// the A/B would have to be two builds, and two builds differ by more than
+/// the thing under test.
+fn chunk_floor_override() -> Option<usize> {
+    static FLOOR: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *FLOOR.get_or_init(|| {
+        std::env::var("ORANGU_PREFILL_CHUNK_FLOOR")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+    })
 }
 
 /// Records what the selected backend answered for

@@ -128,6 +128,8 @@ if-addrs = "0.15.0"
 libloading = "0.9"
 fern = "0.7"
 log = "0.4"
+rten-gemm = "0.26.0"
+rten-tensor = "0.26.0"
 
 [features]
 rocm = ["dep:cubecl-hip-sys"]

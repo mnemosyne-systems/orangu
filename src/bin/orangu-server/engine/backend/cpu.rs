@@ -66,6 +66,13 @@ struct SharedOut(*mut f32);
 unsafe impl Send for SharedOut {}
 unsafe impl Sync for SharedOut {}
 
+/// `ORANGU_PACKED_GEMM=0` puts the float prefill path back on this
+/// engine's own tiled kernel — the control arm, so both can be compared in
+/// one binary rather than in two builds.
+fn packed_gemm_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_PACKED_GEMM"))
+}
 impl CpuBackend {
     /// The fused path: quantize each token's activations to `int8` **once**,
     /// then dot them against the still-quantized weight rows. Returns `None`
@@ -472,6 +479,64 @@ impl CpuBackend {
         true
     }
 
+    /// One `[n_tokens, in_dim] x [in_dim, out_dim]` product through a
+    /// packed, cache-blocked GEMM, writing token-major into `out`.
+    ///
+    /// `rows` is the weight as this engine stores it — `out_dim` rows of
+    /// `in_dim` floats — which is the transpose of the `[k, n]` a GEMM
+    /// wants. It is handed over as a transposed *view*: the packing step
+    /// reads a strided operand at the same rate as a contiguous one
+    /// (measured within 6%), so no weight is copied or reordered to use
+    /// this.
+    ///
+    /// `false` when the shapes do not line up, which leaves the caller's
+    /// own kernel to run — this is an optimization, never the only path to
+    /// an answer.
+    ///
+    /// **Not for one token.** A mat-vec has no reuse to block for, and the
+    /// packing is then pure overhead: measured level at one token and worse
+    /// once the weight is quantized, where reading the packed bytes
+    /// directly beats widening them first.
+    fn packed_gemm_f32(
+        out: &mut [f32],
+        x: &[f32],
+        rows: &[f32],
+        n_tokens: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) -> bool {
+        use rten_gemm::{GemmInputA, GemmInputB, GemmOptions};
+        use rten_tensor::NdTensorView;
+
+        if !packed_gemm_enabled()
+            || n_tokens < 2
+            || rows.len() < in_dim * out_dim
+            || x.len() < n_tokens * in_dim
+            || out.len() < n_tokens * out_dim
+        {
+            return false;
+        }
+        // One executor per thread: building it picks a kernel for the
+        // host's instruction set, which does not change while the process
+        // runs, but the executor owns a boxed kernel that is not `Sync`, so
+        // it cannot be shared from a `static`.
+        thread_local! {
+            static GEMM: rten_gemm::GemmExecutor<f32, f32, f32> =
+                rten_gemm::GemmExecutor::default();
+        }
+        let a = NdTensorView::from_data([n_tokens, in_dim], &x[..n_tokens * in_dim]);
+        let b = NdTensorView::from_data([out_dim, in_dim], &rows[..in_dim * out_dim]);
+        GEMM.with(|gemm| {
+            gemm.gemm(
+                &mut out[..n_tokens * out_dim],
+                GemmInputA::Unpacked(a),
+                GemmInputB::Unpacked(b.transposed()),
+                GemmOptions::default(),
+            )
+            .is_ok()
+        })
+    }
+
     /// The float path: `F32`/`F16`/`BF16` weights, widened a block at a time
     /// straight into the dot. Returns `None` for anything else.
     ///
@@ -543,6 +608,19 @@ impl CpuBackend {
             };
             let row = |o: usize| &rows[o * in_dim..(o + 1) * in_dim];
             out.resize(n_tokens * out_dim, 0.0);
+            // A packed GEMM, where one is available for this element type.
+            // The kernel below is a rank-four row group over token blocks
+            // and blocks on neither of the other two axes, so it re-reads
+            // the activation band once per four output rows — at a few
+            // hundred rows that is two orders of magnitude of traffic the
+            // arithmetic never asked for. A packing GEMM copies both
+            // operands into cache-sized tiles and reads each about once.
+            // Measured at every shape a forward pass runs: 14–21x, and the
+            // weight is handed over as a transposed *view* of the rows
+            // above, so nothing is copied to get there.
+            if Self::packed_gemm_f32(out, x, rows, n_tokens, in_dim, out_dim) {
+                return true;
+            }
             let wanted = 4 * rayon::current_num_threads();
             // Rows per task: 32 unless the shape cannot make enough tasks
             // of them — a rank-64 LoRA's down projection has 64 rows and a
@@ -1145,6 +1223,10 @@ mod tests {
             (GGML_TYPE_F32, 35, 64),
             (GGML_TYPE_F16, 9, 21),
             (GGML_TYPE_BF16, 4, 8),
+            // Model-shaped, because the awkward shapes above are all
+            // smaller than one cache tile and so never exercise a packed
+            // GEMM's blocking: a mixture router is `[n_embd] -> [experts]`.
+            (GGML_TYPE_F32, 128, 2048),
         ] {
             let value = |i: usize| ((i * 31 % 17) as f32 - 8.0) * 0.125;
             let mut bytes = Vec::new();
@@ -1170,6 +1252,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The packed GEMM has to actually run at the shapes it was adopted
+    /// for. It reports failure by returning `false`, and the caller then
+    /// falls through to the kernel below it and produces a correct answer —
+    /// so the cross-check above passes whether or not this path is taken,
+    /// and only this test would notice it silently switching itself off.
+    ///
+    /// One token is the deliberate exception: a mat-vec has no reuse to
+    /// block for and measured level, so it stays on the kernel below.
+    #[test]
+    fn the_packed_gemm_runs_at_model_shapes_and_declines_a_single_token() {
+        let (in_dim, out_dim) = (2048usize, 128usize);
+        let rows = vec![0.5f32; in_dim * out_dim];
+        for n_tokens in [2usize, 256, 2048] {
+            let x = vec![0.25f32; n_tokens * in_dim];
+            let mut out = vec![0f32; n_tokens * out_dim];
+            assert!(
+                CpuBackend::packed_gemm_f32(&mut out, &x, &rows, n_tokens, in_dim, out_dim),
+                "the packed GEMM declined a model shape at {n_tokens} tokens"
+            );
+            let want = 0.5 * 0.25 * in_dim as f32;
+            assert!((out[0] - want).abs() <= 1e-3 * want, "{} vs {want}", out[0]);
+        }
+        let x = vec![0.25f32; in_dim];
+        let mut out = vec![0f32; out_dim];
+        assert!(
+            !CpuBackend::packed_gemm_f32(&mut out, &x, &rows, 1, in_dim, out_dim),
+            "one token should stay on the mat-vec kernel"
+        );
     }
 
     /// The float sibling of [`k_gemm_throughput`], at a Qwen-Image VAE

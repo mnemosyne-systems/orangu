@@ -1386,6 +1386,12 @@ fn prepare(args: Args) -> Result<Prepared> {
     // so a model that fits the card with no room for that context has
     // layers moved to the host until there is. The reserve beside it is
     // the prefill's transient scratch, the same the pool keeps clear.
+    // How wide this file's prefill chunks may be — asked here because the
+    // KV estimate just below and the sliding-window ring are both sized
+    // from it. See `generate::CHUNK_CEILING`.
+    if let Some(width) = engine::arch::prefill_chunk_tokens_for(&loaded) {
+        engine::generate::set_chunk_ceiling(width);
+    }
     let context_kv_bytes = requested_context(args.context, conf.context).and_then(|context| {
         let wgpu = backend.as_wgpu()?;
         let per_token = engine::kv_pool::device_bytes_for(
@@ -1564,6 +1570,12 @@ fn prepare(args: Args) -> Result<Prepared> {
         wgpu.plan_weight_bytes(weights_device_bytes, largest);
     }
     let model = build_model(&loaded, &backend)?;
+    // A mixture whose routed experts reached the card reserved a streaming
+    // region while it loaded, and is never prefilled narrower than the width
+    // that path needs — see `CHUNK_FLOOR`.
+    if engine::arch::expert_region_reserved() {
+        engine::generate::set_chunk_floor(engine::arch::expert_gemm_min_tokens());
+    }
 
     // The diffusion transformer and the VAE, on the same backend as the
     // text encoder. The transformer's tensor types are checked against the

@@ -759,7 +759,13 @@ impl InklingModel {
         };
         // The GPU expert path batches the three projections across experts —
         // see `super::evaluate_routed_experts_batched`.
-        let contribs = if super::gpu_experts() && self.backend.as_wgpu().is_some() {
+        // A batch wide enough to pay for streaming the expert stack
+        // takes the grouped device GEMM too (`super::expert_gemm_wide`).
+        // The activation stays on the host between the projections,
+        // which is right whatever this architecture's activation is.
+        let contribs = if (super::gpu_experts() || super::expert_gemm_wide(selection.len()))
+            && self.backend.as_wgpu().is_some()
+        {
             super::evaluate_routed_experts_batched(
                 self.backend.as_ref(),
                 &selection,

@@ -647,11 +647,15 @@ impl<'a> ExpertProjection<'a> {
 /// reads the weights straight from the mapping — bypassing
 /// `engine::expert_store`'s residency tier and its accounting. That is
 /// correct for weights living in VRAM and wrong for the host path, which
-/// keeps [`project_expert`]. It is also *sequential* over the groups it has
-/// to fall back on, where [`evaluate_routed_experts`] runs them under a
-/// `par_iter` — so a caller that takes this path with nothing resident does
-/// strictly more work than one that never called it. Gate on
-/// [`gpu_experts`], as every caller does.
+/// keeps [`project_expert`]. The groups it falls back on run under the same
+/// `par_iter` [`evaluate_routed_experts`] uses, so entering this with
+/// nothing the card can serve is level rather than costly — measured at two
+/// prefill widths with the grouped path forced to decline
+/// (`ORANGU_MOE_FORCE_HOST_GROUPS`), at −0.9% and −0.1%. It was not always:
+/// the three passes over the activations below once ran single-threaded,
+/// and that is what this sentence used to warn about. Gate on
+/// [`gpu_experts`] or on a batch wide enough to pay for streaming the stack
+/// ([`expert_gemm_wide`]), as every caller does.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn evaluate_routed_experts_batched(
     backend: &dyn crate::engine::backend::Backend,
@@ -2217,7 +2221,45 @@ pub(crate) fn reserve_expert_region(
         orangu::format::format_bytes(largest)
     );
     vulkan.reserve_stream_region(region);
+    EXPERT_REGION_RESERVED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
+
+/// Whether a loaded model reserved an expert streaming region — that is,
+/// whether its routed experts can run on the card at all. Recorded by
+/// [`reserve_expert_region`], read by the prefill chunker, which must not
+/// size a chunk below the width that path needs.
+static EXPERT_REGION_RESERVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// See [`EXPERT_REGION_RESERVED`].
+pub(crate) fn expert_region_reserved() -> bool {
+    EXPERT_REGION_RESERVED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How wide this file wants its prefill chunks, or `None` for the default —
+/// answered from the metadata alone, because the caller asks before the
+/// layers are placed (the KV estimate and the sliding-window ring are sized
+/// from the answer).
+///
+/// A mixture pays for streaming a layer's expert stack once per pass, so
+/// fewer, wider passes move proportionally fewer bytes across the bus. A
+/// file with a sliding window is left alone: its ring mirrors are sized as
+/// the window plus one chunk, so widening the chunk there buys prefill rate
+/// with device memory that the context depends on — a different trade from
+/// this one, and not one to make on a model's behalf.
+pub(crate) fn prefill_chunk_tokens_for(
+    loaded: &crate::engine::loader::LoadedModel,
+) -> Option<usize> {
+    let mixture = loaded.metadata_u64("expert_count").unwrap_or(0) > 0;
+    let windowed = loaded.metadata_u64("attention.sliding_window").unwrap_or(0) > 0;
+    (mixture && !windowed).then_some(EXPERT_STREAM_CHUNK_TOKENS)
+}
+
+/// The prefill chunk width a mixture whose experts stream to the card is
+/// given, unless an operator named one. Wide enough that a chat-length
+/// prompt is one or two passes rather than five; bounded so that one pass
+/// still finishes well inside the driver's limit for a submission.
+const EXPERT_STREAM_CHUNK_TOKENS: usize = 2048;
 
 /// The narrowest batch at which a layer's routed experts run as one
 /// indexed GEMM per projection on the card, the expert stack streamed there

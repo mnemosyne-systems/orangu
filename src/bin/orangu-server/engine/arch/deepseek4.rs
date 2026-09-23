@@ -541,6 +541,19 @@ impl Deepseek4Model {
             );
         }
 
+        // The streaming region the grouped expert GEMM will need, ahead of
+        // the weights — see `super::reserve_expert_region`.
+        super::reserve_expert_region(
+            backend.as_ref(),
+            layers.iter().flat_map(|layer| {
+                [
+                    (layer.ffn.gate_exps.stack_matrix().raw_bytes().len()
+                        + layer.ffn.up_exps.stack_matrix().raw_bytes().len())
+                        as u64,
+                    layer.ffn.down_exps.stack_matrix().raw_bytes().len() as u64,
+                ]
+            }),
+        );
         Ok(Self {
             config: loaded.config.clone(),
             backend,
@@ -1081,8 +1094,14 @@ impl Deepseek4Model {
 
         // The GPU expert path batches the three projections across experts —
         // see `super::evaluate_routed_experts_batched`.
+        // A batch wide enough to pay for streaming the expert stack
+        // takes the grouped device GEMM too (`super::expert_gemm_wide`).
+        // The activation stays on the host between the projections,
+        // which is right whatever this architecture's activation is.
         let routed_branch = || {
-            if super::gpu_experts() && self.backend.as_wgpu().is_some() {
+            if (super::gpu_experts() || super::expert_gemm_wide(selection.len()))
+                && self.backend.as_wgpu().is_some()
+            {
                 super::evaluate_routed_experts_batched(
                     self.backend.as_ref(),
                     &selection,

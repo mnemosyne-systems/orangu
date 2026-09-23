@@ -43,6 +43,8 @@ pub mod prefix_cache;
 pub mod prefix_index;
 pub mod quant;
 pub mod route_ahead;
+#[cfg(test)]
+pub mod rten_probe;
 pub mod sampling;
 pub mod scheduler;
 pub mod slot_store;
