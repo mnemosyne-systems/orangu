@@ -41,7 +41,6 @@ use std::time::Instant;
 
 use rten_gemm::{GemmExecutor, GemmInputA, GemmInputB, GemmOptions};
 use rten_tensor::NdTensorView;
-use rten_tensor::prelude::*;
 
 use crate::engine::backend::{Backend, CpuBackend};
 use crate::engine::loader::{QuantMatrix, test_quant_matrix};
