@@ -2126,7 +2126,23 @@ impl ModelForward for LlamaModel {
     }
 
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
-        let mut x = self.forward_hidden_states_pre_norm(tokens)?;
+        let mut cache = self.new_kv_cache(tokens.len().max(1));
+        self.forward_hidden_states_at(&mut cache, tokens, 0)
+    }
+
+    /// Attention here is causal at every layer, so a chunk's hidden states
+    /// are the ones the whole input would give those positions.
+    fn hidden_states_are_causal(&self) -> bool {
+        true
+    }
+
+    fn forward_hidden_states_at(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        let mut x = self.run_layers(cache, tokens, start_pos)?;
         tensor::rmsnorm_inplace(
             &mut x,
             &self.output_norm,

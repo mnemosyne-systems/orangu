@@ -2850,6 +2850,17 @@ throughput at ordinary prompt lengths is unchanged (227 / 201 / 164 tok/s at
 
 If you still see resets, lower `ORANGU_PREFILL_CHUNK_MS`.
 
+**An embeddings input runs through the same chunks.** `/v1/embeddings` feeds
+the text in chunks sized by the same sizer, each attending over the positions
+before it through a KV cache, so a long input to a causal embedding model
+(the Qwen3 embedding family, served by the llama-family architecture) stays
+under the timeout exactly as a prompt does: on the card measured above,
+Qwen3-Embedding-0.6B embeds 23 000 tokens, where a single pass resets the
+device at 8 192. A **bidirectional** model — `gemma-embedding` (embeddinggemma), every
+token attending to every other — cannot be split without changing its
+vectors, so it runs in one pass; its 2 048-token context keeps that pass
+short.
+
 Under `orangu-coordinator` that is the whole recovery: it restarts a
 profile whose `orangu-server` has stopped on the very next request, so the
 model comes back on a working device at full speed, and a request that was

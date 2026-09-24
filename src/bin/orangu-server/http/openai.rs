@@ -1152,7 +1152,7 @@ pub(crate) async fn pooled_embedding(
     let pooling_type = model.config().pooling_type;
     let hidden = tokio::task::spawn_blocking({
         let model = model.clone();
-        move || model.forward_hidden_states(&tokens)
+        move || crate::engine::generate::embedding_hidden_states(model.as_ref(), &tokens)
     })
     .await
     .map_err(|err| err.to_string())?

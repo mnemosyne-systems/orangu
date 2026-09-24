@@ -3375,6 +3375,28 @@ pub trait ModelForward: Send + Sync {
     /// pools over. A one-shot call: no KV cache reuse across calls.
     fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>>;
 
+    /// Whether every token's hidden state depends only on the tokens before
+    /// it, so an embeddings input can run in chunks through a KV cache
+    /// ([`Self::forward_hidden_states_at`]). `false`, the default, runs it in
+    /// one [`Self::forward_hidden_states`] pass — what a bidirectional model
+    /// needs, and what an architecture gets until it opts in.
+    fn hidden_states_are_causal(&self) -> bool {
+        false
+    }
+
+    /// [`Self::forward_hidden_states`] for `tokens` at `start_pos` in
+    /// `cache`, attending over the positions already there: one chunk of an
+    /// embeddings input. Called only when [`Self::hidden_states_are_causal`].
+    fn forward_hidden_states_at(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Vec<f32>> {
+        let _ = (cache, tokens, start_pos);
+        anyhow::bail!("this architecture does not run its hidden states in chunks")
+    }
+
     /// [`Self::forward_hidden_states`] without the final `output_norm`: the
     /// last decoder layer's output as it leaves the residual stream. What
     /// Qwen-Image 2.1 is conditioned on (diffusers hooks the Qwen3-VL text

@@ -2089,10 +2089,6 @@ fn prefill_in_chunks(
     mut drafter: Option<&mut Drafter<'_>>,
     on_chunk: &mut dyn FnMut(usize),
 ) -> Result<Vec<f32>> {
-    let Chunking {
-        width: batch,
-        policy,
-    } = chunking;
     // One extra decoder block over the prompt, and only for the drafter that
     // reads it. Everything else takes the forward it always took: exporting
     // a state row per position costs a `hc * n_embd` buffer per chunk, and
@@ -2125,6 +2121,75 @@ fn prefill_in_chunks(
         drafter.catch_up(part, pos)?;
         Ok(logits)
     };
+    run_in_chunks(
+        cost,
+        cache,
+        tokens,
+        start_pos,
+        chunking,
+        &mut |cache: &mut KvCache, part: &[u32], pos: usize, last: bool| {
+            chunk(model, cache, part, pos, last)
+        },
+        on_chunk,
+    )
+}
+
+/// Every token's final hidden state for an embeddings request, the input
+/// run the way a prompt runs: in chunks [`prefill`]'s sizer picks, each at
+/// the position the one before it ended, with the cost estimate it carries
+/// across requests. That keeps a long input's submissions under the
+/// driver's timeout. A model whose tokens must all see the whole input
+/// (bidirectional attention) cannot be split this way and runs in one pass.
+pub fn embedding_hidden_states(model: &dyn ModelForward, tokens: &[u32]) -> Result<Vec<f32>> {
+    if !model.hidden_states_are_causal() {
+        return model.forward_hidden_states(tokens);
+    }
+    let mut cache = model.new_kv_cache(tokens.len().max(1));
+    let mut hidden = Vec::with_capacity(tokens.len() * model.config().n_embd);
+    let mut cost = load_chunk_cost();
+    let out = run_in_chunks(
+        &mut cost,
+        &mut cache,
+        tokens,
+        0,
+        Chunking::for_prompt(tokens.len()),
+        &mut |cache: &mut KvCache, part: &[u32], pos: usize, _last: bool| {
+            hidden.extend(crate::engine::decode_stages::pass_of(part.len(), || {
+                model.forward_hidden_states_at(cache, part, pos)
+            })?);
+            Ok(Vec::new())
+        },
+        &mut |_| {},
+    );
+    store_chunk_cost(cost);
+    if let Some(vulkan) = model.vulkan_backend() {
+        vulkan.prompt_prefilled();
+    }
+    out.map(|_| hidden)
+}
+
+/// One chunk's pass for [`run_in_chunks`]: `part` at `pos` into the cache,
+/// `last` for the final chunk.
+type ChunkPass<'a> = dyn FnMut(&mut KvCache, &[u32], usize, bool) -> Result<Vec<f32>> + 'a;
+
+/// The chunk loop itself: how wide each chunk is and when it runs, with
+/// `run` doing one chunk's pass (`part` at `pos`, `last` for the final one)
+/// and returning what the caller keeps from the last. Shared by a prompt's
+/// prefill and an embeddings pass, so both are sized by the same budget.
+#[allow(clippy::too_many_arguments)]
+fn run_in_chunks(
+    cost: &mut ChunkCost,
+    cache: &mut KvCache,
+    tokens: &[u32],
+    start_pos: usize,
+    chunking: Chunking,
+    chunk: &mut ChunkPass<'_>,
+    on_chunk: &mut dyn FnMut(usize),
+) -> Result<Vec<f32>> {
+    let Chunking {
+        width: batch,
+        policy,
+    } = chunking;
     // **The width the NPU has graphs for**, when there is one. A compiled
     // graph has one static shape, so a chunk of any other size is not
     // offered the device — and left to itself this sizer issues almost
@@ -2205,7 +2270,7 @@ fn prefill_in_chunks(
         // feeds the drafter its state rows. The pass still has to be
         // counted — `forward_passes` is what the NPU work measures chunking
         // against.
-        let logits = chunk(model, cache, tokens, start_pos, true)?;
+        let logits = chunk(cache, tokens, start_pos, true)?;
         crate::engine::note_forward_pass();
         on_chunk(tokens.len());
         return Ok(logits);
@@ -2244,7 +2309,7 @@ fn prefill_in_chunks(
         let started = Instant::now();
         let submits_before = crate::engine::decode_stages::submissions_so_far();
         let last = done + n >= tokens.len();
-        let out = chunk(model, cache, &tokens[done..done + n], pos, last)?;
+        let out = chunk(cache, &tokens[done..done + n], pos, last)?;
         if last {
             logits = out;
         }
@@ -4171,6 +4236,121 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// A model whose hidden state at a position is the sum of every token
+    /// up to it — causal by construction, and exact in `f32` for small ids,
+    /// so a chunked run either reproduces the one-pass rows bit for bit or
+    /// fed some token at the wrong position, twice, or not at all.
+    struct PrefixSumModel {
+        config: ModelConfig,
+        causal: bool,
+        chunks: std::sync::Mutex<Vec<(usize, usize)>>,
+    }
+
+    impl PrefixSumModel {
+        fn new(causal: bool) -> Self {
+            Self {
+                config: DeterministicModel::new(8).config,
+                causal,
+                chunks: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ModelForward for PrefixSumModel {
+        fn config(&self) -> &ModelConfig {
+            &self.config
+        }
+
+        fn new_kv_cache(&self, capacity: usize) -> KvCache {
+            KvCache::new(1, capacity, 1)
+        }
+
+        fn forward(
+            &self,
+            _cache: &mut KvCache,
+            _tokens: &[u32],
+            _start_pos: usize,
+            _slot_id: usize,
+        ) -> Result<Vec<f32>> {
+            unimplemented!("an embeddings pass produces no logits")
+        }
+
+        fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+            let mut cache = self.new_kv_cache(tokens.len());
+            self.chunks.lock().unwrap().push((0, tokens.len()));
+            self.prefix_sums(&mut cache, tokens, 0)
+        }
+
+        fn hidden_states_are_causal(&self) -> bool {
+            self.causal
+        }
+
+        fn forward_hidden_states_at(
+            &self,
+            cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+        ) -> Result<Vec<f32>> {
+            self.chunks.lock().unwrap().push((start_pos, tokens.len()));
+            self.prefix_sums(cache, tokens, start_pos)
+        }
+    }
+
+    impl PrefixSumModel {
+        fn prefix_sums(
+            &self,
+            cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+        ) -> Result<Vec<f32>> {
+            let layer = &mut cache.layers[0];
+            anyhow::ensure!(
+                layer.len == start_pos,
+                "chunk at {start_pos}, cache at {}",
+                layer.len
+            );
+            let mut acc: f32 = (0..layer.len).map(|p| layer.key_at(p, 0, 1)[0]).sum();
+            let mut out = Vec::with_capacity(tokens.len());
+            for &t in tokens {
+                layer.push(&[t as f32], &[t as f32]);
+                acc += t as f32;
+                out.push(acc);
+            }
+            Ok(out)
+        }
+    }
+
+    /// A causal model's embedding input is split into chunks, each at the
+    /// position the last one ended, and the rows it gives are the one-pass
+    /// rows exactly.
+    #[test]
+    fn a_causal_embedding_input_runs_in_chunks_with_the_one_pass_rows() {
+        let tokens: Vec<u32> = (0..2000).map(|i| (i % 7) as u32).collect();
+        let model = PrefixSumModel::new(true);
+        let chunked = embedding_hidden_states(&model, &tokens).unwrap();
+        let chunks = model.chunks.lock().unwrap().clone();
+        assert!(chunks.len() > 1, "a 2000-token input ran as {chunks:?}");
+        let mut next = 0;
+        for &(pos, len) in &chunks {
+            assert_eq!(pos, next, "chunks out of order: {chunks:?}");
+            next += len;
+        }
+        assert_eq!(next, tokens.len());
+        let one_pass = PrefixSumModel::new(true)
+            .forward_hidden_states(&tokens)
+            .unwrap();
+        assert_eq!(chunked, one_pass);
+    }
+
+    /// A model whose tokens must see the whole input is never split.
+    #[test]
+    fn a_bidirectional_embedding_input_runs_in_one_pass() {
+        let tokens: Vec<u32> = (0..2000).map(|i| (i % 7) as u32).collect();
+        let model = PrefixSumModel::new(false);
+        embedding_hidden_states(&model, &tokens).unwrap();
+        assert_eq!(*model.chunks.lock().unwrap(), vec![(0, tokens.len())]);
     }
 
     impl ModelForward for PanickingModel {

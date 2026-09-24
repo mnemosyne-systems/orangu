@@ -3782,6 +3782,8 @@ fn workload_name(args: &Args) -> String {
                 ""
             }
         )
+    } else if !args.embed.is_empty() {
+        format!("embeddings {}", list(&args.embed))
     } else if !args.pg.is_empty() {
         format!("prefill+decode pg {} gen {}", list(&args.pg), args.n_gen)
     } else if !args.pp.is_empty() {
@@ -5852,6 +5854,15 @@ mod tests {
     /// and the model has nothing left but `--label` — which a sweep used to
     /// throw away, so two models wrote four series names between eight
     /// measurements and the file could not say which model a row came from.
+    /// An `--embed` run's flamegraph names the embeddings it measured, not
+    /// the decode workload whose defaults it leaves unset.
+    #[test]
+    fn an_embed_run_is_named_as_embeddings() {
+        let mut args = Args::parse_from(["orangu-bench", "--embed", "512,4096"]);
+        args.expand_lists().unwrap();
+        assert_eq!(workload_name(&args), "embeddings 512,4096");
+    }
+
     #[test]
     fn a_labelled_sweep_keeps_the_label_so_two_models_do_not_collide() {
         let spec = sweep::Spec::parse("ORANGU_DEVICE=0,1").expect("a valid spec");

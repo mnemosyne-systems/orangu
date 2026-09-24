@@ -77,3 +77,8 @@ the cache no longer matches — delete the workspace's `embeddings/` subdirector
 under `~/.orangu/workspace/<hash>/` and run `/search` again to re-index.
 Restarting with the **same** model reuses the cache and only re-embeds files that
 changed.
+
+A causal embedding model (such as `Qwen/Qwen3-Embedding-0.6B-GGUF`) takes
+inputs up to its full context: the server runs a long input in chunks, as it
+does a prompt. A bidirectional one (embeddinggemma) runs each input in one
+pass, within its own context length.
