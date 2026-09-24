@@ -3258,6 +3258,14 @@ pub trait ModelForward: Send + Sync {
         self.config().n_layer
     }
 
+    /// The output head — the vocabulary projection a decode step ends with —
+    /// for an architecture whose one-token host path routes it through
+    /// `engine::head_split`, so start-up can measure splitting it with an
+    /// idle GPU. `None` for every other architecture.
+    fn output_head(&self) -> Option<crate::engine::loader::QuantMatrix> {
+        None
+    }
+
     /// Whether this model's decode step is recorded in the chunks
     /// [`decode_chunk_ends`] hands out — the families whose steps are timed
     /// against those plans (`note_decode_step`).

@@ -205,13 +205,16 @@ impl ToolExecutor {
         self.diff_file_cap
     }
 
+    /// The tools offered to the model. Every definition is prefilled with
+    /// every request's prompt — on a cold start ~1700 of a one-line
+    /// question's ~2040 tokens were these (`doc/PERF-ALL.md`, task 10) — so
+    /// a description says what the model cannot guess from the name and the
+    /// parameters, and no more.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = vec![tool(
             "show_file",
-            "Show a text file from the workspace — its entire content by default, \
-                 or only a line range. When investigating unfamiliar code, leave \
-                 `start_line` and `end_line` empty to read the whole file. Use `mode` \
-                 to get structural overviews.",
+            "Show a text file, whole by default, or a line range. `mode` \
+                 `signatures` or `map` gives a structural overview.",
             json!({
                 "type": "object",
                 "properties": {
@@ -230,38 +233,29 @@ impl ToolExecutor {
         if !self.read_only {
             defs.push(tool(
                 "create_file",
-                "Create a file in the workspace with the given content, and optionally \
-                     its permissions (\"0644\"). An existing path is overwritten; pass \
-                     `overwrite: false` for create-if-absent. A missing parent directory \
-                     fails unless `parents` is set. In a Git repository the new file is \
-                     staged with `git add`; nothing is ever committed. A file that did not \
-                     exist before may be written with the workspace's own licence header on \
-                     top of `content` — where its format allows a comment and the project's \
-                     licence is known — so its line numbers are then not the ones in \
-                     `content`. The response reports this as `licensed`, and editing such a \
-                     file by line number means reading it back first.",
+                "Create a file, replacing an existing one unless `overwrite` is false. \
+                     Staged in Git, never committed. A new file may get the project's \
+                     licence header on top (reported as `licensed`): read it back before \
+                     editing it by line number.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
                         "content": {"type": "string"},
-                        "mode": {"type": "string", "description": "octal permissions, e.g. \"0644\""},
-                        "overwrite": {"type": "boolean", "description": "replace an existing file (default true)"},
+                        "mode": {"type": "string", "description": "octal, e.g. \"0644\""},
+                        "overwrite": {"type": "boolean"},
                         "parents": {"type": "boolean"},
-                        "git": {"type": "boolean", "description": "stage the change (default true)"}
+                        "git": {"type": "boolean"}
                     },
                     "required": ["path"]
                 }),
             ));
             defs.push(tool(
                 "modify_file",
-                "Modify an existing file in the workspace, either by replacing `old_text` \
-                     with `new_text` (use this when you know the text but not the line \
-                     numbers) or by giving `edits`, each replacing the inclusive 1-based \
-                     line range `start_line`..`end_line` with `replacement`. Ranges refer \
-                     to the file as it is now, must not overlap, and `end_line = \
-                     start_line - 1` inserts without replacing. In a Git repository the \
-                     change is staged with `git add`; nothing is ever committed.",
+                "Edit a file: replace `old_text` with `new_text`, or apply `edits`, each \
+                     replacing lines `start_line`..`end_line` (1-based, inclusive, of the \
+                     file as it is now; no overlaps; `end_line = start_line - 1` inserts) \
+                     with `replacement`. Staged in Git, never committed.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -281,52 +275,47 @@ impl ToolExecutor {
                                 "required": ["start_line", "end_line"]
                             }
                         },
-                        "git": {"type": "boolean", "description": "stage the change (default true)"}
+                        "git": {"type": "boolean"}
                     },
                     "required": ["path"]
                 }),
             ));
             defs.push(tool(
                 "move_file",
-                "Move or rename a file inside the workspace, optionally setting its \
-                     permissions at the destination. In a Git repository a tracked file \
-                     is moved with `git mv`, so the rename is staged as a rename.",
+                "Move or rename a file; `git mv` when tracked.",
                 json!({
                     "type": "object",
                     "properties": {
                         "from": {"type": "string"},
                         "to": {"type": "string"},
-                        "mode": {"type": "string", "description": "octal permissions, e.g. \"0644\""},
+                        "mode": {"type": "string"},
                         "overwrite": {"type": "boolean"},
                         "parents": {"type": "boolean"},
-                        "git": {"type": "boolean", "description": "stage the change (default true)"}
+                        "git": {"type": "boolean"}
                     },
                     "required": ["from", "to"]
                 }),
             ));
             defs.push(tool(
                 "delete_file",
-                "Delete a file from the workspace. Refuses a directory — use \
-                     delete_directory. In a Git repository a tracked file is deleted with \
-                     `git rm`, so the deletion is staged.",
+                "Delete a file (not a directory); `git rm` when tracked.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
-                        "git": {"type": "boolean", "description": "stage the change (default true)"}
+                        "git": {"type": "boolean"}
                     },
                     "required": ["path"]
                 }),
             ));
             defs.push(tool(
                 "create_directory",
-                "Create one directory in the workspace, optionally with its permissions \
-                     (\"0755\") and any missing parents. Fails if the path already exists.",
+                "Create a directory; fails if the path exists.",
                 json!({
                     "type": "object",
                     "properties": {
                         "path": {"type": "string"},
-                        "mode": {"type": "string", "description": "octal permissions, e.g. \"0755\""},
+                        "mode": {"type": "string"},
                         "parents": {"type": "boolean"},
                         "git": {"type": "boolean"}
                     },
@@ -335,15 +324,14 @@ impl ToolExecutor {
             ));
             defs.push(tool(
                 "move_directory",
-                "Move a directory and everything under it to a new path inside the \
-                     workspace. The destination must not already exist. In a Git \
-                     repository a tracked tree is moved with `git mv`.",
+                "Move a directory tree to a path that does not exist yet; `git mv` when \
+                     tracked.",
                 json!({
                     "type": "object",
                     "properties": {
                         "from": {"type": "string"},
                         "to": {"type": "string"},
-                        "mode": {"type": "string", "description": "octal permissions, e.g. \"0755\""},
+                        "mode": {"type": "string"},
                         "parents": {"type": "boolean"},
                         "git": {"type": "boolean"}
                     },
@@ -352,9 +340,7 @@ impl ToolExecutor {
             ));
             defs.push(tool(
                 "delete_directory",
-                "Delete an empty directory from the workspace. A directory that still \
-                     holds anything is refused — delete its contents first. There is no \
-                     recursive form.",
+                "Delete an empty directory.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -366,7 +352,8 @@ impl ToolExecutor {
             ));
             defs.push(tool(
                 "explore_repository",
-                "Spin up an independent explorer subagent to find relevant files and line ranges. Use this for broad searches so you don't pollute your own context. It returns a <final_answer> block with citations.",
+                "Have a subagent search the repository broadly, keeping your context \
+                     small; returns relevant files and line ranges.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -379,7 +366,7 @@ impl ToolExecutor {
 
         defs.push(tool(
             "list_directory",
-            "List files and directories under the workspace.",
+            "List files and directories.",
             json!({
                 "type": "object",
                 "properties": {
@@ -390,7 +377,7 @@ impl ToolExecutor {
         ));
         defs.push(tool(
             "fetch_url",
-            "Fetch an external URL and return readable text content.",
+            "Fetch a URL as readable text.",
             json!({
                 "type": "object",
                 "properties": {
@@ -402,7 +389,7 @@ impl ToolExecutor {
         ));
         defs.push(tool(
             "run_shell_command",
-            "Run a shell command inside the workspace. Recognized high-volume output may be compressed before truncation to preserve the most useful lines.",
+            "Run a shell command in the workspace.",
             json!({
                 "type": "object",
                 "properties": {
@@ -415,7 +402,7 @@ impl ToolExecutor {
         ));
         defs.push(tool(
             "expand_context",
-            "Retrieve an exact cached context node using an id from a truncation or bounded-index marker. A node may contain the original text or links to smaller nodes for selective expansion.",
+            "Retrieve the cached text behind an id in a truncation marker.",
             json!({
                 "type": "object",
                 "properties": {
@@ -426,17 +413,12 @@ impl ToolExecutor {
         ));
         defs.push(tool(
             "graph_lookup",
-            "Query the workspace Knowledge Graph by symbol name. Returns the matching \
-             node(s) together with their callers (in-edges) and callees (out-edges). \
-             Use this to understand what calls a function, what a struct depends on, \
-             or whether there are circular dependencies — without reading files manually.",
+            "Look up a symbol (name or part of it) in the code graph: its callers and \
+             callees.",
             json!({
                 "type": "object",
                 "properties": {
-                    "symbol": {
-                        "type": "string",
-                        "description": "Symbol name or partial name to search for (case-insensitive)"
-                    }
+                    "symbol": {"type": "string"}
                 },
                 "required": ["symbol"]
             }),
@@ -1555,6 +1537,17 @@ mod file_lifecycle_tool_tests {
         // Migrated away from, not kept alongside.
         assert!(!names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"edit_file".to_string()));
+    }
+
+    /// Every request's prompt carries the definitions, so they stay small:
+    /// 6982 characters of JSON (~1700 tokens) before `doc/PERF-ALL.md`
+    /// task 10, under 4700 since.
+    #[test]
+    fn the_tool_definitions_stay_small() {
+        let workspace = tempfile::tempdir().unwrap();
+        let json =
+            serde_json::to_string(&ToolExecutor::new(workspace.path()).definitions()).unwrap();
+        assert!(json.len() < 4700, "{} characters", json.len());
     }
 
     /// `/license`'s answer reaches the file the model writes — the whole

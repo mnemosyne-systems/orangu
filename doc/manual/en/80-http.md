@@ -830,9 +830,11 @@ readable text rather than the tokenizer's internal spelling.
 
 #### `POST /apply-template`
 
-`{"messages": [...]}` in, `{"prompt": "…"}` out: exactly the string
-`/v1/chat/completions` would build from those messages and hand to the model,
-including a `review`-role server's reasoning-suppression prefill. Nothing is
+`{"messages": [...], "tools": [...]}` in, `{"prompt": "…"}` out: exactly the
+string `/v1/chat/completions` would build from those messages and tool
+definitions (`tools` is optional, and an empty list is none) and hand to the
+model, including a `review`-role server's reasoning-suppression prefill.
+`/tokenize` on the result counts what a request's tools cost in tokens. Nothing is
 generated. `501` when the model carries no `tokenizer.chat_template`.
 
 This is the endpoint to reach for when an answer looks like the model was

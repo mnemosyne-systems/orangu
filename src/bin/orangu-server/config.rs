@@ -199,7 +199,7 @@ pub fn bundled_configuration(
         // nothing for the NPU precompile step to find; leaving it on costs a
         // probe that fails immediately.
         npu_precompile: default_npu_precompile(),
-        prefill_backend: PrefillBackend::Device,
+        prefill_backend: PrefillBackend::Auto,
         npu_cache_gb: default_npu_cache_gb(),
         mlp_unroll: None,
         // The console follows the API's address, baked-in or default —
@@ -242,6 +242,8 @@ pub fn bundled_configuration(
         image_lora_merge: true,
         vae_precision: crate::engine::image::vae::VaePrecision::default(),
         image_weights: crate::engine::image::transformer21::ImageWeights::default(),
+        prompt_weights: crate::engine::prompt_weights::PromptWeights::default(),
+        prefix_warmup: true,
         image_cache: crate::engine::image::stepcache::ImageCache::default(),
         image_reference: crate::engine::image::ReferenceCap::Source,
         image: crate::engine::image::ImageDefaults::default(),
@@ -707,16 +709,17 @@ pub struct ServerConfiguration {
     /// To keep the device but stop it growing the cache, set
     /// [`Config::npu_cache_gb`] to 0 instead.
     pub npu_precompile: bool,
-    /// `[orangu-server].prefill_backend` — `device` (the default: prompts
-    /// run where decode runs), `cpu` (a multi-token pass runs on the CPU
-    /// backend while single-token decode stays on the selected device) or
-    /// `auto` (one prompt-shaped GEMM timed on each backend at load, the
-    /// faster takes the prompts). For a board whose device does a prompt's
-    /// GEMMs slower than its cores do (the CIX P1's Mali: 1.6 against 9.8
-    /// tok/s on the 27B ternary model) and whose memory the two share.
-    /// Honoured by the Qwen 3.5-family trunk (`qwen35`, `qwen35moe`,
-    /// `qwen3next`, `qwen4exp`); `ORANGU_HYBRID_PREFILL_CPU=1` is `cpu`
-    /// from the environment.
+    /// `[orangu-server].prefill_backend` — `auto` (the default: one
+    /// prompt-shaped GEMM timed on each backend at load, the faster takes
+    /// the prompts, so every machine decides for itself), `device` (prompts
+    /// run where decode runs) or `cpu` (a multi-token pass runs on the CPU
+    /// backend while single-token decode stays on the selected device). For
+    /// a board whose device does a prompt's GEMMs slower than its cores do
+    /// (the CIX P1's Mali: 1.6 against 9.8 tok/s on the 27B ternary model,
+    /// 26 against 118 on `gemma-4-E2B`) and whose memory the two share.
+    /// Honoured by the Gemma trunk (dense `gemma*`) and the Qwen 3.5-family
+    /// trunk (`qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp`);
+    /// `ORANGU_HYBRID_PREFILL_CPU=1` is `cpu` from the environment.
     pub prefill_backend: PrefillBackend,
     /// `[orangu-server].npu_cache_gb` — how much compiled-block cache the
     /// NPU precompile may spend on one model.
@@ -836,6 +839,22 @@ pub struct ServerConfiguration {
     /// `smmla` tile when total memory is at least three times the 7 GB
     /// copy), `int8`, or `file` (the file's K-quants, no copy).
     pub image_weights: crate::engine::image::transformer21::ImageWeights,
+    /// `[orangu-server].prompt_weights`: how the weights a prompt multiplies
+    /// on the CPU are held — `auto` (the default: copies for the cores'
+    /// matrix instructions — per-row `int8` for the K-quant projections,
+    /// `bf16` for the unquantized ones — each kind when prompts run on the
+    /// CPU, the CPU has its instruction, the copies take at most half the
+    /// available memory, and the kind measures at least 10% faster at
+    /// load), `copy` (the copies unmeasured), or `file` (the file's weights,
+    /// no copy). See `engine::prompt_weights`.
+    pub prompt_weights: crate::engine::prompt_weights::PromptWeights,
+    /// `[orangu-server].prefix_warmup` — `on` (the default): remember the
+    /// prompt prefixes requests reuse from the cache, per model, and prefill
+    /// them again in the background after a restart, so a client's fixed
+    /// opening (its system prompt and tools) is cached before its first
+    /// request. `ORANGU_PREFIX_WARMUP` overrides it. See
+    /// `engine::warm_prefixes`.
+    pub prefix_warmup: bool,
     /// `[orangu-server].image_cache`: `easy` (the default) or
     /// `easy:<threshold>` (EasyCache — a step whose predicted change is
     /// small reuses the last passes' residual), or `off` (every step runs
@@ -1264,6 +1283,22 @@ pub fn load_server_configuration(
         }
         None => crate::engine::image::transformer21::ImageWeights::default(),
     };
+    let prompt_weights = match section.get("prompt_weights") {
+        Some(value) => {
+            crate::engine::prompt_weights::PromptWeights::parse(value).ok_or_else(|| {
+                anyhow!(
+                    "invalid value for [{SERVER_SECTION}].prompt_weights: '{}' (expected auto, \
+                 copy or file)",
+                    value.trim()
+                )
+            })?
+        }
+        None => crate::engine::prompt_weights::PromptWeights::default(),
+    };
+    let prefix_warmup = match section.get("prefix_warmup") {
+        Some(value) => parse_bool(SERVER_SECTION, "prefix_warmup", value)?,
+        None => true,
+    };
     let image_cache = match section.get("image_cache") {
         Some(value) => crate::engine::image::stepcache::ImageCache::parse(value)
             .map_err(|e| anyhow!("invalid value for [{SERVER_SECTION}].image_cache: {e}"))?,
@@ -1351,7 +1386,7 @@ pub fn load_server_configuration(
                 ));
             }
         },
-        None => PrefillBackend::Device,
+        None => PrefillBackend::Auto,
     };
 
     let backend = match section.get("backend") {
@@ -1459,6 +1494,8 @@ pub fn load_server_configuration(
         image_lora_merge,
         vae_precision,
         image_weights,
+        prompt_weights,
+        prefix_warmup,
         image_cache,
         image_reference,
         image,
@@ -2192,6 +2229,42 @@ mod tests {
         assert!(load("image_weights = q4").is_err());
     }
 
+    /// `prefix_warmup` defaults to on and takes the usual booleans.
+    #[test]
+    fn prefix_warmup_defaults_on() {
+        let load = |keys: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /srv/models\n{keys}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+        assert!(load("").unwrap().prefix_warmup);
+        assert!(!load("prefix_warmup = off").unwrap().prefix_warmup);
+        assert!(load("prefix_warmup = maybe").is_err());
+    }
+
+    /// `prompt_weights` defaults to `auto`, takes `copy` and `file`, and
+    /// refuses anything else at startup.
+    #[test]
+    fn prompt_weights_parses_its_three_values() {
+        use crate::engine::prompt_weights::PromptWeights;
+        let load = |keys: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /srv/models\n{keys}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+        assert_eq!(load("").unwrap().prompt_weights, PromptWeights::Auto);
+        assert_eq!(
+            load("prompt_weights = COPY").unwrap().prompt_weights,
+            PromptWeights::Copy
+        );
+        assert_eq!(
+            load("prompt_weights = file").unwrap().prompt_weights,
+            PromptWeights::File
+        );
+        assert!(load("prompt_weights = q4").is_err());
+        assert!(load("prompt_weights = int8").is_err());
+    }
+
     /// `image_cache` defaults to `easy`, takes a threshold after it, and
     /// `off`.
     #[test]
@@ -2262,15 +2335,15 @@ mod tests {
     /// against a real prompt rather than a sixteen-token one, and back on
     /// once the calibration and the per-channel smoothing made a real
     /// prompt come back with a real answer — see [`default_npu_precompile`].
-    /// `prefill_backend` is `device` unless the file says `cpu` or `auto`;
+    /// `prefill_backend` is `auto` unless the file says `cpu` or `device`;
     /// anything else stops the server at the file.
     #[test]
-    fn prefill_backend_is_device_unless_cpu_is_asked_for() {
+    fn prefill_backend_is_auto_unless_the_file_names_one() {
         use crate::engine::prefill_backend::PrefillBackend;
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
         let conf = load_server_configuration(file.path(), None, false).unwrap();
-        assert_eq!(conf.prefill_backend, PrefillBackend::Device);
+        assert_eq!(conf.prefill_backend, PrefillBackend::Auto);
         for (value, expected) in [
             ("cpu", PrefillBackend::Cpu),
             ("device", PrefillBackend::Device),

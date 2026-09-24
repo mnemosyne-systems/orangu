@@ -175,6 +175,9 @@ fn props_json(state: &AppState) -> serde_json::Value {
         "gpu": state.gpu_tuning,
         // `null` on a machine with no NPU — see `npu_tool::npu_props`.
         "npu": crate::npu_tool::npu_props(),
+        // What the server detected about this machine and chose because of
+        // it — the `[adapt]` log lines, for a program: see `engine::adapt`.
+        "adapt": crate::engine::adapt::decisions(),
         // The served file's architecture. On a `qwen_image` server the
         // engine's `ModelForward` is the text encoder, so `cfg` describes
         // that; `architecture` names what was asked for.
@@ -781,6 +784,12 @@ pub async fn embedding(
 #[derive(Deserialize)]
 pub struct ApplyTemplateRequest {
     messages: Vec<ChatMessage>,
+    /// A chat request's `tools`, rendered into the prompt as the chat
+    /// endpoint renders them — without it this endpoint showed a tool
+    /// request's prompt with every tool definition missing, which is most
+    /// of an `orangu` turn (`doc/PERF-ALL.md`, task 10).
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -804,7 +813,19 @@ pub async fn apply_template(
             .into_response();
     };
     let template = ChatTemplate::new(source.clone());
-    match template.render(&req.messages, true, "", "", state.engine.reasoning_as(role)) {
+    // As `openai::chat_completions` treats it: an empty array is no tools.
+    let tools = req
+        .tools
+        .as_ref()
+        .filter(|t| !matches!(t.as_array(), Some(a) if a.is_empty()));
+    match template.render_with_tools(
+        &req.messages,
+        true,
+        "",
+        "",
+        state.engine.reasoning_as(role),
+        tools,
+    ) {
         Ok(mut prompt) => {
             // Mirror `openai::chat_completions`'s own reasoning-suppression
             // prefill, so this endpoint's whole point — showing exactly

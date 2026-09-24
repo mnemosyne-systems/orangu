@@ -928,6 +928,15 @@ impl Backend for CpuBackend {
         if let Some(layer) = w.layer() {
             crate::engine::dense_residency::touch(layer);
         }
+        // A prompt's weight with a copy for the cores' matrix instructions —
+        // per-row `int8` or `bf16`, built at load when this machine measured
+        // faster with one (`engine::prompt_weights`).
+        if n_tokens >= crate::engine::prompt_weights::MIN_TOKENS
+            && let Some(copy) = crate::engine::prompt_weights::copy_of(w)
+        {
+            *out = copy.matmul(x, n_tokens);
+            return;
+        }
         if self.matmul_fused_into(out, x, n_tokens, w) {
             return;
         }
@@ -1012,6 +1021,221 @@ mod tests {
     use super::*;
     use crate::engine::loader::test_quant_matrix;
     use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q8_0};
+
+    /// The prompt GEMM on a real model's projections — the attention,
+    /// FFN and per-layer-embedding matrices of `ORANGU_TEST_MODEL`'s
+    /// first layers at prompt-chunk widths — printing each matrix's type,
+    /// shape, time and `int8` ops per second. Run with
+    /// `ORANGU_TEST_MODEL=<gguf> cargo test … -- --ignored --nocapture
+    /// k_gemm_timing`; `doc/PERF-ALL.md` task 12.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn k_gemm_timing_on_a_real_model() {
+        let Ok(path) = std::env::var("ORANGU_TEST_MODEL") else {
+            eprintln!("set ORANGU_TEST_MODEL");
+            return;
+        };
+        let loaded = crate::engine::loader::LoadedModel::open(std::path::Path::new(&path))
+            .expect("load model");
+        let widths: Vec<usize> = std::env::var("ORANGU_TEST_WIDTHS")
+            .ok()
+            .map(|v| v.split(',').filter_map(|w| w.trim().parse().ok()).collect())
+            .unwrap_or_else(|| vec![64, 256, 512]);
+        let mut total = 0f64;
+        for name in [
+            "blk.0.attn_q.weight",
+            "blk.0.attn_output.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            "blk.20.ffn_gate.weight",
+            "blk.20.ffn_down.weight",
+            // `gemma-4-E2B`'s unquantized per-layer-embedding matrices
+            // (`doc/PERF-ALL.md`, task 13).
+            "blk.0.inp_gate.weight",
+            "blk.0.proj.weight",
+            "per_layer_model_proj.weight",
+        ] {
+            let Ok(w) = loaded.matrix(name) else {
+                continue;
+            };
+            let copy = vecdot::RowI8::quantize(w.out_dim, w.in_dim, |o| w.row(o));
+            let bf16 = vecdot::have_bf16mm()
+                .then(|| vecdot::Bf16Weights::from_rows(w.out_dim, w.in_dim, |o| w.row(o)));
+            for &n in &widths {
+                let x: Vec<f32> = (0..n * w.in_dim)
+                    .map(|i| ((i * 7919) % 257) as f32 / 257.0 - 0.5)
+                    .collect();
+                let time = |f: &mut dyn FnMut()| {
+                    f();
+                    (0..3)
+                        .map(|_| {
+                            let t = std::time::Instant::now();
+                            f();
+                            t.elapsed().as_secs_f64()
+                        })
+                        .fold(f64::INFINITY, f64::min)
+                };
+                let best = time(&mut || {
+                    let _ = CpuBackend.matmul(&x, n, &w);
+                });
+                let int8 = time(&mut || {
+                    let _ = vecdot::matmul_rowi8(&x, n, &copy);
+                });
+                // The copy's error, relative RMS against the file's weights
+                // through the same quantized activations.
+                let want = CpuBackend.matmul(&x, n, &w);
+                let got = vecdot::matmul_rowi8(&x, n, &copy);
+                let (mut num, mut den) = (0f64, 0f64);
+                for (g, w) in got.iter().zip(&want) {
+                    num += ((g - w) as f64).powi(2);
+                    den += (*w as f64).powi(2);
+                }
+                // The `bf16` copy, the same way.
+                let bf16_note = bf16.as_ref().map_or(String::new(), |b16| {
+                    let t = time(&mut || {
+                        let _ = vecdot::matmul_bf16(&x, n, b16);
+                    });
+                    let got = vecdot::matmul_bf16(&x, n, b16);
+                    let (mut num, mut den) = (0f64, 0f64);
+                    for (g, w) in got.iter().zip(&want) {
+                        num += ((g - w) as f64).powi(2);
+                        den += (*w as f64).powi(2);
+                    }
+                    format!(
+                        " | bf16 copy {:>7.2} ms ({:.2}x), {:.2}% rms off",
+                        t * 1e3,
+                        best / t,
+                        100.0 * (num / den).sqrt()
+                    )
+                });
+                total += best;
+                let ops = 2.0 * (w.in_dim * w.out_dim * n) as f64;
+                println!(
+                    "{name:<26} type {:>2} {:>5}x{:<5} tokens {n:>4}: {:>7.2} ms  {:>6.0} G op/s \
+                     | int8 copy {:>7.2} ms {:>6.0} G op/s ({:.2}x), {:.2}% rms off{bf16_note}",
+                    w.ggml_type(),
+                    w.in_dim,
+                    w.out_dim,
+                    best * 1e3,
+                    ops / best / 1e9,
+                    int8 * 1e3,
+                    ops / int8 / 1e9,
+                    best / int8,
+                    100.0 * (num / den).sqrt()
+                );
+            }
+        }
+        println!("total {:.1} ms", total * 1e3);
+    }
+
+    /// The one-token matmuls a decode step makes, timed on a real model's
+    /// weights: each kind across every layer (so its bytes come from
+    /// memory, as in decode, not from a cache the previous call warmed),
+    /// against a plain parallel read of the same bytes in the same pool —
+    /// the ceiling the kernel could reach. Run pinned to the cores decode
+    /// uses, e.g. `taskset -c 0,1,6-11` with `ORANGU_TEST_THREADS=8` and
+    /// `ORANGU_TEST_MODEL=<gguf> … -- --ignored --nocapture decode_matvec`;
+    /// `doc/PERF-ALL.md` task 15.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    fn decode_matvec_timing_on_a_real_model() {
+        let Ok(path) = std::env::var("ORANGU_TEST_MODEL") else {
+            eprintln!("set ORANGU_TEST_MODEL");
+            return;
+        };
+        let loaded = crate::engine::loader::LoadedModel::open(std::path::Path::new(&path))
+            .expect("load model");
+        let threads = std::env::var("ORANGU_TEST_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let n_layer = (0..)
+            .take_while(|l| loaded.has_tensor(&format!("blk.{l}.attn_q.weight")))
+            .count();
+        let read = |bytes: &[u8]| -> u64 {
+            bytes
+                .par_chunks(64 * 1024)
+                .map(|c| {
+                    c.as_chunks::<8>()
+                        .0
+                        .iter()
+                        .fold(0u64, |a, b| a ^ u64::from_ne_bytes(*b))
+                })
+                .reduce(|| 0, |a, b| a ^ b)
+        };
+        pool.install(|| {
+            let (mut all_bytes, mut all_kernel, mut all_read) = (0f64, 0f64, 0f64);
+            for kind in [
+                "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down",
+                "inp_gate", "proj",
+            ] {
+                let ws: Vec<_> = (0..n_layer)
+                    .filter_map(|l| loaded.matrix(&format!("blk.{l}.{kind}.weight")).ok())
+                    .collect();
+                if ws.is_empty() {
+                    continue;
+                }
+                let xs: Vec<Vec<f32>> = ws
+                    .iter()
+                    .map(|w| {
+                        (0..w.in_dim)
+                            .map(|i| ((i * 7919) % 257) as f32 / 257.0 - 0.5)
+                            .collect()
+                    })
+                    .collect();
+                let bytes: usize = ws.iter().map(|w| w.raw_bytes().len()).sum();
+                // Best of three sweeps over every layer, after one to fault
+                // the pages in.
+                let sweep = |f: &dyn Fn(usize)| {
+                    (0..4)
+                        .map(|_| {
+                            let t = std::time::Instant::now();
+                            for i in 0..ws.len() {
+                                f(i);
+                            }
+                            t.elapsed().as_secs_f64()
+                        })
+                        .skip(1)
+                        .fold(f64::INFINITY, f64::min)
+                };
+                let kernel = sweep(&|i| {
+                    std::hint::black_box(CpuBackend.matmul(&xs[i], 1, &ws[i]));
+                });
+                let raw = sweep(&|i| {
+                    std::hint::black_box(read(ws[i].raw_bytes()));
+                });
+                all_bytes += bytes as f64;
+                all_kernel += kernel;
+                all_read += raw;
+                println!(
+                    "{kind:<12} type {:>2} {:>5}x{:<5} x{:>2}: {:>6.2} ms {:>5.1} GB/s | read {:>6.2} ms \
+                     {:>5.1} GB/s | {:>5.1} µs a call",
+                    ws[0].ggml_type(),
+                    ws[0].in_dim,
+                    ws[0].out_dim,
+                    ws.len(),
+                    kernel * 1e3,
+                    bytes as f64 / kernel / 1e9,
+                    raw * 1e3,
+                    bytes as f64 / raw / 1e9,
+                    kernel / ws.len() as f64 * 1e6
+                );
+            }
+            println!(
+                "all layers: {:.1} MB, kernels {:.1} ms ({:.1} GB/s), read {:.1} ms ({:.1} GB/s)",
+                all_bytes / 1e6,
+                all_kernel * 1e3,
+                all_bytes / all_kernel / 1e9,
+                all_read * 1e3,
+                all_bytes / all_read / 1e9
+            );
+        });
+    }
 
     fn next_byte(seed: &mut u64) -> u8 {
         *seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);

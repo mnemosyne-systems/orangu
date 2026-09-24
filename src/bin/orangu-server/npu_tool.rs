@@ -2734,12 +2734,21 @@ pub fn install_ffn_service(model: &Path, budget_bytes: u64) {
         return;
     }
 
+    // **Speed first.** Whether the NPU beats what prompts would otherwise
+    // run on is one timed block a side; whether its blocks are accurate
+    // enough is five inferences against host-side `f32` references of
+    // whole blocks, single-threaded — ~38% of the CIX P1's start-up samples
+    // for `gemma-4-E2B`, spent on a device the speed check then left out
+    // (`doc/PERF-ALL.md`, task 8). The cheap question decides whether the
+    // expensive one is asked at all.
+    if !beats_the_cpu(&gguf, model, &service, &widths) {
+        return;
+    }
     // **Whether this model should use the device is this model's question**,
     // and it is answered by measurement rather than by any property of the
     // file. `prepare` has already asked it of one block before any of these
     // were compiled; this asks again of the set that actually bound, which
-    // is the one that will serve. Cheap either way: one inference and one
-    // host-side reference.
+    // is the one that will serve.
     let error = block_error(&gguf, model, &service, &widths);
     // Cut short by a shutdown: not a refusal, and nothing to say.
     if stopping() {
@@ -3056,6 +3065,179 @@ fn block_error(
     // Still `None` when nothing could be measured, which `install_ffn_service`
     // reads as "refuse" — an unmeasured path is not a qualified one.
     worst.map(|pct| pct / 100.0)
+}
+
+/// Whether the NPU's blocks are worth using for prompts on *this* machine,
+/// when prompts run on the CPU: per token, a feed-forward block on the NPU
+/// at the width its graphs were compiled for, against the same block
+/// through the CPU backend at the width the CPU path really takes a prompt
+/// in ([`CPU_PROBE_TOKENS`]) — each side where it would actually run.
+///
+/// Measured rather than assumed, because the answer is the machine's. On
+/// an RK3588 the NPU prefilled `gemma-4-E2B` 1.29× faster than its cores;
+/// on the CIX P1, whose big cores have `i8mm`, the same offload took the
+/// CPU prefill from 136 to 109 tok/s at 512 tokens and from 122 to 73 at
+/// 2048. The first form of this check compared one block at the NPU's own
+/// 128 tokens on both sides, and it flipped between starts (the NPU
+/// 11.7 ms against the CPU's 16.4 in one, 14.1 against 12.1 in another) —
+/// the CPU is a third less efficient at 128 tokens than at a chunk's 384,
+/// and the pass that took the NPU that start prefilled at 74 tok/s where
+/// the CPU alone does 150 (`doc/PERF-ALL.md`, task 12). Using the NPU also
+/// holds every chunk of the pass to its width and leaves the cores idle
+/// while it runs, so it must win per token by [`NPU_MARGIN`].
+///
+/// When prompts run on a device this keeps the NPU, as before: the
+/// comparison that would matter there is against the device. `true` (use
+/// the NPU) also when the timing could not be taken, or with
+/// `ORANGU_NPU_FFN=1`.
+fn beats_the_cpu(
+    gguf: &GgufFile,
+    path: &Path,
+    service: &orangu::npu_ffn::NpuFfn,
+    widths: &[usize],
+) -> bool {
+    if std::env::var("ORANGU_NPU_FFN").is_ok_and(|v| v.trim() == "1") {
+        crate::engine::adapt::note("npu", "used for prompts", "ORANGU_NPU_FFN=1");
+        return true;
+    }
+    // Where prompts run, and how the CPU runs them, is settled once the
+    // model is built and its prompt weights are prepared — which is also
+    // when the CPU worker pool exists; a GEMM before that would build
+    // rayon's global pool behind `configure_cpu_threads`'s back.
+    loop {
+        if stopping() {
+            return true;
+        }
+        if crate::engine::prefill_backend::cpu_path_ready() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if crate::engine::prefill_backend::prompts_on_cpu() != Some(true) {
+        crate::engine::adapt::note("npu", "used for prompts", "prompts run on the device");
+        return true;
+    }
+    let Some(t) = time_block(gguf, path, service, widths) else {
+        return true;
+    };
+    let (npu_tok, cpu_tok) = (t.npu / t.npu_tokens as f64, t.cpu / t.cpu_tokens as f64);
+    let measured = format!(
+        "a feed-forward block takes {:.1} ms for {} tokens on the NPU ({:.3} ms a token), \
+         {:.1} ms for {} on the cpu ({:.3} ms a token)",
+        t.npu * 1e3,
+        t.npu_tokens,
+        npu_tok * 1e3,
+        t.cpu * 1e3,
+        t.cpu_tokens,
+        cpu_tok * 1e3,
+    );
+    if npu_tok * NPU_MARGIN < cpu_tok {
+        crate::engine::adapt::note("npu", "used for prompts", measured);
+        true
+    } else {
+        crate::engine::adapt::note(
+            "npu",
+            "not used (ORANGU_NPU_FFN=1 uses it anyway)",
+            format!("{measured}; it must be {NPU_MARGIN}× faster a token"),
+        );
+        false
+    }
+}
+
+/// The width the CPU side of [`beats_the_cpu`] is timed at: what the CPU
+/// prompt path takes a 2 k prompt in (chunks of ~350–400 tokens), where
+/// its GEMM runs at its full rate.
+const CPU_PROBE_TOKENS: usize = 384;
+
+/// How much faster a token the NPU must be: it also holds every chunk of
+/// the pass to its graphs' width and leaves the cores waiting while it runs.
+const NPU_MARGIN: f64 = 1.25;
+
+/// [`time_block`]'s answer: best-of-three seconds on each side, and the
+/// token counts they were taken at.
+struct BlockTimes {
+    npu_tokens: usize,
+    npu: f64,
+    cpu_tokens: usize,
+    cpu: f64,
+}
+
+/// The first block this service holds, timed on the NPU at its widest
+/// bound width and through `CpuBackend` at [`CPU_PROBE_TOKENS`]: the best of
+/// three after a warm-up on each side. The CPU side is the block's three
+/// GEMMs — the activation between them is the same elementwise work on
+/// either side and left out.
+fn time_block(
+    gguf: &GgufFile,
+    path: &Path,
+    service: &orangu::npu_ffn::NpuFfn,
+    widths: &[usize],
+) -> Option<BlockTimes> {
+    use crate::engine::backend::{Backend as _, CpuBackend};
+    use std::time::Instant;
+
+    let blocks = discover_blocks(gguf, path, Some("blk."));
+    let (index, block) = blocks.iter().find_map(|block| {
+        let index = block.prefix.strip_prefix("blk.")?.parse::<usize>().ok()?;
+        widths
+            .iter()
+            .any(|w| service.has(index, *w))
+            .then_some((index, block))
+    })?;
+    let &tokens = widths.iter().filter(|w| service.has(index, **w)).max()?;
+    let x = calibration_for(path, block, tokens);
+
+    let best = |f: &mut dyn FnMut() -> bool| -> Option<f64> {
+        if !f() {
+            return None;
+        }
+        let mut best = f64::INFINITY;
+        for _ in 0..3 {
+            let t = Instant::now();
+            if !f() {
+                return None;
+            }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        Some(best)
+    };
+
+    let mut out = Vec::new();
+    let npu = best(&mut || service.forward_into(index, tokens, &x, &mut out))?;
+
+    // The same activations, repeated out to the CPU's width.
+    let cpu_tokens = CPU_PROBE_TOKENS.max(tokens);
+    let xc: Vec<f32> = x
+        .iter()
+        .copied()
+        .cycle()
+        .take(cpu_tokens * block.d_model)
+        .collect();
+    let loaded = crate::engine::loader::LoadedModel::open(path).ok()?;
+    let gate = loaded.matrix(&block.tensor(FfnRole::Gate)).ok()?;
+    let up = loaded.matrix(&block.tensor(FfnRole::Up)).ok()?;
+    let down = loaded.matrix(&block.tensor(FfnRole::Down)).ok()?;
+    // Through the prompt path's own weights: the copies when
+    // `engine::prompt_weights` built them, else the file's.
+    let cpu = CpuBackend;
+    let product = |x: &[f32], role: FfnRole, w: &crate::engine::loader::QuantMatrix| {
+        match crate::engine::prompt_weights::copy_named(&block.tensor(role)) {
+            Some(copy) => copy.matmul(x, cpu_tokens),
+            None => cpu.matmul(x, cpu_tokens, w),
+        }
+    };
+    let cpu = best(&mut || {
+        let mut h = product(&xc, FfnRole::Gate, &gate);
+        let u = product(&xc, FfnRole::Up, &up);
+        h.iter_mut().zip(&u).for_each(|(h, u)| *h *= u);
+        product(&h, FfnRole::Down, &down).len() == cpu_tokens * block.d_model
+    })?;
+    Some(BlockTimes {
+        npu_tokens: tokens,
+        npu,
+        cpu_tokens,
+        cpu,
+    })
 }
 
 /// How many blocks [`block_error`] measures.

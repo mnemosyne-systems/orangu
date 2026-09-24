@@ -1602,6 +1602,14 @@ pub struct VulkanBackend {
     /// does nothing, measure the default four times, and conclude the kernel
     /// is not the lever.
     attn_coop: bool,
+    /// Lanes of the cooperative *decode* attention kernel
+    /// (`shader_source_attention_split_coop`), `0` for none: 32 where
+    /// [`Self::attn_coop`] is on, else the subgroup's own width on a device
+    /// whose subgroups are narrower (16 on the Mali-G720), where the
+    /// 32-lane kernels are not built. Decode only — the cooperative prefill
+    /// kernels keep their 32. `ORANGU_ATTN_COOP16=0` leaves such a device on
+    /// the classic split kernel (`doc/PERF-ALL.md`, task 6).
+    attn_coop_decode_lanes: u32,
     /// Effective decode-attention split-k factor (phase-1's `(n_head, k_num, 1)`
     /// grid + the partial-`(m,l,acc)` buffer sizes + phase-2's merge count).
     /// Resolved once at build time from `ORANGU_ATTN_SPLIT_K` else a coop-aware
@@ -1717,6 +1725,15 @@ thread_local! {
     /// — a last-bit difference becomes a large one. The chains run on the
     /// calling thread, so this reaches exactly the test that set it.
     static MMQ_OFF_ON_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The decode side's twin of [`MMQ_OFF_ON_THIS_THREAD`]: set by a test
+    /// that compares a fused chain holding `Q4_K` projections against its
+    /// unfused float sequence, so the chain keeps the float `Q4_K` kernel
+    /// rather than the integer-dot one (`shader_source_q4k_i8`). On this
+    /// module's random weights an 8-bit activation rounding compounds
+    /// through a chain to several percent; the kernel's own arithmetic is
+    /// checked by `decode_matvec_q4k_integer_dot`.
+    #[cfg(test)]
+    static Q4K_I8_OFF_ON_THIS_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// A test's stripe budget for the packed routed-expert region, in
     /// bytes — `0` for the configured one. See
     /// [`VulkanBackend::with_expert_stripe_bytes`].
@@ -2551,6 +2568,36 @@ static TERNARY_IDOT_GROUPS: std::sync::LazyLock<usize> = std::sync::LazyLock::ne
     super::env_tuning_value(
         "ORANGU_TERNARY_IDOT_GROUPS",
         TERNARY_IDOT_GROUPS_DEFAULT,
+        "an integer in 1..=16",
+        |n| (1..=16).contains(&n),
+    )
+});
+/// Rows per run of the integer-dot `Q4_K` decode kernel
+/// (`vulkan_shaders::shader_source_q4k_i8`): its activation words are
+/// loaded once per block and reused by every row. `ORANGU_Q4K_I8_ROWS`
+/// overrides it for measurement (`doc/PERF-ALL.md`, task 5). Measured on
+/// the Mali-G720 in a decode step, with [`Q4K_I8_GROUPS`]: `ffn_gate`
+/// (1536 → 6144) at 4 × 4 265 µs, 4 × 8 274, 8 × 4 292, 8 × 2 308, 2 × 8
+/// 303, 8 × 1 399, 16 × 1 453, 1 × 16 453 — the float kernel's 368.
+const Q4K_I8_ROWS_DEFAULT: usize = 4;
+static Q4K_I8_ROWS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    super::env_tuning_value(
+        "ORANGU_Q4K_I8_ROWS",
+        Q4K_I8_ROWS_DEFAULT,
+        "an integer in 1..=16",
+        |n| (1..=16).contains(&n),
+    )
+});
+/// The fewest rows a `Q4_K` projection needs for the integer-dot kernel's
+/// row-group form (fewer take the one-row form).
+const Q4K_I8_WIDE_MIN_OUT: usize = 512;
+/// Runs of [`Q4K_I8_ROWS`] rows one workgroup of it takes in sequence.
+/// `ORANGU_Q4K_I8_GROUPS` overrides it for measurement.
+const Q4K_I8_GROUPS_DEFAULT: usize = 4;
+static Q4K_I8_GROUPS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+    super::env_tuning_value(
+        "ORANGU_Q4K_I8_GROUPS",
+        Q4K_I8_GROUPS_DEFAULT,
         "an integer in 1..=16",
         |n| (1..=16).contains(&n),
     )
@@ -3975,6 +4022,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 "subgroup_max_size": self.subgroup_lanes.1,
                 "attn_split": self.attn_split,
                 "attn_coop": self.attn_coop,
+                "attn_coop_decode_lanes": self.attn_coop_decode_lanes,
                 "attn_gqa": self.attn_gqa,
                 "flash_attn": self.flash_attn,
                 "prefill_attn": self.prefill_attn,
@@ -4077,10 +4125,14 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 (true, false) => "x-scalar",
                 (false, false) => "scalar",
             },
-            match (self.attn_coop, self.attn_split) {
-                (true, _) => "coop",
-                (false, true) => "split-k",
-                (false, false) => "single",
+            if self.attn_coop {
+                "coop"
+            } else if self.attn_coop_decode_lanes > 0 {
+                "coop-decode"
+            } else if self.attn_split {
+                "split-k"
+            } else {
+                "single"
             },
             self.coop_min_n_tokens,
         )
@@ -4371,6 +4423,23 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             && subgroup_wide_enough
             && !crate::engine::env::flag_on("ORANGU_NO_ATTN_COOP")
             && !ATTN_COOP_MISCOMPILED.load(std::sync::atomic::Ordering::Relaxed);
+        // The decode kernel at the subgroup's own width where 32 is too
+        // wide: a workgroup of one subgroup, so `subgroupAdd` is the whole
+        // dot. On the Mali-G720 the classic split kernel took 27 ms a token
+        // of attention at depth 2048 (`doc/PERF-ALL.md`, task 6).
+        let attn_coop_decode_lanes = if attn_coop {
+            32
+        } else if supports_subgroup
+            && info.subgroup_min_size >= 8
+            && info.subgroup_min_size.is_power_of_two()
+            && !crate::engine::env::flag_on("ORANGU_NO_ATTN_COOP")
+            && crate::engine::env::flag_on_unless_disabled("ORANGU_ATTN_COOP16")
+            && !ATTN_COOP_MISCOMPILED.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            info.subgroup_min_size
+        } else {
+            0
+        };
         // Effective decode-attention split-k. An explicit `ORANGU_ATTN_SPLIT_K`
         // always wins; otherwise the cooperative kernel — serial over positions
         // per split — wants more splits than the classic kernel to shorten that
@@ -4378,12 +4447,17 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // classic kernel stays at its own default.
         // `0` stands in for "unset" so the shared helper can report a
         // rejected value: every real split count is a power of two in
-        // `1..=32`, so it cannot collide with one.
+        // `1..=64`, so it cannot collide with one. 64 is a hard ceiling: the
+        // wide split merge (`ATTENTION_SPLIT_REDUCE_WIDE_SHADER`) holds a
+        // split's `(m, l)` in 64-entry workgroup arrays and clamps `k_num`
+        // to them — at 128 it indexed the partials as if there were 64 and
+        // every head past the first read another's (NaN; the fused
+        // attention tests catch it).
         let attn_split_k_override = match super::env_tuning_value(
             "ORANGU_ATTN_SPLIT_K",
             0u32,
-            "one of 1, 2, 4, 8, 16, 32",
-            |n| matches!(n, 1 | 2 | 4 | 8 | 16 | 32),
+            "one of 1, 2, 4, 8, 16, 32, 64",
+            |n| matches!(n, 1 | 2 | 4 | 8 | 16 | 32 | 64),
         ) {
             0 => None,
             n => Some(n),
@@ -4391,8 +4465,17 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // An explicit override pins `k_num` (no per-token adaptation); otherwise
         // the cap is coop-aware and `adaptive_split_k` tunes down at short KV.
         let attn_split_k_pinned = attn_split_k_override.is_some();
-        let attn_split_k =
-            attn_split_k_override.unwrap_or(if attn_coop { 32 } else { ATTN_SPLIT_K_DEFAULT });
+        // The cooperative kernel walks its split's positions one at a time,
+        // so more splits are more parallelism: 32 where it is 32 lanes wide
+        // (measured there), 64 at a narrower subgroup's width — on the
+        // Mali-G720 at depth 2048, `attn.split` took 26.6 ms a token at 8
+        // splits, 14.3 at 16, 8.5 at 32 and 7.3 at 64 (`doc/PERF-ALL.md`,
+        // task 6).
+        let attn_split_k = attn_split_k_override.unwrap_or(match attn_coop_decode_lanes {
+            0 => ATTN_SPLIT_K_DEFAULT,
+            32.. => 32,
+            _ => 64,
+        });
         dump_shaders_if_requested(subgroup_reduce, kv_storage, vec4_tiles);
         // Per-layer GPU timestamps for one decode step (`Self::
         // timestamp_query_set`/`finish_timestamps`/`report_timestamps`,
@@ -4995,6 +5078,11 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             && supports_subgroup
             && crate::engine::env::flag_on_unless_disabled("ORANGU_TERNARY_IDOT")
             && crate::engine::env::flag_on_unless_disabled("ORANGU_TERNARY_I8");
+        // `Q4_K` on the same integer dot and skeleton (`ORANGU_Q4K_I8=0`
+        // keeps its float dual kernel, the A/B's other arm).
+        let q4k_i8_on = decode_mmvq
+            && supports_subgroup
+            && crate::engine::env::flag_on_unless_disabled("ORANGU_Q4K_I8");
         let build_i8 = |n_rows: usize, wide: bool| -> HashMap<u32, wgpu::ComputePipeline> {
             if !decode_mmvq {
                 return HashMap::new();
@@ -5002,6 +5090,18 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             SUPPORTED_TYPES
                 .iter()
                 .filter_map(|&ggml_type| {
+                    if ggml_type == crate::engine::quant::GGML_TYPE_Q4_K {
+                        if !q4k_i8_on {
+                            return None;
+                        }
+                        let (rows, groups) = if wide {
+                            (*Q4K_I8_ROWS, *Q4K_I8_GROUPS)
+                        } else {
+                            (1, 1)
+                        };
+                        let source = vulkan_shaders::shader_source_q4k_i8(rows, groups, true);
+                        return Some((ggml_type, build_pipeline(source)));
+                    }
                     if vulkan_shaders::is_ternary(ggml_type) {
                         if !ternary_i8_on {
                             return None;
@@ -5711,6 +5811,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             q4_k_mmvq,
             attn_gqa,
             attn_coop,
+            attn_coop_decode_lanes,
             attn_split_k,
             attn_split_k_pinned,
             gpu_timestamps,
@@ -8190,15 +8291,42 @@ impl VulkanBackend {
         if self.q4_k_mmvq && w.ggml_type() == crate::engine::quant::GGML_TYPE_Q4_K {
             return self.q4_k_mmvq_fused_pipeline.as_ref().map(|p| (p, 1));
         }
-        if self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens).1 != "block-hoisted" {
+        // `Q4_K`'s integer-dot kernel stands in for its float dual kernel,
+        // which is not a block-hoisted one; every other type's only where
+        // its float kernel is.
+        // Only in its row-group form: a narrower projection (a 256-row K or V)
+        // measured slower on the one-row form than on the float kernel (34
+        // against 22 µs), so it keeps the float one.
+        #[cfg(test)]
+        let q4k_off = Q4K_I8_OFF_ON_THIS_THREAD.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let q4k_off = false;
+        let q4k = !q4k_off
+            && w.ggml_type() == crate::engine::quant::GGML_TYPE_Q4_K
+            && w.in_dim.is_multiple_of(256)
+            && w.out_dim >= Q4K_I8_WIDE_MIN_OUT
+            && self
+                .block_hoisted_i8_pipelines
+                .contains_key(&crate::engine::quant::GGML_TYPE_Q4_K);
+        if !q4k && self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens).1 != "block-hoisted" {
             return None;
         }
         let ternary = vulkan_shaders::is_ternary(w.ggml_type());
-        if w.out_dim >= BLOCK_HOISTED_WIDE_MIN_OUT
+        // The `Q4_K` kernel's rows share its activation words, so it takes
+        // its row groups from far fewer rows than the others: a 1536-row
+        // `ffn_down` is 192 workgroups of eight, plenty for the device.
+        let wide_min = if q4k {
+            Q4K_I8_WIDE_MIN_OUT
+        } else {
+            BLOCK_HOISTED_WIDE_MIN_OUT
+        };
+        if w.out_dim >= wide_min
             && let Some(p) = self.block_hoisted_i8_wide_pipelines.get(&w.ggml_type())
         {
             let rows = if ternary {
                 *TERNARY_IDOT_ROWS * *TERNARY_IDOT_GROUPS
+            } else if q4k {
+                *Q4K_I8_ROWS * *Q4K_I8_GROUPS
             } else {
                 BLOCK_HOISTED_WIDE_ROWS
             };
@@ -8206,7 +8334,7 @@ impl VulkanBackend {
         }
         self.block_hoisted_i8_pipelines
             .get(&w.ggml_type())
-            .map(|p| (p, if ternary { 1 } else { reduce_n_rows() }))
+            .map(|p| (p, if ternary || q4k { 1 } else { reduce_n_rows() }))
     }
 
     /// [`Self::pipeline_for`] for a matmul op — the wide block-hoisted
@@ -12327,6 +12455,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let meta = self.elem_meta_buffer(4096, 0.0);
         let bg = self.elem3_bind_group(&x, &y, &meta);
         self.dispatch_kernel_us(&pipeline, &bg, (workgroups, 1, 1), reps)
+    }
+
+    /// Keeps `Q4_K` on its float decode kernel on this thread until the
+    /// guard drops — see `Q4K_I8_OFF_ON_THIS_THREAD`.
+    #[cfg(test)]
+    pub(crate) fn float_q4k_decode_on_this_thread() -> impl Drop {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                Q4K_I8_OFF_ON_THIS_THREAD.with(|c| c.set(false));
+            }
+        }
+        Q4K_I8_OFF_ON_THIS_THREAD.with(|c| c.set(true));
+        Reset
     }
 
     /// Runs `f` with the integer-dot GEMM disabled on this thread — see
@@ -21613,9 +21755,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let use_flash = self.flash_attn && hd == 512;
         // The cooperative-reduction kernel needs `head_dim % 32 == 0` (gemma's
         // 512/256 qualify). It supersedes flash when both are requested.
-        let use_coop = self.attn_coop && hd.is_multiple_of(32);
+        let lanes = self.attn_coop_decode_lanes;
+        let use_coop = lanes > 0 && hd.is_multiple_of(lanes);
         let source = if use_coop {
-            vulkan_shaders::shader_source_attention_split_coop(self.kv_storage, hd, paging)
+            vulkan_shaders::shader_source_attention_split_coop(self.kv_storage, hd, lanes, paging)
         } else if use_flash {
             vulkan_shaders::shader_source_attention_split_flash(
                 self.kv_storage,
@@ -22987,7 +23130,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // the default when it applies, so the capture must match it.
             let use_flash = self.flash_attn && head_dim == 512;
             let use_gqa = self.attn_gqa && group > 1;
-            let use_coop = self.attn_coop && head_dim.is_multiple_of(32) && !use_flash && !use_gqa;
+            let lanes = self.attn_coop_decode_lanes;
+            let use_coop =
+                lanes > 0 && (head_dim as u32).is_multiple_of(lanes) && !use_flash && !use_gqa;
+            let coop_lanes = if use_coop { lanes } else { 0 };
             if !use_flash && !use_gqa {
                 let k_num = self.attn_split_k;
                 self.capture_push(|| {
@@ -23004,7 +23150,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                         &split.partial_acc,
                         self.kv_storage,
                         self.subgroup_reduce,
-                        use_coop,
+                        coop_lanes,
                         n_head,
                         n_head_kv,
                         head_dim,
@@ -25386,7 +25532,7 @@ fn attn_split_capture_step(
     partial_acc: &wgpu::Buffer,
     kv_storage: vulkan_shaders::KvStorage,
     subgroup: bool,
-    coop: bool,
+    coop_lanes: u32,
     n_head: usize,
     n_head_kv: usize,
     head_dim: usize,
@@ -25422,10 +25568,11 @@ fn attn_split_capture_step(
         size,
     };
     CaptureStep::Dispatch {
-        wgsl: if coop {
+        wgsl: if coop_lanes > 0 {
             vulkan_shaders::shader_source_attention_split_coop(
                 kv_storage,
                 head_dim as u32,
+                coop_lanes,
                 vulkan_shaders::KvPaging::Contiguous,
             )
         } else {

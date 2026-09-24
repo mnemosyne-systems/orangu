@@ -75,6 +75,7 @@ theme = classic
 | `workspaces` | No | Placement of the workspace tabs. Defaults to `top`. Options: `top`, `bottom`, `left`, `right` |
 | `quotes` | No | Quote set shown while the model is thinking. Defaults to `none`. Options: `none`, `star_trek`, `star_wars`, `marco_pierre_white`, `gordon_ramsay`, `calvin_and_hobbes`, `sun_tzu_mandarin`, `sun_tzu_english`, `attila_the_hun`, `all` |
 | `feedback` | No | Show a green or red dot in the output window after each command to indicate success or failure, blink an `orangu ●` progress title and ring the terminal bell when a `/auto_review` finishes. Defaults to `off`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
+| `prime` | No | When a TUI tab opens a fresh session, send its opening — the system prompt and tool definitions every turn starts with, ~1900 tokens on `gemma-4-E2B` — to the server as a one-token request in the background, so the server has it prefilled by the time the first prompt is typed. Measured on the CIX P1: the first turn of a fresh server goes from a full prefill to the cached one. Defaults to `on`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `terminal` | No | Launch command used to open `$EDITOR` for terminal editors in a new window for `/open_file` (for example `xterm -e` or `kitty`). When unset, a terminal emulator is auto-detected |
 
 ### Git and code hosting

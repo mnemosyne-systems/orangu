@@ -536,6 +536,18 @@ pub(crate) struct MlaLayer {
 /// the same dot products in the same order, so which one runs cannot change
 /// an output; see the `hoist` guard in `MlaLayer::forward` for the
 /// measurement that decides it.
+/// `ORANGU_MLA_NO_HOIST=1` keeps latent attention on the per-row
+/// dequantize at every width, so the hoisted path can be compared against
+/// the one it replaced inside one binary.
+///
+/// The hoist is the only thing about this module that changes behaviour at
+/// `n_tokens > 1`, which makes it the first suspect whenever a batched
+/// forward disagrees with the same tokens fed one at a time.
+fn mla_no_hoist() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_MLA_NO_HOIST"))
+}
+
 pub(crate) fn project_rows(
     weights: &ExpertQuantMatrix,
     hoisted: Option<&[Vec<f32>]>,
@@ -800,7 +812,7 @@ impl MlaLayer {
         // Measured **-6.8% on decode** before this guard, against +2.3% on
         // prefill with it — the hoist is a prefill optimization and saying so
         // in the type is cheaper than re-deriving it.
-        let hoist = n_tokens > 1;
+        let hoist = n_tokens > 1 && !mla_no_hoist();
         let wk_b = hoist.then(|| absorb(&self.wk_b, shape.kv_lora_rank));
         let wv_b = hoist.then(|| absorb(&self.wv_b, shape.head_v_mla));
 

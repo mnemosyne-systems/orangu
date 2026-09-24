@@ -2716,8 +2716,26 @@ impl PairedI8 {
 /// (`out` rows at least `2 * k.pairs` long). Needs [`have_i8mm`] on
 /// `aarch64`; elsewhere, or without it, the scalar definition.
 pub fn i8_scores_4rows(q: &PairedI8, qa: usize, qb: usize, k: &PairedI8, out: [&mut [i32]; 4]) {
+    i8_scores_4rows_in(q, qa, qb, k, 0..k.pairs, out)
+}
+
+/// [`i8_scores_4rows`] against key pairs `pairs` of `k` only: `out[r][j]`
+/// is the score against key `2 * pairs.start + j`. What a query block whose
+/// windows cover part of the keys asks for — a sliding-window layer's
+/// prompt attention (`attention_mixed`).
+pub fn i8_scores_4rows_in(
+    q: &PairedI8,
+    qa: usize,
+    qb: usize,
+    k: &PairedI8,
+    pairs: std::ops::Range<usize>,
+    out: [&mut [i32]; 4],
+) {
     debug_assert_eq!(q.dim, k.dim);
+    debug_assert!(pairs.end <= k.pairs);
     let dim = q.dim;
+    let p0 = pairs.start;
+    let n_pairs = pairs.len();
     #[cfg(target_arch = "aarch64")]
     if have_i8mm() {
         use std::arch::aarch64::*;
@@ -2727,13 +2745,13 @@ pub fn i8_scores_4rows(q: &PairedI8, qa: usize, qb: usize, k: &PairedI8, out: [&
         // ran at the instruction's latency, sixteen deep), the query rows
         // loaded once for all four, and each row's eight scores stored as
         // two vectors — a 64-bit zip of the pairs' lanes.
-        let quads = k.pairs / 4;
+        let quads = n_pairs / 4;
         for p4 in 0..quads {
             // Safety: `i8mm` was verified; every load is 16 bytes inside a
             // `2 * dim` pair, `dim` a multiple of 8; the stores write
-            // `o*[8 * p4..8 * p4 + 8]`, inside `2 * k.pairs`.
+            // `o*[8 * p4..8 * p4 + 8]`, inside `2 * n_pairs`.
             unsafe {
-                let kp: [*const i8; 4] = std::array::from_fn(|j| k.pair(4 * p4 + j).as_ptr());
+                let kp: [*const i8; 4] = std::array::from_fn(|j| k.pair(p0 + 4 * p4 + j).as_ptr());
                 let mut x = [vdupq_n_s32(0); 4];
                 let mut y = [vdupq_n_s32(0); 4];
                 let mut c = 0;
@@ -2771,8 +2789,8 @@ pub fn i8_scores_4rows(q: &PairedI8, qa: usize, qb: usize, k: &PairedI8, out: [&
                 }
             }
         }
-        for p in 4 * quads..k.pairs {
-            let kp = k.pair(p);
+        for p in 4 * quads..n_pairs {
+            let kp = k.pair(p0 + p);
             // Safety: `i8mm` was verified; every load is 16 bytes inside a
             // `2 * dim` pair, `dim` a multiple of 8.
             let (x, y) = unsafe {
@@ -2808,9 +2826,9 @@ pub fn i8_scores_4rows(q: &PairedI8, qa: usize, qb: usize, k: &PairedI8, out: [&
     };
     let rows = [2 * qa, 2 * qa + 1, 2 * qb, 2 * qb + 1];
     for (o, &r) in out.into_iter().zip(&rows) {
-        for (j, slot) in o.iter_mut().enumerate().take(2 * k.pairs) {
+        for (j, slot) in o.iter_mut().enumerate().take(2 * n_pairs) {
             *slot = (0..dim)
-                .map(|c| unpaired(q, r, c) * unpaired(k, j, c))
+                .map(|c| unpaired(q, r, c) * unpaired(k, 2 * p0 + j, c))
                 .sum();
         }
     }
@@ -3569,8 +3587,6 @@ pub struct PackedBf16 {
 
 impl PackedBf16 {
     /// `n_rows` rows of `k` values, element `(r, i)` read through `get`.
-    // The reference the fast packers are tested against.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn pack(n_rows: usize, k: usize, get: impl Fn(usize, usize) -> f32) -> Self {
         let rows = n_rows.div_ceil(8) * 8;
         let chunks = k.div_ceil(4);
@@ -3699,8 +3715,6 @@ impl PackedBf16 {
     /// Row `r` from `values` (at most `k` long; the rest of the row, its
     /// padding included, zeros) — a softmax row written straight into
     /// `bfmmla`'s layout.
-    // The reference the fast packers are tested against.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_row(&mut self, r: usize, values: &[f32]) {
         let (pair, half) = (r / 2, r % 2);
         let base = pair * self.chunks * 8 + half * 4;
@@ -3729,18 +3743,27 @@ impl PackedBf16 {
 /// block's probabilities, `b` a head's values transposed.
 pub fn bf16_tiles(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
     debug_assert_eq!(a.chunks, b.chunks);
+    bf16_tiles_at(a, b, 0, out)
+}
+
+/// [`bf16_tiles`] with `a` packed over part of `b`'s `k`: `a`'s chunk `c`
+/// meets `b`'s chunk `b_chunk + c` — a query block's probabilities over the
+/// keys its windows cover, against a head's values packed once over all of
+/// them (`attention_mixed`).
+pub fn bf16_tiles_at(a: &PackedBf16, b: &PackedBf16, b_chunk: usize, out: &mut [f32]) {
+    debug_assert!(b_chunk + a.chunks <= b.chunks);
     debug_assert_eq!(out.len(), a.rows * b.rows);
     #[cfg(target_arch = "aarch64")]
     if have_bf16mm() {
         // Safety: `bf16` was verified.
-        unsafe { bf16_tiles_mmla(a, b, out) };
+        unsafe { bf16_tiles_mmla(a, b, b_chunk, out) };
         return;
     }
-    bf16_tiles_portable(a, b, out)
+    bf16_tiles_portable(a, b, b_chunk, out)
 }
 
 /// The definition [`bf16_tiles_mmla`] is held to.
-pub fn bf16_tiles_portable(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
+pub fn bf16_tiles_portable(a: &PackedBf16, b: &PackedBf16, b_chunk: usize, out: &mut [f32]) {
     let at = |m: &PackedBf16, r: usize, c: usize, i: usize| -> f32 {
         from_bf16(m.data[(r / 2) * m.chunks * 8 + c * 8 + (r % 2) * 4 + i])
     };
@@ -3749,7 +3772,7 @@ pub fn bf16_tiles_portable(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
             let mut acc = 0f32;
             for c in 0..a.chunks {
                 for e in 0..4 {
-                    acc += at(a, i, c, e) * at(b, j, c, e);
+                    acc += at(a, i, c, e) * at(b, j, b_chunk + c, e);
                 }
             }
             out[i * b.rows + j] = acc;
@@ -3758,20 +3781,21 @@ pub fn bf16_tiles_portable(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
 }
 
 #[cfg(target_arch = "aarch64")]
-unsafe fn bf16_tiles_mmla(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
+unsafe fn bf16_tiles_mmla(a: &PackedBf16, b: &PackedBf16, b_chunk: usize, out: &mut [f32]) {
     use std::arch::aarch64::*;
     let chunks = a.chunks;
+    let b_chunks = b.chunks;
     unsafe {
         for it in 0..a.rows / 8 {
             for jt in 0..b.rows / 8 {
                 let mut acc = [[vdupq_n_f32(0.0); 4]; 4];
                 let ap = a.data.as_ptr().add(it * 4 * chunks * 8);
-                let bp = b.data.as_ptr().add(jt * 4 * chunks * 8);
+                let bp = b.data.as_ptr().add(jt * 4 * b_chunks * 8 + b_chunk * 8);
                 for c in 0..chunks {
                     let av: [uint16x8_t; 4] =
                         std::array::from_fn(|p| vld1q_u16(ap.add(p * chunks * 8 + c * 8)));
                     let bv: [uint16x8_t; 4] =
-                        std::array::from_fn(|p| vld1q_u16(bp.add(p * chunks * 8 + c * 8)));
+                        std::array::from_fn(|p| vld1q_u16(bp.add(p * b_chunks * 8 + c * 8)));
                     for (ap_, row) in av.iter().zip(acc.iter_mut()) {
                         for (bp_, cell) in bv.iter().zip(row.iter_mut()) {
                             *cell = bfmmla(*cell, *ap_, *bp_);
@@ -3790,6 +3814,166 @@ unsafe fn bf16_tiles_mmla(a: &PackedBf16, b: &PackedBf16, out: &mut [f32]) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// A weight matrix in `bf16`, packed once for [`matmul_bf16`]: its rows
+/// are [`bf16_tiles`]'s `b` operand, so a prompt's activations, packed per
+/// task, meet them on the 8 × 8 `bfmmla` tile with `f32` sums.
+///
+/// For weights the file stores unquantized (`F32`, `F16`, `BF16`), where an
+/// `int8` copy would add a quantization the file does not have: a `BF16`
+/// matrix is exact here, an `F32` one rounds each weight to 8 bits of
+/// mantissa (`doc/PERF-ALL.md`, task 13).
+pub struct Bf16Weights {
+    packed: PackedBf16,
+    pub in_dim: usize,
+    pub out_dim: usize,
+}
+
+impl Bf16Weights {
+    /// `out_dim` rows of `in_dim`, row `o` produced by `row(o)` in `f32`.
+    pub fn from_rows(
+        out_dim: usize,
+        in_dim: usize,
+        row: impl Fn(usize) -> Vec<f32> + Sync,
+    ) -> Self {
+        let rows: Vec<Vec<f32>> = (0..out_dim).into_par_iter().map(&row).collect();
+        let packed = PackedBf16::pack(out_dim, in_dim, |r, i| rows[r][i]);
+        Self {
+            packed,
+            in_dim,
+            out_dim,
+        }
+    }
+
+    /// Resident bytes.
+    pub fn bytes(&self) -> usize {
+        self.packed.data.len() * 2
+    }
+}
+
+/// Tokens per [`matmul_bf16`] task — two 8-row `bfmmla` tiles of them.
+const BF16_TOKEN_BLOCK: usize = 16;
+
+/// Weight tiles (8 rows each) per [`matmul_bf16`] task.
+const BF16_ROW_TILES: usize = 8;
+
+/// `x · wᵀ` for `x` `[n_tokens][in_dim]` on `bfmmla`: the activations
+/// rounded to `bf16` per task, `f32` sums, `[n_tokens][out_dim]` out.
+/// Tasks are token blocks × groups of weight tiles, so a narrow matrix (256
+/// rows) against a chunk of tokens and a wide one (8960 rows) both spread
+/// over the pool. Needs [`have_bf16mm`].
+pub fn matmul_bf16(x: &[f32], n_tokens: usize, w: &Bf16Weights) -> Vec<f32> {
+    debug_assert_eq!(x.len(), n_tokens * w.in_dim);
+    debug_assert!(have_bf16mm());
+    let (in_dim, out_dim) = (w.in_dim, w.out_dim);
+    let mut out = vec![0f32; n_tokens * out_dim];
+    let n_tb = n_tokens.div_ceil(BF16_TOKEN_BLOCK);
+    let n_jt = w.packed.rows / 8;
+    let n_jg = n_jt.div_ceil(BF16_ROW_TILES);
+    #[derive(Clone, Copy)]
+    struct Sink(*mut f32);
+    unsafe impl Send for Sink {}
+    unsafe impl Sync for Sink {}
+    impl Sink {
+        fn at(self, offset: usize) -> *mut f32 {
+            // Safety: the caller writes inside `out`.
+            unsafe { self.0.add(offset) }
+        }
+    }
+    let sink = Sink(out.as_mut_ptr());
+    (0..n_tb * n_jg).into_par_iter().for_each_init(
+        || (usize::MAX, PackedBf16::zeroed(BF16_TOKEN_BLOCK, in_dim)),
+        |(held, a), task| {
+            let (tb, jg) = (task / n_jg, task % n_jg);
+            let t0 = tb * BF16_TOKEN_BLOCK;
+            let nt = BF16_TOKEN_BLOCK.min(n_tokens - t0);
+            // Consecutive tasks of a worker share a token block: packed once.
+            if *held != tb {
+                for r in 0..BF16_TOKEN_BLOCK {
+                    if r < nt {
+                        a.set_row(r, &x[(t0 + r) * in_dim..(t0 + r + 1) * in_dim]);
+                    } else {
+                        a.set_row(r, &[]);
+                    }
+                }
+                *held = tb;
+            }
+            let jts = jg * BF16_ROW_TILES..((jg + 1) * BF16_ROW_TILES).min(n_jt);
+            let mut tile = [0f32; 64];
+            for it in 0..a.rows / 8 {
+                for jt in jts.clone() {
+                    bf16_tile(a, &w.packed, it, jt, &mut tile);
+                    for (i, row) in tile.chunks(8).enumerate() {
+                        let t = it * 8 + i;
+                        if t >= nt {
+                            break;
+                        }
+                        for (j, v) in row.iter().enumerate() {
+                            let o = jt * 8 + j;
+                            if o < out_dim {
+                                // Safety: (t0 + t, o) is this task's alone.
+                                unsafe { *sink.at((t0 + t) * out_dim + o) = *v };
+                            }
+                        }
+                    }
+                }
+            }
+        },
+    );
+    out
+}
+
+/// One 8 × 8 tile of `a · bᵀ`: `a`'s rows `8 it ..`, `b`'s rows `8 jt ..`,
+/// row-major into `out`.
+fn bf16_tile(a: &PackedBf16, b: &PackedBf16, it: usize, jt: usize, out: &mut [f32; 64]) {
+    debug_assert_eq!(a.chunks, b.chunks);
+    #[cfg(target_arch = "aarch64")]
+    if have_bf16mm() {
+        use std::arch::aarch64::*;
+        let chunks = a.chunks;
+        // Safety: `bf16` was verified; both tiles are inside their packs.
+        unsafe {
+            let mut acc = [[vdupq_n_f32(0.0); 4]; 4];
+            let ap = a.data.as_ptr().add(it * 4 * chunks * 8);
+            let bp = b.data.as_ptr().add(jt * 4 * chunks * 8);
+            for c in 0..chunks {
+                let av: [uint16x8_t; 4] =
+                    std::array::from_fn(|p| vld1q_u16(ap.add(p * chunks * 8 + c * 8)));
+                let bv: [uint16x8_t; 4] =
+                    std::array::from_fn(|p| vld1q_u16(bp.add(p * chunks * 8 + c * 8)));
+                for (ap_, row) in av.iter().zip(acc.iter_mut()) {
+                    for (bp_, cell) in bv.iter().zip(row.iter_mut()) {
+                        *cell = bfmmla(*cell, *ap_, *bp_);
+                    }
+                }
+            }
+            for (pi, row) in acc.iter().enumerate() {
+                for (pj, &v4) in row.iter().enumerate() {
+                    let mut lanes = [0f32; 4];
+                    vst1q_f32(lanes.as_mut_ptr(), v4);
+                    for (lane, v) in lanes.iter().enumerate() {
+                        out[(pi * 2 + lane / 2) * 8 + pj * 2 + lane % 2] = *v;
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let at = |m: &PackedBf16, r: usize, c: usize, i: usize| -> f32 {
+        from_bf16(m.data[(r / 2) * m.chunks * 8 + c * 8 + (r % 2) * 4 + i])
+    };
+    for i in 0..8 {
+        for j in 0..8 {
+            let mut acc = 0f32;
+            for c in 0..a.chunks {
+                for e in 0..4 {
+                    acc += at(a, it * 8 + i, c, e) * at(b, jt * 8 + j, c, e);
+                }
+            }
+            out[i * 8 + j] = acc;
         }
     }
 }
@@ -5389,6 +5573,15 @@ fn k_row_block_sum(act: &ActQ8KRow, b: usize) -> i32 {
     act.sums[b * 2] + act.sums[b * 2 + 1]
 }
 
+/// Whether the super-block-wide `sdot` row kernels for `Q4_K`/`Q6_K` are
+/// used — `ORANGU_SDOT_K_ROWS=0` keeps the per-32 generic form, for
+/// measuring the difference. Default on.
+#[cfg(target_arch = "aarch64")]
+fn sdot_k_rows_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| super::env::flag_on_unless_disabled("ORANGU_SDOT_K_ROWS"))
+}
+
 /// Decode dot for the two-bit family, accumulating across the whole
 /// super-block in `i32`.
 pub fn dot_k_row(ggml_type: u32, row: &[u8], act: &ActQ8KRow) -> f32 {
@@ -5436,6 +5629,18 @@ fn dot_k_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8KRow) ->
             GGML_TYPE_Q4_K => return unsafe { dot_k_row_q4_k_avx2(row, act) },
             GGML_TYPE_Q5_K => return unsafe { dot_k_row_q5_k_avx2(row, act) },
             GGML_TYPE_Q6_K => return unsafe { dot_k_row_q6_k_avx2(row, act) },
+            _ => {}
+        }
+    }
+    // The two types a `Q4_K_M` file's layers are made of take the
+    // super-block-wide `sdot` kernels, the aarch64 counterpart of the AVX2
+    // ones above.
+    #[cfg(target_arch = "aarch64")]
+    if ISA == ISA_DOTPROD && sdot_k_rows_enabled() {
+        // Safety: `ISA_DOTPROD` is instantiated only after `have_dotprod`.
+        match ggml_type {
+            GGML_TYPE_Q4_K => return unsafe { dot_k_row_q4_k_sdot(row, act) },
+            GGML_TYPE_Q6_K => return unsafe { dot_k_row_q6_k_sdot(row, act) },
             _ => {}
         }
     }
@@ -6093,6 +6298,141 @@ fn dot_k_row_q6_k<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
             }
         }
         total += act.d[s] * d * isum as f32;
+    }
+    total
+}
+
+/// [`dot_k_row_q4_k`] on `sdot` hardware, one **super-block per pass**: the
+/// 128 quant bytes split into low and high nibbles in registers, each
+/// 16-byte half dotted against its activations (two independent `sdot`s per
+/// 32-element sub-block), the pair's four lanes scaled by the sub-block's
+/// 6-bit scale with one `mla`, and one horizontal sum per super-block — no
+/// unpacked `i8` array and no reduction per 32 elements. The integer sums
+/// are the generic kernel's exactly and the float expression is the same,
+/// so the result is bit-identical (`sdot_k_rows_match_the_generic_kernels`).
+///
+/// Why it exists: the generic form ran at 5.0 GB/s of weights on one A720,
+/// a quarter of what one core can read, so eight cores could not reach the
+/// memory's rate however they were scheduled (`doc/PERF-ALL.md`, task 15).
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_k_row_q4_k_sdot(row: &[u8], act: &ActQ8KRow) -> f32 {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 128;
+    let mut total = 0f32;
+    unsafe {
+        let m4 = vdupq_n_u8(0x0F);
+        let zero = vdupq_n_s32(0);
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let d = read_f16(block, 0);
+            let dmin = read_f16(block, 2);
+            let scales = &block[4..16];
+            let qs = block.as_ptr().add(16);
+            let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+            let sb = s * SUBS;
+            let mut sc = [0i32; SUBS];
+            let mut imin = 0i32;
+            for (j, sc_j) in sc.iter_mut().enumerate() {
+                let (a, m) = get_scale_min_k4(j, scales);
+                *sc_j = a as i32;
+                imin += m as i32 * k_row_block_sum(act, sb + j);
+            }
+            let mut acc0 = zero;
+            let mut acc1 = zero;
+            for g in 0..4 {
+                let q0 = vld1q_u8(qs.add(g * 32));
+                let q1 = vld1q_u8(qs.add(g * 32 + 16));
+                let lo0 = vreinterpretq_s8_u8(vandq_u8(q0, m4));
+                let lo1 = vreinterpretq_s8_u8(vandq_u8(q1, m4));
+                let hi0 = vreinterpretq_s8_u8(vshrq_n_u8(q0, 4));
+                let hi1 = vreinterpretq_s8_u8(vshrq_n_u8(q1, 4));
+                let xg = x.add(g * 64);
+                let plo = vdotq_s32(
+                    vdotq_s32(zero, lo0, vld1q_s8(xg)),
+                    lo1,
+                    vld1q_s8(xg.add(16)),
+                );
+                let phi = vdotq_s32(
+                    vdotq_s32(zero, hi0, vld1q_s8(xg.add(32))),
+                    hi1,
+                    vld1q_s8(xg.add(48)),
+                );
+                acc0 = vmlaq_n_s32(acc0, plo, sc[2 * g]);
+                acc1 = vmlaq_n_s32(acc1, phi, sc[2 * g + 1]);
+            }
+            let isum = vaddvq_s32(vaddq_s32(acc0, acc1));
+            total += act.d[s] * (d * isum as f32 - dmin * imin as f32);
+        }
+    }
+    total
+}
+
+/// [`dot_k_row_q6_k`] on `sdot` hardware, the same way as
+/// [`dot_k_row_q4_k_sdot`]: each 32-element run's six-bit quants assembled
+/// in registers from its `ql` nibbles and `qh` bit pair, and each 16-lane
+/// half — `Q6_K` scales per 16 — dotted and scaled into the super-block's
+/// accumulator. Bit-identical to the generic kernel.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+unsafe fn dot_k_row_q6_k_sdot(row: &[u8], act: &ActQ8KRow) -> f32 {
+    use std::arch::aarch64::*;
+    const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
+    let mut total = 0f32;
+    unsafe {
+        let m4 = vdupq_n_u8(0x0F);
+        let three = vdupq_n_u8(3);
+        let bias = vdupq_n_s8(32);
+        let zero = vdupq_n_s32(0);
+        // One run's 16 lanes: the nibble, the two high bits above it, less 32.
+        let six = |nib: uint8x16_t, hb: uint8x16_t| {
+            vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(nib, vshlq_n_u8(hb, 4))), bias)
+        };
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let ql = block.as_ptr();
+            let qh = block.as_ptr().add(128);
+            let sc = &block[192..208];
+            let d = read_f16(block, 208);
+            let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+            let mut acc0 = zero;
+            let mut acc1 = zero;
+            for h in 0..2 {
+                let l0 = vld1q_u8(ql.add(h * 64));
+                let l1 = vld1q_u8(ql.add(h * 64 + 16));
+                let l2 = vld1q_u8(ql.add(h * 64 + 32));
+                let l3 = vld1q_u8(ql.add(h * 64 + 48));
+                let h0 = vld1q_u8(qh.add(h * 32));
+                let h1 = vld1q_u8(qh.add(h * 32 + 16));
+                // The four runs of `Q6K_RUNS`, in element order.
+                let runs = [
+                    (
+                        six(vandq_u8(l0, m4), vandq_u8(h0, three)),
+                        six(vandq_u8(l1, m4), vandq_u8(h1, three)),
+                    ),
+                    (
+                        six(vandq_u8(l2, m4), vandq_u8(vshrq_n_u8(h0, 2), three)),
+                        six(vandq_u8(l3, m4), vandq_u8(vshrq_n_u8(h1, 2), three)),
+                    ),
+                    (
+                        six(vshrq_n_u8(l0, 4), vandq_u8(vshrq_n_u8(h0, 4), three)),
+                        six(vshrq_n_u8(l1, 4), vandq_u8(vshrq_n_u8(h1, 4), three)),
+                    ),
+                    (
+                        six(vshrq_n_u8(l2, 4), vshrq_n_u8(h0, 6)),
+                        six(vshrq_n_u8(l3, 4), vshrq_n_u8(h1, 6)),
+                    ),
+                ];
+                for (k, (w0, w1)) in runs.into_iter().enumerate() {
+                    let r = h * 4 + k;
+                    let xr = x.add(r * 32);
+                    let p0 = vdotq_s32(zero, w0, vld1q_s8(xr));
+                    let p1 = vdotq_s32(zero, w1, vld1q_s8(xr.add(16)));
+                    acc0 = vmlaq_n_s32(acc0, p0, sc[2 * r] as i8 as i32);
+                    acc1 = vmlaq_n_s32(acc1, p1, sc[2 * r + 1] as i8 as i32);
+                }
+            }
+            let isum = vaddvq_s32(vaddq_s32(acc0, acc1));
+            total += act.d[s] * d * isum as f32;
+        }
     }
     total
 }
@@ -6952,6 +7292,34 @@ mod tests {
                          (err {err}, term-magnitude {scale})"
                     );
                 }
+            }
+        }
+    }
+
+    /// The super-block-wide `sdot` kernels must reproduce the generic ones
+    /// exactly: the same integer sums, the same float expression.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sdot_k_rows_match_the_generic_kernels() {
+        if !have_dotprod() {
+            return;
+        }
+        for in_dim in [256usize, 1536, 6144] {
+            for seed in [1u32, 7, 99, 1234] {
+                let x = activations(in_dim);
+                let act = quantize_act_k_row(&x);
+                let row = fixture_row(GGML_TYPE_Q4_K, in_dim, seed);
+                assert_eq!(
+                    unsafe { dot_k_row_q4_k_sdot(&row, &act) }.to_bits(),
+                    dot_k_row_q4_k::<ISA_DOTPROD>(&row, &act).to_bits(),
+                    "Q4_K in_dim {in_dim} seed {seed}"
+                );
+                let row = fixture_row(GGML_TYPE_Q6_K, in_dim, seed);
+                assert_eq!(
+                    unsafe { dot_k_row_q6_k_sdot(&row, &act) }.to_bits(),
+                    dot_k_row_q6_k::<ISA_DOTPROD>(&row, &act).to_bits(),
+                    "Q6_K in_dim {in_dim} seed {seed}"
+                );
             }
         }
     }
@@ -8419,6 +8787,44 @@ mod i8_scores_tests {
 mod bf16_tests {
     use super::*;
 
+    /// `matmul_bf16` against the `f32` product: token counts and row counts
+    /// that are not whole tiles or whole tasks, the output token-major.
+    /// Within `bf16` rounding of both operands (8 bits of mantissa each).
+    #[test]
+    fn matmul_bf16_matches_the_f32_product() {
+        if !have_bf16mm() {
+            return;
+        }
+        for &(n_tokens, in_dim, out_dim) in
+            &[(1usize, 64usize, 8usize), (17, 256, 37), (40, 1536, 300)]
+        {
+            let x: Vec<f32> = (0..n_tokens * in_dim)
+                .map(|i| ((i * 31 % 97) as f32 - 48.0) / 48.0)
+                .collect();
+            let w: Vec<f32> = (0..out_dim * in_dim)
+                .map(|i| ((i * 17 % 89) as f32 - 44.0) / 44.0)
+                .collect();
+            let packed = Bf16Weights::from_rows(out_dim, in_dim, |o| {
+                w[o * in_dim..(o + 1) * in_dim].to_vec()
+            });
+            let got = matmul_bf16(&x, n_tokens, &packed);
+            assert_eq!(got.len(), n_tokens * out_dim);
+            for t in 0..n_tokens {
+                for o in 0..out_dim {
+                    let xs = &x[t * in_dim..(t + 1) * in_dim];
+                    let ws = &w[o * in_dim..(o + 1) * in_dim];
+                    let want: f32 = xs.iter().zip(ws).map(|(a, b)| a * b).sum();
+                    let scale: f32 = xs.iter().zip(ws).map(|(a, b)| (a * b).abs()).sum();
+                    let g = got[t * out_dim + o];
+                    assert!(
+                        (g - want).abs() <= 1e-2 * scale.max(1.0),
+                        "{n_tokens}x{in_dim}x{out_dim} token {t} row {o}: {g} against {want}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The `bfmmla` tiles match their portable twin exactly (both sum
     /// `bf16` products in `f32`; the order differs only within a lane's
     /// four) to rounding, and the exact `f32` product to `bf16`'s eight bits.
@@ -8436,7 +8842,7 @@ mod bf16_tests {
         let mut got = vec![0f32; pa.rows * pb.rows];
         bf16_tiles(&pa, &pb, &mut got);
         let mut twin = vec![0f32; pa.rows * pb.rows];
-        bf16_tiles_portable(&pa, &pb, &mut twin);
+        bf16_tiles_portable(&pa, &pb, 0, &mut twin);
         for i in 0..n_a {
             for j in 0..n_b {
                 let (g, t) = (got[i * pb.rows + j], twin[i * pb.rows + j]);

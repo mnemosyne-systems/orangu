@@ -444,9 +444,11 @@ fn detect_power_source() -> (PowerSource, Option<u8>) {
 /// prefill 43.0 → 36.8 tok/s when pinned, because a forward pass is many
 /// short parallel regions with slack the little cores fill — while decode
 /// went the other way, 4.66 → 5.48 tok/s pinned. So the server keeps one
-/// worker per logical core by default and offers the big cluster behind
-/// `ORANGU_EXPERT_BIG_CORES=1`; a decode-only deployment is the case that
-/// wants it, and a decode-specific pool is the open task.
+/// worker per logical core for its global pool and offers the big cluster
+/// behind `ORANGU_EXPERT_BIG_CORES=1`; the per-phase pools a request runs
+/// in are chosen by measurement (`engine::cpu_pools` in `orangu-server`,
+/// `doc/PERF-ALL.md` task 9) — after the prompt path got faster the little
+/// cores stopped helping a prompt, and they still cost decode a third.
 ///
 /// Returns the cores at or above half the largest capacity — the big
 /// cluster, in that ordering — or `None` when the machine is homogeneous
@@ -479,6 +481,194 @@ pub fn big_cores() -> Option<Vec<usize>> {
     {
         None
     }
+}
+
+/// One kind of core on this machine: which logical cores are of it, what
+/// the scheduler rates them (`cpu_capacity`, 1024 for the fastest), their
+/// top clocks, and the core's name where the part number is one this knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreClass {
+    pub name: Option<&'static str>,
+    pub cores: Vec<usize>,
+    /// Lowest and highest `cpu_capacity` among them, when the kernel lists it.
+    pub capacity: Option<(u64, u64)>,
+    /// Lowest and highest maximum clock among them, in MHz.
+    pub max_mhz: Option<(u64, u64)>,
+}
+
+/// The name of an Arm core from its `MIDR` part number (`/proc/cpuinfo`'s
+/// `CPU part`), for the cores a server is likely to meet.
+fn arm_part_name(part: u32) -> Option<&'static str> {
+    Some(match part {
+        0xd03 => "Cortex-A53",
+        0xd05 => "Cortex-A55",
+        0xd08 => "Cortex-A72",
+        0xd0b => "Cortex-A76",
+        0xd0c => "Neoverse-N1",
+        0xd40 => "Neoverse-V1",
+        0xd41 => "Cortex-A78",
+        0xd44 => "Cortex-X1",
+        0xd46 => "Cortex-A510",
+        0xd47 => "Cortex-A710",
+        0xd48 => "Cortex-X2",
+        0xd49 => "Neoverse-N2",
+        0xd4d => "Cortex-A715",
+        0xd4e => "Cortex-X3",
+        0xd4f => "Neoverse-V2",
+        0xd80 => "Cortex-A520",
+        0xd81 => "Cortex-A720",
+        0xd82 => "Cortex-X4",
+        0xd85 => "Cortex-X925",
+        0xd87 => "Cortex-A725",
+        _ => return None,
+    })
+}
+
+/// The kinds of core this machine has, fastest first — by part number
+/// where `/proc/cpuinfo` gives one, else by `cpu_capacity`. One class on a
+/// homogeneous machine; empty where nothing is listed (non-Linux).
+///
+/// What `engine::adapt` reports first, because every CPU decision after it
+/// depends on it: a `Cortex-A520` runs the `smmla` GEMM at a sixth of a
+/// `Cortex-A720`'s rate, so twelve cores are not twelve equal workers.
+pub fn core_classes() -> Vec<CoreClass> {
+    #[cfg(target_os = "linux")]
+    {
+        let read = |path: String| -> Option<u64> {
+            std::fs::read_to_string(path).ok()?.trim().parse().ok()
+        };
+        // `processor : N` then, a few lines on, `CPU part : 0x...`.
+        let mut parts = std::collections::HashMap::new();
+        if let Ok(text) = std::fs::read_to_string("/proc/cpuinfo") {
+            let mut current = None;
+            for line in text.lines() {
+                let Some((key, value)) = line.split_once(':') else {
+                    continue;
+                };
+                match key.trim() {
+                    "processor" => current = value.trim().parse::<usize>().ok(),
+                    "CPU part" => {
+                        if let (Some(cpu), Ok(part)) = (
+                            current,
+                            u32::from_str_radix(value.trim().trim_start_matches("0x"), 16),
+                        ) {
+                            parts.insert(cpu, part);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut cores: Vec<CoreReading> = Vec::new();
+        let Ok(dir) = std::fs::read_dir("/sys/devices/system/cpu") else {
+            return Vec::new();
+        };
+        for entry in dir.flatten() {
+            let name = entry.file_name();
+            let Some(index) = name
+                .to_string_lossy()
+                .strip_prefix("cpu")
+                .and_then(|rest| rest.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            let base = format!("/sys/devices/system/cpu/cpu{index}");
+            cores.push((
+                index,
+                parts.get(&index).copied(),
+                read(format!("{base}/cpu_capacity")),
+                read(format!("{base}/cpufreq/cpuinfo_max_freq")).map(|khz| khz / 1000),
+            ));
+        }
+        core_classes_from(cores)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Vec::new()
+    }
+}
+
+/// One logical core as [`core_classes`] reads it: `(core, part, capacity,
+/// max MHz)`.
+type CoreReading = (usize, Option<u32>, Option<u64>, Option<u64>);
+
+/// [`core_classes`]' grouping over [`CoreReading`]s.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn core_classes_from(mut cores: Vec<CoreReading>) -> Vec<CoreClass> {
+    cores.sort_unstable_by_key(|c| c.0);
+    // The part where known; else the capacity, which is what tells a big
+    // core from a little one on a machine that does not name its parts.
+    let key = |c: &CoreReading| match c.1 {
+        Some(part) => (0, part as u64),
+        None => (1, c.2.unwrap_or(0)),
+    };
+    let mut classes: Vec<((u8, u64), CoreClass)> = Vec::new();
+    for c in &cores {
+        let k = key(c);
+        let class = match classes.iter_mut().find(|(ck, _)| *ck == k) {
+            Some((_, class)) => class,
+            None => {
+                classes.push((
+                    k,
+                    CoreClass {
+                        name: c.1.and_then(arm_part_name),
+                        cores: Vec::new(),
+                        capacity: None,
+                        max_mhz: None,
+                    },
+                ));
+                &mut classes.last_mut().expect("just pushed").1
+            }
+        };
+        class.cores.push(c.0);
+        let widen = |range: Option<(u64, u64)>, v: Option<u64>| match (range, v) {
+            (Some((lo, hi)), Some(v)) => Some((lo.min(v), hi.max(v))),
+            (None, Some(v)) => Some((v, v)),
+            (range, None) => range,
+        };
+        class.capacity = widen(class.capacity, c.2);
+        class.max_mhz = widen(class.max_mhz, c.3);
+    }
+    let mut classes: Vec<CoreClass> = classes.into_iter().map(|(_, c)| c).collect();
+    // Fastest first: by capacity, then by clock.
+    classes.sort_by_key(|c| {
+        std::cmp::Reverse((c.capacity.map_or(0, |r| r.1), c.max_mhz.map_or(0, |r| r.1)))
+    });
+    classes
+}
+
+/// One line for a set of [`CoreClass`]es: `8 × Cortex-A720 (2.2–2.6 GHz,
+/// capacity 866–1024) + 4 × Cortex-A520 (1.8 GHz, capacity 279)`.
+pub fn describe_core_classes(classes: &[CoreClass]) -> String {
+    let range = |r: (u64, u64), f: &dyn Fn(u64) -> String| {
+        if r.0 == r.1 {
+            f(r.0)
+        } else {
+            format!("{}–{}", f(r.0), f(r.1))
+        }
+    };
+    classes
+        .iter()
+        .map(|c| {
+            let mut detail = Vec::new();
+            if let Some(mhz) = c.max_mhz {
+                detail.push(format!(
+                    "{} GHz",
+                    range(mhz, &|v| format!("{:.1}", v as f64 / 1000.0))
+                ));
+            }
+            if let Some(cap) = c.capacity {
+                detail.push(format!("capacity {}", range(cap, &|v| v.to_string())));
+            }
+            let name = c.name.unwrap_or("cores");
+            if detail.is_empty() {
+                format!("{} × {name}", c.cores.len())
+            } else {
+                format!("{} × {name} ({})", c.cores.len(), detail.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 /// [`big_cores`]'s rule over `(core, capacity)` pairs, in core order:
@@ -1496,6 +1686,32 @@ fn format_gpu_entries(out: &mut String, gpus: &[GpuInfo]) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn core_classes_group_by_part_and_sort_fastest_first() {
+        let classes = super::core_classes_from(vec![
+            (0, Some(0xd81), Some(1024), Some(2600)),
+            (2, Some(0xd80), Some(279), Some(1800)),
+            (1, Some(0xd81), Some(866), Some(2200)),
+            (3, Some(0xd80), Some(279), Some(1800)),
+        ]);
+        assert_eq!(classes.len(), 2);
+        assert_eq!(classes[0].name, Some("Cortex-A720"));
+        assert_eq!(classes[0].cores, vec![0, 1]);
+        assert_eq!(classes[0].capacity, Some((866, 1024)));
+        assert_eq!(classes[1].cores, vec![2, 3]);
+        assert_eq!(
+            super::describe_core_classes(&classes),
+            "2 × Cortex-A720 (2.2–2.6 GHz, capacity 866–1024) + 2 × Cortex-A520 (1.8 GHz, capacity 279)"
+        );
+        // No part numbers: grouped by capacity.
+        let x86 = super::core_classes_from(vec![
+            (0, None, None, Some(4000)),
+            (1, None, None, Some(4000)),
+        ]);
+        assert_eq!(x86.len(), 1);
+        assert_eq!(super::describe_core_classes(&x86), "2 × cores (4.0 GHz)");
+    }
+
     /// The big cluster is what stays after halving the largest capacity:
     /// the development board's A720s (905–1024) with its A520s (279) left
     /// out, in core order; a homogeneous machine — or one with no capacity

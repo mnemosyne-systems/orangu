@@ -311,9 +311,13 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     flamegraph_layers: Option<String>,
 
-    /// Seconds to keep sampling under `--flamegraph-layers`.
+    /// Seconds to keep sampling under `--flamegraph-layers` or `--flamegraph-watch`.
     #[arg(long, default_value_t = 60, value_name = "SECONDS")]
     flamegraph_duration: u64,
+
+    /// With `--flamegraph PATH`: profile the server for `--flamegraph-duration` seconds while something else drives it — a real client's request rather than this tool's. One process, so it works where `--flamegraph-layers` (system-wide) is not allowed. Measures nothing itself.
+    #[arg(long, default_value_t = false)]
+    flamegraph_watch: bool,
 
     /// Compare already-collapsed `.folded` profiles side by side; measure nothing.
     #[arg(long, value_delimiter = ',', value_name = "LIST")]
@@ -1218,6 +1222,9 @@ fn run(args: &Args) -> anyhow::Result<()> {
     // coordinator — and this tool only watches.
     if let Some(dir) = &args.flamegraph_layers {
         return profile_layers(args, std::path::Path::new(dir));
+    }
+    if args.flamegraph_watch {
+        return profile_watch(args);
     }
 
     // Starts its own servers, so it comes before the client below is pointed
@@ -3661,6 +3668,35 @@ fn resolve_call_graph(client: &reqwest::blocking::Client, args: &Args) -> String
     if frame_pointers { "fp" } else { "dwarf" }.to_string()
 }
 
+/// `--flamegraph-watch`: the server's flamegraph over a fixed window while
+/// something else — a real `orangu`, a script — drives it, the way
+/// `--flamegraph` brackets this tool's own requests. For the requests this
+/// tool cannot make itself: a client's first turn after a restart, with its
+/// own system prompt and tools, is what `doc/PERF-ALL.md` task 4 measures.
+fn profile_watch(args: &Args) -> anyhow::Result<()> {
+    let Some(svg) = &args.flamegraph else {
+        anyhow::bail!("--flamegraph-watch needs --flamegraph <PATH> for the picture");
+    };
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(args.timeout))
+        .build()?;
+    let label = args
+        .label
+        .clone()
+        .unwrap_or_else(|| server_label(&client, args));
+    let recorder = start_profile(&client, args, svg, &label)?;
+    if !args.json {
+        println!(
+            "  watching for {}s — drive the server now",
+            args.flamegraph_duration
+        );
+    }
+    std::thread::sleep(std::time::Duration::from_secs(args.flamegraph_duration));
+    let summary = recorder.finish()?;
+    report_profile(&summary, args);
+    Ok(())
+}
+
 /// Begin a flamegraph capture of whichever process is answering `--url`.
 fn start_profile(
     client: &reqwest::blocking::Client,
@@ -3729,7 +3765,9 @@ fn url_port(url: &str) -> Option<u16> {
 /// carries its own workload rather than depending on its filename.
 fn workload_name(args: &Args) -> String {
     let list = |v: &[u32]| v.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
-    if !args.image.is_empty() {
+    if args.flamegraph_watch {
+        format!("watched {}s", args.flamegraph_duration)
+    } else if !args.image.is_empty() {
         format!(
             "image {} steps {}{}{}",
             list(&args.image),

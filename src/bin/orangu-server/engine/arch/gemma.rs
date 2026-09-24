@@ -314,6 +314,21 @@ fn kv_estimate(loaded: &LoadedModel, ring_for: Option<usize>) -> usize {
         .sum()
 }
 
+/// Tokens of the prompt-placement probe's pass (`GemmaModel::time_prompt_pass`):
+/// a short prompt, past where a device switches to its batched kernels.
+const PROMPT_PROBE_TOKENS: usize = 64;
+
+/// Layers of that pass: enough of the model to hold its attention,
+/// norms and per-layer embeddings as a prompt does, few enough to cost a
+/// fraction of a second where the device is the slow side — the server
+/// cannot answer until it is done. Four layers timed four times put 1.1 s
+/// on the CIX P1's start-up (the Mali's ~240 ms a pass).
+const PROMPT_PROBE_LAYERS: usize = 2;
+
+/// Passes of the probe: one untimed (pipelines, clocks), the rest timed,
+/// the best kept.
+const PROMPT_PROBE_PASSES: usize = 3;
+
 pub struct GemmaModel {
     config: ModelConfig,
     backend: Arc<dyn Backend>,
@@ -356,6 +371,17 @@ pub struct GemmaModel {
     /// Opt-in raw-Vulkan decode replay (`ORANGU_REPLAY`), built lazily on the
     /// first single-token decode. `None` until then / when disabled.
     decode_replay: std::sync::Mutex<Option<DecodeReplay>>,
+    /// The backend a prompt (a multi-token pass) runs on when it is not the
+    /// model's own: `[orangu-server].prefill_backend` — `auto` (the
+    /// default) times one prompt-shaped FFN GEMM on the device and on the
+    /// CPU at load and keeps the faster (`engine::prefill_backend`). On a
+    /// board whose integrated GPU does the GEMMs at ~150 GFLOP/s and whose
+    /// big cores do the `i8mm` GEMM several times faster, a prompt is
+    /// 4–5× faster on the host while decode stays on the device; on a
+    /// discrete card the device wins and this stays `None`. The weights
+    /// are mapped for both; K/V rows the host writes reach the device's
+    /// mirror the way a CPU-orchestrated pass's always have.
+    prefill_backend: Option<Arc<dyn Backend>>,
 }
 
 impl GemmaModel {
@@ -733,9 +759,16 @@ gemma 4 checkpoint."
             );
         }
 
-        Ok(Self {
+        // Dense models only: a MoE layer's experts are host tensors on
+        // either backend, and its routed branch is what a prompt costs.
+        // Decided below, once the model can run a pass.
+        let probe_gemm = (!is_moe && !is_embedding_arch)
+            .then(|| layers.first().map(|l| l.ffn_gate.clone()))
+            .flatten();
+        let mut model = Self {
             config,
             backend,
+            prefill_backend: None,
             tok_embeddings,
             output_norm,
             output_weight,
@@ -765,10 +798,51 @@ gemma 4 checkpoint."
             per_layer_proj_norm,
             layers,
             decode_replay: std::sync::Mutex::new(None),
-        })
-        .inspect(|_: &Self| {
-            let _ = rms_eps; // used inline below via self.config.rms_eps override per layer call sites
-        })
+        };
+        let _ = rms_eps; // used inline below via self.config.rms_eps override per layer call sites
+        // Where a prompt runs (`engine::prefill_backend`): under `auto`,
+        // a prompt-shaped pass of this model's first layers timed with its
+        // prompts on the device and on the cores (`Self::time_prompt_pass`).
+        if let Some(w) = probe_gemm {
+            let device = model.backend.clone();
+            let pass = format!(
+                "a {PROMPT_PROBE_TOKENS}-token pass through {} of {} layers",
+                PROMPT_PROBE_LAYERS.min(model.layers.len()),
+                model.layers.len()
+            );
+            model.prefill_backend =
+                crate::engine::prefill_backend::cpu_for_prompts_by(&device, &w, &pass, |prompts| {
+                    model.time_prompt_pass(prompts)
+                });
+        }
+        Ok(model)
+    }
+
+    /// Seconds for a [`PROMPT_PROBE_TOKENS`]-token prompt through the first
+    /// [`PROMPT_PROBE_LAYERS`] layers with the prompts on `prompts` (`None`:
+    /// the device) — the best of the timed [`PROMPT_PROBE_PASSES`] after one untimed pass (a device's
+    /// first builds pipelines and lifts its clock). Each pass on a fresh
+    /// cache, as a prompt starts. Leaves `prompts` in place; the caller sets
+    /// the one it chooses.
+    fn time_prompt_pass(&mut self, prompts: Option<Arc<dyn Backend>>) -> Option<f64> {
+        self.prefill_backend = prompts;
+        let tokens: Vec<u32> = (0..PROMPT_PROBE_TOKENS as u32)
+            .map(|i| 10 + i % 97)
+            .map(|t| t.min(self.config.n_vocab.saturating_sub(1) as u32))
+            .collect();
+        let x = self.scaled_token_embeddings(&tokens).ok()?;
+        let layers = 0..PROMPT_PROBE_LAYERS.min(self.layers.len());
+        let mut best = f64::INFINITY;
+        for rep in 0..PROMPT_PROBE_PASSES {
+            let mut cache = self.new_kv_cache(PROMPT_PROBE_TOKENS + 1);
+            let started = std::time::Instant::now();
+            self.run_layers(Some(&mut cache), None, &x, &tokens, 0, true, layers.clone())
+                .ok()?;
+            if rep > 0 {
+                best = best.min(started.elapsed().as_secs_f64());
+            }
+        }
+        Some(best)
     }
 
     fn rms_eps(&self) -> f32 {
@@ -899,6 +973,16 @@ gemma 4 checkpoint."
     /// The device holding the KV cache layer `il` attends over: its own for
     /// a KV-owning layer, the donor's for a layer that shares one
     /// (`GemmaLayer::kv_donor`).
+    /// The backend a pass of `n_tokens` runs on: the prompt backend for a
+    /// multi-token pass of one sequence when the load-time probe chose one,
+    /// the model's own otherwise.
+    fn pass_backend(&self, n_tokens: usize, batch: bool) -> &Arc<dyn Backend> {
+        match &self.prefill_backend {
+            Some(prompts) if n_tokens > 1 && !batch => prompts,
+            _ => &self.backend,
+        }
+    }
+
     fn kv_device(&self, il: usize) -> usize {
         self.layers[self.layers[il].kv_donor].wo.device()
     }
@@ -1333,6 +1417,10 @@ gemma 4 checkpoint."
         let n_embd = self.config.n_embd;
         let eps = self.rms_eps();
         let mut x = x0.to_vec();
+        // Where this pass runs: a prompt goes to the backend the load-time
+        // probe picked for prompts (`Self::prefill_backend`), everything
+        // else — a decode step, a decode batch — to the model's own.
+        let backend = self.pass_backend(n_tokens, batch.is_some());
         // The chunk's host phases, for `ORANGU_CPU_TIMESTAMPS`: what the
         // host does before its chains are recorded, the recording itself,
         // the submission, and what it waits for afterwards. A device idle
@@ -1356,8 +1444,7 @@ gemma 4 checkpoint."
         // filled once, below, instead of waited for per layer.
         let mut pending_kv: Vec<(usize, Vec<crate::engine::backend::vulkan::PendingKvRows>)> =
             Vec::new();
-        let mut kv_stage = self
-            .backend
+        let mut kv_stage = backend
             .as_wgpu()
             .filter(|_| one.is_some() && !prefill_kv_wait())
             .map(|v| {
@@ -1391,8 +1478,7 @@ gemma 4 checkpoint."
         // that declines) reads the host form, computed on demand.
         let inp_per_layer_dev = if has_ple
             && prefill_stream_ple_inputs()
-            && self
-                .backend
+            && backend
                 .as_wgpu()
                 .is_some_and(|v| v.prefill_fused_attention_enabled())
             && self.layers.iter().all(|l| l.moe.is_none())
@@ -1400,7 +1486,7 @@ gemma 4 checkpoint."
             let (Some(proj_w), Some(proj_norm), Some(v)) = (
                 self.per_layer_model_proj.as_ref(),
                 self.per_layer_proj_norm.as_ref(),
-                self.backend.as_wgpu(),
+                backend.as_wgpu(),
             ) else {
                 unreachable!("a per-layer-embedding model loads its projection and norm")
             };
@@ -1419,7 +1505,7 @@ gemma 4 checkpoint."
             None
         };
         let mut inp_per_layer = if has_ple && inp_per_layer_dev.is_none() {
-            Some(self.compute_per_layer_inputs(&x, tokens, n_tokens))
+            Some(self.compute_per_layer_inputs(backend.as_ref(), &x, tokens, n_tokens))
         } else {
             None
         };
@@ -1433,7 +1519,8 @@ gemma 4 checkpoint."
                 let embd = x_embd
                     .as_deref()
                     .expect("kept while the device holds the inputs");
-                *inp = Some(self.compute_per_layer_inputs(embd, tokens, n_tokens));
+                *inp =
+                    Some(self.compute_per_layer_inputs(backend.as_ref(), embd, tokens, n_tokens));
             }
         };
         // Whether the model has per-layer inputs at all, wherever they are.
@@ -1452,7 +1539,7 @@ gemma 4 checkpoint."
         let prefill_trace = submission_trace();
         // The per-dispatch device breakdown (`ORANGU_GPU_TIMESTAMPS=ops`)
         // across every chain this pass submits — reported once at the end.
-        if let Some(vulkan) = self.backend.as_wgpu() {
+        if let Some(vulkan) = backend.as_wgpu() {
             vulkan.begin_op_span();
         }
 
@@ -1476,13 +1563,12 @@ gemma 4 checkpoint."
         // writes its padded tail rows.
         let mut x_dev: Option<wgpu::Buffer> = None;
         let device_rows = crate::engine::backend::vulkan::prefill_rows_capacity(n_tokens);
-        let mut stream_bufs: Option<[wgpu::Buffer; 2]> = self
-            .backend
+        let mut stream_bufs: Option<[wgpu::Buffer; 2]> = backend
             .as_wgpu()
             .filter(|v| v.prefill_fused_attention_enabled())
             .map(|v| std::array::from_fn(|_| v.prefill_rows_buffer(device_rows * n_embd)));
         let land = |x: &mut Vec<f32>, x_dev: &mut Option<wgpu::Buffer>| {
-            if let (Some(b), Some(v)) = (x_dev.take(), self.backend.as_wgpu()) {
+            if let (Some(b), Some(v)) = (x_dev.take(), backend.as_wgpu()) {
                 *x = v.readback_rows(&b, n_tokens * n_embd);
             }
         };
@@ -1499,7 +1585,7 @@ gemma 4 checkpoint."
                 && kv_stage.is_some()
                 && self.layers.iter().all(|l| l.moe.is_none()));
         if starts_on_device {
-            match (&stream_bufs, self.backend.as_wgpu()) {
+            match (&stream_bufs, backend.as_wgpu()) {
                 (Some(bufs), Some(v)) => {
                     v.upload_rows(&bufs[0], &x);
                     x_dev = Some(bufs[0].clone());
@@ -1547,17 +1633,16 @@ gemma 4 checkpoint."
                 && !ffn_on_npu
                 && !capturing
                 && (has_ple_stage || prefill_stream_dense())
-                && self.backend.as_wgpu_on(layer.wo.device()).is_some();
+                && backend.as_wgpu_on(layer.wo.device()).is_some();
             if !stays {
                 land(&mut x, &mut x_dev);
             }
-            if let (true, Some(v)) = (stays && layers_per_submit > 0, self.backend.as_wgpu()) {
+            if let (true, Some(v)) = (stays && layers_per_submit > 0, backend.as_wgpu()) {
                 v.begin_prefill_group();
             }
             // This layer's device scratch, recycled from the last layer's
             // rather than allocated afresh — see `VulkanBackend::scratch_lease`.
-            let _scratch_lease = self
-                .backend
+            let _scratch_lease = backend
                 .as_wgpu()
                 .filter(|_| stays)
                 .and_then(|v| v.scratch_lease());
@@ -1590,8 +1675,7 @@ gemma 4 checkpoint."
             // attention output on the device.
             let moe_head_takes_device_attn = layer.moe.is_some()
                 && moe_head_enabled()
-                && self
-                    .backend
+                && backend
                     .as_wgpu_on(layer.wo.device())
                     .is_some_and(|v| v.moe_head_serves(n_tokens, n_embd));
             let t_fused = Instant::now();
@@ -1599,8 +1683,7 @@ gemma 4 checkpoint."
             // post-attention chain can read it there instead of taking it
             // through host memory and back.
             let mut fused_attn_buf: Option<wgpu::Buffer> = None;
-            let fused_attn = self
-                .backend
+            let fused_attn = backend
                 // This layer's card: a fused attention chain is per-layer
                 // and needs no cross-layer state, so a split model keeps it
                 // — unless the cache it reads is on another card.
@@ -1749,7 +1832,7 @@ gemma 4 checkpoint."
                     });
                 }
                 let t0 = Instant::now();
-                let mut results = self.backend.matmul_batch(&ops).into_iter();
+                let mut results = backend.matmul_batch(&ops).into_iter();
                 if prefill_trace {
                     eprintln!(
                         "orangu-server: [prefill-trace] layer {il} qkv_matmul_batch \
@@ -1841,7 +1924,7 @@ gemma 4 checkpoint."
                     &q,
                     &mut cache.layers[cache_index],
                     &crate::engine::attention::Params {
-                        backend: self.backend.as_ref(),
+                        backend: backend.as_ref(),
                         // The cache's card, which is this layer's own unless
                         // it shares a donor placed elsewhere — see
                         // `attention::Params::device` and `Self::kv_device`.
@@ -1894,46 +1977,44 @@ gemma 4 checkpoint."
             // starts with this layer's result.
             let on_device = stays && fused_attn_buf.is_some();
             let fused_layer = if layer.moe.is_none() && !ffn_on_npu && !capturing {
-                self.backend
-                    .as_wgpu_on(layer.wo.device())
-                    .and_then(|vulkan| {
-                        vulkan.fused_post_attention_prefill_rows(
-                            match &fused_attn_buf {
-                                Some(b) => {
-                                    crate::engine::backend::vulkan::AttnOutSrc::Gpu(b, 0, n_tokens)
-                                }
-                                None => crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out),
-                            },
-                            match &x_dev {
-                                Some(b) => {
-                                    crate::engine::backend::vulkan::AttnOutSrc::Gpu(b, 0, n_tokens)
-                                }
-                                None => crate::engine::backend::vulkan::AttnOutSrc::Host(&x),
-                            },
-                            n_tokens,
-                            &layer.wo,
-                            Some(&layer.attn_post_norm),
-                            &layer.ffn_norm,
-                            &layer.ffn_gate,
-                            &layer.ffn_up,
-                            &layer.ffn_down,
-                            Some(&layer.ffn_post_norm),
-                            eps,
-                            crate::engine::backend::vulkan::FfnActivation::Geglu,
-                            match (&stream_bufs, on_device) {
-                                (Some(bufs), true) => Some((&bufs[1], 0)),
-                                _ => None,
-                            },
-                            // A layer with a per-layer-embedding stage applies
-                            // its output scale there; one without, here.
-                            if on_device && !has_ple_stage {
-                                layer.layer_output_scale
-                            } else {
-                                None
-                            },
-                            None,
-                        )
-                    })
+                backend.as_wgpu_on(layer.wo.device()).and_then(|vulkan| {
+                    vulkan.fused_post_attention_prefill_rows(
+                        match &fused_attn_buf {
+                            Some(b) => {
+                                crate::engine::backend::vulkan::AttnOutSrc::Gpu(b, 0, n_tokens)
+                            }
+                            None => crate::engine::backend::vulkan::AttnOutSrc::Host(&attn_out),
+                        },
+                        match &x_dev {
+                            Some(b) => {
+                                crate::engine::backend::vulkan::AttnOutSrc::Gpu(b, 0, n_tokens)
+                            }
+                            None => crate::engine::backend::vulkan::AttnOutSrc::Host(&x),
+                        },
+                        n_tokens,
+                        &layer.wo,
+                        Some(&layer.attn_post_norm),
+                        &layer.ffn_norm,
+                        &layer.ffn_gate,
+                        &layer.ffn_up,
+                        &layer.ffn_down,
+                        Some(&layer.ffn_post_norm),
+                        eps,
+                        crate::engine::backend::vulkan::FfnActivation::Geglu,
+                        match (&stream_bufs, on_device) {
+                            (Some(bufs), true) => Some((&bufs[1], 0)),
+                            _ => None,
+                        },
+                        // A layer with a per-layer-embedding stage applies
+                        // its output scale there; one without, here.
+                        if on_device && !has_ple_stage {
+                            layer.layer_output_scale
+                        } else {
+                            None
+                        },
+                        None,
+                    )
+                })
             } else {
                 None
             };
@@ -1958,7 +2039,7 @@ gemma 4 checkpoint."
                         // the next layer's input already.
                         group_layers += 1;
                         if group_layers >= layers_per_submit.max(1)
-                            && let Some(v) = self.backend.as_wgpu()
+                            && let Some(v) = backend.as_wgpu()
                         {
                             v.end_prefill_group();
                             group_layers = 0;
@@ -1977,10 +2058,8 @@ gemma 4 checkpoint."
                 // What comes back is the residual the experts read, the
                 // router's logits and the shared branch's result.
                 let moe_head = match &layer.moe {
-                    Some(moe) if moe_head_enabled() => self
-                        .backend
-                        .as_wgpu_on(layer.wo.device())
-                        .and_then(|vulkan| {
+                    Some(moe) if moe_head_enabled() => {
+                        backend.as_wgpu_on(layer.wo.device()).and_then(|vulkan| {
                             let t0 = Instant::now();
                             let scale = 1.0 / (n_embd as f32).sqrt();
                             let router_weight: Vec<f32> =
@@ -2009,7 +2088,8 @@ gemma 4 checkpoint."
                             );
                             trace_submission(il, "moe_head", n_tokens, t0);
                             got
-                        }),
+                        })
+                    }
                     _ => None,
                 };
                 let moe_head_logits = match moe_head {
@@ -2025,12 +2105,11 @@ gemma 4 checkpoint."
                         let attn_elems = n_tokens * layer.wo.in_dim;
                         if attn_out.len() != attn_elems
                             && let (Some(buf), Some(v)) =
-                                (&fused_attn_buf, self.backend.as_wgpu_on(layer.wo.device()))
+                                (&fused_attn_buf, backend.as_wgpu_on(layer.wo.device()))
                         {
                             attn_out = v.readback_rows(buf, attn_elems);
                         }
-                        self.backend
-                            .matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
+                        backend.matmul_into(&mut attn_proj, &attn_out, n_tokens, &layer.wo);
                         tensor::rmsnorm_inplace(
                             &mut attn_proj,
                             &layer.attn_post_norm,
@@ -2066,8 +2145,7 @@ gemma 4 checkpoint."
                             let routed = self.moe_routed_branch(il, moe, &x, n_tokens, &logits);
                             trace_submission(il, "moe_experts", n_tokens, t0);
                             let t0 = Instant::now();
-                            let mut shared = self
-                                .backend
+                            let mut shared = backend
                                 .as_wgpu_on(layer.wo.device())
                                 .expect("the head chain ran on this device")
                                 .finish_rows(pending);
@@ -2122,19 +2200,17 @@ gemma 4 checkpoint."
                     let fused = if on_npu {
                         None
                     } else {
-                        self.backend
-                            .as_wgpu_on(layer.wo.device())
-                            .and_then(|vulkan| {
-                                vulkan.fused_ffn_prefill(
-                                    &ffn_normed,
-                                    n_tokens,
-                                    &layer.ffn_gate,
-                                    &layer.ffn_up,
-                                    &layer.ffn_down,
-                                    crate::engine::backend::vulkan::FfnActivation::Geglu,
-                                    None,
-                                )
-                            })
+                        backend.as_wgpu_on(layer.wo.device()).and_then(|vulkan| {
+                            vulkan.fused_ffn_prefill(
+                                &ffn_normed,
+                                n_tokens,
+                                &layer.ffn_gate,
+                                &layer.ffn_up,
+                                &layer.ffn_down,
+                                crate::engine::backend::vulkan::FfnActivation::Geglu,
+                                None,
+                            )
+                        })
                     };
                     if let Some(mut ffn_out) = fused {
                         if prefill_trace {
@@ -2163,7 +2239,7 @@ gemma 4 checkpoint."
                             npu.forward_into(il, n_tokens, &ffn_normed, &mut ffn_out)
                         });
                         if !from_npu {
-                            self.backend.matmul_batch_into(
+                            backend.matmul_batch_into(
                                 &mut gate_up_scratch,
                                 &[
                                     MatmulOp {
@@ -2192,8 +2268,7 @@ gemma 4 checkpoint."
                             tensor::gelu_inplace(gate);
                             tensor::mul_inplace(gate, &up[0]);
                             let t0 = Instant::now();
-                            self.backend
-                                .matmul_into(&mut ffn_out, gate, n_tokens, &layer.ffn_down);
+                            backend.matmul_into(&mut ffn_out, gate, n_tokens, &layer.ffn_down);
                             if prefill_trace {
                                 eprintln!(
                                     "orangu-server: [prefill-trace] layer {il} ffn_down_matmul \
@@ -2233,70 +2308,63 @@ gemma 4 checkpoint."
                 // On the device the stage is recorded whole — projection,
                 // post-norm, residual add and the layer's output scale — into
                 // the free buffer, which then becomes the next layer's input.
-                let fused = self
-                    .backend
-                    .as_wgpu_on(layer.wo.device())
-                    .and_then(|vulkan| {
-                        let t_gather = Instant::now();
-                        match (&x_dev, &stream_bufs, &inp_per_layer_dev) {
-                            (Some(b), Some(bufs), Some(dev)) => {
-                                use crate::engine::backend::vulkan::AttnOutSrc;
-                                vulkan.fused_ple_prefill_rows(
-                                    AttnOutSrc::Gpu(b, 0, n_tokens),
+                let fused = backend.as_wgpu_on(layer.wo.device()).and_then(|vulkan| {
+                    let t_gather = Instant::now();
+                    match (&x_dev, &stream_bufs, &inp_per_layer_dev) {
+                        (Some(b), Some(bufs), Some(dev)) => {
+                            use crate::engine::backend::vulkan::AttnOutSrc;
+                            vulkan.fused_ple_prefill_rows(
+                                AttnOutSrc::Gpu(b, 0, n_tokens),
+                                n_tokens,
+                                gate_w,
+                                proj_w,
+                                AttnOutSrc::Gpu(
+                                    dev,
+                                    (il * device_rows * per_layer) as u64 * 4,
+                                    n_tokens,
+                                ),
+                                Some(crate::engine::backend::vulkan::PleTail {
+                                    post_norm,
+                                    eps,
+                                    out_scale: layer.layer_output_scale,
+                                }),
+                                Some((&bufs[1], 0)),
+                            )
+                        }
+                        _ => {
+                            host_inputs(&mut inp_per_layer);
+                            let inp = inp_per_layer.as_deref().expect("computed above");
+                            let mut per_layer_in = Vec::with_capacity(n_tokens * per_layer);
+                            for t in 0..n_tokens {
+                                let base = (t * self.layers.len() + il) * per_layer;
+                                per_layer_in.extend_from_slice(&inp[base..base + per_layer]);
+                            }
+                            gather_ms = t_gather.elapsed().as_secs_f64() * 1000.0;
+                            match (&x_dev, &stream_bufs) {
+                                (Some(b), Some(bufs)) => vulkan.fused_ple_prefill_rows(
+                                    crate::engine::backend::vulkan::AttnOutSrc::Gpu(b, 0, n_tokens),
                                     n_tokens,
                                     gate_w,
                                     proj_w,
-                                    AttnOutSrc::Gpu(
-                                        dev,
-                                        (il * device_rows * per_layer) as u64 * 4,
-                                        n_tokens,
-                                    ),
+                                    crate::engine::backend::vulkan::AttnOutSrc::Host(&per_layer_in),
                                     Some(crate::engine::backend::vulkan::PleTail {
                                         post_norm,
                                         eps,
                                         out_scale: layer.layer_output_scale,
                                     }),
                                     Some((&bufs[1], 0)),
-                                )
-                            }
-                            _ => {
-                                host_inputs(&mut inp_per_layer);
-                                let inp = inp_per_layer.as_deref().expect("computed above");
-                                let mut per_layer_in = Vec::with_capacity(n_tokens * per_layer);
-                                for t in 0..n_tokens {
-                                    let base = (t * self.layers.len() + il) * per_layer;
-                                    per_layer_in.extend_from_slice(&inp[base..base + per_layer]);
-                                }
-                                gather_ms = t_gather.elapsed().as_secs_f64() * 1000.0;
-                                match (&x_dev, &stream_bufs) {
-                                    (Some(b), Some(bufs)) => vulkan.fused_ple_prefill_rows(
-                                        crate::engine::backend::vulkan::AttnOutSrc::Gpu(
-                                            b, 0, n_tokens,
-                                        ),
-                                        n_tokens,
-                                        gate_w,
-                                        proj_w,
-                                        crate::engine::backend::vulkan::AttnOutSrc::Host(
-                                            &per_layer_in,
-                                        ),
-                                        Some(crate::engine::backend::vulkan::PleTail {
-                                            post_norm,
-                                            eps,
-                                            out_scale: layer.layer_output_scale,
-                                        }),
-                                        Some((&bufs[1], 0)),
-                                    ),
-                                    _ => vulkan.fused_ple_prefill(
-                                        &x,
-                                        n_tokens,
-                                        gate_w,
-                                        proj_w,
-                                        &per_layer_in,
-                                    ),
-                                }
+                                ),
+                                _ => vulkan.fused_ple_prefill(
+                                    &x,
+                                    n_tokens,
+                                    gate_w,
+                                    proj_w,
+                                    &per_layer_in,
+                                ),
                             }
                         }
-                    });
+                    }
+                });
                 if x_dev.is_some() {
                     match fused {
                         Some(_) => {
@@ -2313,7 +2381,7 @@ gemma 4 checkpoint."
                             }
                             group_layers += 1;
                             if group_layers >= layers_per_submit.max(1)
-                                && let Some(v) = self.backend.as_wgpu()
+                                && let Some(v) = backend.as_wgpu()
                             {
                                 v.end_prefill_group();
                                 group_layers = 0;
@@ -2335,7 +2403,7 @@ gemma 4 checkpoint."
                 } else {
                     host_inputs(&mut inp_per_layer);
                     let inp_per_layer = inp_per_layer.as_deref().expect("computed above");
-                    self.backend.matmul_into(&mut pl_gate, &x, n_tokens, gate_w);
+                    backend.matmul_into(&mut pl_gate, &x, n_tokens, gate_w);
                     tensor::gelu_inplace(&mut pl_gate);
                     for t in 0..n_tokens {
                         let slice = &inp_per_layer[(t * self.layers.len() + il) * per_layer
@@ -2345,8 +2413,7 @@ gemma 4 checkpoint."
                             slice,
                         );
                     }
-                    self.backend
-                        .matmul_into(&mut pl_proj, &pl_gate, n_tokens, proj_w);
+                    backend.matmul_into(&mut pl_proj, &pl_gate, n_tokens, proj_w);
                     std::mem::take(&mut pl_proj)
                 };
                 tensor::rmsnorm_inplace(&mut proj, post_norm, n_tokens, n_embd, eps);
@@ -2361,19 +2428,19 @@ gemma 4 checkpoint."
                     *v *= scale;
                 }
             }
-            if let Some(v) = self.backend.as_wgpu() {
+            if let Some(v) = backend.as_wgpu() {
                 v.end_prefill_group();
                 group_layers = 0;
             }
         }
         phase("record", &mut phases);
-        if let Some(v) = self.backend.as_wgpu() {
+        if let Some(v) = backend.as_wgpu() {
             v.end_prefill_group();
         }
         phase("submit", &mut phases);
         // The previous chunk's rows, parked while this chunk's chains were
         // recorded and submitted — brought home now, while the device works.
-        if let (Some(vulkan), Some(cache)) = (self.backend.as_wgpu(), one.as_deref_mut()) {
+        if let (Some(vulkan), Some(cache)) = (backend.as_wgpu(), one.as_deref_mut()) {
             vulkan.fill_deferred_kv_rows(cache);
         }
         phase("fill-previous", &mut phases);
@@ -2386,8 +2453,7 @@ gemma 4 checkpoint."
         // parks the readback for the next chunk to complete after *its*
         // chains are submitted, so the device runs straight on; the last
         // chunk waits here, and the cache is whole when it returns.
-        if let (Some(vulkan), Some(cache), Some(stage)) =
-            (self.backend.as_wgpu(), one, kv_stage.take())
+        if let (Some(vulkan), Some(cache), Some(stage)) = (backend.as_wgpu(), one, kv_stage.take())
         {
             let pending = std::mem::take(&mut pending_kv);
             if want_x {
@@ -2400,10 +2466,10 @@ gemma 4 checkpoint."
         // Once per prefill, not per layer: what the backend's own allocators
         // have committed. `mem_info_vram_used` gives the total; this attributes
         // it (P11).
-        if let Some(vulkan) = self.backend.as_wgpu().filter(|_| prefill_trace) {
+        if let Some(vulkan) = backend.as_wgpu().filter(|_| prefill_trace) {
             eprintln!("{}", vulkan.footprint_report());
         }
-        if let Some(vulkan) = self.backend.as_wgpu() {
+        if let Some(vulkan) = backend.as_wgpu() {
             vulkan.finish_op_span(start_pos);
         }
         phase("kv", &mut phases);
@@ -2720,6 +2786,10 @@ impl ModelForward for GemmaModel {
         &self.config
     }
 
+    fn output_head(&self) -> Option<crate::engine::loader::QuantMatrix> {
+        Some(self.output_weight.clone())
+    }
+
     fn new_kv_cache(&self, capacity: usize) -> KvCache {
         let mut cache = KvCache::new_with_dims(capacity, &self.kv_dims());
         // A sliding-window layer's attention never reaches past its window,
@@ -2879,8 +2949,10 @@ impl ModelForward for GemmaModel {
         } else {
             let x = self.run_layers_cpu(cache, &x, tokens, start_pos)?;
             let last = &mut x[(n_tokens - 1) * n_embd..].to_vec();
-            tensor::rmsnorm_inplace(last, &self.output_norm, 1, n_embd, eps);
-            self.backend.matmul(last, 1, &self.output_weight)
+            crate::engine::decode_stages::scope(crate::engine::decode_stages::Stage::Head, || {
+                tensor::rmsnorm_inplace(last, &self.output_norm, 1, n_embd, eps);
+                crate::engine::head_split::matmul(self.backend.as_ref(), last, &self.output_weight)
+            })
         };
         if let Some(cap) = self.final_logit_softcapping {
             tensor::softcap_inplace(&mut logits, cap);
@@ -3285,6 +3357,7 @@ impl GemmaModel {
 
     fn compute_per_layer_inputs(
         &self,
+        backend: &dyn Backend,
         x_scaled_embd: &[f32],
         tokens: &[u32],
         n_tokens: usize,
@@ -3308,9 +3381,7 @@ impl GemmaModel {
         let gathered = self.gather_per_layer_tok_embd(tokens, n_tokens);
 
         // Then project the (already sqrt(n_embd)-scaled) hidden state.
-        let mut proj = self
-            .backend
-            .matmul(x_scaled_embd, n_tokens, per_layer_model_proj);
+        let mut proj = backend.matmul(x_scaled_embd, n_tokens, per_layer_model_proj);
         for v in proj.iter_mut() {
             *v *= per_layer_projection_scale;
         }

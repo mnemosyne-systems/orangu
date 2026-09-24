@@ -13,11 +13,15 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+pub mod adapt;
 pub mod arch;
 pub mod attention;
+pub mod attention_tiled;
 pub mod backend;
 pub mod chat_template;
 pub mod constraint;
+pub mod cpu_pools;
+pub mod decode_backend;
 pub mod decode_batch;
 pub mod decode_stages;
 pub mod dense_residency;
@@ -28,6 +32,7 @@ pub mod expert_tier;
 pub mod footprint;
 pub mod generate;
 pub mod hadamard;
+pub mod head_split;
 pub mod image;
 pub mod iq_grids;
 pub mod kv_cache;
@@ -41,6 +46,7 @@ pub mod plan;
 pub mod prefill_backend;
 pub mod prefix_cache;
 pub mod prefix_index;
+pub mod prompt_weights;
 pub mod quant;
 pub mod route_ahead;
 #[cfg(test)]
@@ -53,6 +59,7 @@ pub mod tensor;
 pub mod tokenizer;
 pub mod tool_calls;
 pub mod vecdot;
+pub mod warm_prefixes;
 
 /// The NPU feed-forward service, if this machine has one holding blocks for
 /// the model being served.

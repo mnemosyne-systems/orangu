@@ -68,7 +68,7 @@ _orangu_bench() {
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png \
-             --flamegraph-layers --flamegraph-duration \
+             --flamegraph-layers --flamegraph-duration --flamegraph-watch \
              --compare-profiles --bundle --read-bundle --sweep --sweep-cmd --sweep-env --sweep-start-timeout \
              --render-profile --report --web --host --port --delay --temperature -s --shell-completions -h --help -V --version" -- "$cur") )
         return 0
@@ -138,7 +138,8 @@ _orangu_bench() {
         '--flamegraph-call-graph[Call-graph mode for --flamegraph]:mode:(auto fp dwarf)' \
         '--flamegraph-png[Also render a PNG beside the flamegraph SVG]' \
         '--flamegraph-layers[Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR]:dir:_files -/' \
-        '--flamegraph-duration[Seconds to keep sampling under --flamegraph-layers]:seconds:' \
+        '--flamegraph-duration[Seconds to keep sampling under --flamegraph-layers or --flamegraph-watch]:seconds:' \
+        '--flamegraph-watch[With --flamegraph, profile the server while something else drives it]' \
         '--compare-profiles[Compare already-collapsed .folded profiles side by side; measure nothing]:list:_files' \
         '--bundle[Write the whole run — measurements, configuration, host — to one JSON file]:path:_files' \
         '--read-bundle[Read bundles and report them side by side; measure nothing]:list:_files' \
@@ -218,7 +219,8 @@ complete -c orangu-bench -l flamegraph-freq        -x -d 'Sampling frequency in 
 complete -c orangu-bench -l flamegraph-call-graph  -x -a 'auto fp dwarf' -d 'Call-graph mode for --flamegraph'
 complete -c orangu-bench -l flamegraph-png            -d 'Also render a PNG beside the flamegraph SVG'
 complete -c orangu-bench -l flamegraph-layers      -r -d 'Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR'
-complete -c orangu-bench -l flamegraph-duration    -x -d 'Seconds to keep sampling under --flamegraph-layers'
+complete -c orangu-bench -l flamegraph-duration    -x -d 'Seconds to keep sampling under --flamegraph-layers or --flamegraph-watch'
+complete -c orangu-bench -l flamegraph-watch          -d 'With --flamegraph, profile the server while something else drives it'
 complete -c orangu-bench -l compare-profiles       -r -d 'Compare already-collapsed .folded profiles side by side; measure nothing'
 complete -c orangu-bench -l bundle                 -r -d 'Write the whole run — measurements, configuration, host — to one JSON file'
 complete -c orangu-bench -l read-bundle            -r -d 'Read bundles and report them side by side; measure nothing'
@@ -307,7 +309,8 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--flamegraph-call-graph', 'Call-graph mode for --flamegraph: fp or dwarf'),
         @('--flamegraph-png', 'Also render a PNG beside the flamegraph SVG'),
         @('--flamegraph-layers', 'Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR'),
-        @('--flamegraph-duration', 'Seconds to keep sampling under --flamegraph-layers'),
+        @('--flamegraph-duration', 'Seconds to keep sampling under --flamegraph-layers or --flamegraph-watch'),
+        @('--flamegraph-watch', 'With --flamegraph, profile the server while something else drives it'),
         @('--compare-profiles', 'Compare already-collapsed .folded profiles side by side; measure nothing'),
         @('--bundle', 'Write the whole run - measurements, configuration, host - to one JSON file'),
         @('--read-bundle', 'Read bundles and report them side by side; measure nothing'),

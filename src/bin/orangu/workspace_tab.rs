@@ -41,6 +41,9 @@ pub(crate) struct TabServerConfig<'a> {
     /// tab's interactive session pins its requests through the same
     /// per-endpoint round-robin assignment.
     pub(crate) slots: orangu::llm::SlotRegistry,
+    /// `[orangu].prime`: whether a fresh session primes the server's cache
+    /// with its opening when the tab opens.
+    pub(crate) prime: bool,
 }
 
 /// Everything that belongs to one workspace tab. The run loop reads and mutates
@@ -143,6 +146,7 @@ impl WorkspaceTab {
             llms: config_llms,
             mcp_servers,
             slots,
+            prime,
         } = server_config;
         let workspace_created = if !workspace.exists() {
             std::fs::create_dir_all(&workspace)
@@ -239,6 +243,21 @@ impl WorkspaceTab {
             ep
         };
         let mut session = ChatSession::new(&enhanced_prompt).with_slots(slots);
+        // A fresh session's opening — the system prompt and the tools, the
+        // ~1900 tokens every turn starts with — sent now, in the background,
+        // so the server has prefilled it by the time the first prompt is
+        // typed (`doc/PERF-ALL.md`, task 4). A resumed session's server
+        // cache is whatever it is; its history is not this opening.
+        if prime
+            && !is_resumed
+            && let Some(profile) = config_llms.get(&active_model)
+        {
+            let mut profile = profile.clone();
+            profile.model = active_model_id.clone();
+            if let Ok(request) = session.prime_request(&profile, tools.definitions()) {
+                tokio::spawn(request);
+            }
+        }
         if is_resumed {
             session.restore(load_session_messages(&session_messages_path)?);
             // A resumed session was greeted when it was first opened; its

@@ -770,6 +770,10 @@ struct Prepared {
     /// re-derived at shutdown so the fingerprint that reads a snapshot back is
     /// provably the one that wrote it.
     prefix_cache_snapshot: Option<(PathBuf, String)>,
+    /// The prefixes to prefill in the background once serving has started
+    /// (`engine::warm_prefixes`) — `None` when `prefix_warmup` is off or
+    /// this role generates nothing.
+    warm_prefixes: Option<Vec<Vec<u32>>>,
     model_label: String,
     /// The quantization the resolved file is stored at
     /// ([`orangu::model_spec::quantization_for_file`]), for the startup
@@ -1595,6 +1599,163 @@ fn prepare(args: Args) -> Result<Prepared> {
         wgpu.plan_weight_bytes(weights_device_bytes, largest);
     }
     let model = build_model(&loaded, &backend)?;
+    // Where a token is decoded, measured (`engine::decode_backend`): under
+    // `backend = auto` on one GPU, the same model on the CPU backend — a
+    // view of the mapped weights — and a few one-token decode steps timed
+    // on each; the cores take decode only when clearly faster. Not where a
+    // CPU build would copy the weights (the ternary repack), for a picture
+    // model, or for a role that generates nothing.
+    let (backend, backend_label, model, decode_on_cpu, cpu_step) =
+        if matches!(conf.backend, config::BackendPreference::Auto)
+            && backend.as_wgpu().is_some()
+            && image_variant.is_none()
+            && role.allows_generation()
+            && !engine::loader::ternary_repack::on()
+            && engine::decode_backend::enabled()
+        {
+            let cpu: Arc<dyn Backend> = Arc::new(engine::backend::CpuBackend);
+            let probe_started = std::time::Instant::now();
+            let device_step = engine::decode_backend::seconds_per_token(&model);
+            let cpu_model = build_model(&loaded, &cpu).ok();
+            // The cores at their best: in each CPU pool when there are two
+            // (`engine::cpu_pools`), which also decides the decode pool.
+            let cpu_step = cpu_model.as_ref().and_then(decode_seconds_in_best_pool);
+            match (device_step, cpu_model, cpu_step) {
+                (Some(device_s), Some(cpu_model), Some(cpu_s)) => {
+                    let because = format!(
+                        "a one-token decode step takes {:.1} ms on the device, {:.1} ms on the \
+                         cpu (measured in {:.1} s)",
+                        device_s * 1e3,
+                        cpu_s * 1e3,
+                        probe_started.elapsed().as_secs_f64()
+                    );
+                    if engine::decode_backend::cpu_wins(device_s, cpu_s) {
+                        engine::adapt::note(
+                            "decode",
+                            "on the cpu",
+                            format!("{because}; the device's copy released"),
+                        );
+                        drop(model);
+                        engine::prefill_backend::force_prompts_on_cpu();
+                        let label = if is_x86_feature_detected() {
+                            "CPU/AVX2"
+                        } else {
+                            "CPU"
+                        };
+                        (cpu, label.to_string(), cpu_model, true, Some(cpu_s))
+                    } else {
+                        engine::adapt::note(
+                            "decode",
+                            format!("on the device ({backend_label})"),
+                            format!(
+                                "{because}; the cores must be {}× faster",
+                                engine::decode_backend::min_gain()
+                            ),
+                        );
+                        (backend, backend_label, model, false, None)
+                    }
+                }
+                _ => (backend, backend_label, model, false, None),
+            }
+        } else {
+            (backend, backend_label, model, false, None)
+        };
+    // A model that decodes on the cores from the start (`backend = cpu`, or
+    // no GPU): its decode pool, measured the same way.
+    if backend.is_cpu()
+        && !decode_on_cpu
+        && image_variant.is_none()
+        && role.allows_generation()
+        && engine::cpu_pools::available()
+    {
+        let _ = decode_seconds_in_best_pool(&model);
+    }
+    engine::cpu_pools::set_decode_on_cpu(backend.is_cpu());
+    // Decode left a GPU idle: the output head shared with a fresh backend on
+    // it, where the two read memory faster than the cores alone — measured
+    // on the model's own head (`engine::head_split`). A fresh backend, so
+    // the device holds the head's rows and not the model it just released.
+    if decode_on_cpu
+        && engine::head_split::enabled()
+        && let Some(head) = model.output_head()
+    {
+        match select_backend(
+            conf.backend,
+            &requested_device(device_flag.as_deref(), &conf.device),
+        ) {
+            Ok((device, _)) if device.as_wgpu().is_some() => {
+                engine::cpu_pools::for_request(|| {
+                    engine::head_split::choose(backend.as_ref(), device, &head, &model, cpu_step)
+                });
+            }
+            _ => {}
+        }
+    }
+    // What was derived from the device before the build no longer applies
+    // when decode left it.
+    let wgpu_backend = if decode_on_cpu { None } else { wgpu_backend };
+    let gpu_tuning_summary = if decode_on_cpu {
+        None
+    } else {
+        gpu_tuning_summary
+    };
+    // Where prompts run is known now — the NPU's install waits for it
+    // before it measures its blocks against the CPU.
+    engine::prefill_backend::settle(backend.as_ref());
+    // What this machine's cores are, and what the CPU's prompt path runs on
+    // because of it — each layer's choice in one set of `[adapt]` lines.
+    let classes = orangu::hardware::core_classes();
+    if !classes.is_empty() {
+        engine::adapt::note(
+            "cores",
+            format!("{} worker threads", rayon::current_num_threads()),
+            orangu::hardware::describe_core_classes(&classes),
+        );
+    }
+    if engine::prefill_backend::prompts_on_cpu() == Some(true) {
+        let kernel = if engine::attention_tiled::mixed_available(256) {
+            (
+                "int8 scores, bf16 values (smmla + bfmmla)",
+                "the cores have i8mm and bf16",
+            )
+        } else if engine::attention_tiled::enabled() {
+            (
+                "f32 tiles",
+                "no i8mm or bf16 on these cores, or ORANGU_ATTENTION_MIXED=0",
+            )
+        } else {
+            ("the one-query loop", "ORANGU_ATTENTION_TILED=0")
+        };
+        engine::adapt::note("prompt attention", kernel.0, kernel.1);
+    }
+    engine::prompt_weights::prepare(&loaded, conf.prompt_weights);
+    // Prompts on the cores: the pool they run faster in, timed on the
+    // model's widest FFN GEMM at a prompt chunk's width, through the same
+    // path (its `int8` copy, when built) a prompt takes.
+    if engine::prefill_backend::prompts_on_cpu() == Some(true)
+        && engine::cpu_pools::available()
+        && let Some(w) = engine::prompt_weights::probe_matrix(&loaded)
+    {
+        const TOKENS: usize = 256;
+        let x: Vec<f32> = (0..TOKENS * w.in_dim)
+            .map(|i| ((i * 7919) % 257) as f32 / 257.0 - 0.5)
+            .collect();
+        let what = format!("a {TOKENS}-token {}x{} GEMM", w.in_dim, w.out_dim);
+        engine::cpu_pools::choose_prompts(&what, |pool| {
+            engine::cpu_pools::in_pool(pool, || {
+                use engine::backend::Backend as _;
+                let _ = engine::backend::CpuBackend.matmul(&x, TOKENS, &w);
+                (0..3)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        let _ = engine::backend::CpuBackend.matmul(&x, TOKENS, &w);
+                        t.elapsed().as_secs_f64()
+                    })
+                    .reduce(f64::min)
+            })
+        });
+    }
+    engine::prefill_backend::mark_cpu_path_ready();
     // A mixture whose routed experts reached the card reserved a streaming
     // region while it loaded, and is never prefilled narrower than the width
     // that path needs — see `CHUNK_FLOOR`.
@@ -2162,6 +2323,12 @@ fn prepare(args: Args) -> Result<Prepared> {
         &model_label,
         &model.new_kv_cache(1).structure_tag(),
     );
+    // What earlier runs of this model reused, to warm after serving starts.
+    let warm_prefixes = (engine::warm_prefixes::enabled(conf.prefix_warmup)
+        && role.allows_generation())
+    .then(|| engine::warm_prefixes::path_for(&prefix_fingerprint))
+    .flatten()
+    .map(|path| engine::warm_prefixes::init(path, &prefix_fingerprint));
     if let (Some(pool), Some(dir)) = (prefix_cache.as_ref(), prefix_cache_dir.as_ref()) {
         let loaded = pool.load_from(dir, &prefix_fingerprint);
         if loaded > 0 {
@@ -2381,6 +2548,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         tls: conf.tls.clone(),
         engine,
         prefix_cache_snapshot: prefix_cache_dir.map(|dir| (dir, prefix_fingerprint)),
+        warm_prefixes,
         model_label,
         quantization,
         architecture,
@@ -2744,6 +2912,25 @@ fn gate(configured: bool) -> &'static str {
     if configured { "Yes" } else { "No" }
 }
 
+/// Seconds per one-token decode step of `model` on the cores, in the faster
+/// of the CPU pools (`engine::cpu_pools`) — which becomes the decode pool —
+/// or in the one pool there is.
+fn decode_seconds_in_best_pool(model: &Arc<dyn ModelForward>) -> Option<f64> {
+    if !engine::cpu_pools::available() {
+        return engine::decode_backend::seconds_per_token(model);
+    }
+    let mut best: Option<f64> = None;
+    engine::cpu_pools::choose_decode("a one-token decode step", |pool| {
+        let s =
+            engine::cpu_pools::in_pool(pool, || engine::decode_backend::seconds_per_token(model));
+        if let Some(s) = s {
+            best = Some(best.map_or(s, |b| b.min(s)));
+        }
+        s
+    });
+    best
+}
+
 fn build_model(
     loaded: &engine::loader::LoadedModel,
     backend: &Arc<dyn Backend>,
@@ -2841,6 +3028,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         tls,
         engine,
         prefix_cache_snapshot,
+        warm_prefixes,
         model_label,
         quantization,
         architecture,
@@ -2866,6 +3054,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
     // A handle to the pool taken before `engine` is moved into the router's
     // state, so the snapshot can still be written once serving has stopped.
     let prefix_cache_for_snapshot = engine.prefix_cache.clone();
+    let engine_for_warmup = engine.clone();
 
     let listener = tokio::net::TcpListener::from_std(api_listener)
         .context("failed to attach listener to the async runtime")?;
@@ -3149,6 +3338,18 @@ async fn serve(prepared: Prepared) -> Result<()> {
     // One `select!` and one shutdown path either way — the TLS listener is an
     // `axum::serve::Listener` like the plain one, so only the listener changes.
     let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+    // The prefixes earlier runs reused, prefilled in the background while
+    // the listener is already taking requests (`engine::warm_prefixes`).
+    match warm_prefixes {
+        Some(prefixes) => {
+            tokio::spawn(engine::warm_prefixes::warm_up(engine_for_warmup, prefixes));
+        }
+        None => engine::adapt::note(
+            "prefix warm-up",
+            "off",
+            "prefix_warmup = off, or a role that generates nothing",
+        ),
+    }
     let serve_api = async move {
         match tls_config {
             Some(config) => axum::serve(
@@ -4367,6 +4568,14 @@ fn configure_cpu_threads(flag: Option<&str>, configured: Option<usize>) -> Resul
         let pinned = orangu::hardware::big_cores()
             .filter(|_| std::env::var("ORANGU_EXPERT_BIG_CORES").is_ok_and(|v| v.trim() == "1"));
         let Some(cores) = pinned else {
+            // Every core for the global pool, and beside it the pools a
+            // request runs inside: every core, and the big ones for the
+            // phases that measure faster there (`engine::cpu_pools`).
+            engine::cpu_pools::init(
+                std::thread::available_parallelism().map_or(1, usize::from),
+                orangu::hardware::big_cores(),
+                pin_to_cores,
+            );
             return Ok(WorkerPool::Default);
         };
         let threads = cores.len();

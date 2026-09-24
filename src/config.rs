@@ -48,6 +48,11 @@ pub struct ClientAppConfiguration {
     #[serde(skip)]
     pub banner: Banner,
     pub feedback: bool,
+    /// `[orangu].prime` — on (the default): when a TUI tab opens a fresh
+    /// session, send its opening (system prompt and tools) to the server as
+    /// a one-token request in the background, so the server has it cached
+    /// by the time the first prompt is typed (`ChatSession::prime_request`).
+    pub prime: bool,
     pub auto_rebase: bool,
     pub auto_squash: bool,
     pub compile_workers: usize,
@@ -321,6 +326,9 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
             .map(|value| value.parse().unwrap_or_default())
             .unwrap_or_default(),
         feedback: parse_feedback_bool(client.get("feedback").map(String::as_str).unwrap_or("")),
+        prime: client
+            .get("prime")
+            .is_none_or(|value| parse_feedback_bool(value)),
         auto_rebase: parse_feedback_bool(
             client.get("auto_rebase").map(String::as_str).unwrap_or(""),
         ),

@@ -130,6 +130,33 @@ impl ChatSession {
         }
     }
 
+    /// A request that primes the server's prefix cache with this session's
+    /// opening — its system prompt and `tool_definitions` — before the first
+    /// turn: the messages a first turn sends, with the user's text empty and
+    /// one token asked for. The rendered prompt then matches the first real
+    /// turn's up to where the user's words begin, so the server's shared KV
+    /// pages hold all of it when that turn arrives. On the CIX P1 that opening
+    /// is ~1900 tokens and ~9 s of prefill (`doc/PERF-ALL.md`, task 4).
+    ///
+    /// Returned as a future owning everything it needs, for the caller to
+    /// spawn while the user types; its answer is dropped, and it touches
+    /// nothing in this session. Not pinned to a slot: prefix pages are shared
+    /// by every slot.
+    pub fn prime_request(
+        &self,
+        profile: &LlmConfiguration,
+        tool_definitions: Vec<crate::llm::ToolDefinition>,
+    ) -> Result<impl std::future::Future<Output = ()> + Send + 'static> {
+        let client = OpenAiClient::from_profile(profile)?.with_max_tokens(1);
+        let mut messages = self.messages.clone();
+        messages.push(ChatMessage::user(""));
+        Ok(async move {
+            let _ = client
+                .chat(&messages, &tool_definitions, |_| {}, |_| {})
+                .await;
+        })
+    }
+
     /// Attach a shared [`SlotRegistry`] so this session's requests pin to a
     /// specific orangu-server `id_slot`. Only the interactive per-tab session
     /// should call this — see the `slots` field doc.

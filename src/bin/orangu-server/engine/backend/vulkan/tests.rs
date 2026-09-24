@@ -2133,8 +2133,20 @@ fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens:
             }
         }
     }
+    // On the integer dot the reference carries the same 8-bit activation,
+    // so what is left is the summation order — relative to the outputs'
+    // magnitude, not to an output that happens to cancel near zero. A
+    // random `Q4_K` block's scales put this fixture's outputs near 1e5,
+    // and one of them landing at -0.14 was 0.05 off: 4e-6 of the row. A
+    // kernel that is wrong (a scale, a nibble, a sub-block) is off by the
+    // magnitude itself.
+    let floor = if on_integer_dot {
+        1e-5 * reference.iter().fold(0f32, |m, v| m.max(v.abs()))
+    } else {
+        0.0
+    };
     for (i, (a, b)) in reference.iter().zip(gpu_out.iter()).enumerate() {
-        let tol = tol_factor * a.abs().max(1.0);
+        let tol = tol_factor * a.abs().max(1.0) + floor;
         assert!(
             (a - b).abs() <= tol,
             "ggml_type {ggml_type}: mismatch at flat index {i}: ref={a} gpu={b}"
@@ -10012,6 +10024,9 @@ fn fused_post_attention_prefill_matches_the_unfused_sequence_multi_chunk() {
 /// case rather than a variation of the gemma one.
 #[test]
 fn fused_post_attention_prefill_matches_the_unfused_sequence_swiglu_no_post_norms() {
+    // A comparison against the float sequence: `Q4_K` stays on its float
+    // decode kernel (see `Q4K_I8_OFF_ON_THIS_THREAD`).
+    let _float_q4k = VulkanBackend::float_q4k_decode_on_this_thread();
     cross_check_fused_post_attention_shaped(3, 256, 512, 512, false);
 }
 
@@ -10150,6 +10165,9 @@ fn the_moe_head_chain_matches_the_separate_calls() {
 /// matters; the fused chains' own cross-checks cover the rest.
 #[test]
 fn padding_a_stripe_leaves_its_real_rows_unchanged() {
+    // A comparison against the float sequence: `Q4_K` stays on its float
+    // decode kernel (see `Q4K_I8_OFF_ON_THIS_THREAD`).
+    let _float_q4k = VulkanBackend::float_q4k_decode_on_this_thread();
     let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
@@ -10420,6 +10438,9 @@ fn gqa_prefill_heads_divide_the_group() {
 
 #[test]
 fn fused_ffn_prefill_matches_the_unfused_sequence_small() {
+    // A comparison against the float sequence: `Q4_K` stays on its float
+    // decode kernel (see `Q4K_I8_OFF_ON_THIS_THREAD`).
+    let _float_q4k = VulkanBackend::float_q4k_decode_on_this_thread();
     cross_check_fused_ffn_prefill(3);
 }
 
@@ -11980,6 +12001,9 @@ fn gated_delta_kernel_time() {
 /// the recorder quantizes for them.
 #[test]
 fn fused_attention_layer_matches_the_host_sequence() {
+    // A comparison against the float sequence: `Q4_K` stays on its float
+    // decode kernel (see `Q4K_I8_OFF_ON_THIS_THREAD`).
+    let _float_q4k = VulkanBackend::float_q4k_decode_on_this_thread();
     fused_attention_layer_check(GGML_TYPE_Q4_K);
 }
 
@@ -12632,6 +12656,9 @@ fn fused_recurrent_layer_check(ggml_type: u32) {
 /// `None` rather than a wrong answer.
 #[test]
 fn fused_ffn_with_a_folded_down_projection_matches_the_host_rotation() {
+    // A comparison against the float sequence: `Q4_K` stays on its float
+    // decode kernel (see `Q4K_I8_OFF_ON_THIS_THREAD`).
+    let _float_q4k = VulkanBackend::float_q4k_decode_on_this_thread();
     let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
@@ -15691,6 +15718,26 @@ fn fused_post_attention_decode_model_shaped_on_the_word_reading_types() {
             (a - b).abs() <= 3e-2 * scale,
             "mismatch at index {i}: cpu={a} gpu(fused)={b} (scale {scale})"
         );
+    }
+}
+
+/// `Q4_K` on its integer-dot decode kernel (`shader_source_q4k_i8`) against
+/// the dequantized product at the 8-bit activation rounding: the row-group
+/// form at `gemma-4-E2B`'s FFN and attention shapes (a row count that is not
+/// a whole group included) and the one-row form under
+/// `Q4K_I8_WIDE_MIN_OUT`, one token and a few.
+#[test]
+fn decode_matvec_q4k_integer_dot() {
+    for &(in_dim, out_dim) in &[
+        (1536usize, 6144usize),
+        (6144, 1536),
+        (1536, 2055),
+        (2048, 1536),
+        (512, 300),
+    ] {
+        for n_tokens in [1usize, 3] {
+            cross_check_n_tokens(GGML_TYPE_Q4_K, in_dim, out_dim, n_tokens);
+        }
     }
 }
 

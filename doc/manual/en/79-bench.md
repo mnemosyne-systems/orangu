@@ -1102,7 +1102,8 @@ Options:
       --flamegraph-call-graph <MODE>   Call-graph mode for `--flamegraph`: `auto`, `fp` or `dwarf` [default: auto]
       --flamegraph-png                 Also render a PNG beside the flamegraph SVG
       --flamegraph-layers <DIR>        Profile every running orangu, orangu-coordinator and orangu-server for `--flamegraph-duration` while you drive the workload; one flamegraph per process in DIR. Measures nothing itself.
-      --flamegraph-duration <SECONDS>  Seconds to keep sampling under `--flamegraph-layers` [default: 60]
+      --flamegraph-duration <SECONDS>  Seconds to keep sampling under `--flamegraph-layers` or `--flamegraph-watch` [default: 60]
+      --flamegraph-watch               With `--flamegraph PATH`: profile the server for `--flamegraph-duration` while something else drives it. Measures nothing itself.
       --compare-profiles <LIST>        Compare already-collapsed `.folded` profiles side by side; measure nothing
       --bundle <PATH>                  Write the whole run — measurements, configuration, host — to one JSON file
       --read-bundle <LIST>             Read bundles and report them side by side; measure nothing
@@ -1344,6 +1345,25 @@ Everything below that line is a heuristic over symbol names, and anything it
 cannot name stays visible as `app/other` rather than being dropped — which is
 what the leaf table beside it is for: a residual you can read is a claim you can
 check.
+
+### Profiling a real client's requests (`--flamegraph-watch`)
+
+`--flamegraph` brackets this tool's own requests. Some requests it cannot
+make: a real `orangu`'s first turn, with its own system prompt and tool
+definitions, against a server that has just restarted. `--flamegraph-watch`
+profiles the server — found the same way `--flamegraph` finds it, or
+`--flamegraph-pid` — for `--flamegraph-duration` seconds while something else
+drives it, and writes the same SVG (and PNG with `--flamegraph-png`):
+
+```sh
+orangu-bench --flamegraph-watch --flamegraph-duration 20 \
+    --flamegraph first-turn.svg --flamegraph-png &
+orangu -p "Hello, who are you ?"
+```
+
+It attaches to one process (`perf record -p`), so it works under
+`kernel.perf_event_paranoid = 2`, where `--flamegraph-layers` — which samples
+the whole machine to catch processes started mid-window — is refused.
 
 ### Profiling the whole chain (`--flamegraph-layers`)
 

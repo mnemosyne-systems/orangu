@@ -1628,6 +1628,26 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   is tried behind Vulkan**, ahead of CUDA and OpenCL. Naming a
   backend explicitly fails to start instead of falling back, for when GPU
   inference was asked for specifically. See **GPU backend** below.
+  Under `auto`, when that is one GPU, **where a token is decoded is then
+  measured**: the model is also built on the CPU backend (a view of the
+  same mapped weights) and a few one-token decode steps are timed on each;
+  decode moves to the cores only when they are at least 1.1× faster, and
+  the device's copy is released. The `[adapt] decode:` line says what was
+  measured, with the cores timed in their best worker pool. On the CIX
+  P1 the eight big cores now out-decode the Mali (`gemma-4-E2B`: ~46 against
+  ~64 ms a step, and faster at every depth to 4096 — see
+  `doc/PERF-ALL.md`, tasks 7, 9 and 15), so decode moves to them;
+  `backend = vulkan` keeps the GPU. `ORANGU_DECODE_PROBE=0` skips it and keeps the
+  device.
+  When decode leaves a GPU idle, **the output head may be shared with it**
+  (gemma): a fresh backend on the GPU takes a share of the head's rows, and
+  each token's head runs on the cores and on the GPU at once, where the two
+  together read memory faster than the cores alone. The share is measured on
+  the head. The split is kept only if whole decode steps get ≥ 1.05× faster,
+  and the `[adapt] output head:` line says which. On the CIX P1 it is not
+  kept: the Mali's clock governor holds it at 72 MHz at decode's duty cycle,
+  and the split made a step twice as slow. The check costs ~1.1 s at
+  start-up (`doc/PERF-ALL.md`, task 14). `ORANGU_HEAD_SPLIT=0` skips it.
 - `device` — _which card_, when `backend` finds more than one: `auto` (the
   default — every device on the machine, best first, one of which runs the
   model), an index as printed at startup, or any part of the device's name.
@@ -1639,21 +1659,72 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   proportions like `3,1`. A split buys capacity at a real cost in speed —
   see **Splitting a model across devices** below. `--device-split` and
   `ORANGU_DEVICE_SPLIT` override it for one run.
-- `prefill_backend` — `device` (the default: a prompt runs where decode
-  runs), `cpu` (multi-token passes run on the CPU backend while
-  single-token decode stays on the selected device) or `auto` (one
-  64-token GEMM at the model's FFN gate shape is timed on each backend
-  when the model loads, the faster one takes the prompts, and the log
-  says which and by how much). For a board whose device does a prompt's
-  GEMMs slower than its cores do and whose memory the two share — on the
-  CIX P1's Mali the 27B ternary model prefills at 1.6 tok/s on the
-  device and 10 on its eight big cores (the probe: 79 ms against 18),
-  with decode unchanged at 3 tok/s on the device. Honoured by the Qwen
+- `prefill_backend` — `auto` (the default: when the model loads, a
+  64-token prompt through its first two layers — one 64-token GEMM at the
+  FFN gate's shape for the architectures other than Gemma's — is timed on
+  each backend, the faster one takes the prompts, and the log says which
+  and by how much — every machine decides for itself), `device` (a prompt runs
+  where decode runs) or `cpu` (multi-token passes run on the CPU backend
+  while single-token decode stays on the selected device). It matters on
+  a board whose device does a prompt's GEMMs slower than its cores do and
+  whose memory the two share: on the CIX P1's Mali `gemma-4-E2B` prefills
+  at 19–26 tok/s on the device and 110–145 on the cores, and the 27B
+  ternary model at 1.6 against 10, with decode unchanged on the device;
+  on a discrete card the probe keeps the prompts on the card. Honoured by
+  the dense Gemma family (not its MoE or embedding models) and the Qwen
   3.5-family trunk (`qwen35`, `qwen35moe`, `qwen3next`, `qwen4exp`);
-  `ORANGU_HYBRID_PREFILL_CPU=1` is `cpu` from the environment.
+  other architectures prefill where they decode.
+  `ORANGU_HYBRID_PREFILL_CPU=1` is `cpu` from the environment. When the
+  prompts land on the CPU, an NPU's feed-forward blocks are timed against
+  the CPU's own GEMMs too, per token at the width each side really runs,
+  and left out unless the NPU wins by a quarter (see `ORANGU_NPU_FFN`).
+- `prompt_weights` — `auto` (the default), `copy` or `file`: how the
+  weights a prompt multiplies on the CPU are held. `auto` builds copies
+  laid out for the cores' matrix instructions, each kind on its own
+  measurement: per-row `int8` copies of the K-quant projections (a byte a
+  weight, one scale per row, for the 8 × 8 `smmla` tile), and `bf16`
+  copies of the matrices the file stores unquantized (`F32`/`F16`/`BF16`,
+  for the 8 × 8 `bfmmla` tile — not `int8`, which would quantize weights
+  the file keeps exact). A kind is built when prompts run on the CPU, the
+  CPU has its instruction, all copies take at most half the memory
+  available after load, and the kind's widest matrix measures at least
+  10% faster through a copy at load; decode keeps the file's weights. On
+  the CIX P1 with `gemma-4-E2B`: 1.86 GB of `int8` copies, the projections
+  1.6–1.9× faster within about 1% (relative RMS) of the file's product,
+  and 0.08 GB of `bf16` copies of the per-layer-embedding matrices,
+  2.4–3.7× faster within 0.15%; all built in 0.9 s. `copy` builds them
+  wherever the CPU has the instruction, unmeasured; `file` never does.
+  `ORANGU_PROMPT_WEIGHTS` overrides it for one run.
+- `prefix_warmup` — `on` (the default) or `off`: remember, per model, the
+  prompt prefixes requests reuse from the cache (at least 256 tokens, the
+  four most reused, as token ids in
+  `~/.orangu/server/<fingerprint>/warm-prefixes.json`), and after a restart
+  prefill them again in the background while the listener already takes
+  requests — so a client's fixed opening (the `orangu` system prompt and
+  tools, ~1900 tokens) is cached before its first request. A request that
+  arrives during the warm-up waits for it, never longer than its own cold
+  prefill would have taken. `ORANGU_PREFIX_WARMUP` overrides it.
+
+Every choice the server makes about the machine it is on — where prompts
+run, the core classes, the attention kernel, the prompt weights, the NPU
+— is logged as one `[adapt]` line with what it measured, and listed under
+`adapt` in `GET /props`:
+
+```text
+orangu-server: [adapt] prompts: on the cpu — a 64-token 1536x6144 GEMM takes 14.2 ms on the device, 3.2 ms on the cpu
+orangu-server: [adapt] cores: 12 worker threads — 8 × Cortex-A720 (2.2–2.6 GHz, capacity 866–1024) + 4 × Cortex-A520 (1.8 GHz, capacity 279)
+orangu-server: [adapt] prompt attention: int8 scores, bf16 values (smmla + bfmmla) — the cores have i8mm and bf16
+orangu-server: [adapt] prompt weights (K-quant): int8 copies of 245 matrices (1.86 GB; all copies built in 0.9 s) — a 256-token 12288x1536 GEMM takes 7.2 ms through an int8 copy, 12.5 ms on the file's weights; 1.85 GB of 21.5 available
+orangu-server: [adapt] prompt weights (float): bf16 copies of 71 matrices (0.08 GB; all copies built in 0.9 s) — a 256-token 1536x8960 GEMM takes 9.6 ms through a bf16 copy, 37.0 ms on the file's weights; 0.08 GB of 21.5 available
+orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a feed-forward block takes 13.8 ms for 128 tokens on the NPU (0.108 ms a token), 24.3 ms for 384 on the cpu (0.063 ms a token); it must be 1.25× faster a token
+```
 - `threads` — how many worker threads every CPU path shares: the CPU
   matmul, the MoE expert loop, and the per-expert fan-out. Unset (the
-  default) means one per logical core. `--threads` and `ORANGU_THREADS`
+  default) means one per logical core for loading, and requests run
+  inside worker pools chosen per phase by measurement — every core, or on
+  a machine with big and little cores the big ones — reported as
+  `[adapt] cpu pool (prompts)` and `(decode)` lines (`ORANGU_CPU_POOLS=0`
+  runs them on the one pool). Setting it pins that one pool size. `--threads` and `ORANGU_THREADS`
   override it for one run.
 - `role` — `all` (the default), `code`, `review`, `explorer`,
   `embedding`, or `image`. See **Roles** below. Resolved in this order: an

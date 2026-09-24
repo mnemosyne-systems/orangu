@@ -2222,6 +2222,75 @@ mod real_model_tests {
     ///
     /// Run with `ORANGU_TEST_LLAMA_MODEL=/path/to/Llama-3.2-1B-Instruct-Q4_K_M.gguf
     /// cargo test --release --bin orangu-server real_model_tests -- --ignored`.
+    /// The control for `bailingmoe3`'s equivalence probe: how far apart a
+    /// one-pass forward and the same tokens fed one at a time are on a
+    /// **dense** model, where nothing carries state between positions.
+    ///
+    /// The two take different kernels — a multi-token batch goes through
+    /// the tiled path, a single token through the decode one — so they are
+    /// not bit-identical and never were. What this pins is the *size* of
+    /// that, which is the number the recurrent model's drift has to be read
+    /// against: without it, ordinary kernel rounding and a real batching
+    /// bug look the same.
+    ///
+    /// Run with `ORANGU_TEST_LLAMA_MODEL=/path/to/Llama-3.2-1B-Instruct-
+    /// Q4_K_M.gguf cargo test --release --bin orangu-server
+    /// one_pass_equals_one_token -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn one_pass_equals_one_token_at_a_time_on_a_dense_model() {
+        let path = std::env::var("ORANGU_TEST_LLAMA_MODEL").expect("set ORANGU_TEST_LLAMA_MODEL");
+        let loaded = LoadedModel::open(std::path::Path::new(&path)).expect("load model");
+        let model =
+            LlamaModel::load_with_backend(&loaded, Arc::new(crate::engine::backend::CpuBackend))
+                .expect("build model");
+        let gguf = orangu::gguf::GgufFile::open(std::path::Path::new(&path)).expect("open gguf");
+        let tokenizer =
+            crate::engine::tokenizer::Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        let tokens = tokenizer.encode(
+            "The capital of France is Paris, and the capital of Germany is Berlin. \
+             Lists of European capitals are a common way to test whether a model \
+             can recall a fact stated earlier in the same prompt.",
+            tokenizer.wants_bos(),
+        );
+        println!("{:>6}  {:>12}  {:>10}", "tokens", "worst logit", "top-1");
+        for n in [1usize, 2, 4, 8, 16, 32] {
+            if n > tokens.len() {
+                break;
+            }
+            let part = &tokens[..n];
+            let mut batched = model.new_kv_cache(n + 1);
+            let whole = model.forward(&mut batched, part, 0, 0).expect("one pass");
+            let mut cache = model.new_kv_cache(n + 1);
+            let mut stepped = Vec::new();
+            for (pos, token) in part.iter().enumerate() {
+                stepped = model
+                    .forward(&mut cache, &[*token], pos, 0)
+                    .expect("one token");
+            }
+            let worst = whole
+                .iter()
+                .zip(&stepped)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            let top = |v: &[f32]| {
+                v.iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.partial_cmp(b.1).expect("finite"))
+                    .expect("non-empty")
+                    .0
+            };
+            println!(
+                "{n:>6}  {worst:>12.6}  {:>10}",
+                if top(&whole) == top(&stepped) {
+                    "same"
+                } else {
+                    "DIFFER"
+                }
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn llama3_answers_a_factual_question() {

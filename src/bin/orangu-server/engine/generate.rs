@@ -471,44 +471,50 @@ impl Engine {
             }
             let task_tx = tx.clone();
             let result = tokio::task::spawn_blocking(move || {
-                // `catch_unwind` here (not left to `spawn_blocking`'s own
-                // panic-to-`JoinError` conversion below) so a panic's real
-                // detail can be recovered at all: this closure runs to
-                // completion on the *same* blocking-pool thread the panic
-                // hook (`crate::panic_capture`) just stashed its message/
-                // backtrace on, so `take_last_panic_detail` can only read
-                // it back correctly from right here — by the time this
-                // propagated out as a `JoinError` on a different
-                // (async-runtime) thread, there would be no way to
-                // associate that stash with this specific panic at all.
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run(
-                        model.as_ref(),
-                        tokenizer.as_ref(),
-                        draft.as_deref(),
-                        mtp.as_deref(),
-                        prefix_cache.as_deref(),
-                        slot_store.as_deref(),
-                        paged_kv.as_ref(),
-                        &decode_batcher,
-                        &guard,
-                        req,
-                        role,
-                        process_role,
-                        live_stats,
-                        &metrics,
-                        arrived,
-                        task_tx.clone(),
-                    )
-                }));
-                if let Err(_panic) = result {
-                    let detail =
-                        crate::panic_capture::take_last_panic_detail().unwrap_or_else(|| {
-                            "generation task panicked (no detail captured)".to_string()
-                        });
-                    let message = panic_report(detail, crate::device_lost::is_lost());
-                    let _ = task_tx.send(StreamEvent::Error(message));
-                }
+                // The whole request — its prompt and its answer, and the
+                // panic capture below, which must stay on one thread — in
+                // the CPU pool its phase measured faster in
+                // (`engine::cpu_pools`).
+                super::cpu_pools::for_request(move || {
+                    // `catch_unwind` here (not left to `spawn_blocking`'s own
+                    // panic-to-`JoinError` conversion below) so a panic's real
+                    // detail can be recovered at all: this closure runs to
+                    // completion on the *same* blocking-pool thread the panic
+                    // hook (`crate::panic_capture`) just stashed its message/
+                    // backtrace on, so `take_last_panic_detail` can only read
+                    // it back correctly from right here — by the time this
+                    // propagated out as a `JoinError` on a different
+                    // (async-runtime) thread, there would be no way to
+                    // associate that stash with this specific panic at all.
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run(
+                            model.as_ref(),
+                            tokenizer.as_ref(),
+                            draft.as_deref(),
+                            mtp.as_deref(),
+                            prefix_cache.as_deref(),
+                            slot_store.as_deref(),
+                            paged_kv.as_ref(),
+                            &decode_batcher,
+                            &guard,
+                            req,
+                            role,
+                            process_role,
+                            live_stats,
+                            &metrics,
+                            arrived,
+                            task_tx.clone(),
+                        )
+                    }));
+                    if let Err(_panic) = result {
+                        let detail =
+                            crate::panic_capture::take_last_panic_detail().unwrap_or_else(|| {
+                                "generation task panicked (no detail captured)".to_string()
+                            });
+                        let message = panic_report(detail, crate::device_lost::is_lost());
+                        let _ = task_tx.send(StreamEvent::Error(message));
+                    }
+                })
             })
             .await;
             if let Err(join_err) = result {
@@ -1205,6 +1211,11 @@ fn run(
         generated_tokens: generated,
         generate_time,
     };
+    // A prefix another request left in the cache, reused here: worth
+    // prefilling again after a restart (`engine::warm_prefixes`).
+    if reused_len >= super::warm_prefixes::MIN_TOKENS {
+        super::warm_prefixes::record(&req.prompt_tokens[..reused_len]);
+    }
     // The `\r` and the trailing `\x1b[K` (erase to end of line) only matter
     // if a live update above already moved the cursor onto this line, and
     // are left out otherwise — a log file gets a plain line, not a cursor

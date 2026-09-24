@@ -4080,6 +4080,123 @@ pub fn shader_source_ternary_i8(
     Some(s)
 }
 
+/// The `Q4_K` decode mat-vec on the integer dot, over the activation the
+/// fused decode chain already quantizes to `int8` per 32 (binding 1,
+/// [`PRELUDE_Q8`]'s layout) — the skeleton of [`shader_source_ternary_i8`],
+/// which took the ternary types to 34–44 GB/s on the Mali-G720 where the
+/// float kernels read at 14–17 (`doc/PERF-ALL.md`, task 5).
+///
+/// 64 lanes, eight to a 256-element super-block and eight super-blocks in
+/// flight. Lane `sub` of a block takes sixteen bytes of `qs` — bytes
+/// `32j + 16h ..` for `j = sub / 2`, `h = sub % 2` — whose low nibbles are
+/// elements `64j + 16h ..` (sub-block `2j`) and high nibbles elements
+/// `64j + 32 + 16h ..` (sub-block `2j + 1`): eight `dot4I8Packed` per row
+/// against eight activation words, loaded once per block and reused by
+/// every row of the workgroup (`n_rows` rows, `groups` runs of them), as are
+/// the two activation sums the minimum term needs. Per row and block the
+/// lane then applies its two sub-blocks' scale and minimum
+/// (`d·sc·Σqx − dmin·m·Σx`, each against its sub-block's activation scale)
+/// once to the integer sums.
+///
+/// The two sub-blocks' 6-bit scales and minimums are unpacked together,
+/// branch-free: they are adjacent bytes of `Q4_K`'s twelve, so one 16-bit
+/// field of the right word, two masks and a shift give both, and which
+/// word, which masks and which shift are the lane's own constants. The
+/// first form of this kernel unpacked them a byte at a time for sixteen
+/// elements a lane, ~40 operations beside four packed dots, and ran slower
+/// than the float kernel (477 against 368 µs for `ffn_gate`).
+///
+/// Within the `int8` rounding of the activation of the float kernels, which
+/// is how the start-up self-check (`decode_kernel_agrees`) holds it.
+pub fn shader_source_q4k_i8(n_rows: usize, groups: usize, subgroup: bool) -> String {
+    let mut s = String::new();
+    s.push_str(PRELUDE_Q8);
+    s.push_str(&format!(
+        "\nvar<workgroup> partial_sums: array<f32, {}>;\n\n",
+        n_rows * 64
+    ));
+    s.push_str("@compute @workgroup_size(64)\nfn main(\n    @builtin(workgroup_id) wid: vec3<u32>,\n    @builtin(local_invocation_id) lid: vec3<u32>,\n    @builtin(num_workgroups) nwg: vec3<u32>,");
+    s.push_str(subgroup_entry_params(subgroup));
+    s.push_str("\n) {\n");
+    let wg_rows = n_rows * groups;
+    s.push_str(&format!(
+        "    let n_row_groups = (params.out_dim + {}u) / {wg_rows}u;\n",
+        wg_rows - 1
+    ));
+    s.push_str("    let flat = wid.x + wid.y * nwg.x + wid.z * nwg.x * nwg.y;\n    if (flat >= n_row_groups * params.n_tokens) {\n        return;\n    }\n");
+    s.push_str("    let rg = flat / params.n_tokens;\n    let t = flat % params.n_tokens;\n");
+    s.push_str("    let local = lid.x;\n    let x_base = t * params.in_dim;\n\n");
+    // The lane's place in a super-block, and its scale-unpacking constants:
+    // sub-blocks `2j`, `2j + 1` are bytes `2j`, `2j + 1` of the scales (and
+    // `+ 4` of the minimums) for `j < 2`; for `j ≥ 2` their low four bits
+    // are in the last four bytes and their top two in the first eight.
+    s.push_str("    let sub = local % 8u;\n    let slot = local / 8u;\n    let jc = sub / 2u;\n    let hc = sub % 2u;\n    let e_lo = 64u * jc + 16u * hc;\n    let qs_word = 4u + 8u * jc + 4u * hc;\n    let n_blocks = params.in_dim / 256u;\n    let n_iter = (n_blocks + 7u) / 8u;\n");
+    s.push_str("    let upper = jc >= 2u;\n    let sh = 16u * (jc % 2u);\n    let mask_lo = select(0x3F3Fu, 0x0F0Fu, upper);\n    let mask_hi = select(0u, 0x3030u, upper);\n");
+    s.push_str(&format!(
+        "\n    var g: u32 = 0u;\n    loop {{\n    if (g >= {groups}u) {{\n        break;\n    }}\n    let o_base = (rg * {groups}u + g) * {n_rows}u;\n"
+    ));
+    for i in 0..n_rows {
+        s.push_str(&format!("    let o{i} = o_base + {i}u;\n"));
+    }
+    for i in 0..n_rows {
+        s.push_str(&format!("    var partial{i}: f32 = 0.0;\n"));
+    }
+    for r in 0..n_rows {
+        s.push_str(&format!(
+            "    let row{r} = min(o{r}, params.out_dim - 1u) * (params.row_bytes / 4u);\n"
+        ));
+    }
+    s.push_str("\n    var it: u32 = 0u;\n    loop {\n        if (it >= n_iter) {\n            break;\n        }\n");
+    s.push_str("        let b = it * 8u + slot;\n        let bvalid = b < n_blocks;\n        let bb = min(b, n_blocks - 1u);\n        let eb = x_base + bb * 256u + e_lo;\n        let zero = select(0u, 0xFFFFFFFFu, bvalid);\n");
+    // The eight activation words, their scales and sums — once per block.
+    for k in 0..4 {
+        s.push_str(&format!(
+            "        let xl{k} = q8_word(eb + {}u) & zero;\n        let xh{k} = q8_word(eb + {}u) & zero;\n",
+            4 * k,
+            32 + 4 * k
+        ));
+    }
+    s.push_str("        let dxl = q8_scale(eb);\n        let dxh = q8_scale(eb + 32u);\n");
+    s.push_str("        let sl = f32(dot4I8Packed(0x01010101u, xl0) + dot4I8Packed(0x01010101u, xl1) + dot4I8Packed(0x01010101u, xl2) + dot4I8Packed(0x01010101u, xl3));\n");
+    s.push_str("        let sh_x = f32(dot4I8Packed(0x01010101u, xh0) + dot4I8Packed(0x01010101u, xh1) + dot4I8Packed(0x01010101u, xh2) + dot4I8Packed(0x01010101u, xh3));\n");
+    s.push_str("        let blk = bb * 36u;\n");
+    for r in 0..n_rows {
+        s.push_str(&format!("        if (o{r} < params.out_dim) {{\n"));
+        s.push_str(&format!(
+            "            let wb = row{r} + blk;\n            let dm = unpack2x16float(weights[wb]);\n            let s0 = weights[wb + 1u];\n            let s1 = weights[wb + 2u];\n            let s2 = weights[wb + 3u];\n"
+        ));
+        // Both sub-blocks' scales (bytes 0 and 1 of `scp`) and minimums
+        // (of `mnp`).
+        s.push_str("            let scp = ((select(s0, s2, upper) >> sh) & mask_lo) | (((s0 >> sh) >> 2u) & mask_hi);\n            let mnp = ((select(s1, s2 >> 4u, upper) >> sh) & mask_lo) | (((s1 >> sh) >> 2u) & mask_hi);\n");
+        s.push_str("            var il: i32 = 0;\n            var ih: i32 = 0;\n");
+        for k in 0..4 {
+            s.push_str(&format!(
+                "            let w{k} = weights[wb + qs_word + {k}u];\n            il = il + dot4I8Packed(w{k} & 0x0F0F0F0Fu, xl{k});\n            ih = ih + dot4I8Packed((w{k} >> 4u) & 0x0F0F0F0Fu, xh{k});\n"
+            ));
+        }
+        s.push_str(&format!(
+            "            partial{r} = partial{r} + dxl * (dm.x * f32(scp & 0xFFu) * f32(il) - dm.y * f32(mnp & 0xFFu) * sl) + dxh * (dm.x * f32(scp >> 8u) * f32(ih) - dm.y * f32(mnp >> 8u) * sh_x);\n        }}\n"
+        ));
+    }
+    s.push_str("        it = it + 1u;\n    }\n\n");
+    // The shared combine writes row 0 unguarded (its other kernels never
+    // start a workgroup past the last row); here a run can.
+    s.push_str(
+        &reduce_combine_block(n_rows, subgroup)
+            .replace(
+                "        y[t * params.out_dim + o0] = t0;\n",
+                "        if (o0 < params.out_dim) {\n            y[t * params.out_dim + o0] = t0;\n        }\n",
+            )
+            .replace(
+                "        y[t * params.out_dim + o0] = partial_sums[0];\n",
+                "        if (o0 < params.out_dim) {\n            y[t * params.out_dim + o0] = partial_sums[0];\n        }\n",
+            ),
+    );
+    s.push_str("    workgroupBarrier();\n    g = g + 1u;\n    }\n");
+    s.push_str("}\n");
+    s
+}
+
 /// Words per 128-element block of the transposed `int8` activation layout
 /// the two-phase `PQ2_0` kernel reads (`shader_source_ternary_t`): `[d,
 /// Σq, 0, 0]`, then for each of two phases nine groups of four words —
@@ -12920,11 +13037,17 @@ pub fn shader_source_attention_split(
 /// registers with no branch between them, and the wave issues all of them
 /// before draining with counted `s_waitcnt vmcnt(N)`.
 fn owned_dim_loads(prefix: &str, read_fn: &str, count: u32) -> String {
+    owned_dim_loads_every(prefix, read_fn, count, 32)
+}
+
+/// [`owned_dim_loads`] for a lane that owns every `stride`-th dim — the
+/// cooperative decode kernel at a subgroup's width.
+fn owned_dim_loads_every(prefix: &str, read_fn: &str, count: u32, stride: u32) -> String {
     (0..count)
         .map(|i| {
             format!(
                 "        let {prefix}{i} = {read_fn}(kv_base + {}u);\n",
-                i * 32
+                i * stride
             )
         })
         .collect()
@@ -12964,13 +13087,25 @@ fn owned_dim_dot(q_prefix: &str, k_prefix: &str, count: u32) -> String {
 /// `head_dim % 32 == 0`. Not byte-identical to the *serial* kernel (the
 /// `subgroupAdd` reduces the dot in a different order), but it is bit-identical
 /// to the rolled cooperative kernel it replaces.
+///
+/// `lanes` is the workgroup — one subgroup — and the stride of a lane's dims:
+/// 32 where the device's subgroups are at least that wide, and the
+/// subgroup's own width where they are narrower (16 on the Mali-G720), so
+/// the one `subgroupAdd` still covers the whole dot. At 16 a lane owns
+/// `head_dim / 16` dims — 16 for `gemma-4-E2B`'s sliding layers, 32 for its
+/// full ones (`doc/PERF-ALL.md`, task 6).
 pub fn shader_source_attention_split_coop(
     kv_storage: KvStorage,
     head_dim: u32,
+    lanes: u32,
     paging: KvPaging,
 ) -> String {
-    debug_assert_eq!(head_dim % 32, 0, "coop attention needs head_dim % 32 == 0");
-    let owned = head_dim / 32;
+    debug_assert_eq!(
+        head_dim % lanes,
+        0,
+        "coop attention needs head_dim % lanes == 0"
+    );
+    let owned = head_dim / lanes;
     let (kv_bindings, kv_read_fns) = kv_storage.bindings_and_read_fns();
     let enable = kv_storage.enable_directive();
     let kv_page_binding = paging.binding();
@@ -12978,13 +13113,13 @@ pub fn shader_source_attention_split_coop(
 
     let regs: String = (0..owned)
         .map(|i| {
-            let off = i * 32;
+            let off = i * lanes;
             format!("    var q{i}: f32 = aq[q_base + {off}u + lane];\n    var a{i}: f32 = 0.0;\n")
         })
         .collect();
-    let k_reads = owned_dim_loads("k", "kv_read_k", owned);
+    let k_reads = owned_dim_loads_every("k", "kv_read_k", owned, lanes);
     let dot = owned_dim_dot("q", "k", owned);
-    let v_reads = owned_dim_loads("v", "kv_read_v", owned);
+    let v_reads = owned_dim_loads_every("v", "kv_read_v", owned, lanes);
     let acc: String = (0..owned)
         .map(|i| format!("        a{i} = a{i} * alpha + pw * v{i};\n"))
         .collect();
@@ -13053,7 +13188,7 @@ pub fn shader_source_attention_split_coop(
         .map(|i| {
             format!(
                 "    partial_acc[out_base * HEAD_DIM + {}u + lane] = a{i};\n",
-                i * 32
+                i * lanes
             )
         })
         .collect();
@@ -13087,7 +13222,7 @@ struct AttnSplitMeta {{
 
 const HEAD_DIM: u32 = {head_dim}u;
 
-@compute @workgroup_size(32)
+@compute @workgroup_size({lanes})
 fn main(
     @builtin(workgroup_id) wid: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
@@ -13100,7 +13235,7 @@ fn main(
     let k_num = am.k_num;
     let q_base = h * HEAD_DIM;
 
-    // Each lane owns dims {{ lane, lane+32, … }}. Stage the owned query
+    // Each lane owns dims {{ lane, lane+{lanes}, … }}. Stage the owned query
     // elements into registers and zero the owned accumulators.
 {regs}
     let split_len = (am.n_pos + k_num - 1u) / k_num;

@@ -399,16 +399,50 @@ fn attention_timed(
     // `resize` still zeroes whatever it *grows*, which is all the correctness
     // this needs, and after the first layer it grows by nothing.
     out.resize(n_tokens * n_head * head_dim, 0.0);
-    multi_head_attention(
-        out,
-        q,
-        cache,
-        n_head,
-        n_head.div_ceil(n_head_kv),
-        head_dim,
-        params.scale,
-        window,
-    );
+    // A prompt wide enough to spread over the pool in query blocks takes
+    // a blocked kernel (`attention_tiled`, `doc/PERF-ALL.md` task 3): the
+    // `int8` scores / `bf16` values one where the CPU has `i8mm` and
+    // `bf16`, the `f32` tiles elsewhere. Narrower passes — and decode —
+    // keep the one-query loop.
+    let group_size = n_head.div_ceil(n_head_kv);
+    let wide = n_tokens >= crate::engine::attention_tiled::min_tokens();
+    if wide && crate::engine::attention_tiled::mixed_available(head_dim) {
+        crate::engine::attention_tiled::attention_mixed(
+            out,
+            q,
+            cache,
+            n_head,
+            group_size,
+            head_dim,
+            params.scale,
+            window,
+        );
+    } else if wide
+        && crate::engine::attention_tiled::supports(head_dim)
+        && crate::engine::attention_tiled::enabled()
+    {
+        crate::engine::attention_tiled::attention_tiled(
+            out,
+            q,
+            cache,
+            n_head,
+            group_size,
+            head_dim,
+            params.scale,
+            window,
+        );
+    } else {
+        multi_head_attention(
+            out,
+            q,
+            cache,
+            n_head,
+            group_size,
+            head_dim,
+            params.scale,
+            window,
+        );
+    }
     Ran::OnCpu
 }
 
