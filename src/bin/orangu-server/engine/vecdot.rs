@@ -2723,7 +2723,55 @@ pub fn i8_scores_4rows(q: &PairedI8, qa: usize, qb: usize, k: &PairedI8, out: [&
         use std::arch::aarch64::*;
         let (a, b) = (q.pair(qa), q.pair(qb));
         let [o0, o1, o2, o3] = out;
-        for p in 0..k.pairs {
+        // Four key pairs at a time: eight independent `smmla` chains (two
+        // ran at the instruction's latency, sixteen deep), the query rows
+        // loaded once for all four, and each row's eight scores stored as
+        // two vectors — a 64-bit zip of the pairs' lanes.
+        let quads = k.pairs / 4;
+        for p4 in 0..quads {
+            // Safety: `i8mm` was verified; every load is 16 bytes inside a
+            // `2 * dim` pair, `dim` a multiple of 8; the stores write
+            // `o*[8 * p4..8 * p4 + 8]`, inside `2 * k.pairs`.
+            unsafe {
+                let kp: [*const i8; 4] = std::array::from_fn(|j| k.pair(4 * p4 + j).as_ptr());
+                let mut x = [vdupq_n_s32(0); 4];
+                let mut y = [vdupq_n_s32(0); 4];
+                let mut c = 0;
+                while c < 2 * dim {
+                    let av = vld1q_s8(a.as_ptr().add(c));
+                    let bv = vld1q_s8(b.as_ptr().add(c));
+                    for j in 0..4 {
+                        let kv = vld1q_s8(kp[j].add(c));
+                        x[j] = mmla_2x8(x[j], av, kv);
+                        y[j] = mmla_2x8(y[j], bv, kv);
+                    }
+                    c += 16;
+                }
+                // Lanes per pair: [row0.key0, row0.key1, row1.key0, row1.key1].
+                let rows = |v: &[int32x4_t; 4], lo: bool| -> [int32x4_t; 2] {
+                    let z = |p: int32x4_t, q: int32x4_t| {
+                        let (p, q) = (vreinterpretq_s64_s32(p), vreinterpretq_s64_s32(q));
+                        vreinterpretq_s32_s64(if lo {
+                            vzip1q_s64(p, q)
+                        } else {
+                            vzip2q_s64(p, q)
+                        })
+                    };
+                    [z(v[0], v[1]), z(v[2], v[3])]
+                };
+                for (o, v, lo) in [
+                    (&mut *o0, &x, true),
+                    (&mut *o1, &x, false),
+                    (&mut *o2, &y, true),
+                    (&mut *o3, &y, false),
+                ] {
+                    let [h0, h1] = rows(v, lo);
+                    vst1q_s32(o.as_mut_ptr().add(8 * p4), h0);
+                    vst1q_s32(o.as_mut_ptr().add(8 * p4 + 4), h1);
+                }
+            }
+        }
+        for p in 4 * quads..k.pairs {
             let kp = k.pair(p);
             // Safety: `i8mm` was verified; every load is 16 bytes inside a
             // `2 * dim` pair, `dim` a multiple of 8.
@@ -3463,6 +3511,50 @@ fn from_bf16(v: u16) -> f32 {
     f32::from_bits((v as u32) << 16)
 }
 
+/// `e^x` for `x ≤ 0` to the precision a `bf16` probability keeps: the
+/// same range reduction as `tensor::exp_neon`, a cubic for `e^r` (relative
+/// error ~6e-4 against `bf16`'s 4e-3 rounding) and only the lower clamp —
+/// a softmax row's shifted scores are never positive.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn exp_for_bf16(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let x = vmaxq_f32(x, vdupq_n_f32(-87.0));
+        let n = vrndnq_f32(vmulq_n_f32(x, std::f32::consts::LOG2_E));
+        let r = vfmaq_n_f32(x, n, -0.693_359_4);
+        let r = vfmaq_n_f32(r, n, 2.121_944_4e-4);
+        let p = vfmaq_n_f32(vdupq_n_f32(0.5), r, 1.0 / 6.0);
+        let p = vfmaq_f32(vdupq_n_f32(1.0), r, p);
+        let p = vfmaq_f32(vdupq_n_f32(1.0), r, p);
+        let scale = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(
+            vcvtq_s32_f32(n),
+            vdupq_n_s32(127),
+        )));
+        vmulq_f32(p, scale)
+    }
+}
+
+/// Four `f32` to `bf16`, rounded to nearest even — one `bfcvtn`.
+///
+/// # Safety
+/// The `bf16` extension ([`have_bf16mm`]).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn bfcvtn(v: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::uint16x4_t {
+    let out: std::arch::aarch64::uint16x4_t;
+    unsafe {
+        std::arch::asm!(
+            ".arch_extension bf16",
+            "bfcvtn {o:v}.4h, {i:v}.4s",
+            o = out(vreg) out,
+            i = in(vreg) v,
+            options(pure, nomem, nostack)
+        );
+    }
+    out
+}
+
 /// Rows of `bf16` for [`bf16_tiles`], two at a time: for each chunk of four
 /// `k`, a pair's two rows side by side (`[pair][chunk][2][4]`) — `bfmmla`'s
 /// operand. Rows are padded to a multiple of eight and `k` to four, with
@@ -3534,11 +3626,16 @@ impl PackedBf16 {
             use std::arch::aarch64::*;
             let s = vdupq_n_f32(shift);
             let round = vdupq_n_u32(0x7FFF);
+            let fast = have_bf16mm();
             let one = |c: usize, acc: &mut float32x4_t, row: &mut [u16]| {
-                let e = crate::engine::tensor::exp_neon(vsubq_f32(
-                    vld1q_f32(values.as_ptr().add(c * 4)),
-                    s,
-                ));
+                let x = vsubq_f32(vld1q_f32(values.as_ptr().add(c * 4)), s);
+                if fast {
+                    let e = exp_for_bf16(x);
+                    *acc = vaddq_f32(*acc, e);
+                    vst1_u16(row.as_mut_ptr().add(c * 8), bfcvtn(e));
+                    return;
+                }
+                let e = crate::engine::tensor::exp_neon(x);
                 *acc = vaddq_f32(*acc, e);
                 let bits = vreinterpretq_u32_f32(e);
                 let odd = vandq_u32(vshrq_n_u32::<16>(bits), vdupq_n_u32(1));
@@ -8276,6 +8373,49 @@ mod rowi8_tests {
 }
 
 #[cfg(test)]
+mod i8_scores_tests {
+    use super::*;
+
+    /// The four-rows score kernel is the exact integer product of the
+    /// quantized rows, over a key count that leaves both whole groups of
+    /// four pairs and a tail.
+    #[test]
+    fn i8_scores_4rows_is_the_exact_integer_product() {
+        let dim = 24;
+        let rows: Vec<Vec<f32>> = (0..5)
+            .map(|r| {
+                (0..dim)
+                    .map(|c| ((r * 31 + c * 7) % 23) as f32 - 11.0)
+                    .collect()
+            })
+            .collect();
+        let keys: Vec<Vec<f32>> = (0..14)
+            .map(|r| {
+                (0..dim)
+                    .map(|c| ((r * 13 + c * 5) % 19) as f32 - 9.0)
+                    .collect()
+            })
+            .collect();
+        let q = PairedI8::quantize(rows.len(), dim, |i| &rows[i]);
+        let k = PairedI8::quantize(keys.len(), dim, |i| &keys[i]);
+        let at = |m: &PairedI8, row: usize, c: usize| -> i32 {
+            m.data[(row / 2) * 2 * dim + (c / 8) * 16 + (row % 2) * 8 + c % 8] as i32
+        };
+        let mut out = vec![vec![0i32; 2 * k.pairs]; 4];
+        let [o0, o1, o2, o3] = &mut out[..] else {
+            unreachable!()
+        };
+        i8_scores_4rows(&q, 0, 1, &k, [o0, o1, o2, o3]);
+        for (r, row) in [0, 1, 2, 3].into_iter().zip(&out) {
+            for (j, &got) in row.iter().enumerate().take(keys.len()) {
+                let want: i32 = (0..dim).map(|c| at(&q, r, c) * at(&k, j, c)).sum();
+                assert_eq!(got, want, "row {r} key {j}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod bf16_tests {
     use super::*;
 
@@ -8341,14 +8481,16 @@ mod bf16_tests {
             got.set_row(0, &[0.0; 0]);
             got.set_row(2, &[0.0; 0]);
             let got_sum = got.set_row_exp(1, &x[..len], max);
+            // The body is `exp_for_bf16`'s cubic where `bf16` is available:
+            // ~6e-4 relative, far inside the rounding it goes through.
             assert!(
-                (got_sum - sum).abs() <= 1e-5 * sum,
+                (got_sum - sum).abs() <= 1e-3 * sum,
                 "{len}: {got_sum} vs {sum}"
             );
             for (i, (&a, &b)) in got.data.iter().zip(&want.data).enumerate() {
-                // The tail's exponentials are `libm`'s, the body's the
-                // polynomial's: one `bf16` unit apart at most.
-                assert!(a.abs_diff(b) <= 1, "{len} at {i}: {a:#x} vs {b:#x}");
+                // The tail's exponentials are `libm`'s, the body's a
+                // polynomial's: two `bf16` units apart at most.
+                assert!(a.abs_diff(b) <= 2, "{len} at {i}: {a:#x} vs {b:#x}");
             }
         }
     }
