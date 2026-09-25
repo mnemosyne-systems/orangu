@@ -13,6 +13,9 @@
   // binary is now running behind it, so the Reload button only appears
   // when a reload is actually needed.
   window.__ORANGU_ASSET_VERSION__ = "{{ASSET_VERSION}}";
+  // The largest file the server takes as an attachment: more on an image
+  // server, where a picture to start from can be a large photograph.
+  window.__ORANGU_MAX_ATTACHMENT_BYTES__ = {{MAX_ATTACHMENT_BYTES}};
 
   // Applied before first paint so a saved preference doesn't flash the
   // wrong theme for a frame — the rest of the toggle lives in app.js.

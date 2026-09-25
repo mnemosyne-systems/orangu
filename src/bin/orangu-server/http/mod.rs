@@ -234,6 +234,14 @@ pub fn reject_oversized_context(prompt_tokens: usize) -> Option<Response> {
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     let metrics = state.process_metrics.clone();
+    // An image server takes a picture to start from as base64 in the JSON,
+    // which axum's default 2 MB body cap would refuse long before
+    // `images::MAX_IMAGE_BYTES`. Everything else keeps that default.
+    let body_limit = axum::extract::DefaultBodyLimit::max(if state.engine.image.is_some() {
+        images::IMAGE_BODY_LIMIT
+    } else {
+        2 * 1024 * 1024
+    });
     let router = Router::new()
         .route("/health", get(native::health))
         .route("/ready", get(native::ready))
@@ -265,6 +273,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             state.clone(),
             require_api_key,
         ))
+        .layer(body_limit)
         .with_state(state);
     count_requests(router, metrics)
 }

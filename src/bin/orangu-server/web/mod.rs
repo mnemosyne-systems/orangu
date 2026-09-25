@@ -265,6 +265,11 @@ impl WebState {
 }
 
 pub fn build_router(state: Arc<WebState>) -> Router {
+    let body_limit = if state.engine.image.is_some() {
+        ATTACHMENT_BODY_LIMIT.max(crate::http::images::IMAGE_BODY_LIMIT)
+    } else {
+        ATTACHMENT_BODY_LIMIT
+    };
     Router::new()
         .route("/", get(index))
         .route("/static/app.css", get(app_css))
@@ -303,8 +308,9 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         .merge(models::router())
         // Attachments ride along as base64 in the message JSON, so the
         // default 2 MB body cap is far too small — allow room for a handful
-        // of documents (base64 inflates bytes by ~4/3).
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        // of documents (base64 inflates bytes by ~4/3), or on an image
+        // server one picture of up to `images::MAX_IMAGE_BYTES`.
+        .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state)
 }
 
@@ -326,8 +332,24 @@ async fn diagram_asset(Path((key, name)): Path<(String, String)>) -> impl IntoRe
     }
 }
 
+/// The message body cap for a language model's console.
+const ATTACHMENT_BODY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// The largest file the console lets you attach: 25 MB, or on an image
+/// server the picture cap the server enforces.
+const MAX_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+
 async fn index(State(state): State<Arc<WebState>>) -> impl IntoResponse {
+    let max_attachment_bytes = if state.engine.image.is_some() {
+        crate::http::images::MAX_IMAGE_BYTES
+    } else {
+        MAX_ATTACHMENT_BYTES
+    };
     let html = INDEX_HTML
+        .replace(
+            "{{MAX_ATTACHMENT_BYTES}}",
+            &max_attachment_bytes.to_string(),
+        )
         .replace("{{VERSION}}", state.version)
         .replace("{{MODEL}}", &html_escape(&state.model_display))
         .replace("{{YEAR}}", &orangu::license::current_year().to_string())

@@ -29,7 +29,7 @@
   // server decodes it and extracts text (documents) or notes it as a
   // reference (binaries), since the engine is text-only.
   let pendingAttachments = [];
-  const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+  const MAX_ATTACHMENT_BYTES = Number(window.__ORANGU_MAX_ATTACHMENT_BYTES__) || 25 * 1024 * 1024;
 
   // Swapped into #send-btn by setBusy() below — Send while idle, a plain
   // "X" while a reply is streaming so the same button can cancel it.
@@ -300,7 +300,7 @@
   async function stageFiles(fileList) {
     for (const file of Array.from(fileList || [])) {
       if (file.size > MAX_ATTACHMENT_BYTES) {
-        window.alert(`"${file.name}" is larger than 25 MB and was skipped.`);
+        window.alert(`"${file.name}" is larger than ${Math.round(MAX_ATTACHMENT_BYTES / (1024 * 1024))} MB and was skipped.`);
         continue;
       }
       try {

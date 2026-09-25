@@ -49,6 +49,15 @@ use crate::engine::image::{
     ImageDefaults, ImageEvent, ImageFormat, ImageRequest, InitImage, Pipeline, codec,
 };
 
+/// The largest picture, in bytes once decoded, an image server takes to
+/// start from — on the API and in the web console alike.
+pub const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024;
+
+/// The request body cap for an image server: one [`MAX_IMAGE_BYTES`]
+/// picture as base64 (4 characters per 3 bytes), plus room for the rest of
+/// the JSON around it.
+pub const IMAGE_BODY_LIMIT: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4 + 1024 * 1024;
+
 #[derive(Deserialize, Default)]
 pub struct ImageGenerationRequest {
     #[serde(default)]
@@ -251,9 +260,23 @@ pub fn decode_image_payload(payload: &str) -> Result<(String, Vec<u8>), String> 
             (String::new(), payload)
         }
     };
+    let data = data.trim();
+    // Refused before decoding: the base64 length bounds the bytes it holds.
+    if data.len() / 4 * 3 > MAX_IMAGE_BYTES + 2 {
+        return Err(format!(
+            "image is larger than the {} MB this server takes",
+            MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data.trim())
+        .decode(data)
         .map_err(|err| format!("image is not valid base64: {err}"))?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "image is larger than the {} MB this server takes",
+            MAX_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
     Ok((mime, bytes))
 }
 
@@ -548,6 +571,26 @@ mod tests {
         assert_eq!(bytes, vec![1, 2, 3]);
         assert!(decode_image_payload("https://example.com/a.png").is_err());
         assert!(decode_image_payload("data:image/png,raw").is_err());
+    }
+
+    #[test]
+    fn a_picture_up_to_the_cap_decodes_and_one_past_it_does_not() {
+        let engine = base64::engine::general_purpose::STANDARD;
+        let at_cap = engine.encode(vec![0u8; MAX_IMAGE_BYTES]);
+        assert!(
+            at_cap.len() <= IMAGE_BODY_LIMIT,
+            "the body cap fits the picture cap"
+        );
+        assert_eq!(
+            decode_image_payload(&at_cap).unwrap().1.len(),
+            MAX_IMAGE_BYTES
+        );
+        let past_cap = engine.encode(vec![0u8; MAX_IMAGE_BYTES + 1]);
+        assert!(
+            decode_image_payload(&past_cap)
+                .unwrap_err()
+                .contains("50 MB")
+        );
     }
 
     fn params<'a>(prompt: &'a str) -> ImageParams<'a> {
