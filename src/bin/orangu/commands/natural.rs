@@ -297,6 +297,11 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "cherry pick ",
     "cherry pick",
     "cherry-pick",
+    // --- revert ---
+    "git revert ",
+    "revert commit ",
+    "revert ",
+    "revert commit",
     // --- commit ---
     "git commit -a -m ",
     "git commit -m ",
@@ -798,6 +803,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
     for (prefix, bare) in [("rebase ", true), ("git rebase ", false)] {
         if let Some(target) = strip_ascii_prefix(input, prefix) {
+            if is_abort_argument(target) {
+                return Some(LocalCommand::Abort(GitOperation::Rebase));
+            }
             let target = target.trim();
             if !target.is_empty() && (!bare || is_single_argument(target)) {
                 return Some(LocalCommand::Rebase(Some(Cow::Borrowed(target))));
@@ -809,6 +817,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
     for (prefix, bare) in [("git merge ", false), ("merge ", true)] {
         if let Some(branch) = strip_ascii_prefix(input, prefix) {
+            if is_abort_argument(branch) {
+                return Some(LocalCommand::Abort(GitOperation::Merge));
+            }
             let branch = branch.trim();
             if !branch.is_empty() && (!bare || is_single_argument(branch)) {
                 return Some(LocalCommand::Merge(Some(Cow::Borrowed(branch))));
@@ -987,6 +998,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
     for prefix in ["git cherry-pick ", "cherry-pick ", "cherry pick "] {
         if let Some(commit) = strip_ascii_prefix(input, prefix) {
+            if is_abort_argument(commit) {
+                return Some(LocalCommand::Abort(GitOperation::CherryPick));
+            }
             let commit = commit.trim();
             if !commit.is_empty() {
                 return Some(LocalCommand::CherryPick(Some(Cow::Borrowed(commit))));
@@ -995,6 +1009,24 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
     if matches_ci(input, &["cherry pick", "cherry-pick"]) {
         return Some(LocalCommand::CherryPick(None));
+    }
+    for (prefix, bare) in [
+        ("git revert ", false),
+        ("revert commit ", false),
+        ("revert ", true),
+    ] {
+        if let Some(commit) = strip_ascii_prefix(input, prefix) {
+            if is_abort_argument(commit) {
+                return Some(LocalCommand::Abort(GitOperation::Revert));
+            }
+            let commit = commit.trim();
+            if !commit.is_empty() && (!bare || is_single_argument(commit)) {
+                return Some(LocalCommand::Revert(Some(Cow::Borrowed(commit))));
+            }
+        }
+    }
+    if matches_ci(input, &["revert commit", "git revert"]) {
+        return Some(LocalCommand::Revert(None));
     }
     for prefix in ["git commit -a -m ", "git commit -m ", "commit "] {
         if let Some(msg) = strip_ascii_prefix(input, prefix) {

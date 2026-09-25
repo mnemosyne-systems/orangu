@@ -440,6 +440,10 @@ pub fn cherry_pick_usage_message() -> &'static str {
     "Usage: /cherry_pick <commit>. Use /help to see available commands."
 }
 
+pub fn revert_usage_message() -> &'static str {
+    "Usage: /revert <commit>|abort. Use /help to see available commands."
+}
+
 pub fn commit_usage_message() -> &'static str {
     "Usage: /commit <message>. Use /help to see available commands."
 }

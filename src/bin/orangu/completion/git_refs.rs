@@ -17,10 +17,10 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use std::path::Path;
 
 use super::*;
-use crate::commands::{shell_words, strip_ascii_prefix};
+use crate::commands::{GitOperation, shell_words, strip_ascii_prefix};
 use crate::git::{
-    discover_git_root, git_branch_names, git_local_branch_names, git_remote_branch_names,
-    git_remote_names, git_tag_names,
+    discover_git_dir, discover_git_root, git_branch_names, git_local_branch_names,
+    git_remote_branch_names, git_remote_names, git_tag_names,
 };
 
 pub fn checkout_completion_candidates(
@@ -361,10 +361,39 @@ pub fn cherry_pick_completion_candidates(
         (prefix.len() - rest.len(), rest)
     };
     let token = token.trim_start();
-    let candidates = discover_git_root(workspace)
+    let mut candidates = discover_git_root(workspace)
         .map(|root| git_commit_hashes(&root, token))
         .unwrap_or_default();
+    offer_abort(&mut candidates, token, workspace, GitOperation::CherryPick);
     Some((cmd_len, candidates))
+}
+
+/// Tab/ghost completion for `/revert <commit>` (and its natural-language
+/// forms `git revert ` / `revert commit ` / `revert `): like `/show`, the
+/// abbreviated hashes of the latest commits on the local `HEAD`, newest first
+/// so the commit just made previews as the ghost, with the `abort` subcommand
+/// added by [`offer_abort`]. Returns `None` when the input is not a revert
+/// command, leaving the slash-command list to complete the command name.
+pub fn revert_completion_candidates(
+    prefix: &str,
+    workspace: &Path,
+) -> Option<(usize, Vec<String>)> {
+    let (start, token) = if let Some(rest) = prefix.strip_prefix("/revert ") {
+        ("/revert ".len(), rest)
+    } else if let Some(rest) = strip_ascii_prefix(prefix, "git revert ") {
+        (prefix.len() - rest.len(), rest)
+    } else if let Some(rest) = strip_ascii_prefix(prefix, "revert commit ") {
+        (prefix.len() - rest.len(), rest)
+    } else {
+        let rest = strip_ascii_prefix(prefix, "revert ")?;
+        (prefix.len() - rest.len(), rest)
+    };
+    let token = token.trim_start();
+    let mut candidates = discover_git_root(workspace)
+        .map(|root| git_recent_commit_hashes(&root, token))
+        .unwrap_or_default();
+    offer_abort(&mut candidates, token, workspace, GitOperation::Revert);
+    Some((start, candidates))
 }
 
 /// Tab/ghost completion for `/show <commit>` (and its natural-language forms
@@ -466,14 +495,37 @@ pub fn rebase_completion_candidates(
         (prefix.len() - rest.len(), rest)
     };
 
-    let candidates = discover_git_root(workspace)
+    let mut candidates = discover_git_root(workspace)
         .map(|root| rebase_target_candidates(&root))
         .unwrap_or_default()
         .into_iter()
         .filter(|target| target.starts_with(token))
         .collect();
+    offer_abort(&mut candidates, token, workspace, GitOperation::Rebase);
 
     Some((start, candidates))
+}
+
+/// Add the `abort` subcommand of `/rebase`, `/merge`, `/cherry_pick`, or
+/// `/revert` to
+/// its argument candidates when the typed `token` could begin it. While
+/// `operation` is in progress it is the likely intent, so it goes first and
+/// previews as the ghost; otherwise it follows the branches or commits.
+pub fn offer_abort(
+    candidates: &mut Vec<String>,
+    token: &str,
+    workspace: &Path,
+    operation: GitOperation,
+) {
+    if !"abort".starts_with(token) || candidates.iter().any(|c| c == "abort") {
+        return;
+    }
+    let in_progress = discover_git_dir(workspace).is_some_and(|dir| operation.in_progress(&dir));
+    if in_progress {
+        candidates.insert(0, "abort".to_string());
+    } else {
+        candidates.push("abort".to_string());
+    }
 }
 
 /// The rebase targets in offer order — local branches, then remotes, then

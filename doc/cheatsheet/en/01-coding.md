@@ -37,6 +37,7 @@ form (`commit "..."`, `push`) works just as well.
 | `/commit "[#42] Add the feature"` | Commit every tracked change. Quote the message when it has spaces. |
 | `/amend "[#42] Better wording"` | Rewrite the last commit message. |
 | `/stash` `/cherry_pick abc1234` | Park the working tree; take one commit from elsewhere. |
+| `/revert abc1234` `/rebase abort` | Undo a commit with a new one; back out of a rebase, merge, cherry-pick, or revert that went wrong. |
 
 ## Keep going
 

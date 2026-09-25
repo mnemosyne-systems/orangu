@@ -566,10 +566,13 @@ If `gh` is installed it uses `gh pr merge --merge`; otherwise it uses `git merge
 
 When the merge stops on conflicts, `/create_patch` resolves them: it hands the model every unmerged path, has it reconstruct the intended combined behavior, and stages the result. It leaves the merge itself for you to commit or abort. See the Core tools chapter.
 
+`/merge abort` abandons a merge that stopped on conflicts with `git merge --abort`, returning the branch to where it was before the merge. Tab completion after `/merge ` offers `abort` alongside the branch names — first, as the grey inline ghost, while a merge is in progress.
+
 **Examples**
 
 ```text
 /merge feature/login
+/merge abort
 ```
 
 Natural-language forms:
@@ -577,6 +580,8 @@ Natural-language forms:
 ```text
 merge feature/login
 git merge feature/login
+merge abort
+git merge --abort
 ```
 
 \newpage
@@ -593,9 +598,11 @@ A target argument rebases onto a specific branch, resolved against the configure
 - A remote-tracking branch such as `origin/main` — whose first segment is a configured remote — is refreshed with `git fetch <remote> <branch>` and rebased onto the updated `<remote>/<branch>`.
 - A bare remote name such as `origin` resolves the remote's default branch (from `refs/remotes/<remote>/HEAD`, falling back to `main` then `master`) and rebases onto it, refreshing it first.
 
-A rebase that stops on conflicts is handled by `/create_patch`, which resolves and stages the unmerged paths and leaves `git rebase --continue` (or `--abort`) to you. See the Core tools chapter.
+A rebase that stops on conflicts is handled by `/create_patch`, which resolves and stages the unmerged paths and leaves `git rebase --continue` to you. See the Core tools chapter.
 
-Tab completion after `/rebase ` (or the natural-language forms `rebase ` / `git rebase `) offers, in order, local branch names (from `git branch`), then the configured remotes (from `git remote`, with `origin` floated to the front), then the remote-tracking branches (from `git branch --all`, e.g. `origin/main`). The first local branch is previewed as the grey inline ghost.
+`/rebase abort` abandons the rebase in progress with `git rebase --abort`, returning the branch to where it was before the rebase started.
+
+Tab completion after `/rebase ` (or the natural-language forms `rebase ` / `git rebase `) offers, in order, local branch names (from `git branch`), then the configured remotes (from `git remote`, with `origin` floated to the front), then the remote-tracking branches (from `git branch --all`, e.g. `origin/main`), then `abort`. The first local branch is previewed as the grey inline ghost — or `abort`, which moves to the front while a rebase is in progress.
 
 **Examples**
 
@@ -604,6 +611,7 @@ Tab completion after `/rebase ` (or the natural-language forms `rebase ` / `git 
 /rebase develop
 /rebase origin/main
 /rebase upstream
+/rebase abort
 ```
 
 Natural-language forms:
@@ -613,6 +621,8 @@ rebase
 git rebase
 rebase develop
 git rebase origin/main
+rebase abort
+git rebase --abort
 ```
 
 \newpage
@@ -625,10 +635,13 @@ Cherry-picks a commit onto the current branch with `git cherry-pick`.
 
 As with `/merge` and `/rebase`, `/create_patch` resolves and stages the conflicts a stopped cherry-pick leaves behind. See the Core tools chapter.
 
+`/cherry_pick abort` abandons the cherry-pick in progress with `git cherry-pick --abort`. Tab completion offers `abort` after the commit hashes — first while a cherry-pick is in progress.
+
 **Examples**
 
 ```text
 /cherry_pick abc1234
+/cherry_pick abort
 ```
 
 Natural-language forms:
@@ -637,6 +650,35 @@ Natural-language forms:
 cherry pick abc1234
 cherry-pick abc1234
 git cherry-pick abc1234
+cherry pick abort
+git cherry-pick --abort
+```
+
+\newpage
+
+## /revert
+
+Reverts a commit: `git revert --no-edit <commit>` records a new commit that undoes it, with Git's default `Revert "<subject>"` message, so no editor is opened. The reverted commit stays in history, which makes this the safe way to back out a change that has already been pushed.
+
+`gh` has no equivalent, so it always uses plain Git. Tab completion offers the abbreviated hashes of the latest 25 commits on the current branch, newest first, so the commit you just made is previewed as the grey inline ghost; `abort` follows them.
+
+A revert that stops on conflicts is resolved by `/create_patch`, as with `/merge`, `/rebase`, and `/cherry_pick`, which then finishes it with `git revert --continue`. `/revert abort` abandons it instead with `git revert --abort`; while a revert is in progress, `abort` is the first completion.
+
+**Examples**
+
+```text
+/revert abc1234
+/revert abort
+```
+
+Natural-language forms:
+
+```text
+revert abc1234
+revert commit abc1234
+git revert abc1234
+revert abort
+git revert --abort
 ```
 
 \newpage

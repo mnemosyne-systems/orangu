@@ -248,6 +248,7 @@ cargo run --bin orangu -- --config ./orangu.conf
 - `/branch -m new-name`
 - `/branch -d feature/old`
 - `/cherry_pick <commit>`
+- `/revert <commit>`
 - `/comment 51 "My comment"`
 - `/close -i 51`
 - `/get_comments -i 51`
@@ -323,6 +324,7 @@ add README.md
 remove README.md
 move old.rs new.rs
 cherry pick abc1234
+revert abc1234
 commit "[#42] My feature"
 amend "[#42] My feature"
 push

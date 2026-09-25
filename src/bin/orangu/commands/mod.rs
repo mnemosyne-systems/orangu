@@ -121,7 +121,7 @@ pub fn shell_words(input: &str) -> Result<Vec<String>> {
 /// so it survives the turn being backgrounded by a tab switch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AfterTurn {
-    /// Finish the in-progress rebase, merge, or cherry-pick with its
+    /// Finish the in-progress rebase, merge, cherry-pick, or revert with its
     /// `--continue` — once Git reports no unmerged paths.
     FinishGitOperation,
 }
@@ -448,6 +448,52 @@ pub enum BisectSubcommand<'a> {
     Status,
 }
 
+/// A Git operation that can stop part-way — on conflicts — and be abandoned
+/// with `abort` (`/rebase abort`, `/merge abort`, `/cherry_pick abort`,
+/// `/revert abort`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitOperation {
+    Rebase,
+    Merge,
+    CherryPick,
+    Revert,
+}
+
+impl GitOperation {
+    /// The `git` subcommand: `rebase`, `merge`, `cherry-pick`, or `revert`.
+    pub fn git_verb(self) -> &'static str {
+        match self {
+            GitOperation::Rebase => "rebase",
+            GitOperation::Merge => "merge",
+            GitOperation::CherryPick => "cherry-pick",
+            GitOperation::Revert => "revert",
+        }
+    }
+
+    /// The operation as a sentence starts it.
+    pub fn title(self) -> &'static str {
+        match self {
+            GitOperation::Rebase => "Rebase",
+            GitOperation::Merge => "Merge",
+            GitOperation::CherryPick => "Cherry-pick",
+            GitOperation::Revert => "Revert",
+        }
+    }
+
+    /// Whether this operation is in progress in the repository whose Git
+    /// directory is `git_dir`.
+    pub fn in_progress(self, git_dir: &std::path::Path) -> bool {
+        match self {
+            GitOperation::Rebase => {
+                git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir()
+            }
+            GitOperation::Merge => git_dir.join("MERGE_HEAD").is_file(),
+            GitOperation::CherryPick => git_dir.join("CHERRY_PICK_HEAD").is_file(),
+            GitOperation::Revert => git_dir.join("REVERT_HEAD").is_file(),
+        }
+    }
+}
+
 pub enum BranchSubcommand<'a> {
     List,
     ListAll,
@@ -550,6 +596,11 @@ pub enum LocalCommand<'a> {
     MoveDirectory(Option<(Cow<'a, str>, Cow<'a, str>)>),
     DeleteDirectory(Option<Cow<'a, str>>),
     CherryPick(Option<Cow<'a, str>>),
+    /// `/revert <commit>`: undo a commit with a new one (`git revert`).
+    Revert(Option<Cow<'a, str>>),
+    /// `/rebase abort`, `/merge abort`, `/cherry_pick abort`, `/revert
+    /// abort`: `git <op> --abort` the operation in progress.
+    Abort(GitOperation),
     Commit(Option<Cow<'a, str>>),
     Amend(Option<Cow<'a, str>>),
     Push(bool),

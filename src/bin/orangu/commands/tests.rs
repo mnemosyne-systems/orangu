@@ -1293,6 +1293,67 @@ fn parses_rebase_commands() {
 }
 
 #[test]
+fn parses_abort_commands() {
+    for (input, expected) in [
+        ("/rebase abort", GitOperation::Rebase),
+        ("/rebase --abort", GitOperation::Rebase),
+        ("rebase abort", GitOperation::Rebase),
+        ("git rebase --abort", GitOperation::Rebase),
+        ("/merge abort", GitOperation::Merge),
+        ("merge abort", GitOperation::Merge),
+        ("git merge --abort", GitOperation::Merge),
+        ("/cherry_pick abort", GitOperation::CherryPick),
+        ("cherry pick abort", GitOperation::CherryPick),
+        ("git cherry-pick --abort", GitOperation::CherryPick),
+        ("/revert abort", GitOperation::Revert),
+        ("revert abort", GitOperation::Revert),
+        ("git revert --abort", GitOperation::Revert),
+    ] {
+        assert!(
+            matches!(parse_local_command(input), Some(LocalCommand::Abort(op)) if op == expected),
+            "{input} should abort {expected:?}"
+        );
+    }
+    // Other arguments still name a target.
+    assert!(matches!(
+        parse_local_command("/rebase aborted"),
+        Some(LocalCommand::Rebase(Some(ref target))) if target == "aborted"
+    ));
+}
+
+#[test]
+fn parses_revert_commands() {
+    assert!(matches!(
+        parse_local_command("/revert"),
+        Some(LocalCommand::Revert(None))
+    ));
+    assert!(matches!(
+        parse_local_command("/revert "),
+        Some(LocalCommand::Revert(None))
+    ));
+    assert!(matches!(
+        parse_local_command("git revert"),
+        Some(LocalCommand::Revert(None))
+    ));
+    for input in [
+        "/revert abc1234",
+        "revert abc1234",
+        "revert commit abc1234",
+        "git revert abc1234",
+    ] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::Revert(Some(ref commit))) if commit == "abc1234"
+            ),
+            "{input}"
+        );
+    }
+    // A sentence that merely starts with the verb is a prompt for the model.
+    assert!(parse_local_command("revert the last change").is_none());
+}
+
+#[test]
 fn parses_merge_commands() {
     assert!(matches!(
         parse_local_command("/merge"),

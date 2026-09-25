@@ -13,8 +13,9 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-use crate::commands::{AfterTurn, build_workspace_system_prompt};
-use crate::git::{discover_git_dir, git_current_branch};
+use crate::commands::revert_usage_message;
+use crate::commands::{AfterTurn, GitOperation, build_workspace_system_prompt};
+use crate::git::{abort_output, discover_git_dir, git_current_branch, revert_output};
 use crate::*;
 use std::fs;
 
@@ -878,7 +879,7 @@ fn apply_resolutions(repo_root: &Path, resolutions: &[Resolution]) -> Result<Vec
     Ok(report)
 }
 
-/// `--continue` whichever of rebase, merge, or cherry-pick is in progress,
+/// `--continue` whichever of rebase, merge, cherry-pick, or revert is in progress,
 /// keeping the commit message as it is. Refuses while Git still has unmerged
 /// paths — the model left some conflict unresolved — and reports a rebase
 /// that stops again on a later commit, both pointing back at `/create_patch`.
@@ -915,25 +916,26 @@ fn finish_git_operation(workspace: &Path) -> Result<String> {
     let Some(git_dir) = discover_git_dir(&repo_root) else {
         return Err(anyhow!("not inside a Git repository"));
     };
-    let operation =
-        if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
-            "rebase"
-        } else if git_dir.join("MERGE_HEAD").is_file() {
-            "merge"
-        } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
-            "cherry-pick"
-        } else {
-            return Ok("No Git operation is in progress".to_string());
-        };
+    let Some(operation) = [
+        GitOperation::Rebase,
+        GitOperation::Merge,
+        GitOperation::CherryPick,
+        GitOperation::Revert,
+    ]
+    .into_iter()
+    .find(|operation| operation.in_progress(&git_dir)) else {
+        return Ok("No Git operation is in progress".to_string());
+    };
+    let verb = operation.git_verb();
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(&repo_root)
-        .args([operation, "--continue"])
+        .args([verb, "--continue"])
         // Keep the message the commit already has instead of opening an
         // editor the user is not sitting in front of.
         .env("GIT_EDITOR", "true")
         .output()
-        .with_context(|| format!("failed to run git {operation} --continue"))?;
+        .with_context(|| format!("failed to run git {verb} --continue"))?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() {
@@ -947,7 +949,7 @@ fn finish_git_operation(workspace: &Path) -> Result<String> {
         } else {
             ""
         };
-        return Err(anyhow!("git {operation} --continue failed{hint}\n{detail}"));
+        return Err(anyhow!("git {verb} --continue failed{hint}\n{detail}"));
     }
     let branch = git_current_branch(&repo_root).unwrap_or_else(|_| "HEAD".to_string());
     let head = std::process::Command::new("git")
@@ -960,11 +962,7 @@ fn finish_git_operation(workspace: &Path) -> Result<String> {
         .unwrap_or_default();
     Ok(format!(
         "{} finished: branch '{branch}' is at {head}",
-        match operation {
-            "rebase" => "Rebase",
-            "merge" => "Merge",
-            _ => "Cherry-pick",
-        }
+        operation.title()
     ))
 }
 
@@ -1144,6 +1142,14 @@ fn conflict_operation(repo_root: &Path) -> String {
             "Git is cherry-picking commit {picking} onto branch '{branch}'. In the conflict \
              markers, `<<<<<<< HEAD` holds the current branch and the `>>>>>>>` side holds the \
              picked commit."
+        );
+    }
+    if git_dir.join("REVERT_HEAD").is_file() {
+        let reverting = short("REVERT_HEAD").unwrap_or_else(|| "a commit".to_string());
+        return format!(
+            "Git is reverting commit {reverting} on branch '{branch}'. In the conflict \
+             markers, `<<<<<<< HEAD` holds the current branch and the `>>>>>>>` side holds the \
+             code as it was before that commit — the undo to apply to the current code."
         );
     }
     String::new()
@@ -2155,6 +2161,17 @@ pub(crate) fn handle_command(
         )),
         LocalCommand::CherryPick(Some(commit)) => match cherry_pick_output(workspace, &commit) {
             Ok(_) => Ok(CommandOutcome::Quiet),
+            Err(err) => Ok(local_command_error(err)),
+        },
+        LocalCommand::Revert(None) => Ok(CommandOutcome::OutputError(
+            revert_usage_message().to_string(),
+        )),
+        LocalCommand::Revert(Some(commit)) => match revert_output(workspace, &commit) {
+            Ok(_) => Ok(CommandOutcome::Quiet),
+            Err(err) => Ok(local_command_error(err)),
+        },
+        LocalCommand::Abort(operation) => match abort_output(workspace, operation) {
+            Ok(output) => Ok(CommandOutcome::Output(output)),
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Commit(None) => Ok(CommandOutcome::OutputError(

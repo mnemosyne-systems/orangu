@@ -38,6 +38,7 @@ pub use prune::*;
 pub use pull::*;
 pub(crate) use session::*;
 
+use crate::commands::GitOperation;
 use crate::slash_command::SlashCommand;
 use strum::IntoEnumIterator;
 
@@ -430,6 +431,10 @@ fn structured_completion_candidates_unordered(
         return Some((start, cursor, candidates));
     }
 
+    if let Some((start, candidates)) = revert_completion_candidates(prefix, workspace) {
+        return Some((start, cursor, candidates));
+    }
+
     if let Some((start, candidates)) = show_completion_candidates(prefix, workspace) {
         return Some((start, cursor, candidates));
     }
@@ -467,7 +472,7 @@ fn structured_completion_candidates_unordered(
     }
 
     if let Some((start, branch_prefix)) = merge_completion_prefix(prefix) {
-        let branches = discover_git_root(workspace)
+        let mut branches: Vec<String> = discover_git_root(workspace)
             .map(|root| {
                 let local = git_local_branch_names(&root);
                 let all = git_branch_names(&root);
@@ -483,6 +488,7 @@ fn structured_completion_candidates_unordered(
             .into_iter()
             .filter(|b| b.starts_with(branch_prefix))
             .collect();
+        offer_abort(&mut branches, branch_prefix, workspace, GitOperation::Merge);
         return Some((start, cursor, branches));
     }
 

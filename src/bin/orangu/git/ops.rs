@@ -17,6 +17,7 @@ use anyhow::{Context, Result, anyhow};
 use std::path::{Path, PathBuf};
 
 use super::*;
+use crate::commands::GitOperation;
 
 /// Fetch from a remote with `git fetch`. When `remote` is `None` the first
 /// configured remote (see [`git_remote_names`], `origin` floated to the front)
@@ -740,6 +741,43 @@ pub fn git_cherry_pick(repo_root: &Path, commit: &str) -> Result<String> {
     } else {
         stdout
     })
+}
+
+/// `git revert --no-edit <commit>`: undo `commit` with a new commit carrying
+/// Git's default `Revert "..."` message, so no editor is opened. A revert
+/// that stops on conflicts is left for `/create_patch` or `/revert abort`.
+pub fn revert_output(workspace: &Path, commit: &str) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("revert is only available inside a Git repository"))?;
+    let stdout = git_output(&repo_root, &["revert", "--no-edit", commit])?;
+    Ok(if stdout.is_empty() {
+        format!("Reverted {commit}")
+    } else {
+        stdout
+    })
+}
+
+/// `git <operation> --abort`: abandon the rebase, merge, or cherry-pick in
+/// progress and return the branch to where it was before it started. Refuses
+/// up front when that operation is not in progress, rather than relaying
+/// Git's terser error.
+pub fn abort_output(workspace: &Path, operation: GitOperation) -> Result<String> {
+    let (repo_root, git_dir) = discover_git_repository(workspace).ok_or_else(|| {
+        anyhow!(
+            "{} abort is only available inside a Git repository",
+            operation.git_verb()
+        )
+    })?;
+    if !operation.in_progress(&git_dir) {
+        return Err(anyhow!("No {} is in progress", operation.git_verb()));
+    }
+    git_output(&repo_root, &[operation.git_verb(), "--abort"])?;
+    let branch = git_current_branch(&repo_root).unwrap_or_else(|_| "HEAD".to_string());
+    let head = git_output(&repo_root, &["log", "-1", "--format=%h %s"]).unwrap_or_default();
+    Ok(format!(
+        "{} aborted: branch '{branch}' is back at {head}",
+        operation.title()
+    ))
 }
 
 pub fn commit_output(workspace: &Path, message: &str) -> Result<String> {
@@ -1566,6 +1604,85 @@ mod tests {
         assert!(is_protected_branch("master"));
         assert!(!is_protected_branch("feature/my-branch"));
         assert!(!is_protected_branch("develop"));
+    }
+
+    #[test]
+    fn revert_undoes_a_commit_and_abort_abandons_a_conflicted_one() {
+        let workspace = tempdir().expect("workspace");
+        init_git_for_test(workspace.path());
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .output()
+                .expect("git command");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        let commit = |content: &str, msg: &str| {
+            std::fs::write(workspace.path().join("file.txt"), content).expect("write");
+            git(&["add", "."]);
+            git(&["commit", "-m", msg]);
+        };
+        let read = || std::fs::read_to_string(workspace.path().join("file.txt")).expect("read");
+        commit("one\n", "One");
+        commit("two\n", "Two");
+
+        revert_output(workspace.path(), "HEAD").expect("revert");
+        assert_eq!(read(), "one\n");
+        assert_eq!(git(&["log", "-1", "--format=%s"]), "Revert \"Two\"");
+
+        // Reverting "Two" again conflicts with the revert that followed it.
+        commit("three\n", "Three");
+        let two = git(&["log", "--format=%h", "--grep=^Two$"]);
+        assert!(revert_output(workspace.path(), &two).is_err());
+        let git_dir = workspace.path().join(".git");
+        assert!(GitOperation::Revert.in_progress(&git_dir));
+        let output = abort_output(workspace.path(), GitOperation::Revert).expect("abort");
+        assert!(output.starts_with("Revert aborted: "), "{output}");
+        assert!(!GitOperation::Revert.in_progress(&git_dir));
+        assert_eq!(read(), "three\n");
+    }
+
+    #[test]
+    fn abort_abandons_a_conflicted_merge() {
+        let workspace = tempdir().expect("workspace");
+        init_git_for_test(workspace.path());
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .output()
+                .expect("git command");
+        };
+        let commit = |content: &str, msg: &str| {
+            std::fs::write(workspace.path().join("file.txt"), content).expect("write");
+            git(&["add", "."]);
+            git(&["commit", "-m", msg]);
+        };
+        git(&["checkout", "-B", "main"]);
+        commit("base\n", "Base commit");
+        git(&["checkout", "-b", "other"]);
+        commit("other\n", "Other change");
+        git(&["checkout", "main"]);
+        commit("main\n", "Main change");
+
+        let err = abort_output(workspace.path(), GitOperation::Merge).expect_err("idle");
+        assert_eq!(err.to_string(), "No merge is in progress");
+
+        git(&["merge", "other"]);
+        let git_dir = workspace.path().join(".git");
+        assert!(GitOperation::Merge.in_progress(&git_dir));
+        let output = abort_output(workspace.path(), GitOperation::Merge).expect("abort");
+        assert!(
+            output.starts_with("Merge aborted: branch 'main' is back at ")
+                && output.ends_with(" Main change"),
+            "{output}"
+        );
+        assert!(!GitOperation::Merge.in_progress(&git_dir));
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("file.txt")).expect("read"),
+            "main\n"
+        );
     }
 
     #[test]

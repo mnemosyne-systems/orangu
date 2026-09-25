@@ -550,6 +550,7 @@ fn invalid_static_arguments(command: &LocalCommand<'_>) -> bool {
             | LocalCommand::MoveDirectory(None)
             | LocalCommand::DeleteDirectory(None)
             | LocalCommand::CherryPick(None)
+            | LocalCommand::Revert(None)
             | LocalCommand::Commit(None)
             | LocalCommand::Amend(None)
             | LocalCommand::Prune(None)

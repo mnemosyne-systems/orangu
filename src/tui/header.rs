@@ -197,10 +197,10 @@ pub fn help_text() -> &'static str {
 /amend <message>                                Rewrite the last commit message with git commit --amend
 /bisect [start|good|bad|skip|reset|log]         Binary-search history for the commit that introduced a bug (git bisect); bare /bisect shows the session status
 /branch [<name>|-a|-b|-m|-d <name>]             List, switch, create, rename or delete a branch
-/cherry_pick <commit>                           Cherry-pick a commit onto the current branch
+/cherry_pick <commit>|abort                     Cherry-pick a commit onto the current branch, or abort the cherry-pick in progress
 /comment <number> "<comment>"|<file>            Add a comment to a GitHub/GitLab issue; inline body, file from ~/.orangu/comments/, or `with [auto] review` to post the last /review or /auto_review report
 /create_file <path> [with <mode>] [containing <text>] Create a file (or stage an existing one), with optional permissions and content
-/create_patch                                   Apply fixes from the most recently completed /review or /auto_review; also resolve live Git merge/rebase/cherry-pick conflicts, even without a review report
+/create_patch                                   Apply fixes from the most recently completed /review or /auto_review; also resolve live Git merge/rebase/cherry-pick/revert conflicts, even without a review report
 /close -i <number>|-p <number>                  Close a GitHub/GitLab issue or pull request with gh/glab
 /commit <message>                               Commit all tracked changes with git commit -a -m
 /delete_directory <path>                        Delete an empty directory from the workspace
@@ -213,16 +213,17 @@ pub fn help_text() -> &'static str {
 /issue <reviewer|assignee|label> <number> <value> Add a reviewer, assignee, or label to a GitHub/GitLab issue or pull request
 /init_repo                                      Initialize a Git repository in the workspace
 /log [number]                                   Show commit log (optionally the latest number of commits) plus a count of uncommitted/untracked changes
-/merge <branch>                                 Merge a branch into the current branch
+/merge <branch>|abort                           Merge a branch into the current branch, or abort the merge in progress
 /move_file <source> <destination>               Rename or move a tracked file with git mv
 /pending [delete <n>]                           List queued commands, or delete one by number
 /pull <number>                                  Check out a GitHub/GitLab pull/merge request on a dedicated branch
 /pull_request                                   Create a pull request for the current branch
 /move_directory <from> <to>                     Move a directory and everything under it inside the workspace
 /push [--force]                                 Push the current branch to origin
-/rebase [target]                                Rebase the current branch onto master/main, or onto a given target (Tab completes local branches, then remotes, then remote branches)
+/rebase [target]|abort                          Rebase the current branch onto master/main, or onto a given target (Tab completes local branches, then remotes, then remote branches); abort abandons the rebase in progress
 /remove_file <path>                             Remove a file or directory from Git tracking
 /restore [--staged] <file>                      Restore a file or unstage it (git restore)
+/revert <commit>|abort                          Revert a commit with a new commit (git revert; Tab completes the latest commits first), or abort the revert in progress
 /review                                         Review branch changes against main/master in a split view
 /show [<commit>]                                Show a single commit (its header and diff) with git show; defaults to HEAD (Tab completes the latest 25 commits)
 /squash                                         Squash all branch commits into one

@@ -212,6 +212,7 @@ Then start with:
 /branch -m new-name
 /branch -d feature/old
 /cherry_pick abc1234
+/revert abc1234
 /comment 51 "My comment"
 /close -i 51
 /issue reviewer 114 jesperpedersen

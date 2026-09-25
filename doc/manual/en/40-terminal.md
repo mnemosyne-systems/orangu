@@ -49,7 +49,7 @@ Two groups of commands are refused rather than run, with a message saying which 
 - Commands whose only effect is on the running session — `/model`, `/server`, `/theme <name>`, `/license <spdx>`, `/verbosity`, `/disconnect`, `/reload` — since a one-shot exits before the change could matter. (`/license` with no argument still reports; it is only *setting* one that a one-shot cannot keep.) Select the server and model in `orangu.conf`, or point `--config` at a different file.
 - Commands that need the terminal interface — `/review`, `/auto_review`, `/manual`, `/pending`, `/clear`, `/copy`, `/quit`, `/restart`, and the forms of `/workspace`, `/create_workspace`, and `/session` that switch tab or session. The reporting forms still work: a bare `/workspace` prints the active workspace, and a bare `/session` lists the stored sessions.
 
-`/create_patch` is not in either group: a one-shot has no stored review report, but it still resolves the conflicts of an in-progress merge, rebase, or cherry-pick, which is what makes `orangu -p "/create_patch"` usable from a script that hits one.
+`/create_patch` is not in either group: a one-shot has no stored review report, but it still resolves the conflicts of an in-progress merge, rebase, cherry-pick, or revert, which is what makes `orangu -p "/create_patch"` usable from a script that hits one.
 
 `/export` covers the targets that are computed at export time: `pr`, `issue`, `statistics`, and `duplicates`. `console`, `review`, and `auto review` export what an interactive session accumulated, and report that there is nothing to export.
 
@@ -353,23 +353,26 @@ The completion modes are checked in order:
 2. If the line starts with `/create_file `, or with the natural-language prefixes `create `, `create file `, `add `, `add file `, or `git add `, complete untracked directories first (from `git ls-files --others --directory`), then untracked files. Already-tracked content is excluded.
 3. If the line starts with `/delete_file `, or with the natural-language prefixes `delete file `, `remove `, `remove file `, or `git rm `, complete tracked directories first (from `git ls-files`), then tracked files. Untracked content is excluded.
 4. If the line starts with `/move_file `, or with the natural-language prefixes `move `, `move file `, or `git mv `, complete the first argument from tracked directories and files; complete the second argument from all workspace paths.
-5. If the line starts with `/cherry_pick `, or with the natural-language prefixes `cherry pick `, `cherry-pick `, or `git cherry-pick `, complete abbreviated commit hashes from the default branch (`origin/main`, `origin/master`, `main`, or `master`, tried in that order).
-6. If the line starts with `/fetch `, or with the natural-language prefixes `fetch ` or `git fetch `, complete the configured remotes (from `git remote`), with `origin` floated to the front so the default is offered first and previewed as the inline ghost.
-7. If the line starts with `/add_repository `, or with the natural-language prefix `add repository ` (checked ahead of the bare `add ` form in 2), complete the first word from the users already added (every configured remote but `origin`) and the second from the branches already fetched from that user's copy, then `main` and `master`.
-8. If the line starts with `/rebase `, or with the natural-language prefixes `rebase ` or `git rebase `, complete the rebase target in priority order: local branch names first (from `git branch`), then the configured remotes (from `git remote`, `origin` floated to the front), then the remote-tracking branches (from `git branch --all`, e.g. `origin/main`). The first local branch is previewed as the inline ghost.
-9. If the line starts with `/merge `, or with the natural-language prefixes `merge ` or `git merge `, complete local branch names first (from `git branch`), then remote-only branch names (from `git branch --all`).
-10. If the line starts with `/branch -d `, or with the natural-language prefixes `delete `, `delete branch `, or `git branch -D `, complete local branch names (from `git branch`) excluding `main` and `master`.
-11. If the line starts with `/session ` (with a trailing space), complete session UUIDs sorted newest-first by last-modified time.
-12. If the line starts with `/model `, complete the models available on the selected server, cycling through them. If the line starts with `/server `, complete the names of all INI sections identified as servers; selecting one switches the active server.
-13. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively for the first positional argument. `/show_file` also completes `--hash` and `--author`. When a file path is already present, the next Tab press cycles through that file's commit history (abbreviated hashes from `git log --follow`).
-14. If the line starts with the natural-language prefixes `open `, `open file `, `edit `, or `edit file `, complete workspace file paths recursively.
-15. If the line starts with `/`, complete built-in slash commands and any
+5. If the line starts with `/cherry_pick `, or with the natural-language prefixes `cherry pick `, `cherry-pick `, or `git cherry-pick `, complete abbreviated commit hashes from the default branch (`origin/main`, `origin/master`, `main`, or `master`, tried in that order), then `abort`.
+6. If the line starts with `/revert `, or with the natural-language prefixes `git revert `, `revert commit `, or `revert `, complete the abbreviated hashes of the latest commits on the current branch, newest first — so the latest commit is previewed as the inline ghost — then `abort`.
+7. If the line starts with `/fetch `, or with the natural-language prefixes `fetch ` or `git fetch `, complete the configured remotes (from `git remote`), with `origin` floated to the front so the default is offered first and previewed as the inline ghost.
+8. If the line starts with `/add_repository `, or with the natural-language prefix `add repository ` (checked ahead of the bare `add ` form in 2), complete the first word from the users already added (every configured remote but `origin`) and the second from the branches already fetched from that user's copy, then `main` and `master`.
+9. If the line starts with `/rebase `, or with the natural-language prefixes `rebase ` or `git rebase `, complete the rebase target in priority order: local branch names first (from `git branch`), then the configured remotes (from `git remote`, `origin` floated to the front), then the remote-tracking branches (from `git branch --all`, e.g. `origin/main`), then `abort`. The first local branch is previewed as the inline ghost.
+10. If the line starts with `/merge `, or with the natural-language prefixes `merge ` or `git merge `, complete local branch names first (from `git branch`), then remote-only branch names (from `git branch --all`), then `abort`.
+11. If the line starts with `/branch -d `, or with the natural-language prefixes `delete `, `delete branch `, or `git branch -D `, complete local branch names (from `git branch`) excluding `main` and `master`.
+12. If the line starts with `/session ` (with a trailing space), complete session UUIDs sorted newest-first by last-modified time.
+13. If the line starts with `/model `, complete the models available on the selected server, cycling through them. If the line starts with `/server `, complete the names of all INI sections identified as servers; selecting one switches the active server.
+14. If the line starts with `/open_file ` or `/show_file `, complete workspace file paths recursively for the first positional argument. `/show_file` also completes `--hash` and `--author`. When a file path is already present, the next Tab press cycles through that file's commit history (abbreviated hashes from `git log --follow`).
+15. If the line starts with the natural-language prefixes `open `, `open file `, `edit `, or `edit file `, complete workspace file paths recursively.
+16. If the line starts with `/`, complete built-in slash commands and any
     discovered Agent Skills. Examples include `/help`, `/skills`, `/model`,
     `/server`, `/list_files`, `/show_file`, `/tools`, `/quit`, and a discovered
     skill such as `/debugging`. When the `drop_down` option is enabled in
     `orangu.conf` (the default), this completion is also visualized as an interactive
     dropdown menu that intercepts the Up/Down arrow keys.
-16. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor. In committer mode, while the first word is being typed — the empty line included — the merge flow's remaining steps are offered before those entries.
+17. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor. In committer mode, while the first word is being typed — the empty line included — the merge flow's remaining steps are offered before those entries.
+
+In modes 5, 6, 9, and 10, `abort` moves to the front — and becomes the inline ghost — while that operation (cherry-pick, revert, rebase, or merge) is in progress and stopped on conflicts.
 
 Path-completion details:
 

@@ -1183,6 +1183,108 @@ fn completes_cherry_pick_commits() {
 }
 
 #[test]
+fn completes_abort_for_rebase_merge_and_cherry_pick() {
+    let workspace = tempdir().expect("workspace");
+    init_test_git_repo(workspace.path());
+    fs::write(workspace.path().join("readme.md"), "initial").expect("readme");
+    for args in [
+        &["add", "readme.md"][..],
+        &["commit", "--quiet", "-m", "first commit"][..],
+    ] {
+        assert!(
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .status()
+                .expect("git")
+                .success()
+        );
+    }
+    let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+    let complete = |input: &str| {
+        completion_candidates(input, input.len(), workspace.path(), &[], &[], &skills)
+            .expect("completion")
+            .2
+    };
+
+    // Nothing in progress: `abort` is offered after the branches.
+    for input in ["/rebase ", "/merge ", "git merge ", "/cherry_pick "] {
+        let candidates = complete(input);
+        assert_eq!(
+            candidates.last().map(String::as_str),
+            Some("abort"),
+            "{input}"
+        );
+    }
+    assert_eq!(complete("/rebase ab"), vec!["abort"]);
+    assert!(!complete("/rebase m").contains(&"abort".to_string()));
+
+    // In progress: `abort` comes first, so it previews as the ghost.
+    let git_dir = workspace.path().join(".git");
+    fs::create_dir(git_dir.join("rebase-merge")).expect("rebase-merge");
+    assert_eq!(complete("/rebase ")[0], "abort");
+    assert_eq!(complete("rebase ")[0], "abort");
+    assert_ne!(complete("/merge ")[0], "abort");
+    fs::write(git_dir.join("MERGE_HEAD"), "0000000\n").expect("MERGE_HEAD");
+    assert_eq!(complete("/merge ")[0], "abort");
+    fs::write(git_dir.join("CHERRY_PICK_HEAD"), "0000000\n").expect("CHERRY_PICK_HEAD");
+    assert_eq!(complete("/cherry_pick ")[0], "abort");
+}
+
+#[test]
+fn completes_revert_with_the_latest_commit_first() {
+    let workspace = tempdir().expect("workspace");
+    init_test_git_repo(workspace.path());
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace.path())
+            .output()
+            .expect("git");
+        assert!(output.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    for (content, message) in [("one", "first commit"), ("two", "second commit")] {
+        fs::write(workspace.path().join("readme.md"), content).expect("readme");
+        git(&["add", "readme.md"]);
+        git(&["commit", "--quiet", "-m", message]);
+    }
+    let latest = git(&["log", "-1", "--format=%h"]);
+    let previous = git(&["log", "-1", "--format=%h", "HEAD~1"]);
+    let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+    let complete = |input: &str| {
+        completion_candidates(input, input.len(), workspace.path(), &[], &[], &skills)
+            .expect("completion")
+    };
+
+    for input in ["/revert ", "git revert ", "revert commit ", "revert "] {
+        let (start, _, candidates) = complete(input);
+        assert_eq!(start, input.len(), "{input}");
+        assert_eq!(
+            candidates,
+            vec![latest.clone(), previous.clone(), "abort".to_string()],
+            "{input}"
+        );
+    }
+    // The ghost previews the latest commit.
+    assert_eq!(
+        completion_ghost_suffix(
+            "/revert ",
+            "/revert ".len(),
+            workspace.path(),
+            &[],
+            &[],
+            &skills
+        ),
+        Some(latest.clone())
+    );
+
+    // While a revert is in progress `abort` leads instead.
+    fs::write(workspace.path().join(".git/REVERT_HEAD"), "0000000\n").expect("REVERT_HEAD");
+    assert_eq!(complete("/revert ").2[0], "abort");
+}
+
+#[test]
 fn completes_show_with_recent_local_commits() {
     let workspace = tempdir().expect("workspace");
     init_test_git_repo(workspace.path());

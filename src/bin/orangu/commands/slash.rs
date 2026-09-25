@@ -86,6 +86,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/amend" => Some(LocalCommand::Amend(None)),
         "/branch" => Some(LocalCommand::Branch(BranchSubcommand::List)),
         "/cherry_pick" => Some(LocalCommand::CherryPick(None)),
+        "/revert" => Some(LocalCommand::Revert(None)),
         "/commit" => Some(LocalCommand::Commit(None)),
         "/restore" => Some(LocalCommand::Restore(None)),
         "/diff" => Some(LocalCommand::Diff(None)),
@@ -298,6 +299,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 return Some(LocalCommand::Prune(parse_prune_args(args.trim())));
             }
             if let Some(args) = input.strip_prefix("/merge ") {
+                if is_abort_argument(args) {
+                    return Some(LocalCommand::Abort(GitOperation::Merge));
+                }
                 let branch = args.trim();
                 return Some(LocalCommand::Merge(if branch.is_empty() {
                     None
@@ -306,6 +310,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 }));
             }
             if let Some(args) = input.strip_prefix("/rebase ") {
+                if is_abort_argument(args) {
+                    return Some(LocalCommand::Abort(GitOperation::Rebase));
+                }
                 let target = args.trim();
                 return Some(LocalCommand::Rebase(if target.is_empty() {
                     None
@@ -364,8 +371,22 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 });
             }
             if let Some(args) = input.strip_prefix("/cherry_pick ") {
+                if is_abort_argument(args) {
+                    return Some(LocalCommand::Abort(GitOperation::CherryPick));
+                }
                 let commit = args.trim();
                 return Some(LocalCommand::CherryPick(if commit.is_empty() {
+                    None
+                } else {
+                    Some(Cow::Borrowed(commit))
+                }));
+            }
+            if let Some(args) = input.strip_prefix("/revert ") {
+                if is_abort_argument(args) {
+                    return Some(LocalCommand::Abort(GitOperation::Revert));
+                }
+                let commit = args.trim();
+                return Some(LocalCommand::Revert(if commit.is_empty() {
                     None
                 } else {
                     Some(Cow::Borrowed(commit))
@@ -572,4 +593,10 @@ pub(crate) fn parse_create_file_args(args: &str) -> Option<CreateFileArgs<'_>> {
             .filter(|content| !content.is_empty())
             .map(Cow::Borrowed),
     })
+}
+
+/// Whether the argument to `/rebase`, `/merge`, `/cherry_pick`, or `/revert` is the
+/// `abort` subcommand (`--abort`, as Git spells it, is accepted too).
+pub fn is_abort_argument(args: &str) -> bool {
+    matches!(args.trim(), "abort" | "--abort")
 }

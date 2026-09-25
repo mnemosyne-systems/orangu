@@ -63,6 +63,7 @@ impl OranguHelper {
                 "/delete_file".to_string(),
                 "/move_file".to_string(),
                 "/cherry_pick".to_string(),
+                "/revert".to_string(),
                 "/commit".to_string(),
                 "/amend".to_string(),
                 "/push".to_string(),
