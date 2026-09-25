@@ -120,6 +120,15 @@ pub fn init_git_for_test(workspace: &Path) {
             .expect("git config email")
             .success()
     );
+    // Windows Git defaults to autocrlf=true, which rewrites checked-out files with CRLF.
+    assert!(
+        std::process::Command::new("git")
+            .args(["config", "core.autocrlf", "false"])
+            .current_dir(workspace)
+            .status()
+            .expect("git config autocrlf")
+            .success()
+    );
 }
 
 /// Test helper: run a git command in `dir`, asserting success.
