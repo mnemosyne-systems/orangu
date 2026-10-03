@@ -1030,6 +1030,7 @@ orangu-server show Qwen3-Coder-30B-A3B-Instruct.gguf      # bare name under `mod
 orangu-server show ./relative/or/absolute/path.gguf
 orangu-server show 3 --tensors   # also list every tensor's shape/type/offset
 orangu-server show 3 --full      # print full arrays instead of a preview
+orangu-server show 3 --path      # only the file path(s), every shard, one per line
 orangu-server show               # no argument: list, then pick an NR interactively
 ```
 
@@ -1447,6 +1448,22 @@ kills the bundle on sight.
 
 Releases ship the ordinary `orangu-server`, which includes `bundle`; the
 bundles themselves are built locally, from whichever model suits the machine.
+
+## Container image: the whole stack
+
+`contrib/docker` builds one Docker or Podman image holding
+`orangu-coordinator`, `orangu-server` and a model from `list`:
+
+```sh
+cd contrib/docker
+make MODEL=3              # NR, MODEL or path, as for `show`
+make run                  # http://localhost:9000/v1
+```
+
+The binaries are compiled from the checkout inside the build, and the model's
+files come from `show <MODEL> --path`. Point `orangu` at port 9000 as at any
+coordinator. `contrib/docker/README.md` covers the variables, Podman and
+what is in the image.
 
 ## Configuration
 

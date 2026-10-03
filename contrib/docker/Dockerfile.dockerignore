@@ -1,0 +1,5 @@
+# The build context is the repository root; only the sources are needed.
+.git
+target
+contrib/docker/build
+**/*.gguf

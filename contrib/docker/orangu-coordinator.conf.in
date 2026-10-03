@@ -1,0 +1,15 @@
+# The coordinator configuration baked into the image. The Makefile fills in
+# @MODEL@ with the model it copied into /opt/orangu/models.
+#
+# One profile with role `all` takes every request, whatever model name the
+# client asks for. Its server gets no web console, so nothing can load or
+# download a different model into the container.
+
+[orangu-coordinator]
+host = all
+port = 9000
+models = /opt/orangu/models
+
+[main]
+role = all
+model = @MODEL@

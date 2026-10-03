@@ -366,6 +366,11 @@ enum Command {
         /// Also list each tensor's name, shape, type, and offset.
         #[arg(long)]
         tensors: bool,
+        /// Print only the model's file path(s) — every shard of a split
+        /// model, one per line — for scripts, such as contrib/docker's
+        /// Makefile, that copy a model chosen from `list`.
+        #[arg(long, conflicts_with_all = ["full", "tensors"])]
+        path: bool,
     },
     /// Compile a model's feed-forward blocks for the NPU into a cache.
     ///
@@ -4117,6 +4122,7 @@ fn run_command(
             file,
             full,
             tensors,
+            path: paths_only,
         } => {
             let conf = load_config(config_arg, None, false)?;
             let path = match file {
@@ -4124,6 +4130,12 @@ fn run_command(
                 None => select_model_for_show(&conf.models)?,
             };
             let gguf = GgufFile::open(&path)?;
+            if paths_only {
+                for shard in engine::loader::shard_paths(&path, &gguf)? {
+                    println!("{}", shard.display());
+                }
+                return Ok(());
+            }
             print!("{}", format_show(&gguf, full, tensors));
             Ok(())
         }
@@ -6600,6 +6612,7 @@ mod tests {
                 file: None,
                 full: false,
                 tensors: false,
+                path: false,
             }
             .mode(),
             Command::Download {
