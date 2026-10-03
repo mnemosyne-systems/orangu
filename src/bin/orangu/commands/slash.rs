@@ -143,6 +143,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     Err(_) => return None,
                 };
                 return match words.first().map(String::as_str) {
+                    Some("diff") if words.len() == 1 => Some(LocalCommand::GraphDiff),
                     Some("explain") if words.len() == 2 => {
                         Some(LocalCommand::GraphExplain(Cow::Owned(words[1].clone())))
                     }

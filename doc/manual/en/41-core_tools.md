@@ -1490,16 +1490,20 @@ Nodes are automatically clustered and color-coded based on the file they belong 
 
 `/graph path <source> <target>` finds the shortest directed path between two graph nodes. Add `--undirected` when you want to explore a relationship in either direction. A path is limited to eight hops by default.
 
+`/graph diff` writes `<repository>-<branch>-diff-graph.html`: the same visualization restricted to the branch-changed files against the merge base with main/master, plus their one-hop callers and callees. Changed symbols render larger with a `changed in this branch` badge; the sidebar adds a `Changed files` panel with each file's unified diff (truncated per file) and lists changed files with no graph node as `Not in graph`. On a branch with no changes it reports that; when the changed files contribute no symbols (docs-only) it says so instead of writing an empty page.
+
 For a one-shot query, pass either command with `-p`; Orangu prints the result and exits.
 
 **Examples**
 
 ```text
 /graph
+/graph diff
 /graph explain shortest_path
 /graph path shortest_path resolve_node
 /graph path resolve_node shortest_path --undirected
 
+orangu -p "/graph diff"
 orangu -p "/graph explain shortest_path"
 orangu -p "/graph path shortest_path resolve_node"
 ```

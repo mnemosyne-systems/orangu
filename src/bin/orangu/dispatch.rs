@@ -2475,7 +2475,112 @@ pub(crate) fn handle_command(
                 }
             }
         }
+        LocalCommand::GraphDiff => {
+            // Same stale-branch guard as `/review`: a diff graph of a branch
+            // behind main/master would show stale code.
+            if let Some(refusal) = behind_default_branch_guard(workspace) {
+                return Ok(refusal);
+            }
+            tools.ensure_graph()?;
+            let review = match collect_review_diff(workspace) {
+                Ok(review) => review,
+                Err(err) => return Ok(local_command_error(err)),
+            };
+            if review.files.is_empty() {
+                return Ok(CommandOutcome::Output(format!(
+                    "No changes to graph against {}.",
+                    review.base_label
+                )));
+            }
+            let (changed, diff_files) = graph_diff_workspace_files(workspace, &review.files);
+            if changed.is_empty() {
+                return Ok(CommandOutcome::Output(format!(
+                    "No changed files in this workspace against {}.",
+                    review.base_label
+                )));
+            }
+            let guard = tools
+                .graph_store
+                .lock()
+                .map_err(|_| anyhow::anyhow!("graph store mutex poisoned"))?;
+            match &*guard {
+                None => Ok(CommandOutcome::OutputError(
+                    "Could not build the Knowledge Graph for this workspace.".to_string(),
+                )),
+                Some(store) => {
+                    let repo_name = crate::export::repository_display(workspace);
+                    let repo_name = crate::export::sanitize(&repo_name);
+                    let branch_name = crate::export::branch_display(workspace);
+                    let branch_name = crate::export::sanitize(&branch_name);
+                    match orangu::graph::html::write_diff_html(
+                        store,
+                        workspace,
+                        &repo_name,
+                        &branch_name,
+                        &changed,
+                        &diff_files,
+                        &review.base_label,
+                    ) {
+                        Ok(Some((path, nodes, edges))) => {
+                            let file_url = format!("file://{}", path.display());
+                            let path_display =
+                                path.file_name().unwrap_or_default().to_string_lossy();
+                            Ok(CommandOutcome::MarkdownOutput(format!(
+                                "Diff Graph written to: [{path_display}]({file_url}) ({nodes} nodes / {edges} edges) — {} changed file(s) vs {}",
+                                review.files.len(),
+                                review.base_label
+                            )))
+                        }
+                        Ok(None) => Ok(CommandOutcome::Output(format!(
+                            "Changed files against {} have no symbols in the Knowledge Graph.",
+                            review.base_label
+                        ))),
+                        Err(err) => Ok(CommandOutcome::OutputError(format!(
+                            "Failed to generate diff graph: {err:#}"
+                        ))),
+                    }
+                }
+            }
+        }
     }
+}
+
+/// Map `/review`'s repo-relative changed paths onto the workspace-relative
+/// `source_file` keys the graph indexes by (see
+/// `auto_review_graph_relative_path`), plus each file's plain unified diff.
+/// Files outside the active workspace are skipped — nothing sensible to match
+/// them against.
+fn graph_diff_workspace_files(
+    workspace: &Path,
+    files: &[crate::git::ReviewFileDiff],
+) -> (
+    std::collections::HashSet<String>,
+    Vec<orangu::graph::html::DiffFile>,
+) {
+    let repo_root = git::discover_git_root(workspace);
+    let mut changed = std::collections::HashSet::new();
+    let mut diff_files = Vec::new();
+    for file in files {
+        let workspace_relative = match &repo_root {
+            Some(root) => {
+                let absolute = root.join(&file.path);
+                match absolute.strip_prefix(workspace) {
+                    Ok(relative) => relative.to_string_lossy().replace('\\', "/"),
+                    Err(_) => continue,
+                }
+            }
+            None => file.path.clone(),
+        };
+        if workspace_relative.is_empty() {
+            continue;
+        }
+        changed.insert(workspace_relative.clone());
+        diff_files.push(orangu::graph::html::DiffFile {
+            path: workspace_relative,
+            patch: file.patch.clone(),
+        });
+    }
+    (changed, diff_files)
 }
 
 #[cfg(test)]
