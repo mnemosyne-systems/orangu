@@ -1368,6 +1368,7 @@
   const settingsPanes = {
     mcps: document.getElementById("mcps-panel"),
     models: document.getElementById("models-panel"),
+    monitor: document.getElementById("monitor-panel"),
     image: document.getElementById("image-panel"),
     workers: document.getElementById("workers-panel"),
   };
@@ -2543,6 +2544,206 @@
     imageStatus.textContent = "Reset to the configuration — Save to apply.";
   });
 
+  // ------------------------monitor -----------------------------------
+  // live CPU / GPU / NPU inventory. Polled from /api/monitor
+  // only while the pane is shown same pattern as the model manager's
+  // MODELS_POLL_MS loop. A refresh is one blocking probe server-side
+  // (~250 ms CPU sampling window), so 2 s keeps the bars live without
+  // stacking requests.
+  const MONITOR_POLL_MS = 2000;
+  const monitorBody = document.getElementById("monitor-body");
+  const monitorUpdated = document.getElementById("monitor-updated");
+  const monitorReloadBtn = document.getElementById("monitor-reload-btn");
+  const monitorState = { open: false, timer: null, busy: false };
+
+  function monitorBar(pct) {
+    const wrap = document.createElement("div");
+    wrap.className = "monitor-bar";
+    const fill = document.createElement("span");
+    const clamped = Math.max(0, Math.min(100, Number(pct) || 0));
+    fill.style.width = `${clamped.toFixed(1)}%`;
+    // Traffic-light fill: calm green, amber past 70, red past 90.
+    fill.classList.add(clamped >= 90 ? "crit" : clamped >= 70 ? "warn" : "ok");
+    wrap.appendChild(fill);
+    return wrap;
+  }
+
+  function monitorRow(label, value) {
+    const row = document.createElement("div");
+    row.className = "monitor-row";
+    const key = document.createElement("span");
+    key.className = "monitor-key";
+    key.textContent = label;
+    const val = document.createElement("span");
+    val.className = "monitor-value";
+    val.textContent = value;
+    row.append(key, val);
+    return row;
+  }
+
+  function monitorSection(title) {
+    const h = document.createElement("h3");
+    h.className = "monitor-section";
+    h.textContent = title;
+    monitorBody.appendChild(h);
+  }
+
+  function renderMonitor(view) {
+    monitorBody.innerHTML = "";
+    // Server first: what is serving, and whether it has room.
+    monitorSection("Server");
+    monitorBody.append(
+      monitorRow("Model", view.server.model || "—"),
+      monitorRow("Backend", `${view.server.architecture || "—"} · ${view.server.backend || "—"} · ${view.server.role || "—"}`),
+      monitorRow("Slots", `${view.server.slots_busy}/${view.server.slots_total} busy · ${view.server.queued} queued`),
+    );
+    // CPU: identity row, then the live rate, then per-core bars.
+    monitorSection("CPU");
+    const cores = view.cpu.physical_cores != null
+      ? `${view.cpu.physical_cores} physical / ${view.cpu.logical_cores} logical`
+      : `${view.cpu.logical_cores} logical`;
+    monitorBody.append(
+      monitorRow("Model", view.cpu.brand || "—"),
+      monitorRow("Cores", `${cores}${view.cpu.governor ? ` · ${view.cpu.governor}` : ""}`),
+      monitorRow("Usage", `${view.cpu.usage_pct.toFixed(1)}%`),
+    );
+    monitorBody.appendChild(monitorBar(view.cpu.usage_pct));
+    if (view.cpu.per_core_pct && view.cpu.per_core_pct.length > 1) {
+      const grid = document.createElement("div");
+      grid.className = "monitor-cores";
+      view.cpu.per_core_pct.forEach((pct, i) => {
+        const cell = document.createElement("div");
+        cell.className = "monitor-core";
+        cell.title = `C${i + 1}: ${pct.toFixed(1)}%`;
+        const bar = monitorBar(pct);
+        bar.classList.add("monitor-core-bar");
+        const label = document.createElement("span");
+        label.className = "monitor-core-label";
+        label.textContent = `C${i + 1} ${pct.toFixed(0)}%`;
+        cell.append(bar, label);
+        grid.appendChild(cell);
+      });
+      monitorBody.appendChild(grid);
+    }
+    // Memory: host totals plus this process's own RSS.
+    monitorSection("Memory");
+    const used = view.memory.total_bytes - view.memory.available_bytes;
+    const usedPct = view.memory.total_bytes ? (100 * used) / view.memory.total_bytes : 0;
+    monitorBody.append(
+      monitorRow("RAM", `${formatBytes(used)} / ${formatBytes(view.memory.total_bytes)} (${usedPct.toFixed(1)}%)`),
+    );
+    monitorBody.appendChild(monitorBar(usedPct));
+    monitorBody.append(
+      monitorRow("Server RSS", view.memory.process_bytes != null ? formatBytes(view.memory.process_bytes) : "—"),
+      monitorRow("Swap", `${formatBytes(view.memory.swap_used_bytes)} / ${formatBytes(view.memory.swap_total_bytes)}`),
+    );
+    // GPUs: one block per device `used` is present on NVIDIA only.
+    monitorSection("GPU");
+    if (!view.gpus.length) {
+      monitorBody.appendChild(monitorRow("Devices", "none detected"));
+    }
+    for (const gpu of view.gpus) {
+      const title = gpu.vendor ? `${gpu.vendor} ${gpu.name}` : gpu.name;
+      monitorBody.appendChild(monitorRow("Device", `${title} (${gpu.memory_kind})`));
+      if (gpu.total_bytes != null) {
+        const gpuUsed = gpu.used_bytes || 0;
+        const gpuPct = gpu.total_bytes ? (100 * gpuUsed) / gpu.total_bytes : 0;
+        monitorBody.appendChild(monitorRow("VRAM", `${formatBytes(gpuUsed)} / ${formatBytes(gpu.total_bytes)}`));
+        monitorBody.appendChild(monitorBar(gpuPct));
+      }
+      if (gpu.driver) monitorBody.appendChild(monitorRow("Driver", gpu.driver));
+    }
+    // NPU: at most one device see hardware::format_report.
+    monitorSection("NPU");
+    if (view.npu) {
+      monitorBody.append(
+        monitorRow("Device", `${view.npu.vendor} ${view.npu.target}`),
+        monitorRow("Cores", String(view.npu.cores)),
+        monitorRow("Stack", view.npu.stack === "rknpu" ? "matmul offload (backend = npu)" : "precompiled graphs (not GGUF models)"),
+      );
+      if (view.npu.driver) monitorBody.appendChild(monitorRow("Driver", view.npu.driver));
+    } else {
+      monitorBody.appendChild(monitorRow("Device", "none detected"));
+    }
+    // Power + thermals, warmest first as the probe reports them.
+    monitorSection("Power");
+    monitorBody.appendChild(monitorRow(
+      "Source",
+      view.power.source + (view.power.battery_pct != null ? ` · ${view.power.battery_pct}%` : ""),
+    ));
+    for (const t of view.power.thermals) {
+      monitorBody.appendChild(monitorRow(
+        t.label,
+        t.critical_celsius != null
+          ? `${t.celsius.toFixed(1)} °C (crit ${t.critical_celsius.toFixed(0)} °C)`
+          : `${t.celsius.toFixed(1)} °C`,
+      ));
+    }
+    // OS last: framing, not live state.
+    monitorSection("OS");
+    monitorBody.append(
+      monitorRow("System", view.os.name + (view.os.version ? ` ${view.os.version}` : "")),
+      monitorRow("Uptime", formatCountdown(view.os.uptime_seconds)),
+    );
+    if (view.os.load_one != null) {
+      monitorBody.appendChild(monitorRow(
+        "Load",
+        `${view.os.load_one.toFixed(2)} / ${view.os.load_five.toFixed(2)} / ${view.os.load_fifteen.toFixed(2)}`,
+      ));
+    }
+    // Group each section heading with its rows into a card. The render
+    // above stays flat (one append per row), this pass wraps them, so the
+    // section order never has to be repeated in two places.
+    let card = null;
+    for (const node of Array.from(monitorBody.childNodes)) {
+      if (node.classList && node.classList.contains("monitor-section")) {
+        card = document.createElement("div");
+        card.className = "monitor-card";
+        card.appendChild(node);
+        monitorBody.appendChild(card);
+      } else if (card) {
+        card.appendChild(node);
+      }
+    }
+    const now = new Date();
+    monitorUpdated.textContent = `updated ${now.toLocaleTimeString()}`;
+  }
+
+  async function refreshMonitor() {
+    if (monitorState.busy) return;
+    monitorState.busy = true;
+    try {
+      const res = await fetch("/api/monitor", { cache: "no-store" });
+      if (!res.ok) throw new Error(await res.text());
+      renderMonitor(await res.json());
+    } catch (err) {
+      monitorBody.textContent = String(err && err.message ? err.message : err);
+    } finally {
+      monitorState.busy = false;
+    }
+  }
+
+  function openMonitor() {
+    monitorState.open = true;
+    monitorBody.textContent = "Loading…";
+    refreshMonitor().catch((err) => console.error(err));
+    monitorState.timer = setInterval(() => {
+      if (monitorState.open) refreshMonitor().catch((err) => console.error(err));
+    }, MONITOR_POLL_MS);
+  }
+
+  function closeMonitor() {
+    monitorState.open = false;
+    if (monitorState.timer) {
+      clearInterval(monitorState.timer);
+      monitorState.timer = null;
+    }
+  }
+
+  monitorReloadBtn.addEventListener("click", () => {
+    refreshMonitor().catch((err) => console.error(err));
+  });
+
   // ------------------------------------------------------- settings --
   let settingsPane = null;
 
@@ -2550,6 +2751,7 @@
   // server — for showing a refused Save beside the value that was refused.
   function showSettingsPane(name, keepForm = false) {
     if (settingsPane === "models" && name !== "models") closeModels();
+    if (settingsPane === "monitor" && name !== "monitor") closeMonitor();
     settingsPane = name;
     for (const tab of settingsTabs) {
       tab.setAttribute("aria-pressed", tab.dataset.pane === name ? "true" : "false");
@@ -2558,6 +2760,7 @@
       pane.hidden = key !== name;
     }
     if (name === "models") openModels();
+    if (name === "monitor") openMonitor();
     // A draft with edits survives a look at another pane; a clean one is
     // re-read, in case the file changed.
     if (name === "mcps" && !keepForm && !mcpsDirty()) {
@@ -2596,6 +2799,7 @@
 
   function closeSettings() {
     if (settingsPane === "models") closeModels();
+    if (settingsPane === "monitor") closeMonitor();
     // Whatever the MCP pane still held is dropped: Save has written it by
     // now, and Cancel means not to.
     closeMcpForm();

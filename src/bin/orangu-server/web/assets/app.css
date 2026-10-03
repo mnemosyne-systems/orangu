@@ -1821,3 +1821,142 @@ button:disabled {
 #footer a:hover {
   text-decoration: underline;
 }
+
+#monitor-body {
+  display: flex;
+  flex-direction: column;
+  max-height: 60vh;
+  overflow: auto;
+  scrollbar-gutter: stable;
+  padding-right: 10px;
+}
+
+.monitor-card {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  margin-right: 10px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+
+.monitor-section {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  font-size: 0.75em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.09em;
+  color: var(--text-dim);
+}
+
+.monitor-section::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+  border-radius: 1px;
+}
+
+.monitor-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 2px 0;
+  font-size: 0.9em;
+}
+
+.monitor-key {
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+
+.monitor-value {
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.monitor-bar {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  margin: 2px 0 4px;
+}
+
+.monitor-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #2fa36b, #46c78a);
+  transition: width 0.6s ease;
+}
+
+.monitor-bar > span.warn {
+  background: linear-gradient(90deg, #c77a0a, #ed9a1f);
+}
+
+.monitor-bar > span.crit {
+  background: linear-gradient(90deg, var(--error), #ff7a6b);
+}
+
+.monitor-cores {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(84px, 1fr));
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.monitor-core {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 8px 5px;
+}
+
+.monitor-core-label {
+  display: block;
+  margin-top: 4px;
+  font-size: 0.72em;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.monitor-core-bar {
+  height: 5px;
+  margin: 0;
+}
+
+#monitor-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#monitor-title {
+  flex: 1;
+}
+
+#monitor-updated::before {
+  content: "";
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #2fa36b;
+  margin-right: 6px;
+  animation: monitor-pulse 2s ease-in-out infinite;
+}
+
+@keyframes monitor-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}

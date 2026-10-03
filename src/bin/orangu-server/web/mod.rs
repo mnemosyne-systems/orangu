@@ -28,6 +28,7 @@ pub mod attachments;
 pub mod mcp;
 pub mod mermaid;
 pub mod models;
+pub mod monitor;
 pub mod plantuml;
 pub mod render;
 pub mod sessions;
@@ -306,6 +307,8 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/sessions/{id}/messages", post(send_message))
         .route("/api/sessions/{id}/files/{name}", get(session_file))
         .merge(mcp::router())
+        // The monitoring pane: live CPU/GPU/NPU inventory.
+        .merge(monitor::router())
         // The model manager: list, metadata, download, delete — on the same
         // port as the chat UI.
         .merge(models::router())
