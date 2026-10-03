@@ -653,6 +653,9 @@ pub enum LocalCommand<'a> {
     /// `/graph path <source> <target> [--undirected]`: trace a shortest path.
     GraphPath(Cow<'a, str>, Cow<'a, str>, bool),
     Graph,
+    /// `/graph diff`: filtered HTML graph of branch-changed files plus
+    /// one-hop neighbours, against the merge base with main/master.
+    GraphDiff,
 }
 
 /// `/mcp` manages running HTTP MCP endpoints in the active `orangu.conf`.

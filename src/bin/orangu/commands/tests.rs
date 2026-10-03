@@ -31,6 +31,10 @@ fn parses_copy_as_a_local_command() {
 
 #[test]
 fn parses_graph_explain_and_path_commands() {
+    match parse_local_command("/graph diff") {
+        Some(LocalCommand::GraphDiff) => {}
+        _ => panic!("expected graph diff command"),
+    }
     match parse_local_command("/graph explain APIRouter") {
         Some(LocalCommand::GraphExplain(symbol)) => assert_eq!(symbol, "APIRouter"),
         _ => panic!("expected graph explain command"),
