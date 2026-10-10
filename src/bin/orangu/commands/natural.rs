@@ -182,6 +182,9 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "create pr",
     "open pr",
     "new pr",
+    // --- create issue ---
+    "create issue ",
+    "new issue ",
     // --- close issue / pull request ---
     "close issue ",
     "close -i ",
@@ -692,6 +695,16 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
         ],
     ) {
         return Some(LocalCommand::CreatePullRequest);
+    }
+    if matches_ci(input, &["create issue", "new issue"]) {
+        return Some(LocalCommand::IssueCreate(None));
+    }
+    for prefix in ["create issue ", "new issue "] {
+        if let Some(rest) = strip_ascii_prefix(input, prefix) {
+            return Some(LocalCommand::IssueCreate(parse_issue_create_args(
+                rest.trim(),
+            )));
+        }
     }
     for prefix in ["close issue ", "close -i "] {
         if let Some(rest) = strip_ascii_prefix(input, prefix) {
