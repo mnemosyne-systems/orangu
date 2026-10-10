@@ -182,6 +182,9 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "create pr",
     "open pr",
     "new pr",
+    // --- create issue ---
+    "create issue ",
+    "new issue ",
     // --- close issue / pull request ---
     "close issue ",
     "close -i ",
@@ -693,6 +696,16 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     ) {
         return Some(LocalCommand::CreatePullRequest);
     }
+    if matches_ci(input, &["create issue", "new issue"]) {
+        return Some(LocalCommand::IssueCreate(None));
+    }
+    for prefix in ["create issue ", "new issue "] {
+        if let Some(rest) = strip_ascii_prefix(input, prefix) {
+            return Some(LocalCommand::IssueCreate(parse_natural_issue_create_args(
+                rest.trim(),
+            )));
+        }
+    }
     for prefix in ["close issue ", "close -i "] {
         if let Some(rest) = strip_ascii_prefix(input, prefix) {
             let n = rest.trim().trim_start_matches('#').parse::<u64>().ok();
@@ -1203,4 +1216,57 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
 
     None
+}
+
+/// Translate unquoted `with <field>` clauses to the issue parser's flags.
+/// Keep the original quoting so titles and bodies can contain those words.
+fn parse_natural_issue_create_args(input: &str) -> Option<IssueCreateArgs<'static>> {
+    let mut normalized = String::new();
+    let mut copied = 0;
+    let mut quote = None;
+    let mut chars = input.char_indices();
+    while let Some((index, ch)) = chars.next() {
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some('"') if ch == '\\' => {
+                chars.next();
+            }
+            Some(_) => {}
+            None if ch == '\\' => {
+                chars.next();
+            }
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None => {
+                let boundary = index == 0 || input[..index].ends_with(char::is_whitespace);
+                if index < copied || !boundary {
+                    continue;
+                }
+                let rest = &input[index..];
+                let Some(word) = rest.get(..4) else {
+                    continue;
+                };
+                if !word.eq_ignore_ascii_case("with") || !rest[4..].starts_with(char::is_whitespace)
+                {
+                    continue;
+                }
+                let field_and_value = rest[4..].trim_start();
+                let end = field_and_value
+                    .find(char::is_whitespace)
+                    .unwrap_or(field_and_value.len());
+                let field = &field_and_value[..end];
+                let flag = match field.to_ascii_lowercase().as_str() {
+                    "title" => "--title",
+                    "body" | "description" => "--body",
+                    "label" => "--label",
+                    "assignee" => "--assignee",
+                    _ => continue,
+                };
+                normalized.push_str(&input[copied..index]);
+                normalized.push_str(flag);
+                copied = input.len() - field_and_value.len() + end;
+            }
+        }
+    }
+    normalized.push_str(&input[copied..]);
+    parse_issue_create_args(&normalized)
 }
