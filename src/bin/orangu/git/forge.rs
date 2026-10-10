@@ -17,7 +17,9 @@ use anyhow::{Context, Result, anyhow};
 use std::{fs, path::Path};
 
 use super::*;
-use crate::commands::{CloseTarget, CommentBody, GetCommentsTarget, IssueAction, IssueField};
+use crate::commands::{
+    CloseTarget, CommentBody, GetCommentsTarget, IssueAction, IssueCreateArgs, IssueField,
+};
 use crate::render::{ANSI_FG_RESET, ANSI_FG_SUBTLE};
 
 /// An open pull request (GitHub) or merge request (GitLab), reduced to the number
@@ -647,6 +649,83 @@ pub fn issue_field_output(workspace: &Path, action: &IssueAction<'_>, forge: For
         ));
     }
     Ok(())
+}
+
+/// The `gh`/`glab issue create` arguments for `args`, as owned strings (the
+/// values borrow from the parsed command, so the CLI argv outlives them).
+/// Split out so the flag mapping is unit-testable without running the CLI.
+pub fn issue_create_cli_args(args: &IssueCreateArgs<'_>, forge: Forge) -> Vec<String> {
+    // GitHub: `gh issue create --title T --body B [--label L]... [--assignee A]...`.
+    // GitLab: `glab issue create --title T --description B [--label L]...
+    //          [--assignee A]... --yes` (`--yes` skips the confirm prompt).
+    // The body/description always passes (even empty) so neither CLI prompts
+    // for one interactively.
+    let mut cli: Vec<String> = vec!["issue".to_string(), "create".to_string()];
+    cli.push("--title".to_string());
+    cli.push(args.title.as_ref().to_string());
+    match forge {
+        Forge::GitHub => {
+            cli.push("--body".to_string());
+            cli.push(args.body.as_ref().to_string());
+        }
+        Forge::GitLab => {
+            cli.push("--description".to_string());
+            cli.push(args.body.as_ref().to_string());
+        }
+    }
+    for label in &args.labels {
+        cli.push("--label".to_string());
+        cli.push(label.as_ref().to_string());
+    }
+    for user in &args.assignees {
+        cli.push("--assignee".to_string());
+        cli.push(user.as_ref().to_string());
+    }
+    if forge == Forge::GitLab {
+        cli.push("--yes".to_string());
+    }
+    cli
+}
+
+/// `/issue create <title> ...`: open a new issue through the forge CLI and
+/// report what it printed (the new issue's URL on both forges).
+pub fn create_issue_output(
+    workspace: &Path,
+    args: &IssueCreateArgs<'_>,
+    forge: Forge,
+) -> Result<String> {
+    let repo_root = discover_git_root(workspace)
+        .ok_or_else(|| anyhow!("issue is only available inside a Git repository"))?;
+    let cli = forge.cli();
+    let cli_args = issue_create_cli_args(args, forge);
+    let output = match std::process::Command::new(cli)
+        .args(&cli_args)
+        .current_dir(&repo_root)
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!("issue requires the {cli} CLI to be installed"));
+        }
+        Err(err) => return Err(err).context(format!("failed to run {cli}")),
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "{cli} issue create failed{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(if stdout.is_empty() {
+        format!("Created issue '{}'", args.title.as_ref())
+    } else {
+        stdout
+    })
 }
 
 /// The reviewers, assignees, and labels a repository offers, fetched once at
@@ -1841,6 +1920,88 @@ mod tests {
     use super::*;
     use crate::process_env_lock;
     use tempfile::tempdir;
+
+    #[test]
+    fn issue_create_cli_args_map_to_each_forge() {
+        use std::borrow::Cow;
+
+        let args = IssueCreateArgs {
+            title: Cow::Borrowed("Crash on startup"),
+            body: Cow::Borrowed("Steps to reproduce"),
+            labels: vec![Cow::Borrowed("bug"), Cow::Borrowed("urgent")],
+            assignees: vec![Cow::Borrowed("alice")],
+        };
+        assert_eq!(
+            issue_create_cli_args(&args, Forge::GitHub),
+            vec![
+                "issue",
+                "create",
+                "--title",
+                "Crash on startup",
+                "--body",
+                "Steps to reproduce",
+                "--label",
+                "bug",
+                "--label",
+                "urgent",
+                "--assignee",
+                "alice",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+        // GitLab spells the body `--description` and needs `--yes` so the CLI
+        // never prompts.
+        assert_eq!(
+            issue_create_cli_args(&args, Forge::GitLab),
+            vec![
+                "issue",
+                "create",
+                "--title",
+                "Crash on startup",
+                "--description",
+                "Steps to reproduce",
+                "--label",
+                "bug",
+                "--label",
+                "urgent",
+                "--assignee",
+                "alice",
+                "--yes",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn issue_create_cli_args_always_send_a_body() {
+        use std::borrow::Cow;
+
+        // An empty body still passes `--body`/`--description` so neither CLI
+        // prompts interactively.
+        let args = IssueCreateArgs {
+            title: Cow::Borrowed("Crash"),
+            body: Cow::Borrowed(""),
+            labels: Vec::new(),
+            assignees: Vec::new(),
+        };
+        assert_eq!(
+            issue_create_cli_args(&args, Forge::GitHub),
+            vec!["issue", "create", "--title", "Crash", "--body", ""]
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            issue_create_cli_args(&args, Forge::GitLab)
+                .last()
+                .map(String::as_str),
+            Some("--yes")
+        );
+    }
 
     #[test]
     fn parses_gitlab_member_usernames() {
