@@ -374,6 +374,25 @@ pub struct IssueAction<'a> {
     pub value: Cow<'a, str>,
 }
 
+/// A parsed `/issue create <title> [--body <text>] [--label <label>]
+/// [--assignee <user>]` command: open a new issue with `title`, an optional
+/// `body`, and optional labels/assignees (repeatable or comma-separated).
+/// `body` is empty when no `--body`/`--description` flag was given.
+pub struct IssueCreateArgs<'a> {
+    pub title: Cow<'a, str>,
+    pub body: Cow<'a, str>,
+    pub labels: Vec<Cow<'a, str>>,
+    pub assignees: Vec<Cow<'a, str>>,
+}
+
+/// The `/issue create` subcommand word, offered alongside [`ISSUE_FIELDS`] by
+/// Tab completion and the inline ghost.
+pub const ISSUE_CREATE_COMMAND: &str = "create";
+
+/// The `/issue create` option flags, in offer order, used for Tab completion.
+/// Kept in step with [`parse_issue_create_args`].
+pub const ISSUE_CREATE_FLAGS: [&str; 4] = ["--body", "--description", "--label", "--assignee"];
+
 pub enum GetCommentsTarget {
     Issue(u64),
     PullRequest(u64),
@@ -584,6 +603,10 @@ pub enum LocalCommand<'a> {
     /// assignee, or label to an issue or pull/merge request. `None` is a usage
     /// error (missing or malformed arguments).
     Issue(Option<IssueAction<'a>>),
+    /// `/issue create <title> [--body <text>] [--label <label>] [--assignee
+    /// <user>]`: open a new issue. `None` is a usage error (missing title or
+    /// malformed flags).
+    IssueCreate(Option<IssueCreateArgs<'a>>),
     GetComments(Option<GetCommentsTarget>),
     Prune(Option<PruneTarget>),
     CreatePullRequest,

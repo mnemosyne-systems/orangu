@@ -366,7 +366,141 @@ pub fn parse_issue_args(input: &str) -> Option<IssueAction<'_>> {
 }
 
 pub fn issue_usage_message() -> &'static str {
-    "Usage: /issue <reviewer|assignee|label> <number> <value>. Use /help to see available commands."
+    "Usage: /issue <reviewer|assignee|label> <number> <value> or /issue create <title> [--body <text>] [--label <label>] [--assignee <user>]. Use /help to see available commands."
+}
+
+/// Parse `/issue create` arguments — `<title> [--body <text>] [--label
+/// <label>] [--assignee <user>]` — into an [`IssueCreateArgs`]. The title is
+/// every word up to the first `--flag` (quote it when it carries spaces, as in
+/// `/issue create "Crash on startup" --label bug`); `--description` is an
+/// alias of `--body`, and `-b`/`-d` (body), `-l` (label), `-a` (assignee) are
+/// the short forms. `--label`/`--assignee` repeat and accept comma-separated
+/// lists. Returns `None` when the title is missing, a flag has no value, or an
+/// unknown `--flag` is given.
+pub fn parse_issue_create_args(input: &str) -> Option<IssueCreateArgs<'_>> {
+    let words = shell_words(input.trim()).ok()?;
+    if words.is_empty() {
+        return None;
+    }
+    let mut title_parts: Vec<String> = Vec::new();
+    let mut body: Option<String> = None;
+    let mut labels: Vec<Cow<'_, str>> = Vec::new();
+    let mut assignees: Vec<Cow<'_, str>> = Vec::new();
+    let mut index = 0;
+    // The title is everything up to the first flag.
+    while index < words.len() && !is_issue_create_flag(&words[index]) {
+        title_parts.push(words[index].clone());
+        index += 1;
+    }
+    // Split a `--flag=value` token into `(flag, Some(value))`, a bare `--flag`
+    // into `(flag, None)`, and anything else into `(token, None)` with no flag.
+    fn split_flag_value(token: &str) -> (&str, Option<&str>) {
+        match token.split_once('=') {
+            Some((flag, value)) if flag.starts_with('-') => (flag, Some(value)),
+            _ => (token, None),
+        }
+    }
+    while index < words.len() {
+        let (flag, inline) = split_flag_value(words[index].as_str());
+        let kind = issue_create_flag_kind(flag)?;
+        let value: &str = match inline {
+            Some(value) => value,
+            None => {
+                index += 1;
+                if index >= words.len() {
+                    return None;
+                }
+                // A flag where the value should be means the value is missing.
+                if is_issue_create_flag(words[index].as_str()) {
+                    return None;
+                }
+                words[index].as_str()
+            }
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        match kind {
+            IssueCreateFlag::Body => body = Some(value.to_string()),
+            IssueCreateFlag::Label => {
+                for label in value.split(',') {
+                    let label = label.trim();
+                    if label.is_empty() {
+                        return None;
+                    }
+                    labels.push(Cow::Owned(label.to_string()));
+                }
+            }
+            IssueCreateFlag::Assignee => {
+                for user in value.split(',') {
+                    let user = user.trim();
+                    if user.is_empty() {
+                        return None;
+                    }
+                    assignees.push(Cow::Owned(user.to_string()));
+                }
+            }
+        }
+        index += 1;
+    }
+    let title = title_parts.join(" ").trim().to_string();
+    if title.is_empty() {
+        return None;
+    }
+    Some(IssueCreateArgs {
+        title: Cow::Owned(title),
+        body: Cow::Owned(body.unwrap_or_default()),
+        labels,
+        assignees,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IssueCreateFlag {
+    Body,
+    Label,
+    Assignee,
+}
+
+/// Whether `token` starts an `/issue create` flag (long, short, or
+/// `--flag=value` form). Unknown but flag-shaped tokens (`--bogus`, `-z`)
+/// count too, so a typo surfaces as a usage error instead of silently becoming
+/// title text; a bare `-` and negative numbers (`-5`) stay ordinary title
+/// words.
+fn is_issue_create_flag(token: &str) -> bool {
+    let flag = match token.split_once('=') {
+        Some((flag, _)) if flag.starts_with('-') => flag,
+        _ => token,
+    };
+    if issue_create_flag_kind(flag).is_some() {
+        return true;
+    }
+    looks_like_flag(flag)
+}
+
+/// Whether `word` is shaped like a CLI flag: `-` followed by a non-digit.
+fn looks_like_flag(word: &str) -> bool {
+    let mut chars = word.chars();
+    match (chars.next(), chars.next()) {
+        (Some('-'), Some(second)) => !second.is_ascii_digit(),
+        _ => false,
+    }
+}
+
+/// Map an `/issue create` flag word to what it sets. `--description`/`-d` are
+/// the GitLab-spelled alias of `--body`/`-b`; anything else is `None`.
+fn issue_create_flag_kind(flag: &str) -> Option<IssueCreateFlag> {
+    match flag {
+        "--body" | "--description" | "-b" | "-d" => Some(IssueCreateFlag::Body),
+        "--label" | "-l" => Some(IssueCreateFlag::Label),
+        "--assignee" | "-a" => Some(IssueCreateFlag::Assignee),
+        _ => None,
+    }
+}
+
+pub fn issue_create_usage_message() -> &'static str {
+    "Usage: /issue create <title> [--body <text>] [--label <label>] [--assignee <user>]. Use /help to see available commands."
 }
 
 pub fn parse_get_comments_args(input: &str) -> Option<GetCommentsTarget> {

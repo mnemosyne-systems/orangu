@@ -97,10 +97,11 @@ use commands::{
     CommandState, ExportTarget, LocalCommand, LocalError, McpSubcommand, PruneTarget,
     StashSubcommand, add_repository_usage_message, amend_usage_message, cherry_pick_usage_message,
     close_usage_message, comment_usage_message, commit_usage_message, create_file_usage_message,
-    delete_file_usage_message, get_comments_usage_message, grep_usage_message, issue_usage_message,
-    mcp_usage_message, merge_usage_message, model_usage_message, move_file_usage_message,
-    open_file_usage_message, parse_local_command, prune_usage_message, pull_usage_message,
-    restore_usage_message, server_usage_message, sorted_model_names, system_prompt,
+    delete_file_usage_message, get_comments_usage_message, grep_usage_message,
+    issue_create_usage_message, issue_usage_message, mcp_usage_message, merge_usage_message,
+    model_usage_message, move_file_usage_message, open_file_usage_message, parse_local_command,
+    prune_usage_message, pull_usage_message, restore_usage_message, server_usage_message,
+    sorted_model_names, system_prompt,
 };
 use dispatch::*;
 use git::{
@@ -108,7 +109,7 @@ use git::{
     bisect_log_output, bisect_reset_output, bisect_skip_output, bisect_start_output,
     bisect_status_output, branch_create_output, branch_delete_output, branch_list_all_output,
     branch_list_output, branch_rename_output, cherry_pick_output, close_output,
-    collect_review_diff, comment_all_output, comment_output, commit_output,
+    collect_review_diff, comment_all_output, comment_output, commit_output, create_issue_output,
     create_pull_request_output, discover_git_root, fetch_active_pull_requests, fetch_issue_details,
     fetch_issue_metadata, fetch_output, fetch_pull_request_details, get_comments_output,
     git_checkout, git_diff_against_branch, git_workspace_diff, grep_output, init_repo_output,
