@@ -49,8 +49,8 @@ use markdown::{
 };
 use printpdf::{
     Actions, BorderArray, BuiltinFont, Color, Destination, Line, LinePoint, LinkAnnotation, Mm, Op,
-    PaintMode, ParsedFont, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt,
-    RawImage, Rect, Rgb, TextItem, XObjectTransform,
+    PaintMode, ParsedFont, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Polygon,
+    PolygonRing, Pt, RawImage, Rect, Rgb, TextItem, WindingOrder, XObjectTransform,
 };
 use std::{
     collections::BTreeMap,
@@ -393,10 +393,24 @@ pub fn export_review(
 
     // The appendix (when present) follows the categories on its own page.
     let appendix_blocks = build_appendix_blocks(appendix);
-    let appendix_start = (!appendix_blocks.is_empty()).then_some(page);
+    let mut appendix_start = (!appendix_blocks.is_empty()).then_some(page);
+
+    // A table of contents longer than page 2 pushes every chapter back.
+    let mut toc_entries: Vec<(&str, bool)> = sections
+        .iter()
+        .map(|section| (section.title.as_str(), false))
+        .collect();
+    if appendix_start.is_some() {
+        toc_entries.push(("Appendix", false));
+    }
+    let toc_extra = toc_page_count(&toc_entries, &pdf.fonts) - 1;
+    starts.iter_mut().for_each(|start| *start += toc_extra);
+    if let Some(start) = appendix_start.as_mut() {
+        *start += toc_extra;
+    }
 
     // Page 2 — table of contents: every category, then the appendix.
-    let mut toc_rows: Vec<(&str, usize, Option<bool>)> = sections
+    let mut toc_rows: Vec<(&str, usize, Option<TocIcon>)> = sections
         .iter()
         .map(|section| section.title.as_str())
         .zip(starts.iter().copied())
@@ -474,8 +488,15 @@ pub fn export_duplicates(
         page += paginate(blocks, &pdf.fonts);
     }
 
+    let toc_entries: Vec<(&str, bool)> = chapters
+        .iter()
+        .map(|(title, _)| (title.as_str(), false))
+        .collect();
+    let toc_extra = toc_page_count(&toc_entries, &pdf.fonts) - 1;
+    starts.iter_mut().for_each(|start| *start += toc_extra);
+
     // Page 2 — table of contents (each entry links to its chapter).
-    let toc_rows: Vec<(&str, usize, Option<bool>)> = chapters
+    let toc_rows: Vec<(&str, usize, Option<TocIcon>)> = chapters
         .iter()
         .map(|(title, _)| title.as_str())
         .zip(starts.iter().copied())
@@ -579,12 +600,17 @@ pub fn export_pr(workspace: &Path, prs: &[PullRequestDetail], model: &str) -> Re
         page += pages_for_pr;
     }
 
-    let toc_rows: Vec<(&str, usize, Option<bool>)> = titles
+    let toc_entries: Vec<(&str, bool)> =
+        titles.iter().map(|title| (title.as_str(), true)).collect();
+    let toc_extra = toc_page_count(&toc_entries, &pdf.fonts) - 1;
+    starts.iter_mut().for_each(|start| *start += toc_extra);
+
+    let toc_rows: Vec<(&str, usize, Option<TocIcon>)> = titles
         .iter()
         .map(String::as_str)
         .zip(starts.iter().copied())
         .zip(prs.iter())
-        .map(|((title, start), pr)| (title, start, Some(pr_is_ready(pr))))
+        .map(|((title, start), pr)| (title, start, Some(pr_toc_icon(pr))))
         .collect();
     pdf.new_page();
     pdf.draw_toc(&toc_rows);
@@ -665,12 +691,26 @@ fn review_icon(state: &str) -> ReviewIcon {
     }
 }
 
-/// Whether a pull request is ready to merge as far as its own state goes:
-/// not a draft, and not reported as conflicting (a `None`/unknown mergeable
-/// state is not treated as a conflict). Drives the table of contents' green
-/// checkmark (`true`) versus red "X" (`false`) next to each entry.
-fn pr_is_ready(pr: &PullRequestDetail) -> bool {
-    !pr.draft && pr.conflicting != Some(true)
+/// The icon [`Pdf::draw_toc`] draws after a table of contents entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TocIcon {
+    Check,
+    Cross,
+    Skull,
+}
+
+/// A pull request's table of contents icon: a skull when it has merge
+/// conflicts, a red "X" when it is a draft or its CI is failing (see
+/// [`ci_passing`]), and a green checkmark otherwise (a `None`/unknown
+/// mergeable state is not treated as a conflict).
+fn pr_toc_icon(pr: &PullRequestDetail) -> TocIcon {
+    if pr.conflicting == Some(true) {
+        TocIcon::Skull
+    } else if pr.draft || !ci_passing(pr) {
+        TocIcon::Cross
+    } else {
+        TocIcon::Check
+    }
 }
 
 /// The rows of a pull request's header table: author, dates, branch,
@@ -1156,7 +1196,12 @@ pub fn export_issue(workspace: &Path, issues: &[IssueDetail], model: &str) -> Re
         page += description_pages + comment_pages - 1;
     }
 
-    let toc_rows: Vec<(&str, usize, Option<bool>)> = titles
+    let toc_entries: Vec<(&str, bool)> =
+        titles.iter().map(|title| (title.as_str(), false)).collect();
+    let toc_extra = toc_page_count(&toc_entries, &pdf.fonts) - 1;
+    starts.iter_mut().for_each(|start| *start += toc_extra);
+
+    let toc_rows: Vec<(&str, usize, Option<TocIcon>)> = titles
         .iter()
         .map(String::as_str)
         .zip(starts.iter().copied())
@@ -3346,6 +3391,53 @@ impl Pdf {
         w
     }
 
+    /// Draw a small skull (a cranium and jaw with the eyes, nose and teeth
+    /// cut out) at `(x, baseline)`, sized to `size`, returning its mm width.
+    /// Vector-drawn, since the embedded font has no skull glyph.
+    fn draw_skull(&mut self, x: f32, baseline: f32, size: f32, color: (f32, f32, f32)) -> f32 {
+        let h = size * 0.75 * PT_TO_MM;
+        let at = |u: f32, v: f32| line_point(x + u * h, baseline + v * h);
+        let circle = |cx: f32, cy: f32, r: f32, from: f32, to: f32, steps: usize| {
+            (0..=steps).map(move |i| {
+                let angle = (from + (to - from) * i as f32 / steps as f32).to_radians();
+                (cx + r * angle.cos(), cy + r * angle.sin())
+            })
+        };
+        // The outline: the cranium's arc over the top, then the jaw.
+        let mut outline: Vec<LinePoint> = circle(0.5, 0.6, 0.4, -40.0, 220.0, 20)
+            .map(|(u, v)| at(u, v))
+            .collect();
+        outline.extend([at(0.28, 0.25), at(0.28, 0.0), at(0.72, 0.0), at(0.72, 0.25)]);
+        let eye = |cx: f32| PolygonRing {
+            points: circle(cx, 0.55, 0.11, 0.0, 360.0, 12)
+                .map(|(u, v)| at(u, v))
+                .collect(),
+        };
+        let hole = |points: &[(f32, f32)]| PolygonRing {
+            points: points.iter().map(|&(u, v)| at(u, v)).collect(),
+        };
+        let rings = vec![
+            PolygonRing { points: outline },
+            eye(0.34),
+            eye(0.66),
+            hole(&[(0.5, 0.42), (0.44, 0.3), (0.56, 0.3)]),
+            hole(&[(0.4, 0.04), (0.45, 0.04), (0.45, 0.18), (0.4, 0.18)]),
+            hole(&[(0.55, 0.04), (0.6, 0.04), (0.6, 0.18), (0.55, 0.18)]),
+        ];
+        let (r, g, b) = color;
+        self.ops.push(Op::SetFillColor {
+            col: Color::Rgb(Rgb::new(r, g, b, None)),
+        });
+        self.ops.push(Op::DrawPolygon {
+            polygon: Polygon {
+                rings,
+                mode: PaintMode::Fill,
+                winding_order: WindingOrder::EvenOdd,
+            },
+        });
+        h
+    }
+
     fn draw_status_banner(&mut self, verdict: Verdict) {
         let (label, color) = match verdict {
             Verdict::Approved => ("Approved", STATUS_GREEN),
@@ -3371,28 +3463,43 @@ impl Pdf {
     }
 
     /// Page 2: the table of contents — each entry (categories, then the
-    /// appendix) and its starting page. `ok` is `Some(true)`/`Some(false)`
-    /// to draw a green checkmark/red "X" right after the title (used by the
-    /// `/export pr` table of contents to flag a draft or conflicting pull
-    /// request at a glance), or `None` to draw no icon at all.
-    fn draw_toc(&mut self, rows: &[(&str, usize, Option<bool>)]) {
+    /// appendix) and its starting page. `icon` is drawn right after the
+    /// title (used by the `/export pr` table of contents to flag a draft or
+    /// conflicting pull request at a glance), or `None` to draw no icon.
+    fn draw_toc(&mut self, rows: &[(&str, usize, Option<TocIcon>)]) {
         self.draw_block(&heading("Table of Contents", BODY_SIZE + 5.0));
-        let size = BODY_SIZE + 1.0;
-        let row_height = size * 1.8 * PT_TO_MM;
-        for &(title, page, ok) in rows {
-            if self.cursor_y - row_height < CONTENT_BOTTOM_MM {
+        let size = TOC_SIZE;
+        let line_height = size * 1.3 * PT_TO_MM;
+        for &(title, page, icon) in rows {
+            let lines = toc_title_lines(title, icon.is_some(), &self.fonts);
+            let height = toc_entry_height_mm(lines.len());
+            if self.cursor_y - height < CONTENT_BOTTOM_MM {
                 self.new_page();
             }
-            self.cursor_y -= row_height;
+            let top = self.cursor_y;
+            self.cursor_y -= TOC_ROW_HEIGHT_MM;
             // The entry (title and page number) links to the start of its
-            // chapter, drawn in the brand colour to read as a link.
-            self.text(title, false, MARGIN_MM, self.cursor_y, size, BRAND_COLOR);
-            if let Some(ok) = ok {
-                let icon_x = MARGIN_MM + self.fonts.text_width_mm(title, false, false, size) + 3.0;
-                if ok {
-                    self.draw_checkmark(icon_x, self.cursor_y, size, STATUS_GREEN);
-                } else {
-                    self.text("X", true, icon_x, self.cursor_y, size, STATUS_RED);
+            // chapter, drawn in the brand colour to read as a link. A long
+            // title wraps; the icon and page number follow its last line.
+            for (index, line) in lines.iter().enumerate() {
+                if index > 0 {
+                    self.cursor_y -= line_height;
+                }
+                self.text(line, false, MARGIN_MM, self.cursor_y, size, BRAND_COLOR);
+            }
+            if let Some(icon) = icon {
+                let last = lines.last().map(String::as_str).unwrap_or_default();
+                let icon_x = MARGIN_MM + self.fonts.text_width_mm(last, false, false, size) + 3.0;
+                match icon {
+                    TocIcon::Check => {
+                        self.draw_checkmark(icon_x, self.cursor_y, size, STATUS_GREEN);
+                    }
+                    TocIcon::Cross => {
+                        self.text("X", true, icon_x, self.cursor_y, size, STATUS_RED);
+                    }
+                    TocIcon::Skull => {
+                        self.draw_skull(icon_x, self.cursor_y, size, TEXT_COLOR);
+                    }
                 }
             }
             let number = page.to_string();
@@ -3405,7 +3512,12 @@ impl Pdf {
                 size,
                 BRAND_COLOR,
             );
-            self.link_to_page(page, self.cursor_y - 1.0, size * PT_TO_MM + 2.0);
+            let link_bottom = self.cursor_y - 1.0;
+            self.link_to_page(
+                page,
+                link_bottom,
+                top - TOC_ROW_HEIGHT_MM + size * PT_TO_MM + 1.0 - link_bottom,
+            );
         }
     }
 
@@ -3809,6 +3921,59 @@ fn paginate_from(blocks: &[Block], fonts: &DocFonts, start_cursor_y: f32) -> (us
         cursor_y -= block.space_after_mm;
     }
     (pages, cursor_y)
+}
+
+/// The table of contents' text size, and the height of one entry's first
+/// line (each wrapped line after it adds a tighter line height).
+const TOC_SIZE: f32 = BODY_SIZE + 1.0;
+const TOC_ROW_HEIGHT_MM: f32 = TOC_SIZE * 1.8 * PT_TO_MM;
+
+/// A table of contents title broken into the lines [`Pdf::draw_toc`] draws:
+/// word-wrapped to leave room for a four-digit page number and, with
+/// `has_icon`, the status icon after the last line.
+fn toc_title_lines(title: &str, has_icon: bool, fonts: &DocFonts) -> Vec<String> {
+    let number = fonts.text_width_mm("0000", false, false, TOC_SIZE);
+    let icon = if has_icon {
+        3.0 + TOC_SIZE * PT_TO_MM
+    } else {
+        0.0
+    };
+    let width = (USABLE_WIDTH_MM - number - 4.0 - icon).max(1.0);
+    let chars = spans_chars(&[Span::plain(title)]);
+    wrap(&chars, width, width, true, fonts, TOC_SIZE)
+        .iter()
+        .map(|line| {
+            line.iter()
+                .map(|sc| sc.ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The height of a table of contents entry that wraps to `lines` lines.
+fn toc_entry_height_mm(lines: usize) -> f32 {
+    TOC_ROW_HEIGHT_MM + lines.saturating_sub(1) as f32 * TOC_SIZE * 1.3 * PT_TO_MM
+}
+
+/// How many pages [`Pdf::draw_toc`] fills with these entries (each a title
+/// and whether it carries an icon), so the pages after it can be numbered.
+fn toc_page_count(entries: &[(&str, bool)], fonts: &DocFonts) -> usize {
+    let (mut pages, mut cursor_y) = paginate_from(
+        std::slice::from_ref(&heading("Table of Contents", BODY_SIZE + 5.0)),
+        fonts,
+        CONTENT_TOP_MM,
+    );
+    for &(title, has_icon) in entries {
+        let height = toc_entry_height_mm(toc_title_lines(title, has_icon, fonts).len());
+        if cursor_y - height < CONTENT_BOTTOM_MM {
+            pages += 1;
+            cursor_y = CONTENT_TOP_MM;
+        }
+        cursor_y -= height;
+    }
+    pages
 }
 
 /// Wrap a block into visual lines at the page width.
@@ -4630,24 +4795,46 @@ mod tests {
     }
 
     #[test]
-    fn pr_is_ready_requires_not_draft_and_not_conflicting() {
+    fn pr_toc_icon_marks_conflicts_with_a_skull() {
         let mut pr = sample_pull_request();
+        pr.checks.clear();
         pr.draft = false;
         pr.conflicting = Some(false);
-        assert!(pr_is_ready(&pr));
+        assert_eq!(pr_toc_icon(&pr), TocIcon::Check);
 
         pr.conflicting = None;
-        assert!(
-            pr_is_ready(&pr),
+        assert_eq!(
+            pr_toc_icon(&pr),
+            TocIcon::Check,
             "an unknown mergeable state is not a conflict"
         );
 
         pr.conflicting = Some(true);
-        assert!(!pr_is_ready(&pr));
+        assert_eq!(pr_toc_icon(&pr), TocIcon::Skull);
+
+        pr.draft = true;
+        assert_eq!(
+            pr_toc_icon(&pr),
+            TocIcon::Skull,
+            "a conflict outranks a draft"
+        );
 
         pr.conflicting = Some(false);
-        pr.draft = true;
-        assert!(!pr_is_ready(&pr));
+        assert_eq!(pr_toc_icon(&pr), TocIcon::Cross);
+
+        pr.draft = false;
+        pr.checks = vec![PullRequestCheck {
+            name: "build".to_string(),
+            bucket: "fail".to_string(),
+        }];
+        assert_eq!(
+            pr_toc_icon(&pr),
+            TocIcon::Cross,
+            "a failing test suite is not ready"
+        );
+
+        pr.checks[0].bucket = "pass".to_string();
+        assert_eq!(pr_toc_icon(&pr), TocIcon::Check);
     }
 
     #[test]
@@ -4814,6 +5001,55 @@ mod tests {
         assert!(pages > 1, "the comments should spill over");
         let before = pdf.current_page();
         pdf.draw_pr_detail_page(&pr);
+        assert_eq!(pdf.current_page() - before + 1, pages);
+    }
+
+    #[test]
+    fn toc_wraps_a_long_title_clear_of_the_page_number() {
+        let pdf = Pdf::new("t", "m").expect("pdf");
+        let title = "#1239 [#1238] walbridge: a WAL protocol proxy that enables a PG18 \
+                     primary to stream its WAL to a PG19 replica";
+        let lines = toc_title_lines(title, true, &pdf.fonts);
+        assert!(lines.len() > 1, "the title should wrap: {lines:?}");
+        assert_eq!(lines.join(" "), title);
+        let number = pdf.fonts.text_width_mm("0000", false, false, TOC_SIZE);
+        for line in &lines {
+            let width = pdf.fonts.text_width_mm(line, false, false, TOC_SIZE);
+            assert!(
+                width + number < USABLE_WIDTH_MM,
+                "{line:?} reaches the page number"
+            );
+        }
+        assert_eq!(
+            toc_title_lines("#1 Short", true, &pdf.fonts),
+            vec!["#1 Short"]
+        );
+    }
+
+    #[test]
+    fn toc_page_count_matches_the_drawn_table_of_contents() {
+        let mut pdf = Pdf::new("t", "m").expect("pdf");
+        let long = "A pull request title long enough to wrap onto a second line of the \
+                    table of contents, and then some more words to be sure";
+        let titles: Vec<String> = (0..60)
+            .map(|n| {
+                if n % 3 == 0 {
+                    format!("#{n} {long}")
+                } else {
+                    format!("#{n} Short")
+                }
+            })
+            .collect();
+        let entries: Vec<(&str, bool)> = titles.iter().map(|t| (t.as_str(), true)).collect();
+        let pages = toc_page_count(&entries, &pdf.fonts);
+        assert!(pages > 1, "60 entries should overflow one page");
+        let rows: Vec<(&str, usize, Option<TocIcon>)> = titles
+            .iter()
+            .map(|t| (t.as_str(), 3, Some(TocIcon::Check)))
+            .collect();
+        pdf.new_page();
+        let before = pdf.current_page();
+        pdf.draw_toc(&rows);
         assert_eq!(pdf.current_page() - before + 1, pages);
     }
 

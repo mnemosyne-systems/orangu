@@ -1152,6 +1152,9 @@ pub fn fetch_pull_request_details(
     }
     let mut details = parse_pull_request_details(&output.stdout, forge)?;
     for_each_concurrently(&mut details, |pr| {
+        if pr.conflicting.is_none() {
+            pr.conflicting = fetch_conflicting(&repo_root, pr.number, forge);
+        }
         pr.checks = fetch_pull_request_checks(&repo_root, pr.number, forge);
         pr.comments = fetch_comments(
             &repo_root,
@@ -1428,6 +1431,63 @@ fn json_string_array(entry: &serde_json::Value, key: &str, field: &str) -> Vec<S
         .unwrap_or_default()
 }
 
+/// GitHub's `mergeable` GraphQL enum: MERGEABLE, CONFLICTING, UNKNOWN. GitHub
+/// computes it lazily, so a pull request nobody has looked at recently reads
+/// UNKNOWN (`None`) until [`fetch_conflicting`] asks again.
+fn github_conflicting(entry: &serde_json::Value) -> Option<bool> {
+    match entry.get("mergeable").and_then(serde_json::Value::as_str) {
+        Some("MERGEABLE") => Some(false),
+        Some("CONFLICTING") => Some(true),
+        _ => None,
+    }
+}
+
+/// GitLab's `has_conflicts`, or failing that whether `merge_status` is
+/// `cannot_be_merged`.
+fn gitlab_conflicting(entry: &serde_json::Value) -> Option<bool> {
+    entry
+        .get("has_conflicts")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            entry
+                .get("merge_status")
+                .and_then(serde_json::Value::as_str)
+                .map(|status| status == "cannot_be_merged")
+        })
+}
+
+/// How many times [`fetch_conflicting`] asks for a pull request's mergeable
+/// state, and how long it waits between asks while the forge computes it.
+const CONFLICT_ATTEMPTS: usize = 3;
+const CONFLICT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Ask the forge for one pull request's conflict state directly, retrying
+/// while it is still unknown — the first ask makes GitHub (or GitLab, via
+/// `with_merge_status_recheck`) compute it. `None` when it stays unknown.
+fn fetch_conflicting(repo_root: &Path, number: u64, forge: Forge) -> Option<bool> {
+    let number = number.to_string();
+    let path = format!("projects/:id/merge_requests/{number}?with_merge_status_recheck=true");
+    for attempt in 0..CONFLICT_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(CONFLICT_RETRY_DELAY);
+        }
+        let conflicting = match forge {
+            Forge::GitHub => command_json(
+                repo_root,
+                "gh",
+                &["pr", "view", &number, "--json", "mergeable"],
+            )
+            .and_then(|value| github_conflicting(&value)),
+            Forge::GitLab => command_json(repo_root, "glab", &["api", &path])
+                .and_then(|value| gitlab_conflicting(&value)),
+        };
+        if conflicting.is_some() {
+            return conflicting;
+        }
+    }
+    None
+}
+
 fn parse_github_pr_detail(entry: &serde_json::Value) -> Option<PullRequestDetail> {
     let number = entry.get("number")?.as_u64()?;
     let author = entry
@@ -1436,12 +1496,7 @@ fn parse_github_pr_detail(entry: &serde_json::Value) -> Option<PullRequestDetail
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    // GitHub's `mergeable` GraphQL enum: MERGEABLE, CONFLICTING, UNKNOWN.
-    let conflicting = match entry.get("mergeable").and_then(serde_json::Value::as_str) {
-        Some("MERGEABLE") => Some(false),
-        Some("CONFLICTING") => Some(true),
-        _ => None,
-    };
+    let conflicting = github_conflicting(entry);
     let comments = entry.get("comments").and_then(serde_json::Value::as_array);
     let comment_count = comments.map(Vec::len).unwrap_or(0);
 
@@ -1538,15 +1593,7 @@ fn parse_gitlab_pr_detail(entry: &serde_json::Value) -> Option<PullRequestDetail
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    let conflicting = entry
-        .get("has_conflicts")
-        .and_then(serde_json::Value::as_bool)
-        .or_else(|| {
-            entry
-                .get("merge_status")
-                .and_then(serde_json::Value::as_str)
-                .map(|status| status == "cannot_be_merged")
-        });
+    let conflicting = gitlab_conflicting(entry);
     let comment_count = entry
         .get("user_notes_count")
         .and_then(serde_json::Value::as_u64)
