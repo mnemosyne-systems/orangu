@@ -1,0 +1,8 @@
+# The build context is the repository root; only the sources are needed.
+# contrib/docker itself is left out too: its files are read from the Makefile
+# and the stage context, never compiled, and editing one would otherwise
+# invalidate the cached compile.
+.git
+target
+contrib/docker
+**/*.gguf

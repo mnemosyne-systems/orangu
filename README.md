@@ -231,6 +231,7 @@ Additional documentation and guides:
 - [Inference Server Guide](doc/SERVER.md) · [Server Manual](doc/manual/en/46-server.md) · [Server Internals](doc/manual/en/78-server.md)
 - [Image Generation Manual](doc/manual/en/48-image.md)
 - [Coordinator Guide](doc/COORDINATOR.md) · [Coordinator Manual](doc/manual/en/44-coordinator.md) · [Coordinator Internals](doc/manual/en/76-coordinator.md)
+- [Container Image Manual](doc/manual/en/50-container.md): the coordinator, the server and your models in one Podman or Docker image
 - [Model Building & Quantization](doc/BUILD_MODEL.md) · [GGUF Manual](doc/manual/en/47-gguf.md) · [Corpus Manifest](contrib/orangu-model/README.md)
 - [Core Tools Reference](doc/manual/en/41-core_tools.md) · [Git Tools](doc/manual/en/42-git_tools.md) · [Workspaces](doc/manual/en/31-workspaces.md)
 - [Context Compression Details](doc/manual/en/75-compression.md)
