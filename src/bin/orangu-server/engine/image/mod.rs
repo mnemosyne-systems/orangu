@@ -180,6 +180,10 @@ impl Variant {
         }
     }
 
+    /// The release settings of the Turbo checkpoint ([`Pipeline::turbo`]):
+    /// the eight steps it was distilled for, without guidance.
+    pub const TURBO_STEPS_AND_CFG: (usize, f32) = (8, 1.0);
+
     /// Multiply-adds per image token per transformer pass — see
     /// [`MACS_PER_TOKEN_PASS`].
     fn macs_per_token_pass(self) -> f64 {
@@ -885,6 +889,11 @@ pub struct Pipeline {
     /// The adapter the transformer carries, for `/props` — set by `prepare`
     /// after the load, which is where the file was resolved.
     pub adapter: Option<PathBuf>,
+    /// Whether the transformer is Qwen-Image 2.1's step-distilled Turbo
+    /// checkpoint ([`orangu::model_spec::is_turbo`]), which samples on its
+    /// own fixed schedule ([`scheduler::QWEN_IMAGE_21_TURBO`]) — set by
+    /// `prepare` after the load, which is where the file name is known.
+    pub turbo: bool,
     /// One generation at a time — see the module doc.
     busy: Mutex<()>,
     /// Latent-token passes per second, as last measured: seeded from the
@@ -1051,6 +1060,7 @@ impl Pipeline {
             defaults: RwLock::new(defaults),
             companions,
             adapter: None,
+            turbo: false,
             busy: Mutex::new(()),
             rate: Mutex::new(rate),
         }
@@ -1539,7 +1549,11 @@ impl Pipeline {
             bail!("cancelled");
         }
 
-        let sigmas = scheduler::sigmas(&ScheduleConfig::QWEN_IMAGE, request.steps, n_tokens);
+        let sigmas = if self.turbo {
+            scheduler::resample(&scheduler::QWEN_IMAGE_21_TURBO, request.steps)
+        } else {
+            scheduler::sigmas(&ScheduleConfig::QWEN_IMAGE, request.steps, n_tokens)
+        };
         let mut noise = Noise::seeded(seed);
         let token_width = self.transformer_config().in_channels;
         let mut latents = noise.normals(n_tokens * token_width);

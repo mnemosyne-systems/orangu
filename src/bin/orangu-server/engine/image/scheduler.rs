@@ -85,6 +85,34 @@ pub fn sigmas(config: &ScheduleConfig, steps: usize, image_seq_len: usize) -> Ve
     out
 }
 
+/// The eight-step schedule `Qwen/Qwen-Image-2.1-Turbo` was distilled for
+/// and ships with — `steps + 1` levels, as [`sigmas`] returns.
+pub const QWEN_IMAGE_21_TURBO: [f32; 9] = [
+    1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0,
+];
+
+/// A fixed schedule's levels for `steps` steps: the table itself at its
+/// own count, and otherwise the table read at `steps + 1` evenly spaced
+/// positions, linearly between its entries — so the start is still pure
+/// noise, the end still `0`, and the shape the checkpoint was trained on
+/// is kept.
+pub fn resample(table: &[f32], steps: usize) -> Vec<f32> {
+    assert!(steps > 0, "a schedule needs at least one step");
+    assert!(table.len() >= 2, "a schedule table needs two levels");
+    if table.len() == steps + 1 {
+        return table.to_vec();
+    }
+    let last = (table.len() - 1) as f64;
+    (0..=steps)
+        .map(|i| {
+            let at = last * i as f64 / steps as f64;
+            let lo = (at.floor() as usize).min(table.len() - 2);
+            let frac = at - lo as f64;
+            (table[lo] as f64 + (table[lo + 1] as f64 - table[lo] as f64) * frac) as f32
+        })
+        .collect()
+}
+
 /// diffusers' `calculate_shift`: the shift grows linearly with the token
 /// count between the two anchor points the checkpoint names.
 fn calculate_shift(config: &ScheduleConfig, image_seq_len: f64) -> f64 {
@@ -187,6 +215,21 @@ impl Noise {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Turbo table is served as-is at its own eight steps, and read
+    /// between its entries at any other count, still from noise to `0`.
+    #[test]
+    fn a_fixed_schedule_resamples_between_its_levels() {
+        assert_eq!(resample(&QWEN_IMAGE_21_TURBO, 8), QWEN_IMAGE_21_TURBO);
+        let four = resample(&QWEN_IMAGE_21_TURBO, 4);
+        assert_eq!(four, vec![1.0, 0.95418, 0.89508, 0.704534, 0.0]);
+        let sixteen = resample(&QWEN_IMAGE_21_TURBO, 16);
+        assert_eq!(sixteen.len(), 17);
+        assert_eq!((sixteen[0], sixteen[16]), (1.0, 0.0));
+        assert_eq!(sixteen[2], QWEN_IMAGE_21_TURBO[1]);
+        assert!((sixteen[1] - (1.0 + 0.978453) / 2.0).abs() < 1e-6);
+        assert!(sixteen.windows(2).all(|w| w[0] > w[1]));
+    }
 
     /// The values diffusers computes for a 1024x1024 image at 4 steps
     /// (`image_seq_len = 4096`, `mu = 0.8677`), from

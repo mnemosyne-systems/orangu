@@ -120,17 +120,20 @@ pub fn scan_models_dir(dir: &Path) -> Result<Vec<ModelSummary>> {
     Ok(summaries)
 }
 
-/// `general.architecture` of an opened header, when it has one — or, for a
-/// file with no metadata at all, the architecture its tensor names spell
-/// out (see [`architecture_from_tensors`]).
+/// The architecture an opened header's tensor names spell out (see
+/// [`architecture_from_tensors`]) or, for any other file, its
+/// `general.architecture`. The tensors come first because a label can be
+/// wrong: `unsloth/Qwen-Image-2.1-Turbo-GGUF` says `qwen_image` over a
+/// Qwen-Image 2.1 transformer.
 pub fn architecture_of(gguf: &GgufFile) -> Option<String> {
-    gguf.metadata
-        .iter()
-        .find_map(|(k, v)| match v {
-            crate::gguf::GgufValue::String(s) if k == "general.architecture" => Some(s.clone()),
-            _ => None,
+    architecture_from_tensors(gguf)
+        .map(str::to_string)
+        .or_else(|| {
+            gguf.metadata.iter().find_map(|(k, v)| match v {
+                crate::gguf::GgufValue::String(s) if k == "general.architecture" => Some(s.clone()),
+                _ => None,
+            })
         })
-        .or_else(|| architecture_from_tensors(gguf).map(str::to_string))
 }
 
 /// `general.architecture` of a Qwen-Image 2.1 diffusion transformer — a
@@ -142,11 +145,12 @@ pub const QWEN_IMAGE_21_ARCHITECTURE: &str = "qwen_image_2_1";
 /// — the `unsloth/Qwen-Image-2.1-GGUF` files keep it.
 pub const DIFFUSION_MODEL_PREFIX: &str = "model.diffusion_model.";
 
-/// The architecture of a GGUF that has **no metadata at all**, read off its
-/// tensor names. `unsloth/Qwen-Image-2.1-GGUF` is such a file: 265 tensors
-/// and zero keys — not even `general.architecture` — so without this it is
-/// `No (unknown)` in `list` and unloadable. Only an exact, distinctive shape
-/// is recognised: Qwen-Image 2.1's single-stream transformer has a
+/// The architecture of a GGUF read off its tensor names, whatever its
+/// metadata says. `unsloth/Qwen-Image-2.1-GGUF` has 265 tensors and zero
+/// keys — not even `general.architecture` — and
+/// `unsloth/Qwen-Image-2.1-Turbo-GGUF` the same 265 tensors under
+/// `general.architecture = qwen_image`, the dual-stream model's name. Only
+/// an exact, distinctive shape is recognised: Qwen-Image 2.1's single-stream transformer has a
 /// zero-centred `txt_in.text_norm` and blocks without the dual-stream
 /// `img_mod`/`txt_mod` that Qwen-Image (`qwen_image`) has.
 pub fn architecture_from_tensors(gguf: &GgufFile) -> Option<&'static str> {
@@ -407,6 +411,15 @@ pub fn lightning_steps(spec: &str) -> Option<usize> {
         .parse()
         .ok()
         .filter(|steps| *steps > 0)
+}
+
+/// Whether a Qwen-Image 2.1 transformer's file name — or a
+/// `<user>/<repo>:<quant>` reference to it — says it is the step-distilled
+/// Turbo checkpoint (`qwen-image-2.1-turbo-Q4_K_M.gguf`). Its weights are
+/// laid out like the base model's, so the name is all that tells them
+/// apart; it is served at its own eight-step schedule without guidance.
+pub fn is_turbo(spec: &str) -> bool {
+    spec.to_ascii_lowercase().contains("turbo")
 }
 
 /// Whether `path` names a multi-token-prediction draft head, by the filename
@@ -1781,6 +1794,61 @@ fn format_last_used(timestamp: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Qwen-Image 2.1 transformer is `qwen_image_2_1` with no metadata
+    /// and under a `qwen_image` label alike (the Turbo GGUF's), while a
+    /// dual-stream transformer keeps its own label.
+    #[test]
+    fn a_qwen_image_2_1_transformer_is_named_by_its_tensors() {
+        let tensor = |name: &str| crate::gguf::TensorInfo {
+            name: format!("{DIFFUSION_MODEL_PREFIX}{name}"),
+            dims: vec![1],
+            ggml_type: 0,
+            offset: 0,
+        };
+        let file = |names: &[&str], label: Option<&str>| GgufFile {
+            version: 3,
+            metadata: label
+                .map(|l| {
+                    (
+                        "general.architecture".to_string(),
+                        crate::gguf::GgufValue::String(l.to_string()),
+                    )
+                })
+                .into_iter()
+                .collect(),
+            tensors: names.iter().map(|n| tensor(n)).collect(),
+            alignment: 32,
+            data_offset: 0,
+        };
+        let single = [
+            "txt_in.text_norm.weight",
+            "modulation.1.weight",
+            "transformer_blocks.0.attn.to_q.weight",
+        ];
+        let dual = [
+            "txt_norm.weight",
+            "transformer_blocks.0.attn.to_q.weight",
+            "transformer_blocks.0.img_mod.1.weight",
+        ];
+        let v21 = Some(QWEN_IMAGE_21_ARCHITECTURE.to_string());
+        assert_eq!(architecture_of(&file(&single, None)), v21);
+        assert_eq!(architecture_of(&file(&single, Some("qwen_image"))), v21);
+        assert_eq!(
+            architecture_of(&file(&dual, Some("qwen_image"))).as_deref(),
+            Some("qwen_image")
+        );
+        assert_eq!(architecture_of(&file(&dual, None)), None);
+    }
+
+    /// The Turbo checkpoint is told apart by its name, in a path or a spec.
+    #[test]
+    fn the_turbo_checkpoint_is_named() {
+        assert!(is_turbo("qwen-image-2.1-turbo-Q4_K_M.gguf"));
+        assert!(is_turbo("unsloth/Qwen-Image-2.1-Turbo-GGUF:Q4_K_M"));
+        assert!(!is_turbo("unsloth/Qwen-Image-2.1-GGUF:Q4_K_M"));
+        assert!(!is_turbo("qwen-image-2.1-Q8_0.gguf"));
+    }
 
     /// The VAE is recognised by its decoder's output convolution and the
     /// post-quant convolution in the `safetensors` header — a file with the

@@ -2046,7 +2046,12 @@ fn prepare(args: Args) -> Result<Prepared> {
                 }
                 None => (None, None),
             };
-            let image_defaults = conf.image_defaults_under(variant, lora_path.as_deref());
+            let turbo = variant == engine::image::Variant::QwenImage21
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(orangu::model_spec::is_turbo);
+            let image_defaults = conf.image_defaults_under(variant, lora_path.as_deref(), turbo);
             let mut pipeline = engine::image::Pipeline::load(
                 &transformer,
                 companions.clone(),
@@ -2061,6 +2066,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                 conf.vae_precision,
             )?;
             pipeline.adapter = lora_path.clone();
+            pipeline.turbo = turbo;
             // What the defaults cost on this machine, said once, up front —
             // with the knobs that bring it down, when it is long enough
             // that somebody would otherwise conclude the server hung.

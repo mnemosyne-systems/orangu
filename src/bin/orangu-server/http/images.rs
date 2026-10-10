@@ -112,6 +112,8 @@ pub fn props_json(pipeline: &Pipeline) -> serde_json::Value {
         // multiple of for it.
         "architecture": pipeline.variant.architecture(),
         "size_unit": pipeline.size_unit(),
+        // Qwen-Image 2.1's step-distilled checkpoint, on its own schedule.
+        "turbo": pipeline.turbo,
         "text_encoder": pipeline.companions.text_encoder.display().to_string(),
         "vae": pipeline.companions.vae.display().to_string(),
         // The projector an attached picture is edited with — `null` when an

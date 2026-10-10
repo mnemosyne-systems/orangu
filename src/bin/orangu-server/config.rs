@@ -1964,14 +1964,20 @@ impl ServerConfiguration {
     /// Lightning adapter, where they are the step count its name carries
     /// and guidance off, which is what it was trained for (the base model's
     /// fifty guided steps under it, or eight unguided steps without it, are
-    /// noise).
+    /// noise). The Turbo checkpoint (`turbo`) is the same: eight steps,
+    /// guidance off.
     pub fn image_defaults_under(
         &self,
         variant: crate::engine::image::Variant,
         adapter: Option<&std::path::Path>,
+        turbo: bool,
     ) -> crate::engine::image::ImageDefaults {
         let mut defaults = self.image.clone();
-        let (release_steps, release_cfg) = variant.release_steps_and_cfg();
+        let (release_steps, release_cfg) = if turbo {
+            crate::engine::image::Variant::TURBO_STEPS_AND_CFG
+        } else {
+            variant.release_steps_and_cfg()
+        };
         if !self.image_steps_set {
             defaults.steps = release_steps;
         }
@@ -2918,13 +2924,14 @@ mod tests {
         let conf = load("");
         assert_eq!(conf.image_lora, ImageLora::Auto);
         assert!(!conf.image_steps_set && !conf.image_cfg_scale_set);
-        let under = conf.image_defaults_under(Variant::QwenImage, Some(eight));
+        let under = conf.image_defaults_under(Variant::QwenImage, Some(eight), false);
         assert_eq!((under.steps, under.cfg_scale), (8, 1.0));
-        let base = conf.image_defaults_under(Variant::QwenImage, None);
+        let base = conf.image_defaults_under(Variant::QwenImage, None, false);
         assert_eq!((base.steps, base.cfg_scale), (50, 4.0));
         let other = conf.image_defaults_under(
             Variant::QwenImage,
             Some(Path::new("/srv/models/style.safetensors")),
+            false,
         );
         assert_eq!((other.steps, other.cfg_scale), (50, 4.0));
 
@@ -2937,9 +2944,9 @@ mod tests {
 
         let conf = load("image_steps = 4\nimage_cfg_scale = 2");
         assert!(conf.image_steps_set && conf.image_cfg_scale_set);
-        let under = conf.image_defaults_under(Variant::QwenImage, Some(eight));
+        let under = conf.image_defaults_under(Variant::QwenImage, Some(eight), false);
         assert_eq!((under.steps, under.cfg_scale), (4, 2.0));
-        let v21 = conf.image_defaults_under(Variant::QwenImage21, None);
+        let v21 = conf.image_defaults_under(Variant::QwenImage21, None, false);
         assert_eq!((v21.steps, v21.cfg_scale), (4, 2.0));
     }
 
@@ -3052,16 +3059,19 @@ mod tests {
         assert!(load("image_reference_size = big").is_err());
     }
 
-    /// Qwen-Image 2.1's own settings — forty steps, no guidance — are what
-    /// it gets when the config leaves them out.
+    /// Qwen-Image 2.1's own settings — forty steps, no guidance, eight for
+    /// the Turbo checkpoint — are what it gets when the config leaves them
+    /// out.
     #[test]
     fn qwen_image_2_1_defaults_to_its_release_settings() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(file, "[orangu-server]\nmodels = /srv/models\n").unwrap();
         let conf = load_server_configuration(file.path(), None, false).unwrap();
-        let d = conf.image_defaults_under(Variant::QwenImage21, None);
+        let d = conf.image_defaults_under(Variant::QwenImage21, None, false);
         assert_eq!((d.steps, d.cfg_scale), (40, 1.0));
         assert_eq!((d.width, d.height), (1024, 1024));
+        let turbo = conf.image_defaults_under(Variant::QwenImage21, None, true);
+        assert_eq!((turbo.steps, turbo.cfg_scale), (8, 1.0));
     }
 
     /// NPU precompilation is on unless it is turned off, and a start with

@@ -86,7 +86,9 @@ pub fn run_init() -> Result<()> {
     // wants something other than Qwen-Image's release settings, and written
     // only then, like every other default below.
     let image = if role == Role::Image {
-        Some(prompt_image_keys(Path::new(&models), image_variant)?)
+        let turbo = image_variant == crate::engine::image::Variant::QwenImage21
+            && orangu::model_spec::is_turbo(&model);
+        Some(prompt_image_keys(Path::new(&models), image_variant, turbo)?)
     } else {
         None
     };
@@ -1184,6 +1186,7 @@ impl ImageKeys {
 fn prompt_image_keys(
     models_dir: &Path,
     variant: crate::engine::image::Variant,
+    turbo: bool,
 ) -> Result<ImageKeys> {
     use crate::engine::image::Variant;
     let defaults = crate::engine::image::ImageDefaults::default();
@@ -1285,6 +1288,7 @@ fn prompt_image_keys(
         .and_then(orangu::model_spec::lightning_steps)
     {
         Some(steps) => (steps, 1.0),
+        None if turbo => Variant::TURBO_STEPS_AND_CFG,
         None => variant.release_steps_and_cfg(),
     };
     let steps = prompt_checked(

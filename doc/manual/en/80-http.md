@@ -681,6 +681,7 @@ picture will come out, and how long it will take, before asking for one:
 | :-- | :-- |
 | `architecture` | `qwen_image` or `qwen_image_2_1` |
 | `size_unit` | the pixels each side of a picture must be a multiple of: `16`, or `32` for Qwen-Image 2.1 |
+| `turbo` | `true` for Qwen-Image 2.1's step-distilled Turbo checkpoint, sampled on its eight-step schedule |
 | `text_encoder`, `vae` | the companion files the pipeline was loaded with |
 | `vision` | the vision projector a `qwen_image_2_1` pipeline edits attached pictures with, or `null` — an attached picture is then a starting point |
 | `lora` | the adapter in the weights — `path`, and `steps`, the count a Lightning file's name says it was distilled for — or `null` for the base model |

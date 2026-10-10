@@ -52,13 +52,30 @@ quantization fetches only itself. Any quantization of the transformer
 works — `list` shows them as `Yes (qwen_image_2_1)`; `Q4_K_M` is the one
 measured here. The text encoder is an ordinary language model — `list`
 shows it, and it can be served alone — and the VAE is read as published.
-The transformer GGUFs carry no metadata at all; the server recognises
-the model by its tensors.
+The server recognises the model by its tensors, whatever the file's
+metadata says.
 
 There is no step-distilled adapter for 2.1, and none is needed: the model
 is released to run forty steps *without* guidance, one transformer pass
 each, and its prompt is run through the transformer once per picture
 rather than once per step.
+
+**Turbo.** `unsloth/Qwen-Image-2.1-Turbo-GGUF` is the step-distilled
+checkpoint of the same model: the same transformer shape, the same three
+companions, and pictures in **eight** steps instead of forty — five times
+fewer transformer passes.
+
+```sh
+orangu-server download unsloth/Qwen-Image-2.1-Turbo-GGUF:Q4_K_M
+```
+
+`list` shows it as `Yes (qwen_image_2_1)` too. The server tells it apart
+by `turbo` in the file name, and then samples on the fixed eight-step
+schedule it was distilled for, with guidance off; `image_steps` and
+`image_cfg_scale` left out of the configuration default to `8` and `1`
+(`--init` suggests the same). Another step count reads that schedule at
+evenly spaced points, which keeps its shape but is not what it was trained
+for. `/props` reports `image.turbo`.
 
 **Memory.** Serving at `Q4_K_M` takes about 10 GB of resident memory,
 most of it the transformer and the encoder mapped from disk and shared
