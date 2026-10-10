@@ -1377,8 +1377,8 @@ a rotated-away file is picked up again on the next start.
 The built-in web console (see **Web UI** below) is configured in its own
 section, and **having that section at all is what enables it**. A config
 with no `[web]` binds no second listener; `-i`/`--init` asks
-`Add web console` and then `host`, `port`, `reexec` and `delete`, or writes
-no section at all.
+`Add web console` and then `host`, `port`, `reexec`, `delete` and
+`download`, or writes no section at all.
 
 ```ini
 [web]
@@ -1386,6 +1386,7 @@ host = 127.0.0.1
 port = 8200
 reexec = yes
 delete = yes
+download = yes
 ```
 
 - `port` — where the console listens, bound alongside `[orangu-server].port`
@@ -1419,10 +1420,19 @@ delete = yes
   read-only. It governs **models only** — History's own delete controls are
   unconditional, since a chat session is the console's own scratch data
   rather than a file on disk something else put there.
+- `download` — whether the console's model manager may download models
+  from Hugging Face (default `yes`, same spellings). Set `no` and the
+  download box above the table is gone, and the endpoint behind it refuses.
+  Its own key for the same reason `delete` is: a download is the one thing
+  the console can do that reaches out to the internet and fills the models
+  directory, and a deployment may well want that directory to hold only what
+  was put there by hand. It is independent of `delete`. The **Refresh** markers are unaffected — they only
+  look the repo up, and `orangu-server refresh` is still what acts on one.
 
 `web = <port>` under `[orangu-server]` is what this replaced, and still
 works: a configuration written against it goes on serving the console on
-that port, with `host` and `reexec` at their defaults. A `[web]` section
+that port, with `host`, `reexec`, `delete` and `download` at their
+defaults. A `[web]` section
 takes precedence over it wherever both appear.
 
 ### The `[prometheus]` section
@@ -2397,7 +2407,8 @@ in-place-updating text. One download runs at a time; starting a second while
 one is in flight is refused rather than queued, since two fetches into the
 same directory would compete for the same disk and the same free-space
 check. An interrupted one resumes from its `.part` file the next time it is
-asked for.
+asked for. Set `download = no` in the `[web]` section and the text box
+is gone entirely, and the endpoint behind it refuses.
 
 **Rescan** (the circular arrow in the panel header) re-reads the models
 directory. The panel does not re-read it on its own: opening every GGUF

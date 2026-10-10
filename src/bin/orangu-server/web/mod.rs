@@ -213,18 +213,22 @@ pub struct WebState {
     pub catalog: Arc<models::ModelCatalog>,
     /// What the model manager's **Load** button needs to replace this
     /// process with one serving a different model — see `crate::reexec`.
-    /// `None` when `[orangu-server].reexec` is off or the platform has no
-    /// `execve`, which is how the button knows to disable itself instead of
+    /// `None` when `[web].reexec` is off or the platform has no `execve`,
+    /// which is how the panel knows to leave the button out instead of
     /// offering something that would only refuse.
     pub handover: Option<Arc<crate::reexec::Handover>>,
     /// `[web].delete`: whether the model manager may delete models. When
-    /// false the panel draws no Delete button at all — unlike **Load**,
-    /// which is drawn disabled with a tooltip, because there is nothing
-    /// conditional here to explain: this server simply doesn't do that.
+    /// false the panel draws no Delete button at all — the same as **Load**
+    /// without a handover — because there is nothing conditional here to
+    /// explain: this server simply doesn't do that.
     ///
     /// Models only. History's own delete controls are unconditional — see
     /// [`delete_session`]/[`clear_sessions`].
     pub can_delete: bool,
+    /// `[web].download`: whether the model manager may download models
+    /// from Hugging Face. When false the panel draws no download box, and
+    /// `POST /api/models/download` refuses.
+    pub can_download: bool,
     /// Whether the served model is embedded in this executable (see
     /// `crate::bundle`). It has no row in the model manager's listing and no
     /// Delete button: a bundled model cannot be removed from a running

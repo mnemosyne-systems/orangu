@@ -17,9 +17,10 @@
 
 use crate::config::{
     DEFAULT_DRAFT_TOKENS, DEFAULT_READ_SIZE, HOST_ALL, HOST_ALL_ALIAS, KvCache, PROMETHEUS_SECTION,
-    Role, WEB_SECTION, WORKERS_SECTION, WorkerAddress, default_delete, default_host,
-    default_npu_cache_gb, default_npu_precompile, default_port, default_prometheus_port,
-    default_reexec, default_web_port, default_workers_port, parse_workers_list,
+    Role, WEB_SECTION, WORKERS_SECTION, WorkerAddress, default_delete, default_download,
+    default_host, default_npu_cache_gb, default_npu_precompile, default_port,
+    default_prometheus_port, default_reexec, default_web_port, default_workers_port,
+    parse_workers_list,
 };
 use crate::workers::protocol::ActivationFormat;
 use anyhow::{Context, Result, anyhow};
@@ -129,7 +130,8 @@ pub fn run_init() -> Result<()> {
         let web_port = prompt_line("port", &default_web_port().to_string())?;
         let reexec = prompt_bool("reexec", default_reexec())?;
         let delete = prompt_bool("delete", default_delete())?;
-        Some((web_host, web_port, reexec, delete))
+        let download = prompt_bool("download", default_download())?;
+        Some((web_host, web_port, reexec, delete, download))
     } else {
         None
     };
@@ -225,7 +227,7 @@ pub fn run_init() -> Result<()> {
             path.display()
         ));
     }
-    if let Some((web_host, web_port, reexec, delete)) = &web {
+    if let Some((web_host, web_port, reexec, delete, download)) = &web {
         // `host` and `port` together, the same pair `[orangu-server]` writes
         // unconditionally above — a section that names where it listens
         // reads better than one that leaves half of it implied.
@@ -244,6 +246,12 @@ pub fn run_init() -> Result<()> {
             contents.push_str(&format!(
                 "delete = {}\n",
                 if *delete { "yes" } else { "no" }
+            ));
+        }
+        if *download != default_download() {
+            contents.push_str(&format!(
+                "download = {}\n",
+                if *download { "yes" } else { "no" }
             ));
         }
     }

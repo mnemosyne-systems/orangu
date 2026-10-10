@@ -4566,7 +4566,10 @@ process, not about the directory, so it is decided per request against
 `WebState::model_path`.
 
 `[web].delete` (default `true`) gates removal the same way, reported as
-`can_delete`.
+`can_delete`, and `[web].download` (default `true`) gates
+`POST /api/models/download`, reported as `can_download` — the panel hides its
+download box rather than offering one that would only refuse. The two
+switches are independent.
 
 **It gates models only.** History's own `DELETE /api/sessions/{id}` and
 `DELETE /api/sessions` (its per-row cross and **Clear all** footer) are

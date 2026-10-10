@@ -1577,6 +1577,12 @@ button:disabled {
   gap: 8px;
 }
 
+/* `[web].download = no`: `display: flex` above would otherwise win
+   over the UA `[hidden]` rule. */
+#models-download-form[hidden] {
+  display: none;
+}
+
 #models-download-input {
   flex: 1;
   min-width: 0;

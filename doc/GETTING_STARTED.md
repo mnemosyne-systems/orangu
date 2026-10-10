@@ -61,9 +61,10 @@ asked for a picture model, which is asked its own keys instead:
 | `Add Prometheus metrics` | `Y` | `n` writes no `[prometheus]` section. Accepting asks for its `host` and `port` (`8300`). |
 | `Add workers` | `Y` | `n` writes no `[workers]` section. Accepting asks for its `host`, `port` (`8400`), `workers`, `standby`, `secret` (`none`, the default, `generate` — shown, to give every node the same — or `type`) and `activations`; with no workers listed the server is a node another can use as a worker. |
 
-Accepting the web console asks four more: its `host` (defaulting to the address
+Accepting the web console asks five more: its `host` (defaulting to the address
 the API just took), `port` (`8200`), `reexec` (`Y` — may the console load a
-different model), and `delete` (`Y` — may the console delete models).
+different model), `delete` (`Y` — may the console delete models), and
+`download` (`Y` — may the console download models).
 
 The wizard then prints the file it is about to write and asks
 `Write this configuration? [Y/n]`. Anything but Enter/`y`/`yes` aborts without

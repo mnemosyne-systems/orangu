@@ -1609,12 +1609,14 @@
   // load, the same `(Refresh)` marker on a row whose repo has moved on, and
   // the same `error:` row replacing the cells for a file whose header
   // wouldn't parse. Two icons per row: Show and Delete.
-  function renderTable(models, canLoad, canDelete, loading) {
+  function renderTable(models, canLoad, canDelete, canDownload, loading) {
     modelsTableEl.innerHTML = "";
     if (models.length === 0) {
       const empty = document.createElement("div");
       empty.className = "models-empty";
-      empty.textContent = "No models here yet — download one above.";
+      empty.textContent = canDownload
+        ? "No models here yet — download one above."
+        : "No models here yet.";
       modelsTableEl.appendChild(empty);
       return;
     }
@@ -1888,17 +1890,21 @@
     }
     renderCurrent(data.current, data.loading);
     renderJob(data.job);
+    // `[web].download` off means no download box at all, the same
+    // rule Load and Delete follow — not a box that only ever refuses.
+    modelsDownloadForm.hidden = !data.can_download;
     // `can_load`/`loading` change what a row's Load button does, so they
     // are part of what the table is compared on, not just the rows.
     const signature = JSON.stringify([
       data.models,
       data.can_load,
       data.can_delete,
+      data.can_download,
       data.loading ?? null,
     ]);
     if (signature !== modelsState.tableSignature) {
       modelsState.tableSignature = signature;
-      renderTable(data.models, data.can_load, data.can_delete, data.loading);
+      renderTable(data.models, data.can_load, data.can_delete, data.can_download, data.loading);
     }
     // The topbar name follows the loaded model, so a handover is visible
     // without reloading the page.

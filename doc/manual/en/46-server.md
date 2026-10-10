@@ -187,7 +187,6 @@ Every completed request logs a throughput line, orangu-server-style:
 orangu-server: [slot 0] prompt 42 tokens in 0.18s (233.33 tok/s), generated 128 tokens in 4.31s (29.70 tok/s)
 ```
 
-
 **Reading the model ahead.** A model whose weights are read from their
 file while it serves — on the CPU, a split's layers on the host, or a
 picture model, whose encoder and transformer reach their devices on the
@@ -1539,11 +1538,11 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   perfectly valid and is what most fleets do; this exists so that a single
   binary on one machine, with no package manager, is not forced into one.
 
-                    ```sh
-                    openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
-                      -subj "/CN=your-host" -addext "subjectAltName=DNS:your-host" \
-                      -keyout key.pem -out cert.pem
-                    ```
+                        ```sh
+                        openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+                          -subj "/CN=your-host" -addext "subjectAltName=DNS:your-host" \
+                          -keyout key.pem -out cert.pem
+                        ```
 
 - `api_key` — the bearer token every request must carry. Unset by default,
   which leaves the server open; that is right for the loopback address it also
@@ -1732,6 +1731,7 @@ orangu-server: [adapt] prompt weights (K-quant): int8 copies of 245 matrices (1.
 orangu-server: [adapt] prompt weights (float): bf16 copies of 71 matrices (0.08 GB; all copies built in 0.9 s) — a 256-token 1536x8960 GEMM takes 9.6 ms through a bf16 copy, 37.0 ms on the file's weights; 0.08 GB of 21.5 available
 orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a feed-forward block takes 13.8 ms for 128 tokens on the NPU (0.108 ms a token), 24.3 ms for 384 on the cpu (0.063 ms a token); it must be 1.25× faster a token
 ```
+
 - `threads` — how many worker threads every CPU path shares: the CPU
   matmul, the MoE expert loop, and the per-expert fan-out. Unset (the
   default) means one per logical core for loading, and requests run
@@ -1790,82 +1790,89 @@ The prose above explains the ones with real trade-offs; this is the reference.
 Every key is optional except `models`, and an unset key takes the default
 shown.
 
-| `[orangu-server]` | default | what it does |
-| :-- | :-- | :-- |
-| `models`                | _required_                                 | base directory model specs resolve against                                                                                                                                                                                |
-| `model`                 | —                                          | model to serve when none is given on the command line (required for `--daemon`)                                                                                                                                           |
-| `host` | `all` | bind address; `all` (or `*`) means every interface, a literal address narrows it |
-| `port`                  | `8100`                                     | HTTP API port                                                                                                                                                                                                             |
-| `role` | `all` | `all`, `code`, `review`, `explorer`, `embedding`, `image`; read under `--daemon`, an image model is always `image` |
-| `slots` | `8` for `embedding`, else `1` | concurrent requests, each with its own KV cache |
-| `queue_limit`           | `0`                                        | requests allowed to wait for a slot before `503`; `0` is unbounded                                                                                                                                                        |
-| `context` | — | tokens one request must fit on the device; set, layers move to the host until the card has room for that much KV cache |
-| `api_key`               | —                                          | bearer token every request must carry; unset leaves the server open                                                                                                                                                       |
-| `tls_cert` / `tls_key`  | —                                          | PEM paths for serving HTTPS; both or neither                                                                                                                                                                              |
-| `reasoning_effort` | — (the template decides) | how hard a reasoning model is asked to think, in its own template's words; see **Roles** below |
-| `prefix_warmup` | `yes` | prefill the prompt prefixes requests reused again in the background after a restart; `ORANGU_PREFIX_WARMUP` overrides it |
-| `draft_model`           | —                                          | a second, smaller model whose guesses the served model verifies                                                                                                                                                           |
-| `draft_tokens`          | `4`                                        | tokens the draft proposes per verification                                                                                                                                                                                |
-| `backend`               | `auto`                                     | `auto`, `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm`, `npu`                                                                                                                                                         |
-| `device`                | `auto`                                     | which card: an index, part of a name, or `auto`                                                                                                                                                                           |
-| `device_split` | `off` | spread one model across several devices: `off`, `auto`, `all`, or a ratio list such as `3,1` |
-| `threads` | one per logical core | CPU worker threads |
-| `kv_cache`              | `f16`                                      | GPU KV mirror storage: `f16`, `q8_0`, or `f32`                                                                                                                                                                            |
-| `read_size`             | `8192`                                     | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening                                                                                                                                |
-| `prefill_backend` | `auto` | where prompt passes run: `auto` (whichever backend a prompt-shaped GEMM timed at load favours), `device`, or `cpu` |
-| `prompt_weights` | `auto` | how the weights a prompt multiplies on the CPU are held: `auto` (copies for the cores' matrix instructions, kept when they measure at least 10% faster and fit in half the free memory), `copy` (unmeasured), or `file` (no copy) |
-| `mlp_unroll` | decided at startup | force the GPU's block-unroll decode kernels on or off; unset, each quantized type is checked against the CPU and dropped if wrong |
-| `npu_precompile` | `yes` | whether this model may use the NPU at all; `no` neither compiles nor loads blocks |
-| `npu_cache_gb` | a quarter of memory, 1–16 | GiB of compiled NPU blocks one model may use; `0` stops compiling but still loads cached blocks |
-| `text_encoder`          | largest found                              | the text encoder GGUF: `qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`                                                                                                                                                               |
-| `vae`                   | first found                                | the model's VAE (`.safetensors`): Qwen-Image's, or Qwen-Image 2.1's own                                                                                                                                                           |
-| `vision`                | found beside the text encoder              | the vision projector (`mmproj-*.gguf`) a `qwen_image_2_1` model edits attached pictures with; `none` draws over them instead                                                                                                       |
-| `image_lora`            | `auto`                                     | the adapter applied to the picture transformer: `auto` the Lightning file under `models` (fetched with the model; a picture in 8 unguided steps), `none` the base model, or a `.safetensors` (or 4-step variant, rougher) |
-| `image_lora_merge`      | `yes`                                      | fold the adapter into the weights at startup (a few minutes once, then no cost per pass); `no` applies it in `f32` every pass                                                                                             |
-| `image_weights`         | `auto`                                     | how a `qwen_image_2_1` transformer's linears are held: `auto` per-row `int8` on the 8 × 8 `int8` tile (`i8mm`, `dotprod` or `AVX2`) when the transformer runs on the CPU and total memory is at least three times the 7 GB copy, `int8` whenever it runs on the CPU, `file` the file's K-quants (no copy); a transformer on a GPU keeps the file's; ~1.4–1.9× a step |
-| `vae_precision`         | `int8`                                     | the VAE's convolutions as `Q6_K` on the `int8` kernel (3–4× faster decode), or `f32` as stored (exact)                                                                                                                    |
+| `[orangu-server]`       | default                                    | what it does                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| :---------------------- | :----------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `models`                | _required_                                 | base directory model specs resolve against                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `model`                 | —                                          | model to serve when none is given on the command line (required for `--daemon`)                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `host`                  | `all`                                      | bind address; `all` (or `*`) means every interface, a literal address narrows it                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `port`                  | `8100`                                     | HTTP API port                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `role`                  | `all`                                      | `all`, `code`, `review`, `explorer`, `embedding`, `image`; read under `--daemon`, an image model is always `image`                                                                                                                                                                                                                                                                                                                                                                                   |
+| `slots`                 | `8` for `embedding`, else `1`              | concurrent requests, each with its own KV cache                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `queue_limit`           | `0`                                        | requests allowed to wait for a slot before `503`; `0` is unbounded                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `context`               | —                                          | tokens one request must fit on the device; set, layers move to the host until the card has room for that much KV cache                                                                                                                                                                                                                                                                                                                                                                               |
+| `api_key`               | —                                          | bearer token every request must carry; unset leaves the server open                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `tls_cert` / `tls_key`  | —                                          | PEM paths for serving HTTPS; both or neither                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `reasoning_effort`      | — (the template decides)                   | how hard a reasoning model is asked to think, in its own template's words; see **Roles** below                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `prefix_warmup`         | `yes`                                      | prefill the prompt prefixes requests reused again in the background after a restart; `ORANGU_PREFIX_WARMUP` overrides it                                                                                                                                                                                                                                                                                                                                                                             |
+| `draft_model`           | —                                          | a second, smaller model whose guesses the served model verifies                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `draft_tokens`          | `4`                                        | tokens the draft proposes per verification                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `backend`               | `auto`                                     | `auto`, `cpu`, `vulkan`, `metal`, `dx12`, `cuda`, `opencl`, `rocm`, `npu`                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `device`                | `auto`                                     | which card: an index, part of a name, or `auto`                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `device_split`          | `off`                                      | spread one model across several devices: `off`, `auto`, `all`, or a ratio list such as `3,1`                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `threads`               | one per logical core                       | CPU worker threads                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `kv_cache`              | `f16`                                      | GPU KV mirror storage: `f16`, `q8_0`, or `f32`                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `read_size`             | `8192`                                     | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `prefill_backend`       | `auto`                                     | where prompt passes run: `auto` (whichever backend a prompt-shaped GEMM timed at load favours), `device`, or `cpu`                                                                                                                                                                                                                                                                                                                                                                                   |
+| `prompt_weights`        | `auto`                                     | how the weights a prompt multiplies on the CPU are held: `auto` (copies for the cores' matrix instructions, kept when they measure at least 10% faster and fit in half the free memory), `copy` (unmeasured), or `file` (no copy)                                                                                                                                                                                                                                                                    |
+| `mlp_unroll`            | decided at startup                         | force the GPU's block-unroll decode kernels on or off; unset, each quantized type is checked against the CPU and dropped if wrong                                                                                                                                                                                                                                                                                                                                                                    |
+| `npu_precompile`        | `yes`                                      | whether this model may use the NPU at all; `no` neither compiles nor loads blocks                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `npu_cache_gb`          | a quarter of memory, 1–16                  | GiB of compiled NPU blocks one model may use; `0` stops compiling but still loads cached blocks                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `text_encoder`          | largest found                              | the text encoder GGUF: `qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `vae`                   | first found                                | the model's VAE (`.safetensors`): Qwen-Image's, or Qwen-Image 2.1's own                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `vision`                | found beside the text encoder              | the vision projector (`mmproj-*.gguf`) a `qwen_image_2_1` model edits attached pictures with; `none` draws over them instead                                                                                                                                                                                                                                                                                                                                                                         |
+| `image_lora`            | `auto`                                     | the adapter applied to the picture transformer: `auto` the Lightning file under `models` (fetched with the model; a picture in 8 unguided steps), `none` the base model, or a `.safetensors` (or 4-step variant, rougher)                                                                                                                                                                                                                                                                            |
+| `image_lora_merge`      | `yes`                                      | fold the adapter into the weights at startup (a few minutes once, then no cost per pass); `no` applies it in `f32` every pass                                                                                                                                                                                                                                                                                                                                                                        |
+| `image_weights`         | `auto`                                     | how a `qwen_image_2_1` transformer's linears are held: `auto` per-row `int8` on the 8 × 8 `int8` tile (`i8mm`, `dotprod` or `AVX2`) when the transformer runs on the CPU and total memory is at least three times the 7 GB copy, `int8` whenever it runs on the CPU, `file` the file's K-quants (no copy); a transformer on a GPU keeps the file's; ~1.4–1.9× a step                                                                                                                                 |
+| `vae_precision`         | `int8`                                     | the VAE's convolutions as `Q6_K` on the `int8` kernel (3–4× faster decode), or `f32` as stored (exact)                                                                                                                                                                                                                                                                                                                                                                                               |
 | `image_cache`           | `easy`                                     | whether a step may reuse the last transformer pass rather than run one (EasyCache): `easy` (the default, threshold 0.08) or `easy:<threshold>` a step whose predicted change since the last pass stays under the threshold takes the last two passes' residual extrapolated to it, and `off` runs every step; at 0.08 about 2.4× a 40-step 1024² picture and 3.6× a 512² edit, the picture close to the uncached one but not identical; 0.05 is closer at 2×, 0.1 and above start to ghost lettering |
-| `image_reference_size`  | `source`                                   | the area an edit reads its reference at: `source` the picture's area but never more than the attached picture's own (upsampling adds nothing but tokens), `output` the picture's area (diffusers reads 1024²), or `WIDTHxHEIGHT` a cap; a 256² picture edited at 1024² encodes in 6 s rather than 84 and steps in 50 s rather than 79 |
-| `image_size`            | `1024x1024`                                | a picture's size when the request does not say; multiples of 16                                                                                                                                                           |
-| `image_steps`           | `50`; the adapter's under one              | denoising steps                                                                                                                                                                                                           |
-| `image_cfg_scale`       | `4`; `1` under an adapter                  | classifier-free guidance; `1` turns it off                                                                                                                                                                                |
-| `image_negative_prompt` | a space                                    | what a picture is pushed away from                                                                                                                                                                                        |
-| `image_strength`        | `0.6`                                      | how much of the schedule an attached picture goes through                                                                                                                                                                 |
-| `image_format`          | `png`                                      | the format a picture comes back in: `png`, `jpeg`, `gif`, `webp` or `svg`                                                                                                                                                 |
-| `log_type`              | `console`                                  | where the server's output goes: `console`, or `file` to append it — stamped, and without the once-a-second progress line — to `log_path`; what a `--daemon` needs, since detached it otherwise logs nothing               |
-| `log_path`              | `orangu-server.log` in the start directory | the file `log_type = file` writes to; `~` is expanded, a missing directory created                                                                                                                                        |
-| `web`                   | `0`                                        | the pre-section spelling of `[web].port`, still honored when the file has no `[web]` section and ignored when it does                                                                                                     |
+| `image_reference_size`  | `source`                                   | the area an edit reads its reference at: `source` the picture's area but never more than the attached picture's own (upsampling adds nothing but tokens), `output` the picture's area (diffusers reads 1024²), or `WIDTHxHEIGHT` a cap; a 256² picture edited at 1024² encodes in 6 s rather than 84 and steps in 50 s rather than 79                                                                                                                                                                |
+| `image_size`            | `1024x1024`                                | a picture's size when the request does not say; multiples of 16                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `image_steps`           | `50`; the adapter's under one              | denoising steps                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `image_cfg_scale`       | `4`; `1` under an adapter                  | classifier-free guidance; `1` turns it off                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `image_negative_prompt` | a space                                    | what a picture is pushed away from                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `image_strength`        | `0.6`                                      | how much of the schedule an attached picture goes through                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `image_format`          | `png`                                      | the format a picture comes back in: `png`, `jpeg`, `gif`, `webp` or `svg`                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `log_type`              | `console`                                  | where the server's output goes: `console`, or `file` to append it — stamped, and without the once-a-second progress line — to `log_path`; what a `--daemon` needs, since detached it otherwise logs nothing                                                                                                                                                                                                                                                                                          |
+| `log_path`              | `orangu-server.log` in the start directory | the file `log_type = file` writes to; `~` is expanded, a missing directory created                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `web`                   | `0`                                        | the pre-section spelling of `[web].port`, still honored when the file has no `[web]` section and ignored when it does                                                                                                                                                                                                                                                                                                                                                                                |
 
-| `[web]`  | default                        | what it does                            |
-| :------- | :----------------------------- | :-------------------------------------- |
-| `port`   | `8200`                         | web console port; `0` disables it       |
-| `host`   | follows `[orangu-server].host` | bind address for the console alone      |
-| `reexec` | `yes`                          | let the console switch the served model |
-| `delete` | `yes`                          | let the console delete models from disk |
+| `[web]`    | default                        | what it does                                      |
+| :--------- | :----------------------------- | :------------------------------------------------ |
+| `port`     | `8200`                         | web console port; `0` disables it                 |
+| `host`     | follows `[orangu-server].host` | bind address for the console alone                |
+| `reexec`   | `yes`                          | let the console switch the served model           |
+| `delete`   | `yes`                          | let the console delete models from disk           |
+| `[web]`    | default                        | what it does                                      |
+| :--------- | :----------------------------- | :------------------------------------------------ |
+| `port`     | `8101`                         | web console port; `0` disables it                 |
+| `host`     | follows `[orangu-server].host` | bind address for the console alone                |
+| `reexec`   | `yes`                          | let the console switch the served model           |
+| `delete`   | `yes`                          | let the console delete models from disk           |
+| `download` | `yes`                          | let the console download models from Hugging Face |
 
-| `[prometheus]` | default | what it does |
+| `[prometheus]` | default                        | what it does                                                                                 |
 | :------------- | :----------------------------- | :------------------------------------------------------------------------------------------- |
-| `port` | `8300` | dedicated, **unauthenticated** Prometheus `/metrics` port; the section's absence disables it |
-| `host` | follows `[orangu-server].host` | bind address for the metrics listener alone |
+| `port`         | `8300`                         | dedicated, **unauthenticated** Prometheus `/metrics` port; the section's absence disables it |
+| `host`         | follows `[orangu-server].host` | bind address for the metrics listener alone                                                  |
 
-| `[workers]` | default | what it does |
-| :---------- | :----------------------------- | :------------------------------------------------------------------ |
-| `host` | follows `[orangu-server].host` | address this server binds for its parent |
-| `port` | `8400` | port this server binds for its parent |
-| `workers` | empty | comma-separated `host:port` list of workers (`[v6-address]:port` for IPv6) |
-| `secret` | none | shared secret parent and worker prove to each other |
-| `activations` | `f16` | hidden-state encoding between nodes: `f32`, `f16` or `q8_0` |
-| `timeout` | `60` | seconds one forward may take on a worker's subtree |
-| `connect_timeout` | `10` | seconds reaching a worker may take |
-| `local_layers` | `auto` | layers this node runs itself; `0` = pure coordinator |
-| `standby` | empty | spare workers, `host:port` like `workers`, given layers only when a worker is lost |
-| `download` | `full` | `range` fetches only the layers a parent assigns; only for a node with no workers of its own |
-| `shares` | `decode` | what layers are divided by: measured `decode` or `prompt` speed, or `memory` alone |
-| `decode` | `auto` | where a top-level node decodes after the prompt: `auto`, `tree`, or `top` |
-| `head` | `auto` | which node applies the output head while a tree decodes: `auto`, `top`, or `last` |
-| `offload` | `auto` | `auto` uses workers only when the tree measures at least 10% faster; `always` whenever there are any |
-| `tls_cert`, `tls_key` | none | certificate and key the worker listener serves TLS with |
-| `tls_ca` | `tls_cert` | certificates trusted when dialing workers, which is then over TLS |
+| `[workers]`           | default                        | what it does                                                                                         |
+| :-------------------- | :----------------------------- | :--------------------------------------------------------------------------------------------------- |
+| `host`                | follows `[orangu-server].host` | address this server binds for its parent                                                             |
+| `port`                | `8400`                         | port this server binds for its parent                                                                |
+| `workers`             | empty                          | comma-separated `host:port` list of workers (`[v6-address]:port` for IPv6)                           |
+| `secret`              | none                           | shared secret parent and worker prove to each other                                                  |
+| `activations`         | `f16`                          | hidden-state encoding between nodes: `f32`, `f16` or `q8_0`                                          |
+| `timeout`             | `60`                           | seconds one forward may take on a worker's subtree                                                   |
+| `connect_timeout`     | `10`                           | seconds reaching a worker may take                                                                   |
+| `local_layers`        | `auto`                         | layers this node runs itself; `0` = pure coordinator                                                 |
+| `standby`             | empty                          | spare workers, `host:port` like `workers`, given layers only when a worker is lost                   |
+| `download`            | `full`                         | `range` fetches only the layers a parent assigns; only for a node with no workers of its own         |
+| `shares`              | `decode`                       | what layers are divided by: measured `decode` or `prompt` speed, or `memory` alone                   |
+| `decode`              | `auto`                         | where a top-level node decodes after the prompt: `auto`, `tree`, or `top`                            |
+| `head`                | `auto`                         | which node applies the output head while a tree decodes: `auto`, `top`, or `last`                    |
+| `offload`             | `auto`                         | `auto` uses workers only when the tree measures at least 10% faster; `always` whenever there are any |
+| `tls_cert`, `tls_key` | none                           | certificate and key the worker listener serves TLS with                                              |
+| `tls_ca`              | `tls_cert`                     | certificates trusted when dialing workers, which is then over TLS                                    |
 
 Every section that is none of the above — not `[orangu-server]`, `[web]`,
 `[prometheus]`, or `[workers]` — is read as an **MCP server**, named after
@@ -2040,8 +2047,8 @@ there is nothing else the request could mean.
 The built-in web console (see **Web UI** below) is configured in its own
 section, and **having that section at all is what enables it**. A config
 with no `[web]` binds no second listener; `-i`/`--init` asks
-`Add web console` and then `host`, `port`, `reexec` and `delete`, or writes
-no section at all.
+`Add web console` and then `host`, `port`, `reexec`, `delete` and
+`download`, or writes no section at all.
 
 ```ini
 [web]
@@ -2049,6 +2056,7 @@ host = 127.0.0.1
 port = 8200
 reexec = yes
 delete = yes
+download = yes
 ```
 
 - `port` — where the console listens, bound alongside `[orangu-server].port`
@@ -2082,10 +2090,19 @@ delete = yes
   read-only. It governs **models only** — History's own delete controls are
   unconditional, since a chat session is the console's own scratch data
   rather than a file on disk something else put there.
+- `download` — whether the console's model manager may download models
+  from Hugging Face (default `yes`, same spellings). Set `no` and the
+  download box above the table is gone, and the endpoint behind it refuses.
+  Its own key for the same reason `delete` is: a download is the one thing
+  the console can do that reaches out to the internet and fills the models
+  directory, and a deployment may well want that directory to hold only what
+  was put there by hand. It is independent of `delete`. The **Refresh** markers are unaffected — they only
+  look the repo up, and `orangu-server refresh` is still what acts on one.
 
 `web = <port>` under `[orangu-server]` is what this replaced, and still
 works: a configuration written against it goes on serving the console on
-that port, with `host` and `reexec` at their defaults. A `[web]` section
+that port, with `host`, `reexec`, `delete` and `download` at their
+defaults. A `[web]` section
 takes precedence over it wherever both appear.
 
 ### The `[prometheus]` section
@@ -2236,6 +2253,7 @@ machines without a `secret` is warned about at startup.
   private; who may take part is still `secret`'s job.
 
 **How a tree forms.**
+
 - **Every node runs its own model.** Start each one as usual, with the
   same model. A parent checks, by content, that each child's copy is the
   same file, quantization included (see below), and leaves out a child
@@ -2254,6 +2272,7 @@ machines without a `secret` is warned about at startup.
   away. Nodes that list each other (a loop) refuse the connection.
 
 **When a worker is lost.**
+
 - A request in flight is not lost with it. With a `standby` configured,
   the node directly above the lost worker hands its layers to a standby
   and rebuilds each sequence there from what it sent into them; nothing
@@ -2313,11 +2332,12 @@ the model's own paths, as without `[workers]`, and the workers are let go
 meanwhile. Only between requests (`409` otherwise). `orangu-bench --workers
 compare` measures both ways.
 
-The *Workers* chapter of the manual walks through setting up a tree.
+The _Workers_ chapter of the manual walks through setting up a tree.
 
 **Memory.** Each node holds only the layers it runs: weights are read, and
 uploaded to a GPU, the first time a layer runs. A node with a `[workers]`
 section never reads, uploads or times the whole model at startup. It skips:
+
 - the decode-speed probes;
 - the host preload;
 - the NPU precompile (`npu_precompile` is off);
@@ -2336,8 +2356,8 @@ another, but a worker link carries many requests at once (protocol v2: each
 frame carries a request id), so with several `slots` each machine works on a
 different request at the same time. A prompt chunk before the last is
 answered as soon as a node's own layers are done and continues down the tree
-in the background, so a long prompt is pipelined: stage *k* works on chunk
-*i* while stage *k+1* works on chunk *i−1*. A failure there answers the
+in the background, so a long prompt is pipelined: stage _k_ works on chunk
+_i_ while stage _k+1_ works on chunk _i−1_. A failure there answers the
 sequence's next forward, where recovery takes over. The top cuts a prompt
 into 128-token parts for this (`ORANGU_WORKERS_CHUNK`; `0` keeps the
 engine's chunks). `ORANGU_WORKERS_PIPELINE=0` turns the pipelining off.
@@ -3453,7 +3473,7 @@ channel, and it has its own two companions, found the same way as below:
   4096 (any quantization; `download` fetches
   `unsloth/Qwen3-VL-8B-Instruct-GGUF:UD-Q4_K_XL`, and an embedding model
   of the same shape is never picked). The transformer reads its last
-  layer *before* the final norm.
+  layer _before_ the final norm.
 - **The VAE** — `vae/qwen_image_2.1_vae_bf16.safetensors` from
   `unsloth/Qwen-Image-2.1-FP8` (the same file as
   `Comfy-Org/Qwen-Image-2.1`'s): RGBA, 64 latent channels at a sixteenth
@@ -3645,14 +3665,14 @@ Lightning adapter — the default, when one is under `models` — `image_steps`
 and `image_cfg_scale` follow the adapter (its step count, guidance off)
 unless the file sets them:
 
-| `[orangu-server]`       | default                             |                                                                                                                                                                                                                                                                                      |
-| :---------------------- | :---------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `image_size`            | `1024x1024`                         | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch; 32 for Qwen-Image 2.1                                                                                                                                                                       |
+| `[orangu-server]`       | default                                         |                                                                                                                                                                                                                                                                                      |
+| :---------------------- | :---------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `image_size`            | `1024x1024`                                     | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch; 32 for Qwen-Image 2.1                                                                                                                                                   |
 | `image_steps`           | `50` (2.1: `40`); the adapter's (`8`) under one | denoising steps; the time a picture takes is close to linear in this                                                                                                                                                                                                                 |
-| `image_cfg_scale`       | `4` (2.1: `1`); `1` under an adapter | classifier-free guidance: how far the picture is pushed towards the prompt and away from the negative one. `1` turns guidance off, which halves the work per step                                                                                                                    |
-| `image_negative_prompt` | a single space                      | what the picture is pushed away from; only read when guidance is on                                                                                                                                                                                                                  |
-| `image_strength`        | `0.6`                               | for a picture started from an attached one: how much of the schedule to run — `1` ignores the attachment's content, `0` returns it unchanged                                                                                                                                         |
-| `image_format`          | `png`                               | the container a picture comes back in when the request names none: `png`, `jpeg`, `gif` (one frame, 256 colours), `webp` (lossless) or `svg` (a document of the picture's size with the pixels inside as PNG — there is no pixels-to-vector) — an attached picture's own format wins |
+| `image_cfg_scale`       | `4` (2.1: `1`); `1` under an adapter            | classifier-free guidance: how far the picture is pushed towards the prompt and away from the negative one. `1` turns guidance off, which halves the work per step                                                                                                                    |
+| `image_negative_prompt` | a single space                                  | what the picture is pushed away from; only read when guidance is on                                                                                                                                                                                                                  |
+| `image_strength`        | `0.6`                                           | for a picture started from an attached one: how much of the schedule to run — `1` ignores the attachment's content, `0` returns it unchanged                                                                                                                                         |
+| `image_format`          | `png`                                           | the container a picture comes back in when the request names none: `png`, `jpeg`, `gif` (one frame, 256 colours), `webp` (lossless) or `svg` (a document of the picture's size with the pixels inside as PNG — there is no pixels-to-vector) — an attached picture's own format wins |
 
 The web console sends none of these, so for it they _are_ the settings.
 `/v1/images/generations` takes every one of them per request.
@@ -3824,7 +3844,8 @@ in-place-updating text. One download runs at a time; starting a second while
 one is in flight is refused rather than queued, since two fetches into the
 same directory would compete for the same disk and the same free-space
 check. An interrupted one resumes from its `.part` file the next time it is
-asked for.
+asked for. Set `download = no` in the `[web]` section and the text box
+is gone entirely, and the endpoint behind it refuses.
 
 **Rescan** (the circular arrow in the panel header) re-reads the models
 directory. The panel does not re-read it on its own: opening every GGUF
