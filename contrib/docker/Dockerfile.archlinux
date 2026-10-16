@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile:1
+#
+# The orangu stack in one image, on Arch Linux: orangu-coordinator on port
+# 9000 in front of orangu-server, serving the models staged for it.
+#
+#   make -C contrib/docker DISTRO=archlinux CONFIG=<orangu-coordinator.conf>
+#
+# The official archlinux image is x86_64 (linux/amd64) only. See
+# Dockerfile.rocky10, the default, for the notes this file shares with it.
+
+ARG RUST_VERSION=1
+
+# --- Build: identical to Dockerfile.rocky10, so the compile is shared -------
+FROM docker.io/library/rust:${RUST_VERSION}-bookworm AS build
+
+ARG ORANGU_BUILD_COMMIT=unknown
+ENV ORANGU_BUILD_COMMIT=${ORANGU_BUILD_COMMIT}
+
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked --bin orangu-server --bin orangu-coordinator \
+    && mkdir -p /out \
+    && cp target/release/orangu-server target/release/orangu-coordinator /out/
+
+# --- Runtime -----------------------------------------------------------------
+FROM docker.io/library/archlinux:latest
+
+# ca-certificates is part of the base image already; --needed makes this a
+# no-op unless that ever changes.
+RUN pacman -Sy --noconfirm --needed ca-certificates \
+    && pacman -Scc --noconfirm \
+    && useradd --create-home --home-dir /home/orangu orangu \
+    && mkdir -p /home/orangu/.orangu /workspace \
+    && chown orangu:orangu /home/orangu/.orangu /workspace
+
+COPY --from=stage models/ /opt/orangu/models/
+COPY --from=build /out/orangu-server /out/orangu-coordinator /opt/orangu/bin/
+COPY --from=stage orangu-coordinator.conf /opt/orangu/orangu-coordinator.conf
+
+USER orangu
+WORKDIR /workspace
+VOLUME ["/home/orangu/.orangu", "/workspace"]
+EXPOSE 9000
+ENTRYPOINT ["/opt/orangu/bin/orangu-coordinator", "--config", "/opt/orangu/orangu-coordinator.conf"]

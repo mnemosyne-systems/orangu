@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1
+#
+# The orangu stack in one image, on Rocky Linux 10 — the default:
+# orangu-coordinator on port 9000 in front of orangu-server, serving the
+# models staged for it.
+#
+# Built by the Makefile next to this file, which stages the models and the
+# coordinator config and passes them in as the `stage` build context:
+#
+#   make -C contrib/docker CONFIG=<orangu-coordinator.conf>
+#
+# The build context is the repository root; Dockerfile.rocky10.dockerignore
+# keeps target/, .git/, contrib/docker and the models out of it.
+#
+# Rocky Linux 10 is published as rockylinux/rockylinux, not in Docker's
+# library/ namespace.
+
+ARG RUST_VERSION=1
+
+# --- Build: orangu-server and orangu-coordinator from this checkout ---------
+# The same stage in every Dockerfile.<distro>, so a second distro reuses the
+# first one's compile. Built on Debian 12, whose glibc (2.36) is older than
+# that of every runtime base here: the binaries run on all of them.
+FROM docker.io/library/rust:${RUST_VERSION}-bookworm AS build
+
+# There is no .git in the build context, so the commit the binaries report
+# (orangu::build_info) is handed in instead — see src/build.rs.
+ARG ORANGU_BUILD_COMMIT=unknown
+ENV ORANGU_BUILD_COMMIT=${ORANGU_BUILD_COMMIT}
+
+WORKDIR /src
+COPY . .
+# The registry and target directory are cache mounts, so a rebuild after a
+# source change recompiles only what changed. target/ is not in the image,
+# hence the copy out of it.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked --bin orangu-server --bin orangu-coordinator \
+    && mkdir -p /out \
+    && cp target/release/orangu-server target/release/orangu-coordinator /out/
+
+# --- Runtime -----------------------------------------------------------------
+FROM docker.io/rockylinux/rockylinux:10
+
+# An unprivileged user, and the directories that become volumes, created and
+# owned by it before VOLUME declares them — a volume starts as a copy of what
+# the image has there, and a root-owned one would be unwritable.
+#
+# The HTTP client both binaries build at startup needs the system's root
+# certificates (ca-certificates), and useradd is shadow-utils. Both are part
+# of the base image, so there is nothing to install — and no dnf metadata to
+# download, which is most of the time a `dnf install` takes.
+RUN useradd --create-home --home-dir /home/orangu orangu \
+    && mkdir -p /home/orangu/.orangu /workspace \
+    && chown orangu:orangu /home/orangu/.orangu /workspace
+
+# The models first, in a layer of their own: by far the largest, and the
+# part that changes least often. A rebuild after a code change reuses it.
+COPY --from=stage models/ /opt/orangu/models/
+
+# The coordinator starts orangu-server from next to itself.
+COPY --from=build /out/orangu-server /out/orangu-coordinator /opt/orangu/bin/
+COPY --from=stage orangu-coordinator.conf /opt/orangu/orangu-coordinator.conf
+
+USER orangu
+WORKDIR /workspace
+VOLUME ["/home/orangu/.orangu", "/workspace"]
+EXPOSE 9000
+ENTRYPOINT ["/opt/orangu/bin/orangu-coordinator", "--config", "/opt/orangu/orangu-coordinator.conf"]
