@@ -828,6 +828,8 @@ struct Prepared {
     reexec: bool,
     /// `[web].delete`: whether the web console may delete models.
     delete: bool,
+    /// `[web].download`: whether the web console may download models.
+    download: bool,
     /// The model inside this executable, when that is what is being served
     /// — for the startup banner, and for naming this model to a handover
     /// that has to fall back to it (see [`bundle::EMBEDDED_SPEC`]). `None`
@@ -2874,6 +2876,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         role,
         reexec: conf.reexec,
         delete: conf.delete,
+        download: conf.download,
         bundle: match source {
             ModelSource::Embedded(bundle) => Some(bundle),
             ModelSource::File(_) => None,
@@ -3493,6 +3496,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         role,
         reexec: reexec_allowed,
         delete: delete_allowed,
+        download: download_allowed,
         bundle,
         mcp_servers,
         gpu_tuning,
@@ -3767,6 +3771,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
             catalog: Default::default(),
             handover,
             can_delete: delete_allowed,
+            can_download: download_allowed,
             bundled: bundle.is_some(),
             loading: Default::default(),
             mcp_servers: std::sync::Mutex::new(mcp_servers),

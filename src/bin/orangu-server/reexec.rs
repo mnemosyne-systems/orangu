@@ -92,8 +92,8 @@ pub fn refused_model() -> Option<String> {
 pub const FALLBACK_ROLE_VAR: &str = "ORANGU_FALLBACK_ROLE";
 
 /// Whether this build can hand over at all. `false` on non-Unix, where the
-/// model manager's Load button is disabled for the same reason
-/// `[orangu-server].reexec = no` disables it.
+/// model manager has no Load button, for the same reason `[web].reexec = no`
+/// removes it.
 pub const fn supported() -> bool {
     cfg!(unix)
 }

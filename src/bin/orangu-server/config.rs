@@ -519,6 +519,7 @@ pub fn bundled_configuration(
         // Hub for a model that is already in the file.
         model: None,
         delete: default_delete(),
+        download: default_download(),
         reexec: default_reexec(),
         role_key: Some(role),
         role,
@@ -865,6 +866,12 @@ pub fn default_delete() -> bool {
     true
 }
 
+/// Whether the web console may download models — see
+/// [`ServerConfiguration::download`]. On by default.
+pub fn default_download() -> bool {
+    true
+}
+
 /// Parses a `yes`/`no`/`true`/`false`/`on`/`off`/`1`/`0` config value.
 /// Every spelling a person might reasonably write for a switch, rather than
 /// only the two Rust's own `bool` parser accepts — this is a hand-edited
@@ -1180,9 +1187,20 @@ pub struct ServerConfiguration {
     /// delete controls are unconditional: a session is the console's own
     /// scratch data, not a file on disk something else put there.
     pub delete: bool,
+    /// `[web].download`: whether the web console's model manager may
+    /// download models from Hugging Face. `true` (the default) lets it;
+    /// `false` removes the download box from the panel and makes the
+    /// endpoint behind it refuse.
+    ///
+    /// Its own key for the same reason `delete` is: a download is the one
+    /// thing the console can do that reaches out to the internet and fills
+    /// the models directory, and a deployment may well want the directory to
+    /// hold only what was put there by hand. It does not stop the panel's
+    /// read-only Hub lookup behind the **Refresh** marker.
+    pub download: bool,
     /// `[web].reexec`: whether the web console's model manager may load a
     /// different model into this server. `true` (the default) lets it;
-    /// `false` disables the panel's Load button and makes the endpoint
+    /// `false` removes the panel's Load button and makes the endpoint
     /// behind it refuse.
     ///
     /// Loading a model re-executes this process (see `main::reexec`), which
@@ -1351,7 +1369,7 @@ pub fn load_server_configuration(
     // written against it goes on working untouched — but only when there is
     // no `[web]` section to take precedence over it.
     let web_section = sections.remove(WEB_SECTION);
-    let (web, web_host, web_host_explicit, reexec, delete) = match web_section {
+    let (web, web_host, web_host_explicit, reexec, delete, download) = match web_section {
         Some(web_section) => {
             let port = match web_section.get("port") {
                 Some(value) => value
@@ -1375,7 +1393,11 @@ pub fn load_server_configuration(
                 Some(value) => parse_bool(WEB_SECTION, "delete", value)?,
                 None => default_delete(),
             };
-            (port, web_host, explicit.is_some(), reexec, delete)
+            let download = match web_section.get("download") {
+                Some(value) => parse_bool(WEB_SECTION, "download", value)?,
+                None => default_download(),
+            };
+            (port, web_host, explicit.is_some(), reexec, delete, download)
         }
         None => {
             let port = match section.get("web") {
@@ -1393,6 +1415,7 @@ pub fn load_server_configuration(
                 false,
                 default_reexec(),
                 default_delete(),
+                default_download(),
             )
         }
     };
@@ -1935,6 +1958,7 @@ pub fn load_server_configuration(
         threads,
         reexec,
         delete,
+        download,
         log,
         workers,
         mcp_servers,
@@ -2293,9 +2317,10 @@ mod tests {
         assert_eq!(conf.model, None);
         assert_eq!(conf.backend, BackendPreference::Auto);
         assert_eq!(conf.role, Role::All);
-        // Both on by default.
+        // All on by default.
         assert!(conf.reexec);
         assert!(conf.delete);
+        assert!(conf.download);
         // And the terminal, as it always was.
         assert_eq!(conf.log, LogTarget::Console);
     }
@@ -3175,6 +3200,7 @@ mod tests {
         assert_eq!(conf.web, default_web_port());
         assert!(conf.reexec);
         assert!(conf.delete);
+        assert!(conf.download);
     }
 
     #[test]
@@ -3216,6 +3242,60 @@ mod tests {
         let conf = load_server_configuration(file.path(), None, false).unwrap();
         assert!(conf.reexec);
         assert!(!conf.delete);
+    }
+
+    #[test]
+    fn parses_every_download_spelling() {
+        for (value, expected) in [
+            ("yes", true),
+            ("true", true),
+            ("on", true),
+            ("1", true),
+            ("no", false),
+            ("NO", false),
+            ("false", false),
+            ("off", false),
+            ("0", false),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu-server]\nmodels = /srv/models\n\n[web]\nport = 8101\ndownload = {value}\n"
+            )
+            .unwrap();
+
+            let conf = load_server_configuration(file.path(), None, false).unwrap();
+            assert_eq!(conf.download, expected, "download = {value}");
+        }
+    }
+
+    /// Like `delete`, turning downloads off leaves the other switches alone.
+    #[test]
+    fn download_is_set_independently() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[web]\nport = 8101\ndownload = no\n"
+        )
+        .unwrap();
+
+        let conf = load_server_configuration(file.path(), None, false).unwrap();
+        assert!(!conf.download);
+        assert!(conf.reexec);
+        assert!(conf.delete);
+    }
+
+    #[test]
+    fn rejects_an_invalid_download_value() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[orangu-server]\nmodels = /srv/models\n\n[web]\ndownload = later\n"
+        )
+        .unwrap();
+
+        let err = load_server_configuration(file.path(), None, false).unwrap_err();
+        assert!(err.to_string().contains("[web].download"), "{err}");
     }
 
     #[test]
@@ -3351,6 +3431,7 @@ mod tests {
         assert_eq!(conf.web, 8200);
         assert!(conf.reexec, "the legacy spelling gets the default");
         assert!(conf.delete, "the legacy spelling gets the default");
+        assert!(conf.download, "the legacy spelling gets the default");
         assert_eq!(conf.web_host, conf.host);
     }
 

@@ -33,6 +33,12 @@
 //! concurrent fetches into one models directory would compete for the same
 //! disk and the same free-space check.
 //!
+//! **The mutating endpoints each have a switch in `[web]`**: `reexec` for
+//! Load, `delete` for Delete and `download` for the download box. Each
+//! is reported in the listing (`can_load`, `can_delete`, `can_download`) so
+//! the panel leaves the control out, and each endpoint refuses with `403`
+//! when its switch is off.
+//!
 //! **Access is exactly the chat UI's.** These endpoints are neither
 //! authenticated nor loopback-restricted, matching the rest of the `web`
 //! port (and the file-lifecycle API on the API port) — the whole server
@@ -304,6 +310,9 @@ struct ListView {
     /// `[web].delete`. The panel draws no Delete button at all when this is
     /// false — see [`WebState::can_delete`].
     can_delete: bool,
+    /// `[web].download`. The panel draws no download box when this is
+    /// false — see [`WebState::can_download`].
+    can_download: bool,
     /// Set once a handover has been accepted — the process is about to be
     /// replaced. The panel shows it and stops offering more actions; its
     /// next poll is the one that lands on the new image.
@@ -368,6 +377,7 @@ async fn list(
         },
         can_load: state.handover.is_some(),
         can_delete: state.can_delete,
+        can_download: state.can_download,
         loading: state.loading_model(),
         job: state.jobs.snapshot(),
         // Which row is loaded is decided here rather than baked into the
@@ -534,7 +544,7 @@ async fn select(
             format!(
                 "loading a model from the web console is disabled ({})",
                 if crate::reexec::supported() {
-                    "set reexec = yes in orangu-server.conf to enable it"
+                    "set reexec = yes in the [web] section of orangu-server.conf to enable it"
                 } else {
                     "this platform has no execve"
                 }
@@ -662,10 +672,21 @@ struct DownloadRequest {
 
 /// Starts a Hugging Face download in the background and returns at once —
 /// the UI watches `job` in [`list`]'s response for its progress.
+///
+/// Refused outright when `[web].download` is off — the panel draws no
+/// download box then, so reaching this at all means a hand-made request.
 async fn download(
     State(state): State<Arc<WebState>>,
     Json(req): Json<DownloadRequest>,
 ) -> impl IntoResponse {
+    if !state.can_download {
+        return (
+            StatusCode::FORBIDDEN,
+            "downloading models from the web console is disabled (set download = yes in \
+             the [web] section of orangu-server.conf to enable it)",
+        )
+            .into_response();
+    }
     let repo = req.repo.trim().to_string();
     if repo.is_empty() {
         return (StatusCode::BAD_REQUEST, "no repo given").into_response();

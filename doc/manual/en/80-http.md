@@ -1561,8 +1561,11 @@ disk prints the same bare `MODEL` on each of their rows), and for a load or a
 delete it also sends the `path` that row showed. Given both, the server checks
 they still agree before acting: an `NR` is a *position*, and a download
 finishing while a confirmation dialog is open re-sorts the listing underneath
-it. `select` is a `403` when `[web].reexec` is `no`, and `DELETE /api/models`
-a `403` when `[web].delete` is `no`.
+it. `select` is a `403` when `[web].reexec` is `no`, `DELETE /api/models`
+a `403` when `[web].delete` is `no`, and `POST /api/models/download` a `403`
+when `[web].download` is `no`. `GET /api/models` reports the three as
+`can_load`, `can_delete` and `can_download`, so the panel can leave out a
+control that would only be refused.
 
 Finally, the MCP inventory — the configuration file's MCP sections, which
 orangu clients read and this server only keeps:
