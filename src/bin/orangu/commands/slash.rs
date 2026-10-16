@@ -313,6 +313,21 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                 return Some(LocalCommand::Close(parse_close_args(args.trim())));
             }
             if let Some(args) = input.strip_prefix("/issue ") {
+                let trimmed = args.trim_start();
+                // `/issue create <title> ...` opens a new issue; everything
+                // else is the `<reviewer|assignee|label> <number> <value>` form.
+                if trimmed.eq_ignore_ascii_case("create")
+                    || strip_ascii_prefix(trimmed, "create ")
+                        .or_else(|| strip_ascii_prefix(trimmed, "create\t"))
+                        .is_some()
+                {
+                    let rest = if trimmed.len() == "create".len() {
+                        ""
+                    } else {
+                        trimmed["create".len()..].trim_start_matches([' ', '\t'])
+                    };
+                    return Some(LocalCommand::IssueCreate(parse_issue_create_args(rest)));
+                }
                 return Some(LocalCommand::Issue(parse_issue_args(args)));
             }
             if let Some(args) = input.strip_prefix("/get_comments ") {

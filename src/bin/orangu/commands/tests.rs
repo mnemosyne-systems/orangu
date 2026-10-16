@@ -981,6 +981,98 @@ fn parses_issue_commands() {
             "expected a usage error for {bad:?}"
         );
     }
+
+    // `create` is not a reviewer/assignee/label field — it opens a new issue.
+    assert!(matches!(
+        parse_local_command("/issue create Crash on startup"),
+        Some(LocalCommand::IssueCreate(_))
+    ));
+}
+
+#[test]
+fn parses_issue_create_commands() {
+    // A bare title needs no quoting when it has no flags after it.
+    match parse_local_command("/issue create Crash on startup") {
+        Some(LocalCommand::IssueCreate(Some(args))) => {
+            assert_eq!(args.title, "Crash on startup");
+            assert_eq!(args.body, "");
+            assert!(args.labels.is_empty());
+            assert!(args.assignees.is_empty());
+        }
+        _ => panic!("expected an issue-create action"),
+    }
+
+    // Quoted title with every flag; labels and assignees repeat.
+    match parse_local_command(
+        "/issue create \"Crash on startup\" --body \"Steps to reproduce\" --label bug --label urgent --assignee alice",
+    ) {
+        Some(LocalCommand::IssueCreate(Some(args))) => {
+            assert_eq!(args.title, "Crash on startup");
+            assert_eq!(args.body, "Steps to reproduce");
+            assert_eq!(args.labels, vec!["bug", "urgent"]);
+            assert_eq!(args.assignees, vec!["alice"]);
+        }
+        _ => panic!("expected an issue-create action with flags"),
+    }
+
+    // Comma-separated lists, the `--description` alias, and the short flags.
+    match parse_local_command("/issue create Crash -d Steps -l bug,urgent -a alice,bob") {
+        Some(LocalCommand::IssueCreate(Some(args))) => {
+            assert_eq!(args.title, "Crash");
+            assert_eq!(args.body, "Steps");
+            assert_eq!(args.labels, vec!["bug", "urgent"]);
+            assert_eq!(args.assignees, vec!["alice", "bob"]);
+        }
+        _ => panic!("expected short-flag issue-create parsing"),
+    }
+
+    // The `--flag=value` form works too.
+    match parse_local_command("/issue create Crash --label=bug --assignee=alice") {
+        Some(LocalCommand::IssueCreate(Some(args))) => {
+            assert_eq!(args.labels, vec!["bug"]);
+            assert_eq!(args.assignees, vec!["alice"]);
+        }
+        _ => panic!("expected flag=value issue-create parsing"),
+    }
+
+    // Natural-language forms.
+    match parse_local_command("create issue Crash on startup --label bug") {
+        Some(LocalCommand::IssueCreate(Some(args))) => {
+            assert_eq!(args.title, "Crash on startup");
+            assert_eq!(args.labels, vec!["bug"]);
+        }
+        _ => panic!("expected a natural-language issue-create action"),
+    }
+    match parse_local_command("new issue Crash on startup") {
+        Some(LocalCommand::IssueCreate(Some(args))) => {
+            assert_eq!(args.title, "Crash on startup");
+        }
+        _ => panic!("expected a new-issue action"),
+    }
+
+    // A missing title, a flag without a value, or an unknown flag are usage
+    // errors — while the field form keeps working alongside `create`.
+    for bad in [
+        "/issue create",
+        "/issue create --label bug",
+        "/issue create Crash --label",
+        "/issue create Crash --bogus x",
+        "/issue create Crash --label --assignee alice",
+        "create issue",
+        "new issue",
+    ] {
+        assert!(
+            matches!(
+                parse_local_command(bad),
+                Some(LocalCommand::IssueCreate(None))
+            ),
+            "expected a usage error for {bad:?}"
+        );
+    }
+    assert!(matches!(
+        parse_local_command("/issue label 7 needs triage"),
+        Some(LocalCommand::Issue(_))
+    ));
 }
 
 #[test]

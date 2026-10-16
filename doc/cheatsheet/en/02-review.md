@@ -45,7 +45,7 @@ One rebased commit, pushed, then a pull request — which is exactly what
 | `/pull_request` | Push with upstream and open the pull request from the commit message. Needs `gh`. |
 | `/pull 42` `/merge feature/login` | Check out someone's pull request; merge a branch. |
 | `/create_patch` | Resolve the conflicts a stopped merge, rebase or cherry-pick left behind, and stage them. No review needed. |
-| `/close -i 42` `/issue reviewer 114 <user>` | Close an issue; add a reviewer, assignee or label. |
+| `/close -i 42` `/issue reviewer 114 <user>` `/issue create "Crash" --label bug` | Close an issue; add a reviewer, assignee or label; create an issue. |
 
 Set `auto_rebase = on` and `auto_squash = on` in `[orangu]` to have the
 pre-flight fix itself instead of stopping.

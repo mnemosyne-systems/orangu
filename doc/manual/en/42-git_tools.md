@@ -882,10 +882,11 @@ close pr 58
 
 ## /issue
 
-Adds a **reviewer**, **assignee**, or **label** to a GitHub/GitLab issue or pull/merge request. Requires the `gh` or `glab` CLI.
+Adds a **reviewer**, **assignee**, or **label** to a GitHub/GitLab issue or pull/merge request, or creates a new issue. Requires the `gh` or `glab` CLI.
 
 ```text
 /issue <reviewer|assignee|label> <number> <value>
+/issue create <title> [--body <text>] [--label <label>] [--assignee <user>]
 ```
 
 The three subcommands are:
@@ -899,14 +900,24 @@ The `<number>` may be an issue **or** a pull/merge request — orangu detects wh
 - GitHub — `gh pr edit <n> --add-reviewer|--add-assignee|--add-label <value>`, or `gh issue edit <n> --add-assignee|--add-label <value>`.
 - GitLab — `glab mr update <n> --reviewer|--assignee|--label <value>`, or `glab issue update <n> --assignee|--label <value>`.
 
+### Creating an issue
+
+`/issue create` opens a new issue with the given title. The title is every word up to the first `--flag` — quote it when it carries spaces. `--description` (and `-b`/`-d`) are aliases of `--body`; `--label`/`-l` and `--assignee`/`-a` repeat and accept comma-separated lists:
+
+- GitHub — `gh issue create --title <title> --body <body> [--label <label>]... [--assignee <user>]...`.
+- GitLab — `glab issue create --title <title> --description <body> [--label <label>]... [--assignee <user>]... --yes`.
+
+The body is optional (an empty body is sent so the CLI never prompts), and the command prints the new issue's URL.
+
 ### Completion
 
 Every part Tab-completes (and shows the inline ghost hint):
 
-- the **subcommand** completes against `reviewer`, `assignee`, `label`;
-- the **value** completes against the repository's candidates for that subcommand — collaborators for `reviewer`, assignable users for `assignee`, and label names for `label`.
+- the **subcommand** completes against `reviewer`, `assignee`, `label`, `create`;
+- the **value** completes against the repository's candidates for that subcommand — collaborators for `reviewer`, assignable users for `assignee`, and label names for `label`;
+- after `create`, a `-`-prefixed token offers `--body`/`--description`/`--label`/`--assignee`, and the token after `--label`/`--assignee` (or the value of `--label=`/`--assignee=`) offers the cached labels/assignees.
 
-The candidate lists are fetched once at startup (via `gh`/`glab`) and cached, so completion never shells out on a keystroke. The `<number>` is typed directly (no completion). So `/issue re<TAB> 114 je<TAB>` expands to `/issue reviewer 114 jesperpedersen`.
+The candidate lists are fetched once at startup (via `gh`/`glab`) and cached, so completion never shells out on a keystroke. The `<number>` and the issue title/body are typed directly (no completion). So `/issue re<TAB> 114 je<TAB>` expands to `/issue reviewer 114 jesperpedersen`.
 
 **Examples**
 
@@ -914,6 +925,14 @@ The candidate lists are fetched once at startup (via `gh`/`glab`) and cached, so
 /issue reviewer 114 jesperpedersen
 /issue assignee 51 alice
 /issue label 51 needs triage
+/issue create "Crash on startup" --body "Steps to reproduce..." --label bug --assignee alice
+```
+
+Natural-language forms:
+
+```text
+create issue Crash on startup --label bug
+new issue Crash on startup --body "Steps to reproduce..."
 ```
 
 \newpage
