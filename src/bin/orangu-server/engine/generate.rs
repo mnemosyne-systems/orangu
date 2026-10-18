@@ -1600,7 +1600,7 @@ fn run(
         let emitted = if tokenizer.is_special(next) {
             // A message marker opens or closes a header; it is hidden
             // either way, like every other structural token, but ending one
-            // can call for a separator between two visible messages.
+            // can call for a separator between two visible messages of one kind.
             match header.observe_marker(next) {
                 Some(separator) => Some(separator.to_string()),
                 // Almost every special token is structural and stays hidden.
@@ -2149,8 +2149,10 @@ const MAX_HEADER_LEN: usize = 128;
 ///   caller sees is the same question `Role::enable_thinking` already
 ///   answers for models that mark reasoning with `<think>`. A role that
 ///   suppresses reasoning gets the answer alone; every other role gets
-///   both, separated by a blank line (they are different messages, and
-///   running them together produced `…Final.Three primes larger than…`).
+///   both, apart — the reasoning as `StreamEvent::Reasoning` (they are
+///   different messages, and running them together produced
+///   `…Final.Three primes larger than…`). Two bodies of the same kind are
+///   separated by a blank line; see [`MessageHeader::open_body`].
 ///
 /// A third format frames the same distinction with a *channel*: gemma-4
 /// writes `<|channel>thought\n`, its chain of thought, then `<channel|>`,
@@ -2167,8 +2169,8 @@ const MAX_HEADER_LEN: usize = 128;
 /// is answered here too: `inkling` opens each body with a marker naming its
 /// *kind* (`<|content_thinking|>` for reasoning, `<|content_text|>` for the
 /// answer) and writes no header at all. Same rule — a reasoning body is
-/// hidden when the role says so, and two visible bodies are separated by a
-/// blank line — read off `Tokenizer::content_kinds` rather than off a
+/// hidden when the role says so, and two visible bodies of one kind are
+/// separated by a blank line — read off `Tokenizer::content_kinds` rather than off a
 /// recipient string.
 ///
 /// A fourth format is the one nearly every reasoning model uses, and the
@@ -2253,6 +2255,11 @@ struct MessageHeader {
     /// Whether any *visible* body has already been emitted this turn —
     /// what decides if the next one needs a separator in front of it.
     emitted_body: bool,
+    /// Whether a visible *reasoning* body, and a visible *answer* body, have
+    /// been opened this turn by a body-kind marker or a header — see
+    /// [`Self::open_body`].
+    opened_reasoning: bool,
+    opened_answer: bool,
     suppress_reasoning: bool,
 }
 
@@ -2273,6 +2280,8 @@ impl MessageHeader {
             reasoning_body: Self::prompt_ends_in_think(tokenizer, prompt_tokens),
             trim_leading: Self::prompt_ends_in_think(tokenizer, prompt_tokens),
             emitted_body: false,
+            opened_reasoning: false,
+            opened_answer: false,
             suppress_reasoning: role.suppresses_reasoning(),
         }
     }
@@ -2402,9 +2411,7 @@ impl MessageHeader {
         {
             self.reasoning_body = id == kinds.reasoning;
             self.hidden_body = self.suppress_reasoning && id == kinds.reasoning;
-            let separator = (!self.hidden_body && self.emitted_body).then_some("\n\n");
-            self.emitted_body |= !self.hidden_body;
-            return separator;
+            return self.open_body();
         }
         let (start, message) = self.framing?;
         if id == start {
@@ -2422,9 +2429,31 @@ impl MessageHeader {
             .replace(' ', "")
             .contains(REASONING_RECIPIENT);
         self.hidden_body = self.suppress_reasoning && self.reasoning_body;
-        let separator = (!self.hidden_body && self.emitted_body).then_some("\n\n");
-        self.emitted_body |= !self.hidden_body;
-        separator
+        self.open_body()
+    }
+
+    /// Settles a body a header or a body-kind marker just opened: the
+    /// separator owed in front of it, if any.
+    ///
+    /// Owed only after a visible body *of the same kind*. Reasoning and
+    /// answer leave as different events (`StreamEvent::Reasoning`,
+    /// `StreamEvent::Token`), so nothing downstream runs one into the other,
+    /// and a separator between them lands as a blank first line in whichever
+    /// one comes second — every Muse answer arrived in `content` as
+    /// `"\n\nParis"`. Two bodies of one kind in one turn — reasoning, a
+    /// tool call, more reasoning — still reach the same field, and still need
+    /// keeping apart.
+    fn open_body(&mut self) -> Option<&'static str> {
+        if self.hidden_body {
+            return None;
+        }
+        self.emitted_body = true;
+        let opened = if self.reasoning_body {
+            &mut self.opened_reasoning
+        } else {
+            &mut self.opened_answer
+        };
+        std::mem::replace(opened, true).then_some("\n\n")
     }
 
     /// Feed every *ordinary* (non-special) token's text through this.
@@ -4885,10 +4914,42 @@ mod message_header_tests {
         out
     }
 
+    /// What a client receives from `header` for `stream`, split the way the
+    /// stream splits it: `(reasoning, answer)`.
+    fn reasoning_and_answer(mut header: MessageHeader, stream: &[Out]) -> (String, String) {
+        let (mut reasoning, mut answer) = (String::new(), String::new());
+        for item in stream {
+            let emitted = match item {
+                Marker(id) => header.observe_marker(*id).map(str::to_string),
+                Text(text) => header.observe_text((*text).to_string()),
+            };
+            if let Some(text) = emitted {
+                if header.in_reasoning() {
+                    reasoning.push_str(&text);
+                } else {
+                    answer.push_str(&text);
+                }
+            }
+        }
+        (reasoning, answer)
+    }
+
+    /// A `muse-glimmer` header filter for a reply that resumes inside a
+    /// header, under a role that shows reasoning.
+    fn showing_framed() -> MessageHeader {
+        MessageHeader {
+            framing: Some((START, MESSAGE)),
+            inside: true,
+            ..Default::default()
+        }
+    }
+
     /// A whole `muse-glimmer` assistant turn: a reasoning message, then the
     /// answer. Every header is dropped — this is the bug that made replies
-    /// begin `" to=self"` — and the two bodies are separated rather than
-    /// run together (`…Final.Three primes larger than…`).
+    /// begin `" to=self"` — and the two bodies leave apart rather than run
+    /// together (`…Final.Three primes larger than…`), the answer with no
+    /// blank line in front of it: they are different events, and a
+    /// separator between them reached `content` as `"\n\nParis"`.
     #[test]
     fn a_showing_role_gets_both_messages_with_their_headers_dropped() {
         let turn = [
@@ -4901,7 +4962,43 @@ mod message_header_tests {
             Marker(MESSAGE),
             Text("23, 29, 31."),
         ];
-        assert_eq!(shown(false, true, &turn), "Let me think.\n\n23, 29, 31.");
+        assert_eq!(
+            reasoning_and_answer(showing_framed(), &turn),
+            ("Let me think.".to_string(), "23, 29, 31.".to_string())
+        );
+    }
+
+    /// Two reasoning messages in one turn reach the same field, so they are
+    /// still kept apart — and so are two answers.
+    #[test]
+    fn two_bodies_of_one_kind_are_still_separated() {
+        let turn = [
+            Text(" to=self"),
+            Marker(MESSAGE),
+            Text("First."),
+            Marker(EOM),
+            Marker(START),
+            Text(" to=user"),
+            Marker(MESSAGE),
+            Text("Partly."),
+            Marker(EOM),
+            Marker(START),
+            Text(" to=self"),
+            Marker(MESSAGE),
+            Text("Second."),
+            Marker(EOM),
+            Marker(START),
+            Text(" to=user"),
+            Marker(MESSAGE),
+            Text("Done."),
+        ];
+        assert_eq!(
+            reasoning_and_answer(showing_framed(), &turn),
+            (
+                "First.\n\nSecond.".to_string(),
+                "Partly.\n\nDone.".to_string()
+            )
+        );
     }
 
     /// The same turn under a reasoning-suppressing role: the answer alone,
@@ -5254,8 +5351,8 @@ mod message_header_tests {
     }
 
     /// A whole `inkling` assistant turn: a thinking body, then the answer.
-    /// The showing role gets both, separated; the suppressing role gets the
-    /// answer alone, with no leading separator.
+    /// The showing role gets both, apart and with no separator between them;
+    /// the suppressing role gets the answer alone.
     #[test]
     fn a_typed_body_is_shown_or_hidden_by_its_own_marker() {
         let turn = [
@@ -5265,7 +5362,17 @@ mod message_header_tests {
             Marker(TEXT),
             Text("23, 29, 31."),
         ];
-        assert_eq!(shown_by_kind(false, &turn), "Let me think.\n\n23, 29, 31.");
+        let header = MessageHeader {
+            kinds: Some(crate::engine::tokenizer::ContentKinds {
+                reasoning: THINKING,
+                other: vec![TEXT],
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            reasoning_and_answer(header, &turn),
+            ("Let me think.".to_string(), "23, 29, 31.".to_string())
+        );
         assert_eq!(shown_by_kind(true, &turn), "23, 29, 31.");
     }
 

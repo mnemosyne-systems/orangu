@@ -172,6 +172,11 @@ pub enum ArchFamily {
     /// sliding-window ones rotate**, and both a logit scale and final logit
     /// softcapping on the tail. See `engine::arch::muse`.
     Muse,
+    /// Muse-Spark (`muse-spark`) — [`ArchFamily::Muse`]'s gated, partly
+    /// NoPE attention in front of a latent mixture of experts, with
+    /// weightless post-norms and a norm-preserving (`alpha`/`beta`)
+    /// residual in place of the plain add. See `engine::arch::muse_spark`.
+    MuseSpark,
     /// Inkling (`inkling`) — a rotation-free MoE decoder: position enters
     /// through a learned per-head relative-position bias and a causal
     /// depthwise short convolution on the key/value projections and on
@@ -351,6 +356,11 @@ const PHI3_ARCHITECTURES: &[&str] = &["phi3"];
 /// `muse-glimmer` (e.g. `unsloth/Muse-Glimmer-30B-GGUF`) — see
 /// [`ArchFamily::Muse`] and `engine::arch::muse`.
 const MUSE_ARCHITECTURES: &[&str] = &["muse-glimmer"];
+/// `muse-spark` (e.g. `unsloth/Muse-Spark-Open-816B-A42B-GGUF`) — see
+/// [`ArchFamily::MuseSpark`] and `engine::arch::muse_spark`. The
+/// `mmproj-*.gguf` shipped alongside is a separate vision and audio model
+/// and is not this.
+const MUSE_SPARK_ARCHITECTURES: &[&str] = &["muse-spark"];
 /// `inkling` (e.g. `unsloth/Inkling-Small-GGUF`) — see
 /// [`ArchFamily::Inkling`] and `engine::arch::inkling`. The `mmproj-*.gguf`
 /// shipped alongside is a separate `clip`-architecture model and is not
@@ -487,6 +497,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if MUSE_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Muse);
     }
+    if MUSE_SPARK_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::MuseSpark);
+    }
     if INKLING_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Inkling);
     }
@@ -557,6 +570,7 @@ fn supported_architecture_names() -> Vec<&'static str> {
         .chain(PHI3_ARCHITECTURES)
         .chain(MISTRAL_ARCHITECTURES)
         .chain(MUSE_ARCHITECTURES)
+        .chain(MUSE_SPARK_ARCHITECTURES)
         .chain(INKLING_ARCHITECTURES)
         .chain(NEMOTRON_ARCHITECTURES)
         .chain(BAILINGMOE3_ARCHITECTURES)
@@ -2964,6 +2978,7 @@ mod tests {
             (ArchFamily::Phi3, "phi3"),
             (ArchFamily::Mistral3, "mistral3"),
             (ArchFamily::Muse, "muse-glimmer"),
+            (ArchFamily::MuseSpark, "muse-spark"),
             (ArchFamily::Inkling, "inkling"),
             (ArchFamily::NemotronHMoe, "nemotron_h_moe"),
             (ArchFamily::BailingMoe3, "bailingmoe3"),
@@ -2991,6 +3006,7 @@ mod tests {
                 ArchFamily::Mistral3 => "Mistral3",
                 ArchFamily::Granite => "Granite",
                 ArchFamily::Muse => "Muse",
+                ArchFamily::MuseSpark => "MuseSpark",
                 ArchFamily::Inkling => "Inkling",
                 ArchFamily::NemotronHMoe => "NemotronHMoe",
                 ArchFamily::BailingMoe3 => "BailingMoe3",

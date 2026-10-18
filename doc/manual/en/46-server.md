@@ -1708,9 +1708,10 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
     loses.
 
     Only the **explicit** read routes use it (`ORANGU_EXPERT_READ=pread` or
-    `direct`). The default route is the memory mapping, where request size is
-    the kernel's readahead to decide, so on a default deployment this key
-    changes nothing.
+    `direct`, or the `direct` route the server picks itself for a model whose
+    token's experts outgrow memory — see **Muse-Spark**). The default route is
+    the memory mapping, where request size is the kernel's readahead to
+    decide, so on most deployments this key changes nothing.
 
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `dx12`,
   `cuda`, `opencl`,
@@ -4653,7 +4654,7 @@ that apply to all of them.
 ## Scope
 
 Text-in/text-out GGUF chat, completion, and embedding models — and one
-text-to-image model, one text-to-video model and one text-to-speech model — for twenty
+text-to-image model, one text-to-video model and one text-to-speech model — for twenty-one
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
 _text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way; and
@@ -4707,7 +4708,11 @@ width read from `attention.key_length` rather than derived from
 with a norm on both sides of each sub-layer, per-head query/key norms, a
 sigmoid gate on the attention output, three rotated sliding-window layers
 to every unrotated full-attention one, and both a logit scale and final
-logit softcapping on the output), and Inkling (`inkling`, e.g.
+logit softcapping on the output), and Muse-Spark (`muse-spark`, e.g.
+`unsloth/Muse-Spark-Open-816B-A42B-GGUF` — Muse-Glimmer's attention in
+front of a mixture of experts that runs in a narrower latent space, with
+weightless post-norms and a norm-preserving residual in place of the
+plain add), and Inkling (`inkling`, e.g.
 `unsloth/Inkling-Small-GGUF` — a mixture-of-experts decoder that rotates
 nothing at all: position arrives through a learned per-head
 relative-position bias and a causal short convolution on the key/value
@@ -5061,16 +5066,60 @@ never begins ` to=user`.
 Which messages you see is the server's **role**, the same switch that
 governs reasoning everywhere else. A reasoning-suppressing role
 (`--review`) shows the message addressed to you and nothing else; every
-other role shows the reasoning first, then a blank line, then the answer —
-the same treatment a `<think>`-style model's reasoning already gets here.
+other role reports the reasoning in `reasoning_content`, apart from the
+answer — the same treatment a `<think>`-style model's reasoning gets here.
 Note that this model reasons on every turn: its template writes
 `Reasoning strength: high` into the system block itself and does not read
 the `enable_thinking` flag, so `--review` is what turns the reasoning off
 in the reply, not in the generation.
 
-Not implemented: reporting reasoning separately as `reasoning_content`
-rather than inline, and parsing this model's XML-shaped tool calls (a
-`to=<tool>` message reaches you as its literal markup).
+Its tool calls — an `atem:`-namespaced `invoke` block — come back parsed
+into `tool_calls`.
+
+Muse-Spark (`muse-spark`, e.g. `unsloth/Muse-Spark-Open-816B-A42B-GGUF`)
+runs on the CPU path only: every matmul still goes to the selected
+backend, but no fused layer chain can express its layer. Its attention is
+Muse-Glimmer's — the same gate, per-head query and key norms, and rotation
+on the sliding-window layers only — with one addition: a weightless norm
+over each head of the attention output, before the gate. Its sliding-window
+pattern is a per-layer list rather than a period (46 of its 62 layers
+attend a window of 2048), and the rotated layers take
+`rope.freq_base_swa`. Behind the attention, every layer is a mixture of
+experts — 256 of them, 8 per token, sigmoid-routed with a selection bias —
+whose experts run in a narrower _latent_ space: the router scores the
+full-width normed input, while the experts read it projected down
+(`ffn_latent_down`, 8192 to 4096) and normed, and their sum is projected
+back up (`ffn_latent_up`). Each expert's output is normalized before its
+router weight applies; there is no shared expert. The norms after each
+sub-layer differ from Muse-Glimmer's too: the post-attention one has no
+weight, the post-FFN one scales before it normalizes, and both use the
+file's `post_norm_epsilon`. And the residual is not an add: each sub-layer
+leaves `stream × alpha + branch × beta`, with per-channel vectors the
+converter resolved from one learned gate so that `alpha² + beta² = 1`.
+The token embeddings are normalized on the way in and the logits scaled
+and soft-capped, as for Muse-Glimmer.
+
+Its prompt format, the dropped recipient and the role's choice of messages
+are Muse-Glimmer's, above. Its template writes the reasoning strength into
+the system block from `reasoning_effort` — `low`, `medium`, `high` or
+`xhigh` — so this server's default, `medium`, applies unless
+`[orangu-server].reasoning_effort` names another.
+
+The `UD-Q4_K_XL` quant is 471 GiB in twelve shards, with about 42B
+parameters active per token. Everything but the expert stacks — attention,
+the latent projections, the routers, the embeddings and the output
+projection — is about 21 GiB, and one token selects about 14 GiB of
+experts. On a machine where those 14 GiB do not fit beside the 21 (31 GiB
+of memory, say) no expert is still cached when it is wanted again, so the
+server reads them with `O_DIRECT` into a small cache of its own and leaves
+the page cache to the 21 GiB, which are wanted every token — the startup
+line `[experts] … read with O_DIRECT` says so. Measured there on the CPU:
+7.8 s a token, against 20.2 reading the experts through the mapping, where
+they push the dense weights out of the page cache and the disk reads
+41 GiB a token instead of 20. The drive is then busy almost nine tenths
+of the time, at about 2 GiB/s, so little is left to win in software:
+reading ahead on threads of its own was tried and decoded no faster.
+`ORANGU_EXPERT_READ=mmap` restores the mapping.
 
 Inkling (`inkling`, e.g. `unsloth/Inkling-Small-GGUF`) runs on the CPU path
 only, and is the first architecture here that **rotates nothing** — no
@@ -5116,14 +5165,14 @@ answer, and `<|end_message|>` closes either. The markers are filtered out
 of the reply like any other control token, and which bodies you see is the
 server's **role**, the same switch that governs reasoning everywhere else.
 A reasoning-suppressing role (`--review`) shows the answer alone; every
-other role shows the reasoning, a blank line, then the answer. The model
+other role reports the reasoning in `reasoning_content`, apart from the
+answer. The model
 reasons on every turn regardless — its template writes a thinking-effort
 line into the system block and never reads the `enable_thinking` flag — so
 `--review` turns the reasoning off in the reply, not in the generation.
 
-Not implemented for this model: reporting reasoning separately as
-`reasoning_content` rather than inline, and parsing its JSON tool
-invocations back into `tool_calls` (a `<|content_invoke_tool_json|>` body
+Not implemented for this model: parsing its JSON tool invocations back
+into `tool_calls` (a `<|content_invoke_tool_json|>` body
 reaches you as its literal JSON).
 
 Nemotron-H (`nemotron_h_moe` and the dense `nemotron_h`, e.g.

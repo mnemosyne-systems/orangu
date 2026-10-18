@@ -67,6 +67,7 @@ pub mod kimi3;
 pub mod llama;
 pub mod mistral;
 pub mod muse;
+pub mod muse_spark;
 pub mod nemotron;
 pub mod phi;
 pub mod qwen35;
@@ -2098,6 +2099,39 @@ pub(crate) fn swiglu_moe_ffn(
     moe: &SwigluMoe<'_>,
     il: usize,
 ) -> Vec<f32> {
+    swiglu_moe_ffn_with(
+        backend, routing, normed, normed, n_tokens, n_embd, moe, None, il,
+    )
+}
+
+/// [`swiglu_moe_ffn`] for experts that do not read what the router reads,
+/// and whose outputs may be normed before the router weights apply.
+///
+/// `router_in` is what [`moe_router_logits`] scores; `normed` is what the
+/// experts (and any shared expert) read, `[n_tokens, n_embd]`. They are the
+/// same slice for every full-width mixture. `muse-spark`'s experts run in a
+/// latent space the router never sees — upstream passes its full-width
+/// logits in as `probs_in` — so it hands the two over separately.
+///
+/// `post_exp_norm` is `build_moe_ffn`'s `(post_exp_norm, post_exp_norm_eps)`:
+/// each selected expert's down projection is multiplied by the weight and
+/// RMS-normed **before** its router weight scales it. The order matters — a
+/// norm after the weighting would undo the weighting — so the experts are
+/// evaluated at unit weight and each contribution is normed and weighted
+/// here, which also keeps the grouped device path from summing them on the
+/// card first.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn swiglu_moe_ffn_with(
+    backend: &dyn crate::engine::backend::Backend,
+    routing: &ExpertRouting,
+    router_in: &[f32],
+    normed: &[f32],
+    n_tokens: usize,
+    n_embd: usize,
+    moe: &SwigluMoe<'_>,
+    post_exp_norm: Option<(&[f32], f32)>,
+    il: usize,
+) -> Vec<f32> {
     // The shared expert's input, for the NPU compiler to calibrate on. It
     // is the same `normed` a dense block would capture, and the shared
     // expert is the only part of this FFN a static graph can take: the
@@ -2115,7 +2149,7 @@ pub(crate) fn swiglu_moe_ffn(
     // overlap: it is a device submission at the head of an otherwise
     // host-side branch, and leaving it inside the parallel region puts it in
     // a queue behind the shared MLP's submissions on the same device.
-    let logits = moe_router_logits(backend, normed, n_tokens, moe.gate_inp);
+    let logits = moe_router_logits(backend, router_in, n_tokens, moe.gate_inp);
     let mut selection = route_batch(routing, &logits, n_tokens, moe.exp_probs_b);
     // Trim to the expert budget *before* anything is recorded or read: the
     // counters should describe the work actually done, and a dropped
@@ -2128,6 +2162,18 @@ pub(crate) fn swiglu_moe_ffn(
     for picks in &selection {
         picks.iter().for_each(|&(e, _)| experts.select(e));
     }
+    // With a per-expert norm the experts run at unit weight, and the real
+    // weights are applied after the norm below.
+    let unit_selection: Vec<Vec<(usize, f32)>>;
+    let evaluated = if post_exp_norm.is_some() {
+        unit_selection = selection
+            .iter()
+            .map(|picks| picks.iter().map(|&(e, _)| (e, 1.0)).collect())
+            .collect();
+        &unit_selection
+    } else {
+        &selection
+    };
 
     // The GPU expert path batches the three projections across experts —
     // see `evaluate_routed_experts_batched`.
@@ -2138,14 +2184,17 @@ pub(crate) fn swiglu_moe_ffn(
     // submission per layer. The activation is fused onto the card only for
     // plain SwiGLU — a clamp is not one of the forms the card runs, so a
     // clamped mixture keeps the host's activation between the projections
-    // and still gets the two GEMMs.
-    let fused = matches!(moe.clamp_exp, SwigluLimit::None).then_some(FusedActivation::Swiglu);
+    // and still gets the two GEMMs. Nor with a per-expert norm: a fused
+    // layer may come back already summed, and each expert has to be normed
+    // on its own.
+    let fused = (matches!(moe.clamp_exp, SwigluLimit::None) && post_exp_norm.is_none())
+        .then_some(FusedActivation::Swiglu);
     let routed_branch = || {
         let _span = MoeSpan::routed();
         if (gpu_experts() || expert_gemm_wide(selection.len())) && backend.as_wgpu().is_some() {
             evaluate_routed_experts_batched_views(
                 backend,
-                &selection,
+                evaluated,
                 normed,
                 n_embd,
                 Some(&ExpertProjection::whole(moe.gate_exps)),
@@ -2156,7 +2205,7 @@ pub(crate) fn swiglu_moe_ffn(
                 |gate, up| swiglu_limited(gate, up, moe.clamp_exp),
             )
         } else {
-            evaluate_routed_experts(&selection, |expert, members| {
+            evaluate_routed_experts(evaluated, |expert, members| {
                 let inputs: Vec<&[f32]> = members
                     .iter()
                     .map(|&(t, _)| &normed[t * n_embd..(t + 1) * n_embd])
@@ -2264,11 +2313,22 @@ pub(crate) fn swiglu_moe_ffn(
     let overlap = moe.shared.as_ref().is_some_and(|shared| {
         moe_overlap(backend, n_tokens, &[shared.gate, shared.up, shared.down])
     });
-    let (shared_out, contribs) = if overlap {
+    let (shared_out, mut contribs) = if overlap {
         rayon::join(shared_branch, routed_branch)
     } else {
         (shared_branch(), routed_branch())
     };
+    if let Some((norm, eps)) = post_exp_norm {
+        // `[token][selection rank]`, in router order — the unfused paths'
+        // contract — so each contribution lines up with its own weight.
+        for (picks, row) in selection.iter().zip(contribs.iter_mut()) {
+            for (&(_, weight), contrib) in picks.iter().zip(row.iter_mut()) {
+                tensor::mul_inplace(contrib, norm);
+                rms_norm_rows(contrib, n_embd, eps);
+                contrib.iter_mut().for_each(|v| *v *= weight);
+            }
+        }
+    }
     if let Some(shared_out) = shared_out {
         out = shared_out;
     }
@@ -5234,6 +5294,91 @@ mod tests {
             (weights.iter().sum::<f32>() - 1.0).abs() < 1e-5,
             "{weights:?}"
         );
+    }
+
+    /// `muse-spark`'s mixture: the router scores one input and the experts
+    /// read another, and each expert's output is scaled, RMS-normed and
+    /// only *then* weighted. Checked against the experts evaluated one at a
+    /// time by hand, so a norm applied after the weighting — which cancels
+    /// the weights — or a router fed the expert input shows up as a
+    /// different number.
+    #[test]
+    fn the_per_expert_norm_runs_before_the_router_weight() {
+        use super::{SwigluMoe, swiglu_moe_ffn_with};
+        use crate::engine::backend::CpuBackend;
+        use crate::engine::loader::test_expert_matrix;
+
+        let (n_tokens, n_router_in, n_latent, n_ff, n_expert) = (3, 6, 4, 5, 4);
+        let router: Vec<u8> = (0..n_expert * n_router_in)
+            .flat_map(|i| (((i * 7) % 11) as f32 * 0.2 - 1.0).to_le_bytes())
+            .collect();
+        let gate_inp = test_quant_matrix(&router, GGML_TYPE_F32, n_router_in, n_expert);
+        let gate_exps = test_expert_matrix(n_expert, n_ff, n_latent);
+        let up_exps = test_expert_matrix(n_expert, n_ff, n_latent);
+        let down_exps = test_expert_matrix(n_expert, n_latent, n_ff);
+        let routing = ExpertRouting {
+            n_expert_used: 2,
+            gating: ExpertGating::Sigmoid,
+            weights_norm: true,
+            weights_scale: 1.0,
+            groups: None,
+        };
+        let router_in: Vec<f32> = (0..n_tokens * n_router_in)
+            .map(|i| (i as f32 * 0.37).sin())
+            .collect();
+        let latent: Vec<f32> = (0..n_tokens * n_latent)
+            .map(|i| (i as f32 * 0.53).cos())
+            .collect();
+        let norm = [0.5f32, 1.5, 2.0, 0.25];
+        let eps = 1e-8;
+
+        let got = swiglu_moe_ffn_with(
+            &CpuBackend,
+            &routing,
+            &router_in,
+            &latent,
+            n_tokens,
+            n_latent,
+            &SwigluMoe {
+                gate_inp: &gate_inp,
+                exp_probs_b: None,
+                gate_exps: &gate_exps,
+                up_exps: &up_exps,
+                down_exps: &down_exps,
+                shared: None,
+                clamp_exp: SwigluLimit::None,
+                clamp_shexp: SwigluLimit::None,
+            },
+            Some((&norm, eps)),
+            0,
+        );
+
+        for t in 0..n_tokens {
+            let x = &latent[t * n_latent..(t + 1) * n_latent];
+            let logits = CpuBackend.matmul(
+                &router_in[t * n_router_in..(t + 1) * n_router_in],
+                1,
+                &gate_inp,
+            );
+            let (selected, weights) = routing.route(&logits, None, None);
+            let mut want = vec![0f32; n_latent];
+            for (&e, &w) in selected.iter().zip(&weights) {
+                let gate = CpuBackend.matmul(x, 1, &gate_exps.expert_matrix(e));
+                let up = CpuBackend.matmul(x, 1, &up_exps.expert_matrix(e));
+                let h: Vec<f32> = gate
+                    .iter()
+                    .zip(&up)
+                    .map(|(&g, &u)| tensor::silu(g) * u)
+                    .collect();
+                let mut d = CpuBackend.matmul(&h, 1, &down_exps.expert_matrix(e));
+                tensor::mul_inplace(&mut d, &norm);
+                super::rms_norm_rows(&mut d, n_latent, eps);
+                tensor::axpy_inplace(&mut want, &d, w);
+            }
+            for (g, w) in got[t * n_latent..(t + 1) * n_latent].iter().zip(&want) {
+                assert!((g - w).abs() < 1e-4, "token {t}: {g} vs {w}");
+            }
+        }
     }
 }
 

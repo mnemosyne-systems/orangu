@@ -66,6 +66,7 @@ use engine::arch::kimi3::Kimi3Model;
 use engine::arch::llama::LlamaModel;
 use engine::arch::mistral::MistralModel;
 use engine::arch::muse::MuseModel;
+use engine::arch::muse_spark::MuseSparkModel;
 use engine::arch::nemotron::NemotronModel;
 use engine::arch::phi::PhiModel;
 use engine::arch::qwen3next::Qwen3NextModel;
@@ -1807,6 +1808,30 @@ fn prepare(args: Args) -> Result<Prepared> {
             .unwrap_or(0);
         wgpu.plan_weight_bytes(weights_device_bytes, largest);
     }
+    // Whether the routed experts can live in memory at all decides how they
+    // are read — see `engine::expert_store::set_streaming_regime`. Decided
+    // before anything decodes: the probes below run real steps, and the
+    // first expert read fixes the store for the life of the process.
+    let streaming_experts = {
+        let (device_bytes, host_bytes) =
+            engine::backend::device_resident_split(loaded.resident_tensor_sizes());
+        let total_ram = orangu::hardware::detect_cpu().total_memory_bytes;
+        // One token's share of the routed experts, from the file's own counts;
+        // a model that does not state them is taken to want none.
+        let token_expert_bytes = match (
+            loaded.metadata_u64("expert_used_count"),
+            loaded.metadata_u64("expert_count"),
+        ) {
+            (Some(used), Some(count)) if count > 0 => host_bytes / count * used,
+            _ => 0,
+        };
+        engine::expert_store::set_streaming_regime(
+            host_bytes,
+            device_bytes,
+            token_expert_bytes,
+            total_ram,
+        )
+    };
     let model = build_model(&loaded, &backend)?;
     if !ranged && image_variant.is_none() && role.allows_generation() {
         choose_integer_dot(&model, &path);
@@ -2389,20 +2414,22 @@ fn prepare(args: Args) -> Result<Prepared> {
     // the slot-persistence fingerprint below uses: the per-layer shape is
     // fixed model geometry, so it can be read from a cache that allocates
     // nothing and then scaled to a context far too large to build.
-    // Whether the routed experts can live in memory at all decides how they
-    // are read — see `engine::expert_store::read_ahead_selected`. Decided
-    // here, from the same split the footprint reports, so the two agree.
+    // How the routed experts are read was decided before the model was built
+    // (`streaming_experts`); reported here, with the footprint.
     {
         let (_, host_bytes) =
             engine::backend::device_resident_split(loaded.resident_tensor_sizes());
         let total_ram = orangu::hardware::detect_cpu().total_memory_bytes;
-        if engine::expert_store::set_streaming_regime(host_bytes, total_ram) {
+        if streaming_experts {
             log::info!(
                 "[experts] {} of routed experts against {} of memory — streamed from the \
                  disk; each layer's selection is {}",
                 orangu::format::format_bytes(host_bytes),
                 orangu::format::format_bytes(total_ram),
-                if engine::expert_store::read_ahead_on() {
+                if engine::expert_read::source() == engine::expert_read::Source::Direct {
+                    "read with O_DIRECT, leaving the page cache to the rest of the model \
+                     (ORANGU_EXPERT_READ=mmap reads through it)"
+                } else if engine::expert_store::read_ahead_on() {
                     "read ahead (ORANGU_EXPERT_WILLNEED=0 turns that off)"
                 } else {
                     "faulted in as it is used (ORANGU_EXPERT_WILLNEED=0)"
@@ -4218,6 +4245,9 @@ fn build_model(
         ),
         ArchFamily::Muse => Arc::new(
             MuseModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::MuseSpark => Arc::new(
+            MuseSparkModel::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),
         ArchFamily::Inkling => Arc::new(
             InklingModel::load_with_backend(loaded, backend.clone()).context("building model")?,

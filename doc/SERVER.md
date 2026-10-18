@@ -1287,9 +1287,10 @@ orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a fee
   the bus and any bridge in front of them, which is why this is configurable.
   A span smaller than `read_size` is widened outward to it and the wanted
   bytes taken from the middle; a larger span is read as itself. Only the
-  explicit read routes (`ORANGU_EXPERT_READ=pread|direct`) consult it — the
-  default memory mapping leaves request size to the kernel's readahead, so on
-  a default deployment this key changes nothing.
+  explicit read routes (`ORANGU_EXPERT_READ=pread|direct`, or the `direct`
+  route the server picks itself for a model whose token's experts outgrow
+  memory) consult it — the default memory mapping leaves request size to the
+  kernel's readahead, so on most deployments this key changes nothing.
 - `backend` — `auto` (the default), `cpu`, `vulkan`, `metal`, `cuda`,
   `opencl`, `rocm`, or `npu`. `npu` is Rockchip RKNPU only — a matmul-only
   backend over `librknnrt`; an NPU of the other kind orangu knows about
@@ -3053,8 +3054,8 @@ weights came from. Three environment variables govern it, all off by default:
 
 | variable                                   | effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | :----------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ORANGU_EXPERT_CACHE_GB`                   | Size of an in-process expert weight cache, in GiB. Unset or `0` keeps the incumbent behaviour — weights read straight from the `mmap`, placement left to the OS page cache. Worth setting only when the model does **not** fit in RAM: below that the page cache already holds every expert and a cache can only duplicate memory. Even above it, measurement has not yet found a budget where the cache beats the page cache — it competes with it for the same RAM, and the page cache gets the rest of the machine                                                                         |
-| `ORANGU_EXPERT_READ`                       | Where the expert cache's copies are read from: `mmap` (default — a memcpy from the page cache), `pread` (an explicit read of the shard, still cached), or `direct` (`O_DIRECT`, bypassing the page cache). **`direct` is dramatically slower on a model the page cache can hold** — measured 54x on a 26B MoE — because it converts every memcpy into a disk read. It is for models far larger than RAM                                                                                                                                                                                       |
+| `ORANGU_EXPERT_CACHE_GB`                   | Size of an in-process expert weight cache, in GiB. `0` keeps the incumbent behaviour — weights read straight from the `mmap`, placement left to the OS page cache — and so does leaving it unset, except on a model the server reads with `O_DIRECT` by itself (see `ORANGU_EXPERT_READ`), which gets a 1 GiB cache to land those reads in. Worth setting only when the model does **not** fit in RAM: below that the page cache already holds every expert and a cache can only duplicate memory. Even above it, measurement has not yet found a budget where the cache beats the page cache — it competes with it for the same RAM, and the page cache gets the rest of the machine                                                                         |
+| `ORANGU_EXPERT_READ`                       | Where the expert cache's copies are read from: `mmap` (a memcpy from the page cache), `pread` (an explicit read of the shard, still cached), or `direct` (`O_DIRECT`, bypassing the page cache). The default is `mmap`, except where one token's routed experts are larger than the memory left beside the rest of the model and that rest fits with an eighth of memory to spare: no expert can then still be cached when it is wanted again, so the server reads them `direct` and leaves the page cache to the dense weights (startup line `[experts] … read with O_DIRECT`). Measured on Muse-Spark (449 GiB of experts, 14 GiB a token, 21 GiB dense, 31 GiB of memory): 20.2 s/token through the mapping, 7.8 direct. Setting it overrides that choice either way. **`direct` is dramatically slower on a model the page cache can hold** — measured 54x on a 26B MoE — because it converts every memcpy into a disk read. It is for models far larger than RAM                                                                                                                                                                                       |
 | `ORANGU_EXPERT_CACHE_POLICY`               | Replacement rule: `lfru` (frequency-first with an admission margin), `lfu` (the same scoring, admitting every miss), or the default `lru`. Which one wins depends on the regime, so the default is not a recommendation: on a model that fits in RAM under a small budget, LRU measured 12x better than LFRU; on one whose experts genuinely do not fit, LRU gets **zero** hits at a tight budget while both frequency rules score, because a routing pass is a scan and recency evicts every expert before it comes round again. The rule actually in force is reported back in `/moe-stats` |
 | `ORANGU_PREFIX_CACHE_DIR`                  | Directory for a durable snapshot of the prefix-cache pool, so a conversation survives a restart instead of re-prefilling. Needs `ORANGU_PREFIX_CACHE` as well. A snapshot carries the model's fingerprint and is refused for any other model — a KV cache from elsewhere would match on token ids and answer from the wrong state. Sized per entry as a whole KV cache (~330 KB per position on a 26B MoE), so it is opt-in                                                                                                                                                                   |
 | `ORANGU_EXPERT_BUDGET`                     | Cap on distinct experts evaluated per layer at decode. **Changes what the model computes** — the only setting here that does — and is off by default. Never applied to prefill, and never leaves a position with nothing routed                                                                                                                                                                                                                                                                                                                                                               |
@@ -3156,7 +3157,7 @@ while a confirmation dialog is open re-sorts the listing underneath it.
 ## Scope
 
 Text-in/text-out GGUF chat, completion, and embedding models — and one
-text-to-image model, one text-to-video model and one text-to-speech model — for twenty
+text-to-image model, one text-to-video model and one text-to-speech model — for twenty-one
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
 _text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
@@ -3204,7 +3205,11 @@ width read from `attention.key_length` rather than derived from
 with a norm on both sides of each sub-layer, per-head query/key norms, a
 sigmoid gate on the attention output, three rotated sliding-window layers
 to every unrotated full-attention one, and both a logit scale and final
-logit softcapping on the output), and Inkling (`inkling`, e.g.
+logit softcapping on the output), and Muse-Spark (`muse-spark`, e.g.
+`unsloth/Muse-Spark-Open-816B-A42B-GGUF` — Muse-Glimmer's attention in
+front of a mixture of experts that runs in a narrower latent space, with
+weightless post-norms and a norm-preserving residual in place of the
+plain add), and Inkling (`inkling`, e.g.
 `unsloth/Inkling-Small-GGUF` — a mixture-of-experts decoder that rotates
 nothing at all: position arrives through a learned per-head
 relative-position bias and a causal short convolution on the key/value
@@ -3462,7 +3467,8 @@ pre-tokenizer this server already had, and its template opens the reply
 inside a `<think>` block that the model closes itself — so a
 reasoning-suppressing role (`--review`) separates reasoning from answer
 here exactly as it does for the other `<think>`-marked families, and every
-other role prints the reasoning, a blank line, then the answer. Tool calls
+other role reports the reasoning in `reasoning_content`, apart from the
+answer. Tool calls
 come back in the
 `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`
 form GLM and Ling 3.0 share, already parsed. Like every recurrent family
@@ -3521,16 +3527,60 @@ never begins ` to=user`.
 Which messages you see is the server's **role**, the same switch that
 governs reasoning everywhere else. A reasoning-suppressing role
 (`--review`) shows the message addressed to you and nothing else; every
-other role shows the reasoning first, then a blank line, then the answer —
-the same treatment a `<think>`-style model's reasoning already gets here.
+other role reports the reasoning in `reasoning_content`, apart from the
+answer — the same treatment a `<think>`-style model's reasoning gets here.
 Note that this model reasons on every turn: its template writes
 `Reasoning strength: high` into the system block itself and does not read
 the `enable_thinking` flag, so `--review` is what turns the reasoning off
 in the reply, not in the generation.
 
-Not implemented: reporting reasoning separately as `reasoning_content`
-rather than inline, and parsing this model's XML-shaped tool calls (a
-`to=<tool>` message reaches you as its literal markup).
+Its tool calls — an `atem:`-namespaced `invoke` block — come back parsed
+into `tool_calls`.
+
+Muse-Spark (`muse-spark`, e.g. `unsloth/Muse-Spark-Open-816B-A42B-GGUF`)
+runs on the CPU path only: every matmul still goes to the selected
+backend, but no fused layer chain can express its layer. Its attention is
+Muse-Glimmer's — the same gate, per-head query and key norms, and rotation
+on the sliding-window layers only — with one addition: a weightless norm
+over each head of the attention output, before the gate. Its sliding-window
+pattern is a per-layer list rather than a period (46 of its 62 layers
+attend a window of 2048), and the rotated layers take
+`rope.freq_base_swa`. Behind the attention, every layer is a mixture of
+experts — 256 of them, 8 per token, sigmoid-routed with a selection bias —
+whose experts run in a narrower _latent_ space: the router scores the
+full-width normed input, while the experts read it projected down
+(`ffn_latent_down`, 8192 to 4096) and normed, and their sum is projected
+back up (`ffn_latent_up`). Each expert's output is normalized before its
+router weight applies; there is no shared expert. The norms after each
+sub-layer differ from Muse-Glimmer's too: the post-attention one has no
+weight, the post-FFN one scales before it normalizes, and both use the
+file's `post_norm_epsilon`. And the residual is not an add: each sub-layer
+leaves `stream × alpha + branch × beta`, with per-channel vectors the
+converter resolved from one learned gate so that `alpha² + beta² = 1`.
+The token embeddings are normalized on the way in and the logits scaled
+and soft-capped, as for Muse-Glimmer.
+
+Its prompt format, the dropped recipient and the role's choice of messages
+are Muse-Glimmer's, above. Its template writes the reasoning strength into
+the system block from `reasoning_effort` — `low`, `medium`, `high` or
+`xhigh` — so this server's default, `medium`, applies unless
+`[orangu-server].reasoning_effort` names another.
+
+The `UD-Q4_K_XL` quant is 471 GiB in twelve shards, with about 42B
+parameters active per token. Everything but the expert stacks — attention,
+the latent projections, the routers, the embeddings and the output
+projection — is about 21 GiB, and one token selects about 14 GiB of
+experts. On a machine where those 14 GiB do not fit beside the 21 (31 GiB
+of memory, say) no expert is still cached when it is wanted again, so the
+server reads them with `O_DIRECT` into a small cache of its own and leaves
+the page cache to the 21 GiB, which are wanted every token — the startup
+line `[experts] … read with O_DIRECT` says so. Measured there on the CPU:
+7.8 s a token, against 20.2 reading the experts through the mapping, where
+they push the dense weights out of the page cache and the disk reads
+41 GiB a token instead of 20. The drive is then busy almost nine tenths
+of the time, at about 2 GiB/s, so little is left to win in software:
+reading ahead on threads of its own was tried and decoded no faster.
+`ORANGU_EXPERT_READ=mmap` restores the mapping.
 
 Inkling (`inkling`, e.g. `unsloth/Inkling-Small-GGUF`) runs on the CPU path
 only, and is the first architecture here that **rotates nothing** — no
@@ -3577,14 +3627,14 @@ answer, and `<|end_message|>` closes either. The markers are filtered out
 of the reply like any other control token, and which bodies you see is the
 server's **role**, the same switch that governs reasoning everywhere else.
 A reasoning-suppressing role (`--review`) shows the answer alone; every
-other role shows the reasoning, a blank line, then the answer. The model
+other role reports the reasoning in `reasoning_content`, apart from the
+answer. The model
 reasons on every turn regardless — its template writes a thinking-effort
 line into the system block and never reads the `enable_thinking` flag — so
 `--review` turns the reasoning off in the reply, not in the generation.
 
-Not implemented for this model: reporting reasoning separately as
-`reasoning_content` rather than inline, and parsing its JSON tool
-invocations back into `tool_calls` (a `<|content_invoke_tool_json|>` body
+Not implemented for this model: parsing its JSON tool invocations back
+into `tool_calls` (a `<|content_invoke_tool_json|>` body
 reaches you as its literal JSON).
 
 Nemotron-H (`nemotron_h_moe` and the dense `nemotron_h`, e.g.

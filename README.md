@@ -133,7 +133,7 @@ orangu turns your terminal into a complete code-review workstation against your 
 ### Native GGUF Inference Engine (`orangu-server`)
 
 A high-performance inference engine built entirely in Rust:
-- **Broad Architecture Coverage**: Runs 20 servable model families, including Llama, Mistral, Qwen (dense & MoE), Gemma (including Gemma 4 MoE), DeepSeek-V4, GLM, Kimi-K3, Phi, Nemotron-H, text-to-image diffusion models (`Qwen-Image`), the `LTX-2.5` audio-video model, and the `Qwen3-TTS` speech model.
+- **Broad Architecture Coverage**: Runs 21 servable model families, including Llama, Mistral, Qwen (dense & MoE), Gemma (including Gemma 4 MoE), DeepSeek-V4, GLM, Kimi-K3, Muse-Spark, Phi, Nemotron-H, text-to-image diffusion models (`Qwen-Image`), the `LTX-2.5` audio-video model, and the `Qwen3-TTS` speech model.
 - **Hardware Acceleration**: CPU, **Vulkan** (AMD, NVIDIA, Intel), **Metal** (macOS Apple Silicon native), **CUDA**, and **ROCm**.
 - **Quantization Support**: Native dequantization for `F32`/`F16`/`BF16`, `Q4_0`-`Q8_0`, K-quants (`Q2_K`-`Q6_K`), I-quants (`IQ4_XS` to sub-1.5-bit `IQ1_XXXS`), and Prism's ternary `PQ2_0`/`PTQ1_0`.
 - **Text, Image, Video & Speech Generation**: Serves `/v1/chat/completions`, `/v1/embeddings`, `/v1/images/generations` (with the `--image` deployment role) via Qwen-Image (with transparency support), `/v1/videos` (with the `--video` deployment role) via LTX-2.5: MP4 clips of AV1 video with a FLAC sound track, and `/v1/audio/speech` (with the `--audio` deployment role) via Qwen3-TTS: speech in a voice from a voice pack, as WAV, FLAC or raw PCM.

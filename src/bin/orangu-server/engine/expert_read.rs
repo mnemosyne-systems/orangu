@@ -38,7 +38,24 @@
 //! model drive is an NVMe behind a USB bridge, ~225 MB/s, where queue depth
 //! buys 12.8%).
 //!
-//! Default is `mmap`. `ORANGU_EXPERT_READ=pread|direct` selects the others.
+//! Default is `mmap`, except where `engine::expert_store::
+//! set_streaming_regime` finds the routed experts too large for memory and
+//! the rest of the model small enough to stay in it: there the default is
+//! `direct`, so the page cache keeps the dense weights instead of trading
+//! them for experts it can never hold (Muse-Spark on a 30 GiB machine: 20.2
+//! s/token through the mapping, 8.5 direct). `ORANGU_EXPERT_READ=mmap|pread|
+//! direct` overrides either default.
+//!
+//! # The allocator is part of the route
+//!
+//! A direct read lands in a fresh multi-megabyte allocation per expert, freed
+//! when the tier evicts it — on another thread. glibc answers that pattern
+//! by raising its `mmap` threshold after the first such free and serving the
+//! rest from per-thread arenas, which keep what they are given: measured at
+//! 7.4 GiB of anonymous memory, enough to push the dense weights out of the
+//! page cache the route exists to protect. So choosing `direct` also fixes
+//! the threshold ([`tune_allocator`]), which keeps every such allocation a
+//! mapping of its own that goes back to the kernel when it is freed.
 //!
 //! # `O_DIRECT`'s alignment rules, and why they are not optional
 //!
@@ -51,7 +68,7 @@
 //! any of the three wrong returns `EINVAL`, not wrong data — which is at least
 //! a loud failure, but the fallback below turns it into a slow one instead.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Where the tier's copies come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,13 +93,59 @@ impl Source {
     }
 }
 
-pub fn source() -> Source {
-    static SOURCE: OnceLock<Source> = OnceLock::new();
-    *SOURCE.get_or_init(|| match std::env::var("ORANGU_EXPERT_READ").as_deref() {
-        Ok("pread") => Source::Pread,
-        Ok("direct") => Source::Direct,
-        _ => Source::Mmap,
+/// `ORANGU_EXPERT_READ`, when it names a route.
+fn configured_source() -> Option<Source> {
+    static CONFIGURED: OnceLock<Option<Source>> = OnceLock::new();
+    *CONFIGURED.get_or_init(|| match std::env::var("ORANGU_EXPERT_READ").as_deref() {
+        Ok("mmap") => Some(Source::Mmap),
+        Ok("pread") => Some(Source::Pread),
+        Ok("direct") => Some(Source::Direct),
+        _ => None,
     })
+}
+
+/// The route chosen from the model when `ORANGU_EXPERT_READ` names none —
+/// see [`prefer_direct`].
+static PREFER_DIRECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes `direct` the default route for this process. Called once, at load,
+/// before the first expert is read; `ORANGU_EXPERT_READ` still wins.
+pub fn prefer_direct() {
+    PREFER_DIRECT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn source() -> Source {
+    let source = configured_source().unwrap_or(
+        if PREFER_DIRECT.load(std::sync::atomic::Ordering::Relaxed) {
+            Source::Direct
+        } else {
+            Source::Mmap
+        },
+    );
+    if source == Source::Direct {
+        tune_allocator();
+    }
+    source
+}
+
+/// Fixes glibc's `mmap` threshold so an expert-sized allocation is always a
+/// mapping of its own — see the module documentation. Once per process.
+///
+/// 4 MiB: above everything the forward pass allocates per token at any
+/// width this engine serves, below every expert a streamed model has. Setting
+/// it also switches off glibc's dynamic threshold, which is the part that
+/// matters. Other allocators and C libraries have no such adjustment and
+/// nothing to fix.
+fn tune_allocator() {
+    static TUNED: std::sync::Once = std::sync::Once::new();
+    TUNED.call_once(|| {
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        // Safety: `mallopt` only changes allocator parameters; it is safe to
+        // call at any time from any thread.
+        unsafe {
+            libc::mallopt(libc::M_MMAP_THRESHOLD, 4 * 1024 * 1024);
+        }
+    });
 }
 
 /// Alignment for `O_DIRECT`. A page is a multiple of every logical block size
@@ -156,16 +219,17 @@ fn read_window(offset: u64, len: usize, granule: u64) -> (u64, usize) {
 /// belongs to no registered shard, the file will not open, the read is short —
 /// falls back to the mapping, because this is a performance route and must
 /// never be the reason an expert cannot be read.
-pub fn read_expert(span: &[u8]) -> Vec<u8> {
+pub fn read_expert(span: &[u8]) -> Arc<[u8]> {
     match source() {
-        Source::Mmap => span.to_vec(),
-        Source::Pread => read_via_file(span, false).unwrap_or_else(|| span.to_vec()),
-        Source::Direct => read_via_file(span, true).unwrap_or_else(|| span.to_vec()),
+        Source::Mmap => Arc::from(span),
+        Source::Pread => read_via_file(span, false).unwrap_or_else(|| Arc::from(span)),
+        Source::Direct => read_via_file(span, true).unwrap_or_else(|| Arc::from(span)),
     }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_via_file(span: &[u8], direct: bool) -> Option<Vec<u8>> {
+fn read_via_file(span: &[u8], direct: bool) -> Option<Arc<[u8]>> {
+    #[cfg(target_os = "macos")]
     use std::os::fd::AsRawFd;
 
     let (path, offset) = crate::engine::page_cache::locate(span.as_ptr() as usize, span.len())?;
@@ -195,10 +259,37 @@ fn read_via_file(span: &[u8], direct: bool) -> Option<Vec<u8>> {
     let (start, total) = read_window(offset, span.len(), read_size());
     let lead = (offset - start) as usize;
 
-    let mut buffer = AlignedBuffer::new(total)?;
+    // The window lands in this thread's own buffer, kept between reads:
+    // only the copy handed to the tier is a new allocation.
+    thread_local! {
+        static WINDOW: std::cell::RefCell<Option<AlignedBuffer>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    WINDOW.with_borrow_mut(|window| {
+        if window.as_ref().is_none_or(|b| b.len() < total) {
+            *window = Some(AlignedBuffer::new(total)?);
+        }
+        let buffer = window.as_mut()?;
+        fill_window(&file, buffer, start, total, lead, span.len())
+    })
+}
+
+/// Reads `total` bytes at `start` into `buffer` and copies out the `len`
+/// wanted ones `lead` bytes in.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn fill_window(
+    file: &std::fs::File,
+    buffer: &mut AlignedBuffer,
+    start: u64,
+    total: usize,
+    lead: usize,
+    len: usize,
+) -> Option<Arc<[u8]>> {
+    use std::os::fd::AsRawFd;
+
     let mut filled = 0usize;
     while filled < total {
-        // Safety: `buffer` owns `total` bytes from its base, `filled` is
+        // Safety: `buffer` owns at least `total` bytes from its base, `filled` is
         // within it, and the fd is open for the duration of the call.
         let got = unsafe {
             libc::pread(
@@ -218,14 +309,14 @@ fn read_via_file(span: &[u8], direct: bool) -> Option<Vec<u8>> {
     }
     // A widened window routinely runs past the end of the file, so a short
     // read is only a failure if it stopped before the bytes actually wanted.
-    if filled < lead + span.len() {
+    if filled < lead + len {
         return None;
     }
-    Some(buffer.as_slice()[lead..lead + span.len()].to_vec())
+    Some(Arc::from(&buffer.as_slice()[lead..lead + len]))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_via_file(_span: &[u8], _direct: bool) -> Option<Vec<u8>> {
+fn read_via_file(_span: &[u8], _direct: bool) -> Option<Arc<[u8]>> {
     None
 }
 
@@ -254,6 +345,10 @@ impl AlignedBuffer {
 
     fn as_mut_ptr(&mut self) -> *mut u8 {
         self.ptr
+    }
+
+    fn len(&self) -> usize {
+        self.layout.size()
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -370,7 +465,7 @@ mod tests {
     #[test]
     fn an_unregistered_address_falls_back_to_the_mapping() {
         let bytes: Vec<u8> = (0..=255u8).cycle().take(9000).collect();
-        assert_eq!(read_expert(&bytes), bytes);
+        assert_eq!(&*read_expert(&bytes), &bytes[..]);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             assert!(read_via_file(&bytes, false).is_none());

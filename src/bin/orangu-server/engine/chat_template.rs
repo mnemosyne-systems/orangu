@@ -219,6 +219,7 @@ impl ChatTemplate {
         // template using `.get()` (a common pattern for optional
         // tool-calling/reasoning fields) fails to render at all.
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+        let source = generation_tags_as_if(&source);
         let source = parenthesize_call_kwarg_conditionals(&source).into_owned();
         let env = match env.add_template_owned("chat", source) {
             Ok(()) => Ok(env),
@@ -518,6 +519,61 @@ fn escape_non_ascii(json: &str) -> String {
         }
     }
     out
+}
+
+/// Rewrites Hugging Face's `{% generation %}` … `{% endgeneration %}` to
+/// `{% if true %}` … `{% endif %}`, keeping each tag's whitespace-control
+/// markers, and leaves everything else byte-for-byte alone.
+///
+/// The pair marks an assistant turn for `transformers`' training-time
+/// assistant-token mask and renders as nothing more than its body, but
+/// minijinja has no such statement and rejects the whole template at
+/// compile time ("unknown statement generation") — so every chat request
+/// fails, not only those with an assistant turn. `Muse-Spark-Open-816B`'s
+/// template wraps its assistant branch in one. An always-true `if` is the
+/// same block with the same nesting, and keeping the `-`/`+` markers keeps
+/// the surrounding whitespace exactly as the original would trim it.
+/// Borrowed and untouched when the source never names the statement.
+fn generation_tags_as_if(source: &str) -> std::borrow::Cow<'_, str> {
+    if !source.contains("generation") {
+        return std::borrow::Cow::Borrowed(source);
+    }
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(open) = rest.find("{%") {
+        out.push_str(&rest[..open]);
+        let tag = &rest[open..];
+        let Some(close) = tag.find("%}") else {
+            rest = tag;
+            break;
+        };
+        let inner = &tag[2..close];
+        let lead = if inner.starts_with(['-', '+']) {
+            &inner[..1]
+        } else {
+            ""
+        };
+        let trail = if inner.len() > lead.len() && inner.ends_with(['-', '+']) {
+            &inner[inner.len() - 1..]
+        } else {
+            ""
+        };
+        let word = inner[lead.len()..inner.len() - trail.len()].trim();
+        match word {
+            "generation" | "endgeneration" => {
+                let statement = if word == "generation" {
+                    "if true"
+                } else {
+                    "endif"
+                };
+                out.push_str(&format!("{{%{lead} {statement} {trail}%}}"));
+            }
+            _ => out.push_str(&tag[..close + 2]),
+        }
+        rest = &tag[close + 2..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
 }
 
 /// Rewrites `f(k=a if b else c)` to `f(k=(a if b else c))` throughout a
@@ -882,6 +938,35 @@ mod tests {
                 .unwrap(),
             "none"
         );
+    }
+
+    /// [`generation_tags_as_if`]: the training-mask block renders as its
+    /// body, with the whitespace its `-` markers trim still trimmed —
+    /// `Muse-Spark-Open-816B`'s assistant branch, reduced.
+    #[test]
+    fn renders_a_generation_block_as_its_body() {
+        let tmpl = ChatTemplate::new(
+            "{%- for m in messages -%}\n  {%- generation %}\n  [{{ m.content }}]\n  \
+             {%- endgeneration %}\n{%- endfor -%}"
+                .to_string(),
+        );
+        let messages = vec![
+            ChatMessage::text("user", "a"),
+            ChatMessage::text("assistant", "b"),
+        ];
+        assert_eq!(
+            tmpl.render(&messages, false, "", "", Reasoning::default())
+                .unwrap(),
+            "\n  [a]\n  [b]"
+        );
+        // Text that merely names the statement is not a tag.
+        for source in [
+            "generation",
+            "{{ 'generation' }}",
+            "{% if generation %}x{% endif %}",
+        ] {
+            assert_eq!(generation_tags_as_if(source), source);
+        }
     }
 
     /// The rewrite is a widening, so a template that never needed it must
@@ -1401,6 +1486,40 @@ mod real_model_tests {
             out.contains(r#""name":"get_weather""#),
             "tool declaration was: {out}"
         );
+    }
+
+    /// `unsloth/Muse-Spark-Open-816B-A42B-GGUF`'s template, with tools so
+    /// the ATEM declaration macros run as well: `namespace` flags read
+    /// across a loop, `is sameas false`, `strftime_now`, and string
+    /// slicing on `tojson` output.
+    ///
+    /// Run with `ORANGU_TEST_MUSE_SPARK_MODEL=/path/to/Muse-Spark-Open-816B-A42B-UD-Q4_K_XL-00001-of-00012.gguf
+    /// cargo test --bin orangu-server chat_template::real_model_tests --
+    /// --ignored`.
+    #[test]
+    #[ignore]
+    fn the_muse_spark_template_renders_a_conversation_with_tools() {
+        let tools = serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Current weather for a place",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"place": {"type": "string"}},
+                },
+            },
+        }]);
+        let out = render_real_template("ORANGU_TEST_MUSE_SPARK_MODEL", Some(&tools));
+        assert!(out.starts_with("<|start|>system<|message|>"), "{out}");
+        assert!(out.contains("<|start|>user<|message|>And one more?<|eot|>"));
+        assert!(out.contains("<|start|>assistant to=user<|message|>23, 29, 31.<|eot|>"));
+        assert!(out.contains(r#"{"name": "get_weather""#), "{out}");
+        // No effort asked for: the template's own default, `xhigh`.
+        assert!(out.contains("Reasoning strength: 512."), "{out}");
+        // The generation prompt stops before the recipient, which the
+        // model writes itself.
+        assert!(out.ends_with("<|eot|><|start|>assistant"), "{out}");
     }
 }
 

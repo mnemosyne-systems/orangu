@@ -1,7 +1,7 @@
 # The inference engine: a contributor's map
 
-`orangu-server` carries seventeen architecture modules across twenty servable
-architecture families — seventeen language models, two diffusion
+`orangu-server` carries eighteen architecture modules across twenty-one servable
+architecture families — eighteen language models, two diffusion
 transformers, one for pictures and one for video, and one speech model, each
 of the last three with a module of its own outside `engine::arch` — and six
 device backends.
@@ -92,7 +92,7 @@ fill. Skipping one costs a feature, never correctness:
 | `n_trunk_layer` | correct layer count on files carrying a trailing draft block | `deepseek4`, `glm`, `glm5`, `nemotron`, the three Qwen 3.5-family modules |
 | `vulkan_backend` | GPU timing and tuning reports reach `/props` and `/gpu-timings` | most GPU-capable modules |
 | `forward_maybe_sampling` | device-side argmax, so a greedy decode step never reads back a whole vocabulary | `llama`, `gemma`, `mistral`, `phi` |
-| `forward_all_logits` | **multi-position decode** — speculative decoding needs it on *both* halves of a pair | `gemma`, `deepseek4`, `glm`, `muse` |
+| `forward_all_logits` | **multi-position decode** — speculative decoding needs it on *both* halves of a pair | `gemma`, `deepseek4`, `glm`, `muse`, `muse_spark` |
 | `post_pool_projection` | extra adapter layers after embedding pooling | `gemma` |
 
 Start with the four required methods and nothing else. A correct architecture
@@ -233,12 +233,13 @@ Architectures, by what they are rather than by name:
 | `indexer` | shared selection: the lightning indexer, over single positions or over pools of them |
 | `glm5` | that pair of half-layers, on that residual, choosing what to attend with that indexer |
 | `inkling`, `muse` | their own attention or framing variants |
+| `muse_spark` | `muse`'s attention in front of a latent mixture of experts, on a norm-preserving (`alpha`/`beta`) residual |
 | `nemotron` | one sub-layer per block, rectangular SSM state, gate-less squared-ReLU FFN — routed (`nemotron_h_moe`) or dense (`nemotron_h`) |
 | `dflash` | not a servable model — a draft sidecar that resolves to its target |
 
-Twenty-one modules above, seventeen architecture modules: `qwen_hybrid`, `kda`,
+Twenty-two modules above, eighteen architecture modules: `qwen_hybrid`, `kda`,
 `hyper` and `indexer` are shared parts, not architectures of their own.
-Twenty-one `ArchFamily` variants, twenty *servable* families: `dflash` is a
+Twenty-two `ArchFamily` variants, twenty-one *servable* families: `dflash` is a
 module and a variant but resolves to the model it drafts for rather than
 serving itself, and `QwenImage`, `Ltxv` and `Qwen3Tts` are variants whose
 modules live outside `engine::arch` altogether (below). Those are the two

@@ -102,23 +102,16 @@ const POST_NORM_EPS: f32 = 1e-8;
 ///
 /// Not a cosmetic fallback: the pattern decides which layers are
 /// sliding-window, and *that* decides which layers rotate at all (see
-/// [`MuseLayer::is_swa`]). Defaulting it to "no pattern" would leave a file
-/// without the key with no RoPE anywhere.
+/// [`GatedAttention::is_swa`]). Defaulting it to "no pattern" would leave a
+/// file without the key with no RoPE anywhere.
 const DEFAULT_SWA_PATTERN: usize = 4;
 
 struct MuseLayer {
     attn_norm: Vec<f32>,
-    wq: QuantMatrix,
-    wk: QuantMatrix,
-    wv: QuantMatrix,
-    /// `attn_gate`, `[n_embd, n_head * head_dim]` — projected from the same
-    /// normed input as Q/K/V; `sigmoid` of it gates attention's output
-    /// before `wo`.
-    w_gate: QuantMatrix,
-    wo: QuantMatrix,
-    /// `[head_dim]`, the same vector for every head, applied before RoPE.
-    attn_q_norm: Vec<f32>,
-    attn_k_norm: Vec<f32>,
+    /// Q/K/V, the output gate, QK-norm, and whether this layer is
+    /// sliding-window — and so whether it rotates — three layers in every
+    /// four at the default period.
+    attn: GatedAttention,
     /// `post_attention_norm` — on attention's *output*, before the residual
     /// add, on top of the usual `attn_norm` pre-norm. Uses
     /// [`POST_NORM_EPS`].
@@ -129,13 +122,6 @@ struct MuseLayer {
     ffn_down: QuantMatrix,
     /// `post_ffw_norm` — the FFN's half of the same sandwich, same epsilon.
     ffn_post_norm: Vec<f32>,
-    /// Whether this layer attends a sliding window rather than the whole
-    /// prefix — three layers in every four at the default period.
-    ///
-    /// It also decides whether this layer rotates: upstream's `use_rope =
-    /// hparams.is_swa(il)`. A full-attention layer here is NoPE, and its
-    /// cached keys are therefore stored unrotated.
-    is_swa: bool,
 }
 
 pub struct MuseModel {
@@ -145,19 +131,294 @@ pub struct MuseModel {
     output_norm: Vec<f32>,
     output_weight: QuantMatrix,
     layers: Vec<MuseLayer>,
-    /// `attention.sliding_window` — the width a [`MuseLayer::is_swa`] layer
-    /// attends.
+    /// `attention.sliding_window` — the width a [`GatedAttention::is_swa`]
+    /// layer attends.
     n_swa: usize,
-    /// `logit_scale`, multiplied into the output projection's result.
-    logit_scale: Option<f32>,
-    /// `final_logit_softcapping` — `x -> tanh(x / cap) * cap`, applied
-    /// after [`MuseModel::logit_scale`] and never inside the layer stack.
-    final_logit_softcapping: Option<f32>,
+    logits: LogitTransforms,
     /// Rotary width, base and pairing. `muse-glimmer` sits in upstream's
     /// `LLAMA_ROPE_TYPE_NORM` arm — pairs of *consecutive* head values,
     /// like `llama`/`mistral` and unlike the gemma and Qwen families this
     /// block shape otherwise resembles.
     rope: tensor::RopeParams,
+}
+
+/// The attention half both Muse architectures share: Q/K/V and a gate
+/// projected from the same normed input, per-head QK-norm, rotation on the
+/// sliding-window layers only, and `sigmoid(gate)` multiplied into
+/// attention's output before `attn_output`.
+///
+/// `muse-spark` puts one thing in this sequence that `muse-glimmer` does
+/// not — a weightless per-head RMSNorm on attention's output, before the
+/// gate — which is [`GatedAttention::forward_into`]'s `out_norm_eps`.
+pub(super) struct GatedAttention {
+    pub(super) wq: QuantMatrix,
+    pub(super) wk: QuantMatrix,
+    pub(super) wv: QuantMatrix,
+    /// `attn_gate`, `[n_embd, n_head * head_dim]` — projected from the same
+    /// normed input as Q/K/V; `sigmoid` of it gates attention's output
+    /// before `wo`.
+    pub(super) w_gate: QuantMatrix,
+    pub(super) wo: QuantMatrix,
+    /// `[head_dim]`, the same vector for every head, applied before RoPE.
+    pub(super) attn_q_norm: Vec<f32>,
+    pub(super) attn_k_norm: Vec<f32>,
+    /// Whether this layer attends a sliding window rather than the whole
+    /// prefix.
+    ///
+    /// It also decides whether this layer rotates: upstream's `use_rope =
+    /// hparams.is_swa(il)`. A full-attention layer here is NoPE, and its
+    /// cached keys are therefore stored unrotated.
+    pub(super) is_swa: bool,
+}
+
+/// The shape [`GatedAttention::forward_into`] needs, the same for every
+/// layer of a model.
+pub(super) struct GatedAttentionShape<'a> {
+    pub(super) n_head: usize,
+    pub(super) n_head_kv: usize,
+    pub(super) head_dim: usize,
+    /// The QK-norm's epsilon — the file's `attention.layer_norm_rms_epsilon`.
+    pub(super) eps: f32,
+    /// `attention.sliding_window`.
+    pub(super) n_swa: usize,
+    pub(super) rope: &'a tensor::RopeParams,
+}
+
+impl GatedAttention {
+    pub(super) fn load(loaded: &LoadedModel, il: usize, is_swa: bool) -> Result<Self> {
+        let get = |suffix: &str| -> Result<Vec<f32>> {
+            let name = format!("blk.{il}.{suffix}");
+            Ok(loaded
+                .tensor(&name)
+                .with_context(|| format!("loading {name}"))?
+                .0)
+        };
+        let get_matrix = |suffix: &str| -> Result<QuantMatrix> {
+            let name = format!("blk.{il}.{suffix}");
+            loaded
+                .matrix(&name)
+                .with_context(|| format!("loading {name}"))
+        };
+        Ok(Self {
+            wq: get_matrix("attn_q.weight")?,
+            wk: get_matrix("attn_k.weight")?,
+            wv: get_matrix("attn_v.weight")?,
+            w_gate: get_matrix("attn_gate.weight")?,
+            wo: get_matrix("attn_output.weight")?,
+            attn_q_norm: get("attn_q_norm.weight")?,
+            attn_k_norm: get("attn_k_norm.weight")?,
+            is_swa,
+        })
+    }
+
+    /// The layer's attention from its normed input `normed`
+    /// (`[n_tokens, n_embd]`) to the output projection's result, appending
+    /// each token's K/V to `layer_cache` on the way. `attn_out` is a
+    /// caller-owned buffer reused across layers.
+    ///
+    /// `out_norm_eps` adds a weightless RMSNorm over each head of
+    /// attention's output, before the gate — `muse-spark`'s `attn_o_norm`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn forward_into(
+        &self,
+        backend: &dyn Backend,
+        shape: &GatedAttentionShape<'_>,
+        layer_cache: &mut crate::engine::kv_cache::LayerCache,
+        attn_out: &mut Vec<f32>,
+        normed: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        out_norm_eps: Option<f32>,
+    ) -> Vec<f32> {
+        let GatedAttentionShape {
+            n_head,
+            n_head_kv,
+            head_dim,
+            eps,
+            n_swa,
+            rope,
+        } = *shape;
+        let kv_dim = n_head_kv * head_dim;
+
+        // Q, K, V and the gate are four independent projections of the
+        // same normed input — one batched dispatch instead of four
+        // sequential round trips (see `Backend::matmul_batch`).
+        let mut qkvg = backend.matmul_batch(&[
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: &self.wq,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: &self.wk,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: &self.wv,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens,
+                w: &self.w_gate,
+            },
+        ]);
+        let gate = qkvg.pop().unwrap();
+        let v = qkvg.pop().unwrap();
+        let mut k = qkvg.pop().unwrap();
+        let mut q = qkvg.pop().unwrap();
+
+        tensor::rmsnorm_inplace(&mut q, &self.attn_q_norm, n_tokens * n_head, head_dim, eps);
+        tensor::rmsnorm_inplace(
+            &mut k,
+            &self.attn_k_norm,
+            n_tokens * n_head_kv,
+            head_dim,
+            eps,
+        );
+
+        // RoPE — on the sliding-window layers only; a full-attention
+        // layer rotates neither Q nor K, and its keys go into the cache
+        // exactly as projected. Then append each token's K/V in prompt
+        // order, since a later token's attention reads them.
+        for t in 0..n_tokens {
+            let pos = start_pos + t;
+            if self.is_swa {
+                tensor::rope_apply_params_inplace(
+                    &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
+                    n_head,
+                    head_dim,
+                    pos,
+                    None,
+                    rope,
+                );
+                tensor::rope_apply_params_inplace(
+                    &mut k[t * kv_dim..(t + 1) * kv_dim],
+                    n_head_kv,
+                    head_dim,
+                    pos,
+                    None,
+                    rope,
+                );
+            }
+            layer_cache.push(
+                &k[t * kv_dim..(t + 1) * kv_dim],
+                &v[t * kv_dim..(t + 1) * kv_dim],
+            );
+        }
+
+        // `engine::attention` owns the GPU/CPU choice for every
+        // architecture; the closure is the CPU window, and
+        // `causal`/`n_swa` describe the same range to the GPU kernel.
+        let is_swa = self.is_swa;
+        crate::engine::attention::attention(
+            attn_out,
+            &q,
+            layer_cache,
+            &crate::engine::attention::Params {
+                backend,
+                // This layer's card — see `attention::Params::device`.
+                device: self.wo.device(),
+                n_head,
+                n_head_kv,
+                head_dim,
+                scale: 1.0 / (head_dim as f32).sqrt(),
+                causal: true,
+                n_swa: if is_swa { n_swa } else { 0 },
+                start_pos,
+                n_tokens,
+            },
+            |t| attention_window(n_swa, is_swa, start_pos + t),
+        );
+
+        if let Some(out_eps) = out_norm_eps {
+            super::rms_norm_rows(attn_out, head_dim, out_eps);
+        }
+
+        // The output gate, element-wise: attention's output and the gate
+        // projection are both `[n_tokens, n_head * head_dim]`, so the
+        // two line up position by position.
+        debug_assert_eq!(attn_out.len(), gate.len());
+        for (o, &g) in attn_out.iter_mut().zip(gate.iter()) {
+            *o *= tensor::sigmoid(g);
+        }
+
+        backend.matmul(attn_out, n_tokens, &self.wo)
+    }
+}
+
+/// Which layers attend a sliding window, from
+/// `attention.sliding_window_pattern`: a per-layer array names each layer
+/// directly (`muse-spark`), and a *scalar* period (`muse-glimmer`, default
+/// [`DEFAULT_SWA_PATTERN`] when absent) drives upstream's
+/// `llama_hparams::set_swa_pattern` — `il % n_pattern < n_pattern - 1` is
+/// sliding-window, so every `n_pattern`th layer attends the whole prefix.
+pub(super) fn swa_layers(loaded: &LoadedModel, n_layer: usize) -> Vec<bool> {
+    let per_layer = loaded.metadata_array_u64("attention.sliding_window_pattern");
+    let period = loaded
+        .metadata_u64("attention.sliding_window_pattern")
+        .map(|v| v as usize)
+        .unwrap_or(DEFAULT_SWA_PATTERN);
+    (0..n_layer)
+        .map(|il| match &per_layer {
+            Some(per_layer) => per_layer.get(il).copied().unwrap_or(0) != 0,
+            None => period == 0 || il % period < period - 1,
+        })
+        .collect()
+}
+
+/// The inclusive `[start, end]` key/value position range a query at
+/// absolute position `pos` may attend. Causal throughout — this is a
+/// decoder — so the only variable is whether the window is the whole
+/// prefix or the trailing `n_swa` positions, which is upstream's
+/// `is_masked_swa` for `LLAMA_SWA_TYPE_STANDARD` (`p0 < p1 - n_swa` is
+/// masked).
+pub(super) fn attention_window(n_swa: usize, is_swa: bool, pos: usize) -> (usize, usize) {
+    if is_swa && n_swa > 0 {
+        (pos.saturating_sub(n_swa - 1), pos)
+    } else {
+        (0, pos)
+    }
+}
+
+/// The two scalar logit transforms on the tail: `logit_scale` (a plain
+/// multiply, as Command-R has) and then `final_logit_softcapping`
+/// (`tanh`-based, as gemma2 has).
+pub(super) struct LogitTransforms {
+    /// `logit_scale`, multiplied into the output projection's result.
+    logit_scale: Option<f32>,
+    /// `final_logit_softcapping` — `x -> tanh(x / cap) * cap`, applied
+    /// after the scale and never inside the layer stack.
+    final_logit_softcapping: Option<f32>,
+}
+
+impl LogitTransforms {
+    pub(super) fn from_gguf(loaded: &LoadedModel) -> Self {
+        Self {
+            logit_scale: loaded.metadata_f32("logit_scale"),
+            final_logit_softcapping: loaded.metadata_f32("final_logit_softcapping"),
+        }
+    }
+
+    /// `logit_scale` then `final_logit_softcapping`, in that order, over one
+    /// `[n_vocab]` row — upstream's own order, and the one that makes the
+    /// cap mean what it says: a scale applied *after* it would push the
+    /// logits straight back outside the bound. Both are no-ops when the
+    /// file sets neither.
+    pub(super) fn apply(&self, logits: &mut [f32]) {
+        if let Some(scale) = self.logit_scale {
+            for v in logits.iter_mut() {
+                *v *= scale;
+            }
+        }
+        if let Some(cap) = self.final_logit_softcapping {
+            for v in logits.iter_mut() {
+                *v = (*v / cap).tanh() * cap;
+            }
+        }
+    }
 }
 
 impl MuseModel {
@@ -168,17 +429,7 @@ impl MuseModel {
         let n_swa = loaded
             .metadata_u64("attention.sliding_window")
             .context("missing attention.sliding_window")? as usize;
-        // A *scalar* period, not the per-layer array `gemma4` ships.
-        // Upstream reads it as either and prefers the scalar; only the
-        // scalar form is seen in the released checkpoints, and an array
-        // would name each layer directly.
-        let swa_pattern = loaded
-            .metadata_u64("attention.sliding_window_pattern")
-            .map(|v| v as usize)
-            .unwrap_or(DEFAULT_SWA_PATTERN);
-        let is_swa_per_layer = loaded.metadata_array_u64("attention.sliding_window_pattern");
-        let logit_scale = loaded.metadata_f32("logit_scale");
-        let final_logit_softcapping = loaded.metadata_f32("final_logit_softcapping");
+        let is_swa = swa_layers(loaded, n_layer);
 
         let tok_embeddings = loaded
             .matrix("token_embd.weight")
@@ -197,7 +448,7 @@ impl MuseModel {
         };
 
         let mut layers = Vec::with_capacity(n_layer);
-        for i in 0..n_layer {
+        for (i, &is_swa) in is_swa.iter().enumerate() {
             let get = |suffix: &str| -> Result<Vec<f32>> {
                 let name = format!("blk.{i}.{suffix}");
                 Ok(loaded
@@ -211,26 +462,15 @@ impl MuseModel {
                     .matrix(&name)
                     .with_context(|| format!("loading {name}"))
             };
-            let is_swa = match &is_swa_per_layer {
-                Some(per_layer) => per_layer.get(i).copied().unwrap_or(0) != 0,
-                None => swa_pattern == 0 || i % swa_pattern < swa_pattern - 1,
-            };
             layers.push(MuseLayer {
                 attn_norm: get("attn_norm.weight")?,
-                wq: get_matrix("attn_q.weight")?,
-                wk: get_matrix("attn_k.weight")?,
-                wv: get_matrix("attn_v.weight")?,
-                w_gate: get_matrix("attn_gate.weight")?,
-                wo: get_matrix("attn_output.weight")?,
-                attn_q_norm: get("attn_q_norm.weight")?,
-                attn_k_norm: get("attn_k_norm.weight")?,
+                attn: GatedAttention::load(loaded, i, is_swa)?,
                 attn_post_norm: get("post_attention_norm.weight")?,
                 ffn_norm: get("ffn_norm.weight")?,
                 ffn_gate: get_matrix("ffn_gate.weight")?,
                 ffn_up: get_matrix("ffn_up.weight")?,
                 ffn_down: get_matrix("ffn_down.weight")?,
                 ffn_post_norm: get("post_ffw_norm.weight")?,
-                is_swa,
             });
         }
 
@@ -248,8 +488,7 @@ impl MuseModel {
             output_weight,
             layers,
             n_swa,
-            logit_scale,
-            final_logit_softcapping,
+            logits: LogitTransforms::from_gguf(loaded),
             rope,
         })
     }
@@ -258,17 +497,14 @@ impl MuseModel {
         self.config.head_dim
     }
 
-    /// The inclusive `[start, end]` key/value position range a query at
-    /// absolute position `pos` may attend. Causal throughout — this is a
-    /// decoder — so the only variable is whether the window is the whole
-    /// prefix or the trailing `n_swa` positions, which is upstream's
-    /// `is_masked_swa` for `LLAMA_SWA_TYPE_STANDARD` (`p0 < p1 - n_swa` is
-    /// masked).
-    fn attention_window(&self, is_swa: bool, pos: usize) -> (usize, usize) {
-        if is_swa && self.n_swa > 0 {
-            (pos.saturating_sub(self.n_swa - 1), pos)
-        } else {
-            (0, pos)
+    fn attention_shape(&self) -> GatedAttentionShape<'_> {
+        GatedAttentionShape {
+            n_head: self.config.n_head,
+            n_head_kv: self.config.n_head_kv,
+            head_dim: self.head_dim(),
+            eps: self.config.rms_eps,
+            n_swa: self.n_swa,
+            rope: &self.rope,
         }
     }
 
@@ -304,7 +540,7 @@ impl MuseModel {
 
         let runs = super::decode_device_runs(
             self.backend.as_ref(),
-            self.layers.iter().map(|layer| layer.wo.device()),
+            self.layers.iter().map(|layer| layer.attn.wo.device()),
         )?;
         let tail_device = self.output_weight.device();
         for (index, (device, layers)) in runs.iter().enumerate() {
@@ -323,7 +559,7 @@ impl MuseModel {
             if with_tail {
                 let mut logits =
                     vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
-                self.apply_logit_transforms(&mut logits);
+                self.logits.apply(&mut logits);
                 if vulkan.gpu_timestamps() {
                     vulkan.report_timestamps(start_pos, self.layers.len());
                 }
@@ -349,7 +585,7 @@ impl MuseModel {
             slot_id + 1,
         );
         let mut logits = vulkan.submit_and_readback_for(encoder, &self.output_weight, slot_id + 1);
-        self.apply_logit_transforms(&mut logits);
+        self.logits.apply(&mut logits);
         Some(logits)
     }
 
@@ -390,7 +626,7 @@ impl MuseModel {
                 Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
                 None => GpuInput::Cpu(x_in),
             };
-            let (window_start, window) = if layer.is_swa && self.n_swa > 0 {
+            let (window_start, window) = if layer.attn.is_swa && self.n_swa > 0 {
                 (
                     start_pos.saturating_sub(self.n_swa - 1),
                     Some(self.n_swa as u32),
@@ -408,17 +644,17 @@ impl MuseModel {
                     yarn: RopeYarn::from_params(&self.rope),
                     activation: FfnActivation::Swiglu,
                     normalize_v: false,
-                    attn_gate: Some(&layer.w_gate),
+                    attn_gate: Some(&layer.attn.w_gate),
                     attn_norm: &layer.attn_norm,
-                    wq: &layer.wq,
+                    wq: &layer.attn.wq,
                     q_bias: None,
-                    q_norm: Some(&layer.attn_q_norm),
+                    q_norm: Some(&layer.attn.attn_q_norm),
                     kv: Some(FusedAttnProjection {
-                        wk: &layer.wk,
-                        wv: Some(&layer.wv),
+                        wk: &layer.attn.wk,
+                        wv: Some(&layer.attn.wv),
                         k_bias: None,
                         v_bias: None,
-                        k_norm: Some(&layer.attn_k_norm),
+                        k_norm: Some(&layer.attn.attn_k_norm),
                     }),
                     n_head: cfg.n_head,
                     n_head_kv: cfg.n_head_kv,
@@ -426,7 +662,11 @@ impl MuseModel {
                     // A full-attention layer of this architecture is NoPE:
                     // nothing to rotate, which the chain reads as zero
                     // rotated dimensions.
-                    rope_dim: if layer.is_swa { self.rope.rope_dim } else { 0 },
+                    rope_dim: if layer.attn.is_swa {
+                        self.rope.rope_dim
+                    } else {
+                        0
+                    },
                     rope_freq_base: self.rope.freq_base,
                     freq_factors: None,
                     eps: cfg.rms_eps,
@@ -435,7 +675,7 @@ impl MuseModel {
                     window,
                     scale: 1.0 / (head_dim as f32).sqrt(),
                     cache: &mut cache.layers[il],
-                    wo: &layer.wo,
+                    wo: &layer.attn.wo,
                     attn_post_norm: Some(&layer.attn_post_norm),
                     ffn_norm: &layer.ffn_norm,
                     ffn_gate: Some(&layer.ffn_gate),
@@ -501,7 +741,6 @@ impl MuseModel {
         let head_dim = self.head_dim();
         let n_head = cfg.n_head;
         let n_head_kv = cfg.n_head_kv;
-        let kv_dim = n_head_kv * head_dim;
         let eps = cfg.rms_eps;
 
         let mut x = vec![0f32; n_tokens * n_embd];
@@ -536,7 +775,7 @@ impl MuseModel {
             // and the FFN in one submission. `None` from either falls
             // through to the step-by-step sequence below.
             if muse_fused()
-                && let Some(vulkan) = self.backend.as_wgpu_on(layer.wo.device())
+                && let Some(vulkan) = self.backend.as_wgpu_on(layer.attn.wo.device())
                 && vulkan.prefill_fused_attention_enabled()
                 && let Some(attn) = vulkan.fused_attention_prefill(
                     crate::engine::backend::vulkan::FusedAttnPrefillInput {
@@ -546,27 +785,31 @@ impl MuseModel {
                         pairing: self.rope.layout,
                         yarn: crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope),
                         normalize_v: false,
-                        attn_gate: Some(&layer.w_gate),
+                        attn_gate: Some(&layer.attn.w_gate),
                         normed: &normed,
                         n_tokens,
                         start_pos,
-                        wq: &layer.wq,
-                        q_norm: Some(&layer.attn_q_norm),
+                        wq: &layer.attn.wq,
+                        q_norm: Some(&layer.attn.attn_q_norm),
                         kv: Some(crate::engine::backend::vulkan::FusedAttnPrefillKv {
                             k_bias: None,
                             v_bias: None,
-                            wk: &layer.wk,
-                            k_norm: Some(&layer.attn_k_norm),
-                            wv: Some(&layer.wv),
+                            wk: &layer.attn.wk,
+                            k_norm: Some(&layer.attn.attn_k_norm),
+                            wv: Some(&layer.attn.wv),
                         }),
                         n_head,
                         n_head_kv,
                         head_dim,
-                        rope_dim: if layer.is_swa { self.rope.rope_dim } else { 0 },
+                        rope_dim: if layer.attn.is_swa {
+                            self.rope.rope_dim
+                        } else {
+                            0
+                        },
                         rope_freq_base: self.rope.freq_base,
                         freq_factors: None,
                         eps,
-                        n_swa: if layer.is_swa { self.n_swa } else { 0 },
+                        n_swa: if layer.attn.is_swa { self.n_swa } else { 0 },
                         causal: true,
                         scale: 1.0 / (head_dim as f32).sqrt(),
                         want_attn_out_host: false,
@@ -581,7 +824,7 @@ impl MuseModel {
                     ),
                     crate::engine::backend::vulkan::AttnOutSrc::Host(&x),
                     n_tokens,
-                    &layer.wo,
+                    &layer.attn.wo,
                     Some(&layer.attn_post_norm),
                     &layer.ffn_norm,
                     &layer.ffn_gate,
@@ -599,109 +842,16 @@ impl MuseModel {
                 continue;
             }
 
-            // Q, K, V and the gate are four independent projections of the
-            // same normed input — one batched dispatch instead of four
-            // sequential round trips (see `Backend::matmul_batch`).
-            let mut qkvg = self.backend.matmul_batch(&[
-                MatmulOp {
-                    x: &normed,
-                    n_tokens,
-                    w: &layer.wq,
-                },
-                MatmulOp {
-                    x: &normed,
-                    n_tokens,
-                    w: &layer.wk,
-                },
-                MatmulOp {
-                    x: &normed,
-                    n_tokens,
-                    w: &layer.wv,
-                },
-                MatmulOp {
-                    x: &normed,
-                    n_tokens,
-                    w: &layer.w_gate,
-                },
-            ]);
-            let gate = qkvg.pop().unwrap();
-            let v = qkvg.pop().unwrap();
-            let mut k = qkvg.pop().unwrap();
-            let mut q = qkvg.pop().unwrap();
-
-            tensor::rmsnorm_inplace(&mut q, &layer.attn_q_norm, n_tokens * n_head, head_dim, eps);
-            tensor::rmsnorm_inplace(
-                &mut k,
-                &layer.attn_k_norm,
-                n_tokens * n_head_kv,
-                head_dim,
-                eps,
-            );
-
-            // RoPE — on the sliding-window layers only; a full-attention
-            // layer rotates neither Q nor K, and its keys go into the cache
-            // exactly as projected. Then append each token's K/V in prompt
-            // order, since a later token's attention reads them.
-            let layer_cache = &mut cache.layers[il];
-            for t in 0..n_tokens {
-                let pos = start_pos + t;
-                if layer.is_swa {
-                    tensor::rope_apply_params_inplace(
-                        &mut q[t * n_head * head_dim..(t + 1) * n_head * head_dim],
-                        n_head,
-                        head_dim,
-                        pos,
-                        None,
-                        &self.rope,
-                    );
-                    tensor::rope_apply_params_inplace(
-                        &mut k[t * kv_dim..(t + 1) * kv_dim],
-                        n_head_kv,
-                        head_dim,
-                        pos,
-                        None,
-                        &self.rope,
-                    );
-                }
-                layer_cache.push(
-                    &k[t * kv_dim..(t + 1) * kv_dim],
-                    &v[t * kv_dim..(t + 1) * kv_dim],
-                );
-            }
-
-            // `engine::attention` owns the GPU/CPU choice for every
-            // architecture; the closure is the CPU window, and
-            // `causal`/`n_swa` describe the same range to the GPU kernel.
-            let is_swa = layer.is_swa;
-            crate::engine::attention::attention(
+            let mut attn_proj = layer.attn.forward_into(
+                self.backend.as_ref(),
+                &self.attention_shape(),
+                &mut cache.layers[il],
                 &mut attn_out,
-                &q,
-                layer_cache,
-                &crate::engine::attention::Params {
-                    backend: self.backend.as_ref(),
-                    // This layer's card — see `attention::Params::device`.
-                    device: layer.wo.device(),
-                    n_head,
-                    n_head_kv,
-                    head_dim,
-                    scale: 1.0 / (head_dim as f32).sqrt(),
-                    causal: true,
-                    n_swa: if is_swa { self.n_swa } else { 0 },
-                    start_pos,
-                    n_tokens,
-                },
-                |t| self.attention_window(is_swa, start_pos + t),
+                &normed,
+                n_tokens,
+                start_pos,
+                None,
             );
-
-            // The output gate, element-wise: attention's output and the gate
-            // projection are both `[n_tokens, n_head * head_dim]`, so the
-            // two line up position by position.
-            debug_assert_eq!(attn_out.len(), gate.len());
-            for (o, &g) in attn_out.iter_mut().zip(gate.iter()) {
-                *o *= tensor::sigmoid(g);
-            }
-
-            let mut attn_proj = self.backend.matmul(&attn_out, n_tokens, &layer.wo);
             tensor::rmsnorm_inplace(
                 &mut attn_proj,
                 &layer.attn_post_norm,
@@ -744,28 +894,28 @@ impl MuseModel {
         let head_dim = self.head_dim();
         super::ResidentLayer {
             attn_norm: &layer.attn_norm,
-            wq: &layer.wq,
-            wk: &layer.wk,
-            wv: &layer.wv,
+            wq: &layer.attn.wq,
+            wk: &layer.attn.wk,
+            wv: &layer.attn.wv,
             q_bias: None,
             k_bias: None,
             v_bias: None,
-            q_norm: Some(&layer.attn_q_norm),
-            k_norm: Some(&layer.attn_k_norm),
+            q_norm: Some(&layer.attn.attn_q_norm),
+            k_norm: Some(&layer.attn.attn_k_norm),
             pairing: self.rope.layout,
             yarn: crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope),
-            rope_dim: if layer.is_swa { self.rope.rope_dim } else { 0 },
+            rope_dim: if layer.attn.is_swa { self.rope.rope_dim } else { 0 },
             rope_freq_base: self.rope.freq_base,
             freq_factors: None,
-            n_swa: if layer.is_swa { self.n_swa } else { 0 },
+            n_swa: if layer.attn.is_swa { self.n_swa } else { 0 },
             scale: 1.0 / (head_dim as f32).sqrt(),
-            wo: &layer.wo,
+            wo: &layer.attn.wo,
             ffn_norm: &layer.ffn_norm,
             ffn_gate: &layer.ffn_gate,
             ffn_up: &layer.ffn_up,
             ffn_down: &layer.ffn_down,
             activation: crate::engine::backend::vulkan::FfnActivation::Swiglu,
-            attn_gate: Some(&layer.w_gate),
+            attn_gate: Some(&layer.attn.w_gate),
             attn_post_norm: Some(&layer.attn_post_norm),
             ffn_post_norm: Some(&layer.ffn_post_norm),
             post_norm_eps: Some(POST_NORM_EPS),
@@ -788,7 +938,7 @@ impl MuseModel {
         }
         super::decode_device_runs(
             self.backend.as_ref(),
-            self.layers.iter().map(|layer| layer.wo.device()),
+            self.layers.iter().map(|layer| layer.attn.wo.device()),
         )?
         .into_iter()
         .map(|(device, layers)| {
@@ -904,14 +1054,14 @@ impl MuseModel {
             .as_wgpu_on(self.output_weight.device())
             .is_some_and(|tail| std::ptr::eq(tail, *vulkan));
         if let Some(samples) =
-            samples.filter(|_| tail_on_device && vulkan.gpu_sample() && self.logit_scale.is_none())
+            samples.filter(|_| tail_on_device && vulkan.gpu_sample() && self.logits.logit_scale.is_none())
             && let Some(outcomes) = vulkan.decode_batch_tail(
                 crate::engine::backend::vulkan::AttnOutSrc::Gpu(&h_dev, 0, n_rows),
                 n_rows,
                 &self.output_norm,
                 cfg.rms_eps,
                 &self.output_weight,
-                self.final_logit_softcapping,
+                self.logits.final_logit_softcapping,
                 samples,
                 &slots,
             )
@@ -928,29 +1078,11 @@ impl MuseModel {
             flat.chunks_exact(n_vocab)
                 .map(|row| {
                     let mut row = row.to_vec();
-                    self.apply_logit_transforms(&mut row);
+                    self.logits.apply(&mut row);
                     super::ForwardOutcome::Logits(row)
                 })
                 .collect(),
         ))
-    }
-
-    /// `logit_scale` then `final_logit_softcapping`, in that order, over one
-    /// `[n_vocab]` row — upstream's own order, and the one that makes the
-    /// cap mean what it says: a scale applied *after* it would push the
-    /// logits straight back outside the bound. Both are no-ops when the
-    /// file sets neither.
-    fn apply_logit_transforms(&self, logits: &mut [f32]) {
-        if let Some(scale) = self.logit_scale {
-            for v in logits.iter_mut() {
-                *v *= scale;
-            }
-        }
-        if let Some(cap) = self.final_logit_softcapping {
-            for v in logits.iter_mut() {
-                *v = (*v / cap).tanh() * cap;
-            }
-        }
     }
 }
 
@@ -1004,7 +1136,7 @@ impl ModelForward for MuseModel {
         let last = &mut x[(n_tokens - 1) * n_embd..].to_vec();
         tensor::rmsnorm_inplace(last, &self.output_norm, 1, n_embd, cfg.rms_eps);
         let mut logits = self.backend.matmul(last, 1, &self.output_weight);
-        self.apply_logit_transforms(&mut logits);
+        self.logits.apply(&mut logits);
         Ok(logits)
     }
 
@@ -1100,7 +1232,7 @@ impl ModelForward for MuseModel {
         Ok((0..n_tokens)
             .map(|t| {
                 let mut row = flat[t * n_vocab..(t + 1) * n_vocab].to_vec();
-                self.apply_logit_transforms(&mut row);
+                self.logits.apply(&mut row);
                 row
             })
             .collect())
@@ -1182,7 +1314,7 @@ mod real_model_tests {
         // a checkpoint whose pattern key differs is reported as such rather
         // than as a bad prediction.
         assert_eq!(
-            model.layers.iter().filter(|l| l.is_swa).count(),
+            model.layers.iter().filter(|l| l.attn.is_swa).count(),
             model.layers.len() * 3 / 4,
         );
 

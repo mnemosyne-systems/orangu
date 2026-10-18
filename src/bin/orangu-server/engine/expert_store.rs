@@ -828,7 +828,7 @@ impl ExpertStore for TieredExpertStore {
                 // a `memcpy` from the mapping by default, or a `pread` off the
                 // shard — with `O_DIRECT` — when the page cache is the thing
                 // being avoided rather than relied on.
-                let copy: Arc<[u8]> = Arc::from(crate::engine::expert_read::read_expert(span));
+                let copy = crate::engine::expert_read::read_expert(span);
                 Some(self.admit(key, copy))
             }
             Touch::Decline => {
@@ -857,6 +857,12 @@ impl ExpertStore for TieredExpertStore {
     /// request before this was checked. Hinting a bypassed cache is not a
     /// wasted opportunity, it is spent bandwidth on the one resource a
     /// streaming model has least of.
+    ///
+    /// Nor does it read ahead under `O_DIRECT` instead, on threads of its own:
+    /// tried on Muse-Spark, and a layer's experts reading for themselves —
+    /// up to eight reads in flight, one per expert task — already kept the
+    /// drive busy 88% of the time, against 83% with four read-ahead threads
+    /// (7.70 s/token against 7.97). The drive, not the overlap, is the limit.
     fn prefetch(&self, weights: &ExpertQuantMatrix, experts: &[usize]) {
         if !crate::engine::expert_read::source().uses_page_cache() {
             return;
@@ -939,12 +945,75 @@ static HOST_WEIGHT_BYTES: OnceLock<u64> = OnceLock::new();
 /// exceed it re-reads them from disk every token, and a model whose
 /// experts fit reads them from disk once. The two want opposite things
 /// from a read-ahead hint — see [`streaming_regime`].
-pub fn set_streaming_regime(host_weight_bytes: u64, total_ram: u64) -> bool {
+///
+/// It also decides how they are read — `dense_bytes` is the rest of the
+/// model and `token_expert_bytes` one token's share of the experts; see
+/// [`streams_around_the_page_cache`].
+pub fn set_streaming_regime(
+    host_weight_bytes: u64,
+    dense_bytes: u64,
+    token_expert_bytes: u64,
+    total_ram: u64,
+) -> bool {
     let streaming = host_weight_bytes > total_ram;
     let _ = STREAMING.set(streaming);
     let _ = HOST_WEIGHT_BYTES.set(host_weight_bytes);
+    if streams_around_the_page_cache(streaming, dense_bytes, token_expert_bytes, total_ram) {
+        crate::engine::expert_read::prefer_direct();
+        // Only a direct read wants the tier as its landing area; a route
+        // `ORANGU_EXPERT_READ` pinned to the page cache keeps no tier.
+        if crate::engine::expert_read::source() == crate::engine::expert_read::Source::Direct {
+            let _ = DEFAULT_TIER_BYTES.set(STREAMING_TIER_BYTES);
+        }
+    }
     streaming
 }
+
+/// Whether the routed experts should be read around the page cache rather
+/// than through it: what is left of the model fits with an eighth of memory
+/// to spare, and one token's experts (`token_expert_bytes`) do not fit in
+/// the memory left beside it.
+///
+/// Then an expert is never in the page cache when it is wanted again — a
+/// token's worth evicts the last — so all that routing them through it
+/// achieves is evicting the dense weights, which *would* fit and are wanted
+/// every token. Read with `O_DIRECT` into a small tier instead, the page
+/// cache holds the dense weights and the disk reads only experts. Measured on
+/// Muse-Spark (449 GiB of experts, 21 GiB dense, 30 GiB of memory): 41 GiB
+/// read per token at 20.2 s/token through the mapping, 20 GiB at 7.8 direct.
+///
+/// **The second condition is not a refinement.** A model whose experts merely
+/// exceed memory still has the page cache hold most of the ones in use, and
+/// there the mapping wins outright: Qwen3-Coder-Next (44 GiB of experts,
+/// 0.9 GiB a token, the same machine) decoded at 0.15–0.24 s/token through
+/// the mapping and 2.9 direct. Where the dense weights do not fit either,
+/// nothing keeps them and there is no evidence either way; that case keeps
+/// the mapping too.
+/// `ORANGU_EXPERT_READ` and `ORANGU_EXPERT_CACHE_GB` override the choice.
+fn streams_around_the_page_cache(
+    streaming: bool,
+    dense_bytes: u64,
+    token_expert_bytes: u64,
+    total_ram: u64,
+) -> bool {
+    streaming
+        && dense_bytes <= total_ram - total_ram / 8
+        && token_expert_bytes > total_ram - dense_bytes
+}
+
+/// The tier's budget when [`streams_around_the_page_cache`] chose it: 1 GiB.
+/// A direct read has to land somewhere, and with experts this large and this
+/// rarely reused the tier is a landing area more than a cache — every GiB it
+/// takes is a GiB the dense weights do not get. Measured on Muse-Spark: 7.7
+/// s/token at 1 GiB; 13.8 at 4 GiB under LRU, still with no hits; 20.0 at 4
+/// and 6 GiB under LFRU, whose 2–4% of hits cost the dense weights their
+/// place in the page cache (three million major faults in eight tokens).
+/// Its routing is too even for any budget this machine can spare to pay.
+const STREAMING_TIER_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// The tier budget chosen from the model, used when `ORANGU_EXPERT_CACHE_GB`
+/// is unset.
+static DEFAULT_TIER_BYTES: OnceLock<u64> = OnceLock::new();
 
 /// Whether the read-ahead hint applies now: always in the streaming
 /// regime, and otherwise until one model's worth of experts has been
@@ -1023,11 +1092,13 @@ fn selected_union(selection: &[Vec<(usize, f32)>]) -> Vec<usize> {
 /// The store every expert read goes through, chosen once from the
 /// environment.
 ///
-/// **`ORANGU_EXPERT_CACHE_GB` unset or `0` keeps the incumbent**, so nothing
-/// changes for anyone who has not asked for a tier. That default is not
-/// timidity: on a model that fits in RAM the page cache already holds every
-/// expert, so a tier can only duplicate memory and lose. It earns its place
-/// exactly where the page cache cannot hold the model, and nowhere else.
+/// **`ORANGU_EXPERT_CACHE_GB=0` keeps the incumbent, and so does leaving it
+/// unset** — except for a model [`set_streaming_regime`] decided to read
+/// around the page cache, which gets a small tier to land those reads in.
+/// That default is not timidity: on a model that fits in RAM the page cache
+/// already holds every expert, so a tier can only duplicate memory and lose.
+/// It earns its place exactly where the page cache cannot hold the model, and
+/// nowhere else.
 pub fn global() -> &'static dyn ExpertStore {
     // Boxed: a `TieredExpertStore` is six times the size of the mmap one, and
     // a process holds exactly one of these for its whole life — the
@@ -1074,7 +1145,9 @@ fn tier_policy() -> Policy {
 }
 
 fn tier_budget_bytes() -> Option<u64> {
-    let raw = std::env::var("ORANGU_EXPERT_CACHE_GB").ok()?;
+    let Ok(raw) = std::env::var("ORANGU_EXPERT_CACHE_GB") else {
+        return DEFAULT_TIER_BYTES.get().copied();
+    };
     let gib: f64 = raw.trim().parse().ok()?;
     (gib > 0.0).then_some((gib * 1024.0 * 1024.0 * 1024.0) as u64)
 }
@@ -1090,6 +1163,23 @@ mod tests {
         ];
         assert_eq!(super::selected_union(&selection), vec![7, 3, 11]);
         assert!(super::selected_union(&[]).is_empty());
+    }
+
+    /// Experts are read around the page cache only when the rest of the model
+    /// fits with an eighth of memory to spare and one token's experts do not
+    /// fit beside it.
+    #[test]
+    fn only_a_model_whose_token_outgrows_the_cache_reads_around_it() {
+        let gib = 1024 * 1024 * 1024u64;
+        let around = super::streams_around_the_page_cache;
+        // Muse-Spark on this machine: 21 GiB dense, 14 GiB of experts a
+        // token, 31 GiB of memory.
+        assert!(around(true, 21 * gib, 14 * gib, 31 * gib));
+        // Qwen3-Coder-Next: 2 GiB dense, under 1 GiB of experts a token.
+        assert!(!around(true, 2 * gib, gib, 31 * gib));
+        // Dense weights that do not leave an eighth of memory.
+        assert!(!around(true, 28 * gib, 14 * gib, 31 * gib));
+        assert!(!around(false, 21 * gib, 14 * gib, 31 * gib));
     }
 
     /// Outside the streaming regime the hint must do nothing at all: a

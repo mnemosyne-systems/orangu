@@ -938,7 +938,15 @@ pub async fn chat_completions(
             .tokenizer
             .clean_up_tokenization_spaces(&content);
         let split = tool_calls::split(&content);
-        let mut message = json!({"role": "assistant", "content": split.content});
+        // The whole answer is in hand, so this is where it gets tidied: the
+        // blank line a model leaves between its prose and a call it made is
+        // layout around a span that is no longer there.
+        let visible = if split.has_calls() {
+            split.content.trim()
+        } else {
+            &split.content
+        };
+        let mut message = json!({"role": "assistant", "content": visible});
         // `reasoning_content` is where DeepSeek put a reasoning model's
         // thinking and where llama-server puts it under
         // `--reasoning-format deepseek`; a client that does not know the

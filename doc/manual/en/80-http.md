@@ -479,7 +479,7 @@ recognised:
 | GLM, Ling 3.0 | `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>…</tool_call>` (Ling spells all six delimiters as special tokens) |
 | Nemotron | `<tool_call><function=NAME><parameter=k>v</parameter>…</function></tool_call>` |
 | Mistral | `[TOOL_CALLS][{"name": …, "arguments": {…}}]` |
-| Muse-Glimmer, DeepSeek-V4 | an `<…invoke name="NAME">` block of `<…parameter name="k">v</…>` elements, in each model's own tag namespace |
+| Muse-Glimmer, Muse-Spark, DeepSeek-V4 | an `<…invoke name="NAME">` block of `<…parameter name="k">v</…>` elements, in each model's own tag namespace |
 
 gemma-4's string values are delimited by its own `<|"|>` token, not by a
 plain `"`, and are taken **verbatim** between the two — the template escapes
