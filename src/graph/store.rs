@@ -48,6 +48,9 @@ pub struct GraphEdge {
 pub struct GraphStore {
     graph: StableDiGraph<GraphNode, GraphEdge>,
     node_map: HashMap<String, NodeIndex>,
+    // Keep the extracted targets, including unresolved external names. Resolved
+    // graph edges alone cannot be reconstructed when a target file changes.
+    extracted_edges: Vec<ExtractedEdge>,
 }
 
 impl Default for GraphStore {
@@ -61,6 +64,7 @@ impl GraphStore {
         Self {
             graph: StableDiGraph::new(),
             node_map: HashMap::new(),
+            extracted_edges: Vec::new(),
         }
     }
 
@@ -92,6 +96,16 @@ impl GraphStore {
     }
 
     pub fn add_edge(&mut self, edge: ExtractedEdge) {
+        // Only retain references owned by an existing caller. This also lets
+        // file removal discard every relationship that originated in it.
+        if !self.node_map.contains_key(&edge.source) {
+            return;
+        }
+        self.connect_edge(&edge);
+        self.extracted_edges.push(edge);
+    }
+
+    fn connect_edge(&mut self, edge: &ExtractedEdge) {
         let src = self.node_map.get(&edge.source).cloned();
         // `GraphExtractor::extract_from_file` can only recognize a call as
         // "local" — and so emit the callee's real id — when the callee is
@@ -122,9 +136,9 @@ impl GraphStore {
                     s,
                     t,
                     GraphEdge {
-                        relation: edge.relation,
-                        confidence: edge.confidence,
-                        source_location: edge.source_location,
+                        relation: edge.relation.clone(),
+                        confidence: edge.confidence.clone(),
+                        source_location: edge.source_location.clone(),
                     },
                 );
             }
@@ -163,11 +177,34 @@ impl GraphStore {
             .filter(|&idx| self.graph[idx].source_file == file_path)
             .collect();
 
+        let removed_ids: HashSet<_> = to_remove
+            .iter()
+            .map(|&idx| self.graph[idx].id.clone())
+            .collect();
+        // Relationships belong to the calling file. Keep incoming references
+        // from other files so they can reconnect after replacement.
+        self.extracted_edges
+            .retain(|edge| !removed_ids.contains(&edge.source));
         for idx in to_remove {
             let id = self.graph[idx].id.clone();
             self.node_map.remove(&id);
             self.graph.remove_node(idx);
         }
+    }
+
+    /// Resolve every extracted relationship against the final set of nodes.
+    /// Call once after a batch of file replacements and deletions.
+    pub fn rebuild_edges(&mut self) {
+        self.graph.clear_edges();
+        let edges = std::mem::take(&mut self.extracted_edges);
+        for edge in &edges {
+            self.connect_edge(edge);
+        }
+        self.extracted_edges = edges;
+    }
+
+    pub fn extracted_edges(&self) -> &[ExtractedEdge] {
+        &self.extracted_edges
     }
 
     // ── Analysis ─────────────────────────────────────────────────────────────

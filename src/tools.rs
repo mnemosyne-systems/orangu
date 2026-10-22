@@ -46,6 +46,9 @@ pub struct ToolExecutor {
     /// Shared knowledge graph, populated by the startup scan.
     /// `None` while the background scan is still running.
     pub graph_store: Arc<Mutex<Option<GraphStore>>>,
+    /// Hashes of the file versions currently represented by this executor's graph.
+    pub graph_file_hashes: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    semantic_search: Arc<Mutex<Option<crate::embeddings::SemanticSearch>>>,
     /// The startup scan's build status, updated alongside `graph_store` —
     /// see `GraphBuildStatus`. Surfaced as the Graph dot in `/auto_review`'s
     /// status bar.
@@ -155,6 +158,8 @@ impl ToolExecutor {
             session_dir,
             tool_counts: Arc::new(Mutex::new(std::collections::HashMap::new())),
             graph_store: Arc::new(Mutex::new(None)),
+            graph_file_hashes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            semantic_search: Arc::new(Mutex::new(None)),
             graph_status: Arc::new(Mutex::new(GraphBuildStatus::default())),
             graph_scans: ScanActivity::default(),
             mcp: None,
@@ -166,6 +171,30 @@ impl ToolExecutor {
     pub fn with_mcp(mut self, mcp: Arc<crate::mcp::McpManager>) -> Self {
         self.mcp = Some(mcp);
         self
+    }
+
+    pub fn configure_semantic_search(
+        &self,
+        profile: Option<&crate::config::LlmConfiguration>,
+        is_coordinator: bool,
+        compile_workers: usize,
+        budget_tokens: usize,
+    ) -> Result<()> {
+        let search = profile
+            .map(|profile| {
+                crate::embeddings::SemanticSearch::from_profile(
+                    profile,
+                    is_coordinator,
+                    compile_workers,
+                    budget_tokens,
+                )
+            })
+            .transpose()?;
+        *self
+            .semantic_search
+            .lock()
+            .map_err(|_| anyhow!("semantic search mutex poisoned"))? = search;
+        Ok(())
     }
 
     /// This session's licence choice, or `Auto` if the lock is poisoned —
@@ -452,6 +481,15 @@ impl ToolExecutor {
             }),
         ));
 
+        defs.push(tool(
+            "semantic_search",
+            "Search workspace code by meaning. Refreshes the embedding index before searching; requires an embeddings server.",
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string", "minLength": 1 } },
+                "required": ["query"]
+            }),
+        ));
         if let Some(mcp) = &self.mcp {
             defs.extend(mcp.definitions());
         }
@@ -522,6 +560,7 @@ impl ToolExecutor {
             "graph_lookup" => self.graph_lookup(arguments),
             "graph_explain" => self.graph_explain(arguments),
             "graph_path" => self.graph_path(arguments),
+            "semantic_search" => self.semantic_search(arguments).await,
             _ if self.mcp.as_ref().is_some_and(|mcp| mcp.contains(name)) => {
                 self.mcp
                     .as_ref()
@@ -585,6 +624,10 @@ impl ToolExecutor {
         {
             let _scan = self.graph_scans.begin();
             let result = crate::agents::hooks::run_session_start_hook(&self.workspace);
+            *self
+                .graph_file_hashes
+                .lock()
+                .map_err(|_| anyhow!("graph hashes mutex poisoned"))? = result.file_hashes;
             *guard = Some(result.store);
         }
         drop(guard);
@@ -592,6 +635,36 @@ impl ToolExecutor {
             *status = GraphBuildStatus::Ready;
         }
         Ok(())
+    }
+
+    async fn semantic_search(&self, arguments: &Map<String, Value>) -> Result<String> {
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .filter(|query| !query.trim().is_empty())
+            .ok_or_else(|| anyhow!("missing or empty 'query' argument"))?;
+        let search = self.semantic_search.lock()
+            .map_err(|_| anyhow!("semantic search mutex poisoned"))?
+            .clone()
+            .ok_or_else(|| anyhow!("Semantic search is unavailable: no embeddings-capable server was detected. Use graph_lookup or run_shell_command with rg."))?;
+        // Extraction is synchronous. Run it off the async executor, including
+        // the build's async requests, just as the interactive command does.
+        let workspace = self.workspace.clone();
+        let graph = self.graph_store.clone();
+        let query = query.to_owned();
+        tokio::task::spawn_blocking(move || {
+            use std::sync::atomic::{AtomicBool, AtomicU64};
+            let result = tokio::runtime::Handle::current().block_on(search.search(
+                &workspace,
+                &query,
+                &graph,
+                &AtomicBool::new(false),
+                &AtomicU64::new(0),
+                &AtomicU64::new(0),
+            ))?;
+            Ok(crate::embeddings::format_hits(&query, &result.hits))
+        })
+        .await?
     }
 
     fn graph_lookup(&self, arguments: &Map<String, Value>) -> Result<String> {
@@ -1618,6 +1691,7 @@ mod file_lifecycle_tool_tests {
             "create_directory",
             "move_directory",
             "delete_directory",
+            "semantic_search",
         ] {
             assert!(names.contains(&name.to_string()), "missing tool: {name}");
         }
@@ -1628,13 +1702,13 @@ mod file_lifecycle_tool_tests {
 
     /// Every request's prompt carries the definitions, so they stay small:
     /// 6982 characters of JSON (~1700 tokens) once, trimmed to under 4700
-    /// until the `graph_explain`/`graph_path` tools, under 5700 since.
+    /// until the graph tools, under 6000 with semantic search included.
     #[test]
     fn the_tool_definitions_stay_small() {
         let workspace = tempfile::tempdir().unwrap();
         let json =
             serde_json::to_string(&ToolExecutor::new(workspace.path()).definitions()).unwrap();
-        assert!(json.len() < 5700, "{} characters", json.len());
+        assert!(json.len() < 6000, "{} characters", json.len());
     }
 
     /// `/license`'s answer reaches the file the model writes — the whole
@@ -1979,6 +2053,14 @@ mod graph_tool_tests {
         // counts as a scan in flight.
         assert!(tools.graph_store.lock().expect("store").is_some());
         assert!(!tools.graph_scans.is_scanning());
+        assert!(
+            tools
+                .graph_file_hashes
+                .lock()
+                .unwrap()
+                .values()
+                .all(|hash| hash.len() == 64)
+        );
     }
 
     /// A symbol the graph does not hold is still reported as missing — the
@@ -1995,5 +2077,152 @@ mod graph_tool_tests {
             answer.contains("No symbol matching"),
             "expected a not-found answer, got {answer:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod semantic_search_tests {
+    use super::*;
+    use axum::{Json, Router, extract::State, routing::post};
+
+    type Requests = Arc<Mutex<Vec<Value>>>;
+
+    async fn embed(State(requests): State<Requests>, Json(request): Json<Value>) -> Json<Value> {
+        let data: Vec<_> = request["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| json!({"index": index, "embedding": [1.0, 0.0]}))
+            .collect();
+        requests.lock().unwrap().push(request);
+        Json(json!({"data": data}))
+    }
+
+    struct CacheCleanup(PathBuf);
+    impl Drop for CacheCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+            if let Some(parent) = self.0.parent() {
+                let _ = fs::remove_dir(parent);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn semantic_search_reports_unavailable_and_rejects_invalid_queries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = ToolExecutor::new_read_only(workspace.path());
+        for arguments in [json!({}), json!({"query": "  "}), json!({"query": 42})] {
+            let err = tools
+                .execute("semantic_search", arguments.as_object().unwrap())
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("query"));
+        }
+        let err = tools
+            .execute(
+                "semantic_search",
+                json!({"query": "retry"}).as_object().unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no embeddings-capable server"));
+    }
+
+    #[tokio::test]
+    async fn semantic_search_refreshes_edits_and_deletions_and_reuses_unchanged_embeddings() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Requests::default();
+        let app = Router::new()
+            .route("/v1/embeddings", post(embed))
+            .with_state(requests.clone());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let workspace = tempfile::tempdir().unwrap();
+        let _cache = CacheCleanup(crate::embeddings::EmbeddingIndex::cache_dir(
+            workspace.path(),
+        ));
+        let file = workspace.path().join("retry.rs");
+        fs::write(&file, "pub fn retry_backoff() {}\n").unwrap();
+        let tools = ToolExecutor::new_read_only(workspace.path());
+        let profile = crate::config::LlmConfiguration {
+            endpoint,
+            model: "chat-model".into(),
+            role: "all".into(),
+            api_key: None,
+            request_timeout_seconds: 5,
+            max_tool_rounds: 1,
+            review_max_tokens: 0,
+            code_max_tokens: 0,
+            system_prompt: String::new(),
+            model_verbosity: None,
+            review_confidence_threshold: 0,
+        };
+        tools
+            .configure_semantic_search(Some(&profile), true, 1, 16384)
+            .unwrap();
+        let arguments = json!({"query": "retry delay"});
+        let answer = tools
+            .clone()
+            .execute("semantic_search", arguments.as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            answer.contains("retry_backoff") && answer.contains("retry.rs:1"),
+            "{answer}"
+        );
+        assert_eq!(requests.lock().unwrap().len(), 2);
+
+        tools
+            .execute("semantic_search", arguments.as_object().unwrap())
+            .await
+            .unwrap();
+        {
+            let requests = requests.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                3,
+                "unchanged code should only embed the query"
+            );
+            assert_eq!(requests[2]["input"], json!(["retry delay"]));
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request["model"] == "embeddings")
+            );
+        }
+
+        fs::write(&file, "pub fn exponential_delay() {}\n").unwrap();
+        let answer = tools
+            .execute("semantic_search", arguments.as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(answer.contains("exponential_delay"), "{answer}");
+        assert!(!answer.contains("retry_backoff"), "{answer}");
+
+        fs::remove_file(&file).unwrap();
+        let answer = tools
+            .execute("semantic_search", arguments.as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(answer.contains("No semantic matches"), "{answer}");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            5,
+            "an empty index should not embed the query"
+        );
+
+        tools
+            .configure_semantic_search(None, false, 1, 16384)
+            .unwrap();
+        assert!(
+            tools
+                .clone()
+                .execute("semantic_search", arguments.as_object().unwrap())
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 }

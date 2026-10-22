@@ -1521,6 +1521,10 @@ visualize codebase
 
 ## /search
 
+The model can also request semantic search through the `semantic_search` tool,
+with a `query` argument. Both paths refresh the embedding index before searching
+and use the same ranking, result limit, and semantic token budget.
+
 Semantic code search. Where `/grep` matches text and the Knowledge Graph matches
 symbol names and structure, `/search` matches *meaning*: a query like
 `where is rate-limiting handled?` can surface a `throttle_requests` function whose
