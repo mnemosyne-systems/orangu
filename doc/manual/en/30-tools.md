@@ -41,6 +41,12 @@ MCP support currently exposes tools only. Resources and prompts are not exposed;
 | `fetch_url` | Fetch an external URL and return readable text | `url`, optional `max_chars` |
 | `run_shell_command` | Run a shell command inside the workspace | `command`, optional `cwd`, optional `timeout_seconds` |
 | `expand_context` | Retrieve previously compressed/truncated output using its hash ID | `id` |
+| `semantic_search` | Search workspace code by meaning, refreshing the embedding index first | `query` |
+
+`semantic_search` uses the same implementation and embeddings server as `/search`.
+It reuses embeddings for unchanged files and refreshes changed or deleted files
+before returning up to ten results with source locations. If no embeddings-capable
+server is available, it reports that semantic search is unavailable.
 
 The eight file-lifecycle tools are the same operations `orangu-server`
 serves over HTTP as `/v1/create_file`, `/v1/modify_file` and so on — one

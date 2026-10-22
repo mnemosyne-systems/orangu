@@ -271,6 +271,32 @@ impl OneshotSession {
             Resolution::PromptThen(text, step) => (text, Some(step)),
         };
 
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()?;
+        let is_coordinator = is_active_connection_a_coordinator(
+            &http_client,
+            &self.config,
+            &self.server,
+            Some(&self.profile.endpoint),
+        )
+        .await;
+        // Resolve the candidate without loading an embedding model for every
+        // ordinary one-shot prompt. The tool's first request checks capability.
+        let embeddings_server = if is_coordinator {
+            Some(self.server.clone())
+        } else {
+            self.config.embeddings_server()
+        };
+        self.tools.configure_semantic_search(
+            embeddings_server
+                .as_ref()
+                .and_then(|name| self.config.llms.get(name)),
+            is_coordinator,
+            self.config.compile_workers,
+            self.config.semantic_budget_tokens,
+        )?;
+
         let metrics = Arc::new(Mutex::new(StreamMetrics::default()));
         let collected = Arc::clone(&metrics);
         let started = Instant::now();

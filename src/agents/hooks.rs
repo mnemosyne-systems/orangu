@@ -15,7 +15,7 @@
 
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::graph::{
@@ -170,6 +170,8 @@ pub struct WorkspaceScanResult {
     pub warnings: Vec<String>,
     /// Whether the result was loaded from cache (true) or freshly scanned (false).
     pub from_cache: bool,
+    /// Hashes of the successfully indexed file versions.
+    pub file_hashes: HashMap<String, String>,
 }
 
 impl WorkspaceScanResult {
@@ -270,17 +272,25 @@ fn sha256(content: &str) -> String {
 ///   4. Save updated cache back to disk.
 pub fn run_session_start_hook(workspace: &Path) -> WorkspaceScanResult {
     let cache_path = GraphCache::cache_path(workspace);
+    scan_workspace(workspace, &cache_path)
+}
+
+fn scan_workspace(workspace: &Path, cache_path: &Path) -> WorkspaceScanResult {
     let project_type = detect_project_type(workspace);
     let files = collect_source_files(workspace);
+    let current_paths = source_path_keys(workspace, &files);
 
     // Try loading the cache. If successful, start from the persisted graph.
-    let (cache_opt, mut store) = match GraphCache::load(&cache_path) {
+    let (cache_opt, mut store) = match GraphCache::load(cache_path) {
         Some((cache, store)) => (Some(cache), store),
         None => (None, GraphStore::new()),
     };
 
     let mut warnings: Vec<String> = Vec::new();
-    let mut new_file_hashes: HashMap<String, String> = HashMap::new();
+    let mut new_file_hashes = cache_opt
+        .as_ref()
+        .map(|cache| cache.file_hashes.clone())
+        .unwrap_or_default();
     let from_cache = cache_opt.is_some();
 
     match GraphExtractor::new() {
@@ -329,12 +339,12 @@ pub fn run_session_start_hook(workspace: &Path) -> WorkspaceScanResult {
 
             let mut all_edges = Vec::new();
             for (path_key, hash_opt, res) in results {
-                if let Some(hash) = hash_opt {
-                    new_file_hashes.insert(path_key.clone(), hash);
-                }
                 match res {
                     Err(warn) => warnings.push(warn),
                     Ok(Some((nodes, edges))) => {
+                        if let Some(hash) = hash_opt {
+                            new_file_hashes.insert(path_key.clone(), hash);
+                        }
                         // Evict old nodes for this file before inserting fresh
                         // ones. Without this, renamed/deleted symbols would
                         // persist as phantom nodes in the graph.
@@ -357,14 +367,17 @@ pub fn run_session_start_hook(workspace: &Path) -> WorkspaceScanResult {
     // Purge nodes belonging to files that were in the cache but no longer exist on disk.
     if let Some(ref cache) = cache_opt {
         for cached_key in cache.file_hashes.keys() {
-            if !new_file_hashes.contains_key(cached_key) {
+            if !current_paths.contains(cached_key) {
                 store.remove_nodes_for_file(cached_key);
+                new_file_hashes.remove(cached_key);
             }
         }
     }
 
+    store.rebuild_edges();
+
     // Persist updated cache.
-    GraphCache::save(&cache_path, &store, &new_file_hashes);
+    GraphCache::save(cache_path, &store, &new_file_hashes);
 
     let stats = store.stats();
     let god_nodes = store.find_god_nodes(5);
@@ -378,6 +391,7 @@ pub fn run_session_start_hook(workspace: &Path) -> WorkspaceScanResult {
         store,
         warnings,
         from_cache,
+        file_hashes: new_file_hashes,
     }
 }
 
@@ -389,6 +403,18 @@ pub fn run_session_start_hook(workspace: &Path) -> WorkspaceScanResult {
 pub struct IncrementalScanResult {
     pub rescanned: usize,
     pub stats: GraphStats,
+}
+
+fn source_path_keys(workspace: &Path, files: &[PathBuf]) -> HashSet<String> {
+    files
+        .iter()
+        .map(|path| {
+            path.strip_prefix(workspace)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
 }
 
 /// Rescans only source files whose content hash has changed since the last call.
@@ -405,6 +431,7 @@ pub fn rescan_changed_files(
     file_hashes: &mut HashMap<String, String>,
 ) -> IncrementalScanResult {
     let files = collect_source_files(workspace);
+    let current_paths = source_path_keys(workspace, &files);
     let mut rescanned = 0usize;
 
     match GraphExtractor::new() {
@@ -444,12 +471,24 @@ pub fn rescan_changed_files(
                 && let Some(ref mut s) = *guard
             {
                 let mut all_edges = Vec::new();
+                let mut graph_changed = false;
+
+                file_hashes.retain(|path_key, _| {
+                    if current_paths.contains(path_key) {
+                        true
+                    } else {
+                        s.remove_nodes_for_file(path_key);
+                        graph_changed = true;
+                        false
+                    }
+                });
 
                 // Pass 1: Remove stale nodes, add all new nodes
                 for res in results.into_iter().flatten() {
                     let (path_key, hash, nodes, edges) = res;
                     file_hashes.insert(path_key.clone(), hash);
                     rescanned += 1;
+                    graph_changed = true;
 
                     s.remove_nodes_for_file(&path_key);
                     for node in nodes {
@@ -461,6 +500,9 @@ pub fn rescan_changed_files(
                 // Pass 2: Add all edges now that node_map contains all cross-file targets
                 for edge in all_edges {
                     s.add_edge(edge);
+                }
+                if graph_changed {
+                    s.rebuild_edges();
                 }
             }
         }
@@ -477,4 +519,163 @@ pub fn rescan_changed_files(
         });
 
     IncrementalScanResult { rescanned, stats }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    fn fixture() -> (tempfile::TempDir, tempfile::TempDir, WorkspaceScanResult) {
+        let workspace = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("caller.rs"),
+            "fn caller() { callee(); }",
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("callee.rs"), "fn callee() {}").unwrap();
+        let scan = scan_workspace(workspace.path(), &cache.path().join("cache.json"));
+        assert_eq!(scan.stats.edge_count, 1);
+        (workspace, cache, scan)
+    }
+
+    #[test]
+    fn startup_hashes_skip_unchanged_files_including_files_without_symbols() {
+        let (workspace, cache, _) = fixture();
+        std::fs::write(workspace.path().join("empty.rs"), "// no symbols\n").unwrap();
+        let scan = scan_workspace(workspace.path(), &cache.path().join("cache.json"));
+        let mut hashes = scan.file_hashes;
+        assert_eq!(hashes["callee.rs"], sha256("fn callee() {}"));
+        assert_eq!(hashes["empty.rs"], sha256("// no symbols\n"));
+        let store = Arc::new(Mutex::new(Some(scan.store)));
+        assert_eq!(
+            rescan_changed_files(workspace.path(), &store, &mut hashes).rescanned,
+            0
+        );
+    }
+
+    #[test]
+    fn live_rescan_retains_hashes_and_relationships_from_unchanged_callers() {
+        let (workspace, _, scan) = fixture();
+        let mut hashes = scan.file_hashes;
+        let store = Arc::new(Mutex::new(Some(scan.store)));
+        let changed = "fn callee() { let value = 1; }";
+        std::fs::write(workspace.path().join("callee.rs"), changed).unwrap();
+        let result = rescan_changed_files(workspace.path(), &store, &mut hashes);
+        assert_eq!(result.rescanned, 1);
+        assert_eq!(result.stats.edge_count, 1);
+        assert_eq!(hashes["callee.rs"], sha256(changed));
+        let guard = store.lock().unwrap();
+        let context = guard.as_ref().unwrap().cross_file_context("callee.rs");
+        assert_eq!(context[0].callers[0].node_label, "caller");
+        drop(guard);
+        assert_eq!(
+            rescan_changed_files(workspace.path(), &store, &mut hashes).rescanned,
+            0
+        );
+
+        // Replacing the caller must remove relationships it no longer contains.
+        std::fs::write(workspace.path().join("caller.rs"), "fn caller() {}").unwrap();
+        assert_eq!(
+            rescan_changed_files(workspace.path(), &store, &mut hashes)
+                .stats
+                .edge_count,
+            0
+        );
+    }
+
+    #[test]
+    fn live_rescan_removes_deleted_files_and_reconnects_restored_targets() {
+        let (workspace, _, scan) = fixture();
+        let remaining_nodes = scan
+            .store
+            .all_nodes()
+            .iter()
+            .filter(|node| node.source_file != "callee.rs")
+            .count();
+        let mut hashes = scan.file_hashes;
+        let store = Arc::new(Mutex::new(Some(scan.store)));
+        std::fs::remove_file(workspace.path().join("callee.rs")).unwrap();
+        let result = rescan_changed_files(workspace.path(), &store, &mut hashes);
+        assert_eq!(result.stats.node_count, remaining_nodes);
+        assert_eq!(result.stats.edge_count, 0);
+        assert!(!hashes.contains_key("callee.rs"));
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .lookup("callee")
+                .is_empty()
+        );
+
+        std::fs::write(workspace.path().join("renamed.rs"), "fn callee() {}").unwrap();
+        let result = rescan_changed_files(workspace.path(), &store, &mut hashes);
+        assert_eq!(result.rescanned, 1);
+        assert_eq!(result.stats.edge_count, 1);
+        assert!(hashes.contains_key("renamed.rs"));
+    }
+
+    #[test]
+    fn cached_startup_preserves_incoming_edges_and_unresolved_references() {
+        let (workspace, cache, _) = fixture();
+        let cache_path = cache.path().join("cache.json");
+        std::fs::write(
+            workspace.path().join("callee.rs"),
+            "fn callee() { let n = 2; }",
+        )
+        .unwrap();
+        let scan = scan_workspace(workspace.path(), &cache_path);
+        assert!(scan.from_cache);
+        assert_eq!(scan.stats.edge_count, 1);
+
+        std::fs::remove_file(workspace.path().join("callee.rs")).unwrap();
+        let scan = scan_workspace(workspace.path(), &cache_path);
+        assert_eq!(scan.stats.edge_count, 0);
+        assert!(!scan.file_hashes.contains_key("callee.rs"));
+
+        // The cached caller's unresolved reference must survive another restart.
+        std::fs::write(workspace.path().join("new.rs"), "fn callee() {}").unwrap();
+        let scan = scan_workspace(workspace.path(), &cache_path);
+        assert_eq!(scan.stats.edge_count, 1);
+    }
+
+    #[test]
+    fn live_rescan_rechecks_cross_file_name_ambiguity() {
+        let (workspace, _, scan) = fixture();
+        let mut hashes = scan.file_hashes;
+        let store = Arc::new(Mutex::new(Some(scan.store)));
+        std::fs::write(workspace.path().join("other.rs"), "fn callee() {}").unwrap();
+        assert_eq!(
+            rescan_changed_files(workspace.path(), &store, &mut hashes)
+                .stats
+                .edge_count,
+            0
+        );
+        std::fs::remove_file(workspace.path().join("other.rs")).unwrap();
+        assert_eq!(
+            rescan_changed_files(workspace.path(), &store, &mut hashes)
+                .stats
+                .edge_count,
+            1
+        );
+    }
+
+    #[test]
+    fn failed_reads_keep_the_previous_graph_and_hash_for_retry() {
+        let (workspace, cache, scan) = fixture();
+        std::fs::write(workspace.path().join("callee.rs"), [0xff]).unwrap();
+        let mut hashes = scan.file_hashes;
+        let store = Arc::new(Mutex::new(Some(scan.store)));
+        let result = rescan_changed_files(workspace.path(), &store, &mut hashes);
+        assert_eq!(result.rescanned, 0);
+        assert_eq!(result.stats.edge_count, 1);
+        assert_eq!(hashes["callee.rs"], sha256("fn callee() {}"));
+        let scan = scan_workspace(workspace.path(), &cache.path().join("cache.json"));
+        assert!(!scan.warnings.is_empty());
+        assert_eq!(scan.stats.edge_count, 1);
+        assert_eq!(scan.file_hashes["callee.rs"], hashes["callee.rs"]);
+    }
 }

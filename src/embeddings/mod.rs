@@ -37,6 +37,81 @@ pub use client::EmbeddingClient;
 pub use index::{EmbeddedChunk, EmbeddingIndex, SearchHit};
 pub use sketch::{EllipsoidSketch, SketchMatch};
 
+/// Shared refresh-before-search implementation for `/search` and LLM tools.
+#[derive(Clone)]
+pub struct SemanticSearch {
+    client: EmbeddingClient,
+    compile_workers: usize,
+    budget_tokens: usize,
+}
+
+pub struct SemanticSearchResult {
+    pub indexed_symbols: usize,
+    pub hits: Vec<SearchHit>,
+    pub cancelled: bool,
+}
+
+impl SemanticSearch {
+    pub fn from_profile(
+        profile: &LlmConfiguration,
+        is_coordinator: bool,
+        compile_workers: usize,
+        budget_tokens: usize,
+    ) -> anyhow::Result<Self> {
+        let mut profile = profile.clone();
+        if is_coordinator {
+            profile.model = "embeddings".to_string();
+        }
+        Ok(Self {
+            client: EmbeddingClient::from_profile(&profile)?,
+            compile_workers,
+            budget_tokens,
+        })
+    }
+
+    pub async fn search(
+        &self,
+        workspace: &std::path::Path,
+        query: &str,
+        graph: &std::sync::Mutex<Option<crate::graph::store::GraphStore>>,
+        cancel: &std::sync::atomic::AtomicBool,
+        progress: &std::sync::atomic::AtomicU64,
+        eta: &std::sync::atomic::AtomicU64,
+    ) -> anyhow::Result<SemanticSearchResult> {
+        use std::sync::atomic::Ordering;
+        anyhow::ensure!(
+            !query.trim().is_empty(),
+            "semantic search query must not be empty"
+        );
+        let index = EmbeddingIndex::build_or_update(
+            workspace,
+            &self.client,
+            cancel,
+            self.compile_workers,
+            progress,
+            eta,
+        )
+        .await?;
+        let mut result = SemanticSearchResult {
+            indexed_symbols: index.len(),
+            hits: Vec::new(),
+            cancelled: cancel.load(Ordering::Relaxed),
+        };
+        if result.cancelled || index.is_empty() {
+            return Ok(result);
+        }
+        let query_vector = self.client.embed_one(query).await?;
+        result.cancelled = cancel.load(Ordering::Relaxed);
+        if !result.cancelled {
+            let guard = graph
+                .lock()
+                .map_err(|_| anyhow::anyhow!("graph_store mutex poisoned"))?;
+            result.hits = index.search(&query_vector, guard.as_ref(), 10, self.budget_tokens);
+        }
+        Ok(result)
+    }
+}
+
 /// Probe a server's `/v1/embeddings` endpoint with a trivial request. `Ok(())`
 /// means it responded successfully and semantic `/search` can be enabled;
 /// `Err(reason)` gives a one-line, human-readable cause (connection refused,

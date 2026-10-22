@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use super::extract::{Confidence, ExtractedEdge, ExtractedNode};
 use super::store::{GraphNode, GraphStore};
 
-const CACHE_VERSION: u32 = 2;
+// Version 3 retains unresolved targets so incremental updates can re-resolve
+// relationships from unchanged files. Older caches need a full extraction.
+const CACHE_VERSION: u32 = 3;
 
 // ── On-disk format ────────────────────────────────────────────────────────────
 
@@ -116,11 +118,11 @@ impl GraphCache {
     /// that race simply overwrites the winner with an equivalent cache.
     pub fn save(path: &Path, store: &GraphStore, file_hashes: &HashMap<String, String>) {
         let edges: Vec<CachedEdge> = store
-            .all_edge_data()
-            .into_iter()
-            .map(|(source, target, edge)| CachedEdge {
-                source,
-                target,
+            .extracted_edges()
+            .iter()
+            .map(|edge| CachedEdge {
+                source: edge.source.clone(),
+                target: edge.target.clone(),
                 relation: edge.relation.clone(),
                 confidence: edge.confidence.clone(),
                 source_location: edge.source_location.clone(),

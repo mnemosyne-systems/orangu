@@ -816,6 +816,7 @@ async fn run() -> Result<()> {
     let kg_store = tools.graph_store.clone(); // Arc pointer shared with ToolExecutor
     let kg_status = tools.graph_status.clone();
     let scan_store = kg_store.clone();
+    let scan_hashes = tools.graph_file_hashes.clone();
     let scan_status = kg_status.clone();
     let scan_activity = tools.graph_scans.clone();
     let scan_workspace = tools.workspace().to_path_buf();
@@ -825,29 +826,19 @@ async fn run() -> Result<()> {
             let result = run_session_start_hook(&scan_workspace);
             // The per-file hash table the incremental rescan starts from,
             // seeded here because the store itself moves into the shared Arc.
-            let file_hashes: std::collections::HashMap<String, String> = result
-                .store
-                .all_nodes()
-                .iter()
-                .map(|n| (n.source_file.clone(), String::new()))
-                .collect();
+            if let Ok(mut hashes) = scan_hashes.lock() {
+                *hashes = result.file_hashes;
+            }
             if let Ok(mut guard) = scan_store.lock() {
                 *guard = Some(result.store);
             }
             if let Ok(mut status) = scan_status.lock() {
                 *status = orangu::graph::status::GraphBuildStatus::Ready;
             }
-            file_hashes
         }));
 
-    // Per-file sha256 hashes used by the incremental KG rescan.
-    // Populated once the initial scan completes, then updated incrementally.
-    let mut kg_file_hashes: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
     // Handle for an in-flight incremental rescan (spawned per LLM turn when files change).
-    let mut kg_rescan_handle: Option<
-        tokio::task::JoinHandle<orangu::agents::hooks::IncrementalScanResult>,
-    > = None;
+    let mut kg_rescan_handle: Option<tokio::task::JoinHandle<()>> = None;
 
     // Workspace tab switching. `current_tab!()` packs the active tab's locals
     // into a `WorkspaceTab` (moving them out); `load_tab!(t)` unpacks one back
@@ -1438,17 +1429,15 @@ async fn run() -> Result<()> {
             completion::set_issue_metadata(metadata);
         }
 
-        // Collect the Knowledge Graph scan once it finishes. The store and the
-        // build status are already live (the task publishes them itself); what
-        // is collected here is the per-file hash table the incremental rescan
-        // starts from, and a scan that died without publishing anything.
+        // Collect the startup scan to report failures. The task has already
+        // published the store, file hashes, and build status.
         if kg_scan_handle
             .as_ref()
             .is_some_and(|handle| handle.is_finished())
             && let Some(handle) = kg_scan_handle.take()
         {
             match handle.await {
-                Ok(file_hashes) => kg_file_hashes = file_hashes,
+                Ok(()) => {}
                 Err(err) => {
                     output_state.push_text(&format!("Knowledge graph scan failed: {err:#}"));
                     if let Ok(mut status) = kg_status.lock() {
@@ -2694,16 +2683,27 @@ async fn run() -> Result<()> {
             // Files changed — kick off an incremental KG rescan in the background
             // only if no rescan is already in flight and the initial scan is done.
             if kg_rescan_handle.is_none() && kg_scan_handle.is_none() {
-                let rescan_store = kg_store.clone();
+                let rescan_tools = tools.clone();
                 let rescan_workspace = workspace.clone();
-                let mut hashes_snapshot = kg_file_hashes.clone();
                 let handle = tokio::task::spawn_blocking(move || {
-                    rescan_changed_files(&rescan_workspace, &rescan_store, &mut hashes_snapshot)
+                    if rescan_tools.ensure_graph().is_err() {
+                        return;
+                    }
+                    let Ok(mut hashes) = rescan_tools.graph_file_hashes.lock() else {
+                        return;
+                    };
+                    rescan_changed_files(&rescan_workspace, &rescan_tools.graph_store, &mut hashes);
                 });
                 kg_rescan_handle = Some(handle);
             }
         }
 
+        tools.configure_semantic_search(
+            config.llms.get(&embeddings_server),
+            header_status.is_coordinator,
+            config.compile_workers,
+            config.semantic_budget_tokens,
+        )?;
         let llm_start = std::time::Instant::now();
         let tool_time_before = tools.total_tool_duration();
         let seed = std::time::SystemTime::now()
