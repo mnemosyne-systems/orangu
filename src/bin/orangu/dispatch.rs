@@ -2011,6 +2011,14 @@ pub(crate) fn handle_command(
             Ok(()) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
+        LocalCommand::IssueCreate(None) => Ok(CommandOutcome::OutputError(
+            issue_create_usage_message().to_string(),
+        )),
+        LocalCommand::IssueCreate(Some(args)) => match create_issue_output(workspace, &args, forge)
+        {
+            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Err(err) => Ok(local_command_error(err)),
+        },
         LocalCommand::GetComments(None) => Ok(CommandOutcome::OutputError(
             get_comments_usage_message().to_string(),
         )),
