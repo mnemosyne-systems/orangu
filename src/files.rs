@@ -195,7 +195,8 @@ impl Mode {
 pub struct CreateFileRequest {
     /// Workspace-relative (or workspace-absolute) path of the file to write.
     pub path: String,
-    /// The file's full content. Omitted means an empty file.
+    /// The file's full content. For a .pdf path, rendered as a searchable PDF.
+    /// Omitted means an empty file (or a blank PDF).
     #[serde(default)]
     pub content: String,
     /// Permission bits to set on the new file. Unset leaves the process
@@ -619,7 +620,7 @@ pub fn create(workspace: &Path, request: CreateFileRequest) -> FileResult<Create
     // the answer changes the moment somebody adds a `LICENSE`, and the cost
     // is a couple of small reads against a file write that is about to
     // happen anyway.
-    let content = if request.license && !existed {
+    let content = if request.license && !existed && !crate::pdf::is_pdf_path(&path) {
         let chosen = request
             .license_id
             .as_deref()
@@ -631,9 +632,15 @@ pub fn create(workspace: &Path, request: CreateFileRequest) -> FileResult<Create
         request.content.clone()
     };
     let licensed = content.len() != request.content.len();
+    let bytes = if crate::pdf::is_pdf_path(&path) {
+        crate::pdf::encode_text(file_name, &content)
+            .map_err(|err| FileError::BadRequest(format!("failed to create PDF: {err:#}")))?
+    } else {
+        content.into_bytes()
+    };
 
     prepare_parent(workspace, &path, request.parents)?;
-    std::fs::write(&path, content.as_bytes())
+    std::fs::write(&path, &bytes)
         .map_err(|err| FileError::Io(format!("{}: {err}", path.display())))?;
     if let Some(bits) = mode {
         set_mode(&path, bits)?;
@@ -645,7 +652,7 @@ pub fn create(workspace: &Path, request: CreateFileRequest) -> FileResult<Create
 
     Ok(CreateFileResponse {
         path: display_path(workspace, &path),
-        bytes_written: content.len(),
+        bytes_written: bytes.len(),
         mode: read_mode(&path),
         overwritten: existed,
         licensed,
@@ -672,6 +679,11 @@ pub fn modify(workspace: &Path, request: ModifyFileRequest) -> FileResult<Modify
 
     let original =
         std::fs::read(&path).map_err(|err| FileError::Io(format!("{display}: {err}")))?;
+    if crate::pdf::is_pdf(&path, &original) {
+        return Err(FileError::BadRequest(
+            "PDFs do not support line edits; use create_file to save a new PDF from text".into(),
+        ));
+    }
     let original = String::from_utf8(original)
         .map_err(|_| FileError::NotUtf8(format!("{display}: not valid UTF-8")))?;
     let (lines, trailing_newline) = split_lines(&original);
@@ -824,8 +836,13 @@ pub fn show(workspace: &Path, request: ShowFileRequest) -> FileResult<ShowFileRe
         )));
     }
     let bytes = std::fs::read(&path).map_err(|err| FileError::Io(format!("{display}: {err}")))?;
-    let content = String::from_utf8(bytes)
-        .map_err(|_| FileError::NotUtf8(format!("{display}: not valid UTF-8")))?;
+    let content = if crate::pdf::is_pdf(&path, &bytes) {
+        crate::pdf::extract_text(&bytes)
+            .map_err(|err| FileError::BadRequest(format!("{display}: {err:#}")))?
+    } else {
+        String::from_utf8(bytes)
+            .map_err(|_| FileError::NotUtf8(format!("{display}: not valid UTF-8")))?
+    };
     let (lines, _) = split_lines(&content);
 
     Ok(ShowFileResponse {
@@ -1749,6 +1766,57 @@ mod tests {
         assert_eq!(response.bytes, 8);
         assert_eq!(response.lines, 2);
         assert_eq!(response.path, "a.txt");
+    }
+
+    #[test]
+    fn pdf_create_show_overwrite_and_edit_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = create(
+            dir.path(),
+            create_request("report.PDF", "The answer is 42."),
+        )
+        .unwrap();
+        let bytes = std::fs::read(dir.path().join("report.PDF")).unwrap();
+        assert!(bytes.starts_with(b"%PDF-"));
+        assert_eq!(response.bytes_written, bytes.len());
+        assert!(!response.licensed);
+        let shown = show(dir.path(), show_request("report.PDF")).unwrap();
+        assert!(shown.content.contains("The answer is 42."));
+        assert_eq!(shown.bytes, shown.content.len());
+
+        let mut no_overwrite = create_request("report.PDF", "replacement");
+        no_overwrite.overwrite = false;
+        assert!(matches!(
+            create(dir.path(), no_overwrite),
+            Err(FileError::AlreadyExists(_))
+        ));
+        let error = modify(
+            dir.path(),
+            modify_request(
+                "report.PDF",
+                vec![LineEdit {
+                    start_line: 1,
+                    end_line: 1,
+                    replacement: "changed".into(),
+                }],
+            ),
+        )
+        .unwrap_err();
+        assert!(error.message().contains("PDFs do not support line edits"));
+        assert_eq!(std::fs::read(dir.path().join("report.PDF")).unwrap(), bytes);
+
+        let response = create(
+            dir.path(),
+            create_request("report.PDF", "Updated answer is 43."),
+        )
+        .unwrap();
+        assert!(response.overwritten);
+        assert!(
+            show(dir.path(), show_request("report.PDF"))
+                .unwrap()
+                .content
+                .contains("43")
+        );
     }
 
     #[test]

@@ -60,7 +60,9 @@ pub fn extract(incoming: &IncomingAttachment) -> Result<Attachment> {
         .with_context(|| format!("attachment {}: invalid base64", incoming.name))?;
     let size = bytes.len() as u64;
 
-    let mime = if incoming.mime.is_empty() {
+    let mime = if orangu::pdf::is_pdf(std::path::Path::new(&incoming.name), &bytes) {
+        "application/pdf".to_string()
+    } else if incoming.mime.is_empty() {
         mime_guess::from_path(&incoming.name)
             .first_raw()
             .unwrap_or("application/octet-stream")
@@ -136,6 +138,11 @@ pub fn compose_content(text: &str, attachments: &[Attachment]) -> String {
                 att.mime,
                 human_size(att.size)
             )),
+            None if orangu::pdf::is_pdf_path(std::path::Path::new(&att.name))
+                || att.mime.eq_ignore_ascii_case("application/pdf") => out.push_str(&format!(
+                "[Attached PDF \"{}\" has no readable text. It may require OCR, be password-protected, or be damaged. Its contents are unavailable; do not infer them.]",
+                att.name
+            )),
             None => out.push_str(&format!(
                 "[Attached file \"{}\" ({}, {}) — binary content, not included]",
                 att.name,
@@ -188,7 +195,7 @@ fn classify(name: &str, mime: &str, bytes: &[u8]) -> Kind {
     let name = name.to_ascii_lowercase();
     let ends = |ext: &str| name.ends_with(ext);
 
-    if ends(".pdf") || mime == "application/pdf" {
+    if ends(".pdf") || mime.eq_ignore_ascii_case("application/pdf") || bytes.starts_with(b"%PDF-") {
         return Kind::Pdf;
     }
     if ends(".docx")
@@ -244,10 +251,7 @@ fn is_texty(mime: &str, bytes: &[u8]) -> bool {
 /// parser can panic on malformed files, and a bad upload must not take the
 /// request handler (or the connection) down — a panic just means "no text".
 fn extract_pdf(bytes: &[u8]) -> Option<String> {
-    let owned = bytes.to_vec();
-    std::panic::catch_unwind(move || pdf_extract::extract_text_from_mem(&owned).ok())
-        .ok()
-        .flatten()
+    orangu::pdf::extract_text(bytes).ok()
 }
 
 /// Word (`word/document.xml`) and PowerPoint (`ppt/slides/slideN.xml`) both
@@ -405,6 +409,33 @@ mod tests {
             mime: mime.to_string(),
             data: base64::engine::general_purpose::STANDARD.encode(bytes),
         }
+    }
+
+    #[test]
+    fn pdf_upload_text_reaches_the_query() {
+        let bytes = orangu::pdf::encode_text("Notes", "The secret ingredient is apricot.").unwrap();
+        for (name, mime) in [("notes.PDF", ""), ("download", "application/octet-stream")] {
+            let att = extract(&incoming(name, mime, &bytes)).unwrap();
+            assert!(
+                att.text
+                    .as_ref()
+                    .unwrap()
+                    .contains("secret ingredient is apricot")
+            );
+            let content = compose_content("What is the ingredient?", &[att]);
+            assert!(content.contains("What is the ingredient?"));
+            assert!(content.contains("secret ingredient is apricot"));
+            assert!(!content.contains("%PDF-"));
+        }
+    }
+
+    #[test]
+    fn unreadable_pdf_is_explicit_in_the_query() {
+        let att = extract(&incoming("broken.pdf", "application/pdf", b"%PDF-broken")).unwrap();
+        assert!(att.text.is_none());
+        let content = compose_content("Summarize this", &[att]);
+        assert!(content.contains("no readable text"));
+        assert!(content.contains("OCR"));
     }
 
     #[test]

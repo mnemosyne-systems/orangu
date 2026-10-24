@@ -783,6 +783,12 @@ edit file src/main.rs
 
 Shows the contents of a workspace file, optionally at a specific Git ref and optionally with per-line blame columns.
 
+For a PDF, the command extracts embedded text and adds it to the conversation
+for follow-up questions. For example, run `/show_file report.PDF`, then ask
+for a summary. PDF files use the built-in renderer, including at a Git ref;
+`--hash` and `--author` are unavailable because extracted text lines do not
+correspond to binary Git blame lines. Scanned PDFs require OCR first.
+
 ```text
 /show_file [--hash] [--author] <path> [<ref>]
 ```

@@ -133,6 +133,18 @@ pub fn show_file_output(workspace: &Path, raw_args: &str, virtual_width: usize) 
     let (path, options, rev) = parse_show_file_arguments(raw_args)?;
     let resolved_path = resolve_workspace_path(workspace, &path)?;
 
+    if orangu::pdf::is_pdf_path(&resolved_path) {
+        if options.show_hash || options.show_author {
+            return Err(anyhow!("PDF text does not have Git blame line metadata"));
+        }
+        let content = if let Some(ref rev) = rev {
+            git_show_file_content(workspace, &resolved_path, rev)?
+        } else {
+            orangu::pdf::read_text(&resolved_path)?
+        };
+        return render_show_file_content(&resolved_path, &content, None, options);
+    }
+
     if let Some(ref rev) = rev {
         let content = git_show_file_content(workspace, &resolved_path, rev)?;
         let blame = if options.show_hash || options.show_author {
@@ -847,6 +859,18 @@ mod tests {
     use super::*;
     use crate::process_env_lock;
     use tempfile::tempdir;
+
+    #[test]
+    fn show_pdf_extracts_text_before_terminal_rendering() {
+        let dir = tempdir().unwrap();
+        let bytes = orangu::pdf::encode_text("Spec", "The launch date is Friday.").unwrap();
+        fs::write(dir.path().join("spec.PDF"), bytes).unwrap();
+        let output = show_file_output(dir.path(), "spec.PDF", 120).unwrap();
+        assert!(output.contains("The launch date is Friday."));
+        assert!(!output.contains("%PDF-"));
+        let error = show_file_output(dir.path(), "--hash spec.PDF", 120).unwrap_err();
+        assert!(error.to_string().contains("Git blame"));
+    }
 
     /// A picture embedded as a data URL is described, not dumped: the
     /// terminal has no way to show it and its base64 is kilobytes per line.

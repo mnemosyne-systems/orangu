@@ -2647,6 +2647,14 @@ ever committed** — that stays the user's own decision. A request can pass
 server internals chapter of the manual (`doc/manual/en/78-server.md`), under
 **File-lifecycle API**.
 
+PDF paths are supported by the shared file operations. `show_file` returns
+extracted embedded text, with `bytes` and `lines` describing that text.
+`create_file` renders its text `content` as a searchable PDF when the path
+ends in `.pdf`, including uppercase `.PDF`. PDF line edits are refused;
+use `create_file` to replace a document. Scanned PDFs require OCR before their
+contents can be queried. Saving creates a new plain text PDF and does not
+preserve an existing document's layout, forms or annotations.
+
 The built-in **Web UI** (above) is served on its own `web` port, separate
 from the API's `port`, and exposes a small `/api/...` surface of its own —
 used only by that page's own JavaScript, not part of the OpenAI-

@@ -242,7 +242,7 @@ impl ToolExecutor {
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = vec![tool(
             "show_file",
-            "Show a text file, whole by default, or a line range. `mode` \
+            "Show a text file or extract PDF text for queries, whole by default, or a line range. `mode` \
                  `signatures` or `map` gives a structural overview.",
             json!({
                 "type": "object",
@@ -263,6 +263,7 @@ impl ToolExecutor {
             defs.push(tool(
                 "create_file",
                 "Create a file, replacing an existing one unless `overwrite` is false. \
+                     A .pdf path renders content as a searchable PDF document. \
                      Staged in Git, never committed. A new file may get the project's \
                      licence header on top (reported as `licensed`): read it back before \
                      editing it by line number.",
@@ -830,7 +831,15 @@ impl ToolExecutor {
     async fn show_file(&self, arguments: &Map<String, Value>) -> Result<String> {
         let args: ReadFileRequest = serde_json::from_value(Value::Object(arguments.clone()))?;
         let path = self.resolve_workspace_path(&args.path)?;
-        let mut content = fs::read_to_string(&path)?;
+        let read_path = path.clone();
+        let (mut content, is_pdf) = tokio::task::spawn_blocking(move || -> Result<_> {
+            let bytes = fs::read(&read_path)?;
+            Ok((
+                crate::pdf::decode_text(&read_path, &bytes)?,
+                crate::pdf::is_pdf(&read_path, &bytes),
+            ))
+        })
+        .await??;
 
         redact_secrets(&mut content);
 
@@ -853,6 +862,7 @@ impl ToolExecutor {
         }
 
         if self.compression_enabled
+            && !is_pdf
             && args.mode.is_none()
             && args.start_line.is_none()
             && args.end_line.is_none()
@@ -880,11 +890,21 @@ impl ToolExecutor {
     fn replace_text(&self, arguments: &Map<String, Value>) -> Result<String> {
         let args: EditFileRequest = serde_json::from_value(Value::Object(arguments.clone()))?;
         let path = self.resolve_workspace_path(&args.path)?;
+        if crate::pdf::is_pdf_path(&path) {
+            return Err(anyhow!(
+                "PDFs do not support text replacement; use create_file to save a new PDF from text"
+            ));
+        }
         let (original, created) = match fs::read_to_string(&path) {
             Ok(content) => (content, false),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => (String::new(), true),
             Err(err) => return Err(err.into()),
         };
+        if original.starts_with("%PDF-") {
+            return Err(anyhow!(
+                "PDFs do not support text replacement; use create_file to save a new PDF from text"
+            ));
+        }
 
         let updated = apply_edit(
             &original,
@@ -981,8 +1001,21 @@ impl ToolExecutor {
             .and_then(|value| value.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = response.text().await?;
+        let is_pdf = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .eq_ignore_ascii_case("application/pdf")
+            || response.url().path().to_ascii_lowercase().ends_with(".pdf");
+        let bytes = response.bytes().await?;
         let max_chars = args.max_chars.unwrap_or(20_000);
+        if is_pdf || bytes.starts_with(b"%PDF-") {
+            let text =
+                tokio::task::spawn_blocking(move || crate::pdf::extract_text(&bytes)).await??;
+            return Ok(truncate_text(&text, max_chars));
+        }
+        let body = String::from_utf8_lossy(&bytes);
         if content_type.contains("html") {
             let rendered = html2text::from_read(body.as_bytes(), 120)?;
             Ok(truncate_text(&rendered, max_chars))
@@ -1427,6 +1460,34 @@ mod tests {
         let second = executor.show_file(&args).await.unwrap();
         assert!(second.starts_with("[cached] README.md is unchanged"));
         assert!(second.contains("start_line/end_line"));
+    }
+
+    #[tokio::test]
+    async fn pdf_tool_reads_text_and_caches_it_for_queries() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bytes = crate::pdf::encode_text("Facts", "The project codename is Apricot.").unwrap();
+        fs::write(workspace.path().join("facts.PDF"), bytes).unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+        let mut args = Map::new();
+        args.insert("path".into(), json!("facts.PDF"));
+        let text = executor.show_file(&args).await.unwrap();
+        assert!(text.contains("The project codename is Apricot."));
+        assert!(!text.contains("%PDF-"));
+        assert!(
+            executor
+                .show_file(&args)
+                .await
+                .unwrap()
+                .starts_with("[cached]")
+        );
+        args.insert("start_line".into(), json!(1));
+        assert!(
+            !executor
+                .show_file(&args)
+                .await
+                .unwrap()
+                .starts_with("[cached]")
+        );
     }
 
     #[tokio::test]

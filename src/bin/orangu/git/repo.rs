@@ -506,7 +506,7 @@ pub fn git_show_file_content(workspace: &Path, file_path: &Path, rev: &str) -> R
             }
         ));
     }
-    String::from_utf8(output.stdout).context("git show output was not UTF-8")
+    orangu::pdf::decode_text(file_path, &output.stdout).context("failed to read git show output")
 }
 
 pub fn git_file_commit_hashes(repo_root: &Path, relative_path: &Path) -> Vec<String> {

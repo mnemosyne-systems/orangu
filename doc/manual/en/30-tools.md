@@ -29,7 +29,7 @@ MCP support currently exposes tools only. Resources and prompts are not exposed;
 
 | Tool | Purpose | Key arguments |
 | :-- | :-- | :-- |
-| `show_file` | Show a text file from the workspace | `path`, optional `start_line`, optional `end_line`, optional `mode` |
+| `show_file` | Show a text file or extract PDF text from the workspace | `path`, optional `start_line`, optional `end_line`, optional `mode` |
 | `create_file` | Create a file with content, optionally with its permissions | `path`, optional `content`, `mode`, `overwrite`, `parents`, `git` |
 | `modify_file` | Modify a file, by text replacement or by line ranges | `path`, either `old_text`/`new_text` (+ `replace_all`) or `edits`, optional `git` |
 | `move_file` | Move or rename a file | `from`, `to`, optional `mode`, `overwrite`, `parents`, `git` |
@@ -47,6 +47,30 @@ MCP support currently exposes tools only. Resources and prompts are not exposed;
 It reuses embeddings for unchanged files and refreshes changed or deleted files
 before returning up to ten results with source locations. If no embeddings-capable
 server is available, it reports that semantic search is unavailable.
+
+### PDF documents
+
+`show_file` extracts embedded text from PDF files, including `.PDF` paths, so
+the model can answer questions about their contents. Use `/show_file report.pdf`
+to load a document into the conversation, then ask a question. Line ranges in
+the model tool refer to extracted text lines, not PDF page numbers.
+`fetch_url` also extracts text from PDF responses, with its usual `max_chars`
+limit. The web console accepts PDF uploads and keeps their extracted text in
+the conversation for follow-up questions.
+
+`create_file` renders its `content` as a searchable PDF when the output path
+ends in `.pdf`, with an embedded font, line wrapping and multiple pages as
+needed. For example, ask the model to save its answer to `summary.pdf`. The
+same behavior is available through `/v1/create_file`. Existing documents are
+replaced when `overwrite` is true. This creates a plain text document;
+`/export` remains available for formatted session and review reports.
+
+PDF extraction reads embedded text, not images or scanned pages. Scanned PDFs
+need OCR first, and damaged or password-protected documents may be unreadable.
+Extracted text does not preserve the original page layout or reliably retain
+table columns. PDF line edits and text replacement are refused; save a new
+document with `create_file` instead. Saving does not preserve an existing PDF's
+forms, annotations or layout.
 
 The eight file-lifecycle tools are the same operations `orangu-server`
 serves over HTTP as `/v1/create_file`, `/v1/modify_file` and so on — one

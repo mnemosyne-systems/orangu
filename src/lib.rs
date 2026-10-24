@@ -43,6 +43,7 @@ pub mod npu_cache;
 pub mod npu_ffn;
 pub mod npu_ort;
 pub mod os;
+pub mod pdf;
 pub mod profiling;
 pub mod quantize;
 
