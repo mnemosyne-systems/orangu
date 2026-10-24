@@ -68,10 +68,17 @@ pub fn encode_text(title: &str, text: &str) -> Result<Vec<u8>> {
     const TOP: f32 = 277.0;
     const BOTTOM: f32 = 20.0;
     const WIDTH_PT: f32 = 170.0 * 72.0 / 25.4;
+    let mut doc = PdfDocument::new(title);
+    // An empty embedded font has no glyph mapping and is rejected by PDF
+    // readers. Blank documents need only a page, with no font resources.
+    if text.trim().is_empty() {
+        doc.pages
+            .push(PdfPage::new(Mm(210.0), Mm(297.0), Vec::new()));
+        return Ok(doc.save(&PdfSaveOptions::default(), &mut Vec::new()));
+    }
     let face = ttf_parser::Face::parse(FONT, 0).context("failed to load PDF font metrics")?;
     let parsed = ParsedFont::from_bytes(FONT, 0, &mut Vec::new())
         .ok_or_else(|| anyhow!("failed to load PDF font"))?;
-    let mut doc = PdfDocument::new(title);
     let font = PdfFontHandle::External(doc.add_font(&parsed));
     let mut ops = Vec::new();
     let mut y = TOP;
@@ -147,13 +154,11 @@ mod tests {
     #[test]
     fn pdf_errors_do_not_become_document_content() {
         assert!(extract_text(b"%PDF-invalid").is_err());
-        let blank = encode_text("Empty", "").unwrap();
-        assert!(
-            extract_text(&blank)
-                .unwrap_err()
-                .to_string()
-                .contains("OCR")
-        );
+        for text in ["", " \n\t\r\n"] {
+            let blank = encode_text("Empty", text).unwrap();
+            let error = extract_text(&blank).unwrap_err().to_string();
+            assert!(error.contains("OCR"), "{error}");
+        }
     }
 
     #[test]
