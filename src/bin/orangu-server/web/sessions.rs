@@ -82,6 +82,9 @@ pub struct Attachment {
     pub size: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Page index reused to select context for follow-up questions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<orangu::pdf::ExtractedPdf>,
     /// For a picture (PNG, JPEG, SVG): the file it was kept as under the
     /// session's `files/` directory, so the transcript can show it again
     /// and a `qwen_image` model can start from it on this turn. The bytes

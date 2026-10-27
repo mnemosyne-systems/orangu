@@ -146,7 +146,16 @@ endpoint!(create_file, files::create, CreateFileRequest);
 endpoint!(modify_file, files::modify, ModifyFileRequest);
 endpoint!(move_file, files::move_, MoveFileRequest);
 endpoint!(delete_file, files::delete, DeleteFileRequest);
-endpoint!(show_file, files::show, ShowFileRequest);
+async fn show_file<S: WorkspaceState>(
+    State(state): State<Arc<S>>,
+    FileJson(request): FileJson<ShowFileRequest>,
+) -> Result<impl IntoResponse, FileErrorResponse> {
+    let workspace = state.workspace().to_path_buf();
+    let response = tokio::task::spawn_blocking(move || files::show(&workspace, request))
+        .await
+        .map_err(|err| FileError::Io(format!("file extraction failed: {err}")))??;
+    Ok(Json(response))
+}
 endpoint!(create_directory, files::create_dir, CreateDirectoryRequest);
 endpoint!(move_directory, files::move_dir, MoveDirectoryRequest);
 endpoint!(delete_directory, files::delete_dir, DeleteDirectoryRequest);

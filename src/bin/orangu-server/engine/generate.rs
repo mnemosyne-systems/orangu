@@ -5372,11 +5372,10 @@ mod tests {
         /// How long each forward takes, so requests run side by side
         /// overlap.
         pause: Duration,
-        /// No forward past position 0 runs until this many forwards at
-        /// position 0 have finished: requests started together all hold their
-        /// prompts before any of them decodes, however the threads are
-        /// scheduled.
+        /// Forwards at or past `meet_position` wait until this many requests
+        /// reach that position, regardless of how their threads are scheduled.
         meet: usize,
+        meet_position: usize,
         started: AtomicUsize,
     }
 
@@ -5404,6 +5403,7 @@ mod tests {
                 recurrent: false,
                 pause: Duration::ZERO,
                 meet: 0,
+                meet_position: 0,
                 started: AtomicUsize::new(0),
             }
         }
@@ -5492,22 +5492,21 @@ mod tests {
             self.forwarded_tokens
                 .fetch_add(tokens.len(), Ordering::Relaxed);
             self.forward_calls.fetch_add(1, Ordering::Relaxed);
-            if start_pos > 0 {
+            std::thread::sleep(self.pause);
+            for (i, &t) in tokens.iter().enumerate() {
+                self.absorb(cache, t, start_pos + i);
+            }
+            // Count completed forwards so every request holds its pages
+            // before the rendezvous releases either request.
+            if start_pos == self.meet_position {
+                self.started.fetch_add(1, Ordering::AcqRel);
+            }
+            if start_pos >= self.meet_position {
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while self.started.load(Ordering::Acquire) < self.meet && Instant::now() < deadline
                 {
                     std::thread::sleep(Duration::from_millis(1));
                 }
-            }
-            std::thread::sleep(self.pause);
-            for (i, &t) in tokens.iter().enumerate() {
-                self.absorb(cache, t, start_pos + i);
-            }
-            // Counted once the prompt is held, not when its forward begins:
-            // a thread descheduled mid-prefill would otherwise let the
-            // others decode past it.
-            if start_pos == 0 {
-                self.started.fetch_add(1, Ordering::AcqRel);
             }
             let winner = self.winner(cache);
             Ok(self.logits_for(winner))
@@ -5868,10 +5867,12 @@ mod tests {
                 .map(|p| run_request(&make(), &tokenizer, None, p.clone(), ANSWER))
                 .collect();
 
-            // Both prompts are in before either decodes, so the two answers
-            // grow side by side however late the second thread starts.
+            // Both requests hold five pages before either can grow to six.
+            // Meeting only at the prompt leaves later decode overlap to the
+            // OS scheduler and can let one request finish without any yield.
             let mut model = make();
             model.meet = prompts.len();
+            model.meet_position = 16;
             // Ten pages of four tokens: one request of 29 positions needs
             // eight, two together sixteen.
             const PAGE: usize = 4;

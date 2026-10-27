@@ -130,7 +130,7 @@ pub fn syntax_highlight_assets() -> &'static SyntaxHighlightAssets {
 }
 
 pub fn show_file_output(workspace: &Path, raw_args: &str, virtual_width: usize) -> Result<String> {
-    let (path, options, rev) = parse_show_file_arguments(raw_args)?;
+    let (path, options, rev, pdf_options) = parse_show_file_request(raw_args)?;
     let resolved_path = resolve_workspace_path(workspace, &path)?;
 
     if orangu::pdf::is_pdf_path(&resolved_path) {
@@ -138,11 +138,29 @@ pub fn show_file_output(workspace: &Path, raw_args: &str, virtual_width: usize) 
             return Err(anyhow!("PDF text does not have Git blame line metadata"));
         }
         let content = if let Some(ref rev) = rev {
+            if pdf_options.start_page.is_some()
+                || pdf_options.end_page.is_some()
+                || pdf_options.query.is_some()
+            {
+                return Err(anyhow!(
+                    "PDF page selection at a Git ref is unavailable; omit the ref to select workspace PDF pages"
+                ));
+            }
             git_show_file_content(workspace, &resolved_path, rev)?
         } else {
-            orangu::pdf::read_text(&resolved_path)?
+            let bytes = fs::read(&resolved_path)?;
+            orangu::pdf::extract_document(&bytes, &pdf_options)?.context_text()?
         };
         return render_show_file_content(&resolved_path, &content, None, options);
+    }
+
+    if pdf_options.start_page.is_some()
+        || pdf_options.end_page.is_some()
+        || pdf_options.query.is_some()
+    {
+        return Err(anyhow!(
+            "Page ranges and query are available only for PDF files"
+        ));
     }
 
     if let Some(ref rev) = rev {
@@ -225,19 +243,52 @@ pub fn show_file_output_with_bat(path: &Path, virtual_width: usize) -> Result<Op
         .with_context(|| format!("bat output for {} was not UTF-8", path.display()))
 }
 
+#[cfg(test)]
 pub fn parse_show_file_arguments(
     raw_args: &str,
 ) -> Result<(String, ShowFileOptions, Option<String>)> {
+    let (path, options, rev, _) = parse_show_file_request(raw_args)?;
+    Ok((path, options, rev))
+}
+
+fn parse_show_file_request(
+    raw_args: &str,
+) -> Result<(
+    String,
+    ShowFileOptions,
+    Option<String>,
+    orangu::pdf::PdfReadOptions,
+)> {
     let args = shell_words(raw_args)
         .map_err(|_| LocalError::Usage(show_file_usage_message().to_string()))?;
     let mut options = ShowFileOptions::default();
     let mut path = None;
     let mut rev = None;
+    let mut pdf = orangu::pdf::PdfReadOptions::default();
 
-    for arg in args {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--hash" => options.show_hash = true,
             "--author" => options.show_author = true,
+            "--start-page" | "--end-page" => {
+                let number = args
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| anyhow!("{arg} requires a positive page number"))?;
+                if arg == "--start-page" {
+                    pdf.start_page = Some(number);
+                } else {
+                    pdf.end_page = Some(number);
+                }
+            }
+            "--query" => {
+                pdf.query = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--query requires search words"))?,
+                );
+            }
             _ if arg.starts_with('-') => {
                 return Err(LocalError::Usage(format!(
                     "Unknown option '{arg}'. {}",
@@ -254,11 +305,11 @@ pub fn parse_show_file_arguments(
     }
 
     let path = path.ok_or_else(|| LocalError::Usage(show_file_usage_message().to_string()))?;
-    Ok((path, options, rev))
+    Ok((path, options, rev, pdf))
 }
 
 pub fn show_file_usage_message() -> &'static str {
-    "Usage: /show_file [--hash] [--author] <path> [<ref>]. Use /help to see available commands."
+    "Usage: /show_file [--hash] [--author] [--start-page N] [--end-page N] [--query WORDS] <path> [<ref>]. Use /help to see available commands."
 }
 
 pub fn render_show_file_content(
@@ -870,6 +921,20 @@ mod tests {
         assert!(!output.contains("%PDF-"));
         let error = show_file_output(dir.path(), "--hash spec.PDF", 120).unwrap_err();
         assert!(error.to_string().contains("Git blame"));
+    }
+
+    #[test]
+    fn pdf_flags_preserve_quoted_paths_and_reject_invalid_page_numbers() {
+        let (path, _, rev, pdf) = parse_show_file_request(
+            "--start-page 2 --end-page 4 --query 'annual revenue' 'annual report.PDF'",
+        )
+        .unwrap();
+        assert_eq!(path, "annual report.PDF");
+        assert_eq!(pdf.start_page, Some(2));
+        assert_eq!(pdf.end_page, Some(4));
+        assert_eq!(pdf.query.as_deref(), Some("annual revenue"));
+        assert!(rev.is_none());
+        assert!(parse_show_file_request("--start-page 0 report.pdf").is_err());
     }
 
     /// A picture embedded as a data URL is described, not dumped: the

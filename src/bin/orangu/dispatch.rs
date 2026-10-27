@@ -4006,15 +4006,13 @@ mod tests {
         let workspace = tempdir().expect("workspace");
         let tools = ToolExecutor::new(workspace.path());
 
+        const SHOW_FILE_USAGE: &str = "Usage: /show_file [--hash] [--author] [--start-page N] [--end-page N] [--query WORDS] <path> [<ref>]. Use /help to see available commands.";
         for (input, expected) in [
-            (
-                "/show_file",
-                "Usage: /show_file [--hash] [--author] <path> [<ref>]. Use /help to see available commands.",
-            ),
-            (
-                "/show_file --hash",
-                "Usage: /show_file [--hash] [--author] <path> [<ref>]. Use /help to see available commands.",
-            ),
+            ("/show_file", SHOW_FILE_USAGE),
+            ("/show_file --hash", SHOW_FILE_USAGE),
+            ("/show_file --start-page 1", SHOW_FILE_USAGE),
+            ("/show_file --end-page 2", SHOW_FILE_USAGE),
+            ("/show_file --query revenue", SHOW_FILE_USAGE),
             (
                 "/open_file",
                 "Usage: /open_file <path>. Use /help to see available commands.",

@@ -102,6 +102,22 @@ jobs:
       - name: Run cargo test
         run: cargo test
 
+      # Ordinary tests need no OCR weights. Exercise the real Rust renderer
+      # and OCR models separately, with fixed model contents and no private input.
+      - name: Recognize an image-only PDF with local OCR models
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          pdf_ocr_model_dir="$RUNNER_TEMP/orangu-ocr-models"
+          mkdir -p "$pdf_ocr_model_dir"
+          curl -fL --retry 3 https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.onnx -o "$pdf_ocr_model_dir/text-detection.onnx"
+          curl -fL --retry 3 https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.onnx -o "$pdf_ocr_model_dir/text-recognition.onnx"
+          printf '%s  %s\n' \
+            a917b23dbd9524b465df7e922641b3ff2981623df4ded5a0234004ef2fee7cfe "$pdf_ocr_model_dir/text-detection.onnx" \
+            86c145c2edb96c8caed5b1ebb8f44d706408922211451c309c625157dd6061c5 "$pdf_ocr_model_dir/text-recognition.onnx" | sha256sum --check
+          ORANGU_OCR_MODEL_DIR="$pdf_ocr_model_dir" cargo test --lib pdf::ocr::tests::scanned_ -- --ignored --test-threads=1
+
       # `coop_tiles_are_vec4_only_where_component_stores_work` already probes
       # the one thing that decides whether the tiled GEMM's *weight* tile can
       # be `vec4` here: whether four threads writing four components of one

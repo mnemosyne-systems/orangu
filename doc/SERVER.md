@@ -2893,8 +2893,13 @@ PDF paths are supported by the shared file operations. `show_file` returns
 extracted embedded text, with `bytes` and `lines` describing that text.
 `create_file` renders its text `content` as a searchable PDF when the path
 ends in `.pdf`, including uppercase `.PDF`. PDF line edits are refused;
-use `create_file` to replace a document. Scanned PDFs require OCR before their
-contents can be queried. Saving creates a new plain text PDF and does not
+use `create_file` to replace a document. Scanned pages use local OCR with the
+`ocrs` models in `~/.orangu/ocr` or `ORANGU_OCR_MODEL_DIR`. No model downloads
+occur during extraction. `show_file` accepts inclusive `start_page`/`end_page`
+and keyword `query` options, with original page references in its result.
+Web uploads retain a bounded page index and select context again for each
+follow-up. See the tools manual's PDF section for setup and extraction limits.
+Saving creates a new plain text PDF and does not
 preserve an existing document's layout, forms or annotations.
 
 The built-in **Web UI** (above) is served on its own `web` port, separate

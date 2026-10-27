@@ -50,13 +50,68 @@ server is available, it reports that semantic search is unavailable.
 
 ### PDF documents
 
-`show_file` extracts embedded text from PDF files, including `.PDF` paths, so
+`show_file` extracts text from PDF files, including `.PDF` paths, so
 the model can answer questions about their contents. Use `/show_file report.pdf`
 to load a document into the conversation, then ask a question. Line ranges in
 the model tool refer to extracted text lines, not PDF page numbers.
 `fetch_url` also extracts text from PDF responses, with its usual `max_chars`
-limit. The web console accepts PDF uploads and keeps their extracted text in
-the conversation for follow-up questions.
+limit. Each page is labelled with its original number and extraction source.
+Scanned pages use local OCR when its models are installed. Pages with a small
+amount of embedded text and an image also try OCR, which handles scans with
+digitally added page numbers. Failed pages are marked unavailable while
+readable pages remain usable.
+
+Use page ranges or query keywords for larger documents:
+
+```text
+/show_file --start-page 21 --end-page 30 report.pdf
+/show_file --query "annual revenue" report.pdf
+```
+
+The model tool and `/v1/show_file` accept `start_page`, `end_page` and `query`.
+Page numbers start at one and the range includes both endpoints. Ordinary
+reads inspect the first 20 pages. Queries inspect up to 200 pages and select
+up to six pages by keyword overlap, keeping their original page numbers.
+This is keyword retrieval, not semantic search. Specify a starting page to
+search another part of a long document. Page selection applies to workspace
+files; PDF reads at a Git ref use the default range.
+
+The web console stores a bounded PDF page index alongside the attachment.
+Each follow-up question selects up to six stored pages again, without
+rerunning OCR. Older saved attachments continue to use their stored text.
+Uploads inspect up to 200 pages. At most 20 pages per extraction use OCR;
+use narrower page ranges in the file tools for additional scanned pages.
+Extraction retains up to 200,000 characters, with 30,000 per page, and each
+PDF context includes up to 60,000 text characters. Limits and omissions are
+reported in the context. PDF input is limited to 64 MiB, in addition to any
+upload-size limit configured by the web server.
+
+#### Local OCR setup
+
+OCR uses the existing `ocrs` engine with `hayro` for PDF rendering. Both run
+locally in Rust. Install the official models once in `~/.orangu/ocr/`:
+
+```sh
+mkdir -p ~/.orangu/ocr
+curl -fL https://ocrs-models.s3-accelerate.amazonaws.com/text-detection.onnx -o ~/.orangu/ocr/text-detection.onnx
+curl -fL https://ocrs-models.s3-accelerate.amazonaws.com/text-recognition.onnx -o ~/.orangu/ocr/text-recognition.onnx
+```
+
+On Windows, the default directory is `%USERPROFILE%\.orangu\ocr`. Set
+`ORANGU_OCR_MODEL_DIR` before launching the terminal or server to use another
+directory containing those two files. Reading a PDF never downloads models
+or sends its contents to a service. Missing or invalid models are reported
+on affected pages; embedded text extraction continues to work.
+Reattach a document after installing models if it was previously uploaded
+without them, so its stored page index includes the OCR results.
+
+The supplied OCR recognition model supports Latin script. OCR text is marked
+as potentially inaccurate; it has no fabricated numerical confidence score.
+Use a release build for OCR; the inference libraries are much slower without
+optimization.
+Page images render at a target 200 DPI, bounded to 4096 pixels per edge and
+12 million pixels per page. See the [ocrs documentation](https://github.com/robertknight/ocrs)
+for model and language support.
 
 `create_file` renders its `content` as a searchable PDF when the output path
 ends in `.pdf`, with an embedded font, line wrapping and multiple pages as
@@ -65,10 +120,28 @@ same behavior is available through `/v1/create_file`. Existing documents are
 replaced when `overwrite` is true. This creates a plain text document;
 `/export` remains available for formatted session and review reports.
 
-PDF extraction reads embedded text, not images or scanned pages. Scanned PDFs
-need OCR first, and damaged or password-protected documents may be unreadable.
-Extracted text does not preserve the original page layout or reliably retain
-table columns. PDF line edits and text replacement are refused; save a new
+#### Tables in query context
+
+Table extraction uses `pdfni` with positioned native text or OCR characters.
+Bordered tables retain rows, columns, empty cells, and merged-cell spans.
+Scanned borders are detected with `imageproc`; table extraction needs no
+additional models. Native tables work without the OCR models installed.
+Query context includes complete HTML tables with row and column spans, and
+keeps narrative text outside the tables. The saved web attachment index
+retains this structure for follow-up questions.
+
+Borderless tables use text alignment and are explicitly marked as inferred.
+Their merged cells cannot be verified. Ambiguous layouts produce a warning;
+flattened text should not be used to guess cell associations. OCR can still
+misread characters and numbers. Rotated, skewed, broken-border, nested, and
+cross-page tables are not guaranteed. Context and storage limits omit entire
+tables rather than cutting cells in half, with an explicit omission notice.
+URL character limits and model-tool line ranges also omit tables that would
+be cut. Use PDF page ranges to retrieve a complete table.
+
+Damaged or password-protected documents may be unreadable.
+Extracted text does not preserve the original page layout.
+PDF line edits and text replacement are refused; save a new
 document with `create_file` instead. Saving does not preserve an existing PDF's
 forms, annotations or layout.
 

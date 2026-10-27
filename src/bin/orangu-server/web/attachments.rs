@@ -89,18 +89,32 @@ pub fn extract(incoming: &IncomingAttachment) -> Result<Attachment> {
             mime,
             size,
             text: None,
+            pdf: None,
             image: None,
             image_bytes: Some(bytes),
         });
     }
 
-    let text = extract_text(&incoming.name, &mime, &bytes).map(cap_text);
+    let pdf = if mime.eq_ignore_ascii_case("application/pdf") {
+        orangu::pdf::extract_upload(&bytes).ok()
+    } else {
+        None
+    };
+    let text = if mime.eq_ignore_ascii_case("application/pdf") {
+        pdf.as_ref().map(|doc| doc.context_text().unwrap_or_else(|error| {
+            format!("[PDF extraction unavailable: {error:#}. No document content is available for queries.]")
+        }))
+    } else {
+        extract_text(&incoming.name, &mime, &bytes)
+    }
+    .map(cap_text);
 
     Ok(Attachment {
         name: incoming.name.clone(),
         mime,
         size,
         text,
+        pdf,
         image: None,
         image_bytes: None,
     })
@@ -110,12 +124,20 @@ pub fn extract(incoming: &IncomingAttachment) -> Result<Attachment> {
 /// the chat template sees. Extractable attachments are inlined as fenced
 /// blocks; the rest are named so the model at least knows a file was sent.
 ///
-/// With `pictures` — a model with a vision tower — a picture stands in the
-/// text as its sentinel (`http::openai::picture_sentinel`), numbered by its
-/// place in `pictures`, where its stored name is pushed.
+/// With `pictures`, image attachments use vision sentinels and append their
+/// stored names to the supplied list.
 pub fn compose_content(
     text: &str,
     attachments: &[Attachment],
+    pictures: Option<&mut Vec<String>>,
+) -> String {
+    compose_content_for_query(text, attachments, text, pictures)
+}
+
+pub fn compose_content_for_query(
+    text: &str,
+    attachments: &[Attachment],
+    query: &str,
     mut pictures: Option<&mut Vec<String>>,
 ) -> String {
     let text = text.trim();
@@ -133,6 +155,8 @@ pub fn compose_content(
         }
         match &att.text {
             Some(body) => {
+                let selected = att.pdf.as_ref().and_then(|doc| doc.context_for_query(query).ok());
+                let body = selected.as_deref().unwrap_or(body);
                 let fence = "`".repeat(fence_width(body));
                 out.push_str(&format!(
                     "Attached document \"{}\" ({}):\n{fence}\n{}\n{fence}",
@@ -452,6 +476,51 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_uses_the_saved_page_index_and_old_attachments_still_work() {
+        let mut attachment: Attachment = serde_json::from_str(
+            r#"{"name":"report.pdf","mime":"application/pdf","size":1,"text":"Original PDF text"}"#,
+        )
+        .unwrap();
+        assert!(attachment.pdf.is_none());
+        assert!(
+            compose_content("summary", std::slice::from_ref(&attachment), None)
+                .contains("Original PDF text")
+        );
+        attachment.pdf = Some(orangu::pdf::ExtractedPdf {
+            total_pages: 9,
+            inspected_start: 1,
+            inspected_end: 9,
+            query: None,
+            pages: vec![orangu::pdf::PdfPageText {
+                number: 9,
+                source: orangu::pdf::PageSource::Ocr,
+                text: "Apricot production reached forty two tonnes".into(),
+                warning: None,
+                tables: Vec::new(),
+                body_text: None,
+            }],
+        });
+        let restored: Attachment =
+            serde_json::from_str(&serde_json::to_string(&attachment).unwrap()).unwrap();
+        let picture: Attachment = serde_json::from_str(
+            r#"{"name":"chart.png","mime":"image/png","size":1,"image":"1-0.png"}"#,
+        )
+        .unwrap();
+        let mut pictures = vec!["0-0.png".to_string()];
+        let context = compose_content_for_query(
+            "Original question",
+            &[restored, picture],
+            "What does page 9 say?",
+            Some(&mut pictures),
+        );
+        assert_eq!(pictures, ["0-0.png", "1-0.png"]);
+        assert!(context.contains(&crate::http::openai::picture_sentinel(1)));
+        assert!(context.contains("[Page 9 | OCR"));
+        assert!(context.contains("forty two tonnes"));
+        assert!(!context.contains("Original PDF text"));
+    }
+
+    #[test]
     fn extracts_plain_text_and_reports_size() {
         let att = extract(&incoming("notes.txt", "text/plain", b"hello there")).unwrap();
         assert_eq!(att.text.as_deref(), Some("hello there"));
@@ -536,6 +605,7 @@ mod tests {
                 mime: "text/plain".into(),
                 size: 4,
                 text: Some("BODY".into()),
+                pdf: None,
                 image: None,
                 image_bytes: None,
             },
@@ -544,6 +614,7 @@ mod tests {
                 mime: "application/octet-stream".into(),
                 size: 2048,
                 text: None,
+                pdf: None,
                 image: None,
                 image_bytes: None,
             },
@@ -552,6 +623,7 @@ mod tests {
                 mime: "image/png".into(),
                 size: 2048,
                 text: None,
+                pdf: None,
                 image: Some("1-0.png".into()),
                 image_bytes: None,
             },
@@ -573,6 +645,7 @@ mod tests {
             mime: "image/png".into(),
             size: 2048,
             text: None,
+            pdf: None,
             image: Some(name.into()),
             image_bytes: None,
         };
@@ -609,6 +682,7 @@ mod tests {
             mime: "text/markdown".into(),
             size: 0,
             text: Some("# Entities\n\n```mermaid\nerDiagram\n    A ||--o{ B : has\n```\n".into()),
+            pdf: None,
             image: None,
             image_bytes: None,
         }];

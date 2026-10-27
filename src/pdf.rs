@@ -14,7 +14,19 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 //! PDF text input and output shared by the terminal, file tools and web uploads.
-//! Reading extracts embedded text; scanned pages require OCR outside orangu.
+//! Reading preserves page references and falls back to local OCR for scans.
+
+mod extract;
+mod layout;
+mod ocr;
+mod tables;
+
+pub(crate) use tables::truncate_context;
+pub use tables::{PdfTable, PdfTableCell};
+
+pub use extract::{
+    ExtractedPdf, PageSource, PdfPageText, PdfReadOptions, extract_document, extract_upload,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use printpdf::{
@@ -33,16 +45,7 @@ pub fn is_pdf(path: &Path, bytes: &[u8]) -> bool {
 
 /// Extract text without letting a malformed document's parser panic escape.
 pub fn extract_text(bytes: &[u8]) -> Result<String> {
-    let text = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes))
-        .map_err(|_| anyhow!("PDF parser failed while reading this document"))?
-        .context("Cannot extract PDF text; the document may be damaged or password-protected")?;
-    let text = text.trim();
-    if text.is_empty() {
-        bail!(
-            "PDF contains no extractable text; scanned documents require OCR before they can be queried"
-        );
-    }
-    Ok(text.to_owned())
+    extract_document(bytes, &PdfReadOptions::default())?.context_text()
 }
 
 /// The text of each page, in order, without letting a malformed document's

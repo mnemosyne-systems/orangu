@@ -75,6 +75,9 @@ struct ReadFileRequest {
     path: String,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    start_page: Option<usize>,
+    end_page: Option<usize>,
+    query: Option<String>,
     /// Optional read mode:
     /// - `"full"` (default) — return the whole file (or the requested line range)
     /// - `"signatures"` — return only public item signatures (pub fn, pub struct,
@@ -248,14 +251,17 @@ impl ToolExecutor {
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = vec![tool(
             "show_file",
-            "Show a text file or extract PDF text for queries, whole by default, or a line range. `mode` \
-                 `signatures` or `map` gives a structural overview.",
+            "Read text/PDF. PDFs support page ranges, query keywords, page references and local OCR. \
+                 Code mode: signatures/map.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "start_line": {"type": "integer"},
                     "end_line": {"type": "integer"},
+                    "start_page": {"type": "integer", "minimum": 1},
+                    "end_page": {"type": "integer", "minimum": 1},
+                    "query": {"type": "string"},
                     "mode": {
                         "type": "string",
                         "enum": ["full", "signatures", "map"]
@@ -268,11 +274,8 @@ impl ToolExecutor {
         if !self.read_only {
             defs.push(tool(
                 "create_file",
-                "Create a file, replacing an existing one unless `overwrite` is false. \
-                     A .pdf path renders content as a searchable PDF document. \
-                     Staged in Git, never committed. A new file may get the project's \
-                     licence header on top (reported as `licensed`): read it back before \
-                     editing it by line number.",
+                "Write content; .pdf renders a searchable PDF. Replaces files unless overwrite=false. \
+                     Stages in Git. New source files may get a licence header; read back before line edits.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -847,15 +850,31 @@ impl ToolExecutor {
         let args: ReadFileRequest = serde_json::from_value(Value::Object(arguments.clone()))?;
         let path = self.resolve_workspace_path(&args.path)?;
         let read_path = path.clone();
+        let pdf_options = crate::pdf::PdfReadOptions {
+            start_page: args.start_page,
+            end_page: args.end_page,
+            query: args.query.clone(),
+        };
         let read = tokio::task::spawn_blocking(move || -> Result<_> {
             let bytes = fs::read(&read_path)?;
             if let Some(kind) = picture_type(&bytes) {
                 return Ok(Err((kind, bytes.len())));
             }
-            Ok(Ok((
-                crate::pdf::decode_text(&read_path, &bytes)?,
-                crate::pdf::is_pdf(&read_path, &bytes),
-            )))
+            let is_pdf = crate::pdf::is_pdf(&read_path, &bytes);
+            let content = if is_pdf {
+                crate::pdf::extract_document(&bytes, &pdf_options)?.context_text()?
+            } else {
+                if pdf_options.start_page.is_some()
+                    || pdf_options.end_page.is_some()
+                    || pdf_options.query.is_some()
+                {
+                    return Err(anyhow!(
+                        "Page ranges and query are available only for PDF files"
+                    ));
+                }
+                crate::pdf::decode_text(&read_path, &bytes)?
+            };
+            Ok(Ok((content, is_pdf)))
         })
         .await??;
         let (mut content, is_pdf) = match read {
@@ -873,6 +892,9 @@ impl ToolExecutor {
         if self.compression_enabled
             && args.start_line.is_none()
             && args.end_line.is_none()
+            && args.start_page.is_none()
+            && args.end_page.is_none()
+            && args.query.is_none()
             && let Ok(metadata) = fs::metadata(&path)
         {
             let mut cache = self.context_cache.lock().unwrap();
@@ -903,6 +925,9 @@ impl ToolExecutor {
             }
         }
 
+        if is_pdf {
+            return Ok(render_pdf_slice(&content, args.start_line, args.end_line));
+        }
         Ok(match args.mode.as_deref() {
             Some("signatures") => extract_signatures(&content),
             Some("map") => extract_map(&content),
@@ -1055,7 +1080,7 @@ impl ToolExecutor {
         if is_pdf || bytes.starts_with(b"%PDF-") {
             let text =
                 tokio::task::spawn_blocking(move || crate::pdf::extract_text(&bytes)).await??;
-            return Ok(truncate_text(&text, max_chars));
+            return Ok(crate::pdf::truncate_context(&text, max_chars));
         }
         let body = String::from_utf8_lossy(&bytes);
         if content_type.contains("html") {
@@ -1300,6 +1325,36 @@ fn render_file_slice(content: &str, start_line: Option<usize>, end_line: Option<
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_pdf_slice(content: &str, start_line: Option<usize>, end_line: Option<usize>) -> String {
+    let start = start_line.unwrap_or(1);
+    let end = end_line.unwrap_or(usize::MAX);
+    let lines: Vec<_> = content.lines().collect();
+    let mut out = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        if lines[index] == "<table>" {
+            let close = lines[index..]
+                .iter()
+                .position(|line| *line == "</table>")
+                .map(|offset| index + offset)
+                .unwrap_or(lines.len() - 1);
+            if index + 1 >= start && close < end {
+                out.extend((index..=close).map(|i| format!("{}. {}", i + 1, lines[i])));
+            } else if index < end && close + 1 >= start {
+                out.push("[An entire table was omitted because the line range cuts through it. Use PDF page ranges to read complete tables.]".into());
+            }
+            index = close + 1;
+        } else {
+            let number = index + 1;
+            if number >= start && number <= end {
+                out.push(format!("{number}. {}", lines[index]));
+            }
+            index += 1;
+        }
+    }
+    out.join("\n")
 }
 
 pub fn resolve_workspace_path(workspace: &Path, raw_path: &str) -> Result<PathBuf> {
@@ -1696,6 +1751,22 @@ mod tests {
                 .unwrap()
                 .starts_with("[cached]")
         );
+    }
+
+    #[test]
+    fn pdf_limits_never_expose_partial_table_rows() {
+        let text = "Header\n<table>\n<caption>Values</caption>\n<tr><td>123</td><td>456</td></tr>\n</table>\nFooter";
+        let limited = crate::pdf::truncate_context(text, text.find("456").unwrap());
+        assert!(limited.contains("An entire table"));
+        assert!(!limited.contains("123"));
+        assert!(!limited.contains("<table>"));
+        let sliced = render_pdf_slice(text, Some(3), Some(4));
+        assert!(sliced.contains("An entire table"));
+        assert!(!sliced.contains("123"));
+        let complete = render_pdf_slice(text, Some(2), Some(5));
+        assert!(complete.contains("123"));
+        assert!(complete.contains("</table>"));
+        assert!(!complete.contains("omitted"));
     }
 
     #[tokio::test]

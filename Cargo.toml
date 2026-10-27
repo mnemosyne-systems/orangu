@@ -73,6 +73,11 @@ infer = "0.22.0"
 mime_guess = "2.0.5"
 base64 = "0.23.1"
 pdf-extract = "0.12.0"
+pdfni = { version = "0.2.0", default-features = false }
+imageproc = { version = "0.27.0", default-features = false }
+hayro = "0.8.0"
+ocrs = { version = "0.13.1", default-features = false, features = ["onnx"] }
+rten = { version = "0.26.0", default-features = false, features = ["onnx_format"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
 calamine = "0.37.0"

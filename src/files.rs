@@ -365,9 +365,11 @@ pub struct DeleteFileResponse {
 }
 
 /// `POST /v1/show_file`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ShowFileRequest {
     pub path: String,
+    #[serde(flatten)]
+    pub pdf: crate::pdf::PdfReadOptions,
 }
 
 #[derive(Debug, Serialize)]
@@ -837,9 +839,18 @@ pub fn show(workspace: &Path, request: ShowFileRequest) -> FileResult<ShowFileRe
     }
     let bytes = std::fs::read(&path).map_err(|err| FileError::Io(format!("{display}: {err}")))?;
     let content = if crate::pdf::is_pdf(&path, &bytes) {
-        crate::pdf::extract_text(&bytes)
+        crate::pdf::extract_document(&bytes, &request.pdf)
+            .and_then(|doc| doc.context_text())
             .map_err(|err| FileError::BadRequest(format!("{display}: {err:#}")))?
     } else {
+        if request.pdf.start_page.is_some()
+            || request.pdf.end_page.is_some()
+            || request.pdf.query.is_some()
+        {
+            return Err(FileError::BadRequest(
+                "Page ranges and query are available only for PDF files".into(),
+            ));
+        }
         String::from_utf8(bytes)
             .map_err(|_| FileError::NotUtf8(format!("{display}: not valid UTF-8")))?
     };
@@ -1419,6 +1430,7 @@ mod tests {
     fn show_request(path: &str) -> ShowFileRequest {
         ShowFileRequest {
             path: path.to_string(),
+            ..Default::default()
         }
     }
 

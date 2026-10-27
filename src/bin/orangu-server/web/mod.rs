@@ -823,13 +823,26 @@ async fn send_message(
 
     // Decode + extract text from every attachment up front, so the prompt
     // and the persisted turn share exactly the same view of them.
-    let mut extracted: Vec<Attachment> = Vec::with_capacity(req.attachments.len());
-    for incoming in &req.attachments {
-        match attachments::extract(incoming) {
-            Ok(att) => extracted.push(att),
-            Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+    // OCR is CPU work. Keep it off the async request workers.
+    let incoming = req.attachments;
+    let mut extracted = match tokio::task::spawn_blocking(move || {
+        incoming
+            .iter()
+            .map(attachments::extract)
+            .collect::<anyhow::Result<Vec<Attachment>>>()
+    })
+    .await
+    {
+        Ok(Ok(attachments)) => attachments,
+        Ok(Err(err)) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("attachment extraction failed: {err}"),
+            )
+                .into_response();
         }
-    }
+    };
 
     if req.content.trim().is_empty() && extracted.is_empty() {
         return (StatusCode::BAD_REQUEST, "message is empty").into_response();
@@ -1328,9 +1341,10 @@ fn render_prompt(
         .map(|m: &SessionMessage| {
             ChatMessage::text(
                 &m.role,
-                &attachments::compose_content(
+                &attachments::compose_content_for_query(
                     &m.content,
                     &m.attachments,
+                    new_message,
                     seen.then_some(&mut pictures),
                 ),
             )
