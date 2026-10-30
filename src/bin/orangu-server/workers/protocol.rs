@@ -44,7 +44,8 @@ pub const PROTOCOL_VERSION: u16 = 2;
 /// Optional extensions this build understands, one bit each: a parent
 /// sends a child a message of an extension only when the child's
 /// `HelloAck` advertised its bit, so peers without it still talk.
-pub const FEATURES: u64 = FEATURE_FORK | FEATURE_ROWS | FEATURE_HEAD | FEATURE_ECHO | FEATURE_STATE;
+pub const FEATURES: u64 =
+    FEATURE_FORK | FEATURE_ROWS | FEATURE_HEAD | FEATURE_ECHO | FEATURE_STATE | FEATURE_METRICS;
 
 /// [`Message::Fork`]: a worker copies one session's rows into another.
 pub const FEATURE_FORK: u64 = 1;
@@ -71,6 +72,14 @@ pub const FEATURE_SWITCH: u64 = 16;
 /// alone too.
 pub const FEATURE_STATE: u64 = 32;
 
+/// A `HelloAck` that ends with a list of [`DiscoveryRecord`]s: each node
+/// in the tree reports where Prometheus can scrape it. A child sends the
+/// list only when the parent's `Hello` advertised this bit. The list is
+/// written at the very end of the message, so older versions of
+/// orangu-server — which stop reading when the message runs out — lose
+/// nothing and never see it.
+pub const FEATURE_METRICS: u64 = 64;
+
 /// The extensions `features` advertises, by name, for `/v1/workers`.
 pub fn feature_names(features: u64) -> Vec<&'static str> {
     [
@@ -80,6 +89,7 @@ pub fn feature_names(features: u64) -> Vec<&'static str> {
         (FEATURE_ECHO, "echo"),
         (FEATURE_SWITCH, "switch"),
         (FEATURE_STATE, "state"),
+        (FEATURE_METRICS, "metrics"),
     ]
     .into_iter()
     .filter(|(bit, _)| features & bit != 0)
@@ -404,6 +414,36 @@ pub struct HelloAck {
     /// empty), so a parent knows before planning whether it runs the same.
     /// Appended; `None` from a node that does not say.
     pub model: Option<ModelIdentity>,
+    /// Where every node of this tree can be scraped by Prometheus this
+    /// node's own address first, then every node below it, as each of
+    /// them reported it. A parent collects the whole tree this way, one
+    /// hop at a time. A node with no metrics listener sends an empty
+    /// list. Written at the very end of the message, so a reader that
+    /// does not know it just ignores it.
+    pub discovery: Vec<DiscoveryRecord>,
+}
+
+/// One entry in the tree's phone book: a node's name and the address
+/// where Prometheus finds its metrics page.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct DiscoveryRecord {
+    /// The node's name from its config, as plans print it (for example
+    /// `ad:8402`). This never changes across restarts. The handshake also
+    /// carries an `id`, but that one is random every start and exists only
+    /// to catch a node dialing itself a label needs a name that stays.
+    pub node: String,
+    /// The address others used to reach this node as a worker. Nobody
+    /// connects with it — it only tags metrics, spelled exactly like the
+    /// `worker` label on the parent's `worker_up` series, so data from two
+    /// places can be joined by name. It is always a real address: when a
+    /// parent passes its child's card up, it replaces the child's
+    /// `0.0.0.0` bind (`0.0.0.0` means "all network cards" and is not an
+    /// address you can visit). An address recorded two or more hops up may
+    /// only make sense on the machine it was dialed from.
+    pub worker: String,
+    /// Host and port of this node's metrics listener.
+    pub metrics_host: String,
+    pub metrics_port: u16,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -759,6 +799,15 @@ impl Writer {
         self.fixed(&i.header_hash);
         self.fixed(&i.range_hash);
     }
+    fn discovery(&mut self, records: &[DiscoveryRecord]) {
+        self.u32(records.len() as u32);
+        for r in records {
+            self.string(&r.node);
+            self.string(&r.worker);
+            self.string(&r.metrics_host);
+            self.u16(r.metrics_port);
+        }
+    }
     fn error(&mut self, e: &WorkerError) {
         self.u8(e.code.tag());
         self.string(&e.message);
@@ -905,6 +954,23 @@ impl<'a> Reader<'a> {
             range_hash: self.fixed()?,
         })
     }
+    fn discovery(&mut self) -> Result<Vec<DiscoveryRecord>> {
+        // Each record holds four texts and one port. A text always costs
+        // at least 4 bytes (its length marker), so the count is checked
+        // against the bytes actually present — a made-up count fails
+        // instead of being believed.
+        let n = self.count(14)?;
+        (0..n)
+            .map(|_| {
+                Ok(DiscoveryRecord {
+                    node: self.string()?,
+                    worker: self.string()?,
+                    metrics_host: self.string()?,
+                    metrics_port: self.u16()?,
+                })
+            })
+            .collect()
+    }
     fn error(&mut self) -> Result<WorkerError> {
         Ok(WorkerError {
             code: ErrorCode::from_tag(self.u8()?),
@@ -960,6 +1026,9 @@ impl Message {
                 }
                 if let Some(model) = &h.model {
                     w.identity(model);
+                }
+                if !h.discovery.is_empty() {
+                    w.discovery(&h.discovery);
                 }
                 tag::HELLO_ACK
             }
@@ -1117,6 +1186,11 @@ impl Message {
                     None
                 } else {
                     Some(r.identity()?)
+                },
+                discovery: if r.0.is_empty() {
+                    Vec::new()
+                } else {
+                    r.discovery()?
                 },
             }),
             tag::AUTH => Self::Auth { proof: r.fixed()? },
@@ -1353,6 +1427,20 @@ mod tests {
                 }],
             },
             model: Some(identity()),
+            discovery: vec![
+                DiscoveryRecord {
+                    node: "n1".to_string(),
+                    worker: "n1:8400".to_string(),
+                    metrics_host: "10.0.0.1".to_string(),
+                    metrics_port: 8102,
+                },
+                DiscoveryRecord {
+                    node: "n2".to_string(),
+                    worker: "127.0.0.1:8401".to_string(),
+                    metrics_host: "10.0.0.2".to_string(),
+                    metrics_port: 8102,
+                },
+            ],
         }));
         round_trip(Message::Auth { proof: [1; 32] });
         round_trip(Message::Assign(Assign {
@@ -1468,6 +1556,25 @@ mod tests {
             Message::decode(tag, &payload).unwrap(),
             Message::Release { session: 9 }
         );
+    }
+
+    /// A message with nothing added at the end — the shape an older
+    /// version of orangu-server sends — comes back with no model and no
+    /// discovery records, instead of failing.
+    #[test]
+    fn an_ack_without_appended_fields_decodes_to_empty() {
+        let ack = HelloAck {
+            version: PROTOCOL_VERSION,
+            features: 5,
+            nonce: [4; 32],
+            proof: [9; 32],
+            node: "n1".to_string(),
+            subtree: vec!["n1".to_string()],
+            capacity: Capacity::default(),
+            model: None,
+            discovery: Vec::new(),
+        };
+        round_trip(Message::HelloAck(ack));
     }
 
     #[test]

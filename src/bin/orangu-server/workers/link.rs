@@ -31,8 +31,8 @@
 use super::auth;
 use super::metrics::LinkMetrics;
 use super::protocol::{
-    Capacity, ErrorCode, FEATURES, Hello, Message, PROTOCOL_VERSION, WorkerError, check_path,
-    read_frame, read_message, write_message,
+    Capacity, DiscoveryRecord, ErrorCode, FEATURES, Hello, Message, PROTOCOL_VERSION, WorkerError,
+    check_path, read_frame, read_message, write_message,
 };
 use super::stage::Exchange;
 use super::transport::{self, Tls};
@@ -55,6 +55,11 @@ pub struct ChildInfo {
     pub node: String,
     pub subtree: Vec<String>,
     pub capacity: Capacity,
+    /// The cards this worker handed over in the handshake: its own
+    /// metrics address first, then every node below it. Passed upward
+    /// with this parent's own handshake, so the cards climb one hop at
+    /// a time.
+    pub discovery: Vec<DiscoveryRecord>,
     /// The extensions it understands (`protocol::FEATURES`).
     pub features: u64,
     /// The link's round trip and bandwidth (bytes a second each way), as
@@ -304,6 +309,7 @@ impl ChildLink {
             node: ack.node,
             subtree: ack.subtree,
             capacity: ack.capacity,
+            discovery: ack.discovery,
             features: ack.features,
             link: None,
             model: ack.model,

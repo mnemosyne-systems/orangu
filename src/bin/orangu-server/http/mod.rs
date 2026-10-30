@@ -710,13 +710,17 @@ impl http_body::Body for TrackedBody {
     }
 }
 
-/// The dedicated metrics listener's router (see `main.rs`) — `/metrics` and
-/// a static landing page at `/`, with no [`require_api_key`] layer. Keep it
-/// that way: don't merge this into [`build_router`] or add other routes to it.
+/// The routes of the dedicated metrics listener (see `main.rs`):
+/// `/metrics`, `/targets`, and a little page at `/`, all served without
+/// the [`require_api_key`] check. Keep it to exactly these three: don't
+/// merge with [`build_router`] and don't add more routes here.
+/// (`/targets` belongs here because it is Prometheus's map of the tree,
+/// as `/metrics` is its numbers.)
 pub fn build_metrics_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(native::metrics_index))
         .route("/metrics", get(native::metrics))
+        .route("/targets", get(native::targets))
         .with_state(state)
 }
 

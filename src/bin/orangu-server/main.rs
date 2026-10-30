@@ -2931,6 +2931,13 @@ fn prepare(args: Args) -> Result<Prepared> {
                 let n_ctx = requested_context(args.context, conf.context)
                     .unwrap_or(model.config().n_ctx_train)
                     .min(model.config().n_ctx_train);
+                // The metrics listener's effective address, as `main` binds
+                // it below: what this node reports as its scrape target.
+                let metrics_host = match conf.metrics_host_explicit {
+                    true => conf.metrics_host.as_str(),
+                    false => args.listen.host.as_deref().unwrap_or(&conf.host),
+                };
+                let metrics_port = args.listen.metrics.unwrap_or(conf.metrics);
                 let node = start_workers_node(
                     workers_conf,
                     &model,
@@ -2945,6 +2952,8 @@ fn prepare(args: Args) -> Result<Prepared> {
                     slots.total(),
                     conf.prompt_weights,
                     &backend_label,
+                    metrics_host,
+                    metrics_port,
                     // A picture or video model's text encoder is not split:
                     // such a node serves only as a worker.
                     image.is_none() && video.is_none(),
@@ -4106,6 +4115,8 @@ fn start_workers_node(
     slots: usize,
     prompt_weights: engine::prompt_weights::PromptWeights,
     backend_label: &str,
+    metrics_host: &str,
+    metrics_port: u16,
     split: bool,
 ) -> Result<Arc<workers::node::Node>> {
     let host = config::resolve_bind_host(&workers_conf.host);
@@ -4121,6 +4132,25 @@ fn start_workers_node(
         );
     }
     let hostname = sysinfo::System::host_name().unwrap_or_else(|| "node".to_string());
+    // The address this node reports to its parent as "scrape me here":
+    // the metrics listener's address unless the listener listens on all
+    // interfaces (`0.0.0.0`), which nobody can call, so then an explicit
+    // override, else the machine's name. No listener (port 0) reports
+    // nothing.
+    let metrics_endpoint = (metrics_port != 0).then(|| {
+        let host = workers_conf
+            .advertise_host
+            .clone()
+            .filter(|h| !config::resolve_bind_host(h).eq_ignore_ascii_case("0.0.0.0"))
+            .unwrap_or_else(|| {
+                if config::resolve_bind_host(metrics_host).eq_ignore_ascii_case("0.0.0.0") {
+                    hostname.clone()
+                } else {
+                    metrics_host.to_string()
+                }
+            });
+        (host, metrics_port)
+    });
     let settings = workers::node::NodeSettings {
         name: format!("{hostname}:{}", workers_conf.port),
         listen: Some(format!("{host}:{}", workers_conf.port)),
@@ -4184,6 +4214,7 @@ fn start_workers_node(
             workers_conf.tls_ca.as_deref(),
         )
         .context("setting up TLS for [workers]")?,
+        metrics_endpoint,
         prompt_weights,
     };
     let held = workers::clock::start();

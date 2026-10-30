@@ -644,6 +644,12 @@ pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     )
 }
 
+/// `GET /targets`: the tree as a list of machines for Prometheus to
+/// scrape, this node first.
+pub async fn targets() -> impl IntoResponse {
+    Json(crate::workers::node::discovery_json())
+}
+
 const METRICS_INDEX_HTML: &str = include_str!("assets/metrics.html");
 
 /// Static landing page for `GET /` on the dedicated metrics port.

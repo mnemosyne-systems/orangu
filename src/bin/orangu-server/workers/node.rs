@@ -39,9 +39,9 @@ use super::metrics::{LinkSnapshot, NodeMetrics};
 use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage, Trace};
 use super::plan;
 use super::protocol::{
-    ActivationFormat, Assign, Capacity, ErrorCode, FEATURE_SWITCH, FEATURES, HelloAck, MAX_DEPTH,
-    Message, NodeSetup, PROTOCOL_VERSION, PlanEntry, WorkerError, check_path, read_frame,
-    read_message, write_message,
+    ActivationFormat, Assign, Capacity, DiscoveryRecord, ErrorCode, FEATURE_METRICS,
+    FEATURE_SWITCH, FEATURES, HelloAck, MAX_DEPTH, Message, NodeSetup, PROTOCOL_VERSION, PlanEntry,
+    WorkerError, check_path, read_frame, read_message, write_message,
 };
 use super::session::SessionStore;
 use super::stage::{EncodedStage, MessageStage};
@@ -159,6 +159,11 @@ pub struct NodeSettings {
     pub readmit: Duration,
     /// TLS for the listener and for dialing workers, when configured.
     pub tls: Option<Tls>,
+    /// Where this node's own metrics page lives, as `host` and `port`:
+    /// the address it tells its parent about, so Prometheus can find it.
+    /// `None` when the metrics listener is off then the node reports no
+    /// address for itself.
+    pub metrics_endpoint: Option<(String, u16)>,
     /// `prompt_weights`: how a top-level node decides the copies its tree
     /// runs prompts through (`engine::prompt_weights::decide`).
     pub prompt_weights: prompt_weights::PromptWeights,
@@ -389,6 +394,44 @@ pub fn status_json() -> serde_json::Value {
         Some(node) => node.status(),
         None => serde_json::json!({ "role": "none" }),
     }
+}
+
+/// The tree as a fresh list Prometheus reads, recounted at every visit.
+/// A dropped node disappears next call its data fades out, never reads
+/// zero, so alerts use `absent()` or the parent's `worker_up`, not
+/// `up == 0`.
+pub fn discovery_json() -> serde_json::Value {
+    match NODE.get() {
+        Some(node) => serde_json::Value::Array(node.discovery_targets()),
+        None => serde_json::Value::Array(Vec::new()),
+    }
+}
+
+/// One entry: an address Prometheus can scrape, plus labels every value
+/// from that machine will carry. Label names are fixed here in the code;
+/// only the values come from the tree.
+fn sd_target(record: &DiscoveryRecord, via: Option<String>) -> serde_json::Value {
+    let mut labels = serde_json::Map::new();
+    labels.insert(
+        "node".to_string(),
+        serde_json::Value::String(record.node.clone()),
+    );
+    // Spelled to match the parent's `worker_up{worker=...}` label, so the
+    // two can be joined.
+    if !record.worker.is_empty() {
+        labels.insert(
+            "worker".to_string(),
+            serde_json::Value::String(record.worker.clone()),
+        );
+    }
+    // Which branch it came through — the top never talks deeper than one hop.
+    if let Some(via) = via {
+        labels.insert("via".to_string(), serde_json::Value::String(via));
+    }
+    serde_json::json!({
+        "targets": [format!("{}:{}", record.metrics_host, record.metrics_port)],
+        "labels": labels,
+    })
 }
 
 impl Node {
@@ -680,10 +723,24 @@ impl Node {
             .iter()
             .map(|link| {
                 let info = link.info();
+                // The child's own record is always first (see
+                // anything after it is a grandchild. An empty
+                // address means its metrics listener is disabled.
+                let metrics = info
+                    .as_ref()
+                    .and_then(|i| i.discovery.first())
+                    .filter(|r| r.metrics_port != 0)
+                    .map(|r| {
+                        serde_json::json!({
+                            "host": r.metrics_host,
+                            "port": r.metrics_port,
+                        })
+                    });
                 serde_json::json!({
                     "address": link.addr,
                     "connected": info.is_some(),
                     "node": info.as_ref().map(|i| i.node.clone()),
+                    "metrics": metrics,
                     "subtree_nodes": info.as_ref().map(|i| i.capacity.subtree_nodes),
                     "features": info.as_ref().map(|i| super::protocol::feature_names(i.features)),
                     "setups": info.as_ref().map(|i| setups_json(&i.capacity.setups)),
@@ -694,6 +751,13 @@ impl Node {
                 })
             })
             .collect();
+        // This node's own metrics address; not shown when the metrics
+        // listener is off.
+        let record = self.self_record();
+        let metrics = (record.metrics_port != 0).then_some(serde_json::json!({
+            "host": record.metrics_host,
+            "port": record.metrics_port,
+        }));
         serde_json::json!({
             "node": self.id,
             "name": self.settings.name,
@@ -751,6 +815,8 @@ impl Node {
                 })
                 .cloned()
                 .collect::<Vec<_>>(),
+            // This node's own metrics address, for Prometheus's tree list.
+            "metrics": metrics,
         })
     }
 
@@ -763,6 +829,81 @@ impl Node {
             }
         }
         ids
+    }
+
+    /// One entry per node with a metrics address me first, then my
+    /// children's cards, each tagged `via`; built fresh, so a lost child vanishes.
+    fn discovery_targets(&self) -> Vec<serde_json::Value> {
+        let mut targets = Vec::new();
+        let record = self.self_record();
+        if record.metrics_port != 0 {
+            targets.push(sd_target(&record, None));
+        }
+        for link in &self.links {
+            let Some(info) = link.info() else {
+                continue;
+            };
+            let mut records = info.discovery.iter();
+            // First record = the child itself; rewrite its `worker` with the
+            // address I dialed, matching `worker_up{worker=...}` exactly.
+            if let Some(record) = records.next()
+                && record.metrics_port != 0
+            {
+                let mut first = record.clone();
+                first.worker = link.addr.clone();
+                targets.push(sd_target(&first, Some(link.addr.clone())));
+            }
+            for record in records {
+                // No metrics listener behind it: Prometheus could never
+                // reach it.
+                if record.metrics_port == 0 {
+                    continue;
+                }
+                targets.push(sd_target(record, Some(link.addr.clone())));
+            }
+        }
+        targets
+    }
+
+    /// This node's own card, always present (address may be empty) its
+    /// top spot in the list marks it as this parent's direct child.
+    fn self_record(&self) -> DiscoveryRecord {
+        let (metrics_host, metrics_port) =
+            self.settings.metrics_endpoint.clone().unwrap_or_default();
+        DiscoveryRecord {
+            node: self.settings.name.clone(),
+            // The address the system actually bound, not the settings'
+            // `:0`/`0.0.0.0`, which nobody can dial.
+            worker: self
+                .local_addr
+                .map(|addr| addr.to_string())
+                .unwrap_or_default(),
+            metrics_host,
+            metrics_port,
+        }
+    }
+
+    /// What this handshake sends up: my card first, then the connected
+    /// children's, with each child's `worker` rewritten to the dialed
+    /// address; empty when the parent lacks `FEATURE_METRICS`.
+    fn discovery_for_parent(&self, parent_features: u64) -> Vec<DiscoveryRecord> {
+        if parent_features & FEATURE_METRICS == 0 {
+            return Vec::new();
+        }
+        let mut out = vec![self.self_record()];
+        for link in &self.links {
+            let Some(info) = link.info() else {
+                continue;
+            };
+            let mut records = info.discovery.iter();
+            if let Some(record) = records.next() {
+                let mut first = record.clone();
+                first.worker = link.addr.clone();
+                out.push(first);
+            }
+            out.extend(records.cloned());
+        }
+        out
     }
 
     fn subtree_capacity(&self) -> Capacity {
@@ -2144,6 +2285,7 @@ impl Node {
             subtree: self.subtree_ids(),
             capacity: self.subtree_capacity(),
             model: Some(self.identity.clone()),
+            discovery: self.discovery_for_parent(hello.features),
         });
         write_message(writer, 0, &ack).ok()?;
         let proof = match read_message(reader) {
@@ -2689,6 +2831,7 @@ mod tests {
             maintenance: Duration::from_millis(50),
             readmit: Duration::from_millis(200),
             tls: None,
+            metrics_endpoint: None,
             prompt_weights: prompt_weights::PromptWeights::File,
         }
     }
@@ -2752,6 +2895,79 @@ mod tests {
         let split = top.delegating_model().unwrap();
         assert_eq!(run(split.as_ref(), &tokens, 5), whole);
         assert_eq!(split.active_sessions(), 0);
+        for n in [&top, &middle, &leaf] {
+            n.stop();
+        }
+    }
+
+    /// A tree of three nodes answers with one list at the top: every
+    /// node's scrapable metrics address, each tagged with the branch it
+    /// came through — exactly what `GET /targets` gives Prometheus.
+    #[test]
+    fn a_pyramids_discovery_reaches_the_top() {
+        fn endpointed(name: &str, workers: Vec<String>, port: u16) -> NodeSettings {
+            let mut settings = settings(name, workers, None);
+            settings.metrics_endpoint = Some(("127.0.0.1".to_string(), port));
+            settings
+        }
+        let leaf = node_with(endpointed("leaf", vec![], 9171), Variant::default());
+        let middle = node_with(
+            endpointed("middle", vec![leaf.local_addr().unwrap().to_string()], 9172),
+            Variant::default(),
+        );
+        let top = node_with(
+            endpointed("top", vec![middle.local_addr().unwrap().to_string()], 9173),
+            Variant::default(),
+        );
+        // Planning connects the links; the middle hands its subtree's
+        // records up with its own handshake.
+        let _ = top.plan();
+        let mid_addr = middle.local_addr().unwrap().to_string();
+        let mut targets = Vec::new();
+        for _ in 0..50 {
+            targets = top.discovery_targets();
+            if targets.len() == 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(targets.len(), 3, "{targets:?}");
+        let label =
+            |t: &serde_json::Value, key: &str| t["labels"][key].as_str().map(str::to_string);
+        let nodes: std::collections::HashSet<&str> = targets
+            .iter()
+            .filter_map(|t| t["labels"]["node"].as_str())
+            .collect();
+        assert_eq!(nodes, ["top", "middle", "leaf"].into_iter().collect());
+        for t in &targets {
+            let node = label(t, "node").unwrap();
+            let port = match node.as_str() {
+                "top" => 9173,
+                "middle" => 9172,
+                "leaf" => 9171,
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                t["targets"][0].as_str().unwrap(),
+                &format!("127.0.0.1:{port}")
+            );
+            if node == "top" {
+                assert!(label(t, "via").is_none(), "{t}");
+            } else {
+                // Both descendants sit under the top's one direct child.
+                assert_eq!(label(t, "via").as_deref(), Some(mid_addr.as_str()), "{t}");
+            }
+        }
+        // The middle's entry carries the address the top dialed it at —
+        // the same string its `worker_up{worker=...}` series uses.
+        let middle_target = targets
+            .iter()
+            .find(|t| label(t, "node").as_deref() == Some("middle"))
+            .unwrap();
+        assert_eq!(
+            label(middle_target, "worker").as_deref(),
+            Some(mid_addr.as_str())
+        );
         for n in [&top, &middle, &leaf] {
             n.stop();
         }

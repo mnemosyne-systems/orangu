@@ -206,6 +206,14 @@ pub struct WorkersConfiguration {
     /// its workers — defaulting to its own `tls_cert`, so a tree sharing one
     /// certificate needs nothing more. With neither, it dials in the clear.
     pub tls_ca: Option<PathBuf>,
+    /// `[workers].advertise_host`: the host name this node gives out for
+    /// its metrics page when its parent collects the tree for Prometheus.
+    /// Defaults to the metrics listener's own host, or the machine's name
+    /// when the listener listens everywhere (`all`/`0.0.0.0`) —
+    /// `0.0.0.0` is not an address anyone can visit. Set it when the
+    /// default answers wrong, which on trees across several machines it
+    /// often does.
+    pub advertise_host: Option<String>,
 }
 
 /// `[workers].offload`: whether a top-level node uses its workers when it
@@ -1677,6 +1685,10 @@ pub fn load_server_configuration(
                     .map(|v| v.trim())
                     .filter(|v| !v.is_empty())
                     .map(expand_tilde),
+                advertise_host: workers_section
+                    .get("advertise_host")
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
             })
         }
         None => None,
@@ -2784,6 +2796,25 @@ mod tests {
                 .unwrap()
                 .local_layers,
             LocalLayers::Auto
+        );
+    }
+
+    #[test]
+    fn the_workers_advertise_host_is_optional() {
+        assert_eq!(workers_section("").unwrap().unwrap().advertise_host, None);
+        assert_eq!(
+            workers_section("advertise_host = \n")
+                .unwrap()
+                .unwrap()
+                .advertise_host,
+            None
+        );
+        assert_eq!(
+            workers_section("advertise_host = metrics.internal\n")
+                .unwrap()
+                .unwrap()
+                .advertise_host,
+            Some("metrics.internal".to_string())
         );
     }
 
