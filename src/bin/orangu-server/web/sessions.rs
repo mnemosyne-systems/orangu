@@ -191,7 +191,7 @@ struct SessionActivity {
 /// (`mark_active`) or a one-off liveness check (`is_active`/
 /// `sweep_empty_sessions`), never in a hot per-token loop.
 fn process_start_time(pid: u32) -> Option<u64> {
-    let mut system = System::new();
+    let mut system = System::new().ok()?;
     system.refresh_processes(ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
     system.process(Pid::from_u32(pid)).map(|p| p.start_time())
 }

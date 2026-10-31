@@ -37,42 +37,42 @@ path = "src/bin/orangu-gguf/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
-arboard = { version = "3.6.1", default-features = false }
+arboard = { version = "3.7.0", default-features = false }
 axum = { version = "0.8.9", features = ["multipart"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
 home = "0.5.12"
-html2text = "0.17.1"
-ignore = "0.4.33"
-globset = "0.4.20"
+html2text = "0.17.4"
+ignore = "0.4.34"
+globset = "0.4.21"
 markdown = "1.0.0"
-merman = { version = "0.7.0", features = ["render"] }
+merman = { version = "0.9.3", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape"] }
 printpdf = { version = "0.12.8", default-features = false, features = ["text_layout", "png"] }
 regex = "1.13"
-resvg = { version = "0.48.1", default-features = false, features = ["text", "raster-images"] }
-rmcp = { version = "3.3.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+resvg = { version = "0.49.0", default-features = false, features = ["text", "raster-images"] }
+rmcp = { version = "3.8.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 rustc-hash = "2.1"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls", "stream", "blocking"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 http-body = "1.1"
-rustyline = "18.0.1"
+rustyline = "19.0.0"
 rayon = "1.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 serde_yaml = "0.9.34"
 syntect = { version = "5.3.0", features = ["html"] }
 terminal_size = "0.4.4"
 ttf-parser = "0.25.1"
-sha2 = "0.11.0"
-tiktoken-rs = "0.12.0"
-tokio = { version = "1.53.1", features = ["full"] }
-tokio-util = { version = "0.7.19", features = ["io"] }
+sha2 = "0.11.1"
+tiktoken-rs = "0.12.1"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", features = ["io"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2.5.0"
 infer = "0.22.0"
 mime_guess = "2.0.5"
 base64 = "0.23.1"
-pdf-extract = "0.12.0"
+pdf-extract = "0.12.1"
 pdfni = { version = "0.2.0", default-features = false }
 imageproc = { version = "0.27.0", default-features = false }
 hayro = "0.8.0"
@@ -82,14 +82,14 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 rav1e = { version = "0.8.1", default-features = false, features = ["threading"] }
 calamine = "0.37.0"
 chrono = "0.4.45"
-zip = "9.0.5"
+zip = "9.2.0"
 quick-xml = "0.42.0"
 strum = "0.28.0"
 strum_macros = "0.28.0"
 tree-sitter-c = "0.24"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-ruby = "0.23"
-tree-sitter-php = "0.24"
+tree-sitter-php = "0.25"
 tree-sitter-bash = "0.25"
 tree-sitter-scala = "0.26"
 tree-sitter-ocaml = "0.26"
@@ -98,10 +98,10 @@ tree-sitter-lua = "0.5"
 tree-sitter-r = "1.3"
 tree-sitter-zig = "1.1"
 tree-sitter-swift = "0.7"
-tree-sitter-dart = "0.2"
-tree-sitter-erlang = "0.20"
+tree-sitter-dart = "0.3"
+tree-sitter-erlang = "0.21"
 petgraph = "0.8.3"
-tree-sitter = "0.27.0"
+tree-sitter = "0.27.1"
 tree-sitter-rust = "0.24.2"
 streaming-iterator = "0.1.9"
 tree-sitter-python = "0.25.0"
@@ -110,9 +110,9 @@ tree-sitter-go = "0.25.0"
 tree-sitter-java = "0.23.5"
 tree-sitter-cpp = "0.23.4"
 tree-sitter-typescript = "0.23.2"
-sysinfo = { version = "0.39.6", default-features = false, features = ["system", "component"] }
-minijinja = { version = "2.24", features = ["loop_controls"] }
-minijinja-contrib = { version = "2.24", features = ["pycompat"] }
+sysinfo = { version = "0.40.1", default-features = false, features = ["system", "component"] }
+minijinja = { version = "3.0", features = ["loop_controls", "serde"] }
+minijinja-contrib = { version = "3.0", features = ["pycompat"] }
 bzip2 = "0.6.1"
 flate2 = "1.1"
 tar = "0.4"
@@ -125,18 +125,18 @@ wgpu = { version = "30.0.1", default-features = false, features = ["vulkan", "me
 ash = "0.38"
 pollster = "1.0.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
-cudarc = { version = "0.19.9", features = ["cuda-12000"] }
-opencl3 = "0.12.3"
+cudarc = { version = "0.19.10", features = ["cuda-12000"] }
+opencl3 = "0.12.4"
 cubecl-hip-sys = { version = "7", optional = true }
 ratatui = "0.30.2"
 ansi-to-tui = "8.0.1"
-unicode-width = "0.2.2"
+unicode-width = "0.2.3"
 if-addrs = "0.15.0"
 libloading = "0.9"
 fern = "0.7"
 log = "0.4"
-rten-gemm = "0.26.0"
-rten-tensor = "0.26.0"
+rten-gemm = "0.27.0"
+rten-tensor = "0.27.0"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 rustls-native-certs = "0.8"
 httparse = "1"

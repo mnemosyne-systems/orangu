@@ -1907,7 +1907,9 @@ mod tests {
     /// 30 GiB board).
     fn fits_in_memory(path: &str, copies: u64) -> bool {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let mut system = sysinfo::System::new();
+        let Ok(mut system) = sysinfo::System::new() else {
+            return true;
+        };
         system.refresh_memory();
         let available = system.available_memory();
         if size.saturating_mul(copies) > available {

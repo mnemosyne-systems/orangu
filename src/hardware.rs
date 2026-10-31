@@ -236,8 +236,8 @@ impl PowerInfo {
 /// that half is per-platform below.
 pub fn detect_power() -> PowerInfo {
     let mut thermals: Vec<ThermalInfo> = sysinfo::Components::new_with_refreshed_list()
-        .list()
         .iter()
+        .flat_map(|components| components.iter())
         .filter_map(|component| {
             // A sensor present but not reporting comes back `None`, and one
             // reporting exactly 0 °C is a sensor that is not wired up rather
@@ -691,15 +691,21 @@ fn big_cores_from(mut caps: Vec<(usize, u64)>) -> Option<Vec<usize>> {
 }
 
 pub fn detect_cpu() -> CpuInfo {
-    let mut sys = System::new_with_specifics(
+    // A platform `sysinfo` cannot read reports an unknown CPU with no memory
+    // rather than failing detection outright.
+    let sys = System::new_with_specifics(
         RefreshKind::nothing()
             .with_cpu(CpuRefreshKind::everything())
             .with_memory(MemoryRefreshKind::everything()),
-    );
-    sys.refresh_cpu_all();
-    sys.refresh_memory();
+    )
+    .ok()
+    .map(|mut sys| {
+        sys.refresh_cpu_all();
+        sys.refresh_memory();
+        sys
+    });
 
-    let cpus = sys.cpus();
+    let cpus = sys.as_ref().map(|sys| sys.cpus()).unwrap_or_default();
     let brand = cpus
         .first()
         .map(|c| c.brand().trim().to_string())
@@ -715,11 +721,11 @@ pub fn detect_cpu() -> CpuInfo {
         brand,
         vendor,
         arch: System::cpu_arch(),
-        physical_cores: System::physical_core_count(),
+        physical_cores: System::physical_core_count().ok(),
         logical_cores: cpus.len(),
         frequency_mhz,
-        total_memory_bytes: sys.total_memory(),
-        available_memory_bytes: sys.available_memory(),
+        total_memory_bytes: sys.as_ref().map_or(0, |sys| sys.total_memory()),
+        available_memory_bytes: sys.as_ref().map_or(0, |sys| sys.available_memory()),
         features: detect_cpu_features(),
     }
 }

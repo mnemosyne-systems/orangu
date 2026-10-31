@@ -335,7 +335,10 @@ impl ChatTemplate {
         // two optional variables that must each be *absent* (not null) when
         // unset would otherwise need four literals kept in step.
         let mut ctx = std::collections::BTreeMap::<&str, minijinja::Value>::new();
-        ctx.insert("messages", minijinja::Value::from_serialize(messages));
+        ctx.insert(
+            "messages",
+            minijinja::Value::from(minijinja::value::Serde(messages)),
+        );
         ctx.insert(
             "add_generation_prompt",
             minijinja::Value::from(add_generation_prompt),
@@ -356,9 +359,12 @@ impl ChatTemplate {
             ctx.insert("reasoning_effort", minijinja::Value::from(reasoning_effort));
         }
         if let Some(tools) = tools {
-            ctx.insert("tools", minijinja::Value::from_serialize(tools));
+            ctx.insert(
+                "tools",
+                minijinja::Value::from(minijinja::value::Serde(tools)),
+            );
         }
-        tmpl.render(minijinja::Value::from_serialize(&ctx))
+        tmpl.render(minijinja::Value::from(minijinja::value::Serde(&ctx)))
             .map_err(|err| anyhow!("failed to render chat template: {err}"))
     }
 }
@@ -1252,7 +1258,7 @@ mod tests {
         env.get_template("t")
             .unwrap()
             .render(
-                minijinja::context! { messages => vec![serde_json::json!({"tool_calls": value})] },
+                minijinja::context! { messages => minijinja::value::Serde(vec![serde_json::json!({"tool_calls": value})]) },
             )
             .map_err(|err| anyhow!("{err}"))
     }

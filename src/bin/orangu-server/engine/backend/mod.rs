@@ -1106,8 +1106,9 @@ pub trait Backend: Send + Sync {
     /// [`tests::the_gpu_type_gap_is_exactly_what_this_comment_says`] asserts
     /// the set differences and fails if any of them moves. Read the
     /// assertions, not this paragraph, if the two ever disagree. As of that
-    /// test: `VulkanBackend` lacks only the three lowest-bit `IQ1_*` ids that
-    /// are not ggml's own (`quant`'s 64..=66); the vendor backends
+    /// test: `VulkanBackend` lacks the three lowest-bit `IQ1_*` ids that
+    /// are not ggml's own (`quant`'s 64..=66) and the two FP8 types,
+    /// `F8_E4M3` and `MXFP8` (`quant`'s 43/144); the vendor backends
     /// (`CudaBackend`/`RocmBackend`/`OpenClBackend`, which share one shader
     /// source) lack those, `MXFP4`, and Prism's ternary `PQ2_0`/`PTQ1_0`
     /// (`quant`'s 142/143). The vendor list is a strict subset of
@@ -1438,7 +1439,7 @@ mod tests {
         const NOT_A_WEIGHT: &[u32] = &[quant::GGML_TYPE_I32];
 
         // Every id `quant` can read, swept rather than listed — the highest
-        // id in the tree is 143 and the sweep is deliberately well past it, so
+        // id in the tree is 144 and the sweep is deliberately well past it, so
         // a new type lands in this set on its own.
         let cpu: Vec<u32> = (0..=255u32)
             .filter(|&t| quant::supports_type(t))
@@ -1487,14 +1488,16 @@ mod tests {
 
         assert_eq!(
             gap(vulkan),
-            ["IQ1_XS", "IQ1_XXS", "IQ1_XXXS"],
+            ["F8_E4M3", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS", "MXFP8"],
             "the set of types the CPU path reads and Vulkan has no kernel for has \
              changed; update `Backend::supports_type` and \
              `arch::gpu_project_expert`'s doc comments to match"
         );
         assert_eq!(
             gap(vendor),
-            ["MXFP4", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS", "PQ2_0", "PTQ1_0"],
+            [
+                "MXFP4", "F8_E4M3", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS", "PQ2_0", "PTQ1_0", "MXFP8"
+            ],
             "the set of types the CPU path reads and the vendor backends have no \
              kernel for has changed; update `Backend::supports_type`'s doc to match"
         );

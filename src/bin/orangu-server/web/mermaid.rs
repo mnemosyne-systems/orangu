@@ -38,16 +38,17 @@
 //!    stance [`super::render`] takes for every other node kind.
 //! 2. **The SVG has to stand alone.** An `<img>` document gets no HTML
 //!    layout engine, so Mermaid's usual `<foreignObject>` HTML labels would
-//!    render as nothing at all. [`HostThemeOutput::resvg_safe_editor`] is
-//!    the setting that turns those into plain SVG `<text>`, which is why it
-//!    is not optional here.
+//!    render as nothing at all. [`SvgPipeline::resvg_safe`] is the setting
+//!    that turns those into plain SVG `<text>`, which is why it is not
+//!    optional here.
 //!
 //! Because an `<img>` also can't inherit the page's CSS variables, each
 //! diagram is rendered twice, once per theme, and `app.css` shows whichever
 //! matches. The two SVGs are built in one pass and cached together.
 
 use base64::Engine as _;
-use merman::render::{HeadlessRenderer, HostThemeOutput, HostThemeProfile, HostThemeRoles};
+use merman::svg::{HostTheme, Presentation, SvgPipeline, ThemeRole};
+use merman::{OperationControl, RenderOutput, RenderRequest, Renderer, SvgRequest};
 use rustc_hash::FxHasher;
 use std::{
     collections::HashMap,
@@ -132,78 +133,104 @@ fn cache() -> &'static Mutex<Cache> {
 /// Merman's semantic theme roles, so a diagram sits in the transcript as if
 /// it were styled by the same stylesheet as everything around it rather than
 /// arriving in Mermaid's stock lavender.
-fn roles(dark: bool) -> HostThemeRoles {
+fn roles(dark: bool) -> &'static [(ThemeRole, &'static str)] {
     if dark {
-        HostThemeRoles {
-            canvas: Some("#23272e".into()),        // --assistant-bubble
-            surface: Some("#2a2f38".into()),       // --bg-input
-            surface_alt: Some("#2b3a55".into()),   // --user-bubble
-            surface_muted: Some("#23272e".into()), // --bg-raised
-            text: Some("#e6e8eb".into()),          // --text
-            subtle_text: Some("#9aa3b2".into()),   // --text-dim
-            border: Some("#5b9dff".into()),        // --accent
-            line: Some("#9aa3b2".into()),          // --text-dim
-            edge_label_background: Some("#23272e".into()),
-            cluster_background: Some("#2a2f38".into()),
-            cluster_border: Some("#343a45".into()), // --border
-            note_background: Some("#2b3a55".into()),
-            note_border: Some("#5b9dff".into()),
-            note_text: Some("#e6e8eb".into()),
-            actor_background: Some("#2a2f38".into()),
-            actor_border: Some("#5b9dff".into()),
-            actor_text: Some("#e6e8eb".into()),
-            error: Some("#ff6b6b".into()), // --error
-            ..HostThemeRoles::default()
-        }
+        &[
+            (ThemeRole::Canvas, "#23272e"),       // --assistant-bubble
+            (ThemeRole::Surface, "#2a2f38"),      // --bg-input
+            (ThemeRole::SurfaceAlt, "#2b3a55"),   // --user-bubble
+            (ThemeRole::SurfaceMuted, "#23272e"), // --bg-raised
+            (ThemeRole::Text, "#e6e8eb"),         // --text
+            (ThemeRole::SubtleText, "#9aa3b2"),   // --text-dim
+            (ThemeRole::Border, "#5b9dff"),       // --accent
+            (ThemeRole::Line, "#9aa3b2"),         // --text-dim
+            (ThemeRole::EdgeLabelBackground, "#23272e"),
+            (ThemeRole::ClusterBackground, "#2a2f38"),
+            (ThemeRole::ClusterBorder, "#343a45"), // --border
+            (ThemeRole::NoteBackground, "#2b3a55"),
+            (ThemeRole::NoteBorder, "#5b9dff"),
+            (ThemeRole::NoteText, "#e6e8eb"),
+            (ThemeRole::ActorBackground, "#2a2f38"),
+            (ThemeRole::ActorBorder, "#5b9dff"),
+            (ThemeRole::ActorText, "#e6e8eb"),
+            (ThemeRole::Error, "#ff6b6b"), // --error
+        ]
     } else {
-        HostThemeRoles {
-            canvas: Some("#ffffff".into()),        // --assistant-bubble
-            surface: Some("#eef0f3".into()),       // --bg-input
-            surface_alt: Some("#dbe6ff".into()),   // --user-bubble
-            surface_muted: Some("#f5f6f8".into()), // --bg
-            text: Some("#1b1e23".into()),          // --text
-            subtle_text: Some("#62697a".into()),   // --text-dim
-            border: Some("#2563eb".into()),        // --accent
-            line: Some("#62697a".into()),          // --text-dim
-            edge_label_background: Some("#ffffff".into()),
-            cluster_background: Some("#f5f6f8".into()),
-            cluster_border: Some("#d7dbe0".into()), // --border
-            note_background: Some("#dbe6ff".into()),
-            note_border: Some("#2563eb".into()),
-            note_text: Some("#1b1e23".into()),
-            actor_background: Some("#eef0f3".into()),
-            actor_border: Some("#2563eb".into()),
-            actor_text: Some("#1b1e23".into()),
-            error: Some("#d92d20".into()), // --error
-            ..HostThemeRoles::default()
-        }
+        &[
+            (ThemeRole::Canvas, "#ffffff"),       // --assistant-bubble
+            (ThemeRole::Surface, "#eef0f3"),      // --bg-input
+            (ThemeRole::SurfaceAlt, "#dbe6ff"),   // --user-bubble
+            (ThemeRole::SurfaceMuted, "#f5f6f8"), // --bg
+            (ThemeRole::Text, "#1b1e23"),         // --text
+            (ThemeRole::SubtleText, "#62697a"),   // --text-dim
+            (ThemeRole::Border, "#2563eb"),       // --accent
+            (ThemeRole::Line, "#62697a"),         // --text-dim
+            (ThemeRole::EdgeLabelBackground, "#ffffff"),
+            (ThemeRole::ClusterBackground, "#f5f6f8"),
+            (ThemeRole::ClusterBorder, "#d7dbe0"), // --border
+            (ThemeRole::NoteBackground, "#dbe6ff"),
+            (ThemeRole::NoteBorder, "#2563eb"),
+            (ThemeRole::NoteText, "#1b1e23"),
+            (ThemeRole::ActorBackground, "#eef0f3"),
+            (ThemeRole::ActorBorder, "#2563eb"),
+            (ThemeRole::ActorText, "#1b1e23"),
+            (ThemeRole::Error, "#d92d20"), // --error
+        ]
     }
 }
 
-/// `resvg_safe_editor` is the load-bearing part — see this module's doc
+/// `resvg_safe` is the load-bearing part — see this module's doc
 /// comment for why `<foreignObject>` labels can't survive the `<img>`
 /// embedding. The font stack matches `app.css`'s body font so diagram text
 /// looks like transcript text.
-fn renderer(dark: bool) -> &'static HeadlessRenderer {
-    static RENDERERS: OnceLock<[HeadlessRenderer; 2]> = OnceLock::new();
+fn renderer(dark: bool) -> &'static (Renderer, SvgRequest) {
+    static RENDERERS: OnceLock<[(Renderer, SvgRequest); 2]> = OnceLock::new();
     let renderers = RENDERERS.get_or_init(|| {
         [false, true].map(|dark| {
-            let profile = HostThemeProfile::builder()
-                .font_family(
+            let theme = HostTheme::new()
+                .try_with_font_family(
                     "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif",
                 )
-                .roles(roles(dark))
-                .output(HostThemeOutput::resvg_safe_editor())
-                .build();
-            HeadlessRenderer::new()
-                .with_host_theme(&profile)
-                // Every diagram is its own isolated `<img>` document, so a
-                // fixed id is fine and keeps output byte-identical across
-                // renders of the same source.
-                .with_diagram_id("orangu-diagram")
+                .and_then(|theme| {
+                    roles(dark).iter().try_fold(theme, |theme, &(role, colour)| {
+                        theme.try_with_role(role, colour)
+                    })
+                });
+            let presentation = Presentation::new()
+                .with_theme(theme.expect("the console theme is valid CSS"))
+                .resolve();
+            let renderer =
+                Renderer::new().with_engine(presentation.materialize_engine(Default::default()));
+            let mut request = SvgRequest {
+                pipeline: Some(SvgPipeline::resvg_safe()),
+                presentation: presentation.render_policy(),
+                ..SvgRequest::default()
+            };
+            // Every diagram is its own isolated `<img>` document, so a fixed
+            // id is fine and keeps output byte-identical across renders of
+            // the same source.
+            request.options.diagram_id = Some("orangu-diagram".to_string());
+            (renderer, request)
         })
     });
     &renderers[usize::from(dark)]
+}
+
+/// One theme's SVG for `source`, or `None` when there is no diagram or it
+/// does not parse.
+fn render_svg(source: &str, dark: bool) -> Option<String> {
+    let (renderer, request) = renderer(dark);
+    let output = renderer
+        .render(RenderRequest::svg(
+            source,
+            OperationControl::new(),
+            request.clone(),
+        ))
+        .ok()?;
+    match output {
+        RenderOutput::Svg(Some(svg)) => Some(svg.svg().to_string()),
+        _ => None,
+    }
 }
 
 /// Every Mermaid diagram header, with the tokens each may legally be
@@ -343,12 +370,12 @@ pub fn render(source: &str) -> Option<&'static Diagram> {
 /// hand out a reference without cloning tens of KiB of SVG per token or
 /// holding the cache lock across the caller's use of it.
 fn render_uncached(source: &str) -> Option<&'static Diagram> {
-    // `render_svg_sync` distinguishes "no diagram here" (`Ok(None)`, e.g. a
+    // The renderer distinguishes "no diagram here" (`Svg(None)`, e.g. a
     // block mislabelled `mermaid`) from "a diagram, but it doesn't parse"
     // (`Err`). Both mean the same thing to the caller, so both collapse to
-    // `None` here.
-    let light = renderer(false).render_svg_sync(source).ok().flatten()?;
-    let dark = renderer(true).render_svg_sync(source).ok().flatten()?;
+    // `None` in `render_svg`.
+    let light = render_svg(source, false)?;
+    let dark = render_svg(source, true)?;
     Some(Box::leak(Box::new(Diagram::new(&light, &dark))))
 }
 

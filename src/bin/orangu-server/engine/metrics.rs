@@ -355,7 +355,9 @@ pub struct ProcessMetrics {
     http_total: AtomicU64,
     http_client_errors: AtomicU64,
     http_server_errors: AtomicU64,
-    system: Mutex<System>,
+    /// `None` on a platform `sysinfo` cannot read; every figure it would
+    /// give is then reported as 0.
+    system: Mutex<Option<System>>,
     pid: Pid,
     /// Unix seconds; the OS's own answer, falling back to when this was built.
     start_time_seconds: u64,
@@ -382,15 +384,17 @@ impl Default for ProcessMetrics {
 impl ProcessMetrics {
     pub fn new() -> Self {
         let pid = Pid::from_u32(std::process::id());
-        let mut system = System::new();
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
-            true,
-            ProcessRefreshKind::everything(),
-        );
+        let mut system = System::new().ok();
         let start_time_seconds = system
-            .process(pid)
-            .map(|process| process.start_time())
+            .as_mut()
+            .and_then(|system| {
+                system.refresh_processes_specifics(
+                    ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    ProcessRefreshKind::everything(),
+                );
+                system.process(pid).map(|process| process.start_time())
+            })
             .filter(|&start| start != 0)
             .unwrap_or_else(now_unix_seconds);
 
@@ -449,20 +453,25 @@ impl ProcessMetrics {
     pub fn render(&self, uptime: Duration) -> String {
         let (cpu_seconds, resident, virtual_bytes, mem_total, mem_available) = {
             let mut system = self.system.lock().unwrap_or_else(|e| e.into_inner());
-            system.refresh_processes_specifics(
-                ProcessesToUpdate::Some(&[self.pid]),
-                true,
-                ProcessRefreshKind::everything(),
-            );
-            system.refresh_memory();
-            let process = system.process(self.pid);
-            (
-                process.map_or(0.0, |p| p.accumulated_cpu_time() as f64 / 1000.0),
-                process.map_or(0, |p| p.memory()),
-                process.map_or(0, |p| p.virtual_memory()),
-                system.total_memory(),
-                system.available_memory(),
-            )
+            match system.as_mut() {
+                Some(system) => {
+                    system.refresh_processes_specifics(
+                        ProcessesToUpdate::Some(&[self.pid]),
+                        true,
+                        ProcessRefreshKind::everything(),
+                    );
+                    system.refresh_memory();
+                    let process = system.process(self.pid);
+                    (
+                        process.map_or(0.0, |p| p.accumulated_cpu_time() as f64 / 1000.0),
+                        process.map_or(0, |p| p.memory()),
+                        process.map_or(0, |p| p.virtual_memory()),
+                        system.total_memory(),
+                        system.available_memory(),
+                    )
+                }
+                None => (0.0, 0, 0, 0, 0),
+            }
         };
 
         let mut out = String::new();
@@ -621,7 +630,9 @@ fn load_average_stats() -> Vec<(String, String)> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let load = System::load_average();
+        let Ok(load) = System::load_average() else {
+            return Vec::new();
+        };
         vec![
             ("load1".to_string(), load.one.to_string()),
             ("load5".to_string(), load.five.to_string()),

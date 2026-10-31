@@ -159,7 +159,8 @@ fn collect() -> anyhow::Result<SnapshotView> {
         RefreshKind::nothing()
             .with_cpu(CpuRefreshKind::everything())
             .with_memory(MemoryRefreshKind::everything()),
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("reading system counters: {e}"))?;
     sys.refresh_cpu_usage();
     sys.refresh_memory();
     std::thread::sleep(std::time::Duration::from_millis(SAMPLE_MS));
@@ -168,7 +169,7 @@ fn collect() -> anyhow::Result<SnapshotView> {
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
     let usage_pct = sys.global_cpu_usage();
-    let per_core_pct = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
+    let per_core_pct = sys.cpus().iter().map(|c| c.usage()).collect();
     let pid = sysinfo::get_current_pid().ok();
     let process_bytes = pid.and_then(|pid| sys.process(pid)).map(|p| p.memory());
 

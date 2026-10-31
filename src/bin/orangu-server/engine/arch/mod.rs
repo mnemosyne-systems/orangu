@@ -2642,8 +2642,8 @@ fn device_expert_admissible(enabled: bool, has_gpu: bool, kernel: bool, resident
 /// tier a tier.
 ///
 /// **The kernel term is not the reason the tier does not pay.** On Vulkan it
-/// now excludes three quantizations, none of them ggml's own ids, and the
-/// whole `IQ` range that large mixture-of-experts files are shipped in is
+/// excludes three `IQ1_*` quantizations that are not ggml's own ids and the
+/// two FP8 types, and the whole `IQ` range that large mixture-of-experts files are shipped in is
 /// *not* among them — `Backend::supports_type`'s own doc names the excluded
 /// set per backend and points at the test that pins it. So a routed
 /// expert in an ordinary low-bit file reaches this path; what it then meets is

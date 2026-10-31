@@ -4128,7 +4128,7 @@ fn start_workers_node(
             workers_conf.port
         );
     }
-    let hostname = sysinfo::System::host_name().unwrap_or_else(|| "node".to_string());
+    let hostname = sysinfo::System::host_name().unwrap_or_else(|_| "node".to_string());
     let settings = workers::node::NodeSettings {
         name: format!("{hostname}:{}", workers_conf.port),
         listen: Some(format!("{host}:{}", workers_conf.port)),

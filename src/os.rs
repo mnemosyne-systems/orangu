@@ -155,23 +155,27 @@ fn directory_size(dir: &Path) -> u64 {
 /// come from `sysinfo`; the rest is filled in per-platform below and left
 /// [`None`] where a platform has no answer.
 pub fn detect() -> OsInfo {
-    let mut sys = System::new_with_specifics(
+    let (swap_total_bytes, swap_used_bytes) = System::new_with_specifics(
         RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
-    );
-    sys.refresh_memory();
+    )
+    .map(|mut sys| {
+        sys.refresh_memory();
+        (sys.total_swap(), sys.used_swap())
+    })
+    .unwrap_or((0, 0));
 
     OsInfo {
-        name: System::name().unwrap_or_else(|| std::env::consts::OS.to_string()),
-        version: System::os_version(),
-        long_version: System::long_os_version(),
-        kernel: System::kernel_version(),
+        name: System::name().unwrap_or_else(|_| std::env::consts::OS.to_string()),
+        version: System::os_version().ok(),
+        long_version: System::long_os_version().ok(),
+        kernel: System::kernel_version().ok(),
         distribution_id: System::distribution_id(),
-        hostname: System::host_name(),
+        hostname: System::host_name().ok(),
         machine: detect_machine(),
-        uptime_seconds: System::uptime(),
+        uptime_seconds: System::uptime().unwrap_or(0),
         load_average: detect_load_average(),
-        swap_total_bytes: sys.total_swap(),
-        swap_used_bytes: sys.used_swap(),
+        swap_total_bytes,
+        swap_used_bytes,
         transparent_hugepages: detect_transparent_hugepages(),
         page_size_bytes: detect_page_size(),
         open_files_limit: detect_open_files_limit(),
@@ -185,7 +189,7 @@ pub fn detect() -> OsInfo {
 /// convincing-looking `0.00`s.
 #[cfg(not(target_os = "windows"))]
 fn detect_load_average() -> Option<LoadAverage> {
-    let avg = System::load_average();
+    let avg = System::load_average().ok()?;
     Some(LoadAverage {
         one: avg.one,
         five: avg.five,
