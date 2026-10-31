@@ -812,6 +812,10 @@ fn wait_for_prompt_pages(
     }
     let mut started: Option<Instant> = None;
     loop {
+        // Read before the reserve: pages given back between a refused
+        // reserve and a later read would look like an idle pool and turn
+        // the prompt away instead of trying again.
+        let idle = pool.available() == pool.num_pages();
         if pool.try_reserve(pages) {
             if let Some(started) = started {
                 log::info!(
@@ -829,7 +833,7 @@ fn wait_for_prompt_pages(
         }
         // Nothing to wait for: no one else holds or has been promised a
         // page, or the client has gone.
-        if pool.available() == pool.num_pages() || closed() {
+        if idle || closed() {
             return None;
         }
         if started.is_none() {
