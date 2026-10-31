@@ -27,7 +27,10 @@
 //! `deepseek4` (DeepSeek-V4:
 //! hyper-connections,
 //! shared-key attention over a sliding window plus compressed blocks, and
-//! hash-routed experts), `glm` (GLM with DeepSeek sparse attention:
+//! hash-routed experts), `deepseek41` (DeepSeek-V4.1: that block with
+//! single-pass hyper-connections, compressed keys and top-k selections shared
+//! across layers, and an n-gram-hash Engram embedding), `glm` (GLM with
+//! DeepSeek sparse attention:
 //! absorbed multi-head latent attention plus a lightning indexer), `kimi3`
 //! (Kimi-K3: hybrid delta-net/latent attention with cross-layer residuals
 //! and a latent MoE), `muse` (Muse-Glimmer: `llama`'s dense GQA block plus
@@ -49,6 +52,7 @@
 
 pub mod bailingmoe;
 pub mod deepseek4;
+pub mod deepseek41;
 pub mod dflash;
 pub mod gemma;
 pub mod gemma4_assistant;
@@ -2507,13 +2511,31 @@ pub(crate) fn expert_region_reserved() -> bool {
 /// file with a sliding window is left alone: its ring mirrors are sized as
 /// the window plus one chunk, so widening the chunk there buys prefill rate
 /// with device memory that the context depends on — a different trade from
-/// this one, and not one to make on a model's behalf.
+/// this one, and not one to make on a model's behalf. The exception is a
+/// family that prefills in full-width passes ([`prefill_in_full_width`]):
+/// its window lives in the host cache, with no device ring to size.
 pub(crate) fn prefill_chunk_tokens_for(
     loaded: &crate::engine::loader::LoadedModel,
 ) -> Option<usize> {
     let mixture = loaded.metadata_u64("expert_count").unwrap_or(0) > 0;
     let windowed = loaded.metadata_u64("attention.sliding_window").unwrap_or(0) > 0;
-    (mixture && !windowed).then_some(EXPERT_STREAM_CHUNK_TOKENS)
+    (mixture && (!windowed || prefill_in_full_width(loaded))).then_some(EXPERT_STREAM_CHUNK_TOKENS)
+}
+
+/// Whether this file's prompts are prefilled in full-width chunks rather than
+/// chunks sized to the per-submission time budget.
+///
+/// DeepSeek-V4.1 reads every layer's routed experts — most of a file of
+/// hundreds of gigabytes — on each pass, from storage when the file is larger
+/// than memory. A pass then costs minutes whatever its width, so no chunk
+/// meets the budget and the sizer narrows to its floor: a 1,440-token prompt
+/// becomes some ninety passes, each paying the whole read. Full-width chunks
+/// pay it once per [`EXPERT_STREAM_CHUNK_TOKENS`].
+pub(crate) fn prefill_in_full_width(loaded: &crate::engine::loader::LoadedModel) -> bool {
+    matches!(
+        crate::engine::loader::resolve_arch_family(&loaded.config.architecture),
+        Ok(crate::engine::loader::ArchFamily::Deepseek41)
+    )
 }
 
 /// The prefill chunk width a mixture whose experts stream to the card is

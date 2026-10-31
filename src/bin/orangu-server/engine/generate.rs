@@ -2832,9 +2832,13 @@ fn chunk_floor_override() -> Option<usize> {
 /// the backend is chosen.
 ///
 /// [`Backend::has_submission_timeout`]: crate::engine::backend::Backend::has_submission_timeout
-pub fn set_chunk_policy(has_submission_timeout: bool) {
-    let _ =
-        CHUNK_POLICY.set(env_chunk_policy().unwrap_or_else(|| policy_for(has_submission_timeout)));
+///
+/// `full_width` (`engine::arch::prefill_in_full_width`) chooses
+/// [`ChunkPolicy::Flat`] for a model whose pass costs the same at any width.
+pub fn set_chunk_policy(has_submission_timeout: bool, full_width: bool) {
+    let _ = CHUNK_POLICY.set(
+        env_chunk_policy().unwrap_or_else(|| policy_for(has_submission_timeout && !full_width)),
+    );
 }
 
 /// `ORANGU_CHUNK_POLICY=adaptive|flat`, the override that lets a sweep put

@@ -2053,7 +2053,7 @@ pair must share a vocabulary — speculation compares token _ids_, so two models
 that disagree about what an id means produce wrong or needlessly slow output
 with nothing to see — and both must be an architecture with a multi-position
 forward (the Llama family — `llama`, `qwen2`, `qwen3`, `qwen3moe`, `mistral`,
-`granite`, `qwen2vl`, `qwen3vl` — and `gemma4`, `deepseek4`, `glm-dsa`,
+`granite`, `qwen2vl`, `qwen3vl` — and `gemma4`, `deepseek4`, `deepseek41`, `glm-dsa`,
 `muse-glimmer` today). Either
 failure stops the server with a message naming what is wrong.
 
@@ -4476,6 +4476,9 @@ DeepSeek-V4 (`deepseek4`, e.g.
 `unsloth/DeepSeek-V4-Flash-0731-GGUF` — four parallel residual streams mixed
 per token, one shared key/value vector serving every query head, compressed
 attention blocks on top of a sliding window, and hash-routed experts),
+DeepSeek-V4.1 (`deepseek41`, e.g. `unsloth/DeepSeek-V4.1-Flash-1017-GGUF` —
+the DeepSeek-V4 block with its compressed keys and indexer choices shared
+across runs of layers, and an n-gram-hash Engram embedding),
 GLM-5 (`glm-dsa`, e.g. `unsloth/GLM-5.2-GGUF` — absorbed multi-head latent
 attention over a compressed key/value cache, with a lightning indexer
 choosing which positions each layer attends), GLM-5.3-Flash (`glm5-next`,
@@ -4523,13 +4526,16 @@ the experts form `expert_group_count` groups and only the best
 a dual-stream diffusion transformer that denoises a latent picture under a
 prompt's hidden states, served with a `qwen2vl` text encoder and the
 Qwen-Image VAE beside it; see **Image generation**) — using
-`F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
+`F32`/`F16`/`BF16`/`F8_E4M3`/`MXFP8`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 memory-mapped file (dequantized one row at a time, on demand) rather than
 eagerly resident, so even large models fit in modest RAM. A model split
 across several files (`<name>-00001-of-000NN.gguf` …) is loaded from every
 shard — the shard count comes from the `split.count` metadata key, and each
-shard is mapped separately.
+shard is mapped separately. Type id 43 is read two ways: as plain one-byte
+`F8_E4M3`, or — when the tensor's bytes in the file include one more byte per
+32 elements — as `MXFP8`, blocks of an E8M0 power-of-two scale followed by 32
+`F8_E4M3` values. `list` shows such a tensor's type as `MXFP8`.
 
 `orangu-server list` also recognizes `dflash` draft GGUFs such as the
 DeepSeek-V4-Flash DSpark sidecar. A draft carries no token embeddings and no
@@ -4789,6 +4795,32 @@ persistence cover all of it. That cache is wide: on top of the shared
 which for `DeepSeek-V4-Flash-0731` works out to roughly half a megabyte per
 token of context across all 43 layers, allocated up front for the
 prompt-plus-`max_tokens` budget of each request.
+
+DeepSeek-V4.1 (`deepseek41`) runs on the CPU path only. It keeps
+DeepSeek-V4's streams, shared key/value vector and experts, and changes five
+things. Each sub-layer collapses the streams with the _previous_ sub-layer's
+in-mix (the first attention reads stream 0, and the final collapse uses the
+last FFN's in-mix, with no separate head). Compression ratios are `2` and
+`1`, without overlap, and only the layers in
+`attention.kv_source_layers` compress: every later compressed layer up to the
+next source attends that source's blocks, each a normed latent followed by
+an indexer key projected from it. Likewise only the layers in
+`attention.indexer.source_layers` score the blocks, and the layers after
+each reuse its `attention.indexer.top_k` choice. Past
+`attention.indexer.candidate_source_layer`, a scoring layer considers only the
+`candidate_top_k_blocks` blocks of `candidate_block_size` positions the
+candidate source ranked best. And before each `ple.layers` layer, every
+token gathers rows from one large table (`per_layer_token_embd`, stored as
+`MXFP8`) at positions hashed from it and its predecessors in a compressed
+vocabulary (`engram.token_map`). Those rows give every stream a gated value.
+The table is read a row at a time and never loaded whole. The token ids the
+hash reads back are kept in the positional KV cache beside the keys, so
+rollback, prefix reuse and slot persistence cover them as well.
+A DeepSeek-V4.1 prompt is prefilled in full-width chunks of 2,048 tokens
+rather than chunks sized to the per-submission time budget: each pass reads
+every layer's routed experts, so narrower chunks would add passes without
+shortening any. `ORANGU_CHUNK_POLICY` and `ORANGU_PREFILL_BATCH` still
+override both.
 
 Muse-Glimmer (`muse-glimmer`) runs on the CPU path only. It is a dense
 grouped-query decoder, and most of what it adds to the ordinary block it

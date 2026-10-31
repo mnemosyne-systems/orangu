@@ -82,7 +82,7 @@ dependency on any C or C++ inference library.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
-- `engine/arch/{mod,llama,gemma,phi,mistral,muse,inkling,nemotron,qwen35moe,qwen35,qwen3next,qwen4exp,deepseek4,glm,kimi3,dflash}.rs` — one
+- `engine/arch/{mod,llama,gemma,phi,mistral,muse,inkling,nemotron,qwen35moe,qwen35,qwen3next,qwen4exp,deepseek4,deepseek41,glm,kimi3,dflash}.rs` — one
   `ModelForward` implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,metal,cuda,opencl,rocm}.rs`
   — the `Backend` trait and its six implementors; see below.
@@ -1774,6 +1774,22 @@ mod`), so adding a family is additive rather than a rewrite:
   in `KvCache::layers` like any other key, in slots whose rows each stand
   for `ratio` tokens (`LayerCache::stride`), which is what keeps rollback,
   prefix reuse and slot persistence exact for them.
+- `deepseek41.rs` — DeepSeek-V4.1 (`general.architecture = "deepseek41"`),
+  e.g. `unsloth/DeepSeek-V4.1-Flash-1017-GGUF:Q4_K_XL`. Reuses
+  `deepseek4.rs`'s MoE FFN and grouped output projection and `hyper.rs`'s
+  mixes, and differs in five places: **single-pass hyper-connections**
+  (`HyperShape::mixes_into` predicts a sub-layer's three mixes, and
+  `collapse_with` collapses with the previous sub-layer's in-mix); **shared
+  compressed keys** (only `attention.kv_source_layers` own a compressor; a
+  block row is `[latent | indexer key]`, the key projected from the latent);
+  **shared top-k** (only `attention.indexer.source_layers` score; `PassState`
+  hands each token's choice to the layers after); **candidate blocks** past
+  `attention.indexer.candidate_source_layer`; and **Engram**, an n-gram hash
+  over `engram.token_map` ids gathering rows of the `MXFP8`
+  `per_layer_token_embd` table (id 43 on disk; `orangu::gguf::resolve_mxfp8`
+  re-types it from the tensor's byte extent). The predecessors the hash reads come from a
+  one-wide per-token slot of token ids in `KvCache::layers`, so they roll back
+  with everything else. No query head is RMS-normalized.
 - `glm.rs` — GLM with DeepSeek sparse attention (`general.architecture =
   "glm-dsa"`), e.g. `unsloth/GLM-5.2-GGUF`, confirmed against upstream
   `src/models/glm-dsa.cpp` and the DSA `build_attn` overload in

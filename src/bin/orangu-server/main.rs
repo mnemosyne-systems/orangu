@@ -56,6 +56,7 @@ use config::{
 use engine::arch::ModelForward;
 use engine::arch::bailingmoe::BailingMoeModel;
 use engine::arch::deepseek4::Deepseek4Model;
+use engine::arch::deepseek41::Deepseek41Model;
 use engine::arch::dflash::DFlashModel;
 use engine::arch::gemma::GemmaModel;
 use engine::arch::glm::GlmModel;
@@ -1437,7 +1438,10 @@ fn prepare(args: Args) -> Result<Prepared> {
     // Before any prompt is prefilled: the chunker's sizer aims at a driver
     // timeout, and on a backend that has none it reads the clock as a
     // per-token rate that a streamed model does not have.
-    engine::generate::set_chunk_policy(backend.has_submission_timeout());
+    engine::generate::set_chunk_policy(
+        backend.has_submission_timeout(),
+        engine::arch::prefill_in_full_width(&loaded),
+    );
     // A `PTQ1_0` file is served to a Vulkan device as `PQ2_0`: the same
     // trits in the layout its kernel reads 1.3× faster, for 21% more
     // bytes. Decided here, with the backend final and before anything
@@ -3981,6 +3985,10 @@ fn build_model(
         ArchFamily::DFlash => {
             Arc::new(DFlashModel::load_with_backend(loaded).context("building model")?)
         }
+        ArchFamily::Deepseek41 => Arc::new(
+            Deepseek41Model::load_with_backend(loaded, backend.clone())
+                .context("building model")?,
+        ),
         ArchFamily::Deepseek4 => Arc::new(
             Deepseek4Model::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),

@@ -317,7 +317,7 @@ fn hc_scatter_weight(inject: f32, hc: usize) -> f32 {
 /// The PLE value gate: a signed square root of the per-stream score,
 /// squashed. `|s|` is floored at `1e-6` before the root, so the derivative
 /// stays finite at zero — upstream's `clamp(abs(s), 1e-6, INFINITY)`.
-fn ple_gate(score: f32) -> f32 {
+pub(super) fn ple_gate(score: f32) -> f32 {
     tensor::sigmoid(score.signum() * score.abs().max(1e-6).sqrt())
 }
 

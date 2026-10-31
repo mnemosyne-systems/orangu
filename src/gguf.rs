@@ -180,7 +180,8 @@ impl GgufFile {
     pub fn open_summary(path: &Path) -> Result<GgufFile> {
         let file =
             File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-        Self::read_with(BufReader::new(file), Some(SUMMARY_ARRAY_LIMIT))
+        let len = file.metadata().ok().map(|m| m.len());
+        Self::read_with(BufReader::new(file), Some(SUMMARY_ARRAY_LIMIT), len)
             .with_context(|| format!("failed to parse GGUF file {}", path.display()))
     }
 
@@ -203,7 +204,8 @@ impl GgufFile {
             file.seek(SeekFrom::Start(offset))
                 .with_context(|| format!("failed to seek to {offset} in {}", path.display()))?;
         }
-        Self::read(BufReader::new(file))
+        let len = file.metadata().ok().map(|m| m.len().saturating_sub(offset));
+        Self::read_with(BufReader::new(file), None, len)
             .with_context(|| format!("failed to parse GGUF file {}", path.display()))
     }
 
@@ -227,12 +229,19 @@ impl GgufFile {
     }
 
     fn read<R: GgufSource>(inner: R) -> Result<GgufFile> {
-        Self::read_with(inner, None)
+        Self::read_with(inner, None, None)
     }
 
     /// The parser; `skip_arrays_over` is the summary mode's array limit —
     /// see [`open_summary`](Self::open_summary).
-    fn read_with<R: GgufSource>(inner: R, skip_arrays_over: Option<u64>) -> Result<GgufFile> {
+    ///
+    /// `source_len` is the byte length of the GGUF (file minus segment start)
+    /// when the caller knows it; it bounds the last tensor's extent.
+    fn read_with<R: GgufSource>(
+        inner: R,
+        skip_arrays_over: Option<u64>,
+        source_len: Option<u64>,
+    ) -> Result<GgufFile> {
         let mut reader = Reader {
             inner,
             bytes_read: 0,
@@ -299,6 +308,11 @@ impl GgufFile {
 
         let position = reader.bytes_read;
         let data_offset = position.div_ceil(alignment) * alignment;
+        resolve_mxfp8(
+            &mut tensors,
+            alignment,
+            source_len.map(|len| len.saturating_sub(data_offset)),
+        );
 
         Ok(GgufFile {
             version,
@@ -657,8 +671,8 @@ const GGML_TYPE_NAMES: &[Option<&str>] = &[
     Some("NVFP4"),      // 40
     Some("Q1_0"),       // 41
     Some("Q2_0"),       // 42
-    None,               // 43 \
-    None,               // 44 |
+    Some("F8_E4M3"),    // 43
+    None,               // 44 \
     None,               // 45 |
     None,               // 46 |
     None,               // 47 |
@@ -814,7 +828,62 @@ pub fn is_removed_ggml_type(ggml_type: u32) -> bool {
 /// ggml would otherwise read a `PQ2_0` file as `Q2_0` and decode it wrong
 /// without a word — a file carrying one names itself here for the same
 /// reason. `engine::quant` reads both.
-const PRIVATE_GGML_TYPE_NAMES: &[(u32, &str)] = &[(142, "PQ2_0"), (143, "PTQ1_0")];
+///
+/// `MXFP8` is an id this reader assigns rather than one a file carries: see
+/// [`TYPE_MXFP8`].
+const PRIVATE_GGML_TYPE_NAMES: &[(u32, &str)] =
+    &[(142, "PQ2_0"), (143, "PTQ1_0"), (TYPE_MXFP8, "MXFP8")];
+
+/// `ggml_type` 43 as ggml defines it: one OCP FP8 E4M3 byte per element.
+const TYPE_F8_E4M3: u32 = 43;
+
+/// Elements under one `MXFP8` scale, and the bytes such a block takes.
+const MXFP8_BLOCK: u64 = 32;
+const MXFP8_BLOCK_BYTES: u64 = 1 + MXFP8_BLOCK;
+
+/// OCP MXFP8: blocks of one E8M0 power-of-two scale followed by 32 FP8 E4M3
+/// values, 33 bytes per 32 elements.
+///
+/// Some quantizers write this layout under id 43, which ggml reserves for
+/// *unscaled* E4M3 — the same tensor shape in 32 fewer bytes per kilobyte.
+/// The two are told apart by the bytes the tensor occupies in the file
+/// ([`resolve_mxfp8`]), and a tensor found to carry the scales is given
+/// this id, which no file uses, so that every later size and dequantize
+/// step reads it as what it is.
+pub const TYPE_MXFP8: u32 = 144;
+
+/// Re-types each id-43 tensor whose stored bytes hold an E8M0 scale per 32
+/// elements as [`TYPE_MXFP8`].
+///
+/// A tensor's extent is the distance to the next tensor's offset or, for
+/// the last one, to `data_len` (the size of the tensor-data section, when
+/// the caller knows it). Plain E4M3 ends within one alignment pad of its
+/// element count; the scaled layout needs `n / 32` bytes more, so a tensor
+/// counts as scaled only when that excess is itself at least one alignment
+/// unit — below it the two cannot be told apart and the plain reading
+/// stands.
+fn resolve_mxfp8(tensors: &mut [TensorInfo], alignment: u64, data_len: Option<u64>) {
+    let mut offsets: Vec<u64> = tensors.iter().map(|t| t.offset).collect();
+    offsets.sort_unstable();
+    offsets.dedup();
+    for tensor in tensors.iter_mut() {
+        let count = tensor.element_count();
+        if tensor.ggml_type != TYPE_F8_E4M3
+            || !count.is_multiple_of(MXFP8_BLOCK)
+            || count / MXFP8_BLOCK < alignment
+        {
+            continue;
+        }
+        let end = match offsets.iter().find(|&&o| o > tensor.offset) {
+            Some(&next) => Some(next),
+            None => data_len,
+        };
+        let scaled = count / MXFP8_BLOCK * MXFP8_BLOCK_BYTES;
+        if end.is_some_and(|end| end.saturating_sub(tensor.offset) >= scaled) {
+            tensor.ggml_type = TYPE_MXFP8;
+        }
+    }
+}
 
 pub fn ggml_type_name(ggml_type: u32) -> String {
     if let Some((_, name)) = PRIVATE_GGML_TYPE_NAMES
@@ -1054,7 +1123,7 @@ mod tests {
             assert_eq!(file.tensors[0].ggml_type, 1);
         };
         let from_cursor =
-            GgufFile::read_with(Cursor::new(buf.clone()), Some(SUMMARY_ARRAY_LIMIT)).unwrap();
+            GgufFile::read_with(Cursor::new(buf.clone()), Some(SUMMARY_ARRAY_LIMIT), None).unwrap();
         check(&from_cursor);
 
         let dir = std::env::temp_dir().join("orangu-gguf-summary-test");
@@ -1150,6 +1219,40 @@ mod tests {
         assert_eq!(ggml_type_name(255), "unknown(255)");
     }
 
+    fn f8_tensor(name: &str, count: u64, offset: u64) -> TensorInfo {
+        TensorInfo {
+            name: name.to_string(),
+            dims: vec![256, count / 256],
+            ggml_type: TYPE_F8_E4M3,
+            offset,
+        }
+    }
+
+    /// Id 43 is plain E4M3 when the tensor ends within an alignment pad of
+    /// its element count, and MXFP8 when it spans the extra scale byte per
+    /// 32 elements — whether the next tensor or the data's end bounds it.
+    #[test]
+    fn id_43_reads_as_mxfp8_only_when_its_extent_holds_the_scales() {
+        let n = 256 * 64;
+        let scaled = n / 32 * 33;
+        let mut tensors = vec![
+            f8_tensor("plain", n, 0),
+            f8_tensor("scaled", n, n),
+            f8_tensor("last_scaled", n, n + scaled),
+        ];
+        resolve_mxfp8(&mut tensors, 32, Some(n + 2 * scaled));
+        let types: Vec<u32> = tensors.iter().map(|t| t.ggml_type).collect();
+        assert_eq!(types, [TYPE_F8_E4M3, TYPE_MXFP8, TYPE_MXFP8]);
+
+        // The last tensor with no known data length keeps the plain reading,
+        // and so does one whose extent is only the plain size.
+        let mut tensors = vec![f8_tensor("unknown_end", n, 0)];
+        resolve_mxfp8(&mut tensors, 32, None);
+        assert_eq!(tensors[0].ggml_type, TYPE_F8_E4M3);
+        resolve_mxfp8(&mut tensors, 32, Some(n));
+        assert_eq!(tensors[0].ggml_type, TYPE_F8_E4M3);
+    }
+
     /// The three sub-`IQ1_S` types live at 64+, above a gap ggml has not
     /// filled. All three must name themselves, the gap must read as
     /// reserved rather than as a real type, and the last id ggml has
@@ -1158,12 +1261,14 @@ mod tests {
     #[test]
     fn narrow_iq1_types_are_named_above_ggmls_reserved_range() {
         assert_eq!(ggml_type_name(42), "Q2_0");
-        assert_eq!(ggml_type_name(43), "reserved(43)");
+        assert_eq!(ggml_type_name(43), "F8_E4M3");
+        assert_eq!(ggml_type_name(44), "reserved(44)");
         assert_eq!(ggml_type_name(63), "reserved(63)");
         assert_eq!(ggml_type_name(64), "IQ1_XS");
         assert_eq!(ggml_type_name(65), "IQ1_XXS");
         assert_eq!(ggml_type_name(66), "IQ1_XXXS");
         assert_eq!(ggml_type_name(67), "unknown(67)");
+        assert_eq!(ggml_type_name(TYPE_MXFP8), "MXFP8");
         for reserved in 43..64 {
             assert!(!is_removed_ggml_type(reserved), "type {reserved}");
         }
@@ -1178,7 +1283,7 @@ mod tests {
         assert_eq!(ggml_type_name(142), "PQ2_0");
         assert_eq!(ggml_type_name(143), "PTQ1_0");
         assert_eq!(ggml_type_name(141), "unknown(141)");
-        assert_eq!(ggml_type_name(144), "unknown(144)");
+        assert_eq!(ggml_type_name(145), "unknown(145)");
         assert!(!is_removed_ggml_type(142));
         assert!(!is_removed_ggml_type(143));
     }

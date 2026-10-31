@@ -103,6 +103,13 @@ pub(crate) const GGML_TYPE_IQ4_NL_4_4: u32 = 36;
 pub(crate) const GGML_TYPE_IQ4_NL_4_8: u32 = 37;
 pub(crate) const GGML_TYPE_IQ4_NL_8_8: u32 = 38;
 pub(crate) const GGML_TYPE_MXFP4: u32 = 39;
+/// OCP FP8 E4M3: one byte per element, no block scale — 4 exponent bits
+/// (bias 7), 3 mantissa bits, subnormals, and `0x7F`/`0xFF` as NaN.
+pub(crate) const GGML_TYPE_F8_E4M3: u32 = 43;
+/// OCP MXFP8: one E8M0 scale, then 32 E4M3 values. A file stores it under
+/// id 43; `orangu::gguf` gives the tensor this id once its byte extent shows
+/// the scales are there.
+pub(crate) const GGML_TYPE_MXFP8: u32 = orangu::gguf::TYPE_MXFP8;
 // `IQ1_S` with a narrower codebook index, and the only ids here that ggml
 // itself does not define: 42..63 are left free for ggml to grow into, so a
 // quantizer shipping types of its own starts at 64. A stock build rejects a
@@ -134,6 +141,7 @@ const QK5_1: usize = 32;
 const QK8_0: usize = 32;
 const QK4_NL: usize = 32;
 const QK_MXFP4: usize = 32;
+const QK_MXFP8: usize = 32;
 /// Elements per `PQ2_0`/`PTQ1_0` block — the one thing that separates them
 /// from ggml's own `Q2_0` (64) and `TQ1_0` (256).
 pub(crate) const QK_PRISM: usize = 128;
@@ -162,12 +170,14 @@ pub(crate) fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
         GGML_TYPE_F16 => Some((2, 1)),
         GGML_TYPE_I32 => Some((4, 1)),
         GGML_TYPE_BF16 => Some((2, 1)),
+        GGML_TYPE_F8_E4M3 => Some((1, 1)),
         GGML_TYPE_Q4_0 => Some((2 + QK4_0 / 2, QK4_0)),
         GGML_TYPE_Q4_1 => Some((2 + 2 + QK4_1 / 2, QK4_1)),
         GGML_TYPE_Q5_0 => Some((2 + 4 + QK5_0 / 2, QK5_0)),
         GGML_TYPE_Q5_1 => Some((2 + 2 + 4 + QK5_1 / 2, QK5_1)),
         GGML_TYPE_Q8_0 => Some((2 + QK8_0, QK8_0)),
         GGML_TYPE_MXFP4 => Some((1 + QK_MXFP4 / 2, QK_MXFP4)),
+        GGML_TYPE_MXFP8 => Some((1 + QK_MXFP8, QK_MXFP8)),
         GGML_TYPE_Q2_K => Some((QK_K / 16 + QK_K / 4 + 2 + 2, QK_K)),
         GGML_TYPE_Q3_K => Some((QK_K / 8 + QK_K / 4 + 12 + 2, QK_K)),
         GGML_TYPE_Q4_K => Some((2 + 2 + K_SCALE_SIZE + QK_K / 2, QK_K)),
@@ -208,6 +218,23 @@ pub(crate) fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
 /// fails partway through.
 pub fn supports_type(ggml_type: u32) -> bool {
     block_layout(ggml_type).is_some()
+}
+
+/// One OCP FP8 E4M3 value: subnormal `M * 2^-9`, normal
+/// `(1 + M/8) * 2^(E-7)`, and both all-ones magnitudes NaN.
+fn f8_e4m3_to_f32(x: u8) -> f32 {
+    let ax = x & 0x7F;
+    if ax == 0x7F {
+        return f32::NAN;
+    }
+    let exp = i32::from(ax >> 3);
+    let man = f32::from(ax & 0x7);
+    let value = if exp == 0 {
+        man * (2.0f32).powi(-9)
+    } else {
+        (1.0 + man / 8.0) * (2.0f32).powi(exp - 7)
+    };
+    if x & 0x80 != 0 { -value } else { value }
 }
 
 /// Bytes in one `Q4_0` block, and elements it covers.
@@ -445,12 +472,16 @@ pub fn dequantize_into(
                 .take(element_count)
                 .map(|b| f32::from_bits((u16::from_le_bytes([b[0], b[1]]) as u32) << 16)),
         ),
+        GGML_TYPE_F8_E4M3 => {
+            out.extend(bytes.iter().take(element_count).map(|&b| f8_e4m3_to_f32(b)))
+        }
         GGML_TYPE_Q4_0 => dequantize_q4_0(bytes, element_count, out),
         GGML_TYPE_Q4_1 => dequantize_q4_1(bytes, element_count, out),
         GGML_TYPE_Q5_0 => dequantize_q5_0(bytes, element_count, out),
         GGML_TYPE_Q5_1 => dequantize_q5_1(bytes, element_count, out),
         GGML_TYPE_Q8_0 => dequantize_q8_0(bytes, element_count, out),
         GGML_TYPE_MXFP4 => dequantize_mxfp4(bytes, element_count, out),
+        GGML_TYPE_MXFP8 => dequantize_mxfp8(bytes, element_count, out),
         GGML_TYPE_Q2_K => dequantize_q2_k(bytes, element_count, out),
         GGML_TYPE_Q3_K => dequantize_q3_k(bytes, element_count, out),
         GGML_TYPE_Q4_K => dequantize_q4_k(bytes, element_count, out),
@@ -502,6 +533,18 @@ fn e8m0_to_fp32_half(x: u8) -> f32 {
         u32::from(x - 1) << 23
     };
     f32::from_bits(bits)
+}
+
+/// Each block: an E8M0 scale `2^(e - 127)` times 32 E4M3 values.
+fn dequantize_mxfp8(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
+    const BLOCK_BYTES: usize = 1 + QK_MXFP8;
+    out.clear();
+    out.reserve(element_count);
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
+        let d = 2.0 * e8m0_to_fp32_half(block[0]);
+        out.extend(block[1..].iter().map(|&q| f8_e4m3_to_f32(q) * d));
+    }
+    out.truncate(element_count);
 }
 
 fn dequantize_mxfp4(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
@@ -2019,6 +2062,33 @@ mod tests {
     }
 
     #[test]
+    fn dequantize_f8_e4m3_reads_normals_subnormals_signs_and_nan() {
+        // 0x38 = E7 M0 = 1.0; 0x3C = 1.5; 0xC0 = -2.0; 0x7E = 448 (the
+        // largest finite); 0x01 = 2^-9 (smallest subnormal); 0x08 = 2^-6
+        // (smallest normal); 0x80 = -0.0.
+        let bytes = [0x38, 0x3C, 0xC0, 0x7E, 0x01, 0x08, 0x80, 0x00];
+        let out = dequantize(GGML_TYPE_F8_E4M3, &bytes, bytes.len()).unwrap();
+        assert_eq!(
+            out,
+            [
+                1.0,
+                1.5,
+                -2.0,
+                448.0,
+                2f32.powi(-9),
+                2f32.powi(-6),
+                -0.0,
+                0.0
+            ]
+        );
+        assert!(out[6].is_sign_negative());
+        let nan = dequantize(GGML_TYPE_F8_E4M3, &[0x7F, 0xFF], 2).unwrap();
+        assert!(nan.iter().all(|v| v.is_nan()));
+        assert_eq!(tensor_byte_size(GGML_TYPE_F8_E4M3, 256).unwrap(), 256);
+        assert!(supports_type(GGML_TYPE_F8_E4M3));
+    }
+
+    #[test]
     fn dequantize_i32_widens_signed_integers() {
         let values = [1i32, -2, 4096];
         let mut bytes = Vec::new();
@@ -2276,6 +2346,24 @@ mod tests {
             unpack_block_ptq1_0(&bytes[..24], &bytes[24..26], &mut got);
             assert_eq!(got, want, "ptq1_0 uniform {v}");
         }
+    }
+
+    #[test]
+    fn dequantize_mxfp8_scales_each_32_values_by_their_e8m0_exponent() {
+        // Block 0: scale 2^(119-127) = 2^-8 over 1.0 (0x38) and -1.5 (0xBC);
+        // block 1: scale 2^0 over 448 (0x7E).
+        let mut bytes = vec![119u8, 0x38, 0xBC];
+        bytes.extend([0u8; 30]);
+        bytes.extend([127u8, 0x7E]);
+        bytes.extend([0u8; 31]);
+        let out = dequantize(GGML_TYPE_MXFP8, &bytes, 64).unwrap();
+        assert_eq!(out.len(), 64);
+        assert_eq!(out[0], 2f32.powi(-8));
+        assert_eq!(out[1], -1.5 * 2f32.powi(-8));
+        assert!(out[2..32].iter().all(|&v| v == 0.0));
+        assert_eq!(out[32], 448.0);
+        assert_eq!(tensor_byte_size(GGML_TYPE_MXFP8, 256).unwrap(), 264);
+        assert!(supports_type(GGML_TYPE_MXFP8));
     }
 
     #[test]

@@ -146,6 +146,23 @@ const SPLIT_PATTERN_TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}
 /// module, so a `"gpt2"`-shaped vocab already skips it.
 const SPLIT_PATTERN_BAILINGMOE: &str = r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+";
 
+/// The DeepSeek-V3 pre-tokenizer (`tokenizer.ggml.pre` = `deepseek-v3`,
+/// and `joyai-llm`, which DeepSeek-V4.1 ships), from upstream's
+/// `LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM` arm.
+///
+/// Upstream runs three expressions in sequence — digit runs of up to
+/// three, then CJK runs, then the word/punctuation split — each re-splitting
+/// the pieces of the one before. One leftmost-first alternation does the
+/// same here: digits come first so no later alternative can start on one,
+/// and the letter class subtracts the CJK ranges so a Latin word never runs
+/// on into a CJK one. As elsewhere in this module the trailing-whitespace
+/// look-ahead `\s+(?!\S)` is dropped.
+const SPLIT_PATTERN_DEEPSEEK3: &str = r"\p{N}{1,3}|[一-龥぀-ゟ゠-ヿ]+|[!-/:-@\[-`{-~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}--[一-龥぀-ゟ゠-ヿ]]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// `tokenizer.ggml.pre` values upstream routes to the DeepSeek-V3 split
+/// (its `deepseek-v3` and `joyai-llm` names). Neither sets `ignore_merges`.
+const DEEPSEEK3_PRE_TYPES: &[&str] = &["deepseek-v3", "joyai-llm"];
+
 /// `tokenizer.ggml.pre` values upstream routes to
 /// `LLAMA_VOCAB_PRE_TYPE_BAILINGMOE` (its own list, verbatim) — Ling 1.0,
 /// Ling 2.0 and Ling 3.0 share one vocabulary family with LLaDA-MoE. None
@@ -220,6 +237,9 @@ fn split_pattern_for_pre(pre: &str) -> (&'static str, bool) {
     }
     if pre == "tekken" {
         return (SPLIT_PATTERN_TEKKEN, true);
+    }
+    if DEEPSEEK3_PRE_TYPES.contains(&pre) {
+        return (SPLIT_PATTERN_DEEPSEEK3, false);
     }
     (SPLIT_PATTERN, false)
 }
@@ -1694,6 +1714,30 @@ mod tests {
         let generic = regex::Regex::new(super::SPLIT_PATTERN).unwrap();
         let generic_digits: Vec<&str> = generic.find_iter("2026").map(|m| m.as_str()).collect();
         assert_eq!(generic_digits, vec!["2026"]);
+    }
+
+    /// The DeepSeek-V3 split as one alternation must give the pieces the
+    /// three sequential expressions give: digit runs of three, CJK runs on
+    /// their own even inside a Latin word, an ASCII punctuation mark glued
+    /// to the letters after it, and spaces kept in front of a word.
+    #[test]
+    fn the_deepseek3_pre_tokenizer_splits_digits_cjk_and_words() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("joyai-llm");
+        assert_eq!(pattern, super::SPLIT_PATTERN_DEEPSEEK3);
+        assert!(!ignore_merges);
+        assert_eq!(super::split_pattern_for_pre("deepseek-v3").0, pattern);
+
+        let re = regex::Regex::new(pattern).expect("the pattern compiles");
+        let split = |text: &str| -> Vec<String> {
+            re.find_iter(text).map(|m| m.as_str().to_string()).collect()
+        };
+        assert_eq!(split("12345"), ["123", "45"]);
+        assert_eq!(split("abc中文def"), ["abc", "中文", "def"]);
+        assert_eq!(
+            split("The capital of France is"),
+            ["The", " capital", " of", " France", " is"]
+        );
+        assert_eq!(split("x.y = 1;\n"), ["x", ".y", " =", " ", "1", ";\n"]);
     }
 
     #[test]

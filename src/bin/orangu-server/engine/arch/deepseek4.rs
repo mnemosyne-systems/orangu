@@ -134,24 +134,25 @@ struct Indexer {
 
 /// One layer's mixture-of-experts FFN: routed experts plus one always-on
 /// shared expert, both SwiGLU with the clamp `swiglu_clamp_exp` /
-/// `swiglu_clamp_shexp` ask for.
-struct Moe {
-    norm: Vec<f32>,
-    gate_inp: QuantMatrix,
+/// `swiglu_clamp_shexp` ask for. Shared with `engine::arch::deepseek41`,
+/// whose FFN is this one without the hash-routed layers.
+pub(super) struct Moe {
+    pub(super) norm: Vec<f32>,
+    pub(super) gate_inp: QuantMatrix,
     /// `exp_probs_b.bias` — added to the probabilities for *selection*
     /// only. `None` on a hash-routed layer, which does not select by score.
-    exp_probs_b: Option<Vec<f32>>,
+    pub(super) exp_probs_b: Option<Vec<f32>>,
     /// `ffn_gate_tid2eid.weight`, `[n_vocab, n_expert_used]` — the fixed
     /// per-token-id expert selection of a hash-routed layer.
-    tid2eid: Option<Vec<i32>>,
-    gate_exps: ExpertQuantMatrix,
-    down_exps: ExpertQuantMatrix,
-    up_exps: ExpertQuantMatrix,
-    gate_shexp: QuantMatrix,
-    down_shexp: QuantMatrix,
-    up_shexp: QuantMatrix,
-    clamp_exp: f32,
-    clamp_shexp: f32,
+    pub(super) tid2eid: Option<Vec<i32>>,
+    pub(super) gate_exps: ExpertQuantMatrix,
+    pub(super) down_exps: ExpertQuantMatrix,
+    pub(super) up_exps: ExpertQuantMatrix,
+    pub(super) gate_shexp: QuantMatrix,
+    pub(super) down_shexp: QuantMatrix,
+    pub(super) up_shexp: QuantMatrix,
+    pub(super) clamp_exp: f32,
+    pub(super) clamp_shexp: f32,
 }
 
 /// Where one layer's slices of the positional KV cache live. Every entry is
@@ -207,7 +208,6 @@ pub struct Deepseek4Model {
     /// The shared hyper-connection machinery every layer runs — see
     /// `engine::arch::hyper`.
     hyper: HyperShape,
-    n_expert_used: usize,
     routing: ExpertRouting,
     q_lora_rank: usize,
     o_group_count: usize,
@@ -236,7 +236,7 @@ fn selected_experts_for_token(route: &[i32], token: u32, n_expert_used: usize) -
 /// `n_swa` of them, self included. Upstream's standard sliding-window mask
 /// (`llama_hparams::is_masked_swa`) hides a key exactly when
 /// `query_pos - key_pos >= n_swa`.
-fn raw_window(pos: usize, n_swa: usize) -> std::ops::RangeInclusive<usize> {
+pub(super) fn raw_window(pos: usize, n_swa: usize) -> std::ops::RangeInclusive<usize> {
     (pos + 1).saturating_sub(n_swa)..=pos
 }
 
@@ -245,7 +245,7 @@ fn raw_window(pos: usize, n_swa: usize) -> std::ops::RangeInclusive<usize> {
 /// `n_visible = (pos + 1)/ratio` — note this includes the block the query
 /// itself completes, which is why the compressor state is updated before
 /// the softmax reads the cache.
-fn visible_blocks(pos: usize, ratio: usize) -> usize {
+pub(super) fn visible_blocks(pos: usize, ratio: usize) -> usize {
     (pos + 1) / ratio
 }
 
@@ -253,7 +253,7 @@ fn visible_blocks(pos: usize, ratio: usize) -> usize {
 /// `ggml_rope_ext`, chosen to cancel exactly the `1 + 0.1*ln(1/freq_scale)`
 /// correction ggml's YaRN path applies on top of it — so DSV4 gets YaRN's
 /// frequency ramp with no magnitude scaling at all.
-fn rope_attn_factor(freq_scale: f32, ext_factor: f32) -> f32 {
+pub(super) fn rope_attn_factor(freq_scale: f32, ext_factor: f32) -> f32 {
     if ext_factor == 0.0 {
         return 1.0;
     }
@@ -563,7 +563,6 @@ impl Deepseek4Model {
             output_weight,
             hc_head,
             hyper,
-            n_expert_used,
             routing: ExpertRouting {
                 n_expert_used,
                 gating: ExpertGating::from_gguf(gating_func)?,
@@ -698,7 +697,7 @@ impl Deepseek4Model {
         );
         let cur = collapsed_ffn;
         tensor::rmsnorm_inplace(cur, &layer.ffn.norm, n_tokens, n_embd, eps);
-        let ffn = self.moe_ffn(backend, &layer.ffn, cur, tokens);
+        let ffn = moe_ffn(backend, &self.routing, n_embd, &layer.ffn, cur, tokens);
         self.hyper.expand(x, &ffn, residual, post, comb, n_tokens);
         Ok(())
     }
@@ -941,31 +940,18 @@ impl Deepseek4Model {
             }
         }
 
-        // Grouped output projection: each group of `n_head / o_groups`
-        // heads goes through its own low-rank `wo_a` slice, then the
-        // concatenation goes through the shared `wo_b`.
-        let o_group_dim = n_head * head_dim / self.o_group_count;
-        let mut oa = vec![0f32; n_tokens * self.o_group_count * self.o_lora_rank];
-        for g in 0..self.o_group_count {
-            let mut group = vec![0f32; n_tokens * o_group_dim];
-            for t in 0..n_tokens {
-                let at = t * n_head * head_dim + g * o_group_dim;
-                group[t * o_group_dim..(t + 1) * o_group_dim]
-                    .copy_from_slice(&attn_out[at..at + o_group_dim]);
-            }
-            backend.matmul_into(
-                projected,
-                &group,
-                n_tokens,
-                &layer.wo_a.rows(g * self.o_lora_rank, self.o_lora_rank),
-            );
-            for t in 0..n_tokens {
-                let at = t * self.o_group_count * self.o_lora_rank + g * self.o_lora_rank;
-                oa[at..at + self.o_lora_rank]
-                    .copy_from_slice(&projected[t * self.o_lora_rank..(t + 1) * self.o_lora_rank]);
-            }
-        }
-        backend.matmul_into(out_buf, &oa, n_tokens, &layer.wo_b);
+        grouped_output_projection(
+            backend,
+            &attn_out,
+            n_tokens,
+            n_head * head_dim,
+            self.o_group_count,
+            self.o_lora_rank,
+            &layer.wo_a,
+            &layer.wo_b,
+            projected,
+            out_buf,
+        );
         debug_assert_eq!(out_buf.len(), n_tokens * n_embd);
         Ok(std::mem::take(out_buf))
     }
@@ -1047,159 +1033,205 @@ impl Deepseek4Model {
             })
             .collect()
     }
+}
 
-    /// Routed experts plus the always-on shared expert. The routed
-    /// selection is either the hash table's (the first `hash_layer_count`
-    /// layers) or the top `expert_used_count` by biased probability; the
-    /// weights always come from the *unbiased* probabilities.
-    fn moe_ffn(&self, backend: &dyn Backend, ffn: &Moe, cur: &[f32], tokens: &[u32]) -> Vec<f32> {
-        let n_embd = self.config.n_embd;
-        let mut out = vec![0f32; tokens.len() * n_embd];
-        let mut experts =
-            moe_stats::LayerRecorder::for_tensors(&[&ffn.gate_exps, &ffn.up_exps, &ffn.down_exps]);
-        // Route the whole batch first, so the union can be taken before any
-        // expert's weights are read — see `super::evaluate_routed_experts`.
-        // The hash-routed layers route from the token id rather than the
-        // logits, which changes nothing here: a selection is a selection.
-        //
-        // One matmul for the whole batch rather than one per token: see
-        // `super::moe_router_logits`. The hoist also keeps this device
-        // submission out of the parallel region below, where it would queue
-        // behind the shared expert's.
-        let n_tokens = tokens.len();
-        let logits = super::moe_router_logits(backend, cur, n_tokens, &ffn.gate_inp);
-        let n_expert = logits.len() / n_tokens;
-        let mut selection: Vec<Vec<(usize, f32)>> = tokens
-            .iter()
-            .enumerate()
-            .map(|(t, &token)| {
-                let row = &logits[t * n_expert..(t + 1) * n_expert];
-                let hashed = ffn
-                    .tid2eid
-                    .as_ref()
-                    .map(|route| selected_experts_for_token(route, token, self.n_expert_used));
-                let (selected, weights) =
-                    self.routing.route(row, ffn.exp_probs_b.as_deref(), hashed);
-                selected.into_iter().zip(weights).collect()
-            })
-            .collect();
-        // Trim to the expert budget *before* anything is recorded or
-        // read: the counters should describe the work actually done,
-        // and a dropped expert's weights must never be fetched.
-        super::apply_expert_budget(&mut selection, &ffn.gate_exps);
-        crate::engine::expert_store::read_ahead_selected(
-            &selection,
-            &[&ffn.gate_exps, &ffn.up_exps, &ffn.down_exps],
-        );
-        for picks in &selection {
-            picks.iter().for_each(|&(e, _)| experts.select(e));
-        }
-
-        // The GPU expert path batches the three projections across experts —
-        // see `super::evaluate_routed_experts_batched`.
-        // A batch wide enough to pay for streaming the expert stack
-        // takes the grouped device GEMM too (`super::expert_gemm_wide`).
-        // The activation stays on the host between the projections,
-        // which is right whatever this architecture's activation is.
-        let routed_branch = || {
-            if (super::gpu_experts() || super::expert_gemm_wide(selection.len()))
-                && backend.as_wgpu().is_some()
-            {
-                super::evaluate_routed_experts_batched(
-                    backend,
-                    &selection,
-                    cur,
-                    n_embd,
-                    &ffn.gate_exps,
-                    &ffn.up_exps,
-                    &ffn.down_exps,
-                    |gate, up| swiglu(gate, up, ffn.clamp_exp),
-                )
-            } else {
-                super::evaluate_routed_experts(&selection, |expert, members| {
-                    let inputs: Vec<&[f32]> = members
-                        .iter()
-                        .map(|&(t, _)| &cur[t * n_embd..(t + 1) * n_embd])
-                        .collect();
-                    let gate = super::project_expert(
-                        backend,
-                        &ffn.gate_exps,
-                        expert,
-                        0,
-                        ffn.gate_exps.out_dim,
-                        &inputs,
-                    );
-                    let up = super::project_expert(
-                        backend,
-                        &ffn.up_exps,
-                        expert,
-                        0,
-                        ffn.up_exps.out_dim,
-                        &inputs,
-                    );
-                    let hidden: Vec<Vec<f32>> = gate
-                        .into_iter()
-                        .zip(up)
-                        .map(|(gate, up)| swiglu(&gate, &up, ffn.clamp_exp))
-                        .collect();
-                    let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
-                    super::project_expert(
-                        backend,
-                        &ffn.down_exps,
-                        expert,
-                        0,
-                        ffn.down_exps.out_dim,
-                        &hidden_refs,
-                    )
-                    .into_iter()
-                    .zip(members)
-                    .map(|(mut contribution, &(_, weight))| {
-                        contribution.iter_mut().for_each(|v| *v *= weight);
-                        contribution
-                    })
-                    .collect()
-                })
-            }
-        };
-
-        // The always-on shared expert, for every token at once rather than
-        // three device round-trips per token. Through
-        // `super::matmul_host_fallback`, not `matmul`: the `*_shexp`
-        // matrices are exempt from the backend's up-front type check (see
-        // `engine::backend::is_cpu_only_tensor`), so one of a type this
-        // device has no shader for would otherwise reach a backend that
-        // panics rather than declining.
-        let shared_branch = || {
-            let gate = super::matmul_host_fallback(backend, cur, n_tokens, &ffn.gate_shexp);
-            let up = super::matmul_host_fallback(backend, cur, n_tokens, &ffn.up_shexp);
-            let h = swiglu(&gate, &up, ffn.clamp_shexp);
-            super::matmul_host_fallback(backend, &h, n_tokens, &ffn.down_shexp)
-        };
-
-        // Different processors, no dependency between them, summed at the
-        // end — see `super::moe_overlap_min_tokens`.
-        let overlap = super::moe_overlap(
-            backend,
-            n_tokens,
-            &[&ffn.gate_shexp, &ffn.up_shexp, &ffn.down_shexp],
-        );
-        let (shexp, contribs) = if overlap {
-            rayon::join(shared_branch, routed_branch)
-        } else {
-            (shared_branch(), routed_branch())
-        };
-        experts.loaded_once_per_distinct_expert();
-
+/// The grouped output projection: each of `o_groups` groups of heads goes
+/// through its own `o_lora_rank`-row slice of `wo_a`, then the concatenation
+/// through the shared `wo_b`. `attn_out` is `[n_tokens, width]`, every head
+/// of a token side by side.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn grouped_output_projection(
+    backend: &dyn Backend,
+    attn_out: &[f32],
+    n_tokens: usize,
+    width: usize,
+    o_groups: usize,
+    o_lora_rank: usize,
+    wo_a: &QuantMatrix,
+    wo_b: &QuantMatrix,
+    projected: &mut Vec<f32>,
+    out: &mut Vec<f32>,
+) {
+    let group_dim = width / o_groups;
+    let mut oa = vec![0f32; n_tokens * o_groups * o_lora_rank];
+    let mut group = vec![0f32; n_tokens * group_dim];
+    for g in 0..o_groups {
         for t in 0..n_tokens {
-            let dst = &mut out[t * n_embd..(t + 1) * n_embd];
-            dst.copy_from_slice(&shexp[t * n_embd..(t + 1) * n_embd]);
-            for contrib in &contribs[t] {
-                tensor::add_inplace(dst, contrib);
-            }
+            let at = t * width + g * group_dim;
+            group[t * group_dim..(t + 1) * group_dim]
+                .copy_from_slice(&attn_out[at..at + group_dim]);
         }
-        experts.commit(n_tokens);
-        out
+        backend.matmul_into(
+            projected,
+            &group,
+            n_tokens,
+            &wo_a.rows(g * o_lora_rank, o_lora_rank),
+        );
+        for t in 0..n_tokens {
+            let at = t * o_groups * o_lora_rank + g * o_lora_rank;
+            oa[at..at + o_lora_rank]
+                .copy_from_slice(&projected[t * o_lora_rank..(t + 1) * o_lora_rank]);
+        }
     }
+    backend.matmul_into(out, &oa, n_tokens, wo_b);
+}
+
+/// Routed experts plus the always-on shared expert. The routed
+/// selection is either the hash table's (the first `hash_layer_count`
+/// layers) or the top `expert_used_count` by biased probability; the
+/// weights always come from the *unbiased* probabilities.
+pub(super) fn moe_ffn(
+    backend: &dyn Backend,
+    routing: &ExpertRouting,
+    n_embd: usize,
+    ffn: &Moe,
+    cur: &[f32],
+    tokens: &[u32],
+) -> Vec<f32> {
+    let mut out = vec![0f32; tokens.len() * n_embd];
+    let mut experts =
+        moe_stats::LayerRecorder::for_tensors(&[&ffn.gate_exps, &ffn.up_exps, &ffn.down_exps]);
+    // Route the whole batch first, so the union can be taken before any
+    // expert's weights are read — see `super::evaluate_routed_experts`.
+    // The hash-routed layers route from the token id rather than the
+    // logits, which changes nothing here: a selection is a selection.
+    //
+    // One matmul for the whole batch rather than one per token: see
+    // `super::moe_router_logits`. The hoist also keeps this device
+    // submission out of the parallel region below, where it would queue
+    // behind the shared expert's.
+    let n_tokens = tokens.len();
+    let logits = super::moe_router_logits(backend, cur, n_tokens, &ffn.gate_inp);
+    let n_expert = logits.len() / n_tokens;
+    let mut selection: Vec<Vec<(usize, f32)>> = tokens
+        .iter()
+        .enumerate()
+        .map(|(t, &token)| {
+            let row = &logits[t * n_expert..(t + 1) * n_expert];
+            let hashed = ffn
+                .tid2eid
+                .as_ref()
+                .map(|route| selected_experts_for_token(route, token, routing.n_expert_used));
+            let (selected, weights) = routing.route(row, ffn.exp_probs_b.as_deref(), hashed);
+            selected.into_iter().zip(weights).collect()
+        })
+        .collect();
+    // Trim to the expert budget *before* anything is recorded or
+    // read: the counters should describe the work actually done,
+    // and a dropped expert's weights must never be fetched.
+    super::apply_expert_budget(&mut selection, &ffn.gate_exps);
+    crate::engine::expert_store::read_ahead_selected(
+        &selection,
+        &[&ffn.gate_exps, &ffn.up_exps, &ffn.down_exps],
+    );
+    for picks in &selection {
+        picks.iter().for_each(|&(e, _)| experts.select(e));
+    }
+
+    // The GPU expert path batches the three projections across experts —
+    // see `super::evaluate_routed_experts_batched`.
+    // A batch wide enough to pay for streaming the expert stack
+    // takes the grouped device GEMM too (`super::expert_gemm_wide`).
+    // The activation stays on the host between the projections,
+    // which is right whatever this architecture's activation is.
+    let routed_branch = || {
+        if (super::gpu_experts() || super::expert_gemm_wide(selection.len()))
+            && backend.as_wgpu().is_some()
+        {
+            super::evaluate_routed_experts_batched(
+                backend,
+                &selection,
+                cur,
+                n_embd,
+                &ffn.gate_exps,
+                &ffn.up_exps,
+                &ffn.down_exps,
+                |gate, up| swiglu(gate, up, ffn.clamp_exp),
+            )
+        } else {
+            super::evaluate_routed_experts(&selection, |expert, members| {
+                let inputs: Vec<&[f32]> = members
+                    .iter()
+                    .map(|&(t, _)| &cur[t * n_embd..(t + 1) * n_embd])
+                    .collect();
+                let gate = super::project_expert(
+                    backend,
+                    &ffn.gate_exps,
+                    expert,
+                    0,
+                    ffn.gate_exps.out_dim,
+                    &inputs,
+                );
+                let up = super::project_expert(
+                    backend,
+                    &ffn.up_exps,
+                    expert,
+                    0,
+                    ffn.up_exps.out_dim,
+                    &inputs,
+                );
+                let hidden: Vec<Vec<f32>> = gate
+                    .into_iter()
+                    .zip(up)
+                    .map(|(gate, up)| swiglu(&gate, &up, ffn.clamp_exp))
+                    .collect();
+                let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+                super::project_expert(
+                    backend,
+                    &ffn.down_exps,
+                    expert,
+                    0,
+                    ffn.down_exps.out_dim,
+                    &hidden_refs,
+                )
+                .into_iter()
+                .zip(members)
+                .map(|(mut contribution, &(_, weight))| {
+                    contribution.iter_mut().for_each(|v| *v *= weight);
+                    contribution
+                })
+                .collect()
+            })
+        }
+    };
+
+    // The always-on shared expert, for every token at once rather than
+    // three device round-trips per token. Through
+    // `super::matmul_host_fallback`, not `matmul`: the `*_shexp`
+    // matrices are exempt from the backend's up-front type check (see
+    // `engine::backend::is_cpu_only_tensor`), so one of a type this
+    // device has no shader for would otherwise reach a backend that
+    // panics rather than declining.
+    let shared_branch = || {
+        let gate = super::matmul_host_fallback(backend, cur, n_tokens, &ffn.gate_shexp);
+        let up = super::matmul_host_fallback(backend, cur, n_tokens, &ffn.up_shexp);
+        let h = swiglu(&gate, &up, ffn.clamp_shexp);
+        super::matmul_host_fallback(backend, &h, n_tokens, &ffn.down_shexp)
+    };
+
+    // Different processors, no dependency between them, summed at the
+    // end — see `super::moe_overlap_min_tokens`.
+    let overlap = super::moe_overlap(
+        backend,
+        n_tokens,
+        &[&ffn.gate_shexp, &ffn.up_shexp, &ffn.down_shexp],
+    );
+    let (shexp, contribs) = if overlap {
+        rayon::join(shared_branch, routed_branch)
+    } else {
+        (shared_branch(), routed_branch())
+    };
+    experts.loaded_once_per_distinct_expert();
+
+    for t in 0..n_tokens {
+        let dst = &mut out[t * n_embd..(t + 1) * n_embd];
+        dst.copy_from_slice(&shexp[t * n_embd..(t + 1) * n_embd]);
+        for contrib in &contribs[t] {
+            tensor::add_inplace(dst, contrib);
+        }
+    }
+    experts.commit(n_tokens);
+    out
 }
 
 /// SwiGLU with DeepSeek-V4's clamp — [`super::SwigluLimit::PreActivation`],

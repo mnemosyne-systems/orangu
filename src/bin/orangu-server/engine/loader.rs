@@ -149,6 +149,11 @@ pub enum ArchFamily {
     /// blocks) on top of a sliding window, and hash-routed experts on the
     /// first layers. See `engine::arch::deepseek4`.
     Deepseek4,
+    /// DeepSeek-V4.1 (`deepseek41`) — the DeepSeek-V4 block with
+    /// single-pass hyper-connections, compressed keys and top-k selections
+    /// shared across layers, candidate-block selection, and an n-gram-hash
+    /// Engram embedding. See `engine::arch::deepseek41`.
+    Deepseek41,
     /// Phi-3 / Phi-4-mini — GQA + RoPE + RMSNorm + SwiGLU like
     /// [`ArchFamily::LlamaStyle`], but with a fused QKV projection, a fused
     /// gate/up FFN projection, partial NEOX RoPE carrying LongRoPE
@@ -305,6 +310,7 @@ const QWEN3NEXT_ARCHITECTURES: &[&str] = &["qwen3next"];
 const QWEN4EXP_ARCHITECTURES: &[&str] = &["qwen4exp"];
 const DFLASH_ARCHITECTURES: &[&str] = &["dflash"];
 const DEEPSEEK4_ARCHITECTURES: &[&str] = &["deepseek4"];
+const DEEPSEEK41_ARCHITECTURES: &[&str] = &["deepseek41"];
 /// `glm-dsa` (e.g. `unsloth/GLM-5.2-GGUF`) — GLM's transformer block with
 /// DeepSeek's sparse (indexer-selected) latent attention. Plain `glm4`/
 /// `glm4moe` are *not* here: they are ordinary GQA models with none of
@@ -446,6 +452,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if DEEPSEEK4_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Deepseek4);
     }
+    if DEEPSEEK41_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Deepseek41);
+    }
     if GLM_DSA_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::GlmDsa);
     }
@@ -527,6 +536,7 @@ fn supported_architecture_names() -> Vec<&'static str> {
         .chain(QWEN4EXP_ARCHITECTURES)
         .chain(DFLASH_ARCHITECTURES)
         .chain(DEEPSEEK4_ARCHITECTURES)
+        .chain(DEEPSEEK41_ARCHITECTURES)
         .chain(GLM_DSA_ARCHITECTURES)
         .chain(GLM5NEXT_ARCHITECTURES)
         .chain(KIMI_K3_ARCHITECTURES)
@@ -2873,6 +2883,7 @@ mod tests {
             (ArchFamily::KimiK3, "kimi-k3"),
             (ArchFamily::DFlash, "dflash"),
             (ArchFamily::Deepseek4, "deepseek4"),
+            (ArchFamily::Deepseek41, "deepseek41"),
             (ArchFamily::Phi3, "phi3"),
             (ArchFamily::Mistral3, "mistral3"),
             (ArchFamily::Muse, "muse-glimmer"),
@@ -2897,6 +2908,7 @@ mod tests {
                 ArchFamily::KimiK3 => "KimiK3",
                 ArchFamily::DFlash => "DFlash",
                 ArchFamily::Deepseek4 => "Deepseek4",
+                ArchFamily::Deepseek41 => "Deepseek41",
                 ArchFamily::Phi3 => "Phi3",
                 ArchFamily::Mistral3 => "Mistral3",
                 ArchFamily::Granite => "Granite",
@@ -3014,6 +3026,13 @@ mod tests {
     fn resolve_arch_family_accepts_dflash() {
         for arch in DFLASH_ARCHITECTURES {
             assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::DFlash);
+        }
+    }
+
+    #[test]
+    fn resolve_arch_family_accepts_deepseek41() {
+        for arch in DEEPSEEK41_ARCHITECTURES {
+            assert_eq!(resolve_arch_family(arch).unwrap(), ArchFamily::Deepseek41);
         }
     }
 

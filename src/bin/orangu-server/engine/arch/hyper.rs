@@ -219,6 +219,68 @@ impl HyperShape {
         }
     }
 
+    /// A sub-layer's three mixes — the in-mix (`pre`, `[n_tokens, hc]`), the
+    /// out-mix (`post`, `[n_tokens, hc]`) and the stream combination (`comb`,
+    /// `[n_tokens, hc, hc]`) — predicted from the streams *without*
+    /// collapsing them, for an architecture that collapses with a different
+    /// sub-layer's in-mix (`engine::arch::deepseek41`). The same arithmetic
+    /// as [`Self::collapse_into`] with `out` given.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn mixes_into(
+        &self,
+        backend: &dyn Backend,
+        mixer: &HyperConnection,
+        x: &[f32],
+        n_tokens: usize,
+        pre: &mut Vec<f32>,
+        post: &mut Vec<f32>,
+        comb: &mut Vec<f32>,
+        flat: &mut Vec<f32>,
+        mixes_buf: &mut Vec<f32>,
+    ) {
+        let hc = self.count;
+        rms_norm_rows_into(flat, x, hc * self.n_embd, self.rms_eps);
+        backend.matmul_into(mixes_buf, flat, n_tokens, &mixer.weights);
+        let mix_dim = mixer.weights.out_dim;
+        pre.clear();
+        post.clear();
+        comb.clear();
+        for mix in mixes_buf.chunks_exact(mix_dim).take(n_tokens) {
+            let (p, o, c) = hc_pre_parts(
+                mix,
+                hc,
+                self.eps,
+                self.sinkhorn_iters,
+                &mixer.scale,
+                &mixer.base,
+            );
+            pre.extend_from_slice(&p);
+            post.extend_from_slice(&o);
+            comb.extend_from_slice(&c);
+        }
+    }
+
+    /// Collapses the streams to one vector per token with an in-mix already
+    /// in hand (`pre`, `[n_tokens, hc]`, from [`Self::mixes_into`]).
+    pub(crate) fn collapse_with(
+        &self,
+        cur: &mut Vec<f32>,
+        x: &[f32],
+        pre: &[f32],
+        n_tokens: usize,
+    ) {
+        let n_embd = self.n_embd;
+        let hc = self.count;
+        let cur = tensor::zeroed_to(cur, n_tokens * n_embd);
+        for t in 0..n_tokens {
+            let dst = &mut cur[t * n_embd..(t + 1) * n_embd];
+            for (s, &w) in pre[t * hc..(t + 1) * hc].iter().enumerate() {
+                let src = &x[(t * hc + s) * n_embd..(t * hc + s + 1) * n_embd];
+                tensor::axpy_inplace(dst, src, w);
+            }
+        }
+    }
+
     /// The out-mix: writes this sub-layer's output back into every stream,
     /// each a `post`-weighted copy of the output plus a `comb`-weighted mix
     /// of the streams it came from.
