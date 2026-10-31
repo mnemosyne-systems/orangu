@@ -181,6 +181,10 @@ struct RoleFlags {
     /// role such a model is served in.
     #[arg(long)]
     video: bool,
+    /// Text to speech — a qwen3tts model (Qwen3-TTS), the only kind this role serves and the
+    /// only role such a model is served in.
+    #[arg(long)]
+    audio: bool,
 }
 
 impl RoleFlags {
@@ -202,6 +206,8 @@ impl RoleFlags {
             Some(config::Role::Image)
         } else if self.video {
             Some(config::Role::Video)
+        } else if self.audio {
+            Some(config::Role::Audio)
         } else {
             None
         }
@@ -1184,6 +1190,28 @@ fn prepare(args: Args) -> Result<Prepared> {
         // The prompt this run would otherwise have answered, in its shape,
         // so the transcript still says which role the server came up in.
         println!("Role: {}", role.label());
+    }
+    // A `qwen3tts` file is a speech generator with its own talker: nothing
+    // below — the language model's placement, probes, KV pool and warm-up —
+    // applies to it. See `prepare_audio`.
+    if architecture_key
+        .as_deref()
+        .is_some_and(orangu::model_spec::is_audio_architecture)
+    {
+        return prepare_audio(AudioStart {
+            listen: &args.listen,
+            daemon,
+            threads_flag: threads_flag.as_deref(),
+            conf,
+            source,
+            path,
+            model_label,
+            quantization,
+            config_path,
+            role,
+            reasoning_effort,
+            workspace,
+        });
     }
     let image_variant = architecture_key
         .as_deref()
@@ -3071,6 +3099,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         live_stats: conf.log.is_console() && !args.daemon,
         image,
         video,
+        audio: None,
         vision,
         switch,
     });
@@ -3087,62 +3116,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // listening and were kept open across the exec, so the port is never
     // released and nothing can take it in between. On an ordinary start
     // there is nothing to adopt and it binds.
-    let inherited = reexec::inherited();
-    // `--host`/`--port`/`--web` override whatever the config file (or, for a
-    // bundle, `config::bundled_configuration`) resolved to. Where to listen is
-    // the setting that is routinely per-*run* rather than per-machine — a
-    // second server alongside one already on 8100, a port a firewall happens
-    // to allow, a bundle that should be reachable from the LAN for one
-    // afternoon — and for a bundle there may be no config file to edit at all.
-    let host = args.listen.host.as_deref().unwrap_or(&conf.host);
-    // The console follows `--host` only when it was following the API's
-    // address anyway. A config that deliberately put it somewhere else keeps
-    // it there — see `ServerConfiguration::web_host_explicit`; exposing the
-    // API must never be a way to expose the console by accident.
-    let web_host = match conf.web_host_explicit {
-        true => conf.web_host.as_str(),
-        false => host,
-    };
-    let bind_host = config::resolve_bind_host(host);
-    let api_port = args.listen.port.unwrap_or(conf.port);
-    let web_port = args.listen.web.unwrap_or(conf.web);
-    let api_addr = format!("{bind_host}:{api_port}");
-    let api_listener = reexec::adopt_or_bind(inherited.api, &api_addr)?;
-    api_listener
-        .set_nonblocking(true)
-        .with_context(|| format!("failed to configure listener on {api_addr}"))?;
-
-    let web_listener = if web_port != 0 {
-        // `[web].host` when it names one, else the API's own — see
-        // `ServerConfiguration::web_host`.
-        let web_addr = format!("{}:{web_port}", config::resolve_bind_host(web_host));
-        let listener = reexec::adopt_or_bind(inherited.web, &web_addr)?;
-        listener
-            .set_nonblocking(true)
-            .with_context(|| format!("failed to configure web UI listener on {web_addr}"))?;
-        Some(listener)
-    } else {
-        None
-    };
-
-    // `[prometheus].port`/`--metrics`. `0` (the default) binds nothing.
-    // Like the console, it follows `--host` only when `[prometheus].host` was
-    // not set explicitly.
-    let metrics_host = match conf.metrics_host_explicit {
-        true => conf.metrics_host.as_str(),
-        false => host,
-    };
-    let metrics_port = args.listen.metrics.unwrap_or(conf.metrics);
-    let metrics_listener = if metrics_port != 0 {
-        let metrics_addr = format!("{}:{metrics_port}", config::resolve_bind_host(metrics_host));
-        let listener = reexec::adopt_or_bind(inherited.metrics, &metrics_addr)?;
-        listener
-            .set_nonblocking(true)
-            .with_context(|| format!("failed to configure metrics listener on {metrics_addr}"))?;
-        Some(listener)
-    } else {
-        None
-    };
+    let (api_listener, web_listener, metrics_listener) = bind_listeners(&args.listen, &conf)?;
 
     if args.daemon {
         daemon::ready().context("failed to start as a daemon")?;
@@ -3208,6 +3182,234 @@ fn prepare(args: Args) -> Result<Prepared> {
         web_listener,
         metrics_listener,
     })
+}
+
+/// What [`prepare`] hands [`prepare_audio`] once it knows the model is a
+/// speech generator.
+struct AudioStart<'a> {
+    listen: &'a ListenFlags,
+    daemon: bool,
+    threads_flag: Option<&'a str>,
+    conf: config::ServerConfiguration,
+    source: ModelSource,
+    path: PathBuf,
+    model_label: String,
+    quantization: Option<String>,
+    config_path: Option<PathBuf>,
+    role: config::Role,
+    reasoning_effort: Option<String>,
+    workspace: PathBuf,
+}
+
+/// [`prepare`] for a `qwen3tts` model: its codec and voices found, the
+/// talker, code predictor and codec loaded into `engine::audio::Pipeline`
+/// on the CPU — a speech step is one row through each, which the CPU runs
+/// ahead of a device's per-call cost — and the engine around it, whose
+/// `model` is a placeholder the text endpoints never reach.
+fn prepare_audio(start: AudioStart<'_>) -> Result<Prepared> {
+    let AudioStart {
+        listen,
+        daemon,
+        threads_flag,
+        conf,
+        source,
+        path,
+        model_label,
+        quantization,
+        config_path,
+        role,
+        reasoning_effort,
+        workspace,
+    } = start;
+    if let ModelSource::Embedded(_) = &source {
+        bail!(
+            "a qwen3tts model cannot be bundled: it needs its codec and voices beside it, and a \
+             bundle carries one file"
+        );
+    }
+    let threads = configure_cpu_threads(threads_flag, conf.threads)?;
+    let companions = engine::audio::Companions::locate(
+        &conf.models,
+        conf.codec.as_deref(),
+        conf.voices.as_deref(),
+    )?;
+    log::info!(
+        "orangu-server: qwen3tts codec {}",
+        companions.codec.display()
+    );
+    for pack in &companions.voices {
+        log::info!("orangu-server: qwen3tts voice pack {}", pack.display());
+    }
+    let started = std::time::Instant::now();
+    let backend: Arc<dyn Backend> = Arc::new(engine::backend::CpuBackend);
+    let pipeline = Arc::new(
+        engine::audio::Pipeline::load(&path, companions, backend, conf.audio.clone())
+            .context("loading the speech model")?,
+    );
+    log::info!(
+        "orangu-server: qwen3tts talker {} layers, code predictor {} layers; {} voice(s): {}; \
+         {} Hz, {:.1} frames a second; loaded in {:.1} s on {} CPU worker(s)",
+        pipeline.talker_layers(),
+        pipeline.predictor_layers(),
+        pipeline.voices().len(),
+        pipeline
+            .voices()
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        pipeline.sample_rate(),
+        pipeline.frame_rate(),
+        started.elapsed().as_secs_f64(),
+        match threads {
+            WorkerPool::Sized(n) | WorkerPool::BigCores(n) => n,
+            WorkerPool::Default => rayon::current_num_threads(),
+        },
+    );
+    let gguf = source.gguf()?;
+    let tokenizer = Arc::new(Tokenizer::from_gguf(&gguf).context("building tokenizer")?);
+    let loaded = LoadedModel::open(&path).context("reading the speech model's shape")?;
+    let architecture = loaded.config.architecture.clone();
+    let model: Arc<dyn ModelForward> = Arc::new(engine::audio::placeholder::Placeholder::new(
+        loaded.config.clone(),
+    ));
+    drop(loaded);
+    let engine = Arc::new(Engine {
+        paged_kv: None,
+        metrics: Arc::new(engine::metrics::ServerMetrics::new()),
+        model,
+        draft: None,
+        mtp: None,
+        tokenizer,
+        recurrent: false,
+        chat_template: None,
+        chat_template_source: None,
+        slots: SlotPool::with_queue_limit(conf.slots, conf.queue_limit),
+        prefix_cache: None,
+        decode_batcher: Arc::new(engine::decode_batch::DecodeBatcher::new()),
+        slot_store: None,
+        role,
+        reasoning_effort,
+        live_stats: conf.log.is_console() && !daemon,
+        image: None,
+        video: None,
+        audio: Some(pipeline),
+        vision: None,
+        switch: None,
+    });
+    let (api_listener, web_listener, metrics_listener) = bind_listeners(listen, &conf)?;
+    if daemon {
+        daemon::ready().context("failed to start as a daemon")?;
+    }
+    if let Err(err) = orangu::model_registry::record_used(&model_label, &path) {
+        log::warn!("warning: could not update ~/.orangu/models: {err:#}");
+    }
+    Ok(Prepared {
+        api_key: conf.api_key.clone(),
+        api_data: conf.api_data.clone(),
+        web_search: conf.web_search.clone(),
+        code_execution: conf.code_execution.clone(),
+        tls: conf.tls.clone(),
+        engine,
+        prefix_cache_snapshot: None,
+        warm_prefixes: None,
+        model_label,
+        quantization,
+        architecture,
+        backend_label: "CPU".to_string(),
+        model_path: path,
+        models_dir: conf.models,
+        config_path,
+        listen_override: reexec::Listen {
+            host: listen.host.clone(),
+            api: listen.port,
+            web: listen.web,
+            metrics: listen.metrics,
+        },
+        role,
+        reexec: conf.reexec,
+        delete: conf.delete,
+        download: conf.download,
+        bundle: None,
+        mcp_servers: conf.mcp_servers,
+        gpu_tuning: None,
+        gpu_tuning_summary: None,
+        wgpu_backend: None,
+        workspace,
+        api_listener,
+        web_listener,
+        metrics_listener,
+    })
+}
+
+/// Binds (or, on a handover, adopts) the API's listener, the web console's
+/// and the metrics listener — the addresses `--host`/`--port`/`--web`/
+/// `--metrics` name over the configuration's.
+fn bind_listeners(
+    listen: &ListenFlags,
+    conf: &config::ServerConfiguration,
+) -> Result<(
+    std::net::TcpListener,
+    Option<std::net::TcpListener>,
+    Option<std::net::TcpListener>,
+)> {
+    let inherited = reexec::inherited();
+    // `--host`/`--port`/`--web` override whatever the config file (or, for a
+    // bundle, `config::bundled_configuration`) resolved to. Where to listen is
+    // the setting that is routinely per-*run* rather than per-machine — a
+    // second server alongside one already on 8100, a port a firewall happens
+    // to allow, a bundle that should be reachable from the LAN for one
+    // afternoon — and for a bundle there may be no config file to edit at all.
+    let host = listen.host.as_deref().unwrap_or(&conf.host);
+    // The console follows `--host` only when it was following the API's
+    // address anyway. A config that deliberately put it somewhere else keeps
+    // it there — see `ServerConfiguration::web_host_explicit`; exposing the
+    // API must never be a way to expose the console by accident.
+    let web_host = match conf.web_host_explicit {
+        true => conf.web_host.as_str(),
+        false => host,
+    };
+    let bind_host = config::resolve_bind_host(host);
+    let api_port = listen.port.unwrap_or(conf.port);
+    let web_port = listen.web.unwrap_or(conf.web);
+    let api_addr = format!("{bind_host}:{api_port}");
+    let api_listener = reexec::adopt_or_bind(inherited.api, &api_addr)?;
+    api_listener
+        .set_nonblocking(true)
+        .with_context(|| format!("failed to configure listener on {api_addr}"))?;
+
+    let web_listener = if web_port != 0 {
+        // `[web].host` when it names one, else the API's own — see
+        // `ServerConfiguration::web_host`.
+        let web_addr = format!("{}:{web_port}", config::resolve_bind_host(web_host));
+        let listener = reexec::adopt_or_bind(inherited.web, &web_addr)?;
+        listener
+            .set_nonblocking(true)
+            .with_context(|| format!("failed to configure web UI listener on {web_addr}"))?;
+        Some(listener)
+    } else {
+        None
+    };
+
+    // `[prometheus].port`/`--metrics`. `0` (the default) binds nothing.
+    // Like the console, it follows `--host` only when `[prometheus].host` was
+    // not set explicitly.
+    let metrics_host = match conf.metrics_host_explicit {
+        true => conf.metrics_host.as_str(),
+        false => host,
+    };
+    let metrics_port = listen.metrics.unwrap_or(conf.metrics);
+    let metrics_listener = if metrics_port != 0 {
+        let metrics_addr = format!("{}:{metrics_port}", config::resolve_bind_host(metrics_host));
+        let listener = reexec::adopt_or_bind(inherited.metrics, &metrics_addr)?;
+        listener
+            .set_nonblocking(true)
+            .with_context(|| format!("failed to configure metrics listener on {metrics_addr}"))?;
+        Some(listener)
+    } else {
+        None
+    };
+    Ok((api_listener, web_listener, metrics_listener))
 }
 
 /// The root directory the server operates in: the `-w`/`--workspace`
@@ -4035,6 +4237,10 @@ fn build_model(
             "{architecture} is a diffusion transformer, not a language model; it is served as \
              the model, with its text encoder and VAE beside it, and cannot stand in as a draft"
         ),
+        ArchFamily::Qwen3Tts => bail!(
+            "{architecture} is a speech generator, not a language model; it is served as the \
+             model, with its codec and voices beside it, and cannot stand in as a draft"
+        ),
         ArchFamily::Ltxv => bail!(
             "{architecture} is a video diffusion transformer, not a language model; it is \
              served as the model, with its text encoder and VAEs beside it, and cannot stand in \
@@ -4719,12 +4925,17 @@ pub(crate) fn model_support(
                 .as_deref()
                 .is_some_and(|arch| engine::loader::resolve_arch_family(arch).is_ok());
             let required = config::Role::required_by(architecture.as_deref());
+            let companion_of = architecture
+                .as_deref()
+                .and_then(orangu::model_spec::companion_of);
             orangu::model_spec::ModelSupport {
                 architecture,
                 supported,
                 unsupported_quant,
                 image: required == Some(config::Role::Image),
                 video: required == Some(config::Role::Video),
+                audio: required == Some(config::Role::Audio),
+                companion_of,
             }
         })
         .collect()
@@ -5461,6 +5672,7 @@ fn fix_role_for_model(
             };
             let (serves, kind) = match role {
                 config::Role::Video => ("video generators (ltxv)", "a video"),
+                config::Role::Audio => ("speech generators (qwen3tts)", "a speech"),
                 _ => (
                     "picture generators (qwen_image, qwen_image_2_1)",
                     "an image",
@@ -5498,6 +5710,7 @@ fn select_model_interactively(
     let mode = match role {
         Some(config::Role::Image) => orangu::model_spec::Dimming::ImageModels,
         Some(config::Role::Video) => orangu::model_spec::Dimming::VideoModels,
+        Some(config::Role::Audio) => orangu::model_spec::Dimming::AudioModels,
         Some(_) => orangu::model_spec::Dimming::TextModels,
         None => orangu::model_spec::Dimming::Unsupported,
     };
@@ -5531,8 +5744,15 @@ fn select_model_interactively(
                     "a video",
                     "a video model is only served in the video role (--video, or no role flag)",
                 )
+            } else if support.audio {
+                (
+                    "a speech",
+                    "a speech model is only served in the audio role (--audio, or no role flag)",
+                )
             } else if asked == config::Role::Video {
                 ("a language", "--video serves video models only")
+            } else if asked == config::Role::Audio {
+                ("a language", "--audio serves speech models only")
             } else {
                 ("a language", "--image serves image models only")
             };
@@ -5542,7 +5762,7 @@ fn select_model_interactively(
                 asked.label(),
             );
         }
-        Ok(support.image || support.video)
+        Ok(support.image || support.video || support.audio)
     };
 
     // A single listed model is not a choice — take it and move straight on

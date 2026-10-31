@@ -313,7 +313,13 @@ pub fn download_model_reporting(
         && let Some(architecture) = crate::model_spec::architecture_of(&gguf)
         && crate::model_spec::is_video_architecture(&architecture)
     {
-        download_video_companions(models_dir, &architecture, progress)?;
+        download_video_companions(models_dir, &architecture, progress.clone())?;
+    }
+    if let Ok(gguf) = GgufFile::open_summary(&path)
+        && let Some(architecture) = crate::model_spec::architecture_of(&gguf)
+        && crate::model_spec::is_audio_architecture(&architecture)
+    {
+        download_audio_companions(models_dir, &path, progress)?;
     }
     Ok(path)
 }
@@ -507,6 +513,56 @@ pub fn download_video_companions(
             download_repo_file(models_dir, LTX_COMPANION_REPO, file, progress.clone())
                 .with_context(|| format!("downloading the {architecture} {what}"))?;
         }
+    }
+    Ok(())
+}
+
+/// Where `orangu-server download` fetches a `qwen3tts` model's companions:
+/// the 12 Hz speech codec, in `F16` as its publisher recommends, and the
+/// voice packs.
+pub const QWEN3TTS_CODEC_REPO: &str = "cstr/qwen3-tts-tokenizer-12hz-GGUF";
+pub const QWEN3TTS_CODEC_FILE: &str = "qwen3-tts-tokenizer-12hz.gguf";
+pub const QWEN3TTS_VOICES_REPO: &str = "cstr/qwen3-tts-voices-GGUF";
+
+/// The voice pack made for a talker `width` wide: the 1.7B models' packs
+/// are 2048 wide, the 0.6B models' 1024.
+pub fn qwen3tts_voice_file(width: usize) -> Option<&'static str> {
+    match width {
+        2048 => Some("qwen3-tts-voice-1.7b-designed.gguf"),
+        1024 => Some("qwen3-tts-voice-0.6b-designed.gguf"),
+        _ => None,
+    }
+}
+
+/// Fetches what a speech model (`qwen3tts`, at `model`) needs beside it:
+/// the speech codec, and a voice pack of its talker's width — each skipped
+/// when the models directory already holds one.
+pub fn download_audio_companions(
+    models_dir: &Path,
+    model: &Path,
+    progress: Option<Arc<DownloadProgress>>,
+) -> Result<()> {
+    if crate::model_spec::find_qwen3tts_codec(models_dir).is_none() {
+        eprintln!(
+            "Fetching the speech codec a qwen3tts model needs \
+             ({QWEN3TTS_CODEC_REPO}:{QWEN3TTS_CODEC_FILE})"
+        );
+        download_repo_file(
+            models_dir,
+            QWEN3TTS_CODEC_REPO,
+            QWEN3TTS_CODEC_FILE,
+            progress.clone(),
+        )
+        .context("downloading the qwen3tts speech codec")?;
+    }
+    let width = crate::model_spec::qwen3tts_talker_width(model);
+    let have_voice = crate::model_spec::find_qwen3tts_voicepacks(models_dir)
+        .iter()
+        .any(|pack| width.is_some() && crate::model_spec::qwen3tts_voicepack_width(pack) == width);
+    if !have_voice && let Some(file) = width.and_then(qwen3tts_voice_file) {
+        eprintln!("Fetching a voice for a qwen3tts model ({QWEN3TTS_VOICES_REPO}:{file})");
+        download_repo_file(models_dir, QWEN3TTS_VOICES_REPO, file, progress)
+            .context("downloading a qwen3tts voice pack")?;
     }
     Ok(())
 }

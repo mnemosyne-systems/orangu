@@ -503,6 +503,9 @@ pub fn bundled_configuration(
         audio_vae: None,
         upscaler: None,
         video: crate::engine::video::VideoDefaults::default(),
+        codec: None,
+        voices: None,
+        audio: crate::engine::audio::AudioDefaults::default(),
         // A bundle carries no certificate; TLS is a per-deployment decision.
         tls: None,
         // A key baked into a distributed executable is a key everyone who has
@@ -571,6 +574,9 @@ pub enum Role {
     /// Video generation — the role of an `ltxv` model, fixed by the model
     /// exactly as [`Role::Image`] is.
     Video,
+    /// Text to speech — the role of a `qwen3tts` model, fixed by the model
+    /// exactly as [`Role::Image`] is.
+    Audio,
 }
 
 impl Role {
@@ -583,9 +589,10 @@ impl Role {
             "embedding" => Ok(Role::Embedding),
             "image" => Ok(Role::Image),
             "video" => Ok(Role::Video),
+            "audio" => Ok(Role::Audio),
             other => Err(anyhow!(
-                "invalid role '{other}' (expected all, code, review, explorer, embedding, image, or \
-                 video)"
+                "invalid role '{other}' (expected all, code, review, explorer, embedding, image, \
+                 video, or audio)"
             )),
         }
     }
@@ -599,28 +606,31 @@ impl Role {
             Role::Embedding => "embedding",
             Role::Image => "image",
             Role::Video => "video",
+            Role::Audio => "audio",
         }
     }
 
     /// Whether this is the role a model's architecture decides — [`Role::
-    /// Image`] or [`Role::Video`], which a picture or video generator always
-    /// has and nothing else can have — as opposed to the five an operator picks between for a
-    /// language model. A fixed role is never prompted for and never
-    /// narrowed by an `x-orangu-role` header.
+    /// Image`], [`Role::Video`] or [`Role::Audio`], which a picture, video or
+    /// speech generator always has and nothing else can have — as opposed to
+    /// the five an operator picks between for a language model. A fixed role
+    /// is never prompted for and never narrowed by an `x-orangu-role` header.
     pub fn fixed_by_model(&self) -> bool {
-        matches!(self, Role::Image | Role::Video)
+        matches!(self, Role::Image | Role::Video | Role::Audio)
     }
 
     /// The role a model must be served in, from its `general.architecture`
     /// — `Some(Role::Image)` for a picture generator, `Some(Role::Video)` for
-    /// a video generator, `None` for a language model, whose role is the
-    /// operator's choice.
+    /// a video generator, `Some(Role::Audio)` for a speech generator, `None`
+    /// for a language model, whose role is the operator's choice.
     pub fn required_by(architecture: Option<&str>) -> Option<Role> {
         let architecture = architecture?;
         if orangu::model_spec::is_image_architecture(architecture) {
             Some(Role::Image)
         } else if orangu::model_spec::is_video_architecture(architecture) {
             Some(Role::Video)
+        } else if orangu::model_spec::is_audio_architecture(architecture) {
+            Some(Role::Audio)
         } else {
             None
         }
@@ -645,12 +655,13 @@ impl Role {
             // way for the others' decode steps between its layers. A slot
             // costs a single stream nothing: the KV pool is shared, not split.
             //
-            // A review is one request at a time, and an image or video model
-            // draws one picture or clip at a time (`engine::image::Pipeline`
-            // and `engine::video::Pipeline` each hold a single busy lock), so
-            // a second slot there would only queue.
+            // A review is one request at a time, and an image, video or
+            // speech model makes one picture, clip or recording at a time
+            // (`engine::image::Pipeline`, `engine::video::Pipeline` and
+            // `engine::audio::Pipeline` each hold a single busy lock), so a
+            // second slot there would only queue.
             Role::All | Role::Code | Role::Explorer => 4,
-            Role::Review | Role::Image | Role::Video => 1,
+            Role::Review | Role::Image | Role::Video | Role::Audio => 1,
         }
     }
 
@@ -1190,6 +1201,18 @@ pub struct ServerConfiguration {
     /// say — size, length, frame rate, sound, the two stages, the encoder's
     /// quality.
     pub video: crate::engine::video::VideoDefaults,
+    /// `[orangu-server].codec`: the 12 Hz speech codec (`qwen3tts_tokenizer`
+    /// GGUF) a `qwen3tts` model's codes are decoded with — a path, absolute
+    /// or relative to the models directory. `None` finds the largest one
+    /// under `models`.
+    pub codec: Option<String>,
+    /// `[orangu-server].voices`: a Qwen3-TTS voice pack, or a directory of
+    /// them, a `qwen3tts` model speaks with. `None` takes every pack under
+    /// `models` made for the model's width.
+    pub voices: Option<String>,
+    /// `[orangu-server].audio_*`: what a clip gets when the request does not
+    /// say — voice, language, format, sampling, the longest clip.
+    pub audio: crate::engine::audio::AudioDefaults,
     /// `[orangu-server].draft_tokens`: how many tokens the draft model
     /// proposes per verification (default 4).
     ///
@@ -1881,6 +1904,15 @@ pub fn load_server_configuration(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
     let video = parse_video_defaults(&section)?;
+    let codec = section
+        .get("codec")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let voices = section
+        .get("voices")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let audio = parse_audio_defaults(&section)?;
 
     let kv_cache = match section.get("kv_cache") {
         Some(value) => KvCache::parse(value).ok_or_else(|| {
@@ -2072,6 +2104,9 @@ pub fn load_server_configuration(
         audio_vae,
         upscaler,
         video,
+        codec,
+        voices,
+        audio,
         api_key,
         api_data,
         web_search,
@@ -2324,6 +2359,83 @@ fn parse_video_defaults(
             })?;
     }
     Ok(video)
+}
+
+fn parse_audio_defaults(
+    section: &HashMap<String, String>,
+) -> Result<crate::engine::audio::AudioDefaults> {
+    let mut audio = crate::engine::audio::AudioDefaults::default();
+    let invalid = |key: &str, value: &str, what: &str| {
+        anyhow!(
+            "invalid value for [{SERVER_SECTION}].{key}: '{}' (expected {what})",
+            value.trim()
+        )
+    };
+    if let Some(value) = section.get("audio_voice") {
+        audio.voice = Some(value.trim().to_string()).filter(|v| !v.is_empty());
+    }
+    if let Some(value) = section.get("audio_language") {
+        audio.language = value.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            !audio.language.is_empty(),
+            invalid(
+                "audio_language",
+                value,
+                "a language the model names, or auto"
+            )
+        );
+    }
+    if let Some(value) = section.get("audio_format") {
+        audio.format = crate::engine::audio::AudioFormat::parse(value).ok_or_else(|| {
+            invalid(
+                "audio_format",
+                value,
+                crate::engine::audio::AudioFormat::NAMES,
+            )
+        })?;
+    }
+    if let Some(value) = section.get("audio_temperature") {
+        audio.temperature = value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|t| t.is_finite() && (0.0..=2.0).contains(t))
+            .ok_or_else(|| invalid("audio_temperature", value, "a number from 0 to 2"))?;
+    }
+    if let Some(value) = section.get("audio_top_k") {
+        audio.top_k = value
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|k| *k > 0)
+            .ok_or_else(|| invalid("audio_top_k", value, "a whole number of 1 or more"))?;
+    }
+    if let Some(value) = section.get("audio_repetition_penalty") {
+        audio.repetition_penalty = value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|p| p.is_finite() && *p >= 1.0 && *p <= 2.0)
+            .ok_or_else(|| invalid("audio_repetition_penalty", value, "a number from 1 to 2"))?;
+    }
+    if let Some(value) = section.get("audio_max_seconds") {
+        audio.max_seconds = value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.0 && *s <= crate::engine::audio::MAX_SECONDS)
+            .ok_or_else(|| {
+                invalid(
+                    "audio_max_seconds",
+                    value,
+                    &format!(
+                        "seconds, above 0 and at most {}",
+                        crate::engine::audio::MAX_SECONDS
+                    ),
+                )
+            })?;
+    }
+    Ok(audio)
 }
 
 /// The `approval_mode` values an MCP section may carry — orangu's own

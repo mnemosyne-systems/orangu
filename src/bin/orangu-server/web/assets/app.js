@@ -1375,6 +1375,7 @@
     monitor: document.getElementById("monitor-panel"),
     image: document.getElementById("image-panel"),
     video: document.getElementById("video-panel"),
+    audio: document.getElementById("audio-panel"),
     workers: document.getElementById("workers-panel"),
   };
   const modelsOverlay = settingsOverlay;
@@ -2734,6 +2735,141 @@
     videoStatus.textContent = "Reset to the configuration — Save to apply.";
   });
 
+  // ---------------------------------------------------------- audio --
+  // The speech settings: the defaults every chat turn on a speech model
+  // gets, as `POST /api/props` takes them. Like the Video pane: a form
+  // filled from the server's answer, Reset to the configuration, and the
+  // dialog's Save.
+  const audioForm = document.getElementById("audio-form");
+  const audioNone = document.getElementById("audio-none");
+  const audioModelEl = document.getElementById("audio-model");
+  const audioVoice = document.getElementById("audio-voice");
+  const audioVoiceDescription = document.getElementById("audio-voice-description");
+  const audioLanguage = document.getElementById("audio-language");
+  const audioFormat = document.getElementById("audio-format");
+  const audioTemperature = document.getElementById("audio-temperature");
+  const audioMaxSeconds = document.getElementById("audio-max-seconds");
+  const audioStatus = document.getElementById("audio-status");
+  const audioResetBtn = document.getElementById("audio-reset-btn");
+  const audioTab = settingsTabs.find((tab) => tab.dataset.pane === "audio");
+  // The last `/api/props` answer's `audio` object, or `null` for any other
+  // model.
+  let audioProps = null;
+
+  function fillSelect(select, values, label) {
+    select.replaceChildren();
+    for (const value of values) {
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = label(value);
+      select.appendChild(option);
+    }
+  }
+
+  function capitalised(word) {
+    return word ? `${word.charAt(0).toUpperCase()}${word.slice(1)}` : word;
+  }
+
+  function renderAudioVoiceDescription() {
+    const voice = (audioProps?.voices || []).find((v) => v.name === audioVoice.value);
+    audioVoiceDescription.textContent = voice?.description || "";
+  }
+  audioVoice.addEventListener("change", renderAudioVoiceDescription);
+
+  // The voice a default of `null` means: the first one loaded.
+  function audioDefaultVoice(d) {
+    return d.voice || audioProps?.voices?.[0]?.name || "";
+  }
+
+  function fillAudioForm(d) {
+    audioVoice.value = audioDefaultVoice(d);
+    audioLanguage.value = d.language || "auto";
+    // The console keeps WAV or FLAC; a `pcm` default (the API's bare
+    // samples) is kept as WAV.
+    audioFormat.value = d.format === "flac" ? "flac" : "wav";
+    audioTemperature.value = String(d.temperature);
+    audioMaxSeconds.value = String(Math.round(Number(d.max_seconds)));
+    renderAudioVoiceDescription();
+  }
+
+  // What the form says now, as `POST /api/props`' `audio` object.
+  function audioFormSettings() {
+    return {
+      voice: audioVoice.value,
+      language: audioLanguage.value,
+      format: audioFormat.value,
+      temperature: Number(audioTemperature.value),
+      max_seconds: Number(audioMaxSeconds.value),
+    };
+  }
+
+  async function loadAudioProps() {
+    const res = await fetch("/api/props", { cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    const props = await res.json();
+    audioProps = props.audio;
+    renderAudioProps(props);
+  }
+
+  function renderAudioProps(props) {
+    const audio = props.audio;
+    audioTab.classList.toggle("unavailable", !audio);
+    audioTab.title = audio ? "" : "Not a speech model";
+    audioNone.hidden = !!audio;
+    audioForm.hidden = !audio;
+    if (!audio) {
+      audioModelEl.textContent = props.model || "";
+      return;
+    }
+    fillSelect(audioVoice, audio.voices.map((v) => v.name), (name) => name);
+    fillSelect(audioLanguage, audio.languages, (lang) => (lang === "auto" ? "Auto — from the text" : capitalised(lang)));
+    const voices = audio.voices.length;
+    audioModelEl.textContent = [
+      props.model,
+      `${voices} voice${voices === 1 ? "" : "s"}`,
+      `${Math.round(audio.sample_rate / 1000)} kHz`,
+    ].join(" · ");
+    fillAudioForm(audio.defaults);
+  }
+
+  function audioFormDirty() {
+    if (!audioProps) return false;
+    const d = audioProps.defaults;
+    const f = audioFormSettings();
+    return (
+      f.voice !== audioDefaultVoice(d) ||
+      f.language !== d.language ||
+      f.format !== (d.format === "flac" ? "flac" : "wav") ||
+      f.temperature !== Number(d.temperature) ||
+      f.max_seconds !== Math.round(Number(d.max_seconds))
+    );
+  }
+
+  async function postAudioProps(settings) {
+    audioStatus.textContent = "Saving…";
+    const res = await fetch("/api/props", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ audio: settings }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const props = await res.json();
+    audioProps = props.audio;
+    renderAudioProps(props);
+    const d = props.audio.defaults;
+    audioStatus.textContent = `Set: voice ${audioDefaultVoice(d)}, ${d.language}, ${d.format.toUpperCase()}.`;
+  }
+
+  audioForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveSettings();
+  });
+  audioResetBtn.addEventListener("click", () => {
+    if (!audioProps) return;
+    fillAudioForm(audioProps.configured);
+    audioStatus.textContent = "Reset to the configuration — Save to apply.";
+  });
+
   // ------------------------monitor -----------------------------------
   // live CPU / GPU / NPU inventory. Polled from /api/monitor
   // only while the pane is shown same pattern as the model manager's
@@ -2964,6 +3100,10 @@
       videoStatus.textContent = "";
       loadVideoProps().catch((err) => { videoStatus.textContent = err.message; });
     }
+    if (name === "audio" && !keepForm) {
+      audioStatus.textContent = "";
+      loadAudioProps().catch((err) => { audioStatus.textContent = err.message; });
+    }
     if (name === "workers") {
       openWorkers().catch((err) => { workersSummary.textContent = err.message; });
     }
@@ -2990,6 +3130,7 @@
     // wait on it.
     loadImageProps().catch((err) => console.error(err));
     loadVideoProps().catch((err) => console.error(err));
+    loadAudioProps().catch((err) => console.error(err));
   }
 
   function closeSettings() {
@@ -3026,6 +3167,15 @@
       } catch (err) {
         showSettingsPane("video", true);
         videoStatus.textContent = err.message;
+        return;
+      }
+    }
+    if (audioFormDirty()) {
+      try {
+        await postAudioProps(audioFormSettings());
+      } catch (err) {
+        showSettingsPane("audio", true);
+        audioStatus.textContent = err.message;
         return;
       }
     }

@@ -799,6 +799,9 @@ fn render_image(url: &str, alt: &str) -> String {
     if extension == "mp4" {
         return render_video(url, alt);
     }
+    if extension == "wav" || extension == "flac" {
+        return render_audio(url, alt, &extension);
+    }
     format!(
         "<span class=\"answer-image\"><img src=\"{url}\" alt=\"{alt}\" loading=\"lazy\">\
          <a class=\"diagram-dl\" href=\"{url}\" download=\"orangu-image.{extension}\" \
@@ -818,6 +821,21 @@ fn render_video(url: &str, alt: &str) -> String {
          preload=\"metadata\" playsinline title=\"{alt}\"></video>\
          <a class=\"diagram-dl\" href=\"{url}\" download=\"orangu-video.mp4\" \
          title=\"Download MP4\" aria-label=\"Download video as MP4\">{SAVE_ICON}</a></span>",
+        url = escape_attr(url),
+        alt = escape_attr(alt),
+    )
+}
+
+/// A recording in an answer — a speech model's WAV or FLAC, kept beside
+/// the session — as a player with the same save control a picture gets,
+/// and the text it speaks as its title.
+fn render_audio(url: &str, alt: &str, extension: &str) -> String {
+    let upper = extension.to_ascii_uppercase();
+    format!(
+        "<span class=\"answer-image answer-audio\"><audio src=\"{url}\" controls \
+         preload=\"metadata\" title=\"{alt}\"></audio>\
+         <a class=\"diagram-dl\" href=\"{url}\" download=\"orangu-speech.{extension}\" \
+         title=\"Download {upper}\" aria-label=\"Download speech as {upper}\">{SAVE_ICON}</a></span>",
         url = escape_attr(url),
         alt = escape_attr(alt),
     )
@@ -1690,6 +1708,20 @@ mod tests {
         assert_eq!(image_extension("data:image/jpeg;base64,AA"), "jpg");
         assert_eq!(image_extension("https://x/y.svg?v=1"), "svg");
         assert_eq!(image_extension("https://x/y"), "png");
+    }
+
+    /// A speech model's reply is a recording: a player, saved in its own
+    /// format, titled with the text it speaks.
+    #[test]
+    fn recordings_get_a_player_and_a_save_control() {
+        let html = render_markdown_to_html_t("![Hello there](/api/sessions/x/files/1-0.wav)");
+        assert!(html.contains(
+            "<span class=\"answer-image answer-audio\"><audio src=\"/api/sessions/x/files/1-0.wav\" \
+             controls preload=\"metadata\" title=\"Hello there\">"
+        ));
+        assert!(html.contains("download=\"orangu-speech.wav\""));
+        let html = render_markdown_to_html_t("![x](/api/sessions/x/files/1-0.flac)");
+        assert!(html.contains("download=\"orangu-speech.flac\""));
     }
 
     #[test]

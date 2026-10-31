@@ -145,7 +145,8 @@ disabled). They are mutually exclusive, and `all` is the default, so passing
 `--all` is a statement of intent rather than a change of behaviour. A sixth,
 `--image`, is not picked: a Qwen-Image (`qwen_image` or `qwen_image_2_1`)
 picture generator always comes up in it, and no other model can. A seventh,
-`--video`, is the same for an LTX-2.5 (`ltxv`) video generator.
+`--video`, is the same for an LTX-2.5 (`ltxv`) video generator, and an
+eighth, `--audio`, for a Qwen3-TTS (`qwen3tts`) speech generator.
 
 The server comes up on the host and port from step 1, serving an
 OpenAI-compatible API — this is the URL step 4 asks for:

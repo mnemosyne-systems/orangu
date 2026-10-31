@@ -493,7 +493,7 @@ fn rope_half(x: &mut [f32], dim: usize, head_dim: usize, angles: &[(f32, f32)]) 
 
 /// PyTorch's exact `nn.GELU()`, `x · Φ(x)`, with `erf` from Abramowitz &
 /// Stegun 7.1.26 (absolute error under 1.5e-7).
-fn gelu_erf_inplace(x: &mut [f32]) {
+pub(crate) fn gelu_erf_inplace(x: &mut [f32]) {
     fn erf(x: f64) -> f64 {
         let s = x.signum();
         let x = x.abs();

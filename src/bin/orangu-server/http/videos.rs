@@ -607,6 +607,16 @@ pub async fn content(Path(id): Path<String>, headers: HeaderMap) -> axum::respon
 
 /// `bytes` as `video/mp4`, honouring a single `Range: bytes=a-b`.
 pub fn mp4_response(bytes: &[u8], headers: &HeaderMap) -> axum::response::Response {
+    ranged_response(bytes, headers, "video/mp4")
+}
+
+/// `bytes` as `content_type`, the part a `Range` header asks for when it
+/// asks — what lets a player seek in a clip or a recording.
+pub fn ranged_response(
+    bytes: &[u8],
+    headers: &HeaderMap,
+    content_type: &'static str,
+) -> axum::response::Response {
     let total = bytes.len();
     let range = headers
         .get(header::RANGE)
@@ -629,7 +639,7 @@ pub fn mp4_response(bytes: &[u8], headers: &HeaderMap) -> axum::response::Respon
     match range {
         Some((start, end)) => axum::response::Response::builder()
             .status(StatusCode::PARTIAL_CONTENT)
-            .header(header::CONTENT_TYPE, "video/mp4")
+            .header(header::CONTENT_TYPE, content_type)
             .header(header::ACCEPT_RANGES, "bytes")
             .header(
                 header::CONTENT_RANGE,
@@ -640,7 +650,7 @@ pub fn mp4_response(bytes: &[u8], headers: &HeaderMap) -> axum::response::Respon
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         None => axum::response::Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "video/mp4")
+            .header(header::CONTENT_TYPE, content_type)
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::CONTENT_LENGTH, total)
             .body(Body::from(bytes.to_vec()))

@@ -152,7 +152,9 @@ easy to miss looking down a table:
 
 And one that applies to the generating endpoints: an `embedding`-role server
 answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
-**`501`** naming the mode, rather than pretending to generate.
+**`501`** naming the mode, rather than pretending to generate. A speech
+(`qwen3tts`) server answers `/v1/completions`, `/completion`,
+`/v1/embeddings` and `/v1/messages` with `501` the same way.
 
 ### Endpoints at a glance
 
@@ -190,6 +192,8 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `POST /v1/videos`, `GET /v1/videos` | OpenAI's Videos API, on an `ltxv` model: start a clip as a job, or list the jobs; `501` on any other model |
 | `GET /v1/videos/{id}`, `DELETE /v1/videos/{id}` | one job's status and progress; cancel or drop it |
 | `GET /v1/videos/{id}/content` | the finished clip as `video/mp4`, with `Range` |
+| `POST /v1/audio/speech` | OpenAI's speech API, on a `qwen3tts` model: the text spoken, as WAV, FLAC or PCM; `501` on any other model |
+| `GET /v1/audio/voices` | the voices, languages and formats a `qwen3tts` model offers |
 | `GET /health` | liveness: is this process up. Stays `200` while the server is merely busy |
 | `GET /ready` | readiness: would a request sent now be served |
 | `GET /v1/workers` | this node's place in its `[workers]` tree: role, layers, plan, workers |
@@ -731,6 +735,82 @@ empty `delta` and a `video_progress` object (`id`, `step`, `steps`,
 `phase`, `eta_seconds`) until the final chunk delivers the content with
 `finish_reason: "stop"`. A failed clip is a `500` with the reason, or an
 `{"error"}` event when streamed.
+
+#### `POST /v1/audio/speech`
+
+OpenAI's speech API. Only on a server whose model is a `qwen3tts` speech
+model (see the *Speech generation* section of the server chapter); any
+other model answers `501`. The answer is the clip itself, sent whole
+once it is made:
+
+```sh
+curl -s localhost:8100/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"input": "Hello from orangu.", "voice": "1.7b-designed"}' -o hello.wav
+```
+
+| field | default | |
+| :-- | :-- | :-- |
+| `input` | _required_ | the text to speak |
+| `model` | — | ignored: the server speaks with the model it serves |
+| `voice` | `audio_voice` | a voice's name, or `{"id": name}`; `GET /v1/audio/voices` lists them |
+| `response_format` | `audio_format` | `wav`, `flac` or `pcm`. `mp3`, `opus` and `aac` are refused with `400` naming the supported ones |
+| `speed` | `1.0` | only `1.0`: any other value is a `400` |
+| `stream_format` | `audio` | only `audio`; `sse` is a `400`, the clip being sent whole |
+| `instructions` | — | refused with `400`: a Base model cannot be steered by a description |
+| `language` | `audio_language` | `auto`, or a language the model names (`english`, `german`, …, or their ISO codes) |
+| `temperature` | `audio_temperature` | codebook 0's temperature, `0` (greedy) to `2` |
+| `top_k` | `audio_top_k` | codebook 0's top-k, `1` or more |
+| `repetition_penalty` | `audio_repetition_penalty` | codebook 0's repetition penalty, `1` to `2` |
+| `max_seconds` | `audio_max_seconds` | the longest clip, above `0` and at most `600` |
+| `seed` | random | the sampler's seed, for a clip that can be made again |
+
+The first seven are OpenAI's, the rest this server's. A bad field — an
+empty `input`, a value out of range, an unknown voice or language — is a
+`400` with the reason as plain text, before any work; an unknown voice or
+language names the valid ones.
+
+The body is the audio, with a `Content-Type` of `audio/wav`,
+`audio/flac` or `audio/pcm`. `pcm` is bare 16-bit little-endian mono
+samples at 24 kHz, as OpenAI's is. Five headers describe the clip:
+
+| header | |
+| :-- | :-- |
+| `x-orangu-voice` | the voice that spoke |
+| `x-orangu-seed` | the seed it was made with |
+| `x-orangu-frames` | the codec frames spoken, 12.5 a second |
+| `x-orangu-sample-rate` | `24000` |
+| `x-orangu-finished` | `true` when the model ended the clip, `false` when the length limit cut it |
+
+#### `GET /v1/audio/voices`
+
+The voices a speech server offers, the languages and the formats:
+
+```json
+{"object":"list",
+ "data":[{"id":"1.7b-designed","object":"voice","description":"…"}],
+ "default":"1.7b-designed",
+ "languages":["auto","chinese","english","french","german","italian",
+              "japanese","korean","portuguese","russian","spanish"],
+ "formats":["wav","flac","pcm"]}
+```
+
+`default` is the voice a request that names none gets. `501` on any
+other model.
+
+`POST /v1/chat/completions` on a speech server speaks the last user
+message and answers in OpenAI's audio-output shape: `choices[0].message`
+is `{"role": "assistant", "content": null, "audio": {…}}`, and `audio`
+holds `id`, `data` (the clip, base64), `format`, `transcript` (the text
+spoken), `expires_at`, `voice` and `seconds`. The request's `audio`
+object (`{"voice", "format"}`), `temperature`, `top_k` and `seed` are
+honoured; every other knob is the server's `audio_*` default. With
+`stream: true` the answer is one chunk carrying the same message as its
+`delta`, then `[DONE]`.
+
+`/v1/completions`, `/completion` and `/v1/embeddings` answer `501` on a
+speech model: there is no text to generate or embed, and the message says
+to use `/v1/audio/speech`, or `/v1/chat/completions` for a spoken reply.
+`/v1/messages` answers `501` too, naming the `--audio` mode.
 
 #### Citations
 
@@ -1804,6 +1884,7 @@ Model and server metadata — the closest thing the server exposes over HTTP to
 | `uptime_seconds`, `pid` | which process answered, and for how long it has been up |
 | `image` | `null` for a language model; on a `qwen_image` model, the picture pipeline — see below |
 | `video` | `null` but on an `ltxv` model: the video pipeline — see below |
+| `audio` | `null` but on a `qwen3tts` model: the speech pipeline — see below |
 
 `version` dates the release; `commit` is the only field that tells two builds
 of one version apart, which during performance work is every pair of builds
@@ -1846,6 +1927,21 @@ On a video model, `video` is the same for a clip:
 | `estimated_default_seconds` | what a clip at the defaults costs at the current rate |
 | `rate` | the model behind it, seeded by the startup calibration and replaced by each finished clip's measurements: `encode` (seconds for the prompt), `per_step`, `per_token` and `per_token_sq` (a step's seconds), `decode_per_pixel` and `other_per_pixel` (per output pixel per frame: the video VAE; the upscaler and the file), `audio_per_second`. Seconds for any settings = `encode + Σ steps × (per_step + per_token × n + per_token_sq × n²) + pixels × frames × (decode_per_pixel + other_per_pixel) + audio_per_second × seconds of sound`, summed over the stages' steps (eight, then three), `n` the stage's video tokens: latent frames × `height/32` × `width/32`, a quarter of that in stage 1 of two |
 
+On a speech model, `audio` is the same for a clip of speech:
+
+| `audio.` | |
+| :-- | :-- |
+| `architecture` | `qwen3tts` |
+| `codec` | the speech codec the pipeline was loaded with |
+| `voice_packs` | the voice pack files loaded |
+| `voices` | the voices they hold, each `{name, description}` |
+| `languages` | `auto` and the languages the model names |
+| `formats` | `wav`, `flac`, `pcm` |
+| `sample_rate`, `frame_rate` | `24000` samples and `12.5` codec frames a second |
+| `talker_layers`, `predictor_layers` | the talker's and the code predictor's depth |
+| `defaults` | what a request gets when it does not say: `voice`, `language`, `format`, `temperature`, `top_k`, `repetition_penalty`, `max_seconds` — as they stand |
+| `configured` | the same seven, as the server came up, from the configuration |
+
 #### `POST /props`
 
 Changes the picture defaults — the ones every request that does not say
@@ -1883,6 +1979,21 @@ The checks are the ones `POST /v1/videos` makes, and a value that fails
 one is a `400` that changes nothing; `{"video": …}` on any other model is
 a `501`. The console's **Settings › Video** pane is this endpoint, and the
 change holds until the server restarts.
+
+On a speech model the body is `{"audio": {…}}` with any of `voice`,
+`language`, `format` (`wav`, `flac`, `pcm`), `temperature` (0–2), `top_k`
+(1 or more), `repetition_penalty` (1–2) and `max_seconds` (above 0, at
+most 600), and `"reset": true` as above:
+
+```sh
+curl -s -X POST localhost:8100/props -H 'Content-Type: application/json' \
+  -d '{"audio": {"voice": "1.7b-designed", "format": "flac"}}'
+```
+
+A value that fails the checks `POST /v1/audio/speech` makes refuses the
+whole change with a `400`; `{"audio": …}` on any other model is a `501`.
+The console's **Settings › Audio** pane is this endpoint, and the change
+holds until the server restarts.
 
 A top-level `[workers]` node also takes `{"workers": {"enabled": false}}`:
 it serves alone — its model's own paths, with the prefix pool, paged KV
@@ -2688,7 +2799,7 @@ Chat sessions:
 | `GET /api/sessions` | lists every non-empty session, newest-updated first |
 | `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
 | `POST /api/sessions/{id}/messages` | sends one chat turn against that session; SSE reply |
-| `GET /api/sessions/{id}/files/{name}` | a file kept beside the session: a picture attached to a message (PNG, JPEG, GIF, WebP, SVG), one a `qwen_image` model made, or a clip an `ltxv` model made (`video/mp4`, with `Range`) |
+| `GET /api/sessions/{id}/files/{name}` | a file kept beside the session: a picture attached to a message (PNG, JPEG, GIF, WebP, SVG), one a `qwen_image` model made, a clip an `ltxv` model made (`video/mp4`, with `Range`), or speech a `qwen3tts` model made (`audio/wav` or `audio/flac`, with `Range`) |
 | `DELETE /api/sessions/{id}` | deletes one chat session, directory and all — History's per-row cross |
 | `DELETE /api/sessions` | deletes every chat session — History's **Clear all** footer |
 
@@ -2728,6 +2839,17 @@ control. The file route answers an `.mp4` as `video/mp4` with
 the player can seek. Closing the stream stops the clip at its next
 transformer block. A clip made here is not a `/v1/videos` job and is not
 listed there.
+
+On a `qwen3tts` server the turn is speech — the text is spoken, and every
+knob is the server's `audio_*` default — and the events are `progress`
+(`phase`: reading the text, speaking with the seconds so far, decoding),
+then the same `done` event with `"audio": true`. The clip is kept beside
+the session as a `.wav`, or a `.flac` when the default format is `flac`;
+`content` is a markdown image over its URL followed by a caption line
+(length, voice, language, seed, and "— cut at the length limit" when it
+was cut), and `html` renders that link as an `<audio>` player with a
+download button. The file route answers `audio/wav` or `audio/flac`, with
+`Range`. Closing the stream stops the clip at its next frame.
 
 The model manager, on the same port:
 

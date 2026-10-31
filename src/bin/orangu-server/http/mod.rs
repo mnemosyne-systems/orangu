@@ -19,6 +19,7 @@
 //! is handled here since it's none of them.
 
 pub mod anthropic;
+pub mod audio;
 pub mod images;
 pub mod native;
 pub mod openai;
@@ -634,6 +635,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(videos::retrieve).delete(videos::delete),
         )
         .route("/v1/videos/{id}/content", get(videos::content))
+        .route("/v1/audio/speech", post(audio::speech))
+        .route("/v1/audio/voices", get(audio::voices))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/workers", get(native::workers))
         // The file-lifecycle API, mounted from the shared router

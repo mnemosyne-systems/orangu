@@ -459,6 +459,28 @@ async fn set_props(
             d.fps,
         );
     }
+    let audio: Option<crate::http::audio::AudioSettings> = match update.get("audio") {
+        Some(audio) => match serde_json::from_value(audio.clone()) {
+            Ok(settings) => Some(settings),
+            Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+        },
+        None => None,
+    };
+    if let Some(settings) = &audio {
+        let Some(pipeline) = state.engine.audio.as_deref() else {
+            return (StatusCode::NOT_IMPLEMENTED, "not a speech model").into_response();
+        };
+        if let Err(err) = crate::http::audio::apply_settings(pipeline, settings) {
+            return (StatusCode::BAD_REQUEST, err).into_response();
+        }
+        let d = pipeline.defaults();
+        log::info!(
+            "orangu-server: [audio] defaults set to voice {}, language {}, {} (web console)",
+            d.voice.as_deref().unwrap_or("(first)"),
+            d.language,
+            d.format.label()
+        );
+    }
     Json(props_view(&state)).into_response()
 }
 
@@ -468,6 +490,7 @@ fn props_view(state: &WebState) -> serde_json::Value {
         "architecture": state.architecture,
         "image": state.engine.image.as_deref().map(crate::http::images::props_json),
         "video": state.engine.video.as_deref().map(crate::http::videos::props_json),
+        "audio": state.engine.audio.as_deref().map(crate::http::audio::props_json),
     })
 }
 
@@ -876,6 +899,9 @@ async fn send_message(
     if state.engine.video.is_some() {
         return send_video_message(state, session, req.content, extracted).await;
     }
+    if state.engine.audio.is_some() {
+        return send_audio_message(state, session, req.content, extracted).await;
+    }
 
     let Some(template) = state.engine.chat_template.clone() else {
         return (
@@ -1246,6 +1272,118 @@ async fn send_video_message(
     axum::response::sse::Sse::new(stream).into_response()
 }
 
+/// A console turn on a speech model: the message is the text, the reply is
+/// it spoken, kept beside the transcript (as WAV, or FLAC when that is the
+/// default format — a browser plays either) and shown as a player with a
+/// caption. Progress is the image turn's shape with the `phase` running:
+/// the seconds spoken so far, then the codec's decoding.
+async fn send_audio_message(
+    state: Arc<WebState>,
+    mut session: Session,
+    user_message: String,
+    user_attachments: Vec<Attachment>,
+) -> axum::response::Response {
+    let Some(pipeline) = state.engine.audio.clone() else {
+        return (StatusCode::NOT_IMPLEMENTED, "not a speech model").into_response();
+    };
+    let defaults = pipeline.defaults();
+    let request = match crate::http::audio::build_request(
+        &defaults,
+        crate::http::audio::SpeechParams {
+            text: &user_message,
+            ..Default::default()
+        },
+    ) {
+        Ok(request) => request,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    if request.text.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "there is no text to speak").into_response();
+    }
+    let format = match defaults.format {
+        crate::engine::audio::AudioFormat::Flac => crate::engine::audio::AudioFormat::Flac,
+        _ => crate::engine::audio::AudioFormat::Wav,
+    };
+    let frame_rate = pipeline.frame_rate();
+    let attachment_views: Vec<AttachmentView> = user_attachments
+        .iter()
+        .cloned()
+        .map(|a| attachment_view(&session.id, a))
+        .collect();
+    let started = std::time::Instant::now();
+    let (mut rx, cancel) = pipeline.spawn(request);
+    let stream = async_stream::stream! {
+        // Held for the stream's life: Stop closes the connection, and that
+        // stops the clip at its next frame.
+        let _cancel = cancel;
+        if !attachment_views.is_empty() {
+            yield Ok::<_, Infallible>(
+                axum::response::sse::Event::default()
+                    .data(json!({"type": "attachments", "attachments": attachment_views}).to_string()),
+            );
+        }
+        loop {
+            let Some(event) = rx.recv().await else { break };
+            match event {
+                crate::engine::audio::SpeechEvent::Progress(p) => {
+                    let (phase, step, steps) = match p {
+                        crate::engine::audio::Progress::Prompt => ("reading the text".to_string(), 0, 0),
+                        crate::engine::audio::Progress::Speaking { frames } => (
+                            format!("speaking — {:.1} s so far", frames as f64 / frame_rate),
+                            0,
+                            0,
+                        ),
+                        crate::engine::audio::Progress::Decoding { frames, of } => {
+                            ("decoding".to_string(), frames, of)
+                        }
+                    };
+                    yield Ok(axum::response::sse::Event::default().data(
+                        json!({"type": "progress", "step": step, "steps": steps, "phase": phase, "eta_seconds": null}).to_string(),
+                    ));
+                }
+                crate::engine::audio::SpeechEvent::Done(speech) => {
+                    crate::http::audio::log_speech(&speech, started.elapsed(), " (web console)");
+                    let bytes = format.encode(&speech.samples, speech.sample_rate);
+                    let name = match sessions::store_file(&session.id, format.label(), &bytes) {
+                        Ok(name) => name,
+                        Err(err) => {
+                            yield Ok(axum::response::sse::Event::default()
+                                .data(json!({"type": "error", "message": format!("{err:#}")}).to_string()));
+                            break;
+                        }
+                    };
+                    let alt = user_message.replace(['[', ']', '\n'], " ");
+                    let content = format!(
+                        "![{alt}]({})\n\n*{:.1} s, voice {}, language {}, seed {}{}*",
+                        sessions::file_url(&session.id, &name),
+                        speech.seconds(),
+                        speech.voice,
+                        speech.language,
+                        speech.seed,
+                        if speech.finished { "" } else { " — cut at the length limit" },
+                    );
+                    let html = render::render_markdown_to_html(&content, state.project_licence.as_ref());
+                    let generation_ms = started.elapsed().as_millis() as u64;
+                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms)) {
+                        yield Ok(axum::response::sse::Event::default()
+                            .data(json!({"type": "error", "message": err.to_string()}).to_string()));
+                        break;
+                    }
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(json!({"type": "done", "html": html, "reasoning_html": "", "content": content, "reasoning": "", "truncated": false, "generation_ms": generation_ms, "audio": true}).to_string()));
+                    break;
+                }
+                crate::engine::audio::SpeechEvent::Error(err) => {
+                    yield Ok(axum::response::sse::Event::default()
+                        .data(json!({"type": "error", "message": err}).to_string()));
+                    break;
+                }
+            }
+        }
+    };
+    axum::response::sse::Sse::new(stream).into_response()
+}
+
 /// Serves a file kept beside a session's transcript — an attached or a
 /// generated picture, or a generated clip (with `Range`, so the player can
 /// seek). The name is checked by [`sessions::file_path`], which only ever
@@ -1261,8 +1399,13 @@ async fn session_file(
     let Ok(bytes) = tokio::fs::read(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if path.extension().and_then(|e| e.to_str()) == Some("mp4") {
-        return crate::http::videos::mp4_response(&bytes, &headers);
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("mp4") => return crate::http::videos::mp4_response(&bytes, &headers),
+        Some("wav") => return crate::http::videos::ranged_response(&bytes, &headers, "audio/wav"),
+        Some("flac") => {
+            return crate::http::videos::ranged_response(&bytes, &headers, "audio/flac");
+        }
+        _ => {}
     }
     let content_type = match path.extension().and_then(|e| e.to_str()) {
         Some("svg") => "image/svg+xml",

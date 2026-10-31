@@ -18,7 +18,7 @@ Installs `orangu`, `orangu-coordinator`, `orangu-server`, `orangu-bench` and
 | `orangu-server -i` | Models directory, role, host, port 8100, console; `api_key` unless loopback. |
 | `orangu-server download unsloth/gemma-4-E2B-it-GGUF` | Reports what a model needs here, then fetches it. `:Q8_0` pins a quant, `HF_TOKEN` opens gated repos, `-y` skips the prompt. |
 | `orangu-server plan 3` | That same report for a model already on disk, by `list` NR. Headers only, so it is quick. |
-| `orangu-server --all unsloth/gemma-4-E2B-it-GGUF` | Serve it on `http://localhost:8100/v1`. Roles: `--all`, `--code`, `--review`, `--explorer`, `--embedding`; `--image`, `--video`. |
+| `orangu-server --all unsloth/gemma-4-E2B-it-GGUF` | Serve it on `http://localhost:8100/v1`. Roles: `--all`, `--code`, `--review`, `--explorer`, `--embedding`; `--image`, `--video`, `--audio`. |
 | `orangu -i` | Configure orangu. Enter that URL; the wizard reads the model off the server. |
 | `orangu` | Start, in your project directory. |
 

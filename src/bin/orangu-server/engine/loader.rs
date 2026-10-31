@@ -217,6 +217,14 @@ pub enum ArchFamily {
     /// the video VAE and the audio VAE beside it. See
     /// `engine::video::transformer` for the graph.
     Ltxv,
+    /// Qwen3-TTS (`qwen3tts`, e.g. `cstr/qwen3-tts-1.7b-base-GGUF`) — not a
+    /// chat model: the speech generator that turns text into the codes of a
+    /// 12 Hz speech codec, served through `engine::audio`. Its talker is a
+    /// Qwen3 decoder over embeddings and its code predictor a small one; the
+    /// codec's decoder (`qwen3tts_tokenizer`) and the voice packs
+    /// (`qwen3tts.voicepack`) sit beside it and are opened with
+    /// [`LoadedModel::open_companion`].
+    Qwen3Tts,
 }
 
 /// GGUF `general.architecture` values that map to [`ArchFamily::LlamaStyle`]
@@ -370,6 +378,9 @@ const QWEN_IMAGE_ARCHITECTURES: &[&str] = orangu::model_spec::IMAGE_ARCHITECTURE
 /// `ltxv` (`unsloth/LTX-2.5-GGUF`) — see [`ArchFamily::Ltxv`] and
 /// `engine::video`.
 const LTXV_ARCHITECTURES: &[&str] = orangu::model_spec::VIDEO_ARCHITECTURES;
+/// `qwen3tts` (`cstr/qwen3-tts-1.7b-base-GGUF`) — see [`ArchFamily::Qwen3Tts`]
+/// and `engine::audio`.
+const QWEN3TTS_ARCHITECTURES: &[&str] = orangu::model_spec::AUDIO_ARCHITECTURES;
 
 /// Architectures this engine recognises by name and deliberately does **not**
 /// serve, with the reason.
@@ -491,6 +502,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if LTXV_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Ltxv);
     }
+    if QWEN3TTS_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Qwen3Tts);
+    }
     // A recognised near miss gets its own reason. The alternative — dropping
     // the reader into the whole accepted-name list, which looks like it
     // *should* contain theirs — is what makes an out-of-tree alias mechanism
@@ -548,6 +562,7 @@ fn supported_architecture_names() -> Vec<&'static str> {
         .chain(BAILINGMOE3_ARCHITECTURES)
         .chain(QWEN_IMAGE_ARCHITECTURES)
         .chain(LTXV_ARCHITECTURES)
+        .chain(QWEN3TTS_ARCHITECTURES)
         .cloned()
         .collect()
 }
@@ -1631,6 +1646,7 @@ enum Opened {
     Model,
     Projector,
     Head,
+    Companion,
 }
 
 impl LoadedModel {
@@ -1995,6 +2011,14 @@ impl LoadedModel {
         Self::open_shards_as(&shard_sources(path)?, Opened::Head)
     }
 
+    /// Opens a file a generator reads beside its model — Qwen3-TTS's speech
+    /// codec (`qwen3tts_tokenizer`) or a voice pack (`qwen3tts.voicepack`) —
+    /// for its tensors and raw metadata alone. Neither is a model any family
+    /// serves, so no configuration is read: `engine::audio` reads its own.
+    pub fn open_companion(path: &Path) -> Result<Self> {
+        Self::open_shards_as(&shard_sources(path)?, Opened::Companion)
+    }
+
     /// Loads a model whose shards are byte ranges inside one file that is
     /// not itself a `.gguf` — a bundled `orangu-server`, where the model was
     /// appended to the executable (see `crate::bundle`). Every shard names
@@ -2051,6 +2075,10 @@ impl LoadedModel {
             }
         } else if opened == Opened::Head {
             read_model_config(&gguf, &architecture)?
+        } else if opened == Opened::Companion {
+            companion_model_config(architecture)
+        } else if resolve_arch_family(&architecture)? == ArchFamily::Qwen3Tts {
+            read_audio_model_config(&gguf, &architecture)?
         } else if resolve_arch_family(&architecture)? == ArchFamily::QwenImage {
             read_image_model_config(&gguf, &architecture)?
         } else if resolve_arch_family(&architecture)? == ArchFamily::Ltxv {
@@ -2574,6 +2602,55 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
     })
 }
 
+/// The placeholder [`ModelConfig`] of a file opened with
+/// [`LoadedModel::open_companion`]: its consumer reads its own shape.
+fn companion_model_config(architecture: String) -> ModelConfig {
+    ModelConfig {
+        architecture,
+        n_vocab: 0,
+        n_embd: 1,
+        n_layer: 0,
+        n_head: 1,
+        n_head_kv: 1,
+        head_dim: 1,
+        n_ctx_train: 0,
+        rope_dim: 1,
+        rope_freq_base: 10000.0,
+        rms_eps: 1e-6,
+        pooling_type: PoolingType::Mean,
+    }
+}
+
+/// [`ModelConfig`] for a `qwen3tts` file: its talker's shape
+/// (`qwen3tts.talker.*`), the codec's vocabulary as `n_vocab`. Nothing
+/// generic runs it — `engine::audio` reads its own — but the fields are
+/// what the file says.
+fn read_audio_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig> {
+    let get = |suffix: &str| metadata_u64(gguf, &format!("{architecture}.talker.{suffix}"));
+    let need = |suffix: &str| {
+        get(suffix)
+            .map(|v| v as usize)
+            .ok_or_else(|| anyhow!("{architecture}: missing {architecture}.talker.{suffix}"))
+    };
+    let n_embd = need("d_model")?;
+    let head_dim = need("head_dim")?;
+    Ok(ModelConfig {
+        architecture: architecture.to_string(),
+        n_vocab: need("vocab_size")?,
+        n_embd,
+        n_layer: need("n_layers")?,
+        n_head: need("n_heads")?,
+        n_head_kv: need("n_kv_heads")?,
+        head_dim,
+        n_ctx_train: get("max_pos").unwrap_or(32768) as usize,
+        rope_dim: head_dim,
+        rope_freq_base: metadata_f32(gguf, &format!("{architecture}.talker.rope_theta"))
+            .unwrap_or(1_000_000.0),
+        rms_eps: metadata_f32(gguf, &format!("{architecture}.talker.rms_norm_eps")).unwrap_or(1e-6),
+        pooling_type: PoolingType::Mean,
+    })
+}
+
 /// [`ModelConfig`] for an `ltxv` file: the video stream's width off
 /// `patchify_proj` (`[128, dim]`), its head width from the `config` JSON
 /// the file carries (`transformer.attention_head_dim`), and the block count
@@ -2892,6 +2969,7 @@ mod tests {
             (ArchFamily::BailingMoe3, "bailingmoe3"),
             (ArchFamily::QwenImage, "qwen_image"),
             (ArchFamily::Ltxv, "ltxv"),
+            (ArchFamily::Qwen3Tts, "qwen3tts"),
         ];
         for &(family, name) in representatives {
             // The exhaustiveness guard: this match has no wildcard, so a new
@@ -2918,6 +2996,7 @@ mod tests {
                 ArchFamily::BailingMoe3 => "BailingMoe3",
                 ArchFamily::QwenImage => "QwenImage",
                 ArchFamily::Ltxv => "Ltxv",
+                ArchFamily::Qwen3Tts => "Qwen3Tts",
             };
             assert!(
                 listing.contains(&name),

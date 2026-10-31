@@ -12,7 +12,8 @@ has the reference for every key, and the *HTTP endpoints* chapter the
 API; the *Inference server internals* chapter says how the pipeline is
 built.
 
-For clips with sound, see the *Video generation* chapter.
+For clips with sound, see the *Video generation* chapter, and for speech,
+the *Speech generation* chapter.
 
 ![A 512 × 512 picture from the prompt "Create an image of a cat", eight
 steps on a twelve-core ARM board](images/orangu-image-cat.png)

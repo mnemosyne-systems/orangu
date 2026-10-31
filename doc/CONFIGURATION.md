@@ -192,7 +192,7 @@ Only `models` is required.
 | `model` | No | Model to serve when none is given on the command line: a local path, an `NR`/`MODEL` label, or a `<user>/<model>[:quant]` Hugging Face repo. Required for `--daemon` |
 | `host` | No | Bind address for the API. Defaults to `all` (every interface; `*` is an alias); a literal address such as `127.0.0.1` restricts it |
 | `port` | No | HTTP API port. Defaults to `8100` |
-| `role` | No | Role the server is tuned for: `all`, `code`, `review`, `explorer`, `embedding`, `image`, or `video`. Read only under `--daemon`; otherwise the command-line flag (or `all`) decides. An image model is always served as `image`, a video model as `video` |
+| `role` | No | Role the server is tuned for: `all`, `code`, `review`, `explorer`, `embedding`, `image`, `video`, or `audio`. Read only under `--daemon`; otherwise the command-line flag (or `all`) decides. An image model is always served as `image`, a video model as `video`, a speech model as `audio` |
 | `slots` | No | Concurrent requests, each with its own KV cache. Defaults to `8` for `embedding` and `1` for every other role; must be at least `1` |
 | `queue_limit` | No | Requests allowed to wait for a slot before the server answers `503`. Defaults to `0`, unbounded |
 | `context` | No | Context, in tokens, one request must be able to hold on the device. Unset, every layer goes to the card when it fits and the context is what is left; set, layers move to the host until the card has room for this much KV cache. Must be at least `1` |
@@ -266,6 +266,24 @@ own.
 | `video_audio` | No | Put the sound in the file, when the audio VAE is there. Defaults to `yes` |
 | `video_two_stage` | No | The two-stage recipe (half size, upscale, refine), when the upscaler is there. Defaults to `yes` |
 | `video_quality` | No | The AV1 encoder's quantizer, `0` (best) to `255` (smallest file). Defaults to `80` |
+
+#### Speech models
+
+These apply to a `qwen3tts` model (Qwen3-TTS). `codec` and `voices` name
+its speech codec and voice packs. The `audio_*` keys are the defaults for
+a request that does not set its own.
+
+| Key | Required | Description |
+| :-- | :-- | :-- |
+| `codec` | No | The speech codec GGUF (`qwen3tts_tokenizer`), absolute or relative to `models`. Defaults to the largest one found |
+| `voices` | No | A voice pack file (`qwen3tts.voicepack`), or a directory searched for them. Defaults to every pack under `models` made for the model's width |
+| `audio_voice` | No | Voice a request gets when it names none. Defaults to the first one loaded |
+| `audio_language` | No | `auto` (the default) or a language the model names: `chinese`, `english`, `french`, `german`, `italian`, `japanese`, `korean`, `portuguese`, `russian`, `spanish` (or `zh`, `en`, `fr`, `de`, `it`, `ja`, `ko`, `pt`, `ru`, `es`) |
+| `audio_format` | No | Format the speech is returned in: `wav` (the default), `flac`, or `pcm` |
+| `audio_temperature` | No | Sampling temperature for the first codebook, `0` (greedy) to `2`. Defaults to `0.9` |
+| `audio_top_k` | No | Top-k for the first codebook, `1` or more. Defaults to `50` |
+| `audio_repetition_penalty` | No | Repetition penalty for the first codebook, `1` to `2`. Defaults to `1.05` |
+| `audio_max_seconds` | No | Longest clip, in seconds, above `0` and at most `600`. Defaults to `120` |
 
 #### Logging
 

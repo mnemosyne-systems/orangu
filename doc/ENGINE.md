@@ -1,9 +1,10 @@
 # The inference engine: a contributor's map
 
-`orangu-server` carries seventeen architecture modules across nineteen servable
-architecture families — seventeen language models and two diffusion
-transformers, one for pictures and one for video, each with a module of its
-own outside `engine::arch` — and six device backends.
+`orangu-server` carries seventeen architecture modules across twenty servable
+architecture families — seventeen language models, two diffusion
+transformers, one for pictures and one for video, and one speech model, each
+of the last three with a module of its own outside `engine::arch` — and six
+device backends.
 Each one documents itself well; what has been missing is the thing you need
 *first* — where they sit, which of them you have to touch, and which rules are
 not visible from the module you happen to be reading.
@@ -237,10 +238,10 @@ Architectures, by what they are rather than by name:
 
 Twenty-one modules above, seventeen architecture modules: `qwen_hybrid`, `kda`,
 `hyper` and `indexer` are shared parts, not architectures of their own.
-Twenty `ArchFamily` variants, nineteen *servable* families: `dflash` is a
+Twenty-one `ArchFamily` variants, twenty *servable* families: `dflash` is a
 module and a variant but resolves to the model it drafts for rather than
-serving itself, and `QwenImage` and `Ltxv` are variants whose modules live
-outside `engine::arch` altogether (below). Those are the two
+serving itself, and `QwenImage`, `Ltxv` and `Qwen3Tts` are variants whose
+modules live outside `engine::arch` altogether (below). Those are the two
 conventions every count in the documentation uses — check them against this
 table and `ArchFamily` rather than against another prose count, which is how
 they drifted apart before.
@@ -300,6 +301,24 @@ audio VAE and vocoder (`video::audio`), and an AV1-and-FLAC MP4 writer
 the picture pipeline it runs on `CpuBackend` whatever the encoder was
 placed on. `prepare` hangs it on `Engine::video`; `build_model` refuses the
 family.
+
+`qwen3tts`, Qwen3-TTS, is the third, in `engine::audio`: text to speech.
+Its file holds the *talker*, a Qwen3 decoder that writes codebook 0 of a
+12 Hz speech codec one frame at a time, and the *code predictor*, a small
+decoder that fills codebooks 1–15 of each frame from the talker's hidden
+state; both are `audio::stack`, a Qwen3 transformer run over input
+embeddings with its own key/value cache. Two kinds of companion GGUF sit
+beside it: the codec's decoder (`qwen3tts_tokenizer`, `audio::codec`),
+sixteen codes a frame back to 24 kHz sound, and the voice packs
+(`qwen3tts.voicepack`), each a speaker embedding with a reference
+transcript and its codec codes. The pipeline (`engine::audio::Pipeline`)
+prompts the talker in context — the reference transcript and the new text
+over the reference recording's frames — and runs on `CpuBackend`
+whatever `backend` says. Nothing in it is a language model the engine
+could serve, so `main.rs`'s `prepare_audio` builds the `Engine` around
+`audio::placeholder`, a `ModelForward` that describes the talker's shape
+and runs nothing, and hangs the pipeline on `Engine::audio`; the HTTP
+layer refuses the text endpoints before they reach it.
 
 Backends, and they are not six of a kind:
 

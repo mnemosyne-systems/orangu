@@ -69,6 +69,7 @@ pub fn run_init() -> Result<()> {
         nr_of(&groups, &model).and_then(|nr| crate::model_support(&groups).into_iter().nth(nr - 1));
     let image_model = support.as_ref().is_some_and(|support| support.image);
     let video_model = support.as_ref().is_some_and(|support| support.video);
+    let audio_model = support.as_ref().is_some_and(|support| support.audio);
     let image_variant = support
         .and_then(|support| support.architecture)
         .and_then(|arch| crate::engine::image::Variant::from_architecture(&arch))
@@ -79,6 +80,9 @@ pub fn run_init() -> Result<()> {
     } else if video_model {
         println!("role: {}", Role::Video.label());
         Role::Video
+    } else if audio_model {
+        println!("role: {}", Role::Audio.label());
+        Role::Audio
     } else {
         prompt_role(
             &format!("role [{}]: ", Role::default().label()),

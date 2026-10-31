@@ -577,14 +577,14 @@ pub fn run(request: Request) -> Result<()> {
     // catching now, not after a multi-gigabyte copy.
     crate::reexec::precheck(&model_path)
         .with_context(|| format!("{} cannot be served by this build", model_path.display()))?;
-    // A picture or video generator is several files (transformer, text
-    // encoder, VAEs) and a bundle carries one, so neither the model nor its role can be
-    // bundled — said here, before the copy, rather than at the bundle's
+    // A picture, video or speech generator is several files (transformer,
+    // text encoder, VAEs, a codec and voices) and a bundle carries one, so
+    // neither the model nor its role can be bundled — said here, before the copy, rather than at the bundle's
     // first start.
     let architecture = orangu::model_spec::architecture_of(&gguf);
     if let Some(required) = Role::required_by(architecture.as_deref()) {
         bail!(
-            "{label} cannot be bundled: a {} model needs its text encoder and VAE beside it, so \
+            "{label} cannot be bundled: a {} model needs its companion files beside it, so \
              the {} role is only ever served from a models directory",
             architecture.as_deref().unwrap_or("qwen_image"),
             required.label()
@@ -593,6 +593,7 @@ pub fn run(request: Request) -> Result<()> {
     if role.fixed_by_model() {
         let serves = match role {
             Role::Video => "video generators (ltxv)",
+            Role::Audio => "speech generators (qwen3tts)",
             _ => "picture generators (qwen_image, qwen_image_2_1)",
         };
         bail!(

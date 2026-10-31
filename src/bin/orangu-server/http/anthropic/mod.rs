@@ -959,6 +959,7 @@ async fn prepare(
     if !state.engine.role.allows_generation()
         || state.engine.image.is_some()
         || state.engine.video.is_some()
+        || state.engine.audio.is_some()
     {
         return Err(Box::new(error_response(
             StatusCode::NOT_IMPLEMENTED,

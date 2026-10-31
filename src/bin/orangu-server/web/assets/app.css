@@ -771,6 +771,14 @@ button:disabled {
   background: #000;
 }
 
+/* A recording a qwen3tts model made: the browser's own player, wide
+   enough to scrub, with the save control under it as a picture's is. */
+.answer-image audio {
+  display: block;
+  width: min(480px, 100%);
+  max-width: 100%;
+}
+
 .answer-image .diagram-dl {
   display: inline-flex;
   margin-top: 0.3em;
@@ -1340,26 +1348,30 @@ button:disabled {
    The picture settings pane: a label column and a control column, the
    estimate under them, the two actions last. */
 #image-header,
-#video-header {
+#video-header,
+#audio-header {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
 #image-header h2,
-#video-header h2 {
+#video-header h2,
+#audio-header h2 {
   margin: 0;
   font-size: 1.1em;
 }
 
 #image-model,
-#video-model {
+#video-model,
+#audio-model {
   flex: 1;
   min-width: 0;
 }
 
 #image-form,
-#video-form {
+#video-form,
+#audio-form {
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -1408,27 +1420,35 @@ button:disabled {
   color: var(--text-dim);
 }
 
+#audio-voice-description {
+  margin: -4px 0 0;
+  min-height: 1.2em;
+}
+
 #image-estimate,
 #video-estimate {
   min-height: 1.2em;
 }
 
 #image-actions,
-#video-actions {
+#video-actions,
+#audio-actions {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
 #image-reset-btn,
-#video-reset-btn {
+#video-reset-btn,
+#audio-reset-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
 
 #image-reset-btn svg,
-#video-reset-btn svg {
+#video-reset-btn svg,
+#audio-reset-btn svg {
   width: 16px;
   height: 16px;
 }

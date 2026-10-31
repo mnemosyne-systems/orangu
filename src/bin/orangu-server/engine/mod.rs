@@ -17,6 +17,7 @@ pub mod adapt;
 pub mod arch;
 pub mod attention;
 pub mod attention_tiled;
+pub mod audio;
 pub mod backend;
 pub mod chat_template;
 pub mod constraint;

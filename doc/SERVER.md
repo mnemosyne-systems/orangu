@@ -45,9 +45,9 @@ it isn't already cached there. No separate download step is needed.
 Leave it off entirely and `orangu-server` lists every `.gguf` model under
 the configured `models` directory (the same table `list` prints) and
 prompts for one by `NR`, then — unless `--all`/`--code`/`--review`/
-`--explorer`/`--embedding`/`--image`/`--video` was passed, and unless the
-model is a picture or video generator, whose role is `image` or `video`
-without asking — prompts for a
+`--explorer`/`--embedding`/`--image`/`--video`/`--audio` was passed, and
+unless the model is a picture, video or speech generator, whose role is
+`image`, `video` or `audio` without asking — prompts for a
 [role](#roles) too, TAB-completing over the five names a language model
 can take (dropdown-style: an empty `TAB` press lists all five) and
 defaulting to `all` on an empty entry:
@@ -659,7 +659,9 @@ gate/up experts with optional per-expert `.scale` companions) load via the
 gemma routed-expert path, so they report `Yes (gemma4)`. A `No`
 row is printed _greyed_, not hidden: you can still select
 it, but loading fails with a clear "not yet supported" error — the column
-just surfaces that before you commit. The greying is emitted only to a
+just surfaces that before you commit. A file that only serves beside a model — a speech
+model's codec or voice pack — is `Companion (<arch>)`, here
+`Companion (qwen3tts)`, and is never served on its own. The greying is emitted only to a
 terminal; piped or redirected output stays plain text, so the shell
 completions that read `list` by column (below) are unaffected by it.
 
@@ -1260,6 +1262,11 @@ orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a fee
   `video_size` / `video_seconds` (or `video_frames`) / `video_fps` /
   `video_audio` / `video_two_stage` / `video_quality`, what a clip gets
   when the request does not say. See **Video generation**.
+- `codec` / `voices` name a `qwen3tts` model's speech codec and its voice
+  packs (a file, or a directory searched for them); and `audio_voice` /
+  `audio_language` / `audio_format` / `audio_temperature` / `audio_top_k` /
+  `audio_repetition_penalty` / `audio_max_seconds`, what a clip of speech
+  gets when the request does not say. See **Speech generation**.
 - `kv_cache` — how the GPU-side KV mirror is stored: `f16` (the default),
   `q8_0`, or `f32`. `q8_0` is ~44% smaller than `f16` and cuts attention's
   read bandwidth at long context (−32% attention GPU time at ~295 tokens,
@@ -1319,9 +1326,9 @@ orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a fee
   and the split made a step twice as slow. The check costs ~1.1 s at
   start-up. `ORANGU_HEAD_SPLIT=0` skips it.
 - `role` — `all` (the default), `code`, `review`, `explorer`,
-  `embedding`, `image` or `video`. See **Roles** below. Resolved in this order: an
+  `embedding`, `image`, `video` or `audio`. See **Roles** below. Resolved in this order: an
   explicit CLI flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`/
-  `--image`/`--video`) wins everywhere and skips the prompt entirely; failing that,
+  `--image`/`--video`/`--audio`) wins everywhere and skips the prompt entirely; failing that,
   `--daemon` takes this key directly, having no terminal to prompt on; and
   an attached run with no flag uses it to **pre-select the interactive
   `role` prompt** — ghosted on the empty line, TAB-completing over the
@@ -1332,7 +1339,8 @@ orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a fee
   model, which comes up in it whatever this key says is missing, and
   which refuses any _other_ value here (under `--daemon`) or on the CLI —
   see **Image generation** below. `video` is the same for an `ltxv` model —
-  see **Video generation**.
+  see **Video generation** — and `audio` for a `qwen3tts` model — see
+  **Speech generation**.
 - `log_type` / `log_path` — where the server's output goes. `console` (the
   default) is exactly what it has always printed: the startup banner, a
   progress line rewritten once a second while a request runs, each
@@ -1683,7 +1691,7 @@ the model's own paths, as without `[workers]`, and the workers are let go
 meanwhile. Only between requests (`409` otherwise). `orangu-bench --workers
 compare` measures both ways.
 
-`doc/manual/en/50-workers.md` walks through setting up a tree.
+`doc/manual/en/51-workers.md` walks through setting up a tree.
 
 **Memory.** Each node holds only the layers it runs: weights are read, and
 uploaded to a GPU, the first time a layer runs. A node with a `[workers]`
@@ -1763,8 +1771,9 @@ directory that doesn't exist yet is created, parents included), then
 `model` and `role` (TAB-completing the five names a language model can
 take, defaulting to `all`; an image model answers `image` on its own and
 is then asked the picture pipeline's keys — see **Image generation** —
-and a video model answers `video` and is asked the video pipeline's keys
-— see **Video generation**),
+a video model answers `video` and is asked the video pipeline's keys
+— see **Video generation** — and a speech model answers `audio` — see
+**Speech generation**),
 then `host` (TAB-completing — and previewing as an inline grey
 ghost — `all`, `*`, and every address this machine's network interfaces
 actually have, each listed with the interface it belongs to), then
@@ -1846,13 +1855,14 @@ and the features built on top of it later will do the same.
 
 ## Roles
 
-`--all`/`--code`/`--review`/`--explorer`/`--embedding`/`--image`/`--video`
+`--all`/`--code`/`--review`/`--explorer`/`--embedding`/`--image`/`--video`/`--audio`
 (mutually exclusive; `--all` is the default) hint at which of
 `orangu-server`'s own features matter for a given deployment. Five of them
 are a choice made for a language model; `--image` is not a choice at all —
 it is the role of a `qwen_image` picture generator, which takes it on its
 own and cannot take another (see **Image generation**), and `--video` is
-the same for an `ltxv` video generator (see **Video generation**). These mirror `orangu`'s conventional
+the same for an `ltxv` video generator (see **Video generation**), and
+`--audio` for a `qwen3tts` speech generator (see **Speech generation**). These mirror `orangu`'s conventional
 deployment roles (`all`/`code`/`review`/`explorer`/`embeddings`), but a
 single `orangu-server` process serves whatever model it's given rather than
 picking one — so unlike a real `orangu-server` process per role, this only
@@ -1913,8 +1923,14 @@ with the engine's default sampling and no reasoning to suppress. An
 waits for the first), with no sampling to tune and no reasoning to
 suppress. The header cannot move a request off it or onto it either.
 
+`audio` is what a `qwen3tts` model is served as: every chat turn and
+`/v1/audio/speech` speak their text, one clip at a time (a single slot),
+with the speech model's own sampling and no reasoning to suppress. The
+header cannot move a request off it or onto it either.
+
 The role in effect is, in order: the model's own, when it has one (a
-`qwen_image` file is always `image`, an `ltxv` file always `video`, and an explicit flag or `--daemon`
+`qwen_image` file is always `image`, an `ltxv` file always `video`, a
+`qwen3tts` file always `audio`, and an explicit flag or `--daemon`
 config key saying otherwise is an error rather than overridden); or
 whichever CLI flag was passed; or, if none was and this is an attached run
 with no model given on the command line either, whatever's typed at the
@@ -2589,6 +2605,188 @@ as the prompt, runs it as a `/v1/videos` job and answers with a markdown
 link to the clip's content, the job itself under `videos`. Both are
 documented field by field in the _HTTP endpoints_ chapter.
 
+## Speech generation
+
+`doc/manual/en/50-audio.md` is the walk-through — what to download, how
+to start, what the console's settings do; this section is the reference.
+
+`orangu-server` also serves **Qwen3-TTS**, a text-to-speech model, from
+the same GGUF inventory: a file whose `general.architecture` is
+`qwen3tts` (`cstr/qwen3-tts-1.7b-base-GGUF` or
+`cstr/qwen3-tts-0.6b-base-GGUF`, `list`'s `Yes (qwen3tts)`). Point the
+server at it exactly as at a language model — `orangu-server --audio`, or
+`model = cstr/qwen3-tts-1.7b-base-GGUF:Q8_0` — and every chat turn is
+answered with the text spoken instead of a reply: 24 kHz mono speech, as
+WAV, FLAC or raw PCM.
+
+A `qwen3tts` file carries three parts: the **talker**, a Qwen3 decoder
+that writes codebook 0 of a 12 Hz speech codec one frame at a time; the
+**code predictor**, which fills codebooks 1–15 of each frame; and a
+speaker encoder, which is not used. The rest are its companions, found
+beside it in the models directory:
+
+- **The speech codec** — a GGUF whose `general.architecture` is
+  `qwen3tts_tokenizer` (`cstr/qwen3-tts-tokenizer-12hz-GGUF`,
+  `qwen3-tts-tokenizer-12hz.gguf`). It turns a frame's 16 codes, 12.5
+  frames a second, into 24 kHz mono sound. The largest one found is
+  used, so the `F16` file is taken over a `q8_0` one beside it.
+- **The voice packs** — GGUFs whose `general.architecture` is
+  `qwen3tts.voicepack` (`cstr/qwen3-tts-voices-GGUF`):
+  `qwen3-tts-voice-1.7b-designed.gguf` for the 1.7B talker (a
+  2048-wide speaker embedding), `qwen3-tts-voice-0.6b-designed.gguf` for
+  the 0.6B (1024 wide). A pack holds a speaker embedding plus a
+  reference transcript and its codec codes. A pack made for another
+  talker width is skipped, with a log line saying so. A voice a pack
+  calls `default` is named after its file instead — the file stem
+  without its `qwen3-tts-voice-` prefix, so `1.7b-designed` — and a name
+  that is already taken gets a numeric suffix.
+
+`list` shows the codec and the voice packs as `Companion (qwen3tts)`.
+They are never served on their own. `orangu-server download
+cstr/qwen3-tts-1.7b-base-GGUF:Q8_0` also fetches the codec, when no codec
+is under the models directory, and a voice pack of the model's width,
+when none of that width is there; the web console's model manager
+downloads the same way.
+
+Each companion is recognised by its `general.architecture`, not its
+name. Two keys name them explicitly when they live elsewhere:
+
+```ini
+[orangu-server]
+model = cstr/qwen3-tts-1.7b-base-GGUF:Q8_0
+codec = /srv/tts/qwen3-tts-tokenizer-12hz.gguf
+voices = /srv/tts/voices
+```
+
+`codec` is a path, absolute or relative to `models`. `voices` is a voice
+pack file, or a directory searched for them. Left out, the largest codec
+under `models` is used, and every voice pack under `models` made for the
+model's width. Both are reported at startup:
+
+```
+qwen3tts codec …/qwen3-tts-tokenizer-12hz.gguf
+qwen3tts voice pack …/qwen3-tts-voice-1.7b-designed.gguf
+```
+
+A missing codec, or no voice pack at all, is an error at startup that
+names the repository to download it from. A named `codec` that is not the
+speech codec, or a named `voices` file that is not a voice pack, is
+refused.
+
+**The speech pipeline runs on the CPU.** The talker, the code predictor
+and the codec run on the CPU whatever `backend` and `device` say, and the
+language-model startup — placement, the probes, the KV pool, the
+warm-up — does not apply.
+
+### How a clip is made
+
+Generation is in-context voice cloning. The voice's reference transcript
+and the text to speak are laid over the reference recording's codec
+frames, and the talker continues from there in that voice, a frame at a
+time: codebook 0 is sampled from the talker with top-k `50` at
+temperature `0.9` and a repetition penalty of `1.05` (all three
+configurable, below), and the code predictor fills the other fifteen with
+its own top-k `50` at `0.9`, which is fixed. The codec then decodes the
+frames into sound.
+
+A clip ends when the model ends it, at `audio_max_seconds` (or the
+request's `max_seconds`), or at a runaway guard of 8 seconds plus 1.2
+seconds a text token — whichever comes first. A clip cut short is logged.
+Each clip logs one line:
+
+```
+orangu-server: [audio] 4.6 s of speech (58 frames, voice …, language …, seed …) in … s — prompt (… rows) … s, speaking … s, decoding … s
+```
+
+### The `audio` role
+
+A speech model is not served in a role you pick: it is always `audio`,
+and `--audio` is the flag that says so. The rules are the image role's:
+
+- `orangu-server` with a speech model given (or a config `model =`) and
+  no role flag comes up in it, and the banner's `Mode` line says `audio`.
+- `orangu-server` with no model prompts from the table as usual; picking
+  a speech model settles the role, so the role prompt is skipped.
+- `orangu-server --audio` greys every row of the table that is not a
+  speech model; picking a greyed row is refused. Every other flag greys
+  the speech models: `--code` on a `qwen3tts` model is an error that says
+  so, and `--audio` on a language model is refused with "`--audio` serves
+  speech models only".
+- Under `--daemon`, the config's `role` key stands in for the flag, with
+  the same rules: `role = code` beside a speech `model` is refused, and a
+  missing key is `audio`.
+- `bundle` refuses a speech model (it needs its codec and voice packs
+  beside it, and a bundle carries one file) and refuses `--audio`.
+
+`--init` follows the same rule: picking a speech model at its `model`
+prompt answers `role: audio` on its own.
+
+The default slot count is `1`: one clip at a time.
+
+### What a request gets
+
+Seven keys set what a clip gets when the request does not say:
+
+| `[orangu-server]` | default | |
+| :-- | :-- | :-- |
+| `audio_voice` | the first voice loaded | the voice a request gets when it names none |
+| `audio_language` | `auto` | `auto`, or a language the model names: `chinese`, `english`, `french`, `german`, `italian`, `japanese`, `korean`, `portuguese`, `russian`, `spanish`. The ISO codes `zh`, `en`, `fr`, `de`, `it`, `ja`, `ko`, `pt`, `ru` and `es` are accepted too |
+| `audio_format` | `wav` | `wav`, `flac`, or `pcm` — bare 16-bit little-endian mono at 24 kHz |
+| `audio_temperature` | `0.9` | codebook 0's temperature, `0` to `2`; `0` is greedy |
+| `audio_top_k` | `50` | codebook 0's top-k, `1` or more |
+| `audio_repetition_penalty` | `1.05` | codebook 0's repetition penalty, `1` to `2` |
+| `audio_max_seconds` | `120` | the longest clip, above `0` and at most `600` |
+
+The web console sends none of these, so for it they _are_ the settings,
+and `/v1/audio/speech` takes every one of them per request.
+
+### In the web console
+
+Type a message and send it: the message is the text, and the reply is it
+spoken, in the browser's own audio player with a download button under
+it, and a caption with the length, the voice, the language and the seed
+(and "— cut at the length limit" when the clip was cut). It is kept
+beside the session at `~/.orangu/server/sessions/<uuid>/files/` as WAV,
+or FLAC when the default format is `flac` (a `pcm` default is kept as
+WAV), and comes back on a later visit through **History**. While it is
+made the progress reads _Reading the text_, _Speaking — N s so far_ and
+_Decoding_; Stop cancels it.
+
+**Settings › Audio** is where the speech settings live: the voice (with
+the pack's description under it), the language, the format (WAV or
+FLAC), the temperature and the longest reply in seconds. **Save** makes
+them the server's defaults until it restarts, and **Reset** puts the form
+back to the configuration file's values, as on the Video pane. On a
+model that is not a speech model the pane is greyed with a note saying
+so. The same settings are `GET`/`POST /props` in the _HTTP endpoints_
+chapter.
+
+### Through the API
+
+`POST /v1/audio/speech` is OpenAI's speech API — `input`, `voice` (a
+name, or `{"id": name}`), `response_format` (`wav`, `flac` or `pcm`) and
+`speed` (`1.0` only) — plus the knobs above per request (`language`,
+`temperature`, `top_k`, `repetition_penalty`, `max_seconds`) and `seed`.
+The answer is the audio itself, with headers naming the voice, the seed,
+the frame count, the sample rate and whether the model ended the clip.
+`GET /v1/audio/voices` lists the voices, the languages and the formats.
+
+`POST /v1/chat/completions` on a speech server speaks the last user
+message and answers in OpenAI's audio-output shape: the message's
+`audio` holds the clip as base64 with its transcript. Both are
+documented field by field in the _HTTP endpoints_ chapter.
+
+### What it does not do
+
+- **Cloning from your own recording.** That needs the codec's encoder and
+  the speaker encoder; only voice packs are used.
+- **Steering by a description.** `instructions` is refused: a Base model
+  cannot be steered by one, and there is no voice design.
+- **Another speed.** `speed` other than `1.0` is refused.
+- **MP3, Opus or AAC.** The formats are WAV, FLAC and raw PCM.
+- **Streaming the clip as it is spoken.** The clip is sent whole, once it
+  is made.
+
 ## Model management
 
 **Settings › Models** (the gear in the topbar) is a panel showing the
@@ -2815,6 +3013,8 @@ reached; and `https` on the same port when `tls_cert`/`tls_key` are set.
 | `POST /v1/videos`, `GET /v1/videos`   | OpenAI's Videos API, on an `ltxv` model: `prompt`, `seconds`, `size`, plus `frames`, `fps`, `seed`, `audio`, `two_stage`, `quality` and `stream`. A clip is a job, answered at once (`status: "queued"`); `GET` lists the jobs kept. `501` on any other model |
 | `GET /v1/videos/{id}`, `DELETE /v1/videos/{id}` | one job: `status`, `progress`, `phase`, `eta_seconds`; `DELETE` cancels it or drops it |
 | `GET /v1/videos/{id}/content`         | the finished clip, `video/mp4` with `Range`; `409` until it is `completed` |
+| `POST /v1/audio/speech`               | OpenAI's speech API, on a `qwen3tts` model: `input`, `voice`, `response_format` (`wav`/`flac`/`pcm`), `speed` (`1.0` only), plus `language`, `temperature`, `top_k`, `repetition_penalty`, `max_seconds` and `seed`. Answers with the audio bytes and `x-orangu-voice`/`-seed`/`-frames`/`-sample-rate`/`-finished` headers. `501` on any other model |
+| `GET /v1/audio/voices`                | the voices, languages and formats a `qwen3tts` model offers, and the default voice |
 | `GET /health`                         | liveness — stays `200` while the server is busy                                                                                                                                                                                                                                                                                                                                                                 |
 | `GET /ready`                          | readiness — `503` (with a reason) when the admission queue is full or the GPU device was lost. Open without an `api_key`, like `/health`                                                                                                                                                                                                                                                                        |
 | `GET /v1/workers`                     | this node's place in its `[workers]` tree: role, layers, plan, workers |
@@ -2916,7 +3116,7 @@ configured:
 | `GET /api/sessions`                   | lists every non-empty session, newest-updated first                                                                                                                                                    |
 | `GET /api/sessions/{id}`              | one session's full message history, each assistant reply already rendered to HTML                                                                                                                      |
 | `POST /api/sessions/{id}/messages`    | sends one chat turn against that session; streaming (SSE) reply, the same shape `/v1/chat/completions`' own stream uses                                                                                |
-| `GET /api/sessions/{id}/files/{name}` | a file kept beside that session — a picture attached to a message, one a `qwen_image` model made, or a clip an `ltxv` model made (`video/mp4`, with `Range`)                                                                                                       |
+| `GET /api/sessions/{id}/files/{name}` | a file kept beside that session — a picture attached to a message, one a `qwen_image` model made, a clip an `ltxv` model made (`video/mp4`, with `Range`), or speech a `qwen3tts` model made (`audio/wav` or `audio/flac`, with `Range`)                                                                                                       |
 | `DELETE /api/sessions/{id}`           | deletes one chat session, directory and all — History's per-row cross                                                                                                                                  |
 | `DELETE /api/sessions`                | deletes every chat session — History's **Clear all** footer                                                                                                                                            |
 | `GET /api/models`                     | the models directory as the manager panel draws it: `list`'s own table, which row is loaded, disk use, and any download in flight. Serves a cached scan; `?rescan=true` re-reads the directory         |
@@ -2956,7 +3156,7 @@ while a confirmation dialog is open re-sorts the listing underneath it.
 ## Scope
 
 Text-in/text-out GGUF chat, completion, and embedding models — and one
-text-to-image model and one text-to-video model — for nineteen
+text-to-image model, one text-to-video model and one text-to-speech model — for twenty
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
 _text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way), Gemma4 (`gemma`/`gemma2`/`gemma3`/`gemma4`, dense **and**
@@ -3028,7 +3228,10 @@ prompt's hidden states, served with a `qwen2vl` text encoder and the
 Qwen-Image VAE beside it; see **Image generation**), and LTX-2.5
 (`ltxv`, `unsloth/LTX-2.5-GGUF` — an audio-video diffusion transformer served
 with a Gemma 4 text encoder, a video VAE, an audio VAE and vocoder, and a
-latent upscaler; see **Video generation**) — using
+latent upscaler; see **Video generation**), and Qwen3-TTS (`qwen3tts`,
+`cstr/qwen3-tts-1.7b-base-GGUF` — a Qwen3 decoder that writes a 12 Hz
+speech codec's codes one frame at a time, served with the codec and a
+voice pack beside it; see **Speech generation**) — using
 `F32`/`F16`/`BF16`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 `mmap`ped file (dequantized one row at a time, on demand) rather than

@@ -12,9 +12,9 @@ The model argument resolves the same way `orangu-server show`/`download` do: an
 existing local `.gguf` path, an `NR`/`MODEL` label under the configured `models`
 directory, or a `<user>/<model>[:quant]` Hugging Face repo (fetched on first
 use). The role flag (`--all`/`--code`/`--review`/`--explorer`/`--embedding`/
-`--image`/`--video`, mutually exclusive, `--all` by default; `--image` is
-fixed by a `qwen_image` model and `--video` by an `ltxv` model rather than
-chosen) selects how the server presents itself;
+`--image`/`--video`/`--audio`, mutually exclusive, `--all` by default;
+`--image` is fixed by a `qwen_image` model, `--video` by an `ltxv` model
+and `--audio` by a `qwen3tts` model rather than chosen) selects how the server presents itself;
 give each running server its own port in `orangu-server.conf` when you run more
 than one at a time — including `metrics`, if the dedicated Prometheus
 listener is enabled: two servers sharing one metrics port would otherwise

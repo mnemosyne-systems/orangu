@@ -126,7 +126,7 @@ orangu-server --all unsloth/gemma-4-E2B-it-GGUF
 
 The model is the same spec that was downloaded, and now resolves to the local copy — nothing is fetched a second time. A local `.gguf` path or an `NR`/`MODEL` label from `orangu-server list` works just as well, and omitting the argument prints the installed models and asks which one to serve.
 
-`--all` picks the *role*, not a set of models: it is the general-purpose one, and the default. The alternatives are `--code`, `--review` (suppresses reasoning), `--explorer` (broader, more varied output), and `--embedding` (embeddings only, with the chat and completion endpoints disabled). They are mutually exclusive. A sixth, `--image`, is not picked: a Qwen-Image (`qwen_image` or `qwen_image_2_1`) picture generator always comes up in it, and no other model can. A seventh, `--video`, is the same for an LTX-2.5 (`ltxv`) video generator.
+`--all` picks the *role*, not a set of models: it is the general-purpose one, and the default. The alternatives are `--code`, `--review` (suppresses reasoning), `--explorer` (broader, more varied output), and `--embedding` (embeddings only, with the chat and completion endpoints disabled). They are mutually exclusive. A sixth, `--image`, is not picked: a Qwen-Image (`qwen_image` or `qwen_image_2_1`) picture generator always comes up in it, and no other model can. A seventh, `--video`, is the same for an LTX-2.5 (`ltxv`) video generator, and an eighth, `--audio`, for a Qwen3-TTS (`qwen3tts`) speech generator.
 
 The server binds the host and port from step 1 and serves an OpenAI-compatible endpoint, which is what **orangu** connects to and what step 4 asks for:
 

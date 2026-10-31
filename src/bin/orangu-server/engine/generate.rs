@@ -364,6 +364,12 @@ pub struct Engine {
     /// are its text encoder (LTX's Gemma 4), and the generation endpoints
     /// answer with clips. `None` for every other architecture.
     pub video: Option<Arc<super::video::Pipeline>>,
+    /// The Qwen3-TTS pipeline, when the served model is a `qwen3tts` speech
+    /// generator. It carries its own talker, so [`Self::model`] is then a
+    /// placeholder that runs nothing (`engine::audio::Placeholder`), and the
+    /// generation endpoints answer with speech. `None` for every other
+    /// architecture.
+    pub audio: Option<Arc<super::audio::Pipeline>>,
     /// The served model's vision tower, when one was found beside it: a
     /// chat turn's pictures become prompt tokens through it. `None` for a
     /// model that reads text alone.
@@ -7852,6 +7858,7 @@ mod tests {
             live_stats: false,
             image: None,
             video: None,
+            audio: None,
             vision: None,
             switch: None,
         };

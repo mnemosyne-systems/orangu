@@ -267,6 +267,10 @@ pub struct ChatCompletionRequest {
     max_tokens: Option<usize>,
     #[serde(default)]
     seed: Option<u64>,
+    /// OpenAI's audio output options (`{"voice": ..., "format": ...}`),
+    /// read on a speech model only.
+    #[serde(default)]
+    audio: Option<serde_json::Value>,
     /// llama.cpp's field name and default: reuse an already-computed KV cache
     /// for whatever prefix of this prompt one exists for. `false` forces a
     /// full prefill.
@@ -833,6 +837,10 @@ pub async fn chat_completions(
     if state.engine.video.is_some() {
         return video_chat(state, req).await;
     }
+    // A speech model answers with the turn spoken — see `audio_chat`.
+    if state.engine.audio.is_some() {
+        return audio_chat(state, req).await;
+    }
     if let Some(rejection) = reject_unknown_slot(&state, req.id_slot) {
         return rejection;
     }
@@ -1344,6 +1352,97 @@ async fn video_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::r
     axum::response::sse::Sse::new(stream).into_response()
 }
 
+/// A chat turn on a speech model: the last user message spoken, in the
+/// voice and language the server defaults to (or the request's `audio`
+/// options: `voice`, `format`), answered as OpenAI's audio output — the
+/// text as the transcript and the clip, base64, in `message.audio`.
+async fn audio_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::response::Response {
+    let pipeline = match super::audio::pipeline_or_reject(&state) {
+        Ok(pipeline) => pipeline,
+        Err(response) => return *response,
+    };
+    let Some(turn) = req.messages.iter().rev().find(|m| m.role == "user") else {
+        return (StatusCode::BAD_REQUEST, "no user message to speak").into_response();
+    };
+    let defaults = pipeline.defaults();
+    let options = req.audio.as_ref();
+    let voice = options.and_then(|a| a.get("voice")).and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Object(o) => o.get("id").and_then(|i| i.as_str()).map(str::to_string),
+        _ => None,
+    });
+    let format = match super::audio::parse_format(
+        options
+            .and_then(|a| a.get("format"))
+            .and_then(|f| f.as_str()),
+        defaults.format,
+    ) {
+        Ok(format) => format,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let request = match super::audio::build_request(
+        &defaults,
+        super::audio::SpeechParams {
+            text: &turn.content,
+            voice: voice.as_deref(),
+            temperature: req.temperature,
+            top_k: req.top_k,
+            seed: req.seed,
+            ..Default::default()
+        },
+    ) {
+        Ok(request) => request,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
+    };
+    let created = unix_now();
+    let model = state.model_label.clone();
+    let started = std::time::Instant::now();
+    let speech = match pipeline.speak(request).await {
+        Ok(speech) => speech,
+        Err(err) => return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+    };
+    super::audio::log_speech(&speech, started.elapsed(), " (chat)");
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD
+        .encode(format.encode(&speech.samples, speech.sample_rate));
+    let transcript = turn.content.trim().to_string();
+    let audio = json!({
+        "id": format!("audio-{created}-{}", speech.seed),
+        "data": data,
+        "format": format.label(),
+        "transcript": transcript,
+        "expires_at": created + 3600,
+        "voice": speech.voice,
+        "seconds": speech.seconds(),
+    });
+    let zero_usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+    let message = json!({"role": "assistant", "content": null, "audio": audio});
+    if !req.stream {
+        return Json(json!({
+            "id": format!("chatcmpl-{created}"),
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+            "usage": zero_usage,
+        }))
+        .into_response();
+    }
+    let chunk = json!({
+        "id": format!("chatcmpl-{created}"), "object": "chat.completion.chunk",
+        "created": created, "model": model,
+        "choices": [{"index": 0, "delta": message, "finish_reason": "stop"}],
+        "usage": zero_usage,
+    });
+    let stream = async_stream::stream! {
+        yield Ok::<_, std::convert::Infallible>(
+            axum::response::sse::Event::default().data(chunk.to_string()),
+        );
+        yield Ok(axum::response::sse::Event::default().data("[DONE]"));
+    };
+    axum::response::sse::Sse::new(stream).into_response()
+}
+
 /// The sampler fields an HTTP request may override, gathered so the two
 /// OpenAI-compatible endpoints apply them through one place.
 ///
@@ -1439,6 +1538,9 @@ pub async fn completions(
     Json(req): Json<CompletionsRequest>,
 ) -> axum::response::Response {
     let role = request_role(&state, &headers);
+    if let Some(rejection) = super::audio::reject_text_endpoint(&state, "/v1/completions") {
+        return rejection;
+    }
     if !state.engine.role.allows_generation() {
         return (
             StatusCode::NOT_IMPLEMENTED,
@@ -1620,6 +1722,9 @@ pub async fn embeddings(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EmbeddingsRequest>,
 ) -> axum::response::Response {
+    if let Some(rejection) = super::audio::reject_text_endpoint(&state, "/v1/embeddings") {
+        return rejection;
+    }
     let inputs = match req.input {
         EmbeddingsInput::One(s) => vec![s],
         EmbeddingsInput::Many(v) => v,

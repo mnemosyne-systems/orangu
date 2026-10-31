@@ -7,7 +7,7 @@ Inside, the coordinator switches models by task as it does on your machine —
 embeddings model.
 
 The full guide is the **Container image** chapter of the manual,
-[`doc/manual/en/51-container.md`](../../doc/manual/en/51-container.md) (also
+[`doc/manual/en/52-container.md`](../../doc/manual/en/52-container.md) (also
 `/manual` in `orangu`). This is the short version.
 
 ## Build and run

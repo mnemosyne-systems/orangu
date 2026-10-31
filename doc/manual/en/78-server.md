@@ -2176,8 +2176,9 @@ was asked — the CLI flag, or under `--daemon` the config's `role` key —
 refusing a conflict in either direction. The startup picker
 (`select_model_interactively`) draws the table in one of four
 `model_spec::Dimming` modes — `ImageModels` under `--image`, `VideoModels`
-under `--video`, `TextModels` under any other flag, `Unsupported` with
-none — from `ModelSupport::image` and `ModelSupport::video`,
+under `--video`, `AudioModels` under `--audio`, `TextModels` under any
+other flag, `Unsupported` with none — from `ModelSupport::image`,
+`ModelSupport::video` and `ModelSupport::audio`,
 and refuses a greyed row; `--init` reads the same column to answer its own
 `role` prompt and to ask the `image_*` keys plus `vae_precision` and
 `image_lora_merge` (`init::ImageKeys`, written only where an answer
@@ -2573,6 +2574,109 @@ FLAC and MP4 writers. An ignored test (`ORANGU_LTXV` naming the transformer)
 runs both connectors and one stage-1 step over the real weights and
 compares its time with the rate model's estimate. As for the images,
 there is no captured-tensor fixture from the reference yet.
+
+### Speech generation (`engine::audio`)
+
+A `qwen3tts` GGUF (Qwen3-TTS; `cstr/qwen3-tts-1.7b-base-GGUF`,
+`cstr/qwen3-tts-0.6b-base-GGUF`) is, like an `ltxv` one, not a
+`ModelForward` the engine can serve. `loader::ArchFamily::Qwen3Tts`
+recognises it, and it is never built as a language model. The file holds
+the *talker*, a Qwen3 decoder that writes codebook 0 of a 12 Hz speech
+codec one frame at a time, the *code predictor*, a small decoder that
+fills codebooks 1–15 of each frame from the talker's hidden state, and a
+speaker encoder that is not read. The rest is two kinds of companion,
+which `engine::audio::Companions::locate` takes from
+`[orangu-server].codec` and `voices` when they are set, and otherwise
+finds under `models` by their `general.architecture`
+(`model_spec::find_qwen3tts_codec`, the largest `qwen3tts_tokenizer`
+file; `find_qwen3tts_voicepacks`, every `qwen3tts.voicepack` file). A
+missing codec or an empty voice list is an error naming the repository
+to fetch it from. `model_download::download_audio_companions` fetches the
+codec (`cstr/qwen3-tts-tokenizer-12hz-GGUF`, `qwen3-tts-tokenizer-12hz.gguf`)
+when there is none, and the voice pack of the model's talker width
+(`model_download::qwen3tts_voice_file`, from `cstr/qwen3-tts-voices-GGUF`)
+when there is none of that width. `model_spec::companion_of` names both
+kinds `qwen3tts`, which `list` prints as `Companion (qwen3tts)`.
+
+Its role is `config::Role::Audio`, fixed by the model exactly as
+`Role::Image` and `Role::Video` are: `Role::required_by` names it for
+`qwen3tts`, `Role::fixed_by_model` covers all three,
+`main::fix_role_for_model` refuses a conflict either way, the picker greys
+rows in `model_spec::Dimming::AudioModels` under `--audio` (from
+`ModelSupport::audio`), and `--init` answers `role: audio` on its own and
+asks no keys of its own. `bundle` refuses it before the copy, and
+`prepare_audio` refuses an embedded model in case one reaches it.
+
+`main.rs`'s `prepare` hands a `qwen3tts` model to `prepare_audio` before
+any of the language-model startup — placement, the probes, the KV pool,
+the warm-up — runs. `engine::audio::Pipeline::load` loads the talker, the
+code predictor, the codec and the voices on `CpuBackend`, whatever
+`backend` and `device` say. A voice pack whose speaker embedding is not
+the talker's width is skipped with a log line; a voice named `default` is
+renamed after its file (the stem without `qwen3-tts-voice-`), and a
+repeated name takes a numeric suffix. The `Engine` is built around
+`audio::placeholder::Placeholder`, a `ModelForward` that describes the
+talker's shape for `/props` and the slots and runs nothing, with the
+pipeline on `Engine::audio`. The pipeline keeps its defaults in a
+`RwLock<AudioDefaults>` (`set_defaults` for `POST /props`, `configured`
+for `reset`) and runs one clip at a time behind a `Mutex`.
+
+The modules:
+
+- **`stack`** — the decoder the talker and the code predictor share: a
+  Qwen3 transformer (pre-norm RMSNorm, grouped-query attention with an
+  RMSNorm over each query and key head, NeoX rotary positions, SwiGLU)
+  run over input *embeddings* rather than token ids, with its own
+  key/value cache. The talker's rotary embedding is nominally multimodal;
+  speech carries no picture, so its three position streams hold the same
+  position and the rotation is the single-stream one.
+- **`codec`** — the codec's decoder: the residual vector quantizer's
+  lookups for codebook 0 and codebooks 1–15, a causal convolution, a
+  sliding-window transformer, two ×2 upsamplers, and the vocoder, sixteen
+  codes a frame back to 1920 samples of 24 kHz sound.
+- **`placeholder`** — the engine's stand-in `ModelForward`, above.
+- **`mod.rs`** — `Companions`, the voice packs, `AudioDefaults`,
+  `SpeechRequest`, the sampler, `Pipeline::synthesize`, and the WAV, FLAC
+  (over `video::flac`) and PCM writers (`AudioFormat::encode`).
+
+`Pipeline::synthesize` prompts the talker *in context*: the speaker
+embedding among a few control codes, then the voice's reference
+transcript followed by the text to speak, laid over the reference
+recording's frames, so the frames it writes next continue that voice
+saying the new text. The text runs ahead of the frames one token a frame,
+and what is left of it is fed in as the frames are written. Codebook 0 is
+sampled with the request's temperature, top-k and repetition penalty; the
+code predictor samples codebooks 1–15 with its own top-k 50 at 0.9. A clip
+ends at the model's end code, at `max_seconds`, or at 8 s + 1.2 s a text
+token, whichever is first, and `Speech::finished` says whether the model
+ended it. The reference frames are decoded with the new ones, for the
+codec's context, and their sound is cut off the front.
+
+`Pipeline::spawn` runs a clip on a blocking thread and reports
+`SpeechEvent`s — `Progress` (reading the text, frames spoken, decoding),
+then exactly one of the clip or an error — over a channel whose reader
+holds a `CancelOnDrop`; the work checks the flag at every frame.
+`http::audio` is `/v1/audio/speech` and `/v1/audio/voices`, and
+`reject_text_endpoint` the `501` the text endpoints answer on a speech
+model. `http::openai::audio_chat` runs a chat turn as a clip answered in
+OpenAI's audio-output shape, and the web console's `send_audio_message`
+runs the pipeline directly and keeps the clip as a `.wav` (or `.flac`)
+under the session's `files/`, which `web::render` shows as an `<audio>`
+player. All three build the request through `http::audio::build_request`,
+against `Pipeline::defaults()`; `http::audio::props_json` is the `audio`
+object of `/props` and `/api/props`, and `apply_settings` its `POST`.
+`http::audio::log_speech` writes the `[audio] … of speech` line.
+
+**What is verified, and what is not.** The unit tests pin the pieces: the
+rotary embedding, the codec transformer's sliding window and causal
+attention, the causal, dilated and transposed convolutions, greedy and
+top-k sampling, the WAV and FLAC writers, the format names, the voice
+field's two spellings, and the request checks. An ignored test
+(`ORANGU_QWEN3TTS_DIR` naming a models directory with a model, its codec
+and a voice pack, `ORANGU_QWEN3TTS_OUT` an output directory) decodes a
+voice's reference codes to `ref.wav` and speaks one sentence to
+`speech.wav` with the real weights, for listening. There is no
+captured-tensor fixture from the reference.
 
 ### Constrained decoding (`engine::constraint`, `engine::sampling::Constraint`)
 
@@ -4126,8 +4230,9 @@ already has, not a crashed server.
 ### The startup banner's `Mode` row
 
 `Mode` names which of `--all`/`--code`/`--review`/`--explorer`/`--embedding`/
-`--image`/`--video` this process came up as (`image` whenever the model is a
-`qwen_image` file, `video` whenever it is an `ltxv` file, flag or no flag) — the other half of "what will this server do with my
+`--image`/`--video`/`--audio` this process came up as (`image` whenever the model is a
+`qwen_image` file, `video` whenever it is an `ltxv` file, `audio` whenever
+it is a `qwen3tts` file, flag or no flag) — the other half of "what will this server do with my
 request", beside `Model`. It decides the sampling defaults, whether reasoning
 is suppressed, and whether the generation endpoints answer at all, and without
 it on the banner the only way to tell a `--review` server from an `--all` one
@@ -4882,9 +4987,10 @@ given: the workspace as an absolute path (a `--daemon` process has since
 moved to `/`) and the role as an explicit flag (it may have been answered at
 an interactive prompt). The flag is the *next* model's role, not this one's
 (`reexec::role_for_model`): a `qwen_image` file is always `--image` and an
-`ltxv` file always `--video` (`Role::required_by`, `Role::fixed_by_model`),
-which no language model can take — so a handover onto one says `--image`
-or `--video` whatever this process is, and
+`ltxv` file always `--video` and a `qwen3tts` file always `--audio`
+(`Role::required_by`, `Role::fixed_by_model`), which no language model can
+take — so a handover onto one says `--image`, `--video` or `--audio`
+whatever this process is, and
 one off it back onto a language model says `--all`, nobody being at a
 prompt to choose. `--config` is passed only if it was passed to this
 process, so a server that found its config by the default search makes the

@@ -435,10 +435,108 @@ pub fn is_video_architecture(architecture: &str) -> bool {
     VIDEO_ARCHITECTURES.contains(&architecture)
 }
 
+/// `general.architecture` of a Qwen3-TTS speech generator
+/// (`cstr/qwen3-tts-1.7b-base-GGUF`): its talker, code predictor and
+/// speaker encoder.
+pub const QWEN3TTS_ARCHITECTURE: &str = "qwen3tts";
+/// `general.architecture` of the 12 Hz speech codec a `qwen3tts` model's
+/// codes are decoded with (`cstr/qwen3-tts-tokenizer-12hz-GGUF`).
+pub const QWEN3TTS_CODEC_ARCHITECTURE: &str = "qwen3tts_tokenizer";
+/// `general.architecture` of a Qwen3-TTS voice pack
+/// (`cstr/qwen3-tts-voices-GGUF`): a speaker embedding with a reference
+/// transcript and its codec codes, per voice.
+pub const QWEN3TTS_VOICEPACK_ARCHITECTURE: &str = "qwen3tts.voicepack";
+
+/// The architectures that are speech generators: served in the `audio`
+/// role only, and through `engine::audio`.
+pub const AUDIO_ARCHITECTURES: &[&str] = &[QWEN3TTS_ARCHITECTURE];
+
+/// Whether `architecture` is one of [`AUDIO_ARCHITECTURES`].
+pub fn is_audio_architecture(architecture: &str) -> bool {
+    AUDIO_ARCHITECTURES.contains(&architecture)
+}
+
+/// The model a companion file is read beside, for an architecture that is
+/// one — `Some("qwen3tts")` for the speech codec and a voice pack, `None`
+/// for anything that is a model in its own right.
+pub fn companion_of(architecture: &str) -> Option<&'static str> {
+    [QWEN3TTS_CODEC_ARCHITECTURE, QWEN3TTS_VOICEPACK_ARCHITECTURE]
+        .contains(&architecture)
+        .then_some(QWEN3TTS_ARCHITECTURE)
+}
+
+fn gguf_architecture_is(path: &Path, architecture: &str) -> bool {
+    GgufFile::open_summary(path)
+        .ok()
+        .and_then(|gguf| architecture_of(&gguf))
+        .as_deref()
+        == Some(architecture)
+}
+
+/// Whether `path` is the 12 Hz speech codec (`qwen3tts_tokenizer`).
+pub fn is_qwen3tts_codec(path: &Path) -> bool {
+    gguf_architecture_is(path, QWEN3TTS_CODEC_ARCHITECTURE)
+}
+
+/// The largest speech codec under `dir` — the `F16` one where both it and
+/// a `Q8_0` are there, which its publisher recommends.
+pub fn find_qwen3tts_codec(dir: &Path) -> Option<PathBuf> {
+    largest_gguf(dir, is_qwen3tts_codec)
+}
+
+/// Whether `path` is a Qwen3-TTS voice pack (`qwen3tts.voicepack`).
+pub fn is_qwen3tts_voicepack(path: &Path) -> bool {
+    gguf_architecture_is(path, QWEN3TTS_VOICEPACK_ARCHITECTURE)
+}
+
+/// The talker width of a `qwen3tts` model (`qwen3tts.talker.d_model`).
+pub fn qwen3tts_talker_width(path: &Path) -> Option<usize> {
+    let gguf = GgufFile::open_summary(path).ok()?;
+    gguf.metadata.iter().find_map(|(k, v)| {
+        (k == "qwen3tts.talker.d_model")
+            .then(|| v.as_u64())
+            .flatten()
+            .map(|v| v as usize)
+    })
+}
+
+/// The width of a voice pack's speaker embeddings — the talker width it
+/// was made for.
+pub fn qwen3tts_voicepack_width(path: &Path) -> Option<usize> {
+    let gguf = GgufFile::open_summary(path).ok()?;
+    gguf.tensors
+        .iter()
+        .find(|t| t.name.starts_with("voicepack.spk.") && t.name.ends_with(".embd"))
+        .and_then(|t| t.dims.first())
+        .map(|&d| d as usize)
+}
+
+/// Every voice pack under `dir`, in path order.
+pub fn find_qwen3tts_voicepacks(dir: &Path) -> Vec<PathBuf> {
+    let mut packs: Vec<PathBuf> = walkdir::WalkDir::new(dir)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        })
+        .filter(|path| is_qwen3tts_voicepack(path))
+        .collect();
+    packs.sort();
+    packs.dedup();
+    packs
+}
+
 /// Whether `architecture` is served by a generation pipeline rather than
-/// as a language model — a picture or a video generator.
+/// as a language model — a picture, video or speech generator.
 pub fn is_generator_architecture(architecture: &str) -> bool {
-    is_image_architecture(architecture) || is_video_architecture(architecture)
+    is_image_architecture(architecture)
+        || is_video_architecture(architecture)
+        || is_audio_architecture(architecture)
 }
 
 /// Whether `path` is the text encoder an `ltxv` model needs: a `gemma4`
@@ -1582,6 +1680,14 @@ pub struct ModelSupport {
     /// `orangu-server --video` offers, and the ones every other role flag
     /// greys out.
     pub video: bool,
+    /// Whether the architecture is a speech generator (`qwen3tts`) — the
+    /// rows `orangu-server --audio` offers, and the ones every other role
+    /// flag greys out.
+    pub audio: bool,
+    /// The model this file is read beside when it is a companion rather
+    /// than a model — `Some("qwen3tts")` for the speech codec and a voice
+    /// pack. Never served on its own; the cell says what it belongs to.
+    pub companion_of: Option<&'static str>,
 }
 
 impl ModelSupport {
@@ -1599,7 +1705,8 @@ impl ModelSupport {
                 Dimming::Off | Dimming::Unsupported | Dimming::UpToDate => true,
                 Dimming::ImageModels => self.image,
                 Dimming::VideoModels => self.video,
-                Dimming::TextModels => !self.image && !self.video,
+                Dimming::AudioModels => self.audio,
+                Dimming::TextModels => !self.image && !self.video && !self.audio,
             }
     }
 
@@ -1610,6 +1717,9 @@ impl ModelSupport {
     /// from ever disagreeing about the same file.
     pub fn cell(&self) -> String {
         let arch = self.architecture.as_deref().unwrap_or("unknown");
+        if let Some(model) = self.companion_of {
+            return format!("Companion ({model})");
+        }
         match (&self.unsupported_quant, self.supported) {
             (Some(quant), true) => format!("No ({arch}, {quant})"),
             (Some(quant), false) => format!("No ({arch}, {quant})"),
@@ -1630,6 +1740,8 @@ mod support_cell_tests {
             unsupported_quant: quant.map(str::to_string),
             image: arch == "qwen_image",
             video: arch == "ltxv",
+            audio: arch == "qwen3tts",
+            companion_of: super::companion_of(arch),
         }
     }
 
@@ -1671,6 +1783,25 @@ mod support_cell_tests {
         assert!(!video.selectable(Dimming::TextModels));
         assert!(!image.selectable(Dimming::VideoModels));
         assert!(!text.selectable(Dimming::VideoModels));
+        let audio = support("qwen3tts", true, None);
+        assert!(audio.selectable(Dimming::AudioModels));
+        assert!(!audio.selectable(Dimming::TextModels));
+        assert!(!audio.selectable(Dimming::VideoModels));
+        assert!(!text.selectable(Dimming::AudioModels));
+    }
+
+    /// A speech codec or voice pack is read beside its model, not served:
+    /// the cell names the model it belongs to, and no picker offers it.
+    #[test]
+    fn a_companion_file_says_what_it_belongs_to() {
+        use super::Dimming;
+        let codec = support("qwen3tts_tokenizer", false, None);
+        assert_eq!(codec.cell(), "Companion (qwen3tts)");
+        assert!(!codec.selectable(Dimming::AudioModels));
+        assert_eq!(
+            support("qwen3tts.voicepack", false, None).cell(),
+            "Companion (qwen3tts)"
+        );
     }
 
     /// `loadable()` is what greys the row and gates the pickers, so it has
@@ -1716,6 +1847,10 @@ pub enum Dimming {
     /// generator ([`ModelSupport::video`]). Needs a non-empty `support`
     /// slice.
     VideoModels,
+    /// `orangu-server --audio`: grey every row that is not a loadable
+    /// speech generator ([`ModelSupport::audio`]). Needs a non-empty
+    /// `support` slice.
+    AudioModels,
     /// `orangu-server --all`/`--code`/`--review`/`--explorer`/
     /// `--embedding`: grey the picture and video generators along with the
     /// unloadable rows — an image model is only ever served in the `image`
@@ -1924,6 +2059,7 @@ pub fn format_groups_with_last_used_in_order(
             Dimming::Unsupported
             | Dimming::ImageModels
             | Dimming::VideoModels
+            | Dimming::AudioModels
             | Dimming::TextModels => show_support && !support[index].selectable(dim),
             Dimming::UpToDate => !refresh,
         };
@@ -2820,6 +2956,8 @@ mod tests {
             unsupported_quant: None,
             image: false,
             video: false,
+            audio: false,
+            companion_of: None,
         }];
         let output = format_groups_with_last_used(
             &groups,
