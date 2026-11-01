@@ -179,9 +179,14 @@ pub fn cpu_for_prompts_by(
         return cpu_for_prompts(device, w);
     }
     let cpu: Arc<dyn Backend> = Arc::new(CpuBackend);
+    if let Some(on_cpu) = kept_choice() {
+        record(on_cpu);
+        return on_cpu.then_some(cpu);
+    }
     let (Some(on_device), Some(on_cpu)) = (time_pass(None), time_pass(Some(cpu.clone()))) else {
         return cpu_for_prompts(device, w);
     };
+    keep_choice(on_cpu < on_device, on_cpu, on_device);
     let winner = if on_cpu < on_device {
         "the cpu"
     } else {
@@ -211,8 +216,12 @@ fn cpu_for_prompts_unrecorded(
         PrefillBackend::Device => None,
         PrefillBackend::Cpu => Some(cpu),
         PrefillBackend::Auto => {
+            if let Some(on_cpu) = kept_choice() {
+                return on_cpu.then_some(cpu);
+            }
             let on_device = time_gemm(device.as_ref(), w);
             let on_cpu = time_gemm(cpu.as_ref(), w);
+            keep_choice(on_cpu < on_device, on_cpu, on_device);
             let winner = if on_cpu < on_device {
                 "the cpu"
             } else {
@@ -231,6 +240,30 @@ fn cpu_for_prompts_unrecorded(
             );
             (on_cpu < on_device).then_some(cpu)
         }
+    }
+}
+
+/// The name `auto`'s answer is kept under, beside the model's other
+/// start-up choices (`engine::probe_cache::model_key`).
+const KEPT_AS: &str = "prompts-on-cpu";
+
+/// `auto`'s answer from an earlier start of this build, on this device, for
+/// this model — `true` when prompts ran faster on the cores — reported as the
+/// `[adapt]` line a measurement would print.
+fn kept_choice() -> Option<bool> {
+    let key = crate::engine::probe_cache::model_key()?;
+    let on_cpu = crate::engine::probe_cache::choice(KEPT_AS, key)?;
+    crate::engine::adapt::note(
+        "prompts",
+        format!("on {}", if on_cpu { "the cpu" } else { "the device" }),
+        "measured at an earlier start, kept in probes.json".to_string(),
+    );
+    Some(on_cpu)
+}
+
+fn keep_choice(on_cpu: bool, cpu_s: f64, device_s: f64) {
+    if let Some(key) = crate::engine::probe_cache::model_key() {
+        crate::engine::probe_cache::keep_choice(KEPT_AS, key, on_cpu, cpu_s, device_s);
     }
 }
 

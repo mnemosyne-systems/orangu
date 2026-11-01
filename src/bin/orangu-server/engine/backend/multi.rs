@@ -128,7 +128,7 @@ fn no_split_fusion() -> bool {
 pub(crate) fn host_stream_min_tokens() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_HOST_STREAM_TOKENS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_HOST_STREAM_TOKENS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(HOST_STREAM_TOKENS_DEFAULT)

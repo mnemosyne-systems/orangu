@@ -143,6 +143,20 @@ impl Spec {
         })
     }
 
+    /// A two-value sweep written `a,b` run as `a,b,b,a`, so each value holds
+    /// each position once. The later slot of a sweep runs systematically
+    /// worse (warming hardware, a tiring drive), and `a,b` charges that whole
+    /// penalty to `b`. Any other list — one value, three or more, or two
+    /// already repeated — is left as written.
+    pub fn interleave_two_arms(&mut self) {
+        if let [a, b] = &self.values[..]
+            && a != b
+        {
+            let (a, b) = (a.clone(), b.clone());
+            self.values = vec![a.clone(), b.clone(), b, a];
+        }
+    }
+
     /// The series name for one point, and the stem of its bundle. `VAR=value`,
     /// with an empty value spelled out rather than left blank — a legend entry
     /// reading `ORANGU_SUBGROUP=` is indistinguishable from a truncated one.
@@ -713,6 +727,26 @@ fn port_is_busy(port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn two_values_are_interleaved_and_nothing_else_is() {
+        let mut two = Spec::parse("ARM=old,new").unwrap();
+        two.interleave_two_arms();
+        assert_eq!(two.values, ["old", "new", "new", "old"]);
+        let mut unset = Spec::parse("ORANGU_SUBGROUP=,1").unwrap();
+        unset.interleave_two_arms();
+        assert_eq!(unset.values, ["", "1", "1", ""]);
+        for (spec, want) in [
+            ("ARM=old,new,new,old", vec!["old", "new", "new", "old"]),
+            ("ARM=a,b,c", vec!["a", "b", "c"]),
+            ("ARM=a", vec!["a"]),
+            ("ARM=a,a", vec!["a", "a"]),
+        ] {
+            let mut s = Spec::parse(spec).unwrap();
+            s.interleave_two_arms();
+            assert_eq!(s.values, want, "{spec}");
+        }
+    }
 
     #[test]
     fn a_spec_splits_into_a_variable_and_its_values() {

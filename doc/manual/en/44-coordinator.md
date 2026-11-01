@@ -127,6 +127,7 @@ only.
 | `backend` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].backend` (`auto`/`cpu`/`vulkan`/`metal`/`dx12`/`cuda`/`opencl`/`rocm`/`npu`) when set |
 | `device` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].device` when set — which of the machine's devices it runs on |
 | `slots` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].slots` when set |
+| `context` | profile | No | Forwarded to this profile's `orangu-server` as `[orangu-server].context` when set — the tokens of context the server keeps room for on its device. The check before a swap counts this context's KV cache |
 | `web` | profile | No | Forwarded to this profile's `orangu-server` as `[web].port` when set, exposing that profile's own web console while it's active |
 
 Run it with:
@@ -227,6 +228,24 @@ the least recently used profile is the one stopped. A server stopped either
 way finishes what it is streaming and saves its slots first, exactly as a
 swap does.
 
+Before a profile starts — whether it replaces a running one or starts beside
+them — the coordinator asks `orangu-server plan --deep --json` whether its
+model can run here: its shards are present, this build knows its
+architecture, and what it needs fits. What it needs is the weights every
+token touches plus, when the profile sets `context`, that context's KV cache;
+what the machine has is its memory plus its dedicated cards' memory; and the
+models that stay running beside it count against that too. A start that does
+not fit is refused with what it would take, and every running profile keeps
+serving:
+
+```text
+'big' cannot run on this machine: it needs 40.2 GB, and beside 'chat' (30.1 GB)
+that is more than this machine's 66.8 GB — 'chat' keeps serving
+```
+
+Only a definite answer refuses: a plan that cannot be had in time, or a
+server too old to report what a model needs, lets the start go ahead.
+
 ```ini
 [orangu-coordinator]
 models = ~/.cache/huggingface/hub
@@ -288,6 +307,14 @@ the first one pays the same cold start as any other request.
   because the very first detection attempt gave up too early.
 - **Dynamic Hot-Reloading**: The coordinator watches `orangu-coordinator.conf` and hot-reloads changes automatically (polled every ~5 seconds) without needing a restart.
 - **Fallback Routing**: If a requested profile fails to load (e.g. out of memory), the coordinator automatically falls back to starting the `all`-role profile rather than failing the request entirely.
+- **Swap progress**: a streamed request (`"stream": true`) that has to wait
+  more than a second for a swap gets its response straight away, opening
+  with a progress line every two seconds — SSE comment lines such as
+  `: orangu-coordinator: making 'code' active: loading org/model (12s) — <the
+  server's last line of output>`, which every OpenAI-compatible client
+  ignores — and then the model's answer. A swap that fails after that point
+  arrives as an error event in the stream rather than a `502`. Any client can
+  also read the same progress from `GET /v1/coordinator` under `activating`.
 - **Crash recovery**: a profile whose `orangu-server` has stopped — it lost
   its GPU device to a driver reset (see the Server chapter), was OOM-killed,
   or was killed by hand — is simply started again on the next request. A

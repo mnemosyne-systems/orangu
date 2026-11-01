@@ -23,6 +23,10 @@ pub(crate) struct UsageStats {
     pub(crate) session_id: String,
     pub(crate) workspace: std::path::PathBuf,
     pub(crate) skill_counts: std::collections::HashMap<String, usize>,
+    /// The prompt-cache totals ([`orangu::llm::prompt_cache_totals`]) when
+    /// the last turn ended, and that turn's own share of them.
+    cache_at_turn_end: (u64, u64),
+    last_turn_cache: Option<(u64, u64)>,
 }
 
 impl UsageStats {
@@ -35,6 +39,23 @@ impl UsageStats {
             session_id: String::new(),
             workspace: std::path::PathBuf::new(),
             skill_counts: std::collections::HashMap::new(),
+            cache_at_turn_end: orangu::llm::prompt_cache_totals(),
+            last_turn_cache: None,
+        }
+    }
+
+    /// Takes the prompt-cache totals at the end of a turn: what they grew by
+    /// since the last turn ended is this turn's — every request it made, the
+    /// tool rounds included. A turn that sent no prompt leaves the previous
+    /// turn's figure.
+    fn note_turn_cache(&mut self, totals: (u64, u64)) {
+        let (prompt, cached) = (
+            totals.0.saturating_sub(self.cache_at_turn_end.0),
+            totals.1.saturating_sub(self.cache_at_turn_end.1),
+        );
+        self.cache_at_turn_end = totals;
+        if prompt > 0 {
+            self.last_turn_cache = Some((prompt, cached.min(prompt)));
         }
     }
 
@@ -90,6 +111,7 @@ impl UsageStats {
         let llm_duration = total_duration.saturating_sub(tool_duration);
         self.total_llm_duration += llm_duration;
         self.total_tokens += tokens;
+        self.note_turn_cache(orangu::llm::prompt_cache_totals());
 
         if !cfg!(test) {
             crate::activity_log::append_activity(
@@ -130,6 +152,12 @@ impl UsageStats {
                 "\n\nPrompt cache:\nPrompt tokens    : {prompt}\nServed from cache: {cached}\nCache rate       : {:.1}%",
                 cached as f64 * 100.0 / prompt as f64
             ));
+            if let Some((prompt, cached)) = self.last_turn_cache {
+                out.push_str(&format!(
+                    "\nLast turn        : {cached} of {prompt} ({:.1}%)",
+                    cached as f64 * 100.0 / prompt as f64
+                ));
+            }
         }
 
         if let Ok(cache) = tools.context_cache().lock() {
@@ -221,6 +249,20 @@ pub(crate) fn format_duration(d: std::time::Duration) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_last_turn_is_what_the_totals_grew_by() {
+        let mut stats = super::UsageStats::new();
+        stats.cache_at_turn_end = (1000, 900);
+        stats.note_turn_cache((1500, 1300));
+        assert_eq!(stats.last_turn_cache, Some((500, 400)));
+        // A turn that sent nothing keeps the previous turn's figure.
+        stats.note_turn_cache((1500, 1300));
+        assert_eq!(stats.last_turn_cache, Some((500, 400)));
+        // A turn that missed the cache shows as one, whatever the total says.
+        stats.note_turn_cache((2500, 1300));
+        assert_eq!(stats.last_turn_cache, Some((1000, 0)));
+    }
 
     #[test]
     fn record_elapsed_counts_llm_time_without_tokens() {

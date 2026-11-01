@@ -213,6 +213,42 @@ pub struct Coordinator {
     /// origin — see [`InFlight`]. Stopping a server waits for its count to
     /// reach zero first.
     in_flight: StdMutex<HashMap<String, Arc<AtomicUsize>>>,
+    /// What the swap or start under way is doing, for the clients waiting on
+    /// it — see [`Coordinator::progress`].
+    progress: StdMutex<Option<Progress>>,
+    /// Each profile's need from its fit check ([`PlanFit::needs`]), by
+    /// [`needs_key`].
+    needs: StdMutex<HashMap<String, u64>>,
+}
+
+/// What a profile's need is kept under: the settings it depends on.
+fn needs_key(entry: &CoordinatorLlmEntry) -> String {
+    format!(
+        "{}|{}|{:?}|{:?}",
+        entry.name, entry.model, entry.backend, entry.context
+    )
+}
+
+/// One step of a swap or start, as [`Coordinator::progress`] reports it.
+struct Progress {
+    /// The profile being made active.
+    profile: String,
+    /// What is happening, in a few words.
+    step: String,
+    /// When the swap began.
+    started: Instant,
+    /// The starting server's captured output, once there is a server.
+    tail: Option<OutputTail>,
+}
+
+/// Clears [`Coordinator::progress`] when the swap it describes ends, by
+/// whichever path.
+struct ProgressGuard<'a>(&'a Coordinator);
+
+impl Drop for ProgressGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.progress.lock().unwrap() = None;
+    }
 }
 
 /// One proxied request, counted in [`Coordinator::in_flight`] until it is
@@ -233,16 +269,32 @@ const FIT_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The verdict in `orangu-server plan --json`'s output: `Err` with its
 /// problems only when it says the model does not run.
-fn fit_from_plan(stdout: &[u8]) -> std::result::Result<(), String> {
+/// What a model needs of the machine and what the machine has, from
+/// `plan --json`: the weights every token touches plus the configured
+/// context's KV cache, against the machine's memory and its dedicated
+/// cards'.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PlanFit {
+    needs: u64,
+    capacity: u64,
+}
+
+/// `plan --json`'s verdict: `Err` with its problems when it says the model
+/// does not run here, otherwise what it needs (`None` from a server too old
+/// to say, or an answer that does not parse).
+fn fit_from_plan(stdout: &[u8]) -> std::result::Result<Option<PlanFit>, String> {
     let Some(v) = std::str::from_utf8(stdout)
         .ok()
         .and_then(|s| s.lines().rev().find(|l| l.trim_start().starts_with('{')))
         .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
     else {
-        return Ok(());
+        return Ok(None);
     };
     if v["runs"].as_bool() != Some(false) {
-        return Ok(());
+        return Ok(v["needs_bytes"]
+            .as_u64()
+            .zip(v["capacity_bytes"].as_u64())
+            .map(|(needs, capacity)| PlanFit { needs, capacity }));
     }
     let problems: Vec<&str> = v["problems"]
         .as_array()
@@ -253,6 +305,26 @@ fn fit_from_plan(stdout: &[u8]) -> std::result::Result<(), String> {
     } else {
         problems.join("; ")
     })
+}
+
+/// Whether a model needing `fit.needs` runs beside the models that stay
+/// loaded (`beside`: each profile's name and need), within `fit.capacity`.
+/// `Err` says what it would take.
+fn fits_beside(fit: PlanFit, beside: &[(String, u64)]) -> std::result::Result<(), String> {
+    let staying: u64 = beside.iter().map(|(_, n)| n).sum();
+    if fit.needs.saturating_add(staying) <= fit.capacity {
+        return Ok(());
+    }
+    let names: Vec<String> = beside
+        .iter()
+        .map(|(name, needs)| format!("'{name}' ({})", orangu::format::format_bytes(*needs)))
+        .collect();
+    Err(format!(
+        "it needs {}, and beside {} that is more than this machine's {}",
+        orangu::format::format_bytes(fit.needs),
+        names.join(" and "),
+        orangu::format::format_bytes(fit.capacity)
+    ))
 }
 
 /// How long one slot's save or restore may take: a slot holding a long
@@ -314,7 +386,53 @@ impl Coordinator {
             last_accessed: StdMutex::new(Instant::now()),
             server_binary_override,
             in_flight: StdMutex::new(HashMap::new()),
+            progress: StdMutex::new(None),
+            needs: StdMutex::new(HashMap::new()),
         })
+    }
+
+    /// Records the step a swap toward `profile` has reached; the first step
+    /// marks when the swap began.
+    fn note_step(&self, profile: &str, step: impl Into<String>) {
+        let mut progress = self.progress.lock().unwrap();
+        match progress.as_mut() {
+            Some(p) if p.profile == profile => p.step = step.into(),
+            _ => {
+                *progress = Some(Progress {
+                    profile: profile.to_string(),
+                    step: step.into(),
+                    started: Instant::now(),
+                    tail: None,
+                })
+            }
+        }
+    }
+
+    /// The swap or start under way, if any: the profile, the step, the
+    /// seconds since it began, and the last line the starting server
+    /// printed — what `/v1/coordinator` reports under `activating` and a
+    /// streaming request waiting on it is sent as it goes.
+    pub async fn progress(&self) -> Option<serde_json::Value> {
+        let (profile, step, seconds, tail) = {
+            let progress = self.progress.lock().unwrap();
+            let p = progress.as_ref()?;
+            (
+                p.profile.clone(),
+                p.step.clone(),
+                p.started.elapsed().as_secs(),
+                p.tail.clone(),
+            )
+        };
+        let last_output = match tail {
+            Some(tail) => tail.lock().await.back().cloned(),
+            None => None,
+        };
+        Some(serde_json::json!({
+            "profile": profile,
+            "step": step,
+            "seconds": seconds,
+            "last_output": last_output,
+        }))
     }
 
     /// The in-flight count of the server at `origin`.
@@ -359,6 +477,12 @@ impl Coordinator {
                 );
                 logged = true;
             }
+            if let Some(p) = self.progress.lock().unwrap().as_mut() {
+                p.step = format!(
+                    "waiting for {} response(s) from '{running}' to finish",
+                    count.load(Ordering::Relaxed)
+                );
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -370,7 +494,13 @@ impl Coordinator {
         let mut active = active;
         if matches!(active.child.try_wait(), Ok(None)) {
             self.drain(&origin, &active.entry_name).await;
+            if let Some(p) = self.progress.lock().unwrap().as_mut() {
+                p.step = format!("saving the conversations of '{}'", active.entry_name);
+            }
             self.save_slots(&origin, &active.entry_name).await;
+        }
+        if let Some(p) = self.progress.lock().unwrap().as_mut() {
+            p.step = format!("stopping '{}'", active.entry_name);
         }
         Self::stop(active).await;
     }
@@ -578,7 +708,30 @@ impl Coordinator {
     /// listening socket has been released, not merely asked to release it.
     pub async fn ensure_active(&self, entry: &CoordinatorLlmEntry) -> Result<String> {
         let mut guard = self.active.lock().await;
+        self.activate(&mut guard, entry).await
+    }
 
+    /// [`Self::ensure_active`] for a request that is about to be proxied:
+    /// the request is counted in flight at the returned origin before the
+    /// lock on the active set is released. Counting it after would leave a
+    /// window in which a swap takes the lock, drains a server that has no
+    /// request in flight yet, and stops it under the request.
+    pub async fn begin_active_request(
+        &self,
+        entry: &CoordinatorLlmEntry,
+    ) -> Result<(String, InFlight)> {
+        let mut guard = self.active.lock().await;
+        let origin = self.activate(&mut guard, entry).await?;
+        let in_flight = self.begin_request(&origin);
+        Ok((origin, in_flight))
+    }
+
+    /// The body of [`Self::ensure_active`], run with the active set locked.
+    async fn activate(
+        &self,
+        guard: &mut Vec<ActiveProcess>,
+        entry: &CoordinatorLlmEntry,
+    ) -> Result<String> {
         // The same profile, or a different one a running process already
         // serves: `serves_same_process_as` is true exactly when the only
         // difference is the role, which travels per request instead
@@ -622,6 +775,11 @@ impl Coordinator {
             Self::stop(guard.remove(i)).await;
         }
 
+        // From here a swap or start is under way, which waiting clients hear
+        // about (`Self::progress`); the guard clears it on every way out.
+        let _progress = ProgressGuard(self);
+        self.note_step(&entry.name, "preparing");
+
         // What has to go for `entry` to start: what it cannot run beside,
         // then the least recently used while the set is full. A model that
         // cannot run here at all is refused before any of them is touched.
@@ -639,16 +797,40 @@ impl Coordinator {
                 staying -= 1;
             }
         }
-        if leaving
-            .iter()
-            .any(|&i| matches!(guard[i].child.try_wait(), Ok(None)))
-            && let Err(why) = self.fit_verdict(entry).await
-        {
-            let running = guard[leaving[0]].entry_name.clone();
-            return Err(anyhow!(
-                "'{}' cannot run on this machine: {why} — '{running}' keeps serving",
-                entry.name
-            ));
+        // Asked whenever a live model is in play: one about to be stopped
+        // for it, or one it will run beside, whose memory it shares.
+        let alive: Vec<bool> = guard
+            .iter_mut()
+            .map(|a| matches!(a.child.try_wait(), Ok(None)))
+            .collect();
+        let stays: Vec<usize> = (0..guard.len())
+            .filter(|i| !leaving.contains(i) && alive[*i])
+            .collect();
+        if leaving.iter().any(|&i| alive[i]) || !stays.is_empty() {
+            self.note_step(&entry.name, "checking that it fits beside what stays");
+            let verdict = match self.fit_verdict(entry).await {
+                Ok(Some(fit)) if !stays.is_empty() => {
+                    let mut beside = Vec::new();
+                    for &i in &stays {
+                        if let Some(needs) = self.needs_of(&guard[i].entry_at_start).await {
+                            beside.push((guard[i].entry_name.clone(), needs));
+                        }
+                    }
+                    fits_beside(fit, &beside)
+                }
+                other => other.map(|_| ()),
+            };
+            if let Err(why) = verdict {
+                let serving: Vec<String> = (0..guard.len())
+                    .filter(|&i| alive[i])
+                    .map(|i| format!("'{}'", guard[i].entry_name))
+                    .collect();
+                return Err(anyhow!(
+                    "'{}' cannot run on this machine: {why} — {} keeps serving",
+                    entry.name,
+                    serving.join(" and ")
+                ));
+            }
         }
         leaving.sort_unstable();
         for i in leaving.into_iter().rev() {
@@ -834,6 +1016,7 @@ impl Coordinator {
             self.current_pid.store(0, Ordering::Relaxed);
             Self::stop(active).await;
         }
+        let _progress = ProgressGuard(self);
         let (child, tail) = self.start(entry).await?;
         guard.insert(
             0,
@@ -974,17 +1157,22 @@ impl Coordinator {
     ///
     /// Only a definite "does not run" refuses. A server too old to answer,
     /// one that takes longer than [`FIT_CHECK_TIMEOUT`], or an answer that
-    /// does not parse lets the swap go ahead as it always has.
-    async fn fit_verdict(&self, entry: &CoordinatorLlmEntry) -> std::result::Result<(), String> {
+    /// does not parse lets the swap go ahead as it always has. The need it
+    /// reports is kept for the profile, so a later start beside it can be
+    /// weighed against it ([`Self::needs_of`]).
+    async fn fit_verdict(
+        &self,
+        entry: &CoordinatorLlmEntry,
+    ) -> std::result::Result<Option<PlanFit>, String> {
         if cfg!(test) {
-            return Ok(());
+            return Ok(None);
         }
         let (models_dir, log) = {
             let config = self.config.read().unwrap();
             (config.models.clone(), config.log.clone())
         };
         let Ok(server_config_path) = write_server_config(entry, &models_dir, &log) else {
-            return Ok(());
+            return Ok(None);
         };
         let mut command = Command::new(self.resolve_server_binary());
         command
@@ -998,9 +1186,30 @@ impl Coordinator {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let Ok(Ok(output)) = tokio::time::timeout(FIT_CHECK_TIMEOUT, command.output()).await else {
-            return Ok(());
+            return Ok(None);
         };
-        fit_from_plan(&output.stdout)
+        let fit = fit_from_plan(&output.stdout)?;
+        if let Some(fit) = fit {
+            self.needs
+                .lock()
+                .unwrap()
+                .insert(needs_key(entry), fit.needs);
+        }
+        Ok(fit)
+    }
+
+    /// What `entry`'s model needs of the machine, from its own fit check —
+    /// asked now if it has had none (a profile started before any check, or
+    /// an adopted server). `None` when the plan cannot say.
+    async fn needs_of(&self, entry: &CoordinatorLlmEntry) -> Option<u64> {
+        if let Some(&needs) = self.needs.lock().unwrap().get(&needs_key(entry)) {
+            return Some(needs);
+        }
+        self.fit_verdict(entry)
+            .await
+            .ok()
+            .flatten()
+            .map(|f| f.needs)
     }
 
     async fn start(
@@ -1053,6 +1262,10 @@ impl Coordinator {
             .store(child.id().unwrap_or(0), Ordering::Relaxed);
 
         let tail: OutputTail = Arc::new(Mutex::new(VecDeque::new()));
+        self.note_step(&entry.name, format!("loading {}", entry.model));
+        if let Some(p) = self.progress.lock().unwrap().as_mut() {
+            p.tail = Some(tail.clone());
+        }
         // Kept so a startup failure can wait for these to drain before it
         // reports what the process said — see `wait_until_healthy`.
         let mut capture = Vec::new();
@@ -1311,6 +1524,9 @@ fn write_server_config(
     if let Some(slots) = entry.slots {
         contents.push_str(&format!("slots = {slots}\n"));
     }
+    if let Some(context) = entry.context {
+        contents.push_str(&format!("context = {context}\n"));
+    }
     if let Some(path) = log.path() {
         contents.push_str(&format!(
             "log_type = {}\nlog_path = {}\n",
@@ -1540,12 +1756,41 @@ mod tests {
             fit_from_plan(no),
             Err("architecture: unknown 'xyz'".to_string())
         );
-        assert_eq!(fit_from_plan(br#"{"runs":true,"problems":[]}"#), Ok(()));
+        assert_eq!(fit_from_plan(br#"{"runs":true,"problems":[]}"#), Ok(None));
+        assert_eq!(
+            fit_from_plan(br#"{"runs":true,"problems":[],"needs_bytes":5,"capacity_bytes":9}"#),
+            Ok(Some(PlanFit {
+                needs: 5,
+                capacity: 9
+            }))
+        );
         assert_eq!(
             fit_from_plan(b"error: unexpected argument '--json'"),
-            Ok(())
+            Ok(None)
         );
-        assert_eq!(fit_from_plan(b""), Ok(()));
+        assert_eq!(fit_from_plan(b""), Ok(None));
+    }
+
+    /// A model that fits alone is refused beside the models that stay when
+    /// together they are more than the machine holds; one too old to say
+    /// what it needs counts for nothing.
+    #[test]
+    fn a_start_beside_residents_counts_what_they_need() {
+        const GB: u64 = 1_000_000_000;
+        let fit = PlanFit {
+            needs: 20 * GB,
+            capacity: 64 * GB,
+        };
+        assert_eq!(fits_beside(fit, &[]), Ok(()));
+        assert_eq!(fits_beside(fit, &[("a".into(), 30 * GB)]), Ok(()));
+        let refused =
+            fits_beside(fit, &[("a".into(), 30 * GB), ("b".into(), 20 * GB)]).unwrap_err();
+        assert!(
+            refused.contains("'a'") && refused.contains("'b'"),
+            "{refused}"
+        );
+        // Exactly full still fits.
+        assert_eq!(fits_beside(fit, &[("a".into(), 44 * GB)]), Ok(()));
     }
 
     /// A swap saves every slot of the outgoing server under its profile's
@@ -1681,6 +1926,7 @@ mod tests {
                 backend: None,
                 device: None,
                 slots: None,
+                context: None,
                 web: None,
             },
         );
@@ -1695,6 +1941,7 @@ mod tests {
                 backend: None,
                 device: None,
                 slots: None,
+                context: None,
                 web: None,
             },
         );
@@ -1774,6 +2021,7 @@ mod tests {
                 backend: None,
                 device: None,
                 slots: None,
+                context: None,
                 web: None,
             },
         );
@@ -1799,6 +2047,7 @@ mod tests {
                 backend: None,
                 device: None,
                 slots: None,
+                context: None,
                 web: None,
             },
         );
@@ -1864,6 +2113,7 @@ mod tests {
             backend: Some("vulkan".to_string()),
             device: None,
             slots: Some(4),
+            context: None,
             web: Some(8181),
         };
         let path = write_server_config(
@@ -1920,6 +2170,7 @@ mod tests {
             backend: None,
             device: None,
             slots: None,
+            context: None,
             web: None,
         };
         let path = write_server_config(
@@ -2465,6 +2716,143 @@ while True:
             ["one-b"]
         );
         assert!(!process_is_alive(a_pid), "a was stopped");
+        coordinator.shutdown().await;
+        std::fs::remove_file(&fake_bin).ok();
+    }
+
+    /// A request activated through `begin_active_request` is already in
+    /// flight when the active set is unlocked, so a swap that takes the
+    /// lock next waits for it instead of stopping its server under it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_swap_waits_for_a_request_counted_inside_the_activation() {
+        let Some(fake_bin) = listening_fake_server() else {
+            println!("no python3 to stand in for orangu-server; nothing to check");
+            return;
+        };
+        let [pa, pb] = free_ports::<2>();
+        let config = minimal_config(
+            "startup_timeout = 10",
+            &format!(
+                "[race-a]\nrole = all\nmodel = org/a\nport = {pa}\n\
+                 [race-b]\nrole = all\nmodel = org/b\nport = {pb}\n"
+            ),
+        );
+        let coordinator = Arc::new(Coordinator::new(config, Some(fake_bin.clone())).unwrap());
+        let entry = |name: &str| coordinator.config.read().unwrap().llms[name].clone();
+        let (origin, in_flight) = coordinator
+            .begin_active_request(&entry("race-a"))
+            .await
+            .unwrap();
+        assert_eq!(origin, entry("race-a").origin());
+        let a_pid = residents(&coordinator).await[0].1;
+        let swap = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let b = entry("race-b");
+            async move { coordinator.ensure_active(&b).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!swap.is_finished(), "the swap went ahead mid-request");
+        assert!(process_is_alive(a_pid), "a was stopped under its request");
+        drop(in_flight);
+        swap.await.unwrap().unwrap();
+        assert!(
+            !process_is_alive(a_pid),
+            "a was stopped once its request ended"
+        );
+        coordinator.shutdown().await;
+        std::fs::remove_file(&fake_bin).ok();
+    }
+
+    /// A streamed request kept waiting by a slow start hears where the start
+    /// has got to — SSE comment lines, which a client ignores — and then the
+    /// server's own answer; `/v1/coordinator` reports the same start while
+    /// it runs and nothing once it is done.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_streamed_request_hears_a_slow_start_and_then_the_answer() {
+        if std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            println!("no python3 to stand in for orangu-server; nothing to check");
+            return;
+        }
+        // Prints a line, takes two seconds to listen, then answers `{}`.
+        let fake_bin = fake_server_script(
+            r#"PORT=$(sed -n 's/^port = //p' "$2" | head -1)
+echo "fake orangu-server: loading weights"
+sleep 2
+exec python3 -u -c '
+import socket, sys
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1])))
+s.listen(16)
+while True:
+    c, _ = s.accept()
+    c.recv(65536)
+    c.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 13\r\nConnection: close\r\n\r\ndata: [DONE]\n")
+    c.close()
+' "$PORT"
+"#,
+        );
+        let [port] = free_ports::<1>();
+        let config = minimal_config(
+            "startup_timeout = 20",
+            &format!("[slow]\nrole = all\nmodel = org/slow\nport = {port}\n"),
+        );
+        let coordinator = Arc::new(Coordinator::new(config, Some(fake_bin.clone())).unwrap());
+        let body = axum::body::Bytes::from(r#"{"model":"slow","stream":true}"#);
+        let watch = tokio::spawn({
+            let coordinator = coordinator.clone();
+            async move {
+                for _ in 0..40 {
+                    if let Some(p) = coordinator.progress().await {
+                        return Some(p);
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                None
+            }
+        });
+        let response = crate::proxy::proxy(
+            axum::extract::State(coordinator.clone()),
+            axum::http::Method::POST,
+            "/v1/chat/completions".parse().unwrap(),
+            axum::http::HeaderMap::new(),
+            body,
+        )
+        .await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-type"],
+            "text/event-stream",
+            "the stream started before the server did"
+        );
+        let progress = watch
+            .await
+            .unwrap()
+            .expect("the start was reported while it ran");
+        assert_eq!(progress["profile"], "slow");
+        let text = String::from_utf8(
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let (comments, rest): (Vec<&str>, Vec<&str>) =
+            text.lines().partition(|l| l.starts_with(": "));
+        assert!(
+            comments
+                .iter()
+                .any(|l| l.contains("making 'slow' active: loading org/slow")),
+            "{text}"
+        );
+        assert_eq!(rest, ["data: [DONE]"], "{text}");
+        assert!(coordinator.progress().await.is_none(), "the start is over");
         coordinator.shutdown().await;
         std::fs::remove_file(&fake_bin).ok();
     }

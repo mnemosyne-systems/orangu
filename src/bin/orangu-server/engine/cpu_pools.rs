@@ -127,14 +127,35 @@ pub fn in_pool<T: Send>(pool: Pool, f: impl FnOnce() -> T + Send) -> T {
 }
 
 /// Times `time` in each pool and keeps the faster for `phase`, reporting it
-/// as an `[adapt]` line. `None` from either timing keeps every core.
-fn choose(phase: &'static str, what: &str, mut time: impl FnMut(Pool) -> Option<f64>) -> Pool {
+/// as an `[adapt]` line. `None` from either timing keeps every core. With
+/// `kept_as`, an answer from an earlier start of this build for this model
+/// (`engine::probe_cache::model_key`) is taken instead of timing, and a new
+/// one is kept under that name.
+fn choose(
+    phase: &'static str,
+    what: &str,
+    kept_as: Option<&str>,
+    mut time: impl FnMut(Pool) -> Option<f64>,
+) -> Pool {
     let Some((_, n_big)) = BIG.get() else {
         return Pool::All;
     };
     let all_threads = ALL
         .get()
         .map_or_else(rayon::current_num_threads, |p| p.current_num_threads());
+    let key = kept_as.zip(crate::engine::probe_cache::model_key());
+    if let Some(big) = key.and_then(|(name, key)| crate::engine::probe_cache::choice(name, key)) {
+        let chosen = if big { Pool::Big } else { Pool::All };
+        crate::engine::adapt::note(
+            phase,
+            match chosen {
+                Pool::Big => format!("the {n_big} big cores"),
+                Pool::All => format!("all {all_threads} cores"),
+            },
+            "measured at an earlier start, kept in probes.json".to_string(),
+        );
+        return chosen;
+    }
     let (Some(all), Some(big)) = (time(Pool::All), time(Pool::Big)) else {
         return Pool::All;
     };
@@ -143,6 +164,9 @@ fn choose(phase: &'static str, what: &str, mut time: impl FnMut(Pool) -> Option<
     } else {
         Pool::All
     };
+    if let Some((name, key)) = key {
+        crate::engine::probe_cache::keep_choice(name, key, chosen == Pool::Big, big, all);
+    }
     crate::engine::adapt::note(
         phase,
         match chosen {
@@ -162,16 +186,17 @@ fn choose(phase: &'static str, what: &str, mut time: impl FnMut(Pool) -> Option<
 /// returns its seconds (the caller warms and repeats inside it).
 pub fn choose_prompts(what: &str, time: impl FnMut(Pool) -> Option<f64>) {
     PROMPTS.store(
-        choose("cpu pool (prompts)", what, time).code(),
+        choose("cpu pool (prompts)", what, Some("cpu-pool-prompts"), time).code(),
         Ordering::Relaxed,
     );
 }
 
 /// Decides the decode pool, where the cores decode — or, called with the
-/// two timings `main`'s decode decision already took, records them.
+/// two timings `main`'s decode decision already took, records them. Timed
+/// every start: the same timings decide whether the cores decode at all.
 pub fn choose_decode(what: &str, time: impl FnMut(Pool) -> Option<f64>) {
     DECODE.store(
-        choose("cpu pool (decode)", what, time).code(),
+        choose("cpu pool (decode)", what, None, time).code(),
         Ordering::Relaxed,
     );
 }

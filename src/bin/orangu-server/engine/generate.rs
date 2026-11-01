@@ -32,6 +32,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use super::arch::{ForwardOutcome, GreedySampleParams, ModelForward, MtpHead, MtpStep};
 use super::kv_cache::KvCache;
 use super::prefix_cache::PrefixCache;
+use super::prompt_lookup::NgramIndex;
 use super::sampling::{Sampler, SamplingParams};
 use super::scheduler::SlotPool;
 use super::tokenizer::Tokenizer;
@@ -1321,8 +1322,10 @@ fn run(
     }
     let mut history = req.prompt_tokens.clone();
 
-    // Speculative decoding, greedy or sampled, and not while fused batching
-    // is running the decode step. Sampled is exact because the sampler's draw
+    // Speculative decoding, greedy or sampled. A prompt-lookup verify rides
+    // the batched decode step when other slots are decoding
+    // (`ORANGU_BATCH_VERIFY`); a draft model or an MTP head steps on its
+    // own. Sampled is exact because the sampler's draw
     // for a position depends on the seed and the position alone
     // (`sampling::position_draw`), so the verifier picks at each drafted
     // position what plain decoding would pick there. `spec_buf` (below) holds
@@ -1390,21 +1393,19 @@ fn run(
             states: Vec::new(),
             states_start: 0,
             width: mtp.head.state_width(),
-            echo: mtp
-                .head
-                .block_size()
-                .and(lookup)
-                .map(|(ngram, max_draft)| EchoLookup {
+            echo: mtp.head.block_size().and(lookup).map(|(ngram, max_draft)| {
+                EchoLookup::new(
                     ngram,
                     max_draft,
-                    echo_draft: spec_echo_draft(model.vulkan_backend().is_some()),
-                }),
+                    spec_echo_draft(model.vulkan_backend().is_some()),
+                )
+            }),
         }),
-        (true, None, None, Some((ngram, max_draft))) => Some(Drafter::PromptLookup {
+        (true, None, None, Some((ngram, max_draft))) => Some(Drafter::prompt_lookup(
             ngram,
             max_draft,
-            echo_draft: spec_echo_draft(model.vulkan_backend().is_some()),
-        }),
+            spec_echo_draft(model.vulkan_backend().is_some()),
+        )),
         (true, None, None, None) => None,
     };
 
@@ -1806,7 +1807,7 @@ fn run(
         // with any further accepted tokens queued in `spec_buf`.
         // An echo in progress is verified whatever the gate says, at the
         // width that has been yielding more tokens a millisecond.
-        let echo = spec_buf.is_empty() && drafter.as_ref().is_some_and(|d| d.echoes(&history));
+        let echo = spec_buf.is_empty() && drafter.as_mut().is_some_and(|d| d.echoes(&history));
         let wide = echo
             && drafter.as_ref().is_some_and(Drafter::has_echo_draft)
             && draft_control.echo_wide();
@@ -2527,15 +2528,9 @@ impl MessageHeader {
     }
 }
 
-/// Prompt-lookup speculative-decode settings, read once at the start of a
-/// request. `None` (the default) leaves decoding exactly as it was. Setting
-/// `ORANGU_SPECULATIVE` turns it on; `ORANGU_SPEC_NGRAM` (default 2) is how
-/// many trailing tokens must match a earlier spot in the context to trigger a
-/// draft, and `ORANGU_SPEC_DRAFT` (default 4) how many tokens to draft from
-/// there. See `Self::speculative_next`.
 /// How many prompt tokens go into one forward pass — `ORANGU_PREFILL_BATCH`,
 /// default [`PREFILL_BATCH_DEFAULT`]. `0` means no limit: the whole prompt in
-/// one pass, which is what this code did unconditionally before.
+/// one pass.
 fn prefill_batch() -> usize {
     prefill_batch_override().unwrap_or_else(|| PREFILL_BATCH_DEFAULT.max(chunk_ceiling()))
 }
@@ -2982,9 +2977,63 @@ fn load_chunk_cost() -> ChunkCost {
     if chunk_cost_fit_disabled() {
         return ChunkCost::proportional_only();
     }
-    *CHUNK_COST
+    let mut cost = CHUNK_COST
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // The first prefill of a run starts from the line an earlier start of
+    // this build measured for this model on this device, so it opens at a
+    // workable width instead of probing its way up.
+    static SEEDED: std::sync::Once = std::sync::Once::new();
+    SEEDED.call_once(|| {
+        if cost.last.is_none()
+            && cost.fit.is_none()
+            && let Some(kept) = kept_chunk_cost_fit()
+        {
+            cost.fit = Some(kept);
+            *KEPT_CHUNK_COST_FIT
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(kept);
+        }
+    });
+    *cost
+}
+
+/// The name the chunk sizer's cost line is kept under
+/// (`engine::probe_cache::model_key`).
+const CHUNK_COST_KEPT_AS: &str = "prefill-chunk-cost";
+
+/// The cost line last kept, so one that has barely moved is not written
+/// again after every prompt.
+static KEPT_CHUNK_COST_FIT: Mutex<Option<CostFit>> = Mutex::new(None);
+
+fn kept_chunk_cost_fit() -> Option<CostFit> {
+    let key = super::probe_cache::model_key()?;
+    let kept = super::probe_cache::value(CHUNK_COST_KEPT_AS, key)?;
+    let fixed = kept["fixed_s"].as_f64()?;
+    let per_token = kept["per_token_s"].as_f64()?;
+    (fixed.is_finite() && fixed >= 0.0 && per_token.is_finite() && per_token > 0.0)
+        .then_some(CostFit { fixed, per_token })
+}
+
+/// Keeps `fit` for the next start when it has moved by more than a tenth
+/// in either term since the line last kept.
+fn keep_chunk_cost_fit(fit: CostFit) {
+    let mut kept = KEPT_CHUNK_COST_FIT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let moved = |a: f64, b: f64| (a - b).abs() > 0.1 * b.abs().max(1e-9);
+    if kept.is_some_and(|k| !moved(fit.fixed, k.fixed) && !moved(fit.per_token, k.per_token)) {
+        return;
+    }
+    let Some(key) = super::probe_cache::model_key() else {
+        return;
+    };
+    super::probe_cache::keep_value(
+        CHUNK_COST_KEPT_AS,
+        key,
+        serde_json::json!({"fixed_s": fit.fixed, "per_token_s": fit.per_token}),
+    );
+    *kept = Some(fit);
 }
 
 /// Whether `ORANGU_NO_CHUNK_COST_FIT` asked for the single-point sizer back.
@@ -3001,6 +3050,9 @@ fn store_chunk_cost(cost: ChunkCost) {
     *CHUNK_COST
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = cost;
+    if let Some(fit) = cost.fit.filter(|_| !cost.proportional_only) {
+        keep_chunk_cost_fit(fit);
+    }
 }
 
 /// [`prefill`] with the chunk size passed in rather than read from the
@@ -3919,6 +3971,11 @@ fn trace_tokens() -> bool {
     *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_TRACE_TOKENS"))
 }
 
+/// Prompt-lookup settings, read at the start of a request: on unless
+/// `ORANGU_SPECULATIVE=0`; `ORANGU_SPEC_NGRAM` (default 2) is how many
+/// trailing tokens must match an earlier spot in the context to draft, and
+/// `ORANGU_SPEC_DRAFT` (default 4) how many tokens to draft from there.
+/// `None` when it is off, under test, or when the model cannot verify.
 fn speculative_config() -> Option<(usize, usize)> {
     // On unless turned off: with `engine::draft_control` deciding per step,
     // a draft is verified only while verifying pays, and an empty one costs
@@ -3967,12 +4024,23 @@ const COPY_CONTEXT: usize = 2;
 const DEFERRED_CONTEXT: usize = 64;
 
 /// Prompt lookup's settings, kept by a block head to draft an echo with
-/// ([`Drafter::Mtp`]'s `echo`).
-#[derive(Debug, Clone, Copy)]
+/// ([`Drafter::Mtp`]'s `echo`), and the index of the request's history it
+/// matches from.
+#[derive(Debug, Clone)]
 struct EchoLookup {
-    ngram: usize,
     max_draft: usize,
     echo_draft: usize,
+    index: NgramIndex,
+}
+
+impl EchoLookup {
+    fn new(ngram: usize, max_draft: usize, echo_draft: usize) -> Self {
+        Self {
+            max_draft,
+            echo_draft,
+            index: NgramIndex::new(ngram),
+        }
+    }
 }
 
 /// Where a speculative step's candidate tokens come from.
@@ -3995,9 +4063,10 @@ enum Drafter<'a> {
     /// [`Drafter::echoes`] where wider verifies pay
     /// (`engine::draft_control`).
     PromptLookup {
-        ngram: usize,
         max_draft: usize,
         echo_draft: usize,
+        /// The request's history by n-gram, grown as tokens are committed.
+        index: NgramIndex,
     },
     /// Run the served model's own multi-token-prediction head — one decoder
     /// block that reads the token just produced *and* the state the served
@@ -4069,6 +4138,16 @@ enum Drafter<'a> {
 }
 
 impl Drafter<'_> {
+    /// Prompt lookup matching at least `ngram` tokens, drafting `max_draft`
+    /// (`echo_draft` through an echo where wider verifies pay).
+    fn prompt_lookup(ngram: usize, max_draft: usize, echo_draft: usize) -> Self {
+        Drafter::PromptLookup {
+            max_draft,
+            echo_draft,
+            index: NgramIndex::new(ngram),
+        }
+    }
+
     /// The tokens to speculate on, continuing after all of `history`.
     ///
     /// `room` caps the draft at what the KV cache can still hold. It is not a
@@ -4098,12 +4177,12 @@ impl Drafter<'_> {
         }
         match self {
             Drafter::PromptLookup {
-                ngram,
                 max_draft,
                 echo_draft,
+                index,
             } => Ok(ngram_draft(
+                index,
                 history,
-                *ngram,
                 (*max_draft).max(*echo_draft).min(room),
             )),
             Drafter::Mtp { .. } | Drafter::Assistant { .. } => unreachable!("dispatched above"),
@@ -4199,15 +4278,20 @@ impl Drafter<'_> {
         if let Drafter::Mtp {
             echo: Some(lookup), ..
         } = self
-            && let Some((len, from)) = ngram_match(history, lookup.ngram)
+            && let Some((len, from)) = lookup.index.find(history)
             && from < history.len()
             && len >= copy_context()
         {
-            let ngram = lookup.ngram;
             if len < ECHO_CONTEXT || history.len() - committed > DEFERRED_CONTEXT {
                 self.catch_up(&history[committed..], committed)?;
             }
-            return Ok(ngram_draft(history, ngram, room));
+            let Drafter::Mtp {
+                echo: Some(lookup), ..
+            } = self
+            else {
+                unreachable!("matched above");
+            };
+            return Ok(ngram_draft(&mut lookup.index, history, room));
         }
         let Some(step) = self.catch_up(&history[committed..], committed)? else {
             return Ok(drafted);
@@ -4363,12 +4447,12 @@ impl Drafter<'_> {
             || matches!(self, Drafter::Mtp { echo: Some(lookup), .. } if lookup.echo_draft > lookup.max_draft)
     }
 
-    fn echoes(&self, history: &[u32]) -> bool {
+    fn echoes(&mut self, history: &[u32]) -> bool {
         match self {
-            Drafter::PromptLookup { ngram, .. } => echoing(history, *ngram),
+            Drafter::PromptLookup { index, .. } => echoing(index, history),
             Drafter::Mtp {
                 echo: Some(lookup), ..
-            } => echoing(history, lookup.ngram),
+            } => echoing(&mut lookup.index, history),
             _ => false,
         }
     }
@@ -4647,20 +4731,17 @@ fn draft_forward(
     Ok(last)
 }
 
-/// The longest trailing context prompt lookup compares.
-const NGRAM_LONGEST: usize = 64;
-
 /// Prompt-lookup draft: the continuation of the earlier occurrence of
-/// `history`'s trailing context that matches it furthest back, at least
-/// `shortest` tokens and at most [`NGRAM_LONGEST`], the most recent of equal
-/// ones — a zero-cost (no model call) guess at what comes next, which pays
-/// off whenever the output echoes the context (code, quotations,
-/// structured/repetitive text). A longer matching context is the better
-/// predictor: in a copied list every item ends the same way, and only the
-/// context back to the item before tells the place being copied from the
+/// `history`'s trailing context that matches it furthest back
+/// ([`NgramIndex::find`]) — a zero-cost (no model call) guess at what comes
+/// next, which pays off whenever the output echoes the context (code,
+/// quotations, structured/repetitive text). A longer matching context is the
+/// better predictor: in a copied list every item ends the same way, and only
+/// the context back to the item before tells the place being copied from the
 /// copy just written. Empty when there's no match.
-fn ngram_draft(history: &[u32], shortest: usize, max_draft: usize) -> Vec<u32> {
-    ngram_match(history, shortest)
+fn ngram_draft(index: &mut NgramIndex, history: &[u32], max_draft: usize) -> Vec<u32> {
+    index
+        .find(history)
         .map(|(_, from)| {
             // A picture's rows are never a guess at the reply.
             history[from..(from + max_draft).min(history.len())]
@@ -4679,40 +4760,10 @@ const ECHO_CONTEXT: usize = 16;
 
 /// Whether `history` is copying an earlier passage: its trailing context
 /// matches [`ECHO_CONTEXT`] tokens back, with something left to copy.
-fn echoing(history: &[u32], ngram: usize) -> bool {
-    ngram_match(history, ngram)
+fn echoing(index: &mut NgramIndex, history: &[u32]) -> bool {
+    index
+        .find(history)
         .is_some_and(|(len, from)| len >= ECHO_CONTEXT && from < history.len())
-}
-
-/// [`ngram_draft`]'s match: how many tokens of context it matched, and
-/// where in `history` the continuation it copies starts.
-fn ngram_match(history: &[u32], shortest: usize) -> Option<(usize, usize)> {
-    let shortest = shortest.max(1);
-    if history.len() <= shortest {
-        return None;
-    }
-    let end = history.len();
-    let suffix = &history[end - shortest..];
-    // `(context length, start of the continuation)`.
-    let mut best: Option<(usize, usize)> = None;
-    for start in (0..end - shortest).rev() {
-        if &history[start..start + shortest] != suffix {
-            continue;
-        }
-        let from = start + shortest;
-        let longest = NGRAM_LONGEST.min(from);
-        let mut len = shortest;
-        while len < longest && history[from - len - 1] == history[end - len - 1] {
-            len += 1;
-        }
-        if best.is_none_or(|(l, _)| len > l) {
-            best = Some((len, from));
-            if len == longest {
-                break;
-            }
-        }
-    }
-    best
 }
 
 /// One speculative step. Takes a draft from `drafter`, verifies the whole of
@@ -6967,14 +7018,7 @@ mod tests {
             context: RecordingHead::new(),
             blocks: std::sync::Mutex::new(Vec::new()),
         };
-        let mut drafter = block_drafter(
-            &head,
-            Some(EchoLookup {
-                ngram: 2,
-                max_draft: 4,
-                echo_draft: 0,
-            }),
-        );
+        let mut drafter = block_drafter(&head, Some(EchoLookup::new(2, 4, 0)));
         let passage: Vec<u32> = (20..40).collect();
         let mut history = passage.clone();
         history.push(99);
@@ -7019,14 +7063,7 @@ mod tests {
             context: RecordingHead::new(),
             blocks: std::sync::Mutex::new(Vec::new()),
         };
-        let mut drafter = block_drafter(
-            &head,
-            Some(EchoLookup {
-                ngram: 2,
-                max_draft: 4,
-                echo_draft: 0,
-            }),
-        );
+        let mut drafter = block_drafter(&head, Some(EchoLookup::new(2, 4, 0)));
         let history: Vec<u32> = vec![1, 2, 3, 9, 8, 1, 2];
         drafter.observe_states(0, &StatefulModel::states(&history[..history.len() - 1], 0));
         assert!(!drafter.echoes(&history));
@@ -8439,11 +8476,7 @@ mod tests {
     fn a_draft_never_runs_past_the_end_of_the_context() {
         let history: Vec<u32> = vec![1, 2, 3, 1, 2, 3, 1, 2, 3];
         for room in 0..6 {
-            let mut lookup = Drafter::PromptLookup {
-                ngram: 2,
-                max_draft: 8,
-                echo_draft: 16,
-            };
+            let mut lookup = Drafter::prompt_lookup(2, 8, 16);
             let drafted = lookup
                 .draft(&history, room, &KvCache::new_with_dims(1, &[]), 0)
                 .expect("prompt lookup");
@@ -8528,9 +8561,12 @@ mod tests {
         // Last two tokens are [1, 2]; their most recent earlier occurrence is
         // at index 4, followed by [3, 9, 9] — so a 3-token draft is [3, 9, 9].
         let history = [1u32, 2, 3, 7, 1, 2, 3, 9, 9, 1, 2];
-        assert_eq!(ngram_draft(&history, 2, 3), vec![3, 9, 9]);
+        assert_eq!(
+            ngram_draft(&mut NgramIndex::new(2), &history, 3),
+            vec![3, 9, 9]
+        );
         // max_draft caps the length.
-        assert_eq!(ngram_draft(&history, 2, 1), vec![3]);
+        assert_eq!(ngram_draft(&mut NgramIndex::new(2), &history, 1), vec![3]);
     }
 
     #[test]
@@ -8538,7 +8574,10 @@ mod tests {
         // [1, 2] last recurs at index 6, followed by [7, 7]; but [5, 1, 2]
         // recurs at index 0, followed by [8, 8], and the longer context wins.
         let history = [5u32, 1, 2, 8, 8, 6, 1, 2, 7, 7, 5, 1, 2];
-        assert_eq!(ngram_draft(&history, 2, 2), vec![8, 8]);
+        assert_eq!(
+            ngram_draft(&mut NgramIndex::new(2), &history, 2),
+            vec![8, 8]
+        );
     }
 
     #[test]
@@ -8562,16 +8601,12 @@ mod tests {
         for n in 4..=5 {
             want.extend(item(n));
         }
-        assert_eq!(ngram_draft(&history, 2, 12), want);
+        assert_eq!(ngram_draft(&mut NgramIndex::new(2), &history, 12), want);
     }
 
     #[test]
     fn a_draft_echoes_only_on_a_long_matched_context() {
-        let lookup = Drafter::PromptLookup {
-            ngram: 2,
-            max_draft: 4,
-            echo_draft: 16,
-        };
+        let mut lookup = Drafter::prompt_lookup(2, 4, 16);
         // A passage of 20 distinct tokens, then the reply copying its first
         // 17: matched 17 back, an echo.
         let passage: Vec<u32> = (100..120).collect();
@@ -8582,14 +8617,14 @@ mod tests {
         let mut short = passage.clone();
         short.extend(&passage[..4]);
         assert!(!lookup.echoes(&short));
-        assert!(!ngram_draft(&short, 2, 4).is_empty());
+        assert!(!ngram_draft(&mut NgramIndex::new(2), &short, 4).is_empty());
     }
 
     #[test]
     fn ngram_draft_is_empty_without_a_match_or_enough_history() {
-        assert!(ngram_draft(&[1, 2], 2, 4).is_empty()); // suffix is the whole history
-        assert!(ngram_draft(&[1, 2, 3, 4, 5], 2, 4).is_empty()); // [4,5] never recurs
-        assert!(ngram_draft(&[], 2, 4).is_empty());
+        assert!(ngram_draft(&mut NgramIndex::new(2), &[1, 2], 4).is_empty()); // suffix is the whole history
+        assert!(ngram_draft(&mut NgramIndex::new(2), &[1, 2, 3, 4, 5], 4).is_empty()); // [4,5] never recurs
+        assert!(ngram_draft(&mut NgramIndex::new(2), &[], 4).is_empty());
     }
 
     #[test]

@@ -53,12 +53,13 @@ use std::ptr;
 use std::sync::Mutex;
 
 use cubecl_hip_sys::{
-    HIP_SUCCESS, hipDeviceGetName, hipDeviceSynchronize, hipDeviceTotalMem, hipFree, hipFunction_t,
-    hipGetDeviceCount, hipInit, hipMalloc, hipMemcpy, hipMemcpyKind_hipMemcpyDeviceToHost,
-    hipMemcpyKind_hipMemcpyHostToDevice, hipModule_t, hipModuleGetFunction, hipModuleLaunchKernel,
-    hipModuleLoadData, hipSetDevice, hipStream_t, hipStreamCreate, hiprtcCompileProgram,
-    hiprtcCreateProgram, hiprtcDestroyProgram, hiprtcGetCode, hiprtcGetCodeSize,
-    hiprtcGetProgramLog, hiprtcGetProgramLogSize, hiprtcProgram, hiprtcResult_HIPRTC_SUCCESS,
+    HIP_SUCCESS, hipDeviceGetName, hipDeviceSynchronize, hipDeviceTotalMem, hipDriverGetVersion,
+    hipFree, hipFunction_t, hipGetDeviceCount, hipInit, hipMalloc, hipMemcpy,
+    hipMemcpyKind_hipMemcpyDeviceToHost, hipMemcpyKind_hipMemcpyHostToDevice, hipModule_t,
+    hipModuleGetFunction, hipModuleLaunchKernel, hipModuleLoadData, hipSetDevice, hipStream_t,
+    hipStreamCreate, hiprtcCompileProgram, hiprtcCreateProgram, hiprtcDestroyProgram,
+    hiprtcGetCode, hiprtcGetCodeSize, hiprtcGetProgramLog, hiprtcGetProgramLogSize, hiprtcProgram,
+    hiprtcResult_HIPRTC_SUCCESS,
 };
 
 use crate::engine::loader::QuantMatrix;
@@ -261,6 +262,11 @@ impl RocmBackend {
             }
 
             let device_name = Self::device_name_at(ordinal).unwrap_or_else(|| "ROCm".to_string());
+            let mut driver: std::os::raw::c_int = 0;
+            let _ = hipDriverGetVersion(&mut driver);
+            // Before any knob is resolved, so the profile's values are the
+            // ones they read.
+            super::tuning_profile::install_named("rocm", &device_name, &driver.to_string());
 
             let mut stream: hipStream_t = ptr::null_mut();
             if hipStreamCreate(&mut stream) != HIP_SUCCESS {

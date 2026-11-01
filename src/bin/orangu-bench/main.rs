@@ -59,6 +59,7 @@ mod interference;
 mod kl;
 mod moe;
 mod points;
+mod tuning_profile;
 use orangu::profiling::profile;
 mod report;
 mod shell;
@@ -432,6 +433,14 @@ struct Args {
     /// After a two-value `--sweep`, exit 2 if the second value is worse than the first beyond the sweep's measured noise.
     #[arg(long)]
     fail_on_regression: bool,
+
+    /// Run a two-value `--sweep` in the order written instead of as `a,b,b,a`.
+    #[arg(long)]
+    sweep_as_given: bool,
+
+    /// After a two-value `--sweep`, keep the winning value in the server's tuning profile.
+    #[arg(long)]
+    write_profile: bool,
 
     /// Environment held constant across every `--sweep` point (repeatable).
     #[arg(long = "sweep-env", value_name = "K=V")]
@@ -2140,7 +2149,19 @@ fn capped(cmd: &str, cap: Option<&str>) -> String {
 }
 
 fn run_sweep(args: &Args) -> anyhow::Result<()> {
-    let spec = sweep::Spec::parse(args.sweep.as_deref().expect("checked by the caller"))?;
+    let mut spec = sweep::Spec::parse(args.sweep.as_deref().expect("checked by the caller"))?;
+    if !args.sweep_as_given {
+        spec.interleave_two_arms();
+    }
+    if args.fail_on_regression || args.write_profile {
+        check_verdict_runs(&spec)?;
+    }
+    if args.write_profile && !spec.var.starts_with("ORANGU_") {
+        anyhow::bail!(
+            "--write-profile keeps a tuning variable, and {} is not one (an `ORANGU_*` name)",
+            spec.var
+        );
+    }
     let cmd = args.sweep_cmd.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
             "--sweep needs --sweep-cmd \"<command that starts orangu-server>\": the values \
@@ -2173,6 +2194,8 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
 
     let mut all = Vec::new();
     let mut bundles = Vec::new();
+    // Each point's device key, for `--write-profile`.
+    let mut profile_keys: Vec<Option<String>> = Vec::new();
     for value in &spec.values {
         let label = sweep_point_label(args, &spec, value);
         println!("\n=== {label}");
@@ -2223,6 +2246,7 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
         // is one invocation whose points ran on different cards, which is the
         // case the column exists for.
         stamp_device(&mut measured, device_tag(&env_report.props).as_deref());
+        profile_keys.push(tuning_profile::device_key(&env_report.props));
 
         if let Some(stem) = &args.bundle {
             let path = bundle_point_path(stem, &label);
@@ -2244,7 +2268,11 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
         sweep_point_label(args, &spec, &spec.values[0])
     );
     print_sweep_table(args, &spec, &all);
-    let regressed = print_sweep_verdict(args, &spec, &all);
+    let judged = print_sweep_verdict(args, &spec, &all);
+    let regressed = judged.is_some_and(|j| j.worse);
+    if args.write_profile {
+        write_sweep_profile(&spec, judged, &profile_keys)?;
+    }
     print_sweep_devices(args, &spec, &all);
     if !bundles.is_empty() {
         println!("\nbundles: {}", bundles.join(" "));
@@ -2258,10 +2286,118 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Refuses a `--fail-on-regression` sweep that could never reach a verdict —
+/// not two distinct values, or one of them with fewer than
+/// [`verdict::MIN_RUNS`] runs — before any server is started, rather than
+/// exiting `0` after the whole sweep has run.
+fn check_verdict_runs(spec: &sweep::Spec) -> anyhow::Result<()> {
+    let mut distinct: Vec<&String> = Vec::new();
+    for v in &spec.values {
+        if !distinct.contains(&v) {
+            distinct.push(v);
+        }
+    }
+    if distinct.len() != 2 {
+        anyhow::bail!(
+            "--fail-on-regression judges a sweep of two values, and --sweep {} has {}",
+            spec.var,
+            distinct.len()
+        );
+    }
+    for v in distinct {
+        let runs = spec.values.iter().filter(|x| *x == v).count();
+        if runs < verdict::MIN_RUNS {
+            anyhow::bail!(
+                "--fail-on-regression needs {} runs of each value, and {}={v} has {runs} — \
+                 write it as `a,b,b,a`, or drop --sweep-as-given",
+                verdict::MIN_RUNS,
+                spec.var
+            );
+        }
+    }
+    Ok(())
+}
+
+/// What a sweep's verdict found across its points.
+#[derive(Clone, Copy, Debug)]
+struct Judged {
+    /// Some point came out better.
+    better: bool,
+    /// Some point came out worse.
+    worse: bool,
+}
+
+/// `--write-profile`: the candidate kept in the profile of the device every
+/// point ran on, when it beat the control somewhere and lost nowhere.
+fn write_sweep_profile(
+    spec: &sweep::Spec,
+    judged: Option<Judged>,
+    keys: &[Option<String>],
+) -> anyhow::Result<()> {
+    let candidate = spec
+        .values
+        .iter()
+        .find(|v| **v != spec.values[0])
+        .cloned()
+        .unwrap_or_default();
+    let shown = if candidate.is_empty() {
+        "<unset>"
+    } else {
+        candidate.as_str()
+    };
+    let Some(judged) = judged else {
+        println!("profile unchanged: the sweep reached no verdict");
+        return Ok(());
+    };
+    if judged.worse || !judged.better {
+        println!(
+            "profile unchanged: {}={shown} {}",
+            spec.var,
+            if judged.worse {
+                "was worse at some point"
+            } else {
+                "was not better at any point"
+            }
+        );
+        return Ok(());
+    }
+    let mut distinct: Vec<&Option<String>> = Vec::new();
+    for k in keys {
+        if !distinct.contains(&k) {
+            distinct.push(k);
+        }
+    }
+    let key = match distinct[..] {
+        [Some(key)] => key,
+        [None] => anyhow::bail!(
+            "--write-profile: the server reported no tuning profile key at /props \
+             (gpu.tuning.key); it runs on no device a profile applies to"
+        ),
+        _ => anyhow::bail!(
+            "--write-profile: the sweep's points ran on different devices, so no one \
+             profile holds its answer"
+        ),
+    };
+    let home = home::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("--write-profile: no home directory to write under"))?;
+    let path = tuning_profile::path_under(&home, key);
+    tuning_profile::write(&path, &spec.var, &candidate)?;
+    println!(
+        "profile: {}={shown} written to {}",
+        spec.var,
+        path.display()
+    );
+    Ok(())
+}
+
 /// For a sweep of exactly two values, the second (the candidate) judged
-/// against the first (the control) at every point — see `verdict`. Returns
-/// whether any point came out worse.
-fn print_sweep_verdict(args: &Args, spec: &sweep::Spec, records: &[history::Record]) -> bool {
+/// against the first (the control) at every point — see `verdict`. `None`
+/// when there is no verdict to give.
+fn print_sweep_verdict(
+    args: &Args,
+    spec: &sweep::Spec,
+    records: &[history::Record],
+) -> Option<Judged> {
     let mut distinct: Vec<&String> = Vec::new();
     for v in &spec.values {
         if !distinct.contains(&v) {
@@ -2269,8 +2405,17 @@ fn print_sweep_verdict(args: &Args, spec: &sweep::Spec, records: &[history::Reco
         }
     }
     let [control, candidate] = distinct[..] else {
-        return false;
+        return None;
     };
+    let runs_of = |v: &String| spec.values.iter().filter(|x| *x == v).count();
+    if runs_of(control) < verdict::MIN_RUNS || runs_of(candidate) < verdict::MIN_RUNS {
+        println!(
+            "\nno verdict — it needs {} runs of each value (`VAR=a,b,b,a`) to measure \
+             each arm's drift",
+            verdict::MIN_RUNS
+        );
+        return None;
+    }
     let runs = |value: &str, mode: &str, n: u32| -> Vec<verdict::Run> {
         let label = sweep_point_label(args, spec, value);
         records
@@ -2300,7 +2445,7 @@ verdict — {} against {}, noise = max(2 × standard error, one arm's run-to-run
             control
         },
     );
-    let mut regressed = false;
+    let mut judged: Option<Judged> = None;
     for (mode, n) in &points {
         let Some(v) = verdict::judge(
             &runs(control, mode, *n),
@@ -2309,7 +2454,12 @@ verdict — {} against {}, noise = max(2 × standard error, one arm's run-to-run
         ) else {
             continue;
         };
-        regressed |= v.outcome == verdict::Outcome::Worse;
+        let j = judged.get_or_insert(Judged {
+            better: false,
+            worse: false,
+        });
+        j.worse |= v.outcome == verdict::Outcome::Worse;
+        j.better |= v.outcome == verdict::Outcome::Better;
         println!(
             "  {:<12}  {:>+7.1}%  noise ±{:>5.1}%  {}",
             format!("{mode} {n}"),
@@ -2322,7 +2472,7 @@ verdict — {} against {}, noise = max(2 × standard error, one arm's run-to-run
             }
         );
     }
-    regressed
+    judged
 }
 
 /// Warm a freshly-started server on **the workload it is about to be measured

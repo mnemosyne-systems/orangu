@@ -254,6 +254,11 @@ pub struct CoordinatorLlmEntry {
     /// when set. `None` leaves `orangu-server`'s own role-based default in
     /// place (see `orangu-server`'s `config::Role::default_slots`).
     pub slots: Option<usize>,
+    /// Forwarded to this profile's generated `[orangu-server].context` key
+    /// when set: the tokens of context the server keeps room for on its
+    /// device. `None` leaves the server's own sizing in place. The fit
+    /// check before a swap counts this context's KV cache.
+    pub context: Option<usize>,
     /// Forwarded to this profile's generated `[web].port` key when
     /// set. `None` leaves `orangu-server`'s own default (`0`, disabled) in
     /// place — a coordinator-managed profile has no obvious single "the"
@@ -282,6 +287,7 @@ impl CoordinatorLlmEntry {
             && self.backend == other.backend
             && self.device == other.device
             && self.slots == other.slots
+            && self.context == other.context
             && self.web == other.web
     }
 
@@ -578,6 +584,19 @@ fn parse_llm_profiles(
                 None => None,
             };
 
+            let context = match values
+                .get("context")
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+            {
+                Some(value) => match value.parse::<usize>() {
+                    Ok(0) => return Err(anyhow!("[{name}].context must be at least 1")),
+                    Ok(n) => Some(n),
+                    Err(err) => return Err(anyhow!("invalid value for [{name}].context: {err}")),
+                },
+                None => None,
+            };
+
             let web = parse_port(&values, "web", &name)?;
 
             Ok((
@@ -591,6 +610,7 @@ fn parse_llm_profiles(
                     backend,
                     device,
                     slots,
+                    context,
                     web,
                 },
             ))
@@ -1059,6 +1079,7 @@ mod tests {
             backend: None,
             device: None,
             slots: None,
+            context: None,
             web: None,
         };
 
@@ -1172,6 +1193,7 @@ mod tests {
             backend: None,
             device: None,
             slots: None,
+            context: None,
             web: None,
         };
         let with = |port: u16, backend: Option<&str>, device: Option<&str>| CoordinatorLlmEntry {

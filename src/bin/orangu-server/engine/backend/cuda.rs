@@ -187,6 +187,13 @@ impl CudaBackend {
         let ctx = CudaContext::new(index).ok()?;
         let stream = ctx.default_stream();
         let device_name = ctx.name().unwrap_or_else(|_| "CUDA".to_string());
+        let mut driver: std::os::raw::c_int = 0;
+        // SAFETY: the context above initialised the driver, and the call only
+        // writes the version into `driver`.
+        let _ = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut driver) };
+        // Before any knob is resolved, so the profile's values are the ones
+        // they read.
+        super::tuning_profile::install_named("cuda", &device_name, &driver.to_string());
 
         let mut functions = HashMap::new();
         for &ggml_type in SUPPORTED_TYPES {

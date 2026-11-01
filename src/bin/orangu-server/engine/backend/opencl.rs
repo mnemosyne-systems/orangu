@@ -235,6 +235,13 @@ impl OpenClBackend {
         let device_id = *get_all_devices(CL_DEVICE_TYPE_GPU).ok()?.get(index)?;
         let device = Device::new(device_id);
         let device_name = device.name().unwrap_or_else(|_| "OpenCL".to_string());
+        // Before any knob is resolved, so the profile's values are the ones
+        // they read.
+        super::tuning_profile::install_named(
+            "opencl",
+            &device_name,
+            &device.driver_version().unwrap_or_default(),
+        );
         let context = Context::from_device(&device).ok()?;
         let queue = CommandQueue::create_default(&context, 0).ok()?;
 

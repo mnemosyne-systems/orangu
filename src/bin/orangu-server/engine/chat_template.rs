@@ -22,6 +22,7 @@
 use anyhow::{Result, anyhow};
 use minijinja::Environment;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// One message as the OpenAI Chat Completions API shapes it.
 ///
@@ -60,9 +61,10 @@ pub struct ChatMessage {
     pub image_at: Vec<usize>,
     /// Assistant messages: the calls this turn made. Left as raw JSON rather
     /// than a typed struct because templates reach into it in
-    /// model-specific ways (`function['arguments']` as a mapping *or* a
-    /// pre-serialized string, `tool_call['id']`, vendor extensions), and
-    /// re-shaping it here would only lose whatever a given template needs.
+    /// model-specific ways (`function['arguments']`, `tool_call['id']`,
+    /// vendor extensions), and re-shaping it here would only lose whatever a
+    /// given template needs. A template sees `arguments` as a mapping and
+    /// ids in the form it accepts: see [`ChatTemplate::for_template`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<serde_json::Value>,
     /// Tool messages: which call this is the result of.
@@ -169,6 +171,12 @@ impl From<ChatMessageWire> for ChatMessage {
 /// been had it compiled there.
 pub struct ChatTemplate {
     env: std::result::Result<Environment<'static>, String>,
+    /// Whether the template refuses a tool call id that is not nine
+    /// alphanumeric characters (Mistral's do).
+    nine_char_ids: bool,
+    /// Whether the template takes a tool call's arguments only as JSON text
+    /// (it joins them to a string with `+`).
+    text_arguments: bool,
 }
 
 /// What a request wants from a reasoning model: whether it should think at
@@ -225,7 +233,115 @@ impl ChatTemplate {
             Ok(()) => Ok(env),
             Err(err) => Err(format!("invalid chat template: {err}")),
         };
-        Self { env }
+        let mut template = Self {
+            env,
+            nine_char_ids: false,
+            text_arguments: false,
+        };
+        let object = || serde_json::json!({"k": "v"});
+        let text = || serde_json::json!("{\"k\": \"v\"}");
+        template.nine_char_ids = !template.renders_a_call("call-1-0", object())
+            && template.renders_a_call("a1b2c3d4e", object());
+        let id = if template.nine_char_ids {
+            "a1b2c3d4e"
+        } else {
+            "call-1-0"
+        };
+        template.text_arguments =
+            !template.renders_a_call(id, object()) && template.renders_a_call(id, text());
+        template
+    }
+
+    /// Whether a conversation with one tool call, by `id` and with
+    /// `arguments`, and its result renders.
+    fn renders_a_call(&self, id: &str, arguments: serde_json::Value) -> bool {
+        let session = |id: &str| {
+            let mut call = ChatMessage::text("assistant", "");
+            call.tool_calls = Some(serde_json::json!([{
+                "id": id,
+                "type": "function",
+                "function": {"name": "f", "arguments": arguments},
+            }]));
+            vec![
+                ChatMessage::text("user", "u"),
+                call,
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: "r".to_string(),
+                    tool_call_id: Some(id.to_string()),
+                    name: Some("f".to_string()),
+                    ..Default::default()
+                },
+            ]
+        };
+        self.render_messages(&session(id), true, "", "", Reasoning::default(), None)
+            .is_ok()
+    }
+
+    /// `messages` as the template is given them. A tool call's `arguments`
+    /// arrive as the JSON text the client sent; templates read them as a
+    /// mapping (`arguments.items()`, `arguments | tojson`), so text that
+    /// parses as a JSON object is passed as that object, unless the template
+    /// renders a call only with text arguments. For a template that
+    /// accepts only nine-character alphanumeric call ids, every other id is
+    /// replaced by one derived from it, the same one in each request, so a
+    /// call and its result still match and the prompt still extends the
+    /// last one.
+    fn for_template<'m>(&self, messages: &'m [ChatMessage]) -> Cow<'m, [ChatMessage]> {
+        let rewrite = |m: &ChatMessage| {
+            let calls_need = m
+                .tool_calls
+                .as_ref()
+                .and_then(|c| c.as_array())
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        (!self.text_arguments
+                            && call
+                                .pointer("/function/arguments")
+                                .is_some_and(|a| a.is_string()))
+                            || (self.nine_char_ids
+                                && call
+                                    .get("id")
+                                    .and_then(|id| id.as_str())
+                                    .is_some_and(|id| nine_char_id(id) != id))
+                    })
+                });
+            calls_need
+                || (self.nine_char_ids
+                    && m.tool_call_id
+                        .as_deref()
+                        .is_some_and(|id| nine_char_id(id) != id))
+        };
+        if !messages.iter().any(rewrite) {
+            return Cow::Borrowed(messages);
+        }
+        let mut out = messages.to_vec();
+        for m in &mut out {
+            if let Some(calls) = m.tool_calls.as_mut().and_then(|c| c.as_array_mut()) {
+                for call in calls {
+                    if !self.text_arguments
+                        && let Some(arguments) = call.pointer_mut("/function/arguments")
+                        && let Some(text) = arguments.as_str()
+                        && let Ok(object @ serde_json::Value::Object(_)) =
+                            serde_json::from_str::<serde_json::Value>(text)
+                    {
+                        *arguments = object;
+                    }
+                    if self.nine_char_ids
+                        && let Some(id) = call.get_mut("id")
+                        && let Some(text) = id.as_str()
+                    {
+                        *id = serde_json::Value::String(nine_char_id(text));
+                    }
+                }
+            }
+            if self.nine_char_ids
+                && let Some(id) = m.tool_call_id.as_mut()
+            {
+                *id = nine_char_id(id);
+            }
+        }
+        Cow::Owned(out)
     }
 
     /// `enable_thinking`, when `Some`, is passed into the template as a
@@ -330,6 +446,25 @@ impl ChatTemplate {
         reasoning: Reasoning<'_>,
         tools: Option<&serde_json::Value>,
     ) -> Result<String> {
+        self.render_messages(
+            &self.for_template(messages),
+            add_generation_prompt,
+            bos_token,
+            eos_token,
+            reasoning,
+            tools,
+        )
+    }
+
+    fn render_messages(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        bos_token: &str,
+        eos_token: &str,
+        reasoning: Reasoning<'_>,
+        tools: Option<&serde_json::Value>,
+    ) -> Result<String> {
         let env = self.env.as_ref().map_err(|err| anyhow!("{err}"))?;
         let tmpl = env.get_template("chat").expect("added at construction");
         // Built additively rather than as one `context!` per combination:
@@ -368,6 +503,25 @@ impl ChatTemplate {
         tmpl.render(minijinja::Value::from(minijinja::value::Serde(&ctx)))
             .map_err(|err| anyhow!("failed to render chat template: {err}"))
     }
+}
+
+/// `id` itself when it is nine ASCII letters and digits, otherwise nine
+/// derived from it.
+fn nine_char_id(id: &str) -> String {
+    if id.len() == 9 && id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return id.to_string();
+    }
+    const DIGITS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    let mut h = rustc_hash::FxHasher::default();
+    std::hash::Hasher::write(&mut h, id.as_bytes());
+    let mut n = std::hash::Hasher::finish(&h);
+    (0..9)
+        .map(|_| {
+            let digit = DIGITS[(n % 62) as usize] as char;
+            n /= 62;
+            digit
+        })
+        .collect()
 }
 
 /// `tojson`, as `transformers` defines it for chat templates: a thin
@@ -848,6 +1002,138 @@ fn strftime_now(fmt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent turn as a client sends it back: the call's arguments as
+    /// JSON text, the server's own call id.
+    fn a_called_tool(id: &str) -> Vec<ChatMessage> {
+        let mut call = ChatMessage::text("assistant", "");
+        call.tool_calls = Some(serde_json::json!([{
+            "id": id,
+            "type": "function",
+            "function": {"name": "read", "arguments": "{\"path\": \"a.rs\"}"},
+        }]));
+        vec![
+            ChatMessage::text("user", "Read a.rs"),
+            call,
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "fn main() {}".to_string(),
+                tool_call_id: Some(id.to_string()),
+                name: Some("read".to_string()),
+                ..Default::default()
+            },
+        ]
+    }
+
+    #[test]
+    fn a_template_reads_text_arguments_as_a_mapping() {
+        let template = ChatTemplate::new(
+            "{% for m in messages %}{% if m.tool_calls %}{% for c in m.tool_calls %}\
+             {% for k, v in c.function.arguments.items() %}{{ k }}={{ v }};{% endfor %}\
+             {{ c.function.arguments | tojson }}{% endfor %}{% endif %}{% endfor %}"
+                .to_string(),
+        );
+        let out = template
+            .render(
+                &a_called_tool("call-1-0"),
+                false,
+                "",
+                "",
+                Reasoning::default(),
+            )
+            .unwrap();
+        assert_eq!(out, r#"path=a.rs;{"path":"a.rs"}"#);
+        // Text that is not a JSON object stays text.
+        let mut odd = a_called_tool("call-1-0");
+        odd[1].tool_calls = Some(serde_json::json!([{
+            "id": "call-1-0", "type": "function",
+            "function": {"name": "read", "arguments": "not json"},
+        }]));
+        let template = ChatTemplate::new(
+            "{% for m in messages %}{% if m.tool_calls %}{{ m.tool_calls[0].function.arguments }}\
+             {% endif %}{% endfor %}"
+                .to_string(),
+        );
+        assert_eq!(
+            template
+                .render(&odd, false, "", "", Reasoning::default())
+                .unwrap(),
+            "not json"
+        );
+    }
+
+    #[test]
+    fn a_template_that_joins_arguments_as_text_keeps_them_text() {
+        let template = ChatTemplate::new(
+            "{% for m in messages %}{% if m.tool_calls %}{% for c in m.tool_calls %}\
+             {{ '>>>' + c.function.name + ' ' + c.function.arguments }}{% endfor %}\
+             {% endif %}{% endfor %}"
+                .to_string(),
+        );
+        assert!(template.text_arguments);
+        let out = template
+            .render(
+                &a_called_tool("call-1-0"),
+                false,
+                "",
+                "",
+                Reasoning::default(),
+            )
+            .unwrap();
+        assert_eq!(out, r#">>>read {"path": "a.rs"}"#);
+    }
+
+    /// Mistral's check, reduced.
+    const NINE_CHAR_IDS: &str = "{% for m in messages %}\
+        {% if m.tool_calls %}{% for c in m.tool_calls %}\
+        {% if c.id is not string or c.id|length != 9 %}{{ raise_exception('ids') }}{% endif %}\
+        CALL[{{ c.id }}]{% endfor %}{% elif m.role == 'tool' %}\
+        {% if m.tool_call_id|length != 9 %}{{ raise_exception('ids') }}{% endif %}\
+        RESULT[{{ m.tool_call_id }}]{% endif %}{% endfor %}";
+
+    #[test]
+    fn a_template_that_wants_nine_character_ids_gets_them_and_they_match() {
+        let template = ChatTemplate::new(NINE_CHAR_IDS.to_string());
+        assert!(template.nine_char_ids);
+        let out = template
+            .render(
+                &a_called_tool("call-1700000000-0"),
+                false,
+                "",
+                "",
+                Reasoning::default(),
+            )
+            .unwrap();
+        let id = nine_char_id("call-1700000000-0");
+        assert_eq!(id.len(), 9);
+        assert!(id.bytes().all(|b| b.is_ascii_alphanumeric()));
+        assert_eq!(out, format!("CALL[{id}]RESULT[{id}]"));
+        // The same id each request; another call, another id.
+        assert_eq!(nine_char_id("call-1700000000-0"), id);
+        assert_ne!(nine_char_id("call-1700000000-1"), id);
+        // An id already in the form is kept.
+        assert_eq!(nine_char_id("a1B2c3D4e"), "a1B2c3D4e");
+    }
+
+    #[test]
+    fn a_template_that_takes_any_id_sees_the_one_sent() {
+        let template = ChatTemplate::new(
+            "{% for m in messages %}{% if m.tool_calls %}CALL[{{ m.tool_calls[0].id }}]\
+             {% elif m.role == 'tool' %}RESULT[{{ m.tool_call_id }}]{% endif %}{% endfor %}"
+                .to_string(),
+        );
+        assert!(!template.nine_char_ids);
+        let out = template
+            .render(
+                &a_called_tool("toolu_01"),
+                false,
+                "",
+                "",
+                Reasoning::default(),
+            )
+            .unwrap();
+        assert_eq!(out, "CALL[toolu_01]RESULT[toolu_01]");
+    }
 
     #[test]
     fn renders_a_simple_template() {
@@ -1520,6 +1806,229 @@ mod real_model_tests {
         // The generation prompt stops before the recipient, which the
         // model writes itself.
         assert!(out.ends_with("<|eot|><|start|>assistant"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+
+    /// orangu-bench's coding session as an agent runs it: the fixture's
+    /// system prompt and tools, and each turn a user message, a tool call,
+    /// its result and the answer. One message list per request: one after
+    /// the user's message, which the model answers with the call, and one
+    /// after the result, which it answers in prose.
+    fn agent_turns() -> (serde_json::Value, Vec<Vec<ChatMessage>>) {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../orangu-bench/fixtures/coding-session.json"
+        ))
+        .unwrap();
+        let tools = fixture["tools"].clone();
+        let tool = tools[0]["function"]["name"].as_str().unwrap().to_string();
+        let mut messages = vec![ChatMessage::text(
+            "system",
+            fixture["system"].as_str().unwrap(),
+        )];
+        let mut turns = Vec::new();
+        for (i, turn) in fixture["turns"].as_array().unwrap().iter().enumerate() {
+            messages.push(ChatMessage::text("user", turn.as_str().unwrap()));
+            turns.push(messages.clone());
+            // Named as this server names a call (`http::openai`).
+            let id = format!("call-1700000000-{i}");
+            messages.push(ChatMessage {
+                role: "assistant".into(),
+                tool_calls: Some(serde_json::json!([
+                    {"id": id, "type": "function",
+                     "function": {"name": tool, "arguments": "{\"path\": \"src/store.rs\"}"}}
+                ])),
+                ..Default::default()
+            });
+            messages.push(ChatMessage {
+                role: "tool".into(),
+                content: format!("contents of src/store.rs, read {i}"),
+                tool_call_id: Some(id),
+                name: Some(tool.clone()),
+                ..Default::default()
+            });
+            turns.push(messages.clone());
+            messages.push(ChatMessage::text(
+                "assistant",
+                &format!("Answer {i}: here is the change."),
+            ));
+        }
+        (tools, turns)
+    }
+
+    /// One request's prompt against the previous request's, from
+    /// [`shared_prefixes`].
+    struct Shared {
+        request: usize,
+        /// The previous prompt's length, and how much of it this one starts
+        /// with, in bytes.
+        previous: usize,
+        shared: usize,
+        /// The text either side of where the two part.
+        was: String,
+        now: String,
+    }
+
+    /// Each request's rendered prompt against the previous request's: how
+    /// much of it the new one starts with — what the server's prefix cache
+    /// can answer of the new request before its new tail. A template that
+    /// rewrites history (drops an earlier turn's reasoning, moves the tools,
+    /// re-renders the system block) shares less than all of it. `Err` names
+    /// the request that does not render.
+    fn shared_prefixes(source: &str) -> Result<Vec<Shared>, String> {
+        let (tools, turns) = agent_turns();
+        let template = ChatTemplate::new(source.to_string());
+        let mut previous: Option<String> = None;
+        let mut out = Vec::new();
+        for (i, messages) in turns.iter().enumerate() {
+            let prompt = template
+                .render_with_tools(
+                    messages,
+                    true,
+                    "<bos>",
+                    "<eos>",
+                    Reasoning::default(),
+                    Some(&tools),
+                )
+                .map_err(|e| format!("request {i} does not render: {e:#}"))?;
+            if let Some(previous) = &previous {
+                let shared = prompt
+                    .char_indices()
+                    .zip(previous.chars())
+                    .find(|((_, a), b)| a != b)
+                    .map_or(previous.len().min(prompt.len()), |((at, _), _)| at);
+                let near = |text: &str| {
+                    let from = text.floor_char_boundary(shared.saturating_sub(60));
+                    let to = text.floor_char_boundary((shared + 60).min(text.len()));
+                    text[from..to].to_string()
+                };
+                out.push(Shared {
+                    request: i,
+                    previous: previous.len(),
+                    shared,
+                    was: near(previous),
+                    now: near(&prompt),
+                });
+            }
+            previous = Some(prompt);
+        }
+        Ok(out)
+    }
+
+    /// Every request's rendered prompt starts with the whole of the previous
+    /// request's; fails with the request it first parts at and the text on
+    /// either side.
+    fn assert_each_request_extends_the_last(name: &str, source: &str) {
+        for s in shared_prefixes(source).unwrap_or_else(|e| panic!("{name}: {e}")) {
+            assert_eq!(
+                s.shared,
+                s.previous,
+                "{name}: request {} does not start with request {}'s prompt; they part at \
+                 byte {}:\n  was: {:?}\n  now: {:?}",
+                s.request,
+                s.request - 1,
+                s.shared,
+                s.was,
+                s.now
+            );
+        }
+    }
+
+    /// The check itself, on a template shaped like the tool-capable ones —
+    /// tools declared in the opening block, calls and results in the
+    /// transcript — and on one that rewrites history, which it must catch.
+    #[test]
+    fn the_prefix_check_passes_a_stable_template_and_catches_a_rewrite() {
+        const STABLE: &str = "{{ bos_token }}{% for m in messages %}\
+            {% if m.role == 'system' %}<sys>{{ m.content }}{% if tools %}<tools>\
+            {% for t in tools %}{{ t.function.name }};{% endfor %}</tools>{% endif %}</sys>\
+            {% elif m.get('tool_calls') %}<assistant><call>{{ m.tool_calls[0].function.name }}\
+            {{ m.tool_calls[0].function.arguments }}</call>\
+            {% elif m.role == 'tool' %}<result>{{ m.content }}</result>\
+            {% else %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% endif %}\
+            {% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}";
+        assert_each_request_extends_the_last("stable", STABLE);
+        // Numbers the turns from the end: every request renumbers them all.
+        const REWRITES: &str = "{% for m in messages %}[{{ messages|length - loop.index }}]\
+            {{ m.content }}{% endfor %}";
+        let caught =
+            std::panic::catch_unwind(|| assert_each_request_extends_the_last("rewrites", REWRITES));
+        assert!(caught.is_err(), "a template that rewrites history passed");
+    }
+
+    /// The same session through real templates — every `.jinja` in
+    /// `ORANGU_TEST_TEMPLATES` (`a.jinja:b.jinja`), and the template of the
+    /// model in `ORANGU_TEST_MODEL` when that is set — as a report: how many
+    /// requests rewrite the previous prompt, and the least of it one reuses,
+    /// with the text where they part. Rewriting is the template's own
+    /// choice, so only a template that cannot render the session fails.
+    ///
+    /// Run with `ORANGU_TEST_TEMPLATES=a.jinja:b.jinja cargo test --bin
+    /// orangu-server how_much_of_each_prompt -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs ORANGU_TEST_TEMPLATES or ORANGU_TEST_MODEL"]
+    fn how_much_of_each_prompt_real_templates_reuse() {
+        let mut sources: Vec<(String, String)> = Vec::new();
+        if let Ok(paths) = std::env::var("ORANGU_TEST_TEMPLATES") {
+            for path in paths.split(':').filter(|p| !p.is_empty()) {
+                sources.push((path.to_string(), std::fs::read_to_string(path).unwrap()));
+            }
+        }
+        if let Ok(path) = std::env::var("ORANGU_TEST_MODEL") {
+            let gguf =
+                orangu::gguf::GgufFile::open(std::path::Path::new(&path)).expect("open gguf");
+            let source = gguf
+                .metadata
+                .iter()
+                .find_map(|(k, v)| match (k.as_str(), v) {
+                    ("tokenizer.chat_template", orangu::gguf::GgufValue::String(s)) => {
+                        Some(s.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the file has no tokenizer.chat_template");
+            sources.push((path, source));
+        }
+        assert!(
+            !sources.is_empty(),
+            "set ORANGU_TEST_TEMPLATES or ORANGU_TEST_MODEL"
+        );
+        let mut unrendered = Vec::new();
+        for (name, source) in &sources {
+            match shared_prefixes(source) {
+                Ok(shared) => {
+                    let ratio = |s: &Shared| s.shared as f64 / s.previous.max(1) as f64;
+                    let worst = shared
+                        .iter()
+                        .min_by(|a, b| ratio(a).total_cmp(&ratio(b)))
+                        .expect("the session has more than one request");
+                    let rewrites = shared.iter().filter(|s| s.shared < s.previous).count();
+                    println!(
+                        "{name}: {rewrites} of {} requests rewrite the previous prompt; the \
+                         worst, request {}, reuses {} of {} bytes ({:.1}%)",
+                        shared.len(),
+                        worst.request,
+                        worst.shared,
+                        worst.previous,
+                        ratio(worst) * 100.0
+                    );
+                    if worst.shared < worst.previous {
+                        println!("    was: {:?}\n    now: {:?}", worst.was, worst.now);
+                    }
+                }
+                Err(why) => {
+                    println!("{name}: {why}");
+                    unrendered.push(name.clone());
+                }
+            }
+        }
+        assert!(
+            unrendered.is_empty(),
+            "templates that cannot render the session: {unrendered:?}"
+        );
     }
 }
 

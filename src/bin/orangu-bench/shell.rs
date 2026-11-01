@@ -64,7 +64,7 @@ _orangu_bench() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
             "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-depth --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --kl --kl-rows --kl-top --kl-tokens --kl-text --shared-prefix --shared-prefix-tokens \
-             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --per-rep \
+             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --sweep-as-given --write-profile --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels --chart-grid --chart-overlay \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png --flamegraph-keep-data \
@@ -126,6 +126,8 @@ _orangu_bench() {
         '--drop-model-cache[Evict the model from the page cache before every repetition]' \
         '--no-warmup[Skip the initial warmup run]' \
         '--fail-on-regression[After a two-value --sweep, exit 2 if the second value is worse beyond the noise]' \
+        '--sweep-as-given[Run a two-value --sweep in the order written instead of as a,b,b,a]' \
+        '--write-profile[After a two-value --sweep, keep the winning value in the server tuning profile]' \
         '--per-rep[Also print every repetition'"'"'s rate, in order, after each row]' \
         '--timeout[Per-request timeout in seconds]:seconds:' \
         '--model[Model id to request]:id:' \
@@ -228,6 +230,8 @@ complete -c orangu-bench -l reps                   -x -d 'Repetitions per depth;
 complete -c orangu-bench -l drop-model-cache          -d 'Evict the model from the page cache before every repetition'
 complete -c orangu-bench -l no-warmup                 -d 'Skip the initial warmup run'
 complete -c orangu-bench -l fail-on-regression        -d 'After a two-value --sweep, exit 2 if the second value is worse beyond the noise'
+complete -c orangu-bench -l sweep-as-given            -d 'Run a two-value --sweep in the order written instead of as a,b,b,a'
+complete -c orangu-bench -l write-profile             -d 'After a two-value --sweep, keep the winning value in the server tuning profile'
 complete -c orangu-bench -l per-rep                   -d 'Also print every repetition\'s rate, in order, after each row'
 complete -c orangu-bench -l timeout                -x -d 'Per-request timeout in seconds'
 complete -c orangu-bench -l model                  -x -d 'Model id to request'
@@ -339,6 +343,8 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--drop-model-cache', 'Evict the model from the page cache before every repetition'),
         @('--no-warmup', 'Skip the initial warmup run'),
         @('--fail-on-regression', 'After a two-value --sweep, exit 2 if the second value is worse beyond the noise'),
+        @('--sweep-as-given', 'Run a two-value --sweep in the order written instead of as a,b,b,a'),
+        @('--write-profile', 'After a two-value --sweep, keep the winning value in the server tuning profile'),
         @('--per-rep', 'Also print every repetition''s rate, in order, after each row'),
         @('--timeout', 'Per-request timeout in seconds'),
         @('--model', 'Model id to request'),

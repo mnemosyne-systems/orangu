@@ -26,12 +26,25 @@
 //! The file is `~/.orangu/server/tuning/<vendor>-<device>-<driver>.json`:
 //!
 //! ```json
-//! { "values": { "ORANGU_REDUCE_N_ROWS": "2", "ORANGU_COOP_MIN_N_TOKENS": "32" } }
+//! { "values": { "ORANGU_REDUCE_N_ROWS": "2", "ORANGU_COOP_MIN_TOKENS": "32" } }
 //! ```
+//!
+//! A device another API drives (CUDA, ROCm, OpenCL) has no PCI ids to hand,
+//! so its file is named by the API, the device's name and the driver's
+//! version instead: `cuda-nvidia_geforce_rtx_4090-12040.json`.
 //!
 //! The driver is part of the name because a driver update changes which
 //! choice is fastest; a profile from the previous driver is not applied to
 //! the next one. `ORANGU_TUNING_PROFILE=0` ignores the profile.
+//!
+//! The knobs are process-wide and read once, so one profile applies: the
+//! first device's. A second device with a profile of its own is told so at
+//! start-up rather than half-applied.
+//!
+//! Every tuning variable reads through [`var`], [`env_var`] or [`var_os`] —
+//! the boolean flags too, through `engine::env` — so a profile can set any
+//! of them. A variable read before the first device is installed sees the
+//! environment alone.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -58,7 +71,18 @@ struct File {
 /// The profile's file name for a device: vendor and device ids, and the
 /// driver's name and version reduced to a file-name-safe slug.
 pub fn file_name(vendor: u32, device: u32, driver: &str, driver_info: &str) -> String {
-    let slug: String = format!("{driver}-{driver_info}")
+    let slug = slug(&format!("{driver}-{driver_info}"));
+    format!("{vendor:04x}-{device:04x}-{slug}.json")
+}
+
+/// The profile's file name for a device of another API: the API, the
+/// device's name and the driver's version, each a file-name-safe slug.
+pub fn named_file_name(api: &str, device: &str, driver: &str) -> String {
+    format!("{}-{}-{}.json", slug(api), slug(device), slug(driver))
+}
+
+fn slug(text: &str) -> String {
+    let slug: String = text
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' {
@@ -68,8 +92,7 @@ pub fn file_name(vendor: u32, device: u32, driver: &str, driver_info: &str) -> S
             }
         })
         .collect();
-    let slug = slug.trim_matches('_');
-    format!("{vendor:04x}-{device:04x}-{slug}.json")
+    slug.trim_matches('_').to_string()
 }
 
 /// Where profiles live.
@@ -81,23 +104,48 @@ pub fn dir() -> Option<PathBuf> {
 /// read once, and a second device's profile arriving later could not change
 /// them consistently.
 pub fn install(info: &wgpu::AdapterInfo) {
-    DEVICE_KEY.get_or_init(|| {
-        file_name(info.vendor, info.device, &info.driver, &info.driver_info)
-            .trim_end_matches(".json")
-            .to_string()
-    });
+    install_file(file_name(
+        info.vendor,
+        info.device,
+        &info.driver,
+        &info.driver_info,
+    ));
+}
+
+/// [`install`] for a device of another API — see [`named_file_name`].
+pub fn install_named(api: &str, device: &str, driver: &str) {
+    install_file(named_file_name(api, device, driver));
+}
+
+fn install_file(name: String) {
+    let key = name.trim_end_matches(".json").to_string();
+    let first = DEVICE_KEY.get_or_init(|| key.clone());
+    if *first != key {
+        // A second device: the knobs were read for the first one's.
+        if disabled() {
+            return;
+        }
+        if let Some(path) = dir().map(|d| d.join(&name)).filter(|p| p.exists()) {
+            log::warn!(
+                "orangu-server: tuning profile {} is not applied: the tuning variables are \
+                 read once for the whole process, and the first device's profile ({}) is \
+                 the one in use",
+                path.display(),
+                loaded_path().map_or_else(|| "none".to_string(), |p| p.display().to_string())
+            );
+        }
+        return;
+    }
     PROFILE.get_or_init(|| {
-        if std::env::var("ORANGU_TUNING_PROFILE").is_ok_and(|v| v.trim() == "0") {
+        if disabled() {
             return None;
         }
-        let path = dir()?.join(file_name(
-            info.vendor,
-            info.device,
-            &info.driver,
-            &info.driver_info,
-        ));
-        load(path)
+        load(dir()?.join(&name))
     });
+}
+
+fn disabled() -> bool {
+    std::env::var("ORANGU_TUNING_PROFILE").is_ok_and(|v| v.trim() == "0")
 }
 
 fn load(path: PathBuf) -> Option<Profile> {
@@ -143,6 +191,22 @@ pub fn var(name: &str) -> Option<String> {
         .or_else(|| value(name).map(str::to_string))
 }
 
+/// [`var`] in the shape of [`std::env::var`], for a reader written against
+/// it: `NotPresent` when neither the environment nor the profile sets it.
+pub fn env_var(name: &str) -> Result<String, std::env::VarError> {
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => value(name)
+            .map(str::to_string)
+            .ok_or(std::env::VarError::NotPresent),
+        other => other,
+    }
+}
+
+/// [`var`] in the shape of [`std::env::var_os`].
+pub fn var_os(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).or_else(|| value(name).map(std::ffi::OsString::from))
+}
+
 /// `name` from the profile alone.
 pub fn value(name: &str) -> Option<&'static str> {
     PROFILE
@@ -166,6 +230,88 @@ mod tests {
         let b = super::file_name(0x1002, 0x7340, "radv", "Mesa 25.3.0");
         assert_eq!(a, "1002-7340-radv_mesa_25.2.1.json");
         assert_ne!(a, b, "a driver update must not reuse the old profile");
+    }
+
+    #[test]
+    fn another_apis_file_name_carries_its_device_and_driver() {
+        assert_eq!(
+            super::named_file_name("cuda", "NVIDIA GeForce RTX 4090", "12040"),
+            "cuda-nvidia_geforce_rtx_4090-12040.json"
+        );
+        assert_ne!(
+            super::named_file_name("cuda", "NVIDIA GeForce RTX 4090", "12040"),
+            super::named_file_name("cuda", "NVIDIA GeForce RTX 4090", "12050")
+        );
+    }
+
+    /// Every `ORANGU_*` read under `engine::backend` goes through the
+    /// profile's readers, so a profile can set it — except the variables
+    /// below, which select a test, a probe or a diagnostic rather than tune a
+    /// kernel.
+    #[test]
+    fn every_backend_tuning_variable_reads_through_the_profile() {
+        const NOT_TUNING: &[&str] = &[
+            "ORANGU_TEST_",
+            "ORANGU_BENCH_",
+            "ORANGU_SWEEP_",
+            "ORANGU_TD_",
+            "ORANGU_NORM_PROBE_",
+            "ORANGU_MSL_",
+            "ORANGU_DUMP_SHADERS",
+            "ORANGU_PROBE_TRACE",
+            "ORANGU_VK_NO_SELFCHECK",
+            "ORANGU_GPU_TIMESTAMPS",
+            "ORANGU_CPU_TIMESTAMPS",
+            "ORANGU_TUNING_PROFILE",
+            "ORANGU_NPU_MODE",
+            "ORANGU_Q2K_STUB",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/bin/orangu-server/engine/backend");
+        let mut files = Vec::new();
+        let mut dirs = vec![root];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    // Test code selects tests and probes, not tunings.
+                    && path.file_name().is_some_and(|n| n != "tests.rs")
+                {
+                    files.push(path);
+                }
+            }
+        }
+        let mut direct = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (n, line) in text.lines().enumerate() {
+                if line.trim() == "mod tests {" {
+                    break;
+                }
+                for reader in ["std::env::var(\"", "std::env::var_os(\""] {
+                    let Some(at) = line.find(reader) else {
+                        continue;
+                    };
+                    let name: String = line[at + reader.len()..]
+                        .chars()
+                        .take_while(|c| *c != '"')
+                        .collect();
+                    if name.starts_with("ORANGU_")
+                        && !NOT_TUNING.iter().any(|p| name.starts_with(p))
+                    {
+                        direct.push(format!("{}:{} {name}", file.display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            direct.is_empty(),
+            "read with std::env, so a tuning profile cannot set them — use \
+             tuning_profile::var/env_var/var_os, or env_tuning_value:\n{}",
+            direct.join("\n")
+        );
     }
 
     #[test]

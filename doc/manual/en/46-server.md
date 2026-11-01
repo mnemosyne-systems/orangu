@@ -230,10 +230,14 @@ A repo in the model catalogue (the models `suggest` lists) fetched without a
 `:quant` takes the catalogue's quantization instead — `orangu-server download
 unsloth/Qwen3.6-35B-A3B-GGUF` fetches `UD-Q4_K_M`. `--with-drafter` also
 fetches the drafter the catalogue pairs with it: a smaller model of the same
-vocabulary, after which the command prints the `draft_model` line that turns
-it on, or a multi-token-prediction head from the model's own repo, which the
-server attaches from beside the model. For a model the catalogue pairs with
-nothing it says so; prompt lookup drafts for every model without a download.
+vocabulary, or a multi-token-prediction head from the model's own repo, which
+the server attaches from beside the model. A draft model is written into the
+configuration as `draft_model` when its `[orangu-server].model` is the model
+just downloaded and it sets no `draft_model` yet; otherwise the command
+prints the line to add and changes nothing. The catalogue pairs only drafters
+the server uses by default, so a head it leaves off (the gemma-4 assistant
+heads, below) is not fetched. For a model the catalogue pairs with nothing it
+says so; prompt lookup drafts for every model without a download.
 
 Every download **plans the model against this machine first**, and prints
 what it found before fetching anything:
@@ -1077,6 +1081,7 @@ orangu-server plan 4                       # NR from `list`
 orangu-server plan unsloth/GLM-5.2-GGUF    # MODEL from `list`
 orangu-server plan                         # no argument: list, then pick an NR
 orangu-server plan 4 --deep                # also verify shards and architecture
+orangu-server plan 4 --deep --json         # one JSON line, for a program
 ```
 
 ```
@@ -1095,6 +1100,17 @@ Device     6.14 GiB too large for this GPU (3.98 GiB) — the driver will page w
 Only the GGUF tensor tables are read — a few hundred kilobytes at the head
 of each shard — so planning that 434 GiB model costs about as long as `ls`,
 not a thirty-minute load.
+
+`--json` prints the verdict as one line a program can act on — the
+coordinator asks it before every start: `runs`, the `problems` that stop it,
+and the arithmetic behind it. `needs_bytes` is the weights every token
+touches (`dense_bytes`) plus `kv_bytes`, the KV cache for the configured
+`[orangu-server].context` (`context`; counted with `--deep`, which opens the
+model to price it, and zero when it is unset); `capacity_bytes`
+is the machine's memory (`memory_bytes`) plus its dedicated cards'
+(`device_memory_bytes`, zero under `backend = cpu`). `runs` is false when the
+needs exceed the capacity, and with `--deep` when a shard is missing or the
+architecture unknown.
 
 The split is the answer, not the file size. **Dense** weights are touched by
 every token, so they must be resident. **Experts** on a mixture-of-experts
@@ -1735,7 +1751,7 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   ~64 ms a step, and faster at every depth to 4096), so decode moves to them;
   `backend = vulkan` keeps the GPU. `ORANGU_DECODE_PROBE=0` skips it and keeps the
   device. A device win is remembered for the same device, driver, model
-  file and build (`~/.orangu/server/tuning/probes.json`, for a week), so a
+  file (by its content) and build (`~/.orangu/server/tuning/probes.json`, for a week), so a
   restart skips the measurement; the `[adapt] decode:` line says so.
   When decode leaves a GPU idle, **the output head may be shared with it**
   (gemma): a fresh backend on the GPU takes a share of the head's rows, and

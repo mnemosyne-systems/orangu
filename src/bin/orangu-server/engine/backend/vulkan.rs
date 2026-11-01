@@ -197,7 +197,7 @@ const OP_ARENA_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 fn expert_stream_bytes() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_EXPERT_STREAM_BYTES")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_STREAM_BYTES")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(256 * 1024 * 1024)
@@ -2351,7 +2351,7 @@ fn expert_region_release() -> bool {
 fn stream_region_headroom_bytes() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_EXPERT_REGION_HEADROOM_MIB")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_REGION_HEADROOM_MIB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(256)
@@ -2367,7 +2367,7 @@ fn stream_region_headroom_bytes() -> u64 {
 fn expert_region_cap_bytes() -> u64 {
     static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_EXPERT_REGION_MIB")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_REGION_MIB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&m| m > 0)
@@ -2448,7 +2448,7 @@ fn add_norm_pair() -> bool {
 fn mmq_rows_pinned() -> u32 {
     static R: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *R.get_or_init(|| {
-        std::env::var("ORANGU_MMQ_ROWS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_MMQ_ROWS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .filter(|r: &u32| [64, 128].contains(r))
@@ -2461,7 +2461,7 @@ fn mmq_rows_pinned() -> u32 {
 fn expert_gemm_toks() -> u32 {
     static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_EXPERT_GEMM_TOKS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_GEMM_TOKS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .filter(|t: &u32| [16, 32, 64, 128].contains(t))
@@ -2483,7 +2483,7 @@ fn mmq_toks_cap_for(name: &str) -> u32 {
 fn mmq_wide_min_workgroups() -> usize {
     static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MIN.get_or_init(|| {
-        std::env::var("ORANGU_MMQ_WIDE_MIN_WG")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_MMQ_WIDE_MIN_WG")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(32)
@@ -2539,7 +2539,7 @@ struct AttnPrefillSplit {
 fn attn_prefill_split_target() -> usize {
     static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *TARGET.get_or_init(|| {
-        std::env::var("ORANGU_ATTN_PREFILL_SPLIT")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_ATTN_PREFILL_SPLIT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(256)
@@ -2553,7 +2553,7 @@ fn attn_prefill_split_target() -> usize {
 pub(crate) fn max_matmul_tokens_per_submission() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
-        std::env::var("ORANGU_MAX_TOKENS_PER_SUBMISSION")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_MAX_TOKENS_PER_SUBMISSION")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)
@@ -3055,7 +3055,7 @@ type NormPipelines = [wgpu::ComputePipeline; NORM_WGS.len()];
 /// `ORANGU_NORM_WG` still overrides, and still applies to every row width —
 /// it is a sweep knob, and a sweep wants the variable pinned.
 fn norm_wg_for(n_embd: usize) -> usize {
-    if std::env::var_os("ORANGU_NORM_WG").is_some() {
+    if crate::engine::backend::tuning_profile::var_os("ORANGU_NORM_WG").is_some() {
         return norm_wg();
     }
     NORM_WGS
@@ -3118,14 +3118,16 @@ enum WaitMode {
 /// the wake-up at its end. `0` blocks throughout.
 fn wait_mode() -> WaitMode {
     static M: std::sync::OnceLock<WaitMode> = std::sync::OnceLock::new();
-    *M.get_or_init(|| match std::env::var("ORANGU_BUSY_POLL") {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "" | "0" | "false" | "off" | "no" => WaitMode::Block,
-            "auto" | "predict" | "predicted" => WaitMode::Predicted,
-            _ => WaitMode::Spin,
+    *M.get_or_init(
+        || match crate::engine::backend::tuning_profile::env_var("ORANGU_BUSY_POLL") {
+            Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+                "" | "0" | "false" | "off" | "no" => WaitMode::Block,
+                "auto" | "predict" | "predicted" => WaitMode::Predicted,
+                _ => WaitMode::Spin,
+            },
+            Err(_) => WaitMode::Spin,
         },
-        Err(_) => WaitMode::Spin,
-    })
+    )
 }
 
 /// The share of a predicted wait that [`WaitMode::Predicted`] blocks
@@ -3134,7 +3136,7 @@ fn wait_mode() -> WaitMode {
 fn predicted_block_percent() -> u64 {
     static P: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *P.get_or_init(|| {
-        std::env::var("ORANGU_BUSY_POLL_BLOCK")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_BUSY_POLL_BLOCK")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|p| (0..=100).contains(p))
@@ -3435,7 +3437,7 @@ fn ple_trace() -> bool {
 fn ple_repeat() -> usize {
     static REPEAT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *REPEAT.get_or_init(|| {
-        std::env::var("ORANGU_PLE_REPEAT")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PLE_REPEAT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n >= 1)
@@ -3448,7 +3450,7 @@ fn ple_repeat() -> usize {
 fn fpa_repeat() -> usize {
     static REPEAT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *REPEAT.get_or_init(|| {
-        std::env::var("ORANGU_FPA_REPEAT")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_FPA_REPEAT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n >= 1)
@@ -4507,6 +4509,10 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             "tuning": {
                 "profile": super::tuning_profile::loaded_path()
                     .map(|p| p.display().to_string()),
+                // The profile file this device reads, by name without
+                // `.json`, whether or not one exists yet — what
+                // `orangu-bench --write-profile` writes to.
+                "key": super::tuning_profile::device_key(),
                 "coop_min_n_tokens": self.coop_min_n_tokens,
                 "mmq_toks_cap": self.mmq_toks_cap(),
                 // Weight bytes below which a decode matmul goes to the host
@@ -4520,7 +4526,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 // at the widths models actually have. `pinned` says whether
                 // `ORANGU_NORM_WG` overrode it, which is the thing a sweep
                 // needs to be able to see.
-                "norm_wg_pinned": std::env::var_os("ORANGU_NORM_WG").is_some(),
+                "norm_wg_pinned": crate::engine::backend::tuning_profile::var_os("ORANGU_NORM_WG").is_some(),
                 "norm_wg_by_n_embd": norm_wg_by_n_embd,
                 "attn_split_k": self.attn_split_k,
                 "attn_split_k_pinned": self.attn_split_k_pinned,
@@ -4715,7 +4721,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             // `ORANGU_NO_KV_F16=1` — an explicit "not f16", which means f32.
             crate::config::KvCache::F32
         } else {
-            std::env::var("ORANGU_KV_CACHE")
+            crate::engine::backend::tuning_profile::env_var("ORANGU_KV_CACHE")
                 .ok()
                 .and_then(|raw| crate::config::KvCache::parse(&raw))
                 .unwrap_or_else(kv_cache_preference)
@@ -4774,7 +4780,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // `ORANGU_THIN_TILE_SIZE` (default 8, clamped to `2..=16` so the
         // `n_rows * tile` shared-memory partials and register pressure stay
         // bounded).
-        let thin_tile = std::env::var("ORANGU_THIN_TILE").is_ok_and(|v| v != "0");
+        let thin_tile = crate::engine::backend::tuning_profile::env_var("ORANGU_THIN_TILE")
+            .is_ok_and(|v| v != "0");
         let thin_tile_size = super::env_tuning_value(
             "ORANGU_THIN_TILE_SIZE",
             8usize,
@@ -5045,37 +5052,43 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         if supports_timestamp_in_passes {
             required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
         }
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("orangu-server"),
-            required_features,
-            required_limits: limits,
-            experimental_features: Default::default(),
-            // Small memory blocks for the sub-allocated buffers (the
-            // activation arenas, the KV pool's layers): the default's
-            // 128–256 MiB blocks left ~400 MiB of a 4 GiB card reserved
-            // and empty, which on a model that fills the card is the
-            // difference between its streaming region fitting and not.
-            // Every large buffer (weights, region) is a dedicated
-            // allocation either way. `ORANGU_VULKAN_MEMORY_HINT=performance`
-            // is the control arm.
-            memory_hints: match std::env::var("ORANGU_VULKAN_MEMORY_HINT").as_deref() {
-                Ok("performance") => wgpu::MemoryHints::Performance,
-                Ok("usage") => wgpu::MemoryHints::MemoryUsage,
-                Ok(v) if v.trim().parse::<u64>().is_ok() => wgpu::MemoryHints::Manual {
-                    suballocated_device_memory_block_size: (4 << 20)
-                        ..(v.trim().parse::<u64>().unwrap_or(16) << 20),
+        let (device, queue) = pollster::block_on(
+            adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("orangu-server"),
+                required_features,
+                required_limits: limits,
+                experimental_features: Default::default(),
+                // Small memory blocks for the sub-allocated buffers (the
+                // activation arenas, the KV pool's layers): the default's
+                // 128–256 MiB blocks left ~400 MiB of a 4 GiB card reserved
+                // and empty, which on a model that fills the card is the
+                // difference between its streaming region fitting and not.
+                // Every large buffer (weights, region) is a dedicated
+                // allocation either way. `ORANGU_VULKAN_MEMORY_HINT=performance`
+                // is the control arm.
+                memory_hints: match crate::engine::backend::tuning_profile::env_var(
+                    "ORANGU_VULKAN_MEMORY_HINT",
+                )
+                .as_deref()
+                {
+                    Ok("performance") => wgpu::MemoryHints::Performance,
+                    Ok("usage") => wgpu::MemoryHints::MemoryUsage,
+                    Ok(v) if v.trim().parse::<u64>().is_ok() => wgpu::MemoryHints::Manual {
+                        suballocated_device_memory_block_size: (4 << 20)
+                            ..(v.trim().parse::<u64>().unwrap_or(16) << 20),
+                    },
+                    // Blocks of at most 16 MiB: the chains' per-call scratch
+                    // and uploads churn, and a block stays with the card while
+                    // one live allocation sits in it — with 64 MiB blocks a
+                    // 4446-token prompt on a 1.9 GiB model held 1280 MiB of
+                    // them with 383 live and filled the card.
+                    _ => wgpu::MemoryHints::Manual {
+                        suballocated_device_memory_block_size: (4 << 20)..(16 << 20),
+                    },
                 },
-                // Blocks of at most 16 MiB: the chains' per-call scratch
-                // and uploads churn, and a block stays with the card while
-                // one live allocation sits in it — with 64 MiB blocks a
-                // 4446-token prompt on a 1.9 GiB model held 1280 MiB of
-                // them with 383 live and filled the card.
-                _ => wgpu::MemoryHints::Manual {
-                    suballocated_device_memory_block_size: (4 << 20)..(16 << 20),
-                },
-            },
-            trace: Default::default(),
-        }))
+                trace: Default::default(),
+            }),
+        )
         .ok()?;
 
         // Loaded (if present and this adapter supports `PIPELINE_CACHE`)
@@ -5551,7 +5564,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // Like the prefill's integer-dot GEMM, on where the driver says the
         // packed dot is a native instruction.
         let accelerated = super::vulkan_replay::integer_dot_accelerated(&device);
-        let decode_mmvq_forced = std::env::var_os("ORANGU_DECODE_MMVQ").is_some();
+        let decode_mmvq_forced =
+            crate::engine::backend::tuning_profile::var_os("ORANGU_DECODE_MMVQ").is_some();
         let decode_mmvq_start = if decode_mmvq_forced {
             crate::engine::env::flag_on_unless_disabled("ORANGU_DECODE_MMVQ")
         } else {
@@ -5681,7 +5695,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // `ORANGU_PREFILL_MMQ=1|0` names it.
         let integer_dot_accelerated =
             super::vulkan_replay::integer_dot_accelerated(&device).unwrap_or(false);
-        let prefill_mmq_forced = std::env::var_os("ORANGU_PREFILL_MMQ").is_some();
+        let prefill_mmq_forced =
+            crate::engine::backend::tuning_profile::var_os("ORANGU_PREFILL_MMQ").is_some();
         let prefill_mmq_start = if prefill_mmq_forced {
             crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_MMQ")
         } else {
@@ -5897,7 +5912,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             };
 
         let ternary_idot_pipelines: HashMap<u32, wgpu::ComputePipeline> = {
-            let on = match std::env::var("ORANGU_TERNARY_IDOT") {
+            let on = match crate::engine::backend::tuning_profile::env_var("ORANGU_TERNARY_IDOT") {
                 Ok(_) => crate::engine::env::flag_on_unless_disabled("ORANGU_TERNARY_IDOT"),
                 Err(_) => integer_dot_accelerated,
             };
@@ -6410,10 +6425,11 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         // region in host memory reads its weights across the bus, which
         // on a 26B-A4B prefill made every expert dispatch a fixed 40 ms
         // whatever the batch (6 ms with the region resident).
-        if let Some(bytes) = std::env::var("ORANGU_EXPERT_STREAM_EARLY")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&b| b > 0)
+        if let Some(bytes) =
+            crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_STREAM_EARLY")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|&b| b > 0)
         {
             backend.ensure_stream_capacity_bytes(bytes << 20);
         }
@@ -9238,7 +9254,7 @@ impl VulkanBackend {
     /// cap is narrower, or prompts do not run on the integer-dot GEMM.
     pub fn mmq_toks_cap_choices(&self) -> Vec<u32> {
         let full = vulkan_shaders::MMQ_WIDE_TILE_TOKENS;
-        let pinned = std::env::var("ORANGU_MMQ_TOKS")
+        let pinned = crate::engine::backend::tuning_profile::env_var("ORANGU_MMQ_TOKS")
             .ok()
             .and_then(|v| v.trim().parse::<u32>().ok())
             .is_some_and(|t| [16, 32, 64, 128].contains(&t));
@@ -12139,7 +12155,7 @@ impl VulkanBackend {
     fn mmq_toks_for(&self, n_tokens: usize) -> u32 {
         static FIXED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let fixed = *FIXED.get_or_init(|| {
-            std::env::var("ORANGU_MMQ_TOKS")
+            crate::engine::backend::tuning_profile::env_var("ORANGU_MMQ_TOKS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .filter(|t: &u32| [16, 32, 64, 128].contains(t))
@@ -13134,7 +13150,7 @@ impl VulkanBackend {
     fn record_heater(&self, pass: &mut wgpu::ComputePass<'_>) {
         static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let n = *N.get_or_init(|| {
-            std::env::var("ORANGU_MOE_HEATER")
+            crate::engine::backend::tuning_profile::env_var("ORANGU_MOE_HEATER")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
                 .unwrap_or(0)

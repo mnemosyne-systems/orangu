@@ -66,6 +66,10 @@ pub async fn coordinator_info(State(coordinator): State<Arc<Coordinator>>) -> Js
         // embedding model and then loading the chat model back, ~25s and a
         // discarded KV cache, to learn something this field states.
         "roles": coordinator.configured_roles(),
+        // The swap or start under way — the profile, the step it is at, the
+        // seconds since it began and the starting server's last line of
+        // output — or `null`.
+        "activating": coordinator.progress().await,
     }))
 }
 
@@ -191,68 +195,82 @@ async fn send_upstream(
     request.header(ROLE_HEADER, role).send().await
 }
 
-pub async fn proxy(
-    State(coordinator): State<Arc<Coordinator>>,
+/// How long a streaming request waits on a swap before its response starts
+/// with the swap's progress instead of waiting in silence.
+const PROGRESS_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How often a waiting stream is told where the swap has got to.
+const PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a request needs forwarded, owned, so a response stream can carry it.
+struct Forward {
+    coordinator: Arc<Coordinator>,
+    entry: crate::config::CoordinatorLlmEntry,
     method: Method,
-    uri: Uri,
+    path_and_query: String,
     headers: HeaderMap,
     body: Bytes,
-) -> Response {
-    let model_hint = extract_model_field(&body);
-    let implied_role = implied_role_for_path(uri.path());
-    let entry = coordinator
-        .resolve_entry(model_hint.as_deref(), implied_role)
-        .await;
+}
 
-    let origin = match coordinator.ensure_active(&entry).await {
-        Ok(origin) => origin,
+/// Whether the request asks for a streamed answer (`"stream": true`).
+fn wants_stream(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("stream").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// Makes `entry`'s server active — falling back to the default profile when
+/// it cannot start — and counts the request in flight there from inside the
+/// activation, so a swap to another profile waits for this answer instead of
+/// cutting it off. `Err` is the message to answer with.
+async fn activate_entry(
+    coordinator: Arc<Coordinator>,
+    entry: crate::config::CoordinatorLlmEntry,
+) -> Result<(String, crate::process::InFlight), String> {
+    match coordinator.begin_active_request(&entry).await {
+        Ok(active) => Ok(active),
         Err(err) => {
             let default_entry = coordinator.default_entry();
-            if entry.name != default_entry.name {
-                log::warn!(
-                    "warning: failed to start '{}': {err:#}; falling back to '{}'",
-                    entry.name,
-                    default_entry.name
-                );
-                match coordinator.ensure_active(&default_entry).await {
-                    Ok(origin) => origin,
-                    Err(fallback_err) => {
-                        return (
-                            StatusCode::BAD_GATEWAY,
-                            format!("orangu-coordinator: failed to start both '{}' and fallback '{}': {fallback_err:#}", entry.name, default_entry.name),
-                        ).into_response();
-                    }
-                }
-            } else {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "orangu-coordinator: failed to start default profile '{}': {err:#}",
-                        entry.name
-                    ),
-                )
-                    .into_response();
+            if entry.name == default_entry.name {
+                return Err(format!(
+                    "orangu-coordinator: failed to start default profile '{}': {err:#}",
+                    entry.name
+                ));
             }
+            log::warn!(
+                "warning: failed to start '{}': {err:#}; falling back to '{}'",
+                entry.name,
+                default_entry.name
+            );
+            coordinator
+                .begin_active_request(&default_entry)
+                .await
+                .map_err(|fallback_err| {
+                    format!(
+                        "orangu-coordinator: failed to start both '{}' and fallback '{}': \
+                         {fallback_err:#}",
+                        entry.name, default_entry.name
+                    )
+                })
         }
-    };
+    }
+}
 
-    // Counted from here until the response body has been streamed out, so a
-    // swap to another profile waits for this answer instead of cutting it off.
-    let in_flight = coordinator.begin_request(&origin);
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-    let target = format!("{origin}{path_and_query}");
-
-    let upstream = match send_upstream(
-        &coordinator,
-        &method,
+/// Sends the request to `origin`. `Err` is the message to answer with.
+async fn forward(f: &Forward, origin: &str) -> Result<reqwest::Response, String> {
+    let target = format!("{origin}{}", f.path_and_query);
+    match send_upstream(
+        &f.coordinator,
+        &f.method,
         &target,
-        &headers,
-        &entry.role,
-        body.clone(),
+        &f.headers,
+        &f.entry.role,
+        f.body.clone(),
     )
     .await
     {
-        Ok(response) => response,
+        Ok(response) => Ok(response),
         // The child was alive when `ensure_active` checked and gone by the
         // time this request reached it — the window a profile's
         // `orangu-server` exiting on its own (a lost GPU device, an OOM
@@ -268,29 +286,84 @@ pub async fn proxy(
         // connection failed, and asking the question that can lag is how
         // the retry ends up in the same closed port. See its doc comment.
         Err(first) => {
-            let Ok(origin) = coordinator.ensure_reachable(&entry).await else {
-                return (
-                    StatusCode::BAD_GATEWAY,
-                    format!("orangu-coordinator: failed to reach {target}: {first}"),
-                )
-                    .into_response();
+            let Ok(origin) = f.coordinator.ensure_reachable(&f.entry).await else {
+                return Err(format!(
+                    "orangu-coordinator: failed to reach {target}: {first}"
+                ));
             };
-            let target = format!("{origin}{path_and_query}");
-            match send_upstream(&coordinator, &method, &target, &headers, &entry.role, body).await {
-                Ok(response) => response,
-                Err(retry) => {
-                    return (
-                        StatusCode::BAD_GATEWAY,
-                        format!(
-                            "orangu-coordinator: failed to reach {target}: {retry} \
-                             (after restarting '{}', which had stopped: {first})",
-                            entry.name
-                        ),
-                    )
-                        .into_response();
-                }
-            }
+            let target = format!("{origin}{}", f.path_and_query);
+            send_upstream(
+                &f.coordinator,
+                &f.method,
+                &target,
+                &f.headers,
+                &f.entry.role,
+                f.body.clone(),
+            )
+            .await
+            .map_err(|retry| {
+                format!(
+                    "orangu-coordinator: failed to reach {target}: {retry} \
+                     (after restarting '{}', which had stopped: {first})",
+                    f.entry.name
+                )
+            })
         }
+    }
+}
+
+pub async fn proxy(
+    State(coordinator): State<Arc<Coordinator>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let model_hint = extract_model_field(&body);
+    let implied_role = implied_role_for_path(uri.path());
+    let entry = coordinator
+        .resolve_entry(model_hint.as_deref(), implied_role)
+        .await;
+    let streaming = wants_stream(&body);
+    let f = Forward {
+        coordinator: coordinator.clone(),
+        entry: entry.clone(),
+        method,
+        path_and_query: uri
+            .path_and_query()
+            .map_or("/", |pq| pq.as_str())
+            .to_string(),
+        headers,
+        body,
+    };
+    let activation = activate_entry(coordinator, entry);
+    if streaming {
+        // A streamed answer waiting on a swap starts at once with the
+        // swap's progress, rather than holding the caller silent for as
+        // long as a model takes to load. A swap done within the moment
+        // answers as if there had been none.
+        let mut activation = Box::pin(activation);
+        tokio::select! {
+            done = &mut activation => return answer(f, done).await,
+            () = tokio::time::sleep(PROGRESS_AFTER) => return progress_stream(f, activation),
+        }
+    }
+    answer(f, activation.await).await
+}
+
+/// The upstream's answer passed through as it came, status and headers
+/// included — or a `502` with the message when it cannot be had.
+async fn answer(
+    f: Forward,
+    activation: Result<(String, crate::process::InFlight), String>,
+) -> Response {
+    let (origin, in_flight) = match activation {
+        Ok(active) => active,
+        Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
+    };
+    let upstream = match forward(&f, &origin).await {
+        Ok(response) => response,
+        Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
     };
 
     let status = upstream.status();
@@ -321,6 +394,103 @@ pub async fn proxy(
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     *response.headers_mut() = response_headers;
+    response
+}
+
+/// One SSE comment line saying where a swap has got to — a line a client
+/// ignores by the protocol's own rule, and a person reading the stream (or a
+/// client that shows it) sees.
+fn progress_line(progress: &Value) -> String {
+    let text = format!(
+        "orangu-coordinator: making '{}' active: {} ({}s){}",
+        progress["profile"].as_str().unwrap_or("?"),
+        progress["step"].as_str().unwrap_or("?"),
+        progress["seconds"].as_u64().unwrap_or(0),
+        progress["last_output"]
+            .as_str()
+            .map(|l| format!(" — {l}"))
+            .unwrap_or_default()
+    );
+    // One line: a newline inside a comment would end it.
+    format!(": {}\n", text.replace(['\r', '\n'], " "))
+}
+
+/// An SSE event carrying an error, as an OpenAI-compatible stream reports one.
+fn error_event(message: &str) -> Bytes {
+    Bytes::from(format!(
+        "data: {}\n\n",
+        json!({"error": {"message": message, "type": "coordinator_error"}})
+    ))
+}
+
+/// A streamed answer started before its server is ready: `200` with SSE
+/// headers now, a progress comment every [`PROGRESS_EVERY`] until the swap
+/// is done, then the upstream's own events. A swap or request that fails
+/// after this point is reported as an error event, the status line having
+/// gone already.
+fn progress_stream(
+    f: Forward,
+    mut activation: std::pin::Pin<
+        Box<
+            impl std::future::Future<Output = Result<(String, crate::process::InFlight), String>>
+            + Send
+            + 'static,
+        >,
+    >,
+) -> Response {
+    let stream = async_stream::stream! {
+        let mut tick = tokio::time::interval(PROGRESS_EVERY);
+        let done = loop {
+            tokio::select! {
+                done = &mut activation => break done,
+                _ = tick.tick() => {
+                    if let Some(progress) = f.coordinator.progress().await {
+                        yield Ok::<_, reqwest::Error>(Bytes::from(progress_line(&progress)));
+                    }
+                }
+            }
+        };
+        let (origin, _in_flight) = match done {
+            Ok(active) => active,
+            Err(message) => {
+                yield Ok(error_event(&message));
+                return;
+            }
+        };
+        let mut upstream = match forward(&f, &origin).await {
+            Ok(upstream) => upstream,
+            Err(message) => {
+                yield Ok(error_event(&message));
+                return;
+            }
+        };
+        if !upstream.status().is_success() {
+            let status = upstream.status();
+            let text = upstream.text().await.unwrap_or_default();
+            yield Ok(error_event(&format!("{status}: {}", text.trim())));
+            return;
+        }
+        loop {
+            match upstream.chunk().await {
+                Ok(Some(chunk)) => yield Ok(chunk),
+                Ok(None) => break,
+                Err(err) => {
+                    yield Err(err);
+                    break;
+                }
+            }
+        }
+    };
+    let mut response = Response::new(Body::from_stream(stream));
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/event-stream"),
+    );
+    headers.insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
     response
 }
 

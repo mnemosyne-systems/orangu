@@ -26,7 +26,15 @@
 //!
 //! Start-up choices between kernel families made by timing them (whether
 //! the decode kernels take the integer dot) are kept the same way, under
-//! the same key.
+//! the same key, and so are the choices made for the whole run — which
+//! cores a prompt runs on, whether prompts run on the CPU backend, and the
+//! prefill chunk sizer's cost line — under [`model_key`], which names the
+//! cores where there is no device, so a run on the cores alone keeps its
+//! answers too.
+//!
+//! The model is named by its content, not its path: a file moved or copied
+//! keeps its answers, and one replaced at the same path (another
+//! quantization, a re-download) does not inherit them.
 //!
 //! `ORANGU_PROBE_CACHE=0` measures every time.
 
@@ -53,16 +61,51 @@ fn file() -> Option<PathBuf> {
     crate::engine::backend::tuning_profile::dir().map(|d| d.join("probes.json"))
 }
 
-/// What the answer for `model` on `device` depends on, as one string — or
-/// `None` when the file cannot be described.
-pub fn key(device: &str, model: &Path) -> Option<String> {
+/// Bytes read from each end of a model file for its fingerprint: the head
+/// holds the whole tensor table, the tail the last tensor's data.
+const FINGERPRINT_BYTES: u64 = 64 * 1024;
+
+/// A model file's content fingerprint: its length and a hash of its first
+/// and last [`FINGERPRINT_BYTES`]. Kept per path, length and modification
+/// time, so a file is read once a run and again only once it changes.
+fn fingerprint(model: &Path) -> Option<u64> {
+    use std::collections::HashMap;
+    use std::hash::Hasher;
+    use std::io::{Read, Seek, SeekFrom};
+    type Seen = HashMap<PathBuf, (u64, SystemTime, u64)>;
+    static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
     let meta = std::fs::metadata(model).ok()?;
-    let mtime = meta
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs();
+    let (len, mtime) = (meta.len(), meta.modified().ok()?);
+    let mut seen = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(&(l, m, fp)) = seen.as_ref().and_then(|s| s.get(model))
+        && l == len
+        && m == mtime
+    {
+        return Some(fp);
+    }
+    let mut file = std::fs::File::open(model).ok()?;
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write_u64(len);
+    let mut buf = vec![0u8; FINGERPRINT_BYTES.min(len) as usize];
+    file.read_exact(&mut buf).ok()?;
+    hasher.write(&buf);
+    if len > FINGERPRINT_BYTES {
+        let tail = FINGERPRINT_BYTES.min(len - FINGERPRINT_BYTES);
+        file.seek(SeekFrom::End(-(tail as i64))).ok()?;
+        buf.resize(tail as usize, 0);
+        file.read_exact(&mut buf).ok()?;
+        hasher.write(&buf);
+    }
+    let fp = hasher.finish();
+    seen.get_or_insert_with(HashMap::new)
+        .insert(model.to_path_buf(), (len, mtime, fp));
+    Some(fp)
+}
+
+/// What the answer for `model` on `device` depends on, as one string — or
+/// `None` when the file cannot be read.
+pub fn key(device: &str, model: &Path) -> Option<String> {
+    let fp = fingerprint(model)?;
     // The binary's own time as well as its version: two builds of one commit
     // can carry different kernels.
     let exe = std::env::current_exe()
@@ -72,12 +115,91 @@ pub fn key(device: &str, model: &Path) -> Option<String> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_secs());
     Some(format!(
-        "{device}|{}|{}|{mtime}|{} {exe}|{}",
-        model.display(),
-        meta.len(),
+        "{device}|{fp:016x}|{} {exe}|{}",
         orangu::build_info::id(),
         rayon::current_num_threads()
     ))
+}
+
+/// The cores, named for a run with no device: the architecture and, where
+/// the system says, the processor's model name.
+fn host_key() -> String {
+    let name = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().to_string())
+        })
+        .unwrap_or_default();
+    let slug: String = format!("cpu-{}-{name}", std::env::consts::ARCH)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    slug.trim_end_matches('_').to_string()
+}
+
+/// The model this process serves, for [`model_key`].
+static MODEL: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Names the model this process serves — once, before it is built.
+pub fn set_model(path: &Path) {
+    let _ = MODEL.set(path.to_path_buf());
+}
+
+/// The key for the whole run's choices: the served model on this process's
+/// first device ([`crate::engine::backend::tuning_profile::device_key`]), or
+/// on the cores when there is none. Computed on first use, which comes after
+/// the device is chosen.
+pub fn model_key() -> Option<&'static str> {
+    static KEY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        let model = MODEL.get()?;
+        let device = crate::engine::backend::tuning_profile::device_key()
+            .map_or_else(host_key, str::to_string);
+        key(&device, model)
+    })
+    .as_deref()
+}
+
+/// A kept value `what` for `key`, as it was written, if there is a young
+/// enough one.
+pub fn value(what: &str, key: &str) -> Option<serde_json::Value> {
+    if !enabled() {
+        return None;
+    }
+    let map = read(&file()?);
+    let entry = map.get(&choice_key(what, key))?;
+    let when = entry["when"].as_u64()?;
+    if now().saturating_sub(when) > MAX_AGE.as_secs() {
+        return None;
+    }
+    Some(entry["value"].clone())
+}
+
+/// Keeps `value` as `what` for `key`.
+pub fn keep_value(what: &str, key: &str, value: serde_json::Value) {
+    if !enabled() {
+        return;
+    }
+    let Some(path) = file() else {
+        return;
+    };
+    let at = now();
+    let entry = serde_json::json!({"value": value, "when": at});
+    if let Err(err) = put_value_in(&path, &choice_key(what, key), entry, at) {
+        log::warn!(
+            "orangu-server: could not keep the {what} in {}: {err}",
+            path.display()
+        );
+    }
 }
 
 fn now() -> u64 {
@@ -119,7 +241,24 @@ fn put_in(path: &Path, key: &str, probe: DecodeProbe, at: u64) -> std::io::Resul
     )
 }
 
+/// Writes `value` under `key`, keeping every other young entry.
+///
+/// Several servers on one host (a coordinator's residents) share the file,
+/// so the read, the change and the write happen under an exclusive lock on
+/// a file beside it: without it two servers writing at once each read the
+/// map before the other's entry was in it, and the last rename dropped the
+/// first one's. The new map is written to a temporary file of this writer's
+/// own and renamed over the old, so a reader never sees half a file.
 fn put_value_in(path: &Path, key: &str, value: serde_json::Value, at: u64) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("json.lock"))?;
+    lock.lock()?;
     let mut map = read(path);
     // Entries past their age only take room.
     map.retain(|_, v| {
@@ -128,12 +267,19 @@ fn put_value_in(path: &Path, key: &str, value: serde_json::Value, at: u64) -> st
             .is_some_and(|w| at.saturating_sub(w) <= MAX_AGE.as_secs())
     });
     map.insert(key.to_string(), value);
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let written = std::fs::write(&tmp, serde_json::Value::Object(map).to_string())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        std::fs::remove_file(&tmp).ok();
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::Value::Object(map).to_string())?;
-    std::fs::rename(tmp, path)
+    // The lock is released when `lock` closes, after the rename.
+    written
 }
 
 /// The key a kept on/off choice named `what` is stored under, beside the
@@ -312,6 +458,39 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Writers running at once — threads here, servers on one host in use;
+    /// the lock is on the file, so both are kept apart the same way — each
+    /// keep their entry.
+    #[test]
+    fn writers_at_once_lose_no_entry() {
+        let dir = std::env::temp_dir().join(format!("orangu-writers-{}", std::process::id()));
+        let path = dir.join("probes.json");
+        const WRITERS: usize = 8;
+        const EACH: usize = 25;
+        std::thread::scope(|s| {
+            for w in 0..WRITERS {
+                let path = &path;
+                s.spawn(move || {
+                    for i in 0..EACH {
+                        let p = DecodeProbe {
+                            device_s: w as f64,
+                            cpu_s: i as f64,
+                        };
+                        put_in(path, &format!("{w}-{i}"), p, 1000).unwrap();
+                    }
+                });
+            }
+        });
+        assert_eq!(read(&path).len(), WRITERS * EACH);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "temporary files left behind: {left:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn the_key_names_the_file_and_the_build() {
         let me = std::env::current_exe().unwrap();
@@ -319,5 +498,39 @@ mod tests {
         assert!(k.starts_with("1002-7340-radv|"));
         assert!(k.contains(orangu::build_info::id()));
         assert!(key("d", Path::new("/no/such/file")).is_none());
+    }
+
+    /// A copy of a file at another path is the same model; the same path
+    /// holding other bytes is not.
+    #[test]
+    fn the_key_names_the_content_not_the_path() {
+        let dir = std::env::temp_dir().join(format!("orangu-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (a, b) = (dir.join("a.gguf"), dir.join("b.gguf"));
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&a, &bytes).unwrap();
+        std::fs::write(&b, &bytes).unwrap();
+        assert_eq!(key("d", &a), key("d", &b));
+        // Same length, a different last byte: a different model.
+        let mut other = bytes.clone();
+        *other.last_mut().unwrap() ^= 1;
+        let c = dir.join("c.gguf");
+        std::fs::write(&c, &other).unwrap();
+        assert_ne!(key("d", &a), key("d", &c));
+        // A short file is read whole.
+        let short = dir.join("short.gguf");
+        std::fs::write(&short, b"GGUF").unwrap();
+        assert!(key("d", &short).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_host_key_names_the_cores() {
+        let k = host_key();
+        assert!(k.starts_with(&format!("cpu_{}", std::env::consts::ARCH)));
+        assert!(
+            k.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        );
     }
 }

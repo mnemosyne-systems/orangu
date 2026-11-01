@@ -473,7 +473,7 @@ fn main_reduce_suffix(n_rows: usize, subgroup: bool) -> String {
 fn blocks_per_trip() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_BLOCKS_PER_TRIP")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_BLOCKS_PER_TRIP")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| [1, 2, 4].contains(n))
@@ -1041,8 +1041,10 @@ pub struct CoopVec4Tiles {
 /// separately: whichever one is worth converting, the measurement should say
 /// which.
 pub fn coop_vec4_tiles(backend: wgpu::Backend) -> CoopVec4Tiles {
-    let (force_w, force_x) =
-        forced_scalar_tiles(&std::env::var("ORANGU_COOP_SCALAR_TILES").unwrap_or_default());
+    let (force_w, force_x) = forced_scalar_tiles(
+        &crate::engine::backend::tuning_profile::env_var("ORANGU_COOP_SCALAR_TILES")
+            .unwrap_or_default(),
+    );
     let component_stores_work = backend == wgpu::Backend::Vulkan;
     CoopVec4Tiles {
         w: component_stores_work && !force_w,
@@ -1080,7 +1082,7 @@ fn rolled_x_fill() -> bool {
 pub fn coop_geom() -> CoopGeom {
     static G: std::sync::OnceLock<CoopGeom> = std::sync::OnceLock::new();
     *G.get_or_init(|| {
-        let Some(spec) = std::env::var_os("ORANGU_COOP_GEOM") else {
+        let Some(spec) = crate::engine::backend::tuning_profile::var_os("ORANGU_COOP_GEOM") else {
             return COOP_GEOM_DEFAULT;
         };
         let spec = spec.to_string_lossy().to_string();
@@ -7094,7 +7096,7 @@ pub fn shader_source_mmq_q4k_wide_toks(rows: u32, toks: u32) -> String {
     );
     let tgroups = (toks / 16) as usize;
     // `ORANGU_MMQ_WIDE_KS`: the slice depth, for measuring it.
-    let ks = std::env::var("ORANGU_MMQ_WIDE_KS")
+    let ks = crate::engine::backend::tuning_profile::env_var("ORANGU_MMQ_WIDE_KS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(MMQ_WIDE_KS);
@@ -7473,7 +7475,7 @@ pub fn shader_source_mmq_q6k_wide_toks(rows: u32, toks: u32) -> String {
         "a tile is 16 tokens per lane pair per warp"
     );
     let tgroups = (toks / 16) as usize;
-    let ks = std::env::var("ORANGU_MMQ_WIDE_KS_Q6K")
+    let ks = crate::engine::backend::tuning_profile::env_var("ORANGU_MMQ_WIDE_KS_Q6K")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(MMQ_WIDE_KS_Q6K);
@@ -14312,7 +14314,7 @@ const GQA_PREFILL_REG_BUDGET: u32 = 64;
 /// the `subgroupAdd` that reduces the score is correct without the kernel
 /// having to know that size. A wider workgroup would have to assume it.
 pub fn gqa_prefill_heads_per_workgroup(head_dim: u32, group: u32) -> u32 {
-    if let Some(pinned) = std::env::var("ORANGU_GQA_HEADS")
+    if let Some(pinned) = crate::engine::backend::tuning_profile::env_var("ORANGU_GQA_HEADS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .filter(|&n| n >= 1 && n <= group && group.is_multiple_of(n))

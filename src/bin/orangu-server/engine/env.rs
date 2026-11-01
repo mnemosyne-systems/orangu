@@ -30,6 +30,9 @@
 //! `engine::backend` because the flags using it are spread across the whole
 //! binary — `main`, the architectures, the backends and the scheduler — not
 //! just the two shader modules.
+//!
+//! A flag the environment does not set is read from the device's tuning
+//! profile (`engine::backend::tuning_profile`), once that is installed.
 
 /// Whether a boolean tuning flag is switched **on**.
 ///
@@ -45,7 +48,7 @@
 /// Whitespace is trimmed and case is ignored, because these are typed by hand
 /// into shell one-liners and pasted into bug reports.
 pub(crate) fn flag_on(name: &str) -> bool {
-    match std::env::var(name) {
+    match crate::engine::backend::tuning_profile::env_var(name) {
         Ok(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "off" | "no"
@@ -68,7 +71,7 @@ pub(crate) fn flag_on(name: &str) -> bool {
 /// reading a call site tells you which way the feature points without having to
 /// find the constant.
 pub(crate) fn flag_on_unless_disabled(name: &str) -> bool {
-    match std::env::var(name) {
+    match crate::engine::backend::tuning_profile::env_var(name) {
         Ok(value) => !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "" | "0" | "false" | "off" | "no"
@@ -81,7 +84,7 @@ pub(crate) fn flag_on_unless_disabled(name: &str) -> bool {
 /// whose default someone else decides (a model's own answer, say). Same
 /// off-list as [`flag_on`].
 pub(crate) fn flag_setting(name: &str) -> Option<bool> {
-    std::env::var_os(name).map(|_| flag_on(name))
+    crate::engine::backend::tuning_profile::var_os(name).map(|_| flag_on(name))
 }
 
 #[cfg(test)]

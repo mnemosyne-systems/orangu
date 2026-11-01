@@ -42,8 +42,9 @@ pub struct CatalogueEntry {
     pub context: u64,
     /// The roles it suits, in `orangu.conf`'s names.
     pub roles: &'static [&'static str],
-    /// The drafter that pairs with it, where there is one. Prompt lookup
-    /// drafts for every model without being fetched.
+    /// The drafter that pairs with it, where there is one the server uses by
+    /// default (a head it leaves off is not paired). Prompt lookup drafts
+    /// for every model without being fetched.
     pub drafter: Option<Drafter>,
 }
 
@@ -121,7 +122,7 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         params_billion: 5.1,
         context: 32768,
         roles: &["all", "code", "review"],
-        drafter: Some(Drafter::MtpHead("MTP/mtp-gemma-4-E2B-it-Q8_0.gguf")),
+        drafter: None,
     },
     CatalogueEntry {
         repo: "unsloth/gemma-4-E4B-it-GGUF",
@@ -148,7 +149,7 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         params_billion: 12.0,
         context: 32768,
         roles: &["all", "code", "review"],
-        drafter: Some(Drafter::MtpHead("MTP/mtp-gemma-4-12b-it-Q8_0.gguf")),
+        drafter: None,
     },
     CatalogueEntry {
         repo: "unsloth/gemma-4-26B-A4B-it-GGUF",

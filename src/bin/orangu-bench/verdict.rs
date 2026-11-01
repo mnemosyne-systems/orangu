@@ -27,6 +27,12 @@
 //!
 //! The threshold is the larger of twice the first and the second. A
 //! difference beyond it is the change; anything inside it is not shown to be.
+//!
+//! The second spread needs two runs of each arm, so an arm with fewer gets no
+//! verdict ([`MIN_RUNS`]): one run cannot tell the change from the drift.
+
+/// Runs of each arm a verdict needs.
+pub const MIN_RUNS: usize = 2;
 
 /// One run's summary of one point, as the history records it.
 #[derive(Clone, Copy, Debug)]
@@ -60,9 +66,9 @@ fn mean(v: &[f64]) -> f64 {
 }
 
 /// Judges `candidate` against `control` for one point. `None` when either arm
-/// has no run or the control's mean is not positive.
+/// has fewer than [`MIN_RUNS`] runs or the control's mean is not positive.
 pub fn judge(control: &[Run], candidate: &[Run], lower_is_better: bool) -> Option<Verdict> {
-    if control.is_empty() || candidate.is_empty() {
+    if control.len() < MIN_RUNS || candidate.len() < MIN_RUNS {
         return None;
     }
     let c = mean(&control.iter().map(|r| r.mean).collect::<Vec<_>>());
@@ -161,7 +167,11 @@ mod tests {
     }
 
     #[test]
-    fn an_arm_with_no_run_has_no_verdict() {
+    fn an_arm_with_fewer_than_two_runs_has_no_verdict() {
         assert!(judge(&[], &[run(1.0, 0.0)], false).is_none());
+        // A large, tight difference still needs each arm's drift measured.
+        assert!(judge(&[run(100.0, 0.1)], &[run(150.0, 0.1)], false).is_none());
+        assert!(judge(&[run(100.0, 0.1); 2], &[run(150.0, 0.1)], false).is_none());
+        assert!(judge(&[run(100.0, 0.1); 2], &[run(150.0, 0.1); 2], false).is_some());
     }
 }

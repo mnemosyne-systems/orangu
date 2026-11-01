@@ -2618,12 +2618,146 @@ fn parse_mcp_configuration(
     })
 }
 
+/// What [`with_draft_model`] makes of a configuration.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DraftModelEdit {
+    /// The configuration with `draft_model` added to its server section.
+    Written(String),
+    /// `draft_model` is already set, to this; it is left as it is.
+    AlreadySet(String),
+    /// The configured `model` (if any) is not the repo the drafter was paired
+    /// with, so a draft model of that vocabulary would draft for the wrong
+    /// model.
+    OtherModel(Option<String>),
+}
+
+/// Whether `model`, a configured `[orangu-server].model`, names `repo`
+/// (`<user>/<model>`): as a spec with or without its `:quant`, or as a file
+/// in the Hugging Face hub cache's directory for it.
+fn model_names_repo(model: &str, repo: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    let repo = repo.to_ascii_lowercase();
+    model.split(':').next() == Some(repo.as_str())
+        || model.contains(&format!("models--{}", repo.replace('/', "--")))
+}
+
+/// `contents`, a server configuration, with `draft_model = draft` added to
+/// its `[orangu-server]` section — when that section's `model` is `repo` and
+/// it sets no `draft_model` yet. Every other line is kept as written; the key
+/// goes after the section's last setting.
+pub fn with_draft_model(contents: &str, repo: &str, draft: &str) -> Result<DraftModelEdit> {
+    let sections = parse_ini_sections(contents)?;
+    let section = sections.get(SERVER_SECTION);
+    let value = |key: &str| {
+        section
+            .and_then(|s| s.get(key))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    if let Some(set) = value("draft_model") {
+        return Ok(DraftModelEdit::AlreadySet(set));
+    }
+    let model = value("model");
+    if !model.as_deref().is_some_and(|m| model_names_repo(m, repo)) {
+        return Ok(DraftModelEdit::OtherModel(model));
+    }
+    let lines: Vec<&str> = contents.split_inclusive('\n').collect();
+    let mut in_server = false;
+    let mut last_setting = None;
+    for (i, raw) in lines.iter().enumerate() {
+        let line = raw.trim();
+        if let Some(name) = line.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+            in_server = name.trim() == SERVER_SECTION;
+            if in_server {
+                last_setting = Some(i);
+            }
+        } else if in_server && !line.is_empty() && !line.starts_with('#') && !line.starts_with(';')
+        {
+            last_setting = Some(i);
+        }
+    }
+    let at = last_setting.expect("the section has a model, so it has a line") + 1;
+    let mut out = String::with_capacity(contents.len() + draft.len() + 16);
+    for (i, line) in lines.iter().enumerate() {
+        if i == at {
+            out.push_str(&format!("draft_model = {draft}\n"));
+        }
+        out.push_str(line);
+        if i + 1 == at && !line.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    if at == lines.len() {
+        out.push_str(&format!("draft_model = {draft}\n"));
+    }
+    Ok(DraftModelEdit::Written(out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::engine::image::Variant;
     use std::io::Write;
 
+    #[test]
+    fn a_draft_model_is_written_after_the_server_sections_last_setting() {
+        let conf = "# mine\n[orangu-server]\nmodels = ~/models\nmodel = unsloth/Qwen3-4B-GGUF:Q4_K_M\n\n# later\n[other]\nkey = 1\n";
+        let DraftModelEdit::Written(out) = with_draft_model(
+            conf,
+            "unsloth/Qwen3-4B-GGUF",
+            "unsloth/Qwen3-0.6B-GGUF:Q4_K_M",
+        )
+        .unwrap() else {
+            panic!("not written");
+        };
+        assert_eq!(
+            out,
+            "# mine\n[orangu-server]\nmodels = ~/models\nmodel = unsloth/Qwen3-4B-GGUF:Q4_K_M\n\
+             draft_model = unsloth/Qwen3-0.6B-GGUF:Q4_K_M\n\n# later\n[other]\nkey = 1\n"
+        );
+        let sections = parse_ini_sections(&out).unwrap();
+        assert_eq!(
+            sections[SERVER_SECTION]["draft_model"],
+            "unsloth/Qwen3-0.6B-GGUF:Q4_K_M"
+        );
+        assert_eq!(sections["other"]["key"], "1");
+    }
+
+    #[test]
+    fn a_draft_model_is_appended_to_a_file_without_a_final_newline() {
+        let conf = "[orangu-server]\nmodels = m\nmodel = UNSLOTH/qwen3-4b-gguf";
+        assert_eq!(
+            with_draft_model(conf, "unsloth/Qwen3-4B-GGUF", "d/e:Q4").unwrap(),
+            DraftModelEdit::Written(
+                "[orangu-server]\nmodels = m\nmodel = UNSLOTH/qwen3-4b-gguf\ndraft_model = d/e:Q4\n"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_draft_model_is_not_written_over_one_or_for_another_model() {
+        let set = "[orangu-server]\nmodel = a/b\ndraft_model = x/y:Q8_0\n";
+        assert_eq!(
+            with_draft_model(set, "a/b", "c/d:Q4").unwrap(),
+            DraftModelEdit::AlreadySet("x/y:Q8_0".to_string())
+        );
+        let other = "[orangu-server]\nmodel = a/other:Q4\n";
+        assert_eq!(
+            with_draft_model(other, "a/b", "c/d:Q4").unwrap(),
+            DraftModelEdit::OtherModel(Some("a/other:Q4".to_string()))
+        );
+        assert_eq!(
+            with_draft_model("[orangu-server]\nmodels = m\n", "a/b", "c/d:Q4").unwrap(),
+            DraftModelEdit::OtherModel(None)
+        );
+        // A file in the hub cache's directory for the repo is the repo.
+        let path = "[orangu-server]\nmodel = ~/.cache/huggingface/hub/models--a--b/snapshots/1/b-Q4_K_M.gguf\n";
+        assert!(matches!(
+            with_draft_model(path, "a/b", "c/d:Q4").unwrap(),
+            DraftModelEdit::Written(_)
+        ));
+    }
     #[test]
     fn loads_models_directory_with_defaults() {
         let mut file = tempfile::NamedTempFile::new().unwrap();

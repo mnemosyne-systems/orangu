@@ -260,27 +260,6 @@ pub fn too_long_response(message: String) -> axum::response::Response {
     (axum::http::StatusCode::BAD_REQUEST, message).into_response()
 }
 
-/// Refuses a request whose *prompt* is longer than this device can hold, before
-/// any of it is processed — `None` when it fits, or when there is no device
-/// ceiling to apply.
-///
-/// The prompt alone, not the prompt plus `max_tokens`. `max_tokens` is a cap
-/// on the answer, not a reservation, and the engine already clamps it to the
-/// model's own context length; the device ceiling clamps it the same way (see
-/// `engine::generate`). Counting it here refused every request from a client
-/// that asks for a generous cap without knowing the card — the web console
-/// asks for 32768 on every turn, and on a device whose room is 16384 tokens
-/// that made the console unusable on any prompt at all.
-///
-/// **A `400`, not a `500`.** Nothing is broken and retrying changes nothing:
-/// the only thing that can work is a shorter prompt, and the status code is
-/// what tells a client to try that rather than file a bug. `/auto_review` does
-/// exactly that, dropping a file's whole-file context and reviewing its diff.
-///
-/// Asked here rather than only inside the engine because *here* is where an
-/// answer is still free. Past this point the prompt is on its way to a device
-/// that answers an oversized request by stalling until its driver resets it,
-/// taking every other request on the process with it.
 /// Prompts at least this long are tokenised on a blocking thread.
 const ENCODE_INLINE_BYTES: usize = 16 * 1024;
 
@@ -305,6 +284,27 @@ pub async fn encode_off_runtime(
     }
 }
 
+/// Refuses a request whose *prompt* is longer than this device can hold, before
+/// any of it is processed — `None` when it fits, or when there is no device
+/// ceiling to apply.
+///
+/// The prompt alone, not the prompt plus `max_tokens`. `max_tokens` is a cap
+/// on the answer, not a reservation, and the engine already clamps it to the
+/// model's own context length; the device ceiling clamps it the same way (see
+/// `engine::generate`). Counting it here refused every request from a client
+/// that asks for a generous cap without knowing the card — the web console
+/// asks for 32768 on every turn, and on a device whose room is 16384 tokens
+/// that made the console unusable on any prompt at all.
+///
+/// **A `400`, not a `500`.** Nothing is broken and retrying changes nothing:
+/// the only thing that can work is a shorter prompt, and the status code is
+/// what tells a client to try that rather than file a bug. `/auto_review` does
+/// exactly that, dropping a file's whole-file context and reviewing its diff.
+///
+/// Asked here rather than only inside the engine because *here* is where an
+/// answer is still free. Past this point the prompt is on its way to a device
+/// that answers an oversized request by stalling until its driver resets it,
+/// taking every other request on the process with it.
 pub fn reject_oversized_context(prompt_tokens: usize) -> Option<Response> {
     let ceiling = crate::engine::generate::kv_device_token_ceiling()?;
     if crate::engine::generate::prompt_fits_device(prompt_tokens, ceiling) {

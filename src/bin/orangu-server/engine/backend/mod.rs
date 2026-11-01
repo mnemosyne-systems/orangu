@@ -571,10 +571,12 @@ pub(crate) fn tail_probe_is_timing() -> bool {
 /// other from outside.
 fn tail_forced() -> Option<bool> {
     static FORCED: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-    *FORCED.get_or_init(|| match std::env::var("ORANGU_TAIL_HOST").as_deref() {
-        Ok("0") => Some(false),
-        Ok("1") => Some(true),
-        _ => None,
+    *FORCED.get_or_init(|| {
+        match crate::engine::backend::tuning_profile::env_var("ORANGU_TAIL_HOST").as_deref() {
+            Ok("0") => Some(false),
+            Ok("1") => Some(true),
+            _ => None,
+        }
     })
 }
 
@@ -699,7 +701,7 @@ pub(crate) const MAX_MULTI_TOKEN_PHASE_TOKENS_DEFAULT: usize = 256;
 pub(crate) fn max_multi_token_phase_tokens() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
-        std::env::var("ORANGU_MAX_TOKENS_PER_SUBMISSION")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_MAX_TOKENS_PER_SUBMISSION")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|n| *n > 0)

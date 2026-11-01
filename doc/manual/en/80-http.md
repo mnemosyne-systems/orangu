@@ -459,13 +459,23 @@ Messages carry the other half of the conversation:
 
 | Field | On | Meaning |
 | :-- | :-- | :-- |
-| `tool_calls` | `assistant` | the calls that turn made, passed to the template verbatim |
+| `tool_calls` | `assistant` | the calls that turn made, passed to the template as sent except as below |
 | `tool_call_id` | `tool` | which call this message answers |
 | `name` | `tool` | the function's name; some templates use it directly, others resolve it from `tool_call_id` |
 
 All three are required for a **multi-turn** tool conversation. Without them
 the transcript replayed on turn N+1 shows an assistant message with empty
 content and no record of any call, and the model calls the same tool again.
+
+A client sends `function.arguments` as JSON text, while templates read it as
+a mapping (`arguments.items()`, `arguments | tojson`). Text that parses as a
+JSON object therefore reaches the template as that object. The exception is a
+template that renders a call only with text arguments, which is checked once
+when the template loads. Likewise, a template that accepts only nine-character
+alphanumeric call ids (Mistral's) sees each other id in `tool_calls` and
+`tool_call_id` replaced by nine characters derived from it. The replacement is
+the same in every request, so a call still matches its result, and each
+prompt still extends the one before it.
 
 **Reading the model's answer back.** There is no standard for how a model
 *writes* a call — its template teaches it one, and the forms differ far more
@@ -2935,9 +2945,22 @@ client can probe it to tell the three apart:
     "review": "bartowski/gemma-4-12B-it-GGUF",
     "explorer": "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
     "embeddings": "bartowski/gemma-4-12B-it-GGUF"
+  },
+  "roles": ["all", "explorer"],
+  "activating": {
+    "profile": "explorer",
+    "step": "loading unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+    "seconds": 7,
+    "last_output": "orangu-server: [kv] paged cache — 256 pages of 64 tokens"
   }
 }
 ```
+
+`activating` is the swap or start under way, `null` when there is none: the
+profile being made active, the step it has reached (waiting for the outgoing
+server's responses to finish, saving its conversations, checking the new
+model fits, stopping the outgoing server, loading), the seconds since the
+swap began, and the last line the starting server printed.
 
 `version`, `commit` and `build` are the coordinator's own build, as on a
 server's `GET /version` — `/version` itself is proxied through to the active

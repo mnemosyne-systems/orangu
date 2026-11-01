@@ -50,6 +50,7 @@ pub mod prefill_backend;
 pub mod prefix_cache;
 pub mod prefix_index;
 pub mod probe_cache;
+pub mod prompt_lookup;
 pub mod prompt_weights;
 pub mod quant;
 pub mod route_ahead;

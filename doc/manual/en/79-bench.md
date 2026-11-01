@@ -749,11 +749,64 @@ That is bigger than most changes worth measuring, so a two-value sweep written
 | +4.8%, −9.8%, +4.0%, −8.8% across four same-order runs | a **+0.11%** change |
 | −3.1% | a **+3.9%** change |
 
-**Write each value more than once, in both orders** — `VAR=a,b,b,a` and
-`VAR=b,a,a,b` — so every value holds every position, and pool the runs.
+So a sweep of two values written `VAR=a,b` runs as **`VAR=a,b,b,a`**: each
+value holds each position once, and each arm is measured twice.
+`--sweep-as-given` runs the list in the order written instead. A list of
+three or more values, or one that already repeats its values, always runs as
+written; for those, write each value more than once, in both orders, and pool
+the runs.
 And score on **mean ± sd, not best-of**: the extra variance in the late slot
 inflates a best-of statistic, which is how the +0.11% change above also
 produced a confident-looking +4.9% "win".
+
+### The sweep verdict (`--fail-on-regression`)
+
+A `--sweep` of exactly two distinct values, each run at least twice —
+`VAR=a,b`, which runs as `a,b,b,a`, or a longer list such as
+`VAR=a,b,b,a,a,b` — ends with a verdict: the second value
+(the candidate) judged against the first (the control) at every measured
+point, as a change in percent beside the noise it has to beat. The noise is
+the larger of twice the standard error and one arm's own run-to-run spread,
+and each point reads `better`, `WORSE` or `within noise`. The run-to-run
+spread is measured from an arm's own runs, so a value run once has none, and
+a sweep with such a value prints `no verdict` instead.
+
+```
+verdict — on against 0, noise = max(2 × standard error, one arm's run-to-run spread)
+  tg 0             +3.4%  noise ±  1.2%  better
+  tg 4096          -0.6%  noise ±  1.9%  within noise
+```
+
+`--fail-on-regression` makes that verdict the exit status: `orangu-bench`
+exits `2` when any point came out `WORSE`, and `0` otherwise, so a script or
+CI job can refuse a change on it. A sweep that could never reach a verdict —
+not two distinct values, or a value with fewer than two runs (`a,b` with
+`--sweep-as-given`) — is refused before any server starts.
+
+```sh
+orangu-bench --sweep 'ORANGU_FEATURE=0,1' \
+  --sweep-cmd "orangu-server -c bench.conf <model>" --fail-on-regression
+```
+
+### Keeping a sweep's winner (`--write-profile`)
+
+`--write-profile` keeps the verdict's answer in the server's tuning profile,
+`~/.orangu/server/tuning/<key>.json`, where `<key>` is the device's own, as
+the swept server reports it at `/props` under `gpu.tuning.key`. The
+candidate is written when it was better at some point and worse at none; any
+other verdict leaves the file as it was and says why. An empty candidate
+(`VAR=1,`) removes the variable from the profile, which leaves it at its
+built-in default. The other values in the file are kept.
+
+```sh
+orangu-bench --sweep 'ORANGU_REDUCE_N_ROWS=1,2' \
+  --sweep-cmd "orangu-server -c bench.conf <model>" --write-profile
+```
+
+It needs a sweep the verdict can judge (two values, each run twice), an
+`ORANGU_*` variable, and every point on the same device; the profile is
+written under the home directory of the user running `orangu-bench`, which
+is the server's when `--sweep-cmd` starts it on this machine.
 
 ### Storage mode (`--storage-probe`) — what request size is worth
 
@@ -1318,6 +1371,9 @@ Options:
       --read-bundle <LIST>             Read bundles and report them side by side; measure nothing
       --sweep <SPEC>                   Sweep one tuning variable: `VAR=v1,v2,...` (`;` if a value has a comma); needs `--sweep-cmd`
       --sweep-cmd <CMD>                Shell command that starts the server, run once per `--sweep` value
+      --fail-on-regression             After a two-value --sweep, exit 2 if the second value is worse beyond the noise
+      --sweep-as-given                 Run a two-value --sweep in the order written instead of as a,b,b,a
+      --write-profile                  After a two-value --sweep, keep the winning value in the server's tuning profile
       --sweep-env <K=V>                Environment held constant across every `--sweep` point (repeatable)
       --sweep-start-timeout <SECONDS>  Seconds to wait for a swept server to come up [default: 300]
       --render-profile <PATH>          Re-render an already-collapsed `.folded` profile to SVG; measure nothing

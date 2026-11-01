@@ -1831,6 +1831,9 @@ fn prepare(args: Args) -> Result<Prepared> {
             total_ram,
         )
     };
+    // Before the build: an architecture may make a run-wide choice while it
+    // loads (where prompts run), and keeps it under this model's key.
+    engine::probe_cache::set_model(&path);
     let model = build_model(&loaded, &backend)?;
     if !ranged && image_variant.is_none() && role.allows_generation() {
         choose_integer_dot(&model, &path);
@@ -5092,13 +5095,51 @@ fn run_command(
                 // Against the machine's *total* memory, not what is free: the
                 // caller is typically about to stop another model to make
                 // room, and what it needs to know is whether any amount of
-                // room would do.
-                let runs = problems.is_empty() && plan.dense_fits_in(cpu.total_memory_bytes);
-                if !plan.dense_fits_in(cpu.total_memory_bytes) {
+                // room would do. A dedicated card's memory counts beside the
+                // machine's — weights on the card need no room in RAM — and
+                // a configured context's KV cache counts beside the weights,
+                // at two bytes an element, the least any storage takes.
+                let context = requested_context(None, conf.context);
+                let kv_bytes = context
+                    .filter(|_| deep)
+                    .and_then(|context| {
+                        let loaded = engine::loader::LoadedModel::open(&path).ok()?;
+                        let elements = engine::arch::kv_elements_per_token(&loaded) as u64
+                            * context as u64
+                            + engine::arch::kv_fixed_elements(&loaded, context) as u64;
+                        Some(elements * 2)
+                    })
+                    .unwrap_or(0);
+                let device_memory_bytes: u64 =
+                    if matches!(conf.backend, config::BackendPreference::Cpu) {
+                        0
+                    } else {
+                        gpus.iter()
+                            .filter(|g| g.memory_kind == orangu::hardware::MemoryKind::Dedicated)
+                            .filter_map(|g| g.vram_total_bytes)
+                            .sum()
+                    };
+                let needs_bytes = plan.dense_bytes + kv_bytes;
+                let capacity_bytes = cpu.total_memory_bytes + device_memory_bytes;
+                let runs = problems.is_empty() && needs_bytes <= capacity_bytes;
+                if needs_bytes > capacity_bytes {
                     problems.push(format!(
-                        "the weights every token touches ({}) are more than this machine's memory ({})",
+                        "the weights every token touches ({}){} are more than this machine's \
+                         memory{} ({})",
                         orangu::format::format_bytes(plan.dense_bytes),
-                        orangu::format::format_bytes(cpu.total_memory_bytes)
+                        context
+                            .filter(|_| kv_bytes > 0)
+                            .map(|c| format!(
+                                " and the KV cache for {c} tokens of context ({})",
+                                orangu::format::format_bytes(kv_bytes)
+                            ))
+                            .unwrap_or_default(),
+                        if device_memory_bytes > 0 {
+                            " and its cards'"
+                        } else {
+                            ""
+                        },
+                        orangu::format::format_bytes(capacity_bytes)
                     ));
                 }
                 println!(
@@ -5110,6 +5151,11 @@ fn run_command(
                         "dense_bytes": plan.dense_bytes,
                         "device_bytes": plan.device_bytes,
                         "memory_bytes": cpu.total_memory_bytes,
+                        "device_memory_bytes": device_memory_bytes,
+                        "context": context,
+                        "kv_bytes": kv_bytes,
+                        "needs_bytes": needs_bytes,
+                        "capacity_bytes": capacity_bytes,
                         "checked": deep,
                         "runs": runs,
                         "problems": problems,
@@ -5218,6 +5264,9 @@ fn run_command(
             yes,
             with_drafter,
         } => {
+            let config_path = config_arg
+                .clone()
+                .or_else(config::default_server_config_path);
             let conf = load_config(config_arg, None, false)?;
             let repo = orangu::model_catalogue::with_catalogue_quant(
                 orangu::model_download::strip_hub_url(&repo),
@@ -5229,7 +5278,7 @@ fn run_command(
             let path = orangu::model_download::download_model(&conf.models, &repo)?;
             println!("Downloaded to {}", path.display());
             if with_drafter {
-                download_catalogue_drafter(&conf.models, &repo)?;
+                download_catalogue_drafter(&conf.models, &repo, config_path.as_deref())?;
             }
             Ok(())
         }
@@ -6377,16 +6426,23 @@ fn expert_tier_projection(
 /// default was measured.
 /// `download --with-drafter`: the drafter the catalogue pairs with `spec`'s
 /// repo, fetched beside it — a draft model into the models directory, an
-/// MTP head from the model's own repo — and how to use it. A model the
-/// catalogue does not pair says so and fetches nothing.
-fn download_catalogue_drafter(models: &std::path::Path, spec: &str) -> Result<()> {
+/// MTP head from the model's own repo. A draft model is also written into
+/// the configuration at `config` as `draft_model`, when that configuration
+/// serves this repo and names no draft model yet; otherwise the line to add
+/// is printed. A model the catalogue does not pair says so and fetches
+/// nothing.
+fn download_catalogue_drafter(
+    models: &std::path::Path,
+    spec: &str,
+    config: Option<&std::path::Path>,
+) -> Result<()> {
     use orangu::model_catalogue::Drafter;
     let repo = spec.split(':').next().unwrap_or(spec);
     match orangu::model_catalogue::entry_for(repo).and_then(|e| e.drafter) {
         Some(Drafter::Model(draft)) => {
             let path = orangu::model_download::download_model(models, draft)?;
             println!("Downloaded the drafter to {}", path.display());
-            println!("Set `draft_model = {draft}` in [orangu-server] to draft with it.");
+            configure_draft_model(config, repo, draft)?;
         }
         Some(Drafter::MtpHead(file)) => {
             let path = orangu::model_download::download_repo_file(models, repo, file, None)?;
@@ -6396,6 +6452,40 @@ fn download_catalogue_drafter(models: &std::path::Path, spec: &str) -> Result<()
         None => {
             println!("The catalogue pairs no drafter with {repo}; prompt lookup drafts for it.")
         }
+    }
+    Ok(())
+}
+
+/// Writes `draft_model = draft` into the configuration at `config` when it
+/// serves `repo` and names no draft model yet, and says what it did.
+fn configure_draft_model(config: Option<&std::path::Path>, repo: &str, draft: &str) -> Result<()> {
+    let line = format!("draft_model = {draft}");
+    let Some(path) = config else {
+        println!("Add `{line}` to [orangu-server] to draft with it.");
+        return Ok(());
+    };
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read configuration {}", path.display()))?;
+    match config::with_draft_model(&contents, repo, draft)
+        .with_context(|| format!("failed to parse configuration {}", path.display()))?
+    {
+        config::DraftModelEdit::Written(updated) => {
+            std::fs::write(path, updated)
+                .with_context(|| format!("failed to write configuration {}", path.display()))?;
+            println!("Wrote `{line}` to [orangu-server] in {}.", path.display());
+        }
+        config::DraftModelEdit::AlreadySet(set) if set == draft => {
+            println!("{} already drafts with it.", path.display());
+        }
+        config::DraftModelEdit::AlreadySet(set) => println!(
+            "{} already sets `draft_model = {set}`; left as it is. Set `{line}` to draft \
+             with this one.",
+            path.display()
+        ),
+        config::DraftModelEdit::OtherModel(_) => println!(
+            "{} does not serve {repo}; add `{line}` to [orangu-server] where it does.",
+            path.display()
+        ),
     }
     Ok(())
 }
