@@ -904,7 +904,11 @@ impl MuseModel {
             k_norm: Some(&layer.attn.attn_k_norm),
             pairing: self.rope.layout,
             yarn: crate::engine::backend::vulkan::RopeYarn::from_params(&self.rope),
-            rope_dim: if layer.attn.is_swa { self.rope.rope_dim } else { 0 },
+            rope_dim: if layer.attn.is_swa {
+                self.rope.rope_dim
+            } else {
+                0
+            },
             rope_freq_base: self.rope.freq_base,
             freq_factors: None,
             n_swa: if layer.attn.is_swa { self.n_swa } else { 0 },
@@ -1053,8 +1057,8 @@ impl MuseModel {
             .backend
             .as_wgpu_on(self.output_weight.device())
             .is_some_and(|tail| std::ptr::eq(tail, *vulkan));
-        if let Some(samples) =
-            samples.filter(|_| tail_on_device && vulkan.gpu_sample() && self.logits.logit_scale.is_none())
+        if let Some(samples) = samples
+            .filter(|_| tail_on_device && vulkan.gpu_sample() && self.logits.logit_scale.is_none())
             && let Some(outcomes) = vulkan.decode_batch_tail(
                 crate::engine::backend::vulkan::AttnOutSrc::Gpu(&h_dev, 0, n_rows),
                 n_rows,
