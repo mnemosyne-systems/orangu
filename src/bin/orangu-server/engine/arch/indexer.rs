@@ -21,7 +21,8 @@
 //! their latent attention.
 //!
 //! A scoring layer projects a small query per head off the *attention
-//! query's own* LoRA intermediate, keeps its own narrow per-token key
+//! query's own* LoRA intermediate — or, on a model whose attention query has
+//! no bottleneck (`mistral-large4`), off the LayerNormed layer input — keeps its own narrow per-token key
 //! cache, and scores every visible position with a `relu`'d per-head dot
 //! product weighted by a per-head scalar read from the layer input. The
 //! real attention then attends only the `attention.indexer.top_k`
@@ -126,6 +127,9 @@ pub(crate) struct IndexerShape {
     pub rope: Option<RopeParams>,
     /// `rope.dimension_count`, whether or not anything is rotated.
     pub rope_dim: usize,
+    /// Learned per-pair rotary frequency divisors (`rope_freqs.weight`), or
+    /// `None` for the plain frequencies.
+    pub freq_factors: Option<std::sync::Arc<[f32]>>,
 }
 
 impl IndexerShape {
@@ -153,6 +157,7 @@ impl IndexerShape {
                 .unwrap_or(0.0),
             rope,
             rope_dim: if rope.is_some() { rope_dim } else { 0 },
+            freq_factors: None,
         })
     }
 
@@ -186,8 +191,16 @@ pub(crate) struct KeyPool {
 /// One scoring layer's lightning indexer.
 pub(crate) struct Indexer {
     /// `[q_lora_rank, indexer.head_count * indexer.key_length]` — shares
-    /// the attention query's LoRA intermediate.
+    /// the attention query's LoRA intermediate. With [`Self::q_norm`] it is
+    /// `[n_embd, ..]` and reads the layer input instead.
     q_b: QuantMatrix,
+    /// `indexer.q_norm` (weight, bias): a LayerNorm over the layer input
+    /// that the query is projected from, on a model whose attention query
+    /// has no LoRA intermediate to share.
+    q_norm: Option<(Vec<f32>, Vec<f32>)>,
+    /// `indexer.ssmax` — the per-head, position-dependent query scale. See
+    /// `engine::arch::position::Ssmax`.
+    ssmax: Option<super::position::Ssmax>,
     /// `[n_embd, indexer.key_length]`: one key per token, all heads.
     attn_k: QuantMatrix,
     k_norm_weight: Vec<f32>,
@@ -260,8 +273,21 @@ impl Indexer {
             None => None,
         };
 
+        let q_norm = if loaded.has_tensor(&format!("blk.{layer}.indexer.q_norm.weight")) {
+            Some((get("indexer.q_norm.weight")?, get("indexer.q_norm.bias")?))
+        } else {
+            None
+        };
+        let ssmax = super::position::Ssmax::load(
+            loaded,
+            &format!("blk.{layer}.indexer.ssmax"),
+            shape.n_head,
+        )?;
+
         Ok(Self {
             q_b: get_matrix("indexer.attn_q_b.weight")?,
+            q_norm,
+            ssmax,
             attn_k: get_matrix("indexer.attn_k.weight")?,
             k_norm_weight: get("indexer.k_norm.weight")?,
             k_norm_bias: get("indexer.k_norm.bias")?,
@@ -276,7 +302,9 @@ impl Indexer {
     /// pooling gate to cache beside it.
     ///
     /// `qr` is the attention query's own LoRA intermediate, which the
-    /// indexer query is projected from; `normed` is the layer input;
+    /// indexer query is projected from — unless this layer carries its own
+    /// `indexer.q_norm`, when the query is projected from the LayerNormed
+    /// `normed` and `qr` is not read. `normed` is the layer input;
     /// `pos_of(t)` is token `t`'s position.
     pub(crate) fn inputs(
         &self,
@@ -288,7 +316,26 @@ impl Indexer {
         pos_of: &dyn Fn(usize) -> usize,
     ) -> IndexerInputs {
         let dim = shape.head_size;
-        let mut q = backend.matmul(qr, n_tokens, &self.q_b);
+        let mut q = match &self.q_norm {
+            Some((weight, bias)) => {
+                let width = normed.len() / n_tokens.max(1);
+                let mut src = normed.to_vec();
+                for row in src.chunks_exact_mut(width) {
+                    layer_norm_inplace(row, weight, bias, shape.norm_eps);
+                }
+                backend.matmul(&src, n_tokens, &self.q_b)
+            }
+            None => backend.matmul(qr, n_tokens, &self.q_b),
+        };
+        if let Some(ssmax) = &self.ssmax {
+            for t in 0..n_tokens {
+                ssmax.apply(
+                    &mut q[t * shape.n_head * dim..(t + 1) * shape.n_head * dim],
+                    dim,
+                    pos_of(t),
+                );
+            }
+        }
         let mut keys = backend.matmul(normed, n_tokens, &self.attn_k);
         for t in 0..n_tokens {
             let key = &mut keys[t * dim..(t + 1) * dim];
@@ -307,7 +354,7 @@ impl Indexer {
                         1,
                         rope_dim,
                         pos,
-                        None,
+                        shape.freq_factors.as_deref(),
                         rope,
                     );
                 }
@@ -316,7 +363,7 @@ impl Indexer {
                     1,
                     rope_dim,
                     pos,
-                    None,
+                    shape.freq_factors.as_deref(),
                     rope,
                 );
             }

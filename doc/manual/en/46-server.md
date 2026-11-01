@@ -2066,7 +2066,7 @@ pair must share a vocabulary — speculation compares token _ids_, so two models
 that disagree about what an id means produce wrong or needlessly slow output
 with nothing to see — and both must be an architecture with a multi-position
 forward (the Llama family — `llama`, `qwen2`, `qwen3`, `qwen3moe`, `mistral`,
-`granite`, `qwen2vl`, `qwen3vl` — and `gemma4`, `deepseek4`, `deepseek41`, `glm-dsa`,
+`granite`, `qwen2vl`, `qwen3vl` — and `gemma4`, `deepseek4`, `deepseek41`, `glm-dsa`, `mistral-large4`,
 `muse-glimmer` today). Either
 failure stops the server with a message naming what is wrong.
 
@@ -4681,7 +4681,7 @@ that apply to all of them.
 ## Scope
 
 Text-in/text-out GGUF chat, completion, and embedding models — and one
-text-to-image model, one text-to-video model and one text-to-speech model — for twenty-one
+text-to-image model, one text-to-video model and one text-to-speech model — for twenty-two
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
 _text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way; and
@@ -4730,7 +4730,11 @@ the FFN gate and up projections fused into one `ffn_up` tensor, and LongRoPE
 frequency factors on a partially-rotated head), and Mistral 3 (`mistral3`,
 e.g. Ministral-3 — `llama`'s block shape plus YaRN RoPE scaling, a head
 width read from `attention.key_length` rather than derived from
-`n_embd / n_head`, and an attention temperature scale), and Muse-Glimmer
+`n_embd / n_head`, and an attention temperature scale), and Mistral Large 4
+(`mistral-large4`, e.g. `unsloth/Mistral-Large-4-1T-A52B-GGUF` — despite the
+name, GLM-5's block rather than Mistral 3's, plus a learned per-head query
+scale, unrotated layers, key/value rows shared between layers, learned
+rotary frequencies and a final logit softcap), and Muse-Glimmer
 (`muse-glimmer`, e.g. `unsloth/Muse-Glimmer-30B-GGUF` — a dense GQA block
 with a norm on both sides of each sub-layer, per-head query/key norms, a
 sigmoid gate on the attention output, three rotated sliding-window layers
@@ -4969,6 +4973,28 @@ file omits it, as GLM-5.2's quants do). Below `indexer.top_k` positions the
 selection cannot change the answer — every visible position is chosen — so
 the scoring pass is skipped there. The multi-token-prediction block these
 files carry (`blk.78` in GLM-5.2) is a draft head and is not run.
+
+Mistral Large 4 (`mistral-large4`) runs on the CPU path only, and on the
+same trunk as `glm-dsa`: despite the name its block is GLM-5's, not Mistral
+3's — absorbed latent attention over a compressed key/value cache, a
+per-token lightning indexer choosing what each layer attends (layers marked
+off in `attention.indexer.types` reuse the last scoring layer's choice), one
+leading dense FFN block and then routed experts with an always-on shared
+one. What it shares with Mistral 3 is its rotary convention: YaRN read from
+the same keys, with consecutive-pair rotation. Six things are its own, all
+declared in the file. The attention query has no low-rank bottleneck, so
+the indexer LayerNorms the layer input itself before projecting its query.
+Both queries carry SSMax, a learned per-head scale `s · log(pos + 1) + b`.
+Every fourth layer is unrotated (`attention.rope_pattern`): its query head
+is all non-rotary and its cache row is the compressed vector alone. Some
+layers attend the key/value rows an earlier unrotated layer wrote
+(`attention.kv_source_map`) and keep no cache of their own. The rotary
+frequencies are divided by learned factors (`rope_freqs.weight`), shared by
+every layer and the indexer. And the logits pass through
+`final_logit_softcapping`. Numbers in a prompt split into right-aligned
+groups of three digits (`tokenizer.ggml.pre = "tekken-num3"`), so `12345` is
+`12` then `345`. The vision tower shipped beside it is a separate file and
+is not loaded.
 
 GLM-5.3-Flash (`glm5-next`) runs on the CPU path only, and is the model in
 this server assembled most nearly out of parts other models here already

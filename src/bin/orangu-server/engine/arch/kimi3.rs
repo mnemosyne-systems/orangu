@@ -64,7 +64,7 @@ use std::sync::Arc;
 
 use super::Seqs;
 use super::kda::{KIMI3_KDA_NAMES, KdaLayer, KdaShape, MlaLayer, MlaShape};
-use super::{ExpertGating, ExpertRouting, ModelForward, rms_norm_scale, row_mean_sq};
+use super::{ExpertRouting, ModelForward, rms_norm_scale, row_mean_sq};
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::{KvCache, RecurrentSpec};
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
@@ -212,6 +212,7 @@ impl Kimi3Model {
             kv_row: kv_lora_rank + rope_dim,
             rope: None,
             rope_dim,
+            freq_factors: None,
             kq_scale: 1.0 / (head_k_mla as f32).sqrt(),
             eps: loaded.config.rms_eps,
         };
@@ -243,24 +244,7 @@ impl Kimi3Model {
             "activation.situ_beta must be positive (got {situ_beta})"
         );
 
-        let routing = ExpertRouting {
-            groups: super::ExpertGroups::from_gguf(
-                loaded,
-                loaded.metadata_u64("expert_count").unwrap_or(0) as usize,
-            )?,
-            n_expert_used: loaded
-                .metadata_u64("expert_used_count")
-                .context("missing expert_used_count")? as usize,
-            gating: ExpertGating::from_gguf(
-                loaded
-                    .metadata_u64("expert_gating_func")
-                    .context("missing expert_gating_func")?,
-            )?,
-            weights_norm: loaded
-                .metadata_u64("expert_weights_norm")
-                .is_some_and(|v| v != 0),
-            weights_scale: loaded.metadata_f32("expert_weights_scale").unwrap_or(1.0),
-        };
+        let routing = ExpertRouting::from_gguf(loaded)?;
 
         let tok_embeddings = loaded
             .matrix("token_embd.weight")

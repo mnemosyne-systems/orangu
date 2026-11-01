@@ -562,8 +562,19 @@ pub(crate) struct MlaShape {
     pub rope: Option<RopeParams>,
     /// `rope.dimension_count`, whether or not anything is rotated.
     pub rope_dim: usize,
+    /// Learned per-pair rotary frequency divisors (`rope_freqs.weight`,
+    /// LeRoPE), `rope_dim / 2` of them, or `None` for the plain
+    /// frequencies.
+    pub freq_factors: Option<std::sync::Arc<[f32]>>,
     pub kq_scale: f32,
     pub eps: f32,
+}
+
+/// The compressed key/value projection of a layer that writes its own
+/// cache rows.
+struct KvProjection {
+    wkv_a_mqa: QuantMatrix,
+    kv_a_norm: Vec<f32>,
 }
 
 /// How a file spells the query projection: through a low-rank bottleneck
@@ -580,8 +591,13 @@ enum Query {
 /// One absorbed-MLA layer's weights.
 pub(crate) struct MlaLayer {
     q: Query,
-    wkv_a_mqa: QuantMatrix,
-    kv_a_norm: Vec<f32>,
+    /// `None` on a layer that attends rows another layer wrote
+    /// (`attention.kv_source_map`): it projects a query and nothing else,
+    /// and `cache_index` names the source layer's slot.
+    kv: Option<KvProjection>,
+    /// `attn_ssmax` — a learned per-head, position-dependent query scale.
+    /// See `engine::arch::position::Ssmax`.
+    ssmax: Option<super::position::Ssmax>,
     wk_b: ExpertQuantMatrix,
     wv_b: ExpertQuantMatrix,
     /// `attn_gate` — sigmoid-gates the attention output before the output
@@ -690,11 +706,35 @@ pub(crate) fn project_rows(
 }
 
 impl MlaLayer {
+    /// Loads a layer that writes its own compressed rows into
+    /// `cache_index`.
     pub(crate) fn load(
         loaded: &LoadedModel,
         layer: usize,
         shape: &MlaShape,
         cache_index: usize,
+    ) -> Result<Self> {
+        Self::load_inner(loaded, layer, shape, cache_index, true)
+    }
+
+    /// Loads a layer with no key/value projection of its own, which
+    /// attends the rows an earlier layer already wrote into `source_index`
+    /// this same pass.
+    pub(crate) fn load_reading(
+        loaded: &LoadedModel,
+        layer: usize,
+        shape: &MlaShape,
+        source_index: usize,
+    ) -> Result<Self> {
+        Self::load_inner(loaded, layer, shape, source_index, false)
+    }
+
+    fn load_inner(
+        loaded: &LoadedModel,
+        layer: usize,
+        shape: &MlaShape,
+        cache_index: usize,
+        owns_kv: bool,
     ) -> Result<Self> {
         let get = |suffix: &str| -> Result<Vec<f32>> {
             let name = format!("blk.{layer}.{suffix}");
@@ -724,14 +764,33 @@ impl MlaLayer {
             },
             Err(_) => Query::Plain(get_matrix("attn_q.weight")?),
         };
-
-        let wkv_a_mqa = get_matrix("attn_kv_a_mqa.weight")?;
+        let q_out = match &q {
+            Query::Lora { wq_b, .. } => wq_b.out_dim,
+            Query::Plain(wq) => wq.out_dim,
+        };
         anyhow::ensure!(
-            wkv_a_mqa.out_dim == shape.kv_row,
-            "layer {layer}'s attn_kv_a_mqa projects to {} outputs, not kv_lora_rank + rope dims ({})",
-            wkv_a_mqa.out_dim,
-            shape.kv_row
+            q_out == shape.n_head * shape.head_k_mla,
+            "layer {layer}'s query projects to {q_out} outputs, not head_count * key_length_mla ({})",
+            shape.n_head * shape.head_k_mla
         );
+
+        let kv = if owns_kv {
+            let wkv_a_mqa = get_matrix("attn_kv_a_mqa.weight")?;
+            anyhow::ensure!(
+                wkv_a_mqa.out_dim == shape.kv_row,
+                "layer {layer}'s attn_kv_a_mqa projects to {} outputs, not kv_lora_rank + rope dims ({})",
+                wkv_a_mqa.out_dim,
+                shape.kv_row
+            );
+            Some(KvProjection {
+                wkv_a_mqa,
+                kv_a_norm: get("attn_kv_a_norm.weight")?,
+            })
+        } else {
+            None
+        };
+        let ssmax =
+            super::position::Ssmax::load(loaded, &format!("blk.{layer}.attn_ssmax"), shape.n_head)?;
 
         let gate = get_matrix("attn_gate.weight").ok();
         if let Some(gate) = &gate {
@@ -747,8 +806,8 @@ impl MlaLayer {
 
         Ok(Self {
             q,
-            wkv_a_mqa,
-            kv_a_norm: get("attn_kv_a_norm.weight")?,
+            kv,
+            ssmax,
             wk_b: get_expert_matrix("attn_k_b.weight")?,
             wv_b: get_expert_matrix("attn_v_b.weight")?,
             gate,
@@ -851,43 +910,56 @@ impl MlaLayer {
             ..
         } = scratch;
         let q = &mut *q;
-        backend.matmul_into(kv, normed, n_tokens, &self.wkv_a_mqa);
+        // A layer reading another layer's rows writes none of its own.
+        let owns_kv = self.kv.is_some();
+        match &self.kv {
+            Some(proj) => backend.matmul_into(kv, normed, n_tokens, &proj.wkv_a_mqa),
+            None => kv.clear(),
+        }
         let kv = &mut *kv;
+        let freq_factors = shape.freq_factors.as_deref();
 
         for t in 0..n_tokens {
             let pos = seqs.pos(t);
             // The compressed half is normed; the rotary half is roped (or,
             // for a model that rotates nothing, left alone). The two
             // together are one cache row.
-            let row = &mut kv[t * shape.kv_row..(t + 1) * shape.kv_row];
-            tensor::rmsnorm_inplace(
-                &mut row[..shape.kv_lora_rank],
-                &self.kv_a_norm,
-                1,
-                shape.kv_lora_rank,
-                eps,
-            );
-            if let Some(rope) = &shape.rope {
-                tensor::rope_apply_params_inplace(
-                    &mut row[shape.kv_lora_rank..],
+            if let Some(proj) = &self.kv {
+                let row = &mut kv[t * shape.kv_row..(t + 1) * shape.kv_row];
+                tensor::rmsnorm_inplace(
+                    &mut row[..shape.kv_lora_rank],
+                    &proj.kv_a_norm,
                     1,
-                    shape.rope_dim,
-                    pos,
-                    None,
-                    rope,
+                    shape.kv_lora_rank,
+                    eps,
                 );
-                let q_t =
-                    &mut q[t * n_head * shape.head_k_mla..(t + 1) * n_head * shape.head_k_mla];
+                if let Some(rope) = &shape.rope {
+                    tensor::rope_apply_params_inplace(
+                        &mut row[shape.kv_lora_rank..],
+                        1,
+                        shape.rope_dim,
+                        pos,
+                        freq_factors,
+                        rope,
+                    );
+                }
+            }
+            let q_t = &mut q[t * n_head * shape.head_k_mla..(t + 1) * n_head * shape.head_k_mla];
+            if let Some(rope) = &shape.rope {
                 for h in 0..n_head {
                     tensor::rope_apply_params_inplace(
                         &mut q_t[h * shape.head_k_mla + nope..(h + 1) * shape.head_k_mla],
                         1,
                         shape.rope_dim,
                         pos,
-                        None,
+                        freq_factors,
                         rope,
                     );
                 }
+            }
+            // One scalar per head, so it commutes with the absorption below.
+            if let Some(ssmax) = &self.ssmax {
+                ssmax.apply(q_t, shape.head_k_mla, pos);
             }
         }
 
@@ -986,7 +1058,7 @@ impl MlaLayer {
             _ => None,
         }
         .map(|cache| {
-            for t in 0..n_tokens {
+            for t in (0..n_tokens).filter(|_| owns_kv) {
                 let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
                 cache.layers[self.cache_index].push(kv_t, kv_t);
             }
@@ -1039,10 +1111,12 @@ impl MlaLayer {
             let keys: &[f32] = match &dense_keys {
                 Some(all) => &all[..(start_pos + t + 1) * shape.kv_row],
                 None => {
-                    let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
                     let pos = seqs.pos(t);
                     let cache = seqs.cache(t);
-                    cache.layers[self.cache_index].push(kv_t, kv_t);
+                    if owns_kv {
+                        let kv_t = &kv[t * shape.kv_row..(t + 1) * shape.kv_row];
+                        cache.layers[self.cache_index].push(kv_t, kv_t);
+                    }
                     let causal: Vec<usize>;
                     let chosen: &[usize] = match selection {
                         Some(selection) => &selection[t],
@@ -1210,13 +1284,17 @@ mod tests {
             kv_row: 6,
             rope: None,
             rope_dim: 0,
+            freq_factors: None,
             kq_scale: 0.5,
             eps: 1e-6,
         };
         let layer = MlaLayer {
             q: Query::Plain(matrix(N_EMBD, shape.n_head * shape.head_k_mla, 1.2)),
-            wkv_a_mqa: matrix(N_EMBD, shape.kv_row, 1.3),
-            kv_a_norm: values(shape.kv_lora_rank, 1.4),
+            kv: Some(KvProjection {
+                wkv_a_mqa: matrix(N_EMBD, shape.kv_row, 1.3),
+                kv_a_norm: values(shape.kv_lora_rank, 1.4),
+            }),
+            ssmax: None,
             wk_b: crate::engine::loader::test_expert_matrix(
                 shape.n_head,
                 shape.kv_lora_rank,
@@ -1482,6 +1560,87 @@ mod tests {
                 out
             },
         );
+    }
+
+    /// One prompt through `layer` on `cache`, from position 0, with `sparse`
+    /// choosing the per-token gather over the dense batched path.
+    fn mla_prompt(
+        layer: &MlaLayer,
+        shape: &MlaShape,
+        cache: &mut KvCache,
+        x: &[f32],
+        n: usize,
+        sparse: bool,
+    ) -> Vec<f32> {
+        let backend = crate::engine::backend::CpuBackend;
+        let selection: Vec<Vec<usize>> = (0..n).map(|t| (0..=t).collect()).collect();
+        let mut out = Vec::new();
+        let mut scratch = MlaScratch::default();
+        let mut seqs = Seqs::One {
+            cache,
+            start_pos: 0,
+        };
+        layer.project_query_into(&backend, &mut scratch, shape, x, n);
+        layer.attend_into(
+            &backend,
+            &mut out,
+            &mut scratch,
+            shape,
+            &mut seqs,
+            x,
+            n,
+            sparse.then_some(selection.as_slice()),
+        );
+        out
+    }
+
+    /// A layer with no key/value projection (`attention.kv_source_map`)
+    /// attends exactly the rows its source wrote, and writes none: with the
+    /// source's own query weights it reproduces the source's output, on
+    /// both the dense and the gathered path, and the cache does not grow.
+    #[test]
+    fn a_kv_reading_layer_attends_its_sources_rows_and_writes_none() {
+        let n = 3;
+        let x = values(n * N_EMBD, 2.0);
+        for sparse in [false, true] {
+            let (source, shape) = mla();
+            let (mut reader, _) = mla();
+            reader.kv = None;
+            let mut cache = KvCache::new_mixed(16, &[shape.kv_row], &[]);
+            let expected = mla_prompt(&source, &shape, &mut cache, &x, n, sparse);
+            let rows = cache.layers[0].len;
+            let got = mla_prompt(&reader, &shape, &mut cache, &x, n, sparse);
+            assert_eq!(cache.layers[0].len, rows, "the reader pushed rows");
+            for (a, b) in got.iter().zip(&expected) {
+                assert!(
+                    (a - b).abs() < 1e-5,
+                    "sparse={sparse}: {got:?} vs {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// SSMax is one scalar per head on the query, so a constant factor `c`
+    /// (scale 0, bias `c`) must equal attending with `kq_scale * c`.
+    #[test]
+    fn ssmax_scales_the_attention_logits_per_head() {
+        let n = 3;
+        let x = values(n * N_EMBD, 3.0);
+        let (mut scaled, shape) = mla();
+        scaled.ssmax = Some(super::super::position::Ssmax::from_parts(
+            vec![0.0; shape.n_head],
+            vec![1.7; shape.n_head],
+        ));
+        let (plain, mut wide) = mla();
+        wide.kq_scale *= 1.7;
+
+        let mut a = KvCache::new_mixed(16, &[shape.kv_row], &[]);
+        let mut b = KvCache::new_mixed(16, &[shape.kv_row], &[]);
+        let got = mla_prompt(&scaled, &shape, &mut a, &x, n, false);
+        let expected = mla_prompt(&plain, &wide, &mut b, &x, n, false);
+        for (g, e) in got.iter().zip(&expected) {
+            assert!((g - e).abs() < 1e-4, "{got:?} vs {expected:?}");
+        }
     }
 
     /// The per-head gate and the per-dimension gate must be told apart by

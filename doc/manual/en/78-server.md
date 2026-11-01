@@ -1793,27 +1793,59 @@ mod`), so adding a family is additive rather than a rewrite:
 - `glm.rs` — GLM with DeepSeek sparse attention (`general.architecture =
   "glm-dsa"`), e.g. `unsloth/GLM-5.2-GGUF`, confirmed against upstream
   `src/models/glm-dsa.cpp` and the DSA `build_attn` overload in
-  `src/llama-graph.cpp`. The block shape is an ordinary pre-norm
-  transformer and the FFN is `qwen35moe`'s routed-plus-shared MoE (dense
-  for the first `leading_dense_block_count` layers); the attention is what
-  earns it a module. **MLA, absorbed**: one `kv_lora_rank`-wide compressed
-  vector per token plus a shared rotary part is the whole layer's K and V
-  for every head, and instead of decompressing it, the query goes through
-  the per-head key-decompression matrix (`attn_k_b`) and the output comes
-  back through `attn_v_b`. The cache is therefore K-only — the value is the
-  leading `kv_lora_rank` of the same row, which is what
-  `arch::attend`'s `value_dim` parameter exists for. **The lightning
-  indexer**: a 32-head, 128-wide attention with its own per-token key cache
-  scores every earlier position, and the layer attends only the
-  `indexer.top_k` best; `attention.indexer.types` says which layers score
-  and which reuse the last scoring layer's choice, defaulted from the
-  reference config for the GLM-5.2 quants that omit the key. The scoring
-  pass is skipped below `indexer.top_k` positions, where it provably cannot
-  change the mask. Note the two normalizations that differ from everything
-  around them: the indexer key is **LayerNorm**ed (mean-centred, with a
-  bias) rather than RMS-normed, and the attention scale follows
-  `key_length_mla`, not the wider absorbed query/key width. The
-  multi-token-prediction block (`blk.78`) is not run, as in `deepseek4.rs`.
+  `src/llama-graph.cpp`. A loader: it reads how a `glm-dsa` file spells its
+  shape into `dsa.rs`'s trunk and runs nothing of its own. **MLA,
+  absorbed**: one `kv_lora_rank`-wide compressed vector per token plus a
+  shared rotary part is the whole layer's K and V for every head, and
+  instead of decompressing it, the query goes through the per-head
+  key-decompression matrix (`attn_k_b`) and the output comes back through
+  `attn_v_b`. The cache is therefore K-only — the value is the leading
+  `kv_lora_rank` of the same row. The query has a LoRA bottleneck
+  (`attn_q_a`/`attn_q_b`) whose intermediate the indexer's query is
+  projected off. YaRN, when declared, follows the DeepSeek convention: the
+  rope kernel's own magnitude stays at 1 and `mscale²` is folded into the
+  softmax scale, which follows `key_length_mla`, not the wider absorbed
+  query/key width. `attention.indexer.types` says which layers score, and
+  is defaulted from the reference config for the GLM-5.2 quants that omit
+  it. The multi-token-prediction block (`blk.78`) is not run, as in
+  `deepseek4.rs`.
+- `dsa.rs` — **not an architecture**: the DeepSeek-sparse-attention trunk
+  `glm.rs` and `mistral_large4.rs` are both configurations of. A plain
+  pre-norm stack — attention, residual, FFN, residual — of
+  `kda::MlaLayer` restricted to what an `indexer::Indexer` selects, then
+  `ffn::LayerFfn`. A layer without its own indexer attends the selection
+  the last scoring layer made, carried down the stack per token; a
+  selection that is the whole causal window for every token (any position
+  below `indexer.top_k`) takes the dense attention path, which reads the
+  prefix once instead of gathering it per token. A model may declare more
+  than one attention shape — rotary and position-free layers differ in
+  query split, cache-row width and indexer rotation — and each layer names
+  its own by index (`LayerPlan`), along with the layer whose cache rows it
+  attends. `validate_plans` refuses a stack whose first layer does not
+  score, or whose layer reads rows that are not an earlier same-shape
+  layer's own. The tail applies `final_logit_softcapping` when the file
+  declares it.
+- `ffn.rs` — **not an architecture**: the DeepSeek-style feed-forward
+  layer (`LayerFfn`): dense SwiGLU for the first
+  `leading_dense_block_count` layers, then routed SwiGLU experts plus one
+  always-on shared expert, through `swiglu_moe_ffn`. `dsa.rs`, `glm5.rs`
+  and `bailingmoe.rs` load and run it; each passes its own `FfnLimits` —
+  `glm5-next`'s pre-activation clamp on the dense blocks as well as the
+  experts, Ling 3.0's activated clamp on the experts only, none for the
+  others. Routing comes from `ExpertRouting::from_gguf`, which every MoE
+  architecture with a declared gating function shares.
+- `position.rs` — **not an architecture**: the position-dependent terms
+  several architectures share. `yarn_rope_params` reads the rotary
+  parameters a file declares, YaRN included, with the magnitude term
+  upstream hands the rope kernel (pre-cancelling the kernel's own
+  `1 + 0.1·ln(factor)`, and the `yarn_log_multiplier` ratio when the key is
+  set) — `mistral.rs` and `mistral_large4.rs` both read their rope through
+  it. `log_position_temperature` is `log(floor(pos / floor) + 1) · scale +
+  1`, `mistral3`'s attention temperature. `Ssmax` is a learned per-head
+  query scale `s · log(pos + 1) + b` over the same basis; one scalar per
+  head, so it commutes with the rotation and with MLA's absorption, and
+  `kda::MlaLayer` and `indexer::Indexer` both apply it when a layer carries
+  `attn_ssmax` / `indexer.ssmax`.
 - `hyper.rs` — **not an architecture**: the hyper-connection (mHC) residual
   that `deepseek4.rs` and `glm5.rs` both run, extracted from the first when
   the second needed it. In place of a residual *vector* the state between
@@ -1829,10 +1861,11 @@ mod`), so adding a family is additive rather than a rewrite:
   architectures differ solely in the final collapse: `deepseek4` has a mixer
   of its own (`output_hc_*`), `glm5` takes the plain mean.
 - `indexer.rs` — **not an architecture**: the lightning indexer (DeepSeek
-  sparse attention) that `glm.rs` and `glm5.rs` both bolt onto their latent
-  attention, extracted from the first when the second needed it. A scoring
-  layer projects a small per-head query off the *attention query's own* LoRA
-  intermediate, keeps a narrow key cache, and scores each visible key with a
+  sparse attention) that `dsa.rs` and `glm5.rs` both bolt onto their latent
+  attention. A scoring layer projects a small per-head query off the
+  *attention query's own* LoRA intermediate — or, on a layer that carries
+  `indexer.q_norm` (`mistral-large4`, whose query has no LoRA), off the
+  LayerNormed layer input — keeps a narrow key cache, and scores each visible key with a
   `relu`'d per-head dot product weighted by a per-head scalar read from the
   layer input. Two shapes: per position (`glm-dsa`), and **pooled**
   (`glm5-next`), where positions are grouped into fixed
@@ -2004,7 +2037,26 @@ mod`), so adding a family is additive rather than a rewrite:
   `[3072, 4096]`), YaRN RoPE scaling, `NORM` rope pairing, and a
   Llama-4-style attention temperature scale — the last of which is exactly
   `1.0` below the trained context, so a short prompt cannot tell whether it
-  is implemented at all.
+  is implemented at all. The rope parameters and the temperature formula
+  come from `position.rs`.
+- `mistral_large4.rs` — `mistral-large4` (Mistral Large 4), e.g.
+  `unsloth/Mistral-Large-4-1T-A52B-GGUF`, confirmed against upstream
+  `src/models/mistral-large4.cpp`. Despite the name, `glm-dsa`'s block, not
+  `mistral3`'s, and a loader onto `dsa.rs` the way `glm.rs` is; from
+  `mistral3` it takes the rope convention (`position::yarn_rope_params`,
+  NORM pairing). What it adds, every item declared in the file: a query
+  with no LoRA (`attn_q`), so the indexer LayerNorms the layer input for its
+  own query (`indexer.q_norm`); SSMax on both queries (`attn_ssmax`,
+  `indexer.ssmax`); position-free layers from `attention.rope_pattern`,
+  run as a second attention shape whose cache row is the compressed vector
+  alone — upstream zero-pads it to the rotary width, which adds nothing to a
+  dot product; key/value rows shared between layers from
+  `attention.kv_source_map`, the reading layer loaded with
+  `MlaLayer::load_reading` and carrying no `attn_kv_a_mqa`; learned rotary
+  frequency divisors (`rope_freqs.weight`) on the attention and the
+  indexer alike; and `final_logit_softcapping`. YaRN runs without magnitude
+  scaling, so the softmax scale is the plain `1/sqrt(key_length_mla)`. The
+  tokenizer's `tekken-num3` split groups digits from the right in threes.
 
 - `muse.rs` — `muse-glimmer` (Muse-Glimmer), e.g.
   `unsloth/Muse-Glimmer-30B-GGUF`, confirmed against upstream
@@ -4034,7 +4086,7 @@ or parsed, and are noted as such where they appear.
 | `ORANGU_PREFILL_KV_WAIT` | off (`1` turns it on) | While the residual stream stays on the device, a KV-owning layer's attention chain no longer waits for its key/value rows to come back to the host before the next layer is recorded: the positions are counted into the cache at once (the device pages already hold the values, which is all the next stripe and the next layer read) and the rows land in one mappable stage per chunk, filled after the chunk with a single wait. The host copy is what prefix reuse and slot save read, and it is complete by the time either can run. The per-layer wait had been the one place the device-resident prefill still drained the device: on a 42-layer model with 24 KV-owning layers it was 335 ms of a 158-token chunk. `1` restores the wait per layer, the control arm. |
 | `ORANGU_PREFILL_STREAM_DENSE` | on (`0` turns it off) | Whether a dense gemma layer **without** a per-layer-embedding stage keeps the residual stream on the device: its post-attention chain writes the layer's result — output scale included, folded into the FFN post-norm's kernel — straight into the other stream buffer, as the per-layer-embedding chain does for a layer that has one. Before, the stream only held a layer with that stage; every other layer (the embedding model's, the 31B's) landed its rows on the host and took its chains one waited-for call at a time. Measured 2× on `embeddinggemma` at 64–128 tokens; a bidirectional batch above the stripe width still takes the host path (the fused attention chain declines it), so 256 tokens and up are unchanged. `0` restores the per-layer-embedding requirement, the control arm. |
 | `ORANGU_HOST_STREAM_TOKENS` | `32` (integer; `0` turns it off) | On a model split with the CPU as a device, the narrowest batch at which a **host layer's** projection is sent to the first card rather than run on the CPU. A host layer's weights are already in RAM, and at one token the card would spend longer fetching them than multiplying — but a prefill batch multiplies the same weights by every token, so above this width the layer's Q/K/V, gate/up and down projections upload their weights into the card's bounded streaming region (the same region routed experts stream through, `ORANGU_EXPERT_STREAM_BYTES`), run the integer-dot GEMM there, and read the rows back to the host exactly as the CPU's product would arrive. Nothing else about the layer moves: its attention and its KV cache stay on the host, and the card's residency plan is untouched since the region recycles. A batch wider than one submission's stripe (`ORANGU_MAX_TOKENS_PER_SUBMISSION`) streams stripe by stripe with the weights uploaded once. Decode never takes it, whatever the width — a decode step's numerics must not depend on how many sequences share it. Output differs from the CPU kernel's by the activation rounding, and is closer to the float product: on real weights and activations of the 12B model's first host layer, the card's error against the dequantized product is 0.4–0.6 % where the CPU kernel's is 0.9–1.5 %. Measured on gemma-4-12B split 18:30 over a 4 GiB card and the host, a 512-token chunk's host layer went from 1045 ms (gate/up 586, down 258, Q/K/V 182, attention 19) to 187 ms (83, 56, 29, 19) against 115 for a resident layer's whole fused chain; the prompt went from 12.5 to 49 tok/s at 574 tokens, the 31B from 3.7 to 16. `0` keeps every host layer on the host, the control arm. |
-| `ORANGU_EXPERT_GEMM_TOKENS` | `256` (integer; `0` turns it off) | The narrowest prefill batch at which a mixture-of-experts layer's **routed experts run on the card**, as one submission per layer: the layer's whole expert stack (every expert's gate/up rows as one tensor, ~270 MiB on a 128-expert model) crosses the bus into the streaming region, every expert is multiplied by the rows routed to it in a single *indexed* integer-dot GEMM dispatch per projection (a table names, per token tile, which expert's rows and which activation rows; the activations are quantized once for the layer and never gathered per expert), the activation and multiply run on the card, the product is quantized there, the down stack is copied over the gate/up one inside the same submission and multiplied the same way, and the rows are weighted by their routing weights and summed per token on the card — the host reads back the layer's `[n_tokens, n_embd]` result and nothing else. Per-expert output scales (a QAT file's) are applied by the GEMM as it stores. Uploads go through a persistently mapped staging pair filled by every core and copied by the DMA engine (2.3 → 4.8 GB/s against `write_buffer`'s one-thread copy), and the next layer's stacks are staged while this layer's submission runs. Below the width the host's per-expert GEMM is faster: the stack crosses the bus whatever the batch, the host's cost is per token; measured on a 26B-A4B file the two are level near 220 tokens (host 0.55 ms per token per layer; card ~120 ms per layer fixed plus ~10 ms per 128 tokens), the card 9% behind at 158 tokens and 29% ahead at 574 (49 → 63 tok/s, the reference engine at 66). The region is reserved at model load so it lands in the card's own memory: created later, once the weights had filled a 4 GiB card, it landed in host memory and every expert dispatch read its weights across the bus at a fixed 40 ms (6 ms resident). `ORANGU_EXPERT_GEMM_TOKS` (16/32/64/128, default 32) is the indexed kernel's token tile — one expert's routed tokens are a few dozen, and the dense kernels' 128-token tile would be three quarters padding. Output differs from the host path's by the activation roundings, both 8-bit; a wrong tile or table is off by whole rows. `0` keeps the experts on the host at every width, the control arm. Applies to the SwiGLU/GEGLU expert families — `gemma`, `qwen35moe`/`qwen3next`, and every architecture on the shared SwiGLU mixture path (`qwen3moe`, `glm-dsa`, `glm5-next`, `bailingmoe3`) — whose whole routed feed-forward runs as one submission; a gate-less family (`nemotron_h_moe`) has the same one-submission form with its squared ReLU fused on the card, but keeps its experts on the host at every width unless `ORANGU_GPU_EXPERTS` is set: it picks six of 128 experts per token, so a wide chunk streams 650–830 MiB of stack per layer and the device form measured level with the host GEMM, which leaves the card's memory to the KV pool. |
+| `ORANGU_EXPERT_GEMM_TOKENS` | `256` (integer; `0` turns it off) | The narrowest prefill batch at which a mixture-of-experts layer's **routed experts run on the card**, as one submission per layer: the layer's whole expert stack (every expert's gate/up rows as one tensor, ~270 MiB on a 128-expert model) crosses the bus into the streaming region, every expert is multiplied by the rows routed to it in a single *indexed* integer-dot GEMM dispatch per projection (a table names, per token tile, which expert's rows and which activation rows; the activations are quantized once for the layer and never gathered per expert), the activation and multiply run on the card, the product is quantized there, the down stack is copied over the gate/up one inside the same submission and multiplied the same way, and the rows are weighted by their routing weights and summed per token on the card — the host reads back the layer's `[n_tokens, n_embd]` result and nothing else. Per-expert output scales (a QAT file's) are applied by the GEMM as it stores. Uploads go through a persistently mapped staging pair filled by every core and copied by the DMA engine (2.3 → 4.8 GB/s against `write_buffer`'s one-thread copy), and the next layer's stacks are staged while this layer's submission runs. Below the width the host's per-expert GEMM is faster: the stack crosses the bus whatever the batch, the host's cost is per token; measured on a 26B-A4B file the two are level near 220 tokens (host 0.55 ms per token per layer; card ~120 ms per layer fixed plus ~10 ms per 128 tokens), the card 9% behind at 158 tokens and 29% ahead at 574 (49 → 63 tok/s, the reference engine at 66). The region is reserved at model load so it lands in the card's own memory: created later, once the weights had filled a 4 GiB card, it landed in host memory and every expert dispatch read its weights across the bus at a fixed 40 ms (6 ms resident). `ORANGU_EXPERT_GEMM_TOKS` (16/32/64/128, default 32) is the indexed kernel's token tile — one expert's routed tokens are a few dozen, and the dense kernels' 128-token tile would be three quarters padding. Output differs from the host path's by the activation roundings, both 8-bit; a wrong tile or table is off by whole rows. `0` keeps the experts on the host at every width, the control arm. Applies to the SwiGLU/GEGLU expert families — `gemma`, `qwen35moe`/`qwen3next`, and every architecture on the shared SwiGLU mixture path (`qwen3moe`, `glm-dsa`, `mistral-large4`, `glm5-next`, `bailingmoe3`) — whose whole routed feed-forward runs as one submission; a gate-less family (`nemotron_h_moe`) has the same one-submission form with its squared ReLU fused on the card, but keeps its experts on the host at every width unless `ORANGU_GPU_EXPERTS` is set: it picks six of 128 experts per token, so a wide chunk streams 650–830 MiB of stack per layer and the device form measured level with the host GEMM, which leaves the card's memory to the KV pool. |
 | `ORANGU_EXPERT_PACK` | on (`0` turns it off) | Whether a layer's routed experts reach the card **packed**: only the experts the batch routed to, copied from the staged stack into the streaming region in stripes the region's size, each stripe multiplied before the next is copied over it, all inside the one submission — rather than the whole stack uploaded and the region sized to hold it. A 512-token chunk routes to 70–95 of a 128-expert layer, so it moves 60–75% of the bytes, and the region is `ORANGU_EXPERT_REGION_MIB` instead of the largest stack; the staging pair becomes a trio so the next layer's stack can be filled while the stripes' copies are still in flight. Measured on a 26B-A4B file: 100 → 112 tok/s at 512 tokens, the region 333 → 128 MiB, and the card's KV pool 1408 → 1600 tokens. Needs the mapped staging (a discrete card whose host-visible heap is known and is a window smaller than the card's memory — on unified memory, an integrated GPU, there is no window for a half to be sized past, so the pair is not used and uploads take the belt); otherwise, or with `0`, the stack goes whole. |
 | `ORANGU_EXPERT_REGION_MIB` | `128` (integer, MiB) | The streaming region's size when the experts are packed (`ORANGU_EXPERT_PACK`): one stripe of routed experts, and what the card holds for the region between prompts. Larger means fewer stripes per layer (a stripe is a copy and a dispatch per projection) and less room for the KV pool; smaller than one expert's rows falls back to the whole stack. |
 | `ORANGU_HOST_PRELOAD` | on (`0` turns it off) | On a model whose host-resident weights (a mixture-of-experts model's routed experts) fit in memory, reads them into the page cache at start — through the file in 8 MiB reads, in file order, twice — before the first request would otherwise bring them in by demand faults (measured at 30 MB/s on a drive that reads sequentially at 400: eleven minutes of a first prompt on a 20 GiB file). Twice because a page read once sits on the kernel's inactive list and is the first evicted under the server's own allocations when other files hold the cache; the second read keeps it. Logged with the bytes and the time (57 s cold for 24 GiB, 17 s mostly cached). A model larger than memory is the streaming regime and takes `ORANGU_EXPERT_WILLNEED` instead; the per-selection read-ahead also applies to the first pass of a resident model. `0` leaves the first request to do it. |

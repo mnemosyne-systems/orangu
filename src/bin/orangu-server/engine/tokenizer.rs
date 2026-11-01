@@ -126,6 +126,39 @@ const SPLIT_PATTERN_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\
 /// `"gpt2"`-shaped vocab already skips it.
 const SPLIT_PATTERN_TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
 
+/// The "tekken-num3" pre-tokenizer (`mistral-large4`), upstream's
+/// `LLAMA_VOCAB_PRE_TYPE_TEKKEN_NUM3`: [`SPLIT_PATTERN_TEKKEN`] with digits
+/// split into **right-aligned** groups of three — `12345` is `12`, `345`.
+///
+/// Upstream spells the grouping as `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`,
+/// a look-ahead this crate cannot compile. The pattern here takes the whole
+/// digit run instead, and [`right_aligned_digit_groups`] cuts it after the
+/// match — see [`Tokenizer::right_aligned_digits`].
+const SPLIT_PATTERN_TEKKEN_NUM3: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
+
+/// The `tokenizer.ggml.pre` values whose digit runs are cut into
+/// right-aligned groups of three after the regex split.
+const RIGHT_ALIGNED_DIGIT_PRE_TYPES: &[&str] = &["tekken-num3"];
+
+/// Cuts one digit run into right-aligned groups of three: the first group
+/// takes `len % 3` digits (or three), every later one exactly three. What
+/// upstream's look-ahead produces, since its greedy `\p{N}{1,3}` only
+/// succeeds when a multiple of three digits follows.
+fn right_aligned_digit_groups(run: &str) -> Vec<&str> {
+    let starts: Vec<usize> = run.char_indices().map(|(i, _)| i).collect();
+    let n = starts.len();
+    let mut groups = Vec::with_capacity(n / 3 + 1);
+    let mut take = if n.is_multiple_of(3) { 3 } else { n % 3 };
+    let mut at = 0;
+    while at < n {
+        let end = starts.get(at + take).copied().unwrap_or(run.len());
+        groups.push(&run[starts[at]..end]);
+        at += take;
+        take = 3;
+    }
+    groups
+}
+
 /// The Bailing/Ling pre-tokenizer (`tokenizer.ggml.pre` =
 /// `bailingmoe`/`bailingmoe2`/`llada-moe`), from upstream's
 /// `LLAMA_VOCAB_PRE_TYPE_BAILINGMOE` arm.
@@ -238,6 +271,9 @@ fn split_pattern_for_pre(pre: &str) -> (&'static str, bool) {
     if pre == "tekken" {
         return (SPLIT_PATTERN_TEKKEN, true);
     }
+    if pre == "tekken-num3" {
+        return (SPLIT_PATTERN_TEKKEN_NUM3, true);
+    }
     if DEEPSEEK3_PRE_TYPES.contains(&pre) {
         return (SPLIT_PATTERN_DEEPSEEK3, false);
     }
@@ -302,6 +338,10 @@ pub struct Tokenizer {
     /// the merge loop over its bytes. Set for every `LLAMA3_PRE_TYPES`
     /// vocab; false elsewhere, which is exactly the previous behavior.
     ignore_merges: bool,
+    /// Whether a digit run the split regex matched whole is cut into
+    /// right-aligned groups of three before merging
+    /// ([`RIGHT_ALIGNED_DIGIT_PRE_TYPES`]).
+    right_aligned_digits: bool,
     /// Structural tokens ([`is_structural_token_type`]), longest-string-first,
     /// so a literal occurrence in text (a chat template's
     /// `<|start_header_id|>`, or the `<think>` its generation prompt opens
@@ -498,14 +538,13 @@ impl Tokenizer {
         // The pre-tokenizer split pattern is a property of `tokenizer.ggml.
         // pre`, not of `tokenizer.ggml.model` — every vocab below is still
         // `"gpt2"`-shaped, they just disagree on where word boundaries fall.
+        let pre = metadata_string(gguf, "tokenizer.ggml.pre").unwrap_or_default();
         let (split_pattern, ignore_merges) = match vocab_kind {
-            VocabKind::Gpt2Byte => split_pattern_for_pre(
-                metadata_string(gguf, "tokenizer.ggml.pre")
-                    .unwrap_or_default()
-                    .as_str(),
-            ),
+            VocabKind::Gpt2Byte => split_pattern_for_pre(pre.as_str()),
             _ => (SPLIT_PATTERN, false),
         };
+        let right_aligned_digits = vocab_kind == VocabKind::Gpt2Byte
+            && RIGHT_ALIGNED_DIGIT_PRE_TYPES.contains(&pre.as_str());
         let scores = f32_array(gguf, "tokenizer.ggml.scores").unwrap_or_default();
         let add_space_prefix =
             metadata_u32(gguf, "tokenizer.ggml.add_space_prefix").is_none_or(|v| v != 0);
@@ -602,6 +641,7 @@ impl Tokenizer {
             char_to_byte,
             split_re: Regex::new(split_pattern).context("building tokenizer split regex")?,
             ignore_merges,
+            right_aligned_digits,
             special_tokens,
             special_ids,
             bos_token,
@@ -692,8 +732,17 @@ impl Tokenizer {
         // Reused across words so `ignore_merges`' whole-word lookup doesn't
         // allocate per pre-token; untouched entirely when the flag is off.
         let mut mapped = String::new();
-        for word_match in self.split_re.find_iter(text) {
-            let word = word_match.as_str();
+        let words = self.split_re.find_iter(text).flat_map(|m| {
+            let word = m.as_str();
+            let digits = self.right_aligned_digits && word.chars().all(char::is_numeric);
+            let (whole, grouped) = if digits {
+                (None, Some(right_aligned_digit_groups(word)))
+            } else {
+                (Some(word), None)
+            };
+            whole.into_iter().chain(grouped.into_iter().flatten())
+        });
+        for word in words {
             // Upstream's `llm_tokenizer_bpe_session::tokenize`: with
             // `ignore_merges`, a pre-tokenized word that is already a vocab
             // token is emitted as that token rather than being rebuilt from
@@ -1697,6 +1746,30 @@ mod tests {
     /// injects nothing numeric, but a prompt that mentions a year or a
     /// version would be mis-tokenized in a way that still reads fluently,
     /// which is exactly the failure this arm exists to prevent.
+    /// `tekken-num3` groups digits from the *right*: `12345` is `12`,`345`,
+    /// not the left-aligned `123`,`45` that `\p{N}{1,3}` gives. Everything
+    /// else splits as plain `tekken` does.
+    #[test]
+    fn the_tekken_num3_pre_tokenizer_groups_digits_from_the_right() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("tekken-num3");
+        assert_eq!(pattern, super::SPLIT_PATTERN_TEKKEN_NUM3);
+        assert!(ignore_merges);
+        assert!(super::RIGHT_ALIGNED_DIGIT_PRE_TYPES.contains(&"tekken-num3"));
+        assert!(!super::RIGHT_ALIGNED_DIGIT_PRE_TYPES.contains(&"tekken"));
+
+        use super::right_aligned_digit_groups as groups;
+        assert_eq!(groups("1"), ["1"]);
+        assert_eq!(groups("12"), ["12"]);
+        assert_eq!(groups("123"), ["123"]);
+        assert_eq!(groups("1234"), ["1", "234"]);
+        assert_eq!(groups("12345"), ["12", "345"]);
+        assert_eq!(groups("1234567"), ["1", "234", "567"]);
+
+        let re = regex::Regex::new(pattern).expect("the pattern compiles");
+        let split: Vec<&str> = re.find_iter("Paris 12345 x").map(|m| m.as_str()).collect();
+        assert_eq!(split, ["Paris", " ", "12345", " x"]);
+    }
+
     #[test]
     fn the_bailing_pre_tokenizer_splits_digits_one_at_a_time() {
         let (pattern, ignore_merges) = super::split_pattern_for_pre("bailingmoe2");

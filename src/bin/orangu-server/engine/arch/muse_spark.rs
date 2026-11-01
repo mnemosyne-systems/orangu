@@ -63,7 +63,7 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 
 use super::muse::{GatedAttention, GatedAttentionShape, LogitTransforms, swa_layers};
-use super::{ExpertGating, ExpertRouting, ModelForward, SwigluLimit, SwigluMoe};
+use super::{ExpertRouting, ModelForward, SwigluLimit, SwigluMoe};
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::KvCache;
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
@@ -137,24 +137,7 @@ impl MuseSparkModel {
             .context("missing moe_latent_size")? as usize;
         let is_swa = swa_layers(loaded, n_layer);
 
-        let routing = ExpertRouting {
-            groups: super::ExpertGroups::from_gguf(
-                loaded,
-                loaded.metadata_u64("expert_count").unwrap_or(0) as usize,
-            )?,
-            n_expert_used: loaded
-                .metadata_u64("expert_used_count")
-                .context("missing expert_used_count")? as usize,
-            gating: ExpertGating::from_gguf(
-                loaded
-                    .metadata_u64("expert_gating_func")
-                    .context("missing expert_gating_func")?,
-            )?,
-            weights_norm: loaded
-                .metadata_u64("expert_weights_norm")
-                .is_some_and(|v| v != 0),
-            weights_scale: loaded.metadata_f32("expert_weights_scale").unwrap_or(1.0),
-        };
+        let routing = ExpertRouting::from_gguf(loaded)?;
 
         let tok_embeddings = loaded
             .matrix("token_embd.weight")

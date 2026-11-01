@@ -54,6 +54,8 @@ pub mod bailingmoe;
 pub mod deepseek4;
 pub mod deepseek41;
 pub mod dflash;
+pub mod dsa;
+pub mod ffn;
 pub mod gemma;
 pub mod gemma4_assistant;
 pub mod glm;
@@ -66,10 +68,12 @@ pub mod kda;
 pub mod kimi3;
 pub mod llama;
 pub mod mistral;
+pub mod mistral_large4;
 pub mod muse;
 pub mod muse_spark;
 pub mod nemotron;
 pub mod phi;
+pub mod position;
 pub mod qwen35;
 pub mod qwen35moe;
 pub mod qwen3next;
@@ -564,6 +568,31 @@ pub(crate) struct ExpertRouting {
 const MIN_EXPERT_WEIGHT_SUM: f32 = 6.103_515_6e-5;
 
 impl ExpertRouting {
+    /// The routing a file declares: `expert_used_count` and
+    /// `expert_gating_func` (both required), `expert_weights_norm`,
+    /// `expert_weights_scale`, and the expert groups.
+    pub(crate) fn from_gguf(loaded: &crate::engine::loader::LoadedModel) -> Result<Self> {
+        use anyhow::Context as _;
+        Ok(Self {
+            n_expert_used: loaded
+                .metadata_u64("expert_used_count")
+                .context("missing expert_used_count")? as usize,
+            gating: ExpertGating::from_gguf(
+                loaded
+                    .metadata_u64("expert_gating_func")
+                    .context("missing expert_gating_func")?,
+            )?,
+            weights_norm: loaded
+                .metadata_u64("expert_weights_norm")
+                .is_some_and(|v| v != 0),
+            weights_scale: loaded.metadata_f32("expert_weights_scale").unwrap_or(1.0),
+            groups: ExpertGroups::from_gguf(
+                loaded,
+                loaded.metadata_u64("expert_count").unwrap_or(0) as usize,
+            )?,
+        })
+    }
+
     /// Which experts one token uses and with what weight, following
     /// `llm_graph_context::build_moe_ffn` exactly.
     ///

@@ -59,7 +59,6 @@ use engine::arch::deepseek4::Deepseek4Model;
 use engine::arch::deepseek41::Deepseek41Model;
 use engine::arch::dflash::DFlashModel;
 use engine::arch::gemma::GemmaModel;
-use engine::arch::glm::GlmModel;
 use engine::arch::glm5::Glm5Model;
 use engine::arch::inkling::InklingModel;
 use engine::arch::kimi3::Kimi3Model;
@@ -4220,8 +4219,16 @@ fn build_model(
         ArchFamily::Deepseek4 => Arc::new(
             Deepseek4Model::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),
+        // `glm-dsa` and `mistral-large4` are two configurations of one
+        // trunk, `arch::dsa`; each module reads its own file conventions
+        // into it.
         ArchFamily::GlmDsa => Arc::new(
-            GlmModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+            crate::engine::arch::glm::load_with_backend(loaded, backend.clone())
+                .context("building model")?,
+        ),
+        ArchFamily::MistralLarge4 => Arc::new(
+            crate::engine::arch::mistral_large4::load_with_backend(loaded, backend.clone())
+                .context("building model")?,
         ),
         ArchFamily::Glm5Next => Arc::new(
             Glm5Model::load_with_backend(loaded, backend.clone()).context("building model")?,

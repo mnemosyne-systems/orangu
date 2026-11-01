@@ -1,7 +1,7 @@
 # The inference engine: a contributor's map
 
-`orangu-server` carries eighteen architecture modules across twenty-one servable
-architecture families — eighteen language models, two diffusion
+`orangu-server` carries nineteen architecture modules across twenty-two servable
+architecture families — nineteen language models, two diffusion
 transformers, one for pictures and one for video, and one speech model, each
 of the last three with a module of its own outside `engine::arch` — and six
 device backends.
@@ -226,7 +226,10 @@ Architectures, by what they are rather than by name:
 | `qwen35`, `qwen35moe`, `qwen3next` | thin modules over that trunk — dense, MoE, and a different MoE layout |
 | `qwen4exp` | that trunk's two sub-layers on a four-stream hyper-connection residual, with indexer-selected block-sparse attention and an n-gram-hash per-layer embedding |
 | `deepseek4` | multi-head latent attention, block-compressed KV, routed experts |
-| `glm` | latent attention with a sparse-attention indexer |
+| `dsa` | shared trunk: latent attention restricted to what a sparse-attention indexer picks, then dense-lead / shared-expert MoE |
+| `glm`, `mistral_large4` | thin loaders onto that trunk — GLM-5 as declared, and Mistral Large 4 with SSMax, NoPE layers, shared key/value rows, learned rotary frequencies and a logit softcap |
+| `ffn` | shared FFN: dense SwiGLU for the leading layers, routed + shared-expert SwiGLU after |
+| `position` | shared positional terms: YaRN as a file declares it, the log-position attention temperature, SSMax |
 | `kda` | shared half-layers: Kimi Delta Attention, and absorbed latent attention with an optional rotation and output gate |
 | `kimi3`, `bailingmoe` | thin modules over that pair — cross-layer residuals with latent experts, and Ling 3.0's rotated latent attention with group-limited experts |
 | `hyper` | shared residual: a bundle of hyper-connected streams in place of the residual vector |
@@ -237,9 +240,10 @@ Architectures, by what they are rather than by name:
 | `nemotron` | one sub-layer per block, rectangular SSM state, gate-less squared-ReLU FFN — routed (`nemotron_h_moe`) or dense (`nemotron_h`) |
 | `dflash` | not a servable model — a draft sidecar that resolves to its target |
 
-Twenty-two modules above, eighteen architecture modules: `qwen_hybrid`, `kda`,
-`hyper` and `indexer` are shared parts, not architectures of their own.
-Twenty-two `ArchFamily` variants, twenty-one *servable* families: `dflash` is a
+Twenty-six modules above, nineteen architecture modules: `qwen_hybrid`, `kda`,
+`hyper`, `indexer`, `dsa`, `ffn` and `position` are shared parts, not
+architectures of their own.
+Twenty-three `ArchFamily` variants, twenty-two *servable* families: `dflash` is a
 module and a variant but resolves to the model it drafts for rather than
 serving itself, and `QwenImage`, `Ltxv` and `Qwen3Tts` are variants whose
 modules live outside `engine::arch` altogether (below). Those are the two

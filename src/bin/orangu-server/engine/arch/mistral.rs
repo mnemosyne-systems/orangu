@@ -142,11 +142,9 @@ impl MistralModel {
             });
         }
 
-        let n_ctx_orig = loaded
-            .metadata_u64("rope.scaling.original_context_length")
-            .map(|v| v as usize)
-            .unwrap_or(config.n_ctx_train);
-        let rope = Self::rope_params(loaded, &config, n_ctx_orig);
+        let n_ctx_orig = super::position::original_context_length(loaded);
+        // `mistral3` is in upstream's `LLAMA_ROPE_TYPE_NORM` arm.
+        let rope = super::position::yarn_rope_params(loaded, n_ctx_orig, tensor::RopeLayout::Norm);
 
         // Upstream refuses to load rather than guess when the floor scale
         // would be zero (`mistral3.cpp`: "invalid n_ctx_orig_yarn for
@@ -173,72 +171,17 @@ impl MistralModel {
         Ok(model)
     }
 
-    /// Reads the RoPE hyperparameters, including YaRN when the file asks
-    /// for it.
+    /// Llama-4-style temperature tuning applied to Q after RoPE —
+    /// [`super::position::log_position_temperature`] with
+    /// `floor_scale = n_ctx_orig` (16384 for Ministral-3).
     ///
-    /// YaRN is opt-in per file: upstream only sets a nonzero
-    /// `yarn_ext_factor` when `rope.scaling.type` is literally `"yarn"`
-    /// (`llama-context.cpp`), and with `ext_factor == 0` both the ramp and
-    /// the magnitude correction are skipped, leaving a plain rope.
-    ///
-    /// `attn_factor` mirrors that same function: it starts at 1.0, then
-    /// upstream pre-cancels the `1 + 0.1*ln(factor)` that `rope_yarn` is
-    /// about to multiply back in, then folds in the file's own
-    /// `rope.scaling.attn_factor`. The `rope_yarn_log_mul` branch next to it
-    /// computes a ratio of two `get_mscale` calls that is 1.0 for every
-    /// architecture except DeepSeek-V2, so it drops out here.
-    fn rope_params(
-        loaded: &LoadedModel,
-        config: &ModelConfig,
-        n_ctx_orig: usize,
-    ) -> tensor::RopeParams {
-        let yarn = loaded.metadata_string("rope.scaling.type").as_deref() == Some("yarn");
-        let scale_factor = loaded.metadata_f32("rope.scaling.factor").unwrap_or(0.0);
-        let freq_scale = if scale_factor == 0.0 {
-            1.0
-        } else {
-            1.0 / scale_factor
-        };
-        let mut attn_factor = 1.0f32;
-        if yarn {
-            attn_factor *= 1.0 / (1.0 + 0.1 * scale_factor.ln());
-        }
-        attn_factor *= loaded
-            .metadata_f32("rope.scaling.attn_factor")
-            .unwrap_or(1.0);
-        tensor::RopeParams {
-            rope_dim: config.rope_dim,
-            freq_base: config.rope_freq_base,
-            freq_scale,
-            ext_factor: if yarn { 1.0 } else { 0.0 },
-            attn_factor,
-            beta_fast: loaded
-                .metadata_f32("rope.scaling.yarn_beta_fast")
-                .unwrap_or(32.0),
-            beta_slow: loaded
-                .metadata_f32("rope.scaling.yarn_beta_slow")
-                .unwrap_or(1.0),
-            n_ctx_orig,
-            // `mistral3` is in upstream's `LLAMA_ROPE_TYPE_NORM` arm.
-            layout: tensor::RopeLayout::Norm,
-        }
-    }
-
-    /// Llama-4-style temperature tuning, from
-    /// `llm_graph_input_attn_temp::set_input`:
-    /// `log(floor(pos / floor_scale) + 1) * scale + 1`, applied to Q after
-    /// RoPE.
-    ///
-    /// Note this is exactly `1.0` — a no-op — for every position below
-    /// `floor_scale` (`n_ctx_orig`, 16384 for Ministral-3), because the
-    /// floor is then 0 and `log(1) == 0`. It only starts damping attention
-    /// past the trained context, which is why a short-prompt test cannot
-    /// tell whether it is implemented at all.
+    /// Exactly `1.0` — a no-op — for every position below the floor, which
+    /// is why a short-prompt test cannot tell whether it is implemented at
+    /// all.
     fn attn_temperature(&self, pos: usize) -> f32 {
         match self.attn_temp_scale {
             Some(scale) => {
-                let floor_scale = self.rope.n_ctx_orig.max(1);
-                ((pos / floor_scale) as f32 + 1.0).ln() * scale + 1.0
+                super::position::log_position_temperature(pos, self.rope.n_ctx_orig, scale)
             }
             None => 1.0,
         }
@@ -1231,24 +1174,6 @@ impl ModelForward for MistralModel {
             self.config.rms_eps,
         );
         Ok(x)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    /// The temperature curve, against the formula's own definition rather
-    /// than a remembered constant: flat at exactly 1.0 across the whole
-    /// trained context (the floor is 0 there, and `log(1) == 0`), then
-    /// rising once positions run past it.
-    #[test]
-    fn attn_temperature_is_identity_within_the_trained_context() {
-        let model_temp =
-            |pos: usize, floor: usize, scale: f32| ((pos / floor) as f32 + 1.0).ln() * scale + 1.0;
-        for pos in [0usize, 1, 100, 16383] {
-            assert_eq!(model_temp(pos, 16384, 0.1), 1.0, "pos {pos}");
-        }
-        assert!(model_temp(16384, 16384, 0.1) > 1.0);
-        assert!(model_temp(65536, 16384, 0.1) > model_temp(16384, 16384, 0.1));
     }
 }
 

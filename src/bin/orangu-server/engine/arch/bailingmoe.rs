@@ -53,42 +53,13 @@ use anyhow::{Context, Result};
 use std::sync::Arc;
 
 use super::Seqs;
+use super::ffn::{FfnLimits, LayerFfn};
 use super::kda::{BAILINGMOE3_KDA_NAMES, KdaLayer, KdaShape, MlaLayer, MlaShape};
-use super::{
-    ExpertGating, ExpertGroups, ExpertRouting, ModelForward, SwigluLimit, SwigluMoe,
-    SwigluSharedExpert,
-};
+use super::{ExpertRouting, ModelForward, SwigluLimit};
 use crate::engine::backend::Backend;
 use crate::engine::kv_cache::{KvCache, RecurrentSpec};
-use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, ModelConfig, QuantMatrix};
+use crate::engine::loader::{LoadedModel, ModelConfig, QuantMatrix};
 use crate::engine::tensor::{self, RopeLayout, RopeParams};
-
-/// One MoE layer: routed experts plus the always-on shared one, both at
-/// full width on the layer input.
-struct Moe {
-    gate_inp: QuantMatrix,
-    exp_probs_b: Option<Vec<f32>>,
-    gate_exps: ExpertQuantMatrix,
-    up_exps: ExpertQuantMatrix,
-    down_exps: ExpertQuantMatrix,
-    gate_shexp: QuantMatrix,
-    up_shexp: QuantMatrix,
-    down_shexp: QuantMatrix,
-    /// This layer's entries in `swiglu_clamp_exp` / `swiglu_clamp_shexp`.
-    /// Ling 3.0 takes the *activated* form of the clamp — upstream's
-    /// `arch == LLM_ARCH_DEEPSEEK4` branch is the other one.
-    clamp_exp: SwigluLimit,
-    clamp_shexp: SwigluLimit,
-}
-
-enum Ffn {
-    Dense {
-        gate: QuantMatrix,
-        up: QuantMatrix,
-        down: QuantMatrix,
-    },
-    Moe(Box<Moe>),
-}
 
 enum Attn {
     Kda(Box<KdaLayer>),
@@ -99,7 +70,12 @@ struct Layer {
     attn_norm: Vec<f32>,
     ffn_norm: Vec<f32>,
     attn: Attn,
-    ffn: Ffn,
+    ffn: LayerFfn,
+    /// This layer's entries in `swiglu_clamp_exp` / `swiglu_clamp_shexp`.
+    /// Ling 3.0 takes the *activated* form of the clamp — upstream's
+    /// `arch == LLM_ARCH_DEEPSEEK4` branch is the other one — and leaves
+    /// its dense blocks unclamped.
+    limits: FfnLimits,
 }
 
 pub struct BailingMoeModel {
@@ -196,6 +172,7 @@ impl BailingMoeModel {
                 ..RopeParams::default()
             }),
             rope_dim,
+            freq_factors: None,
             // The *query head's* width, not the wider absorbed key's.
             kq_scale: 1.0 / (head_k_mla as f32).sqrt(),
             eps: loaded.config.rms_eps,
@@ -215,21 +192,7 @@ impl BailingMoeModel {
         let n_expert = loaded
             .metadata_u64("expert_count")
             .context("missing expert_count")? as usize;
-        let routing = ExpertRouting {
-            n_expert_used: loaded
-                .metadata_u64("expert_used_count")
-                .context("missing expert_used_count")? as usize,
-            gating: ExpertGating::from_gguf(
-                loaded
-                    .metadata_u64("expert_gating_func")
-                    .context("missing expert_gating_func")?,
-            )?,
-            weights_norm: loaded
-                .metadata_u64("expert_weights_norm")
-                .is_some_and(|v| v != 0),
-            weights_scale: loaded.metadata_f32("expert_weights_scale").unwrap_or(1.0),
-            groups: ExpertGroups::from_gguf(loaded, n_expert)?,
-        };
+        let routing = ExpertRouting::from_gguf(loaded)?;
         let n_layer_dense_lead = loaded
             .metadata_u64("leading_dense_block_count")
             .unwrap_or(0) as usize;
@@ -267,18 +230,6 @@ impl BailingMoeModel {
                     .with_context(|| format!("loading {name}"))?
                     .0)
             };
-            let get_matrix = |suffix: &str| -> Result<QuantMatrix> {
-                let name = format!("blk.{i}.{suffix}");
-                loaded
-                    .matrix(&name)
-                    .with_context(|| format!("loading {name}"))
-            };
-            let get_expert_matrix = |suffix: &str| -> Result<ExpertQuantMatrix> {
-                let name = format!("blk.{i}.{suffix}");
-                loaded
-                    .expert_matrix(&name)
-                    .with_context(|| format!("loading {name}"))
-            };
 
             let attn = if kv_heads == 0 {
                 recurrent_specs.push(kda.recurrent_spec());
@@ -299,37 +250,11 @@ impl BailingMoeModel {
                 )?))
             };
 
-            let ffn = if i < n_layer_dense_lead {
-                Ffn::Dense {
-                    gate: get_matrix("ffn_gate.weight")?,
-                    up: get_matrix("ffn_up.weight")?,
-                    down: get_matrix("ffn_down.weight")?,
-                }
-            } else {
-                let moe = Moe {
-                    gate_inp: get_matrix("ffn_gate_inp.weight")?,
-                    exp_probs_b: get("exp_probs_b.bias").ok(),
-                    gate_exps: get_expert_matrix("ffn_gate_exps.weight")?,
-                    up_exps: get_expert_matrix("ffn_up_exps.weight")?,
-                    down_exps: get_expert_matrix("ffn_down_exps.weight")?,
-                    gate_shexp: get_matrix("ffn_gate_shexp.weight")?,
-                    up_shexp: get_matrix("ffn_up_shexp.weight")?,
-                    down_shexp: get_matrix("ffn_down_shexp.weight")?,
-                    clamp_exp: SwigluLimit::activated(clamp_exp.get(i).copied().unwrap_or(0.0)),
-                    clamp_shexp: SwigluLimit::activated(clamp_shexp.get(i).copied().unwrap_or(0.0)),
-                };
-                anyhow::ensure!(
-                    moe.gate_exps.n_expert == n_expert,
-                    "layer {i} carries {} experts, not the declared expert_count ({n_expert})",
-                    moe.gate_exps.n_expert
-                );
-                anyhow::ensure!(
-                    moe.gate_inp.out_dim == n_expert,
-                    "layer {i}'s router scores {} experts, not the declared expert_count \
-                     ({n_expert}) — grouped selection would then cut the wrong rows",
-                    moe.gate_inp.out_dim
-                );
-                Ffn::Moe(Box::new(moe))
+            let ffn = LayerFfn::load(loaded, i, i < n_layer_dense_lead, Some(n_expert))?;
+            let limits = FfnLimits {
+                dense: SwigluLimit::None,
+                exp: SwigluLimit::activated(clamp_exp.get(i).copied().unwrap_or(0.0)),
+                shexp: SwigluLimit::activated(clamp_shexp.get(i).copied().unwrap_or(0.0)),
             };
 
             layers.push(Layer {
@@ -337,6 +262,7 @@ impl BailingMoeModel {
                 ffn_norm: get("ffn_norm.weight")?,
                 attn,
                 ffn,
+                limits,
             });
         }
 
@@ -442,50 +368,25 @@ impl BailingMoeModel {
                 n_embd,
                 self.config.rms_eps,
             );
-            match &layer.ffn {
-                // The leading dense layers capture too. This model's
-                // `leading_dense_block_count` is 1, so without this the
-                // capture is one layer short of the model's depth for ever
-                // and the NPU concludes the architecture never offers its
-                // feed-forward input at all.
-                Ffn::Dense { gate, up, down } => {
-                    crate::engine::dump_ffn_input(il, n_tokens, &cur);
-                    super::swiglu_ffn_into(
-                        backend,
-                        &mut ffn_out,
-                        &mut ffn_scratch,
-                        &cur,
-                        n_tokens,
-                        gate,
-                        up,
-                        down,
-                    );
-                }
-                Ffn::Moe(moe) => {
-                    ffn_out = super::swiglu_moe_ffn(
-                        backend,
-                        &self.routing,
-                        &cur,
-                        n_tokens,
-                        n_embd,
-                        &SwigluMoe {
-                            gate_inp: &moe.gate_inp,
-                            exp_probs_b: moe.exp_probs_b.as_deref(),
-                            gate_exps: &moe.gate_exps,
-                            up_exps: &moe.up_exps,
-                            down_exps: &moe.down_exps,
-                            shared: Some(SwigluSharedExpert {
-                                gate: &moe.gate_shexp,
-                                up: &moe.up_shexp,
-                                down: &moe.down_shexp,
-                            }),
-                            clamp_exp: moe.clamp_exp,
-                            clamp_shexp: moe.clamp_shexp,
-                        },
-                        il,
-                    )
-                }
+            // The leading dense layers capture too. This model's
+            // `leading_dense_block_count` is 1, so without this the capture
+            // is one layer short of the model's depth for ever and the NPU
+            // concludes the architecture never offers its feed-forward input
+            // at all.
+            if layer.ffn.is_dense() {
+                crate::engine::dump_ffn_input(il, n_tokens, &cur);
             }
+            layer.ffn.forward_into(
+                backend,
+                &self.routing,
+                &mut ffn_out,
+                &mut ffn_scratch,
+                &cur,
+                n_tokens,
+                n_embd,
+                layer.limits,
+                il,
+            );
             tensor::add_inplace(&mut x, &ffn_out);
         }
 

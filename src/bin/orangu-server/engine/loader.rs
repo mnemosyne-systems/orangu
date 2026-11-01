@@ -165,6 +165,14 @@ pub enum ArchFamily {
     /// `attention.key_length` rather than derived, and an attention
     /// temperature scale. See `engine::arch::mistral`.
     Mistral3,
+    /// Mistral Large 4 (`mistral-large4`) — not `mistral3`'s block but
+    /// [`ArchFamily::GlmDsa`]'s: absorbed multi-head latent attention with
+    /// a per-token lightning indexer, then shared-expert MoE. On top of it,
+    /// a query with no LoRA, a learned per-head SSMax query scale, NoPE
+    /// layers, key/value rows shared between layers, learned rotary
+    /// frequencies and a final logit softcap. See
+    /// `engine::arch::mistral_large4` and `engine::arch::dsa`.
+    MistralLarge4,
     /// Muse-Glimmer (`muse-glimmer`) — a dense GQA decoder with gemma-style
     /// sandwich norms around both sub-layers, per-head QK-norm, a sigmoid
     /// output gate on attention (`attn_gate`), an alternating pattern of
@@ -277,6 +285,10 @@ const LLAMA_STYLE_ARCHITECTURES: &[&str] = &[
 /// `mistral3` (e.g. `unsloth/Ministral-3-3B-Instruct-2512-GGUF`) — see
 /// [`ArchFamily::Mistral3`] and `engine::arch::mistral`.
 const MISTRAL_ARCHITECTURES: &[&str] = &["mistral3"];
+/// `mistral-large4` (e.g. `unsloth/Mistral-Large-4-1T-A52B-GGUF`) — see
+/// [`ArchFamily::MistralLarge4`]. The `mmproj-*.gguf` shipped alongside is
+/// a separate vision model and is not this.
+const MISTRAL_LARGE4_ARCHITECTURES: &[&str] = &["mistral-large4"];
 
 /// [`ArchFamily::Granite`] and `engine::arch::granite`.
 ///
@@ -491,6 +503,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if MISTRAL_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Mistral3);
     }
+    if MISTRAL_LARGE4_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::MistralLarge4);
+    }
     if GRANITE_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Granite);
     }
@@ -569,6 +584,7 @@ fn supported_architecture_names() -> Vec<&'static str> {
         .chain(KIMI_K3_ARCHITECTURES)
         .chain(PHI3_ARCHITECTURES)
         .chain(MISTRAL_ARCHITECTURES)
+        .chain(MISTRAL_LARGE4_ARCHITECTURES)
         .chain(MUSE_ARCHITECTURES)
         .chain(MUSE_SPARK_ARCHITECTURES)
         .chain(INKLING_ARCHITECTURES)
@@ -2991,6 +3007,7 @@ mod tests {
             (ArchFamily::Deepseek41, "deepseek41"),
             (ArchFamily::Phi3, "phi3"),
             (ArchFamily::Mistral3, "mistral3"),
+            (ArchFamily::MistralLarge4, "mistral-large4"),
             (ArchFamily::Muse, "muse-glimmer"),
             (ArchFamily::MuseSpark, "muse-spark"),
             (ArchFamily::Inkling, "inkling"),
@@ -3018,6 +3035,7 @@ mod tests {
                 ArchFamily::Deepseek41 => "Deepseek41",
                 ArchFamily::Phi3 => "Phi3",
                 ArchFamily::Mistral3 => "Mistral3",
+                ArchFamily::MistralLarge4 => "MistralLarge4",
                 ArchFamily::Granite => "Granite",
                 ArchFamily::Muse => "Muse",
                 ArchFamily::MuseSpark => "MuseSpark",
