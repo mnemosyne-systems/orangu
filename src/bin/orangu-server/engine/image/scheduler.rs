@@ -85,6 +85,45 @@ pub fn sigmas(config: &ScheduleConfig, steps: usize, image_seq_len: usize) -> Ve
     out
 }
 
+/// FLUX.2's noise levels — `steps + 1` values, as [`sigmas`] returns:
+/// the same linear spacing and exponential shift, but with the shift `mu`
+/// fitted to both the token count and the step count
+/// ([`flux2_empirical_mu`]) and no stretch to a terminal level
+/// (`shift_terminal` is unset in its `scheduler_config.json`).
+pub fn flux2_sigmas(steps: usize, image_seq_len: usize) -> Vec<f32> {
+    assert!(steps > 0, "a schedule needs at least one step");
+    let mu = flux2_empirical_mu(image_seq_len, steps).exp();
+    let mut out: Vec<f32> = (0..steps)
+        .map(|i| {
+            let t = if steps == 1 {
+                1.0
+            } else {
+                1.0 + (1.0 / steps as f64 - 1.0) * (i as f64 / (steps - 1) as f64)
+            };
+            (mu / (mu + (1.0 / t - 1.0))) as f32
+        })
+        .collect();
+    out.push(0.0);
+    out
+}
+
+/// diffusers' `compute_empirical_mu` for FLUX.2: two lines in the token
+/// count, for 10 and 200 steps, interpolated linearly in the step count;
+/// past 4300 tokens the 200-step line alone.
+pub fn flux2_empirical_mu(image_seq_len: usize, steps: usize) -> f64 {
+    let (a1, b1) = (8.738_095_24e-5, 1.898_333_33);
+    let (a2, b2) = (0.000_169_27, 0.456_666_66);
+    let len = image_seq_len as f64;
+    if image_seq_len > 4300 {
+        return a2 * len + b2;
+    }
+    let m_200 = a2 * len + b2;
+    let m_10 = a1 * len + b1;
+    let a = (m_200 - m_10) / 190.0;
+    let b = m_200 - 200.0 * a;
+    a * steps as f64 + b
+}
+
 /// The eight-step schedule `Qwen/Qwen-Image-2.1-Turbo` was distilled for
 /// and ships with — `steps + 1` levels, as [`sigmas`] returns.
 pub const QWEN_IMAGE_21_TURBO: [f32; 9] = [
@@ -215,6 +254,21 @@ impl Noise {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Against diffusers' `compute_empirical_mu` and the shifted
+    /// `np.linspace` it feeds, worked in Python.
+    #[test]
+    fn flux2_schedule_matches_the_reference() {
+        assert!((flux2_empirical_mu(4096, 50) - 2.023_351_157).abs() < 1e-6);
+        assert!((flux2_empirical_mu(5000, 20) - 1.303_016_66).abs() < 1e-6);
+        let s = flux2_sigmas(50, 4096);
+        assert_eq!(s.len(), 51);
+        assert_eq!((s[0], s[50]), (1.0, 0.0));
+        assert!((s[1] - 0.997_309).abs() < 1e-6);
+        assert!((s[49] - 0.133_719).abs() < 1e-6);
+        let s = flux2_sigmas(4, 1024);
+        assert!((s[1] - 0.958_085).abs() < 1e-6 && (s[3] - 0.717_497).abs() < 1e-6);
+    }
 
     /// The Turbo table is served as-is at its own eight steps, and read
     /// between its entries at any other count, still from noise to `0`.

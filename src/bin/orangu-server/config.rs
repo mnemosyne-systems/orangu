@@ -2143,11 +2143,13 @@ impl ServerConfiguration {
     /// The picture defaults for a `variant` model with `adapter` in place:
     /// `image_steps` and `image_cfg_scale` as configured, or — left out —
     /// the model's own release settings (Qwen-Image's fifty steps at
-    /// guidance 4, Qwen-Image 2.1's forty unguided ones), except under a
+    /// guidance 4, Qwen-Image 2.1's forty unguided ones, FLUX.2 [klein]
+    /// base's fifty at guidance 4), except under a
     /// Lightning adapter, where they are the step count its name carries
     /// and guidance off, which is what it was trained for (the base model's
     /// fifty guided steps under it, or eight unguided steps without it, are
-    /// noise). The Turbo checkpoint (`turbo`) is the same: eight steps,
+    /// noise). A step-distilled checkpoint (`turbo`) is the same: its own
+    /// steps (Qwen-Image 2.1 Turbo's eight, a distilled [klein]'s four),
     /// guidance off.
     pub fn image_defaults_under(
         &self,
@@ -2157,7 +2159,7 @@ impl ServerConfiguration {
     ) -> crate::engine::image::ImageDefaults {
         let mut defaults = self.image.clone();
         let (release_steps, release_cfg) = if turbo {
-            crate::engine::image::Variant::TURBO_STEPS_AND_CFG
+            variant.turbo_steps_and_cfg()
         } else {
             variant.release_steps_and_cfg()
         };

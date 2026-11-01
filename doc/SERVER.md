@@ -2101,8 +2101,35 @@ There is no adapter for 2.1 (`image_lora = auto` finds none; naming one is
 an error), and none is needed: its release settings — the defaults when
 the config leaves them out — are forty steps without guidance. Sizes are
 multiples of 32. `orangu-server download unsloth/Qwen-Image-2.1-GGUF:Q4_K_M`
-fetches the three files. Everything below applies to both models except
-where it names Qwen-Image's own files.
+fetches the three files.
+
+**FLUX.2 [klein] 4B** is served the same way: `unsloth/FLUX.2-klein-base-4B-GGUF`
+(`list`'s `Yes (flux2_klein)`). Its GGUFs say `flux`, FLUX.1's name, and are
+recognised by their tensors (global modulation, no guidance embedder — a
+FLUX.1 or FLUX.2 [dev] file stays `No (flux)`). It is a 4-billion-parameter
+transformer of five dual-stream and twenty single-stream blocks
+(`engine::image::flux2`), with two companions found the same way:
+
+- **The text encoder** — Qwen3-4B, a `qwen3` GGUF of width 2560 (any
+  quantization; `download` fetches `unsloth/Qwen3-4B-GGUF:Q8_0`, and an
+  embedding model of the same shape is never picked). The prompt is put in
+  the Qwen3 chat template, padded or cut to 512 tokens, and the
+  transformer reads layers 9, 18 and 27 side by side; the padding stays in
+  what it attends to, as the reference pipeline hands it over.
+- **The VAE** — `vae/diffusion_pytorch_model.safetensors` from
+  `black-forest-labs/FLUX.2-klein-base-4B` (or ComfyUI's
+  `flux2-vae.safetensors`, in the original naming): 32 latent channels at
+  an eighth of the picture, normalised by the VAE's own batch statistics.
+
+Its release settings are fifty steps at guidance 4 for the `base`
+checkpoint, four without guidance for a step-distilled [klein] (a file
+without `base` in its name); sizes are multiples of 16; a blank negative
+prompt is the empty one. There is no adapter and no editing: an attached
+picture is a starting point. `orangu-server download
+unsloth/FLUX.2-klein-base-4B-GGUF:Q4_K_M` fetches the three files.
+
+Everything below applies to every picture model except where it names
+Qwen-Image's own files.
 
 A `qwen_image` file is one third of the model, and the other two thirds
 are found beside it in the models directory:
@@ -2268,14 +2295,14 @@ is asked none of these.
 
 Six keys set what a picture request gets when it does not say. The
 defaults are the model's own release settings — Qwen-Image 2.1's forty
-unguided steps, Qwen-Image's fifty at guidance 4 — except that under a
+unguided steps, Qwen-Image's and FLUX.2 [klein] base's fifty at guidance 4 — except that under a
 Lightning adapter — the default, when one is under `models` — `image_steps`
 and `image_cfg_scale` follow the adapter (its step count, guidance off)
 unless the file sets them:
 
 | `[orangu-server]`       | default                             |                                                                                                                                                                                                                                                                                      |
 | :---------------------- | :---------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `image_size`            | `1024x1024`                         | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch; 32 for Qwen-Image 2.1                                                                                                                                                                       |
+| `image_size`            | `1024x1024`                         | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch (Qwen-Image, FLUX.2 [klein]); 32 for Qwen-Image 2.1                                                                                                                                                                       |
 | `image_steps`           | `50` (2.1: `40`); the adapter's (`8`) under one | denoising steps; the time a picture takes is close to linear in this                                                                                                                                                                                                                 |
 | `image_cfg_scale`       | `4` (2.1: `1`); `1` under an adapter | classifier-free guidance: how far the picture is pushed towards the prompt and away from the negative one. `1` turns guidance off, which halves the work per step                                                                                                                    |
 | `image_negative_prompt` | a single space                      | what the picture is pushed away from; only read when guidance is on                                                                                                                                                                                                                  |
@@ -3226,7 +3253,8 @@ Delta Attention layers alternating with gated, _rotated_ absorbed latent
 attention, over sigmoid-routed experts whose selection is group-limited:
 the experts form `expert_group_count` groups and only the best
 `expert_group_used_count` of them may serve a token), and Qwen-Image
-(`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF`, and `qwen_image_2_1`,
+(`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF`, `flux2_klein`,
+`unsloth/FLUX.2-klein-base-4B-GGUF` with a `qwen3` encoder, and `qwen_image_2_1`,
 `unsloth/Qwen-Image-2.1-GGUF` with a `qwen3vl` encoder — not a language model:
 a dual-stream diffusion transformer that denoises a latent picture under a
 prompt's hidden states, served with a `qwen2vl` text encoder and the

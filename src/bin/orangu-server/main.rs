@@ -174,7 +174,7 @@ struct RoleFlags {
     /// Embedding only.
     #[arg(long)]
     embedding: bool,
-    /// Picture generation — a qwen_image or qwen_image_2_1 model, the only kind this role
+    /// Picture generation — a qwen_image, qwen_image_2_1 or flux2_klein model, the only kind this role
     /// serves and the only role such a model is served in.
     #[arg(long)]
     image: bool,
@@ -2226,10 +2226,10 @@ fn prepare(args: Args) -> Result<Prepared> {
                 config::ImageLora::Spec(spec) => {
                     Some(engine::image::resolve_lora(&conf.models, spec)?)
                 }
-                // No step distillation is published for Qwen-Image 2.1,
-                // and Qwen-Image's Lightning adapters do not fit its
-                // transformer: `auto` finds nothing to serve.
-                config::ImageLora::Auto if variant == engine::image::Variant::QwenImage21 => None,
+                // No step distillation is published for Qwen-Image 2.1 or
+                // FLUX.2 [klein] as an adapter, and Qwen-Image's Lightning
+                // adapters fit neither transformer: `auto` finds nothing.
+                config::ImageLora::Auto if variant != engine::image::Variant::QwenImage => None,
                 config::ImageLora::Auto => {
                     let found = orangu::model_spec::find_qwen_image_lightning(&conf.models);
                     if found.is_none() {
@@ -2267,11 +2267,10 @@ fn prepare(args: Args) -> Result<Prepared> {
                 }
                 None => (None, None),
             };
-            let turbo = variant == engine::image::Variant::QwenImage21
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(orangu::model_spec::is_turbo);
+            let turbo = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| variant.is_step_distilled(name));
             let image_defaults = conf.image_defaults_under(variant, lora_path.as_deref(), turbo);
             let mut pipeline = engine::image::Pipeline::load(
                 &transformer,
@@ -5704,7 +5703,7 @@ fn fix_role_for_model(
                 config::Role::Video => ("video generators (ltxv)", "a video"),
                 config::Role::Audio => ("speech generators (qwen3tts)", "a speech"),
                 _ => (
-                    "picture generators (qwen_image, qwen_image_2_1)",
+                    "picture generators (qwen_image, qwen_image_2_1, flux2_klein)",
                     "an image",
                 ),
             };

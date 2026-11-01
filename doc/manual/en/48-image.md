@@ -202,6 +202,46 @@ the defaults (1024 × 1024, eight steps) about 20 minutes on the same
 board. The two models' companions are different files and do not mix;
 each finds its own.
 
+### FLUX.2 [klein] 4B
+
+**FLUX.2 [klein] 4B** (Black Forest Labs' compact text-to-image model, 4
+billion parameters, Apache 2.0) is served as `flux2_klein`. It is the
+smallest of the three — the quickest to draw and the lightest to hold —
+and needs two companions, which the download fetches beside it:
+
+```sh
+orangu-server download unsloth/FLUX.2-klein-base-4B-GGUF:Q4_K_M
+```
+
+- **The transformer** — `flux-2-klein-base-4b-Q4_K_M.gguf` from
+  `unsloth/FLUX.2-klein-base-4B-GGUF`, 2.3 GiB (`Q8_0` is 4.1 GiB).
+- **The text encoder** — `Qwen3-4B-Q8_0.gguf` from `unsloth/Qwen3-4B-GGUF`,
+  4.0 GiB. The picture is conditioned on three of its inner layers, which
+  is why the 8-bit file is the one fetched; any quantization of Qwen3-4B
+  under `models` is used instead (not Qwen3-Embedding-4B, which `list`
+  marks as an embedding model).
+- **The VAE** — `vae/diffusion_pytorch_model.safetensors` from
+  `black-forest-labs/FLUX.2-klein-base-4B`, 160 MiB. ComfyUI's
+  `flux2-vae.safetensors` is read too.
+
+`list` shows the transformer as `Yes (flux2_klein)`. Its file says
+`flux`, the name FLUX.1 files carry as well; the server recognises
+[klein] by its tensors, and a FLUX.1 or FLUX.2 [dev] file stays
+`No (flux)`.
+
+The `base` checkpoint is the undistilled model and is released to run
+**fifty steps at guidance 4** — two transformer passes a step — which is
+what `image_steps` and `image_cfg_scale` default to under it. A
+step-distilled [klein] (a file without `base` in its name) defaults to
+**four steps without guidance**. Sides are multiples of 16 pixels, and a
+blank negative prompt is the empty one FLUX.2 is guided against. Every
+prompt is read as 512 tokens — padded or cut — so a long prompt costs no
+more than a short one, and words past the 512th are not read.
+
+[klein] does not draw transparency, and an attached picture is a
+starting point rather than an edit (see **Strength** below). There is no
+adapter for it: `image_lora` stays `auto` (nothing) or `none`.
+
 ## Starting the server
 
 The image model is served in its own role, `image`, and `--image` is the
@@ -279,9 +319,9 @@ not say otherwise. Each row has an **(i)** that explains it on hover.
 
 | setting | choices | |
 | :-- | :-- | :-- |
-| **Size** | 256 × 256 up to 2048 × 2048, or *Other…* for any `WIDTHxHEIGHT` | Both sides a multiple of 32 for Qwen-Image 2.1 (16 for Qwen-Image 2512); a preset the served model cannot draw, such as 1280 × 720 on 2.1, is greyed. 1024 × 1024 is the default; 2048 × 2048 is 2.1's native size, and hours on a CPU. 512 × 512 is a preview in minutes |
-| **Steps** | 4, 8, 20, 40, 50, or a number | The time is linear in them. Qwen-Image 2.1 is made for 40, and 20 is a usable draft. For 2512, the 8-step adapter is made for 8, the 4-step file for 4, and the base model without an adapter needs 50 |
-| **Guidance** | Off, 4, 6, or a number | Classifier-free guidance pushes the picture towards the prompt and away from the negative one; it doubles the work of every step. Qwen-Image 2.1 is released to run with it off (stable-diffusion.cpp's examples use 6). For 2512: off under a Lightning adapter, which was trained without it, and 4 for the base model |
+| **Size** | 256 × 256 up to 2048 × 2048, or *Other…* for any `WIDTHxHEIGHT` | Both sides a multiple of 32 for Qwen-Image 2.1 (16 for Qwen-Image 2512 and FLUX.2 [klein]); a preset the served model cannot draw, such as 1280 × 720 on 2.1, is greyed. 1024 × 1024 is the default; 2048 × 2048 is 2.1's native size, and hours on a CPU. 512 × 512 is a preview in minutes |
+| **Steps** | 4, 8, 20, 40, 50, or a number | The time is linear in them. Qwen-Image 2.1 is made for 40, and 20 is a usable draft. For 2512, the 8-step adapter is made for 8, the 4-step file for 4, and the base model without an adapter needs 50. FLUX.2 [klein] base is made for 50, a distilled [klein] for 4 |
+| **Guidance** | Off, 4, 6, or a number | Classifier-free guidance pushes the picture towards the prompt and away from the negative one; it doubles the work of every step. Qwen-Image 2.1 is released to run with it off (stable-diffusion.cpp's examples use 6). For 2512: off under a Lightning adapter, which was trained without it, and 4 for the base model. FLUX.2 [klein] base: 4; a distilled [klein]: off |
 | **Negative prompt** | text | What the picture is pushed away from — *blurry, text, extra limbs*. Read only when guidance is on |
 | **Strength** | 0 – 1 | For a picture started from an attached one (not an edit — see **Editing a picture**): how much of the schedule to run over it. 1 ignores the attachment's content and keeps only its size; 0 returns it unchanged; 0.6 keeps the composition and redraws the rest |
 | **Format** | PNG, JPEG, GIF, WebP, SVG | What the picture comes back as. PNG and WebP are lossless and keep a transparent picture's alpha, JPEG smaller (a transparent picture on white), GIF one frame on 256 colours, SVG a document of the picture's size carrying it as PNG (there is no pixels-to-vector). A picture started from an attachment comes back in the attachment's own format |

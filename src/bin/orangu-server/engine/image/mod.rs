@@ -50,8 +50,22 @@
 //! rather than once per step (see [`transformer21`]'s module doc), and its
 //! guidance is plain classifier-free guidance — the release samples without
 //! any, forty steps.
+//!
+//! **FLUX.2 [klein]** (`flux2_klein`, [`Variant::Flux2Klein`]) goes through
+//! it with a third set: a 4-billion-parameter transformer of dual- and
+//! single-stream blocks ([`flux2`]) conditioned on three of a Qwen3-4B
+//! encoder's layers side by side, the prompt padded to 512 tokens
+//! ([`qwen3vl::TextModel::forward_layers_masked`] — the padding is part of
+//! what the transformer attends to), and the FLUX.2 VAE ([`vae_flux2`]):
+//! 32 latent channels at an eighth of the picture, 2x2 cells folded into a
+//! 128-wide token and normalised by the VAE's own batch statistics. Its
+//! schedule's shift is fitted to the step count as well as the size
+//! ([`scheduler::flux2_sigmas`]) and its guidance is plain — the base
+//! model's release settings are fifty steps at 4, the step-distilled
+//! [klein] four without guidance.
 
 pub mod codec;
+pub mod flux2;
 pub mod lora;
 pub mod qwen3vl;
 pub mod safetensors;
@@ -61,6 +75,7 @@ pub mod transformer;
 pub mod transformer21;
 pub mod vae;
 pub mod vae21;
+pub mod vae_flux2;
 
 use crate::engine::arch::ModelForward;
 use crate::engine::backend::Backend;
@@ -73,10 +88,12 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 pub use codec::ImageFormat;
+use flux2::Flux2Transformer;
 use scheduler::{Noise, ScheduleConfig};
 use transformer::{ForwardInput, QwenImageTransformer};
 use transformer21::QwenImage21Transformer;
 use vae::{Feature, LATENTS_MEAN, LATENTS_STD, QwenImageVae, SPATIAL_COMPRESSION, Z_DIM};
+use vae_flux2::Flux2Vae;
 use vae21::QwenImage21Vae;
 
 /// The text encoder's chat framing around a prompt — diffusers'
@@ -97,6 +114,17 @@ const PROMPT21_SYSTEM: &str =
     "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
 const PROMPT21_USER_PREFIX: &str = "<|im_start|>user\n";
 
+/// FLUX.2 [klein]'s framing: the Qwen3 chat template around a user turn,
+/// `add_generation_prompt` with `enable_thinking = False` (the empty
+/// thought). Nothing is dropped: every token conditions the picture.
+const FLUX2_PROMPT_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+/// The length every FLUX.2 prompt is truncated or padded to —
+/// `max_sequence_length`.
+const FLUX2_PROMPT_TOKENS: usize = 512;
+/// The text encoder layers the transformer reads, side by side —
+/// `text_encoder_out_layers`.
+const FLUX2_TEXT_LAYERS: [usize; 3] = [9, 18, 27];
+
 /// Which picture model the pipeline serves — decided by the transformer
 /// file's architecture, and deciding every companion and default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +135,9 @@ pub enum Variant {
     /// `qwen_image_2_1`: Qwen-Image 2.1 — single-stream and block-causal,
     /// 7 billion parameters, Qwen3-VL-8B encoder, RGBA VAE.
     QwenImage21,
+    /// `flux2_klein`: FLUX.2 [klein] 4B — dual- then single-stream, Qwen3-4B
+    /// encoder, the FLUX.2 VAE.
+    Flux2Klein,
 }
 
 impl Variant {
@@ -115,6 +146,7 @@ impl Variant {
         match architecture {
             "qwen_image" => Some(Self::QwenImage),
             orangu::model_spec::QWEN_IMAGE_21_ARCHITECTURE => Some(Self::QwenImage21),
+            orangu::model_spec::FLUX2_KLEIN_ARCHITECTURE => Some(Self::Flux2Klein),
             _ => None,
         }
     }
@@ -123,17 +155,32 @@ impl Variant {
         match self {
             Self::QwenImage => "qwen_image",
             Self::QwenImage21 => orangu::model_spec::QWEN_IMAGE_21_ARCHITECTURE,
+            Self::Flux2Klein => orangu::model_spec::FLUX2_KLEIN_ARCHITECTURE,
+        }
+    }
+
+    /// Whether a transformer file of this variant is a step-distilled
+    /// checkpoint, by its name (its weights are laid out like the base
+    /// model's): Qwen-Image 2.1 Turbo, or a FLUX.2 [klein] that is not the
+    /// `base` one.
+    pub fn is_step_distilled(self, file_name: &str) -> bool {
+        match self {
+            Self::QwenImage => false,
+            Self::QwenImage21 => orangu::model_spec::is_turbo(file_name),
+            Self::Flux2Klein => orangu::model_spec::is_distilled_klein(file_name),
         }
     }
 
     /// Pixels one latent token covers along each side, which a picture's
     /// size must be a multiple of: Qwen-Image's VAE cell is 8 pixels and its
     /// transformer packs 2x2 cells into a token; Qwen-Image 2.1's cell is 16
-    /// pixels, one token each, and diffusers still rounds to 32.
+    /// pixels, one token each, and diffusers still rounds to 32. FLUX.2's
+    /// cell is 8 pixels, 2x2 of them a token.
     pub fn size_unit(self) -> usize {
         match self {
             Self::QwenImage => 2 * SPATIAL_COMPRESSION,
             Self::QwenImage21 => 2 * vae21::SPATIAL_COMPRESSION,
+            Self::Flux2Klein => 2 * vae_flux2::SPATIAL_COMPRESSION,
         }
     }
 
@@ -142,6 +189,7 @@ impl Variant {
         match self {
             Self::QwenImage => (TEXT_ENCODER_ARCHITECTURE, TEXT_ENCODER_WIDTH),
             Self::QwenImage21 => ("qwen3vl", 4096),
+            Self::Flux2Klein => ("qwen3", orangu::model_spec::FLUX2_KLEIN_TEXT_ENCODER_WIDTH),
         }
     }
 
@@ -153,6 +201,10 @@ impl Variant {
                 orangu::model_download::QWEN_IMAGE_21_TEXT_ENCODER_REPO,
                 orangu::model_download::QWEN_IMAGE_21_TEXT_ENCODER_TAG,
             ),
+            Self::Flux2Klein => (
+                orangu::model_download::FLUX2_KLEIN_TEXT_ENCODER_REPO,
+                orangu::model_download::FLUX2_KLEIN_TEXT_ENCODER_TAG,
+            ),
         }
     }
 
@@ -163,13 +215,18 @@ impl Variant {
                 orangu::model_download::QWEN_IMAGE_21_VAE_REPO,
                 orangu::model_download::QWEN_IMAGE_21_VAE_FILE,
             ),
+            Self::Flux2Klein => (
+                orangu::model_download::FLUX2_VAE_REPO,
+                orangu::model_download::FLUX2_VAE_FILE,
+            ),
         }
     }
 
     /// The model's own release settings, before the configuration: see
     /// [`ImageDefaults::default`] for Qwen-Image's. Qwen-Image 2.1's are
     /// forty steps without guidance (`true_cfg_scale = 1.0`, "meant to be
-    /// sampled without guidance").
+    /// sampled without guidance"); FLUX.2 [klein] base's are fifty at
+    /// guidance 4.
     pub fn release_steps_and_cfg(self) -> (usize, f32) {
         match self {
             Self::QwenImage => {
@@ -177,12 +234,29 @@ impl Variant {
                 (d.steps, d.cfg_scale)
             }
             Self::QwenImage21 => (40, 1.0),
+            Self::Flux2Klein => (50, 4.0),
         }
     }
 
-    /// The release settings of the Turbo checkpoint ([`Pipeline::turbo`]):
-    /// the eight steps it was distilled for, without guidance.
-    pub const TURBO_STEPS_AND_CFG: (usize, f32) = (8, 1.0);
+    /// The release settings of a step-distilled checkpoint
+    /// ([`Pipeline::turbo`]), without guidance: the eight steps Qwen-Image
+    /// 2.1 Turbo was distilled for, the four of a distilled FLUX.2 [klein].
+    pub fn turbo_steps_and_cfg(self) -> (usize, f32) {
+        match self {
+            Self::Flux2Klein => (4, 1.0),
+            Self::QwenImage | Self::QwenImage21 => (8, 1.0),
+        }
+    }
+
+    /// The blank a negative prompt left empty is encoded as: a single
+    /// space for the Qwen models (what their own examples pass), the empty
+    /// string for FLUX.2, whose pipeline guides against `""`.
+    fn blank_negative(self) -> &'static str {
+        match self {
+            Self::Flux2Klein => "",
+            Self::QwenImage | Self::QwenImage21 => " ",
+        }
+    }
 
     /// Multiply-adds per image token per transformer pass — see
     /// [`MACS_PER_TOKEN_PASS`].
@@ -191,6 +265,8 @@ impl Variant {
             Self::QwenImage => MACS_PER_TOKEN_PASS,
             // `4 × 4096² + 3 × 4096 × 12288` per block, thirty-two blocks.
             Self::QwenImage21 => 7.0e9,
+            // `4 × 3072² + 3 × 3072 × 9216` per block, twenty-five blocks.
+            Self::Flux2Klein => 3.1e9,
         }
     }
 }
@@ -256,7 +332,7 @@ impl Companions {
             None => find_vae(models_dir, variant)?,
         };
         let vision = match (variant, vision) {
-            (Variant::QwenImage, _) | (_, Some("none")) => None,
+            (Variant::QwenImage | Variant::Flux2Klein, _) | (_, Some("none")) => None,
             (Variant::QwenImage21, Some(path)) => {
                 let path = PathBuf::from(path);
                 let path = if path.is_absolute() {
@@ -287,12 +363,14 @@ fn find_text_encoder(models_dir: &Path, variant: Variant) -> Result<PathBuf> {
     let found = match variant {
         Variant::QwenImage => orangu::model_spec::find_qwen_image_text_encoder(models_dir),
         Variant::QwenImage21 => orangu::model_spec::find_qwen_image21_text_encoder(models_dir),
+        Variant::Flux2Klein => orangu::model_spec::find_flux2_klein_text_encoder(models_dir),
     };
     let (architecture, width) = variant.text_encoder();
     let (repo, tag) = variant.text_encoder_download();
     let name = match variant {
         Variant::QwenImage => "Qwen2.5-VL-7B",
         Variant::QwenImage21 => "Qwen3-VL-8B",
+        Variant::Flux2Klein => "Qwen3-4B",
     };
     found.ok_or_else(|| {
         anyhow::anyhow!(
@@ -314,6 +392,10 @@ fn find_vae(models_dir: &Path, variant: Variant) -> Result<PathBuf> {
         Variant::QwenImage21 => (
             orangu::model_spec::find_qwen_image21_vae(models_dir),
             "Qwen-Image 2.1 VAE (a .safetensors with a 64-channel, RGBA decoder)",
+        ),
+        Variant::Flux2Klein => (
+            orangu::model_spec::find_flux2_vae(models_dir),
+            "FLUX.2 VAE (a .safetensors with a 32-channel decoder and its latent batch statistics)",
         ),
     };
     let (repo, file) = variant.vae_download();
@@ -396,6 +478,7 @@ fn calibration_tensor(transformer: &LoadedModel) -> &'static str {
         "transformer_blocks.0.img_mlp.net.0.proj.weight",
         "transformer_blocks.0.img_mlp.gate_up.weight",
         "transformer_blocks.0.img_mlp.proj.weight",
+        Flux2Transformer::CALIBRATION_TENSOR,
     ]
     .into_iter()
     .find(|name| transformer.has_tensor(name))
@@ -781,6 +864,13 @@ enum Model {
         transformer: QwenImage21Transformer,
         vae: QwenImage21Vae,
     },
+    Flux2Klein {
+        transformer: Flux2Transformer,
+        vae: Flux2Vae,
+        /// The Qwen3 encoder read through the reference forward, which
+        /// takes the padding mask and returns inner layers.
+        text: qwen3vl::TextModel,
+    },
 }
 
 /// A prompt as the transformer reads it: Qwen-Image's text-encoder hidden
@@ -889,10 +979,12 @@ pub struct Pipeline {
     /// The adapter the transformer carries, for `/props` — set by `prepare`
     /// after the load, which is where the file was resolved.
     pub adapter: Option<PathBuf>,
-    /// Whether the transformer is Qwen-Image 2.1's step-distilled Turbo
-    /// checkpoint ([`orangu::model_spec::is_turbo`]), which samples on its
-    /// own fixed schedule ([`scheduler::QWEN_IMAGE_21_TURBO`]) — set by
-    /// `prepare` after the load, which is where the file name is known.
+    /// Whether the transformer is a step-distilled checkpoint
+    /// ([`Variant::is_step_distilled`]): Qwen-Image 2.1 Turbo, which samples
+    /// on its own fixed schedule ([`scheduler::QWEN_IMAGE_21_TURBO`]), or a
+    /// distilled FLUX.2 [klein], whose schedule is the base model's at its
+    /// own few steps — set by `prepare` after the load, which is where the
+    /// file name is known.
     pub turbo: bool,
     /// One generation at a time — see the module doc.
     busy: Mutex<()>,
@@ -929,6 +1021,55 @@ impl Pipeline {
                 )
             })?;
         let (_, text_width) = variant.text_encoder();
+        if variant == Variant::Flux2Klein {
+            ensure!(
+                lora.is_none(),
+                "no adapter is served for {}: set [orangu-server].image_lora = none",
+                variant.architecture()
+            );
+            let transformer = Flux2Transformer::load(transformer, backend.clone())
+                .context("building the flux2_klein transformer")?;
+            let layers = FLUX2_TEXT_LAYERS.len();
+            ensure!(
+                transformer.config.txt_dim == layers * encoder.config().n_embd,
+                "the transformer reads {}-wide text states — {layers} layers of a {}-wide encoder \
+                 — but the text encoder is {} wide{}",
+                transformer.config.txt_dim,
+                transformer.config.txt_dim / layers,
+                encoder.config().n_embd,
+                if transformer.config.txt_dim == layers * 4096 {
+                    " (a FLUX.2 [klein] 9B reads Qwen3-8B: point [orangu-server].text_encoder at it)"
+                } else {
+                    ""
+                }
+            );
+            let weights =
+                LoadedModel::open(&companions.text_encoder).context("mapping the text encoder")?;
+            let text = qwen3vl::TextModel::load(&weights, backend.clone())?;
+            ensure!(
+                FLUX2_TEXT_LAYERS
+                    .iter()
+                    .all(|&l| l <= weights.config.n_layer),
+                "the text encoder has {} layers; the transformer reads layer {}",
+                weights.config.n_layer,
+                FLUX2_TEXT_LAYERS[layers - 1]
+            );
+            let vae = Flux2Vae::load(&companions.vae, backend, vae_precision)
+                .context("loading the VAE")?;
+            return Ok(Self::assemble(
+                Model::Flux2Klein {
+                    transformer,
+                    vae,
+                    text,
+                },
+                variant,
+                encoder,
+                tokenizer,
+                defaults,
+                companions,
+                rate,
+            ));
+        }
         if variant == Variant::QwenImage21 {
             ensure!(
                 lora.is_none(),
@@ -1070,6 +1211,7 @@ impl Pipeline {
         match &self.model {
             Model::QwenImage { transformer, .. } => &transformer.config,
             Model::QwenImage21 { transformer, .. } => &transformer.config,
+            Model::Flux2Klein { transformer, .. } => &transformer.config,
         }
     }
 
@@ -1152,10 +1294,45 @@ impl Pipeline {
         Ok(hidden)
     }
 
+    /// FLUX.2 [klein]'s conditioning: the prompt in the Qwen3 chat template,
+    /// truncated or padded with `<|endoftext|>` to [`FLUX2_PROMPT_TOKENS`],
+    /// and the encoder's [`FLUX2_TEXT_LAYERS`] side by side for every token
+    /// — padding included, as diffusers hands them to the transformer —
+    /// `[512, 3 × width]`.
+    fn encode_prompt_flux2(
+        &self,
+        text: &qwen3vl::TextModel,
+        prompt: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<f32>> {
+        let rendered = format!("{PROMPT21_USER_PREFIX}{prompt}{FLUX2_PROMPT_SUFFIX}");
+        let mut tokens = self.tokenizer.encode(&rendered, false);
+        tokens.truncate(FLUX2_PROMPT_TOKENS);
+        let n_real = tokens.len();
+        ensure!(n_real > 0, "the prompt encoded to no tokens");
+        let pad = self.tokenizer.encode("<|endoftext|>", false);
+        ensure!(
+            pad.len() == 1,
+            "the text encoder's tokenizer has no <|endoftext|> token to pad with"
+        );
+        tokens.resize(FLUX2_PROMPT_TOKENS, pad[0]);
+        text.forward_layers_masked(&tokens, n_real, &FLUX2_TEXT_LAYERS, Some(cancel))
+            .context("running the text encoder")
+    }
+
     /// A prompt as the transformer reads it (see [`Condition`]).
     fn condition(&self, prompt: &str, cancel: &AtomicBool) -> Result<Condition> {
         match &self.model {
             Model::QwenImage { .. } => Ok(Condition::Hidden(self.encode_prompt(prompt)?)),
+            Model::Flux2Klein { text, .. } => {
+                let started = Instant::now();
+                let hidden = self.encode_prompt_flux2(text, prompt, cancel)?;
+                log::info!(
+                    "orangu-server: [image] prompt: text encoder {:.1}s",
+                    started.elapsed().as_secs_f64()
+                );
+                Ok(Condition::Hidden(hidden))
+            }
             Model::QwenImage21 { transformer, .. } => {
                 let started = Instant::now();
                 let hidden = self.encode_prompt21(prompt)?;
@@ -1314,6 +1491,7 @@ impl Pipeline {
         match &self.model {
             Model::QwenImage { transformer, .. } => transformer.take_stages(),
             Model::QwenImage21 { transformer, .. } => transformer.take_stages(),
+            Model::Flux2Klein { transformer, .. } => transformer.take_stages(),
         }
     }
 
@@ -1344,16 +1522,26 @@ impl Pipeline {
                     sigma,
                     cancel: Some(cancel),
                 }),
+            (Model::Flux2Klein { transformer, .. }, Condition::Hidden(txt)) => {
+                transformer.forward(&flux2::ForwardInput {
+                    img: latents,
+                    grid,
+                    txt,
+                    sigma,
+                    cancel: Some(cancel),
+                })
+            }
             _ => bail!("a prompt encoded for one picture model was given to the other"),
         }
     }
 
     /// Classifier-free guidance of `positive` by `negative`: Qwen-Image's
-    /// with its norm rescale ([`guide`]), Qwen-Image 2.1's plain.
+    /// with its norm rescale ([`guide`]), Qwen-Image 2.1's and FLUX.2's
+    /// plain.
     fn guide(&self, positive: &mut [f32], negative: &[f32], scale: f32, token_width: usize) {
         match self.variant {
             Variant::QwenImage => guide(positive, negative, scale, token_width),
-            Variant::QwenImage21 => {
+            Variant::QwenImage21 | Variant::Flux2Klein => {
                 for (p, n) in positive.iter_mut().zip(negative) {
                     *p = n + scale * (*p - n);
                 }
@@ -1408,11 +1596,26 @@ impl Pipeline {
                 normalize_latent21(&mut z);
                 Ok(z)
             }
+            Model::Flux2Klein { vae, .. } => {
+                let rgb = codec::decode_to_feature(bytes, width, height)
+                    .context("reading the attached picture")?;
+                let (mean, logvar) = vae
+                    .encode_unless(&rgb, Some(cancel))
+                    .context("encoding the attached picture")?;
+                let z = sample(mean, logvar, noise);
+                let (h8, w8) = (
+                    height / vae_flux2::SPATIAL_COMPRESSION,
+                    width / vae_flux2::SPATIAL_COMPRESSION,
+                );
+                let mut tokens = pack_patches(&z, h8, w8, vae_flux2::Z_DIM);
+                normalize_flux2(&mut tokens, vae);
+                Ok(tokens)
+            }
         }
     }
 
-    /// The picture a finished latent decodes to: RGB for Qwen-Image, RGBA
-    /// for Qwen-Image 2.1, in `[-1, 1]`.
+    /// The picture a finished latent decodes to: RGB for Qwen-Image and
+    /// FLUX.2, RGBA for Qwen-Image 2.1, in `[-1, 1]`.
     fn picture_from_latent(
         &self,
         latents: &[f32],
@@ -1438,6 +1641,16 @@ impl Pipeline {
                 let mut z = latents.to_vec();
                 denormalize_latent21(&mut z);
                 vae.decode_unless(&Feature::new(h16, w16, vae21::Z_DIM, z), Some(cancel))
+            }
+            Model::Flux2Klein { vae, .. } => {
+                let (h8, w8) = (
+                    height / vae_flux2::SPATIAL_COMPRESSION,
+                    width / vae_flux2::SPATIAL_COMPRESSION,
+                );
+                let mut tokens = latents.to_vec();
+                denormalize_flux2(&mut tokens, vae);
+                let z = unpack_patches(&tokens, h8, w8, vae_flux2::Z_DIM);
+                vae.decode_unless(&Feature::new(h8, w8, vae_flux2::Z_DIM, z), Some(cancel))
             }
         }
     }
@@ -1531,10 +1744,11 @@ impl Pipeline {
                 .clone()
                 .unwrap_or_else(|| self.defaults().negative_prompt);
             // An empty negative prompt still encodes to something: the
-            // template frames it. A single space is what Qwen's own examples
-            // pass, so a blank stays a blank rather than an error.
-            let text = if text.is_empty() {
-                " ".to_string()
+            // template frames it. Each model's own blank is used for it (and
+            // for the other model's), so a blank stays a blank rather than
+            // an error.
+            let text = if text.trim().is_empty() {
+                self.variant.blank_negative().to_string()
             } else {
                 text
             };
@@ -1549,7 +1763,9 @@ impl Pipeline {
             bail!("cancelled");
         }
 
-        let sigmas = if self.turbo {
+        let sigmas = if self.variant == Variant::Flux2Klein {
+            scheduler::flux2_sigmas(request.steps, n_tokens)
+        } else if self.turbo {
             scheduler::resample(&scheduler::QWEN_IMAGE_21_TURBO, request.steps)
         } else {
             scheduler::sigmas(&ScheduleConfig::QWEN_IMAGE, request.steps, n_tokens)
@@ -1895,21 +2111,53 @@ fn denormalize_latent21(z: &mut [f32]) {
     }
 }
 
+/// FLUX.2's latent normalisation, on patchified tokens: `(z - mean) / std`
+/// per channel by the VAE's batch statistics.
+fn normalize_flux2(tokens: &mut [f32], vae: &Flux2Vae) {
+    for row in tokens.chunks_mut(vae_flux2::PATCHED) {
+        for ((v, m), s) in row.iter_mut().zip(&vae.bn_mean).zip(&vae.bn_std) {
+            *v = (*v - m) / s;
+        }
+    }
+}
+
+fn denormalize_flux2(tokens: &mut [f32], vae: &Flux2Vae) {
+    for row in tokens.chunks_mut(vae_flux2::PATCHED) {
+        for ((v, m), s) in row.iter_mut().zip(&vae.bn_mean).zip(&vae.bn_std) {
+            *v = *v * s + m;
+        }
+    }
+}
+
 /// diffusers' `_pack_latents`: a channel-last `[h8 * w8, 16]` latent into
 /// `[(h8/2) * (w8/2), 64]` tokens, each a 2x2 patch with features ordered
 /// `(channel, dy, dx)`.
 pub(crate) fn pack_latent(z: &[f32], h8: usize, w8: usize) -> Vec<f32> {
-    debug_assert_eq!(z.len(), h8 * w8 * Z_DIM);
+    pack_patches(z, h8, w8, Z_DIM)
+}
+
+/// The inverse of [`pack_latent`].
+pub(crate) fn unpack_latent(tokens: &[f32], h8: usize, w8: usize) -> Vec<f32> {
+    unpack_patches(tokens, h8, w8, Z_DIM)
+}
+
+/// A channel-last `[h8 * w8, channels]` latent as `[(h8/2) * (w8/2),
+/// 4 * channels]` tokens, each a 2x2 patch with features ordered
+/// `(channel, dy, dx)` — Qwen-Image's `_pack_latents`, and FLUX.2's
+/// `_patchify_latents` followed by `_pack_latents`.
+pub(crate) fn pack_patches(z: &[f32], h8: usize, w8: usize, channels: usize) -> Vec<f32> {
+    debug_assert_eq!(z.len(), h8 * w8 * channels);
     let (rows, cols) = (h8 / 2, w8 / 2);
-    let mut out = vec![0.0f32; rows * cols * Z_DIM * 4];
+    let width = channels * 4;
+    let mut out = vec![0.0f32; rows * cols * width];
     for r in 0..rows {
         for q in 0..cols {
-            let token = &mut out[(r * cols + q) * Z_DIM * 4..(r * cols + q + 1) * Z_DIM * 4];
-            for c in 0..Z_DIM {
+            let token = &mut out[(r * cols + q) * width..(r * cols + q + 1) * width];
+            for c in 0..channels {
                 for dy in 0..2 {
                     for dx in 0..2 {
                         let px = (2 * r + dy) * w8 + (2 * q + dx);
-                        token[c * 4 + dy * 2 + dx] = z[px * Z_DIM + c];
+                        token[c * 4 + dy * 2 + dx] = z[px * channels + c];
                     }
                 }
             }
@@ -1918,19 +2166,20 @@ pub(crate) fn pack_latent(z: &[f32], h8: usize, w8: usize) -> Vec<f32> {
     out
 }
 
-/// The inverse of [`pack_latent`].
-pub(crate) fn unpack_latent(tokens: &[f32], h8: usize, w8: usize) -> Vec<f32> {
+/// The inverse of [`pack_patches`].
+pub(crate) fn unpack_patches(tokens: &[f32], h8: usize, w8: usize, channels: usize) -> Vec<f32> {
     let (rows, cols) = (h8 / 2, w8 / 2);
-    debug_assert_eq!(tokens.len(), rows * cols * Z_DIM * 4);
-    let mut z = vec![0.0f32; h8 * w8 * Z_DIM];
+    let width = channels * 4;
+    debug_assert_eq!(tokens.len(), rows * cols * width);
+    let mut z = vec![0.0f32; h8 * w8 * channels];
     for r in 0..rows {
         for q in 0..cols {
-            let token = &tokens[(r * cols + q) * Z_DIM * 4..(r * cols + q + 1) * Z_DIM * 4];
-            for c in 0..Z_DIM {
+            let token = &tokens[(r * cols + q) * width..(r * cols + q + 1) * width];
+            for c in 0..channels {
                 for dy in 0..2 {
                     for dx in 0..2 {
                         let px = (2 * r + dy) * w8 + (2 * q + dx);
-                        z[px * Z_DIM + c] = token[c * 4 + dy * 2 + dx];
+                        z[px * channels + c] = token[c * 4 + dy * 2 + dx];
                     }
                 }
             }

@@ -108,7 +108,7 @@ pub fn props_json(pipeline: &Pipeline) -> serde_json::Value {
         })
     };
     json!({
-        // `qwen_image` or `qwen_image_2_1`, and the pixels a side must be a
+        // `qwen_image`, `qwen_image_2_1` or `flux2_klein`, and the pixels a side must be a
         // multiple of for it.
         "architecture": pipeline.variant.architecture(),
         "size_unit": pipeline.size_unit(),

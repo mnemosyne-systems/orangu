@@ -95,8 +95,7 @@ pub fn run_init() -> Result<()> {
     // wants something other than Qwen-Image's release settings, and written
     // only then, like every other default below.
     let image = if role == Role::Image {
-        let turbo = image_variant == crate::engine::image::Variant::QwenImage21
-            && orangu::model_spec::is_turbo(&model);
+        let turbo = image_variant.is_step_distilled(&model);
         Some(prompt_image_keys(Path::new(&models), image_variant, turbo)?)
     } else {
         None
@@ -1339,8 +1338,9 @@ fn prompt_video_keys() -> Result<VideoKeys> {
 /// the two companion files). A value that would not load is re-asked, with
 /// the same wording the config loader would have rejected it with.
 ///
-/// A Qwen-Image 2.1 model (`variant`) has its own encoder, no adapter to
-/// ask about, and its own release steps and guidance to offer.
+/// A Qwen-Image 2.1 or FLUX.2 [klein] model (`variant`) has its own
+/// encoder, no adapter to ask about, and its own release steps and guidance
+/// to offer.
 fn prompt_image_keys(
     models_dir: &Path,
     variant: crate::engine::image::Variant,
@@ -1369,9 +1369,9 @@ fn prompt_image_keys(
     // Qwen-Image 2.1 has none: nothing to ask.
     let found = match variant {
         Variant::QwenImage => orangu::model_spec::find_qwen_image_lightning(models_dir),
-        Variant::QwenImage21 => None,
+        Variant::QwenImage21 | Variant::Flux2Klein => None,
     };
-    let image_lora = if variant == Variant::QwenImage21 {
+    let image_lora = if variant != Variant::QwenImage {
         "auto".to_string()
     } else {
         prompt_line(
@@ -1446,7 +1446,7 @@ fn prompt_image_keys(
         .and_then(orangu::model_spec::lightning_steps)
     {
         Some(steps) => (steps, 1.0),
-        None if turbo => Variant::TURBO_STEPS_AND_CFG,
+        None if turbo => variant.turbo_steps_and_cfg(),
         None => variant.release_steps_and_cfg(),
     };
     let steps = prompt_checked(

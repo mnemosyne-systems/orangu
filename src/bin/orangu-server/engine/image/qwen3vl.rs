@@ -30,7 +30,9 @@
 //!   `(t, row, column)`, spread over the head's frequencies `t h w t h w
 //!   …`), and the DeepStack features added to the picture's rows after the
 //!   first three layers. Text alone reduces to the served path, which a
-//!   test holds it to.
+//!   test holds it to. The same forward reads a plain `qwen3` (one rotary
+//!   axis) for FLUX.2 [klein], which needs inner layers of a padded,
+//!   masked prompt ([`TextModel::forward_layers_masked`]).
 //!
 //! Both are diffusers' `Qwen3VLForConditionalGeneration` as
 //! `QwenImage21Pipeline` calls it, cross-read against llama.cpp's
@@ -554,27 +556,16 @@ impl TextModel {
     pub fn load(loaded: &LoadedModel, backend: Arc<dyn Backend>) -> Result<Self> {
         let c = &loaded.config;
         ensure!(
-            c.architecture == "qwen3vl",
-            "the picture-reading text model is a qwen3vl, not a {}",
+            c.architecture == "qwen3vl" || c.architecture == "qwen3",
+            "the reference text model is a qwen3vl or a qwen3, not a {}",
             c.architecture
         );
-        let sections = loaded
-            .metadata
-            .iter()
-            .find(|(k, _)| k == "qwen3vl.rope.dimension_sections")
-            .and_then(|(_, v)| match v {
-                orangu::gguf::GgufValue::Array(items) => Some(
-                    items
-                        .iter()
-                        .filter_map(|v| v.as_u64())
-                        .map(|v| v as usize)
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
-            })
-            .filter(|s| s.len() >= 3)
-            .map(|s| [s[0], s[1], s[2]])
-            .unwrap_or([24, 20, 20]);
+        // A plain `qwen3` has one rotary axis: every frequency on `t`.
+        let sections = if c.architecture == "qwen3" {
+            [c.head_dim / 2, 0, 0]
+        } else {
+            Self::sections(loaded)
+        };
         ensure!(
             sections.iter().sum::<usize>() * 2 == c.head_dim,
             "the rotary sections {sections:?} do not cover a {}-wide head",
@@ -612,6 +603,27 @@ impl TextModel {
             theta: c.rope_freq_base as f64,
             sections,
         })
+    }
+
+    /// `qwen3vl.rope.dimension_sections`: rotary frequencies per axis.
+    fn sections(loaded: &LoadedModel) -> [usize; 3] {
+        loaded
+            .metadata
+            .iter()
+            .find(|(k, _)| k == "qwen3vl.rope.dimension_sections")
+            .and_then(|(_, v)| match v {
+                orangu::gguf::GgufValue::Array(items) => Some(
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .filter(|s| s.len() >= 3)
+            .map(|s| [s[0], s[1], s[2]])
+            .unwrap_or([24, 20, 20])
     }
 
     /// Every token's last-layer hidden state, **before** the final norm —
@@ -668,79 +680,13 @@ impl TextModel {
         }
         ensure!(pic == sorted.len(), "a picture starts outside the prompt");
         let angles = self.rope_angles(&positions);
-        let (n_head, n_kv, hd) = (self.n_head, self.n_head_kv, self.head_dim);
         let limits = causal_limits(n);
-        let scale = 1.0 / (hd as f32).sqrt();
         let mut normed = Vec::new();
         for (li, layer) in self.layers.iter().enumerate() {
             if super::cancelled(cancel) {
                 bail!("cancelled");
             }
-            tensor::rmsnorm_into(&mut normed, &x, &layer.attn_norm, n, dim, self.eps);
-            let mut qkv = self.backend.matmul_batch(&[
-                MatmulOp {
-                    x: &normed,
-                    n_tokens: n,
-                    w: &layer.wq,
-                },
-                MatmulOp {
-                    x: &normed,
-                    n_tokens: n,
-                    w: &layer.wk,
-                },
-                MatmulOp {
-                    x: &normed,
-                    n_tokens: n,
-                    w: &layer.wv,
-                },
-            ]);
-            let v = qkv.pop().expect("three results");
-            let mut k = qkv.pop().expect("three results");
-            let mut q = qkv.pop().expect("three results");
-            tensor::rmsnorm_inplace(&mut q, &layer.q_norm, n * n_head, hd, self.eps);
-            tensor::rmsnorm_inplace(&mut k, &layer.k_norm, n * n_kv, hd, self.eps);
-            rope_half(&mut q, n_head * hd, hd, &angles);
-            rope_half(&mut k, n_kv * hd, hd, &angles);
-            // Grouped-query attention: each key/value head serves
-            // `n_head / n_kv` query heads.
-            let group = n_head / n_kv;
-            let expand = |src: &[f32]| -> Vec<f32> {
-                let mut out = vec![0.0f32; n * n_head * hd];
-                out.par_chunks_mut(n_head * hd)
-                    .zip(src.par_chunks(n_kv * hd))
-                    .for_each(|(dst, row)| {
-                        for h in 0..n_head {
-                            dst[h * hd..(h + 1) * hd]
-                                .copy_from_slice(&row[(h / group) * hd..(h / group + 1) * hd]);
-                        }
-                    });
-                out
-            };
-            let (k, v) = (expand(&k), expand(&v));
-            let attn = step_attention(&q, n, &k, &v, n, n_head, hd, scale, Some(&limits));
-            drop((q, k, v));
-            let out = self.linear(&attn, n, &layer.wo);
-            tensor::add_inplace(&mut x, &out);
-            tensor::rmsnorm_into(&mut normed, &x, &layer.ffn_norm, n, dim, self.eps);
-            let mut gu = self.backend.matmul_batch(&[
-                MatmulOp {
-                    x: &normed,
-                    n_tokens: n,
-                    w: &layer.gate,
-                },
-                MatmulOp {
-                    x: &normed,
-                    n_tokens: n,
-                    w: &layer.up,
-                },
-            ]);
-            let up = gu.pop().expect("two results");
-            let mut gate = gu.pop().expect("two results");
-            gate.par_iter_mut()
-                .zip(up.par_iter())
-                .for_each(|(g, u)| *g = tensor::silu(*g) * u);
-            let down = self.linear(&gate, n, &layer.down);
-            tensor::add_inplace(&mut x, &down);
+            self.layer(layer, &mut x, n, &angles, &limits, &mut normed);
             // DeepStack: the vision tower's intermediate features, added to
             // the picture's rows after the first layers.
             for (at, row) in x.chunks_mut(dim).enumerate() {
@@ -754,6 +700,138 @@ impl TextModel {
             }
         }
         Ok(x)
+    }
+
+    /// One decoder layer over `x` (`[n, dim]`) in place: query `i` attends
+    /// to the first `limits[i]` keys.
+    fn layer(
+        &self,
+        layer: &TextLayer,
+        x: &mut [f32],
+        n: usize,
+        angles: &[(f32, f32)],
+        limits: &[usize],
+        normed: &mut Vec<f32>,
+    ) {
+        let dim = self.dim;
+        let (n_head, n_kv, hd) = (self.n_head, self.n_head_kv, self.head_dim);
+        let scale = 1.0 / (hd as f32).sqrt();
+        tensor::rmsnorm_into(normed, x, &layer.attn_norm, n, dim, self.eps);
+        let mut qkv = self.backend.matmul_batch(&[
+            MatmulOp {
+                x: normed,
+                n_tokens: n,
+                w: &layer.wq,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens: n,
+                w: &layer.wk,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens: n,
+                w: &layer.wv,
+            },
+        ]);
+        let v = qkv.pop().expect("three results");
+        let mut k = qkv.pop().expect("three results");
+        let mut q = qkv.pop().expect("three results");
+        tensor::rmsnorm_inplace(&mut q, &layer.q_norm, n * n_head, hd, self.eps);
+        tensor::rmsnorm_inplace(&mut k, &layer.k_norm, n * n_kv, hd, self.eps);
+        rope_half(&mut q, n_head * hd, hd, angles);
+        rope_half(&mut k, n_kv * hd, hd, angles);
+        // Grouped-query attention: each key/value head serves
+        // `n_head / n_kv` query heads.
+        let group = n_head / n_kv;
+        let expand = |src: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; n * n_head * hd];
+            out.par_chunks_mut(n_head * hd)
+                .zip(src.par_chunks(n_kv * hd))
+                .for_each(|(dst, row)| {
+                    for h in 0..n_head {
+                        dst[h * hd..(h + 1) * hd]
+                            .copy_from_slice(&row[(h / group) * hd..(h / group + 1) * hd]);
+                    }
+                });
+            out
+        };
+        let (k, v) = (expand(&k), expand(&v));
+        let attn = step_attention(&q, n, &k, &v, n, n_head, hd, scale, Some(limits));
+        drop((q, k, v));
+        let out = self.linear(&attn, n, &layer.wo);
+        tensor::add_inplace(x, &out);
+        tensor::rmsnorm_into(normed, x, &layer.ffn_norm, n, dim, self.eps);
+        let mut gu = self.backend.matmul_batch(&[
+            MatmulOp {
+                x: normed,
+                n_tokens: n,
+                w: &layer.gate,
+            },
+            MatmulOp {
+                x: normed,
+                n_tokens: n,
+                w: &layer.up,
+            },
+        ]);
+        let up = gu.pop().expect("two results");
+        let mut gate = gu.pop().expect("two results");
+        gate.par_iter_mut()
+            .zip(up.par_iter())
+            .for_each(|(g, u)| *g = tensor::silu(*g) * u);
+        let down = self.linear(&gate, n, &layer.down);
+        tensor::add_inplace(x, &down);
+    }
+
+    /// The hidden states after each of `layers` decoder layers (`hidden_states[l]`
+    /// in transformers' numbering: `0` is the embeddings), side by side per
+    /// token — `[tokens.len(), layers.len() * dim]` — for a prompt whose
+    /// first `n_real` tokens are text and the rest padding. As under the
+    /// attention mask a padded batch is encoded with, no query sees a
+    /// padding key: a text token attends causally, a padding token to the
+    /// whole text. Only as many layers run as the deepest one asked for.
+    /// What FLUX.2 [klein] is conditioned on.
+    pub fn forward_layers_masked(
+        &self,
+        tokens: &[u32],
+        n_real: usize,
+        layers: &[usize],
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Vec<f32>> {
+        let (n, dim) = (tokens.len(), self.dim);
+        ensure!(n_real > 0 && n_real <= n, "a prompt of no text tokens");
+        let deepest = layers.iter().copied().max().unwrap_or(0);
+        ensure!(
+            deepest <= self.layers.len(),
+            "layer {deepest} asked of a {}-layer text encoder",
+            self.layers.len()
+        );
+        let mut x = vec![0.0f32; n * dim];
+        x.par_chunks_mut(dim)
+            .zip(tokens.par_iter())
+            .for_each(|(row, &t)| row.copy_from_slice(&self.embd.row(t as usize)));
+        let positions: Vec<[usize; 3]> = (0..n).map(|i| [i; 3]).collect();
+        let angles = self.rope_angles(&positions);
+        let limits: Vec<usize> = (0..n).map(|i| (i + 1).min(n_real)).collect();
+        let width = layers.len() * dim;
+        let mut out = vec![0.0f32; n * width];
+        let take = |x: &[f32], depth: usize, out: &mut [f32]| {
+            for (slot, _) in layers.iter().enumerate().filter(|(_, l)| **l == depth) {
+                out.par_chunks_mut(width)
+                    .zip(x.par_chunks(dim))
+                    .for_each(|(o, row)| o[slot * dim..(slot + 1) * dim].copy_from_slice(row));
+            }
+        };
+        take(&x, 0, &mut out);
+        let mut normed = Vec::new();
+        for (li, layer) in self.layers[..deepest].iter().enumerate() {
+            if super::cancelled(cancel) {
+                bail!("cancelled");
+            }
+            self.layer(layer, &mut x, n, &angles, &limits, &mut normed);
+            take(&x, li + 1, &mut out);
+        }
+        Ok(out)
     }
 
     fn linear(&self, x: &[f32], n: usize, w: &QuantMatrix) -> Vec<f32> {

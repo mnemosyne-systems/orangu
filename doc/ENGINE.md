@@ -286,6 +286,22 @@ bidirectional block inside the causal prompt. Its GGUFs carry no metadata, so
 the loader strips the `model.diffusion_model.` prefix they are written
 under. `image::Variant` is what the pipeline switches on.
 
+`flux2_klein`, FLUX.2 [klein] 4B, is the family's third set of parts. Its
+GGUF says `flux` and is named by its tensors. The transformer
+(`image::flux2`) is five dual-stream blocks and twenty single-stream ones
+(one `linear1` for `q | k | v | mlp`, one `linear2` for the joined
+attention and gated-SiLU feed-forward), modulated by three linears shared
+by every block, with four-axis rotary positions (`t, row, column, index`,
+`theta = 2000`). The text encoder is a Qwen3-4B read through
+`image::qwen3vl::TextModel::forward_layers_masked` — the same reference
+forward, with one rotary axis — since the model reads layers 9, 18 and 27
+of a prompt padded to 512 tokens under a padding mask, neither of which
+the served path exposes. The VAE (`image::vae_flux2`) is the 2-D
+`AutoencoderKL` with GroupNorm, 32 latent channels and a batch-statistics
+normalisation of the 2x2-patchified latent, on `image::vae`'s
+convolutions; `scheduler::flux2_sigmas` is the schedule, its shift fitted
+to the step count as well as the token count.
+
 `ltxv`, LTX-2.5's audio-video diffusion transformer, is the other family
 outside the table, in `engine::video`. It draws a clip's frames and its
 sound together: two token streams, video and audio, through 48 blocks that

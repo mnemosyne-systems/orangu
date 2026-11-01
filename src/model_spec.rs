@@ -140,6 +140,15 @@ pub fn architecture_of(gguf: &GgufFile) -> Option<String> {
 /// name this project gives it, since its GGUFs carry none (below).
 pub const QWEN_IMAGE_21_ARCHITECTURE: &str = "qwen_image_2_1";
 
+/// The architecture of a FLUX.2 [klein] diffusion transformer — a name this
+/// project gives it: its GGUFs say `general.architecture = flux`, the name
+/// FLUX.1's carry too, and the two share nothing a loader could serve both
+/// from.
+pub const FLUX2_KLEIN_ARCHITECTURE: &str = "flux2_klein";
+
+/// The width of the text encoder a FLUX.2 [klein] 4B reads: Qwen3-4B's.
+pub const FLUX2_KLEIN_TEXT_ENCODER_WIDTH: u64 = 2560;
+
 /// The prefix the ComfyUI/stable-diffusion.cpp GGUF tooling writes before
 /// every tensor of a diffusion model (`model.diffusion_model.img_in.weight`)
 /// — the `unsloth/Qwen-Image-2.1-GGUF` files keep it.
@@ -153,6 +162,12 @@ pub const DIFFUSION_MODEL_PREFIX: &str = "model.diffusion_model.";
 /// an exact, distinctive shape is recognised: Qwen-Image 2.1's single-stream transformer has a
 /// zero-centred `txt_in.text_norm` and blocks without the dual-stream
 /// `img_mod`/`txt_mod` that Qwen-Image (`qwen_image`) has.
+///
+/// `unsloth/FLUX.2-klein-base-4B-GGUF` says `flux`, which a FLUX.1 file
+/// says too: FLUX.2's blocks share three global modulation linears
+/// (`double_stream_modulation_img`, …) where FLUX.1's carry their own, and
+/// [klein] has no guidance embedder (FLUX.2 [dev], which does, is left as
+/// `flux`).
 pub fn architecture_from_tensors(gguf: &GgufFile) -> Option<&'static str> {
     let has = |name: &str| {
         gguf.tensors.iter().any(|t| {
@@ -162,6 +177,13 @@ pub fn architecture_from_tensors(gguf: &GgufFile) -> Option<&'static str> {
                     .is_some_and(|rest| rest == name)
         })
     };
+    if has("double_stream_modulation_img.lin.weight")
+        && has("single_stream_modulation.lin.weight")
+        && has("double_blocks.0.img_attn.qkv.weight")
+        && !has("guidance_in.in_layer.weight")
+    {
+        return Some(FLUX2_KLEIN_ARCHITECTURE);
+    }
     (has("txt_in.text_norm.weight")
         && has("modulation.1.weight")
         && has("transformer_blocks.0.attn.to_q.weight")
@@ -171,7 +193,11 @@ pub fn architecture_from_tensors(gguf: &GgufFile) -> Option<&'static str> {
 
 /// The architectures that are picture generators rather than language
 /// models: served in the `image` role only, and through `engine::image`.
-pub const IMAGE_ARCHITECTURES: &[&str] = &["qwen_image", QWEN_IMAGE_21_ARCHITECTURE];
+pub const IMAGE_ARCHITECTURES: &[&str] = &[
+    "qwen_image",
+    QWEN_IMAGE_21_ARCHITECTURE,
+    FLUX2_KLEIN_ARCHITECTURE,
+];
 
 /// Whether `architecture` is one of [`IMAGE_ARCHITECTURES`].
 pub fn is_image_architecture(architecture: &str) -> bool {
@@ -308,6 +334,63 @@ pub fn is_qwen_image21_text_encoder(path: &Path) -> bool {
 /// [`is_qwen_image21_text_encoder`]), largest file first.
 pub fn find_qwen_image21_text_encoder(dir: &Path) -> Option<PathBuf> {
     largest_gguf(dir, is_qwen_image21_text_encoder)
+}
+
+/// Whether `path` is the text encoder a `flux2_klein` 4B model needs — a
+/// `qwen3` GGUF of Qwen3-4B's width (2560) with the 27 layers the
+/// transformer reads from, that is a chat model and not the embedding
+/// fine-tune of the same shape (which declares a `pooling_type`). Judged
+/// from its header alone.
+pub fn is_flux2_klein_text_encoder(path: &Path) -> bool {
+    let Ok(gguf) = GgufFile::open_summary(path) else {
+        return false;
+    };
+    let key = |name: &str| {
+        gguf.metadata
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+    };
+    architecture_of(&gguf).as_deref() == Some("qwen3")
+        && key("qwen3.embedding_length").and_then(|v| v.as_u64())
+            == Some(FLUX2_KLEIN_TEXT_ENCODER_WIDTH)
+        && key("qwen3.block_count")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|n| n >= 27)
+        && key("qwen3.pooling_type").is_none()
+}
+
+/// Every FLUX.2 [klein] text encoder under `dir` (see
+/// [`is_flux2_klein_text_encoder`]), largest file first.
+pub fn find_flux2_klein_text_encoder(dir: &Path) -> Option<PathBuf> {
+    largest_gguf(dir, is_flux2_klein_text_encoder)
+}
+
+/// Whether a FLUX.2 [klein] transformer's file name — or a
+/// `<user>/<repo>:<quant>` reference to it — names a step-distilled
+/// checkpoint: a [klein] that is not the undistilled `base`
+/// (`flux-2-klein-4b-Q4_K_M.gguf` against `flux-2-klein-base-4b-…`).
+pub fn is_distilled_klein(spec: &str) -> bool {
+    let spec = spec.to_ascii_lowercase();
+    spec.contains("klein") && !spec.contains("base")
+}
+
+/// Whether `path` is the FLUX.2 VAE: a `safetensors` whose decoder reads
+/// 32 latent channels (`decoder.conv_in.weight`, `[512, 32, 3, 3]`) and
+/// that carries the 128 batch statistics of the patchified latent
+/// (`bn.running_mean`) — in diffusers' naming or the original one, which
+/// share both names. Judged from the header.
+pub fn is_flux2_vae(path: &Path) -> bool {
+    let Some(header) = safetensors_header(path) else {
+        return false;
+    };
+    shape_of(&header, "decoder.conv_in.weight").is_some_and(|s| s.len() == 4 && s[1] == 32)
+        && shape_of(&header, "bn.running_mean").is_some_and(|s| s == [128])
+}
+
+/// The first FLUX.2 VAE under `dir`, in path order.
+pub fn find_flux2_vae(dir: &Path) -> Option<PathBuf> {
+    first_safetensors(dir, is_flux2_vae)
 }
 
 /// Whether `path` is the vision half of Qwen3-VL-8B — the `mmproj-*.gguf`
@@ -2133,6 +2216,41 @@ mod tests {
             Some("qwen_image")
         );
         assert_eq!(architecture_of(&file(&dual, None)), None);
+        // FLUX.2 [klein] under FLUX.1's label; FLUX.1 and FLUX.2 [dev] keep it.
+        let klein = [
+            "double_stream_modulation_img.lin.weight",
+            "single_stream_modulation.lin.weight",
+            "double_blocks.0.img_attn.qkv.weight",
+        ];
+        assert_eq!(
+            architecture_of(&file(&klein, Some("flux"))).as_deref(),
+            Some(FLUX2_KLEIN_ARCHITECTURE)
+        );
+        let mut dev = klein.to_vec();
+        dev.push("guidance_in.in_layer.weight");
+        assert_eq!(
+            architecture_of(&file(&dev, Some("flux"))).as_deref(),
+            Some("flux")
+        );
+        let flux1 = [
+            "double_blocks.0.img_mod.lin.weight",
+            "double_blocks.0.img_attn.qkv.weight",
+        ];
+        assert_eq!(
+            architecture_of(&file(&flux1, Some("flux"))).as_deref(),
+            Some("flux")
+        );
+    }
+
+    /// A distilled FLUX.2 [klein] is told apart from `base` by its name.
+    #[test]
+    fn a_distilled_klein_is_named() {
+        assert!(is_distilled_klein("flux-2-klein-4b-Q4_K_M.gguf"));
+        assert!(is_distilled_klein("unsloth/FLUX.2-klein-4B-GGUF:Q8_0"));
+        assert!(!is_distilled_klein(
+            "unsloth/FLUX.2-klein-base-4B-GGUF:Q4_K_M"
+        ));
+        assert!(!is_distilled_klein("flux-2-klein-base-4b-Q8_0.gguf"));
     }
 
     /// The Turbo checkpoint is told apart by its name, in a path or a spec.

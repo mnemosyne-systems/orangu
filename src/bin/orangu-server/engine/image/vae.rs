@@ -429,6 +429,8 @@ pub(super) fn load_conv(
             }
             (*cout, *cin, *kh, rows)
         }
+        // A linear layer: a 1x1 convolution over channel-last pixels.
+        [cout, cin] => (*cout, *cin, 1, w.clone()),
         other => anyhow::bail!("{name}: unexpected kernel shape {other:?}"),
     };
     ensure!(

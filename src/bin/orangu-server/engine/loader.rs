@@ -2576,7 +2576,13 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
             .ok_or_else(|| anyhow!("{architecture}: model is missing tensor '{name}'"))
     };
     let img_in = dims("img_in.weight")?;
-    let norm_q = dims("transformer_blocks.0.attn.norm_q.weight")?;
+    // FLUX.2 [klein]: a head norm named its own way, and two kinds of block.
+    let flux2 = architecture == orangu::model_spec::FLUX2_KLEIN_ARCHITECTURE;
+    let norm_q = if flux2 {
+        dims("double_blocks.0.img_attn.norm.query_norm.scale")?
+    } else {
+        dims("transformer_blocks.0.attn.norm_q.weight")?
+    };
     anyhow::ensure!(
         img_in.len() == 2 && norm_q.len() == 1,
         "{architecture}: img_in.weight / attn.norm_q.weight have unexpected shapes"
@@ -2586,20 +2592,28 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
     if head_dim == 0 || !n_embd.is_multiple_of(head_dim) {
         bail!("{architecture}: stream width {n_embd} is not a multiple of head width {head_dim}");
     }
-    let n_layer = gguf
-        .tensors
-        .iter()
-        .filter_map(|t| {
-            plain(&t.name)
-                .strip_prefix("transformer_blocks.")?
-                .split('.')
-                .next()?
-                .parse::<usize>()
-                .ok()
-        })
-        .max()
-        .map(|last| last + 1)
-        .ok_or_else(|| anyhow!("{architecture}: no transformer_blocks.N tensors"))?;
+    let blocks = |prefix: &str| {
+        gguf.tensors
+            .iter()
+            .filter_map(|t| {
+                plain(&t.name)
+                    .strip_prefix(prefix)?
+                    .split('.')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .max()
+            .map(|last| last + 1)
+    };
+    let n_layer = if flux2 {
+        blocks("double_blocks.").unwrap_or(0) + blocks("single_blocks.").unwrap_or(0)
+    } else {
+        blocks("transformer_blocks.").unwrap_or(0)
+    };
+    if n_layer == 0 {
+        bail!("{architecture}: no transformer blocks");
+    }
     Ok(ModelConfig {
         architecture: architecture.to_string(),
         n_vocab: 0,

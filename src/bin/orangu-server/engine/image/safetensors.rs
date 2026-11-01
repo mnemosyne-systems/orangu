@@ -117,7 +117,13 @@ impl SafeTensors {
                 "F16" | "BF16" => 2,
                 // Raw bytes: a checkpoint's embedded files (LTX-2's text
                 // encoder carries its tokenizer this way), read with `bytes`.
-                "U8" => 1,
+                "U8" | "I8" | "BOOL" => 1,
+                // Integer bookkeeping a checkpoint carries beside its
+                // weights (a BatchNorm's `num_batches_tracked`): indexed so
+                // the file opens, refused by `tensor` if ever read.
+                "I16" | "U16" => 2,
+                "I32" | "U32" => 4,
+                "I64" | "U64" | "F64" => 8,
                 other => {
                     bail!("tensor '{name}' is stored as {other}, which this reader does not read")
                 }

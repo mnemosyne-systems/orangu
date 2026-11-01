@@ -717,7 +717,7 @@ pub(super) fn layer_norm_into(dst: &mut Vec<f32>, src: &[f32], dim: usize, eps: 
 }
 
 /// `x * (1 + scale) + shift`, per row.
-fn modulate_inplace(x: &mut [f32], shift: &[f32], scale: &[f32], dim: usize) {
+pub(super) fn modulate_inplace(x: &mut [f32], shift: &[f32], scale: &[f32], dim: usize) {
     x.par_chunks_mut(dim).for_each(|row| {
         for ((v, s), sh) in row.iter_mut().zip(scale).zip(shift) {
             *v = *v * (1.0 + s) + sh;
@@ -726,7 +726,7 @@ fn modulate_inplace(x: &mut [f32], shift: &[f32], scale: &[f32], dim: usize) {
 }
 
 /// `x += gate * y`, per row.
-fn gated_add(x: &mut [f32], y: &[f32], gate: &[f32], dim: usize) {
+pub(super) fn gated_add(x: &mut [f32], y: &[f32], gate: &[f32], dim: usize) {
     x.par_chunks_mut(dim)
         .zip(y.par_chunks(dim))
         .for_each(|(row, add)| {
@@ -762,7 +762,7 @@ fn gelu_inplace(x: &mut [f32]) {
     tensor::gelu_inplace(x);
 }
 
-fn concat_rows(a: &[f32], b: &[f32]) -> Vec<f32> {
+pub(super) fn concat_rows(a: &[f32], b: &[f32]) -> Vec<f32> {
     let mut out = Vec::with_capacity(a.len() + b.len());
     out.extend_from_slice(a);
     out.extend_from_slice(b);
