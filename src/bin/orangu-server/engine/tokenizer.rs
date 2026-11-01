@@ -248,7 +248,26 @@ const LLAMA3_PRE_TYPES: &[&str] = &[
 /// `\p{N}{1,3}` digit runs, and the `[\r\n/]*` tail that no other family
 /// here has. Confirmed against colibrì's `inkling` engine, which carries
 /// the same pattern spelled out as an explicit scanner.
-const GPT4O_PRE_TYPES: &[&str] = &["gpt-4o", "llama4", "kanana2", "talkie", "inkling"];
+///
+/// `minimax-m2` (MiniMax-M2 and `minimax-m3`, e.g.
+/// `unsloth/MiniMax-M3.1-Flash-GGUF`) shares upstream's `GPT4O` regex case
+/// arm verbatim, and like the rest leaves `ignore_merges` clear.
+const GPT4O_PRE_TYPES: &[&str] = &[
+    "gpt-4o",
+    "llama4",
+    "kanana2",
+    "talkie",
+    "inkling",
+    "minimax-m2",
+];
+
+/// `tokenizer.ggml.pre` values whose upstream arm leaves `add_bos` at its
+/// `false` default, for a file that does not set
+/// `tokenizer.ggml.add_bos_token` itself. Everywhere else an absent key
+/// means `true` (see [`Tokenizer::wants_bos`]). `minimax-m2`'s vocab
+/// declares a BOS (`]~b]`) that its chat template writes itself, as a role
+/// marker, and a raw completion never starts with.
+const NO_DEFAULT_BOS_PRE_TYPES: &[&str] = &["minimax-m2"];
 
 /// Picks the pre-tokenizer split pattern and upstream's `ignore_merges`
 /// flag for a `tokenizer.ggml.pre` value, falling back to the generic
@@ -376,7 +395,7 @@ pub struct Tokenizer {
     /// `tokenizer.ggml.add_bos_token`, read by [`Tokenizer::wants_bos`] and
     /// by [`Tokenizer::encode_for_embedding`]. Defaults to `true` when the
     /// key is absent — most decoder-LM GGUFs want BOS and don't bother
-    /// setting it.
+    /// setting it — except for [`NO_DEFAULT_BOS_PRE_TYPES`].
     ///
     /// **A completion asks this rather than assuming.** It used to be
     /// consulted only for embeddings, on the reasoning that a chat or
@@ -598,8 +617,11 @@ impl Tokenizer {
         let eos_token = metadata_u32(gguf, "tokenizer.ggml.eos_token_id");
         let eot_token = metadata_u32(gguf, "tokenizer.ggml.eot_token_id");
         let add_eos_token = metadata_u32(gguf, "tokenizer.ggml.add_eos_token").unwrap_or(0) != 0;
-        let add_bos_token =
-            metadata_u32(gguf, "tokenizer.ggml.add_bos_token").is_none_or(|v| v != 0);
+        let add_bos_token = match metadata_u32(gguf, "tokenizer.ggml.add_bos_token") {
+            Some(v) => v != 0,
+            None => metadata_string(gguf, "tokenizer.ggml.pre")
+                .is_none_or(|pre| !NO_DEFAULT_BOS_PRE_TYPES.contains(&pre.as_str())),
+        };
 
         let token_types = i64_array(gguf, "tokenizer.ggml.token_type").unwrap_or_default();
         // One predicate for both — see `is_structural_token_type`. Matched
@@ -661,7 +683,8 @@ impl Tokenizer {
     }
 
     /// Whether this file asks for a BOS token in front of a prompt —
-    /// `tokenizer.ggml.add_bos_token`, `true` where the key is absent.
+    /// `tokenizer.ggml.add_bos_token`, `true` where the key is absent unless
+    /// the pre-tokenizer is one of [`NO_DEFAULT_BOS_PRE_TYPES`].
     ///
     /// **What a completion should pass to [`Self::encode`].** Hardcoding
     /// `true` there puts a BOS in front of every prompt for a model trained
@@ -985,10 +1008,19 @@ impl Tokenizer {
     /// Matched on the vocabulary's own token names, like its three
     /// neighbours here: the framing belongs to the chat format, not to an
     /// architecture.
+    ///
+    /// MiniMax's vocabulary carries both `<think>`/`</think>` and its own
+    /// `<mm:think>`/`</mm:think>`, and its chat template writes — so the
+    /// model emits — only the latter. Its pair is tried first; a vocabulary
+    /// without it falls through to the common spelling.
     pub fn think_framing(&self) -> Option<(u32, u32)> {
-        let open = *self.token_to_id.get("<think>")?;
-        let close = *self.token_to_id.get("</think>")?;
-        (self.is_special(open) && self.is_special(close)).then_some((open, close))
+        [("<mm:think>", "</mm:think>"), ("<think>", "</think>")]
+            .into_iter()
+            .find_map(|(open, close)| {
+                let open = *self.token_to_id.get(open)?;
+                let close = *self.token_to_id.get(close)?;
+                (self.is_special(open) && self.is_special(close)).then_some((open, close))
+            })
     }
 
     /// The marker a reasoning body opens with, and the markers every other
@@ -1528,7 +1560,7 @@ fn clean_spaces_in_prose(text: &str) -> String {
 /// represent arbitrary binary byte sequences. Printable ASCII/Latin-1 bytes
 /// map to themselves; everything else (control characters, space, ...) maps
 /// to a codepoint starting at 256 upward, in byte order.
-fn byte_to_unicode_table() -> [char; 256] {
+pub(crate) fn byte_to_unicode_table() -> [char; 256] {
     let printable: Vec<u32> = (b'!' as u32..=b'~' as u32)
         .chain(0xA1..=0xAC)
         .chain(0xAE..=0xFF)

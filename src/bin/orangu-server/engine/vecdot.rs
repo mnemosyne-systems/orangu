@@ -37,20 +37,20 @@
 //! relative error stays around 1e-3 (see the tests, which check every
 //! kernel against the `quant::dequantize` reference).
 //!
-//! Only the five types that actually carry weight in real GGUF releases get
-//! a fused kernel — `Q8_0`, `Q5_0`, `Q4_K`, `Q6_K`, `IQ4_NL`. Anything else
-//! returns `false` from [`supports`] and the caller keeps its old
-//! dequantize path, so this is strictly an addition: no existing type
-//! changes behavior.
+//! The types with a fused kernel are the ones [`supports`] accepts — the
+//! 32-element legacy formats, the K-quants, `IQ4_NL`/`IQ4_XS`, Prism's
+//! `PQ2_0`/`PTQ1_0` and `NVFP4`. Anything else returns `false` from
+//! [`supports`] and the caller keeps the dequantize path.
 
 use super::iq_grids::KVALUES_IQ4NL;
+use super::quant;
 #[cfg(target_arch = "aarch64")]
 use super::quant::unpack_block_pq2_0_neon;
 use super::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
-    GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
-    PQ2_0_BLOCK_BYTES, PTQ1_0_BLOCK_BYTES, QK_PRISM, get_scale_min_k4, read_f16,
+    GGML_TYPE_NVFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0, PQ2_0_BLOCK_BYTES, PTQ1_0_BLOCK_BYTES, QK_PRISM, get_scale_min_k4, read_f16,
     unpack_block_pq2_0, unpack_block_ptq1_0, unpack_q3_k_scales,
 };
 use rayon::prelude::*;
@@ -284,6 +284,7 @@ pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
         GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
         | GGML_TYPE_IQ4_XS => in_dim.is_multiple_of(256),
         GGML_TYPE_PQ2_0 | GGML_TYPE_PTQ1_0 => in_dim.is_multiple_of(QK_PRISM),
+        GGML_TYPE_NVFP4 => in_dim.is_multiple_of(NVFP4_BLOCK),
         _ => false,
     }
 }
@@ -364,7 +365,10 @@ impl Default for UnpackedRow {
 pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedRow) {
     // `Q6_K`, `Q3_K` and `Q2_K` carry a scale per 16; everything else is
     // uniform across a 32-element block.
-    let stride = if matches!(ggml_type, GGML_TYPE_Q6_K | GGML_TYPE_Q3_K | GGML_TYPE_Q2_K) {
+    let stride = if matches!(
+        ggml_type,
+        GGML_TYPE_Q6_K | GGML_TYPE_Q3_K | GGML_TYPE_Q2_K | GGML_TYPE_NVFP4
+    ) {
         GROUP
     } else {
         32
@@ -377,6 +381,7 @@ pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedR
         GGML_TYPE_Q5_1 => unpack_q5_1(row, out),
         GGML_TYPE_IQ4_NL => unpack_iq4_nl(row, out),
         GGML_TYPE_IQ4_XS => unpack_iq4_xs(row, out),
+        GGML_TYPE_NVFP4 => unpack_nvfp4(row, out),
         GGML_TYPE_Q2_K => unpack_q2_k(row, out),
         GGML_TYPE_Q3_K => unpack_q3_k(row, out),
         GGML_TYPE_Q4_K => unpack_q4_k(row, out),
@@ -1533,6 +1538,107 @@ fn unpack_iq4_nl(row: &[u8], out: &mut UnpackedRow) {
         out.scale[b] = dw;
         out.min[b] = 0.0;
     }
+}
+
+// ---------------------------------------------------------------- NVFP4
+
+/// Elements in one `NVFP4` block: four [`GROUP`]-wide sub-blocks.
+const NVFP4_BLOCK: usize = 64;
+/// `block_nvfp4`: four UE4M3 sub-block scales, then 32 bytes of E2M1 pairs.
+const NVFP4_BLOCK_BYTES: usize = 4 + NVFP4_BLOCK / 2;
+
+/// Unpacks two adjacent `NVFP4` sub-blocks — 16 bytes of `qs` — into 32
+/// `int8` weights. Each sub-block's 8 bytes give its first 8 values in the
+/// low nibbles and its last 8 in the high ones, each an index into the E2M1
+/// codebook ([`quant::KVALUES_MXFP4`], doubled to whole numbers in
+/// `-12..=12`; the sub-block scale carries the halving).
+#[inline(always)]
+fn unpack_nvfp4_pair(qs: &[u8], w: &mut [i8; 32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("ssse3") {
+            // Safety: guarded by the runtime feature check above.
+            return unsafe { unpack_nvfp4_pair_ssse3(qs, w) };
+        }
+    }
+    #[allow(unreachable_code)]
+    unpack_nvfp4_pair_scalar(qs, w)
+}
+
+/// The reference form, and the fallback where no byte-shuffle exists.
+#[inline(always)]
+fn unpack_nvfp4_pair_scalar(qs: &[u8], w: &mut [i8; 32]) {
+    for s in 0..2 {
+        for j in 0..8 {
+            let q = qs[s * 8 + j];
+            w[s * 16 + j] = quant::KVALUES_MXFP4[(q & 0x0F) as usize];
+            w[s * 16 + 8 + j] = quant::KVALUES_MXFP4[(q >> 4) as usize];
+        }
+    }
+}
+
+/// The `IQ4_NL` shuffle with one extra step: the low and high nibbles of
+/// the 16 bytes are regrouped by sub-block (`unpacklo/hi_epi64`) before the
+/// table lookup, so each 16 output bytes are one sub-block's low eight then
+/// its high eight.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn unpack_nvfp4_pair_ssse3(qs: &[u8], w: &mut [i8; 32]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let table = _mm_loadu_si128(quant::KVALUES_MXFP4.as_ptr() as *const __m128i);
+        let packed = _mm_loadu_si128(qs.as_ptr() as *const __m128i);
+        let lo = _mm_and_si128(packed, _mm_set1_epi8(0x0F));
+        let hi = _mm_and_si128(_mm_srli_epi16::<4>(packed), _mm_set1_epi8(0x0F));
+        let first = _mm_unpacklo_epi64(lo, hi);
+        let second = _mm_unpackhi_epi64(lo, hi);
+        _mm_storeu_si128(
+            w.as_mut_ptr() as *mut __m128i,
+            _mm_shuffle_epi8(table, first),
+        );
+        _mm_storeu_si128(
+            w.as_mut_ptr().add(16) as *mut __m128i,
+            _mm_shuffle_epi8(table, second),
+        );
+    }
+}
+
+/// `NVFP4` into the generic [`UnpackedRow`] form — a scale per [`GROUP`],
+/// symmetric, no min.
+fn unpack_nvfp4(row: &[u8], out: &mut UnpackedRow) {
+    out.has_min = false;
+    for (b, block) in row.as_chunks::<NVFP4_BLOCK_BYTES>().0.iter().enumerate() {
+        for pair in 0..2 {
+            let at = b * NVFP4_BLOCK + pair * 32;
+            let w: &mut [i8; 32] = (&mut out.q[at..at + 32]).try_into().unwrap();
+            unpack_nvfp4_pair(&block[4 + pair * 16..], w);
+        }
+        for (s, &scale) in block[..4].iter().enumerate() {
+            out.scale[b * 4 + s] = quant::ue4m3_to_f32_half(scale);
+            out.min[b * 4 + s] = 0.0;
+        }
+    }
+}
+
+/// Fused `NVFP4` decode: each 32-element activation block holds two
+/// sub-blocks, so it is [`dot_q3_k`]'s shape — two 16-element dots, each at
+/// its own scale, one activation scale.
+fn dot_nvfp4<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (b, block) in row.as_chunks::<NVFP4_BLOCK_BYTES>().0.iter().enumerate() {
+        for pair in 0..2 {
+            unpack_nvfp4_pair(&block[4 + pair * 16..], &mut w);
+            let blk = b * 2 + pair;
+            let qx = &act.q[blk * 32..];
+            let s0 = quant::ue4m3_to_f32_half(block[pair * 2]);
+            let s1 = quant::ue4m3_to_f32_half(block[pair * 2 + 1]);
+            total += act.d[blk]
+                * (s0 * dot16::<ISA>(&w, qx) as f32
+                    + s1 * dot16::<ISA>(&w[16..], &qx[16..]) as f32);
+        }
+    }
+    total
 }
 
 // ---------------------------------------------------------------- Q4_K
@@ -6153,6 +6259,7 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
         GGML_TYPE_IQ4_XS => dot_iq4_xs::<ISA>(row, act),
         GGML_TYPE_PQ2_0 => dot_pq2_0::<ISA>(row, act),
         GGML_TYPE_PTQ1_0 => dot_ptq1_0::<ISA>(row, act),
+        GGML_TYPE_NVFP4 => dot_nvfp4::<ISA>(row, act),
         other => panic!("vecdot::dot_row called for unsupported ggml_type {other}"),
     }
 }
@@ -8474,6 +8581,7 @@ mod tests {
             GGML_TYPE_IQ4_XS => (136, 256),
             GGML_TYPE_PQ2_0 => (34, 128),
             GGML_TYPE_PTQ1_0 => (28, 128),
+            GGML_TYPE_NVFP4 => (36, 64),
             other => panic!("unhandled {other}"),
         };
         let row_bytes = in_dim / block_elems * block_bytes;
@@ -8509,6 +8617,14 @@ mod tests {
                 GGML_TYPE_PQ2_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 // `PTQ1_0` is the other type with a trailing `d`.
                 GGML_TYPE_PTQ1_0 => block[26..28].copy_from_slice(&[0x00, 0x30]),
+                // Four UE4M3 sub-block scales, kept finite and nonzero
+                // (exponent 1..=14), varied so a scale applied to the wrong
+                // sub-block shows.
+                GGML_TYPE_NVFP4 => {
+                    for (i, s) in block[0..4].iter_mut().enumerate() {
+                        *s = (((*s >> 3) % 14 + 1) << 3) | (i as u8 & 0x7);
+                    }
+                }
                 other => panic!("unhandled {other}"),
             }
         }
@@ -8690,6 +8806,7 @@ mod tests {
             GGML_TYPE_IQ4_XS => (136, 256),
             GGML_TYPE_PQ2_0 => (34, 128),
             GGML_TYPE_PTQ1_0 => (28, 128),
+            GGML_TYPE_NVFP4 => (36, 64),
             other => panic!("unhandled {other}"),
         };
         let mut row = pseudo_bytes(in_dim / block_elems * block_bytes, seed);
@@ -8709,6 +8826,11 @@ mod tests {
                 GGML_TYPE_Q6_K => block[208..210].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_PQ2_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_PTQ1_0 => block[26..28].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_NVFP4 => {
+                    for (i, s) in block[0..4].iter_mut().enumerate() {
+                        *s = (((*s >> 3) % 14 + 1) << 3) | (i as u8 & 0x7);
+                    }
+                }
                 other => panic!("unhandled {other}"),
             }
         }
@@ -8746,6 +8868,7 @@ mod tests {
                 GGML_TYPE_Q4_K,
                 GGML_TYPE_Q5_K,
                 GGML_TYPE_Q6_K,
+                GGML_TYPE_NVFP4,
             ] {
                 let row = fixture_row(ggml_type, in_dim, 5);
                 let acts: Vec<ActQ8> = (0..n_tokens)
@@ -8976,6 +9099,30 @@ mod tests {
         for seed in [1, 7, 99] {
             check(GGML_TYPE_IQ4_NL, 896, seed);
             check(GGML_TYPE_IQ4_NL, 4864, seed);
+        }
+    }
+
+    /// `NVFP4` at MiniMax-M3's two expert widths (`n_ff_exp`, `n_embd`):
+    /// both the decode dot and the prefill unpack against the dequantizer.
+    #[test]
+    fn nvfp4_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_NVFP4, 3072, seed);
+            check(GGML_TYPE_NVFP4, 6144, seed);
+        }
+    }
+
+    /// The SSSE3 nibble regrouping must produce exactly the scalar form's
+    /// order — one sub-block's low eight, then its high eight.
+    #[test]
+    fn nvfp4_shuffle_unpack_matches_the_scalar_one() {
+        for seed in 0..64u32 {
+            let qs = pseudo_bytes(16, seed);
+            let mut fast = [0i8; 32];
+            let mut slow = [0i8; 32];
+            unpack_nvfp4_pair(&qs, &mut fast);
+            unpack_nvfp4_pair_scalar(&qs, &mut slow);
+            assert_eq!(fast, slow, "seed {seed}");
         }
     }
 

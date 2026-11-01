@@ -67,6 +67,7 @@ pub mod inkling;
 pub mod kda;
 pub mod kimi3;
 pub mod llama;
+pub mod minimax_m3;
 pub mod mistral;
 pub mod mistral_large4;
 pub mod muse;
@@ -1761,6 +1762,29 @@ pub(crate) struct SwigluMoe<'a> {
     /// `<arch>.swiglu_clamp_shexp` for this layer — the same for the
     /// shared expert.
     pub clamp_shexp: SwigluLimit,
+    /// Per-expert output scalars, for a file whose expert weights are
+    /// stored without their tensor-wide scale (NVFP4's).
+    pub scales: ExpertScales<'a>,
+}
+
+/// `ffn_{gate,up,down}_exps.scale` — one `f32` per expert multiplying that
+/// projection's output, upstream's `build_lora_mm_id(.., *_exps_s)`. The
+/// gate and up scales land **before** the activation, so they cannot be
+/// folded into the router weight the way the down scale could.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExpertScales<'a> {
+    pub gate: Option<&'a [f32]>,
+    pub up: Option<&'a [f32]>,
+    pub down: Option<&'a [f32]>,
+}
+
+impl ExpertScales<'_> {
+    /// No scales: every projection is used as stored.
+    pub(crate) const NONE: Self = Self {
+        gate: None,
+        up: None,
+        down: None,
+    };
 }
 
 /// `<arch>.swiglu_clamp_exp` / `_shexp` — upstream's optional SwiGLU limit,
@@ -1784,9 +1808,32 @@ pub(crate) enum SwigluLimit {
     /// `silu(min(gate, limit)) * clamp(up)` — the clamp lands on the gate
     /// before the activation. `deepseek4` and `glm5-next`.
     PreActivation(f32),
+    /// gpt-oss's `swiglu_oai`: `g * sigmoid(alpha * g) * (u + 1)` with
+    /// `g = min(gate, limit)` and `u = clamp(up, -limit, limit)` — a
+    /// sharpened SiLU and a `+1` on the linear branch, not a clamp on
+    /// plain SwiGLU. Upstream's `LLM_FFN_SWIGLU_OAI_MOE`, whose constants
+    /// (`alpha = 1.702`, `limit = 7`) are in the graph, not the file —
+    /// see [`Self::OAI`]. `minimax-m3` uses it everywhere.
+    Oai { alpha: f32, limit: f32 },
 }
 
 impl SwigluLimit {
+    /// [`Self::Oai`] at the constants upstream's `build_ffn` and
+    /// `build_moe_ffn` hard-code for `LLM_FFN_SWIGLU_OAI_MOE`.
+    pub(crate) const OAI: Self = Self::Oai {
+        alpha: 1.702,
+        limit: 7.0,
+    };
+
+    /// `swiglu_oai` for one element — ggml's `ggml_compute_forward_swiglu_oai`,
+    /// `x / (1 + exp(-alpha * x)) * (y + 1)`.
+    #[inline]
+    fn oai(gate: f32, up: f32, alpha: f32, limit: f32) -> f32 {
+        let x = gate.min(limit);
+        let y = up.clamp(-limit, limit);
+        x / (1.0 + (-alpha * x).exp()) * (y + 1.0)
+    }
+
     /// [`Self::Activated`] for a real limit, [`Self::None`] for the `0.0` a
     /// missing `swiglu_clamp_*` entry reads as.
     pub(crate) fn activated(limit: f32) -> Self {
@@ -1823,6 +1870,11 @@ impl SwigluLimit {
                 .iter()
                 .zip(up.iter())
                 .map(|(&g, &u)| tensor::silu(g.min(limit)) * u.clamp(-limit, limit))
+                .collect(),
+            Self::Oai { alpha, limit } => gate
+                .iter()
+                .zip(up.iter())
+                .map(|(&g, &u)| Self::oai(g, u, alpha, limit))
                 .collect(),
         }
     }
@@ -1865,6 +1917,11 @@ impl SwigluLimit {
             Self::PreActivation(limit) => {
                 for (g, &u) in gate.iter_mut().zip(up.iter()) {
                     *g = tensor::silu(g.min(limit)) * u.clamp(-limit, limit);
+                }
+            }
+            Self::Oai { alpha, limit } => {
+                for (g, &u) in gate.iter_mut().zip(up.iter()) {
+                    *g = Self::oai(*g, u, alpha, limit);
                 }
             }
         }
@@ -2226,9 +2283,18 @@ pub(crate) fn swiglu_moe_ffn_with(
                 evaluated,
                 normed,
                 n_embd,
-                Some(&ExpertProjection::whole(moe.gate_exps)),
-                &ExpertProjection::whole(moe.up_exps),
-                &ExpertProjection::whole(moe.down_exps),
+                Some(&ExpertProjection {
+                    scale: moe.scales.gate,
+                    ..ExpertProjection::whole(moe.gate_exps)
+                }),
+                &ExpertProjection {
+                    scale: moe.scales.up,
+                    ..ExpertProjection::whole(moe.up_exps)
+                },
+                &ExpertProjection {
+                    scale: moe.scales.down,
+                    ..ExpertProjection::whole(moe.down_exps)
+                },
                 None,
                 fused,
                 |gate, up| swiglu_limited(gate, up, moe.clamp_exp),
@@ -2255,12 +2321,23 @@ pub(crate) fn swiglu_moe_ffn_with(
                     moe.up_exps.out_dim,
                     &inputs,
                 );
+                let gate_scale = moe.scales.gate.map_or(1.0, |s| s[expert]);
+                let up_scale = moe.scales.up.map_or(1.0, |s| s[expert]);
                 let hidden: Vec<Vec<f32>> = gate
                     .into_iter()
                     .zip(up)
-                    .map(|(gate, up)| swiglu_limited(&gate, &up, moe.clamp_exp))
+                    .map(|(mut gate, mut up)| {
+                        if gate_scale != 1.0 {
+                            gate.iter_mut().for_each(|v| *v *= gate_scale);
+                        }
+                        if up_scale != 1.0 {
+                            up.iter_mut().for_each(|v| *v *= up_scale);
+                        }
+                        swiglu_limited(&gate, &up, moe.clamp_exp)
+                    })
                     .collect();
                 let hidden_refs: Vec<&[f32]> = hidden.iter().map(Vec::as_slice).collect();
+                let down_scale = moe.scales.down.map_or(1.0, |s| s[expert]);
                 project_expert(
                     backend,
                     moe.down_exps,
@@ -2272,7 +2349,8 @@ pub(crate) fn swiglu_moe_ffn_with(
                 .into_iter()
                 .zip(members)
                 .map(|(mut contribution, &(_, weight))| {
-                    contribution.iter_mut().for_each(|v| *v *= weight);
+                    let w = weight * down_scale;
+                    contribution.iter_mut().for_each(|v| *v *= w);
                     contribution
                 })
                 .collect()
@@ -5167,6 +5245,35 @@ mod tests {
         assert_eq!(SwigluLimit::PreActivation(limit).apply(&small, &up), plain);
     }
 
+    /// `swiglu_oai` against ggml's own expression,
+    /// `min(g, 7) / (1 + exp(-1.702 * min(g, 7))) * (clamp(u, -7, 7) + 1)`,
+    /// at points on each side of both clamps. The `+ 1` on the linear branch
+    /// is what a plain clamped SwiGLU lacks: at `u = 0` this is not zero.
+    /// The in-place form the dense arm uses must agree with it exactly.
+    #[test]
+    fn swiglu_oai_matches_ggml_on_both_sides_of_the_limit() {
+        let gate = [-3.0f32, 0.0, 1.5, 6.9, 9.0, 2.0];
+        let up = [0.5f32, 2.0, 0.0, -8.0, 3.0, 12.0];
+        let want: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&g, &u)| {
+                let x = g.min(7.0);
+                let y = u.clamp(-7.0, 7.0);
+                x / (1.0 + (-1.702 * x).exp()) * (y + 1.0)
+            })
+            .collect();
+        assert_eq!(SwigluLimit::OAI.apply(&gate, &up), want);
+        let mut inplace = gate.to_vec();
+        SwigluLimit::OAI.apply_inplace(&mut inplace, &up);
+        assert_eq!(inplace, want);
+        assert!(want[2] > 0.0, "u = 0 must still pass the gate through");
+        assert_eq!(
+            want[4],
+            want[4].min(7.0 / (1.0 + (-1.702f32 * 7.0).exp()) * 4.0)
+        );
+    }
+
     /// A `swiglu_clamp_*` entry a file does not carry reads as `0.0`, and
     /// `0.0` must mean *no clamp* rather than a clamp to zero — which would
     /// zero the whole FFN.
@@ -5377,6 +5484,7 @@ mod tests {
                 shared: None,
                 clamp_exp: SwigluLimit::None,
                 clamp_shexp: SwigluLimit::None,
+                scales: super::ExpertScales::NONE,
             },
             Some((&norm, eps)),
             0,

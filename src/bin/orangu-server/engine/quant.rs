@@ -103,6 +103,11 @@ pub(crate) const GGML_TYPE_IQ4_NL_4_4: u32 = 36;
 pub(crate) const GGML_TYPE_IQ4_NL_4_8: u32 = 37;
 pub(crate) const GGML_TYPE_IQ4_NL_8_8: u32 = 38;
 pub(crate) const GGML_TYPE_MXFP4: u32 = 39;
+/// NVIDIA's NVFP4: 64 elements in four 16-element sub-blocks, each with its
+/// own unsigned E4M3 scale, over the same E2M1 values `MXFP4` uses. The
+/// per-tensor global scale NVFP4 also has is not in the block; a file that
+/// needs it carries it beside the weight (`ffn_*_exps.scale`).
+pub(crate) const GGML_TYPE_NVFP4: u32 = 40;
 /// OCP FP8 E4M3: one byte per element, no block scale — 4 exponent bits
 /// (bias 7), 3 mantissa bits, subnormals, and `0x7F`/`0xFF` as NaN.
 pub(crate) const GGML_TYPE_F8_E4M3: u32 = 43;
@@ -142,6 +147,8 @@ const QK8_0: usize = 32;
 const QK4_NL: usize = 32;
 const QK_MXFP4: usize = 32;
 const QK_MXFP8: usize = 32;
+const QK_NVFP4: usize = 64;
+const QK_NVFP4_SUB: usize = 16;
 /// Elements per `PQ2_0`/`PTQ1_0` block — the one thing that separates them
 /// from ggml's own `Q2_0` (64) and `TQ1_0` (256).
 pub(crate) const QK_PRISM: usize = 128;
@@ -155,7 +162,8 @@ const PTQ1_0_QS: usize = (QK_PRISM - 4 * QK_PRISM / 64) / 5;
 const PTQ1_0_QH: usize = QK_PRISM / 64;
 const QK_K: usize = 256;
 const K_SCALE_SIZE: usize = 12;
-const KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+pub(crate) const KVALUES_MXFP4: [i8; 16] =
+    [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 /// Bytes per block, and elements per block, for a supported `ggml_type`.
 /// `None` for a type this engine can't yet read.
@@ -177,6 +185,7 @@ pub(crate) fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
         GGML_TYPE_Q5_1 => Some((2 + 2 + 4 + QK5_1 / 2, QK5_1)),
         GGML_TYPE_Q8_0 => Some((2 + QK8_0, QK8_0)),
         GGML_TYPE_MXFP4 => Some((1 + QK_MXFP4 / 2, QK_MXFP4)),
+        GGML_TYPE_NVFP4 => Some((QK_NVFP4 / QK_NVFP4_SUB + QK_NVFP4 / 2, QK_NVFP4)),
         GGML_TYPE_MXFP8 => Some((1 + QK_MXFP8, QK_MXFP8)),
         GGML_TYPE_Q2_K => Some((QK_K / 16 + QK_K / 4 + 2 + 2, QK_K)),
         GGML_TYPE_Q3_K => Some((QK_K / 8 + QK_K / 4 + 12 + 2, QK_K)),
@@ -481,6 +490,7 @@ pub fn dequantize_into(
         GGML_TYPE_Q5_1 => dequantize_q5_1(bytes, element_count, out),
         GGML_TYPE_Q8_0 => dequantize_q8_0(bytes, element_count, out),
         GGML_TYPE_MXFP4 => dequantize_mxfp4(bytes, element_count, out),
+        GGML_TYPE_NVFP4 => dequantize_nvfp4(bytes, element_count, out),
         GGML_TYPE_MXFP8 => dequantize_mxfp8(bytes, element_count, out),
         GGML_TYPE_Q2_K => dequantize_q2_k(bytes, element_count, out),
         GGML_TYPE_Q3_K => dequantize_q3_k(bytes, element_count, out),
@@ -559,6 +569,50 @@ fn dequantize_mxfp4(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
         }
         for &q in qs.iter().take(QK_MXFP4 / 2) {
             out.push(KVALUES_MXFP4[(q >> 4) as usize] as f32 * d);
+        }
+    }
+    out.truncate(element_count);
+}
+
+/// An NVFP4 sub-block scale: unsigned E4M3 with no sign bit, halved to
+/// cancel the doubled E2M1 codebook ([`KVALUES_MXFP4`] holds `2x` the FP4
+/// values). `0x00` and `0x7F` (the E4M3 NaN pattern) read as zero, and the
+/// top bit is ignored — both as ggml's `ggml_ue4m3_to_fp32` does.
+pub(crate) fn ue4m3_to_f32_half(x: u8) -> f32 {
+    if x == 0 || x == 0x7F {
+        return 0.0;
+    }
+    let exp = i32::from((x >> 3) & 0xF);
+    let man = f32::from(x & 0x7);
+    let raw = if exp == 0 {
+        man * 2f32.powi(-9)
+    } else {
+        (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    };
+    raw * 0.5
+}
+
+/// Each 36-byte block: four UE4M3 scales, then 32 bytes of E2M1 pairs.
+/// Within a 16-element sub-block the low nibbles are its first eight
+/// values and the high nibbles its last eight — the `MXFP4` split, per
+/// sub-block rather than per block.
+fn dequantize_nvfp4(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
+    const N_SUB: usize = QK_NVFP4 / QK_NVFP4_SUB;
+    const BLOCK_BYTES: usize = N_SUB + QK_NVFP4 / 2;
+    const HALF: usize = QK_NVFP4_SUB / 2;
+    out.clear();
+    out.reserve(element_count);
+    for block in bytes.as_chunks::<BLOCK_BYTES>().0 {
+        let (scales, qs) = block.split_at(N_SUB);
+        for (s, &scale) in scales.iter().enumerate() {
+            let d = ue4m3_to_f32_half(scale);
+            let sub = &qs[s * HALF..(s + 1) * HALF];
+            for &q in sub {
+                out.push(f32::from(KVALUES_MXFP4[(q & 0x0F) as usize]) * d);
+            }
+            for &q in sub {
+                out.push(f32::from(KVALUES_MXFP4[(q >> 4) as usize]) * d);
+            }
         }
     }
     out.truncate(element_count);
@@ -2375,6 +2429,44 @@ mod tests {
         let want: Vec<f32> = KVALUES_MXFP4.iter().map(|&v| v as f32).collect();
         assert_eq!(out[..16], want[..], "low nibbles");
         assert_eq!(out[16..], want[..], "high nibbles");
+    }
+
+    /// ggml's `dequantize_row_nvfp4`, written out longhand: per sub-block,
+    /// value `j` is the low nibble of byte `j` and value `j + 8` its high
+    /// nibble, scaled by `ue4m3(d[s]) * 0.5`. Two sub-blocks share nothing,
+    /// so a scale applied to the wrong one fails here.
+    #[test]
+    fn dequantize_nvfp4_scales_each_sixteen_element_sub_block() {
+        // Scales: 0x38 = 2^0 -> 0.5 after the halving, 0x40 = 2^1 -> 1.0,
+        // 0x00 and 0x7F both read as zero.
+        let mut block = vec![0x38u8, 0x40, 0x00, 0x7F];
+        for s in 0..4u8 {
+            block.extend((0..8u8).map(|j| (j + s) & 0x0F | (((15 - j) & 0x0F) << 4)));
+        }
+        assert_eq!(block.len(), 36);
+        assert_eq!(tensor_byte_size(GGML_TYPE_NVFP4, 64).unwrap(), 36);
+        assert!(supports_type(GGML_TYPE_NVFP4));
+        let out = dequantize(GGML_TYPE_NVFP4, &block, 64).unwrap();
+        let k = |n: u8| f32::from(KVALUES_MXFP4[n as usize]);
+        for j in 0..8u8 {
+            assert_eq!(out[j as usize], k(j) * 0.5, "sub 0 low {j}");
+            assert_eq!(out[8 + j as usize], k(15 - j) * 0.5, "sub 0 high {j}");
+            assert_eq!(out[16 + j as usize], k((j + 1) & 0x0F), "sub 1 low {j}");
+            assert_eq!(out[24 + j as usize], k(15 - j), "sub 1 high {j}");
+        }
+        assert!(out[32..].iter().all(|&v| v == 0.0), "zero and NaN scales");
+    }
+
+    /// The UE4M3 decode against ggml's formula at the edges: the smallest
+    /// subnormal, the subnormal/normal seam, and the largest finite value.
+    /// The sign bit is not a sign here.
+    #[test]
+    fn ue4m3_scale_matches_ggml_including_subnormals() {
+        assert_eq!(ue4m3_to_f32_half(0x01), 2f32.powi(-9) * 0.5);
+        assert_eq!(ue4m3_to_f32_half(0x07), 7.0 * 2f32.powi(-9) * 0.5);
+        assert_eq!(ue4m3_to_f32_half(0x08), 2f32.powi(-6) * 0.5);
+        assert_eq!(ue4m3_to_f32_half(0x7E), 448.0 * 0.5);
+        assert_eq!(ue4m3_to_f32_half(0x80 | 0x38), ue4m3_to_f32_half(0x38));
     }
 
     /// A `Q4_K` super-block with `d=1.0`, `dmin=0.0`, every scale byte set to

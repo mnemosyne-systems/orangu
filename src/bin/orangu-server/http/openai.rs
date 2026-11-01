@@ -379,6 +379,13 @@ fn response_schema(
 /// template that checks for it).
 pub(crate) const EMPTY_THINK_BLOCK: &str = "<think>\n\n</think>\n\n";
 
+/// [`EMPTY_THINK_BLOCK`] for MiniMax's `<mm:think>` spelling. Its chat
+/// template does not write an empty pair for a turn without reasoning: it
+/// writes the closing marker alone, and its system prompt tells the model
+/// that "when thinking is disabled, begin your response directly after the
+/// `</mm:think>` prefix".
+pub(crate) const MINIMAX_EMPTY_THINK_BLOCK: &str = "</mm:think>";
+
 /// Appends [`EMPTY_THINK_BLOCK`] to a rendered prompt when — and only
 /// when — that approximation is the right tool for this model.
 ///
@@ -439,9 +446,13 @@ pub(crate) fn append_empty_think_block(
 ) {
     if tokenizer.message_framing().is_none()
         && tokenizer.content_kinds().is_none()
-        && tokenizer.think_framing().is_some()
+        && let Some((open, _)) = tokenizer.think_framing()
     {
-        prompt.push_str(EMPTY_THINK_BLOCK);
+        prompt.push_str(if tokenizer.token_text(open) == Some("<mm:think>") {
+            MINIMAX_EMPTY_THINK_BLOCK
+        } else {
+            EMPTY_THINK_BLOCK
+        });
     }
 }
 

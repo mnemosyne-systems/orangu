@@ -173,6 +173,11 @@ pub enum ArchFamily {
     /// frequencies and a final logit softcap. See
     /// `engine::arch::mistral_large4` and `engine::arch::dsa`.
     MistralLarge4,
+    /// MiniMax-M3 (`minimax-m3`) — GQA with per-head QK-norm and partial
+    /// NEOX rotation, block-sparse attention (MSA) chosen per key/value
+    /// group by a small indexer, and the DeepSeek-V3 shared-expert MoE with
+    /// `swiglu_oai` and per-expert scales. See `engine::arch::minimax_m3`.
+    MinimaxM3,
     /// Muse-Glimmer (`muse-glimmer`) — a dense GQA decoder with gemma-style
     /// sandwich norms around both sub-layers, per-head QK-norm, a sigmoid
     /// output gate on attention (`attn_gate`), an alternating pattern of
@@ -289,6 +294,10 @@ const MISTRAL_ARCHITECTURES: &[&str] = &["mistral3"];
 /// [`ArchFamily::MistralLarge4`]. The `mmproj-*.gguf` shipped alongside is
 /// a separate vision model and is not this.
 const MISTRAL_LARGE4_ARCHITECTURES: &[&str] = &["mistral-large4"];
+/// `minimax-m3` (e.g. `unsloth/MiniMax-M3.1-Flash-GGUF`) — see
+/// [`ArchFamily::MinimaxM3`]. The `mmproj-*.gguf` shipped alongside is a
+/// separate vision model and is not this.
+const MINIMAX_M3_ARCHITECTURES: &[&str] = &["minimax-m3"];
 
 /// [`ArchFamily::Granite`] and `engine::arch::granite`.
 ///
@@ -506,6 +515,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if MISTRAL_LARGE4_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::MistralLarge4);
     }
+    if MINIMAX_M3_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::MinimaxM3);
+    }
     if GRANITE_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Granite);
     }
@@ -585,6 +597,7 @@ fn supported_architecture_names() -> Vec<&'static str> {
         .chain(PHI3_ARCHITECTURES)
         .chain(MISTRAL_ARCHITECTURES)
         .chain(MISTRAL_LARGE4_ARCHITECTURES)
+        .chain(MINIMAX_M3_ARCHITECTURES)
         .chain(MUSE_ARCHITECTURES)
         .chain(MUSE_SPARK_ARCHITECTURES)
         .chain(INKLING_ARCHITECTURES)
@@ -3008,6 +3021,7 @@ mod tests {
             (ArchFamily::Phi3, "phi3"),
             (ArchFamily::Mistral3, "mistral3"),
             (ArchFamily::MistralLarge4, "mistral-large4"),
+            (ArchFamily::MinimaxM3, "minimax-m3"),
             (ArchFamily::Muse, "muse-glimmer"),
             (ArchFamily::MuseSpark, "muse-spark"),
             (ArchFamily::Inkling, "inkling"),
@@ -3036,6 +3050,7 @@ mod tests {
                 ArchFamily::Phi3 => "Phi3",
                 ArchFamily::Mistral3 => "Mistral3",
                 ArchFamily::MistralLarge4 => "MistralLarge4",
+                ArchFamily::MinimaxM3 => "MinimaxM3",
                 ArchFamily::Granite => "Granite",
                 ArchFamily::Muse => "Muse",
                 ArchFamily::MuseSpark => "MuseSpark",

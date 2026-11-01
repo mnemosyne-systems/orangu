@@ -4233,6 +4233,13 @@ fn build_model(
             crate::engine::arch::mistral_large4::load_with_backend(loaded, backend.clone())
                 .context("building model")?,
         ),
+        ArchFamily::MinimaxM3 => Arc::new(
+            crate::engine::arch::minimax_m3::MinimaxM3Model::load_with_backend(
+                loaded,
+                backend.clone(),
+            )
+            .context("building model")?,
+        ),
         ArchFamily::Glm5Next => Arc::new(
             Glm5Model::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),

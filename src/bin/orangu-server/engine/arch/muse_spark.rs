@@ -324,6 +324,7 @@ impl MuseSparkModel {
                 shared: None,
                 clamp_exp: SwigluLimit::None,
                 clamp_shexp: SwigluLimit::None,
+                scales: super::ExpertScales::NONE,
             },
             Some((&moe.post_exp_norm, self.post_norm_eps)),
             il,

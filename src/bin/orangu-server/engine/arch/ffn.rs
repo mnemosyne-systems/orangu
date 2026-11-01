@@ -19,12 +19,14 @@
 //!
 //! Not an architecture. `engine::arch::dsa` (`glm-dsa`, `mistral-large4`),
 //! `engine::arch::glm5` and `engine::arch::bailingmoe` all load and run it
-//! through [`LayerFfn`]; what differs between them is only the routing
-//! rules ([`super::ExpertRouting`]) and the SwiGLU clamps ([`FfnLimits`]).
+//! through [`LayerFfn`], and so does `engine::arch::minimax_m3`; what differs
+//! between them is the routing rules ([`super::ExpertRouting`]), the gated
+//! activation ([`FfnLimits`]) and whether the experts carry per-expert
+//! scales.
 
 use anyhow::{Context, Result};
 
-use super::{ExpertRouting, FfnScratch, SwigluLimit, SwigluMoe, SwigluSharedExpert};
+use super::{ExpertRouting, ExpertScales, FfnScratch, SwigluLimit, SwigluMoe, SwigluSharedExpert};
 use crate::engine::backend::Backend;
 use crate::engine::loader::{ExpertQuantMatrix, LoadedModel, QuantMatrix};
 
@@ -36,6 +38,12 @@ pub(crate) struct SharedExpertMoe {
     gate_exps: ExpertQuantMatrix,
     up_exps: ExpertQuantMatrix,
     down_exps: ExpertQuantMatrix,
+    /// `ffn_{gate,up,down}_exps.scale` — per-expert output scalars, present
+    /// when the expert stacks are stored without their tensor-wide scale
+    /// (`minimax-m3`'s NVFP4 experts).
+    gate_scale: Option<Vec<f32>>,
+    up_scale: Option<Vec<f32>>,
+    down_scale: Option<Vec<f32>>,
     gate_shexp: QuantMatrix,
     up_shexp: QuantMatrix,
     down_shexp: QuantMatrix,
@@ -53,12 +61,14 @@ pub(crate) enum LayerFfn {
     Moe(Box<SharedExpertMoe>),
 }
 
-/// The SwiGLU clamps one layer applies — `swiglu_clamp_exp` /
-/// `swiglu_clamp_shexp`, in whichever form the architecture takes them.
-/// [`FfnLimits::NONE`] for a file that declares none.
+/// The gated activation one layer applies — the SwiGLU clamps
+/// `swiglu_clamp_exp` / `swiglu_clamp_shexp` in whichever form the
+/// architecture takes them, or `swiglu_oai` ([`FfnLimits::OAI`]).
+/// [`FfnLimits::NONE`] for plain SwiGLU.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FfnLimits {
-    /// The dense arm's limit. Only `glm5-next` clamps its dense blocks.
+    /// The dense arm's activation. `glm5-next` clamps its dense blocks and
+    /// `minimax-m3` runs `swiglu_oai` on them; everything else is plain.
     pub dense: SwigluLimit,
     pub exp: SwigluLimit,
     pub shexp: SwigluLimit,
@@ -69,6 +79,13 @@ impl FfnLimits {
         dense: SwigluLimit::None,
         exp: SwigluLimit::None,
         shexp: SwigluLimit::None,
+    };
+
+    /// `swiglu_oai` on every arm — dense, routed and shared.
+    pub(crate) const OAI: Self = Self {
+        dense: SwigluLimit::OAI,
+        exp: SwigluLimit::OAI,
+        shexp: SwigluLimit::OAI,
     };
 }
 
@@ -102,6 +119,18 @@ impl LayerFfn {
                 .expert_matrix(&name)
                 .with_context(|| format!("loading {name}"))
         };
+        let optional_vec = |suffix: &str| -> Result<Option<Vec<f32>>> {
+            let name = format!("blk.{layer}.{suffix}");
+            if !loaded.has_tensor(&name) {
+                return Ok(None);
+            }
+            Ok(Some(
+                loaded
+                    .tensor(&name)
+                    .with_context(|| format!("loading {name}"))?
+                    .0,
+            ))
+        };
         let moe = SharedExpertMoe {
             gate_inp: get_matrix("ffn_gate_inp.weight")?,
             exp_probs_b: loaded
@@ -111,6 +140,9 @@ impl LayerFfn {
             gate_exps: get_expert_matrix("ffn_gate_exps.weight")?,
             up_exps: get_expert_matrix("ffn_up_exps.weight")?,
             down_exps: get_expert_matrix("ffn_down_exps.weight")?,
+            gate_scale: optional_vec("ffn_gate_exps.scale")?,
+            up_scale: optional_vec("ffn_up_exps.scale")?,
+            down_scale: optional_vec("ffn_down_exps.scale")?,
             gate_shexp: get_matrix("ffn_gate_shexp.weight")?,
             up_shexp: get_matrix("ffn_up_shexp.weight")?,
             down_shexp: get_matrix("ffn_down_shexp.weight")?,
@@ -127,6 +159,19 @@ impl LayerFfn {
                  ({n_expert})",
                 moe.gate_inp.out_dim
             );
+            for (scale, name) in [
+                (&moe.gate_scale, "ffn_gate_exps.scale"),
+                (&moe.up_scale, "ffn_up_exps.scale"),
+                (&moe.down_scale, "ffn_down_exps.scale"),
+            ] {
+                if let Some(scale) = scale {
+                    anyhow::ensure!(
+                        scale.len() == n_expert,
+                        "layer {layer}'s {name} has {} values, not expert_count ({n_expert})",
+                        scale.len()
+                    );
+                }
+            }
         }
         Ok(Self::Moe(Box::new(moe)))
     }
@@ -181,6 +226,11 @@ impl LayerFfn {
                         }),
                         clamp_exp: limits.exp,
                         clamp_shexp: limits.shexp,
+                        scales: ExpertScales {
+                            gate: moe.gate_scale.as_deref(),
+                            up: moe.up_scale.as_deref(),
+                            down: moe.down_scale.as_deref(),
+                        },
                     },
                     il,
                 )

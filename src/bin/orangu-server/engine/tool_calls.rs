@@ -30,9 +30,10 @@
 //!
 //! # Several bodies, one opener
 //!
-//! `<tool_call>` is not one format. Supported architectures write three
+//! `<tool_call>` is not one format. Supported architectures write four
 //! different things inside that same span — JSON, `<arg_key>`/`<arg_value>`
-//! pairs, and a `<function=…>`/`<parameter=…>` nest — so the *body* is what
+//! pairs, a `<function=…>`/`<parameter=…>` nest, and MiniMax's
+//! `<invoke name=…>` with one element per argument — so the *body* is what
 //! distinguishes them, discriminated by its own leading structure once the
 //! span is already anchored. Whether the delimiters themselves arrive as
 //! text or as special tokens is a third, independent axis, and a property
@@ -106,7 +107,7 @@ enum Syntax {
     /// `call:NAME{key:value,...}` — see [`parse_gemma_dsl`].
     #[default]
     GemmaDsl,
-    /// A `<tool_call>` span, whose body may be any of three shapes — see
+    /// A `<tool_call>` span, whose body may be any of four shapes — see
     /// [`parse_tool_call_body`].
     ToolCallSpan,
     /// `[{"name": "...", "arguments": {...}}, ...]` to end of text.
@@ -324,11 +325,12 @@ fn parse_gemma_dsl(body: &str) -> Vec<ParsedToolCall> {
     }]
 }
 
-/// A `<tool_call>` span's body, whichever of the three shapes it is.
+/// A `<tool_call>` span's body, whichever of the four shapes it is.
 ///
 /// Discriminated by leading structure, and each test is unambiguous: JSON
 /// opens with a brace or a bracket, the key/value shape has an `<arg_key>`
-/// element, and the nested shape has a `<function=` element. A body matching
+/// element, the nested shape has a `<function=` element, and MiniMax's
+/// element-per-argument shape opens with `<invoke name="`. A body matching
 /// none of them yields nothing, which leaves the whole span in the answer as
 /// prose — the right outcome for text that merely happens to sit between
 /// those tags.
@@ -348,7 +350,110 @@ fn parse_tool_call_body(body: &str) -> Vec<ParsedToolCall> {
     if trimmed.contains("<function=") {
         return parse_function_parameters(trimmed);
     }
+    if trimmed.starts_with(INVOKE_ELEMENT_OPEN) {
+        return parse_invoke_elements(trimmed);
+    }
     Vec::new()
+}
+
+/// The opening of a MiniMax-M3 call inside a `<tool_call>` span.
+const INVOKE_ELEMENT_OPEN: &str = "<invoke name=\"";
+
+/// `<invoke name="NAME"><KEY>value</KEY>…</invoke>` — MiniMax-M3, whose
+/// template writes each argument as an element named for its key, and
+/// expands a structured value the same way: a mapping's entries as
+/// elements, a list's entries as `<item>` elements. Every tag is preceded
+/// by the `]<]minimax[>[` namespace token, which is special and so already
+/// gone by the time the text reaches this parser.
+///
+/// A leaf is [`scalar_or_json`]'d, as in the other tag formats: the
+/// template writes strings and numbers bare and booleans as JSON.
+fn parse_invoke_elements(body: &str) -> Vec<ParsedToolCall> {
+    let mut calls = Vec::new();
+    let mut rest = body.trim_start();
+    while let Some(after_open) = rest.strip_prefix(INVOKE_ELEMENT_OPEN) {
+        let Some(name_end) = after_open.find("\">") else {
+            return Vec::new();
+        };
+        let name = &after_open[..name_end];
+        let inner_start = &after_open[name_end + 2..];
+        let Some(end) = inner_start.find("</invoke>") else {
+            return Vec::new();
+        };
+        let Some(arguments) = xml_elements(&inner_start[..end]) else {
+            return Vec::new();
+        };
+        let arguments = arguments.into_iter().collect::<Map<String, Value>>();
+        calls.push(ParsedToolCall {
+            name: name.to_string(),
+            arguments: Value::Object(arguments).to_string(),
+        });
+        rest = inner_start[end + "</invoke>".len()..].trim_start();
+    }
+    calls
+}
+
+/// A run of sibling elements, `<a>…</a><b>…</b>`, as `(name, value)`
+/// pairs; `None` when `text` is not wholly that. Whitespace between
+/// elements is ignored. An element whose content is itself a run of
+/// elements becomes an array when every child is `<item>` and an object
+/// otherwise; any other content is a leaf.
+fn xml_elements(text: &str) -> Option<Vec<(String, Value)>> {
+    let mut out = Vec::new();
+    let mut rest = text.trim_start();
+    while !rest.is_empty() {
+        let after_lt = rest.strip_prefix('<')?;
+        let name_end = after_lt.find('>')?;
+        let name = &after_lt[..name_end];
+        if name.is_empty() || name.starts_with('/') || name.contains(char::is_whitespace) {
+            return None;
+        }
+        let content_start = &after_lt[name_end + 1..];
+        let content_len = matching_close(content_start, name)?;
+        let content = &content_start[..content_len];
+        out.push((name.to_string(), element_value(content)));
+        rest = content_start[content_len + name.len() + 3..].trim_start();
+    }
+    Some(out)
+}
+
+/// Where `<name>`'s matching `</name>` starts in `text` (the content after
+/// the opening tag), counting nested elements of the same name — a list of
+/// lists nests `<item>` in `<item>`.
+fn matching_close(text: &str, name: &str) -> Option<usize> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let mut depth = 0usize;
+    let mut at = 0;
+    loop {
+        let next_close = at + text[at..].find(&close)?;
+        match text[at..next_close].find(&open) {
+            Some(rel) => {
+                depth += 1;
+                at += rel + open.len();
+            }
+            None if depth == 0 => return Some(next_close),
+            None => {
+                depth -= 1;
+                at = next_close + close.len();
+            }
+        }
+    }
+}
+
+/// One element's content: nested elements as an array or an object, text
+/// as a leaf.
+fn element_value(content: &str) -> Value {
+    if content.trim_start().starts_with('<')
+        && let Some(children) = xml_elements(content)
+        && !children.is_empty()
+    {
+        if children.iter().all(|(name, _)| name == "item") {
+            return Value::Array(children.into_iter().map(|(_, v)| v).collect());
+        }
+        return Value::Object(children.into_iter().collect());
+    }
+    scalar_or_json(content)
 }
 
 /// `NAME<arg_key>k</arg_key><arg_value>v</arg_value>…`
@@ -806,6 +911,8 @@ pub fn call_name(opener: &str, span: &str) -> Option<String> {
             } else if let Some(at) = body.find("<function=") {
                 let rest = &body[at + "<function=".len()..];
                 rest[..rest.find('>')?].trim().to_string()
+            } else if let Some(rest) = body.strip_prefix(INVOKE_ELEMENT_OPEN) {
+                rest[..rest.find("\">")?].to_string()
             } else {
                 body[..body.find("<arg_key>")?].trim().to_string()
             }
@@ -2032,6 +2139,53 @@ mod tests {
         assert_eq!(args["recursive"], true);
     }
 
+    /// MiniMax-M3's body: each argument an element named for its key, a
+    /// mapping expanded into elements and a list into `<item>`s — nested
+    /// `<item>` in `<item>` included. The namespace token before every tag
+    /// is special and arrives already removed.
+    #[test]
+    fn an_invoke_element_body_in_a_tool_call_span_is_read() {
+        let split = split(
+            "Checking.<tool_call>\n<invoke name=\"edit\"><path>src/a.rs</path>\
+             <count>3</count><dry>true</dry><opts><mode>fast</mode><tags><item>x</item>\
+             <item>y</item></tags></opts><grid><item><item>1</item><item>2</item></item>\
+             </grid></invoke>\n<invoke name=\"ls\"><dir>/tmp</dir></invoke>\n</tool_call>",
+        );
+        assert_eq!(split.content, "Checking.");
+        assert_eq!(split.calls.len(), 2);
+        assert_eq!(split.calls[0].name, "edit");
+        let args: Value = serde_json::from_str(&split.calls[0].arguments).unwrap();
+        assert_eq!(
+            args,
+            serde_json::json!({
+                "path": "src/a.rs",
+                "count": 3,
+                "dry": true,
+                "opts": {"mode": "fast", "tags": ["x", "y"]},
+                "grid": [[1, 2]],
+            })
+        );
+        assert_eq!(split.calls[1].name, "ls");
+        assert_eq!(
+            call_name("<tool_call>", "\n<invoke name=\"edit\"><pa").as_deref(),
+            Some("edit")
+        );
+    }
+
+    /// A leaf that is prose containing angle brackets stays a string, and a
+    /// call left unclosed is not a call.
+    #[test]
+    fn an_invoke_element_leaf_with_markup_is_text_and_an_open_invoke_is_prose() {
+        let parsed = split(
+            "<tool_call><invoke name=\"write\"><body>if a < b { x }</body></invoke></tool_call>",
+        );
+        let args: Value = serde_json::from_str(&parsed.calls[0].arguments).unwrap();
+        assert_eq!(args["body"], "if a < b { x }");
+
+        let open = split("<tool_call><invoke name=\"write\"><body>x</body></tool_call>");
+        assert!(open.calls.is_empty());
+    }
+
     /// Two calls in one span must not pool their parameters.
     #[test]
     fn two_functions_in_one_span_keep_their_own_parameters() {
@@ -2113,7 +2267,7 @@ mod tests {
         }
     }
 
-    /// A body matching none of the three shapes is prose, and stays in the
+    /// A body matching none of the four shapes is prose, and stays in the
     /// answer rather than vanishing.
     #[test]
     fn an_unreadable_tool_call_body_is_left_in_the_answer() {

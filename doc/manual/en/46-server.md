@@ -2082,7 +2082,7 @@ pair must share a vocabulary — speculation compares token _ids_, so two models
 that disagree about what an id means produce wrong or needlessly slow output
 with nothing to see — and both must be an architecture with a multi-position
 forward (the Llama family — `llama`, `qwen2`, `qwen3`, `qwen3moe`, `mistral`,
-`granite`, `qwen2vl`, `qwen3vl` — and `gemma4`, `deepseek4`, `deepseek41`, `glm-dsa`, `mistral-large4`,
+`granite`, `qwen2vl`, `qwen3vl` — and `gemma4`, `deepseek4`, `deepseek41`, `glm-dsa`, `mistral-large4`, `minimax-m3`,
 `muse-glimmer` today). Either
 failure stops the server with a message naming what is wrong.
 
@@ -4697,7 +4697,7 @@ that apply to all of them.
 ## Scope
 
 Text-in/text-out GGUF chat, completion, and embedding models — and one
-text-to-image model, one text-to-video model and one text-to-speech model — for twenty-two
+text-to-image model, one text-to-video model and one text-to-speech model — for twenty-three
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
 _text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way; and
@@ -4750,7 +4750,11 @@ width read from `attention.key_length` rather than derived from
 (`mistral-large4`, e.g. `unsloth/Mistral-Large-4-1T-A52B-GGUF` — despite the
 name, GLM-5's block rather than Mistral 3's, plus a learned per-head query
 scale, unrotated layers, key/value rows shared between layers, learned
-rotary frequencies and a final logit softcap), and Muse-Glimmer
+rotary frequencies and a final logit softcap), and MiniMax-M3
+(`minimax-m3`, e.g. `unsloth/MiniMax-M3.1-Flash-GGUF` — grouped-query
+attention with per-head query/key norms and half-rotated heads, block-sparse
+attention chosen per key/value group by a small indexer, and a shared-expert
+mixture with the `swiglu_oai` activation and NVFP4 experts), and Muse-Glimmer
 (`muse-glimmer`, e.g. `unsloth/Muse-Glimmer-30B-GGUF` — a dense GQA block
 with a norm on both sides of each sub-layer, per-head query/key norms, a
 sigmoid gate on the attention output, three rotated sliding-window layers
@@ -4788,7 +4792,7 @@ latent upscaler; see **Video generation**), and Qwen3-TTS (`qwen3tts`,
 `cstr/qwen3-tts-1.7b-base-GGUF` — a Qwen3 decoder that writes a 12 Hz
 speech codec's codes one frame at a time, served with the codec and a
 voice pack beside it; see **Speech generation**) — using
-`F32`/`F16`/`BF16`/`F8_E4M3`/`MXFP8`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
+`F32`/`F16`/`BF16`/`F8_E4M3`/`MXFP8`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`NVFP4`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 memory-mapped file (dequantized one row at a time, on demand) rather than
 eagerly resident, so even large models fit in modest RAM. A model split
@@ -5011,6 +5015,34 @@ every layer and the indexer. And the logits pass through
 groups of three digits (`tokenizer.ggml.pre = "tekken-num3"`), so `12345` is
 `12` then `345`. The vision tower shipped beside it is a separate file and
 is not loaded.
+
+MiniMax-M3 (`minimax-m3`) is a pre-norm stack whose attention is grouped
+(64 query heads over 4 key/value heads of 128) with an RMSNorm on each query
+and key head and rotation on the leading `rope.dimension_count` values of each
+head only. From layer `leading_dense_block_count` on, attention is
+block-sparse: positions are cut into `attention.indexer.block_size` blocks, a
+small indexer — one query head per key/value group and one key per token, each
+normed and rotated the same way — scores every visible position, a block takes
+its best position's score, and each group attends its
+`attention.indexer.top_k` best blocks, its own block always among them. A
+query that sees no more blocks than that attends all of them, which is
+ordinary causal attention, so the first `top_k × block_size` positions (2048
+in MiniMax-M3.1-Flash) take the dense path on whichever processor attention
+runs on; past that, the selection and the attention over it run on the host.
+The feed-forward is dense for the leading layers and then sigmoid-routed
+experts with a selection-only bias, renormalized and scaled, beside one
+always-on shared expert — all three with the `swiglu_oai` activation
+(`min(g, 7) · sigmoid(1.702 · min(g, 7)) · (clamp(u, −7, 7) + 1)`). The
+routed experts are NVFP4, whose per-tensor scale the file stores beside each
+expert stack (`ffn_*_exps.scale`, one value per expert) and which is applied
+to that expert's output; on the host they take a fused integer dot (16-value
+sub-blocks against `int8` activations) rather than being dequantized, and
+the GPU has no NVFP4 kernel. A raw completion gets no BOS token, and reasoning is
+framed by `<mm:think>`/`</mm:think>`; a role that suppresses reasoning
+prefills `</mm:think>` alone, which is what the model's own template writes for
+a turn without it. Tool calls are read from its `<invoke name="…">` blocks,
+with one element per argument. The vision tower shipped beside it is a
+separate file and is not loaded.
 
 GLM-5.3-Flash (`glm5-next`) runs on the CPU path only, and is the model in
 this server assembled most nearly out of parts other models here already

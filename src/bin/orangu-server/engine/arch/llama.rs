@@ -1136,6 +1136,7 @@ impl LlamaModel {
                         shared: None,
                         clamp_exp: super::SwigluLimit::None,
                         clamp_shexp: super::SwigluLimit::None,
+                        scales: super::ExpertScales::NONE,
                     },
                     il,
                 );
@@ -2254,6 +2255,7 @@ impl LlamaModel {
                                     shared: None,
                                     clamp_exp: super::SwigluLimit::None,
                                     clamp_shexp: super::SwigluLimit::None,
+                                    scales: super::ExpertScales::NONE,
                                 },
                                 layer_idx,
                             );
