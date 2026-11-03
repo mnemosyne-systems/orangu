@@ -3809,7 +3809,7 @@ checksum = "7e036b411754132fd6b74e94b74e9a13c5cf606fa93d1885c35860d3060820b1"
 
 [[package]]
 name = "orangu"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
