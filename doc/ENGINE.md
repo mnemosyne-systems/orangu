@@ -307,6 +307,21 @@ normalisation of the 2x2-patchified latent, on `image::vae`'s
 convolutions; `scheduler::flux2_sigmas` is the schedule, its shift fitted
 to the step count as well as the token count.
 
+`moss_image`, MOSS-Image, is the fourth. The transformer (`image::moss`)
+is forty-two single-stream blocks over `[image | text]`, all modulated by
+one `shared_block_modulation` linear over the time embedding, with a
+soft-capped gated feed-forward (`4 tanh(g/4) σ(g) · 25 tanh(h/25)`) and
+four-axis rotate-half rotary positions (`r, f, h, w`, base 10000; the
+picture centred on its grid and placed after the text on `f`). The text
+encoder is Qwen3.5-9B, the server's `qwen35` model read through
+`ModelForward::forward_hidden_states` (the trunk's layer loop and final
+norm); the transformer's two-block text refiner runs once per prompt
+(`MossTransformer::embed_text`), not once per step. The VAE is
+`image::vae_flux2` loading MOSS's small-decoder file; the latent tokens
+are FLUX.2's. `scheduler::moss_sigmas` shifts by 5 and snaps to the
+thousand training levels, so a large step count can run fewer steps, and
+the guidance pass skips block 22 (`MOSS_UNCOND_SKIP`).
+
 `ltxv`, LTX-2.5's audio-video diffusion transformer, is the other family
 outside the table, in `engine::video`. It draws a clip's frames and its
 sound together: two token streams, video and audio, through 48 blocks that

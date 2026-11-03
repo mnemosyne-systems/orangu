@@ -299,7 +299,7 @@ A failed build keeps `build/`; `make clean` removes it.
 ## Limits
 
 - **CPU only.** The images carry no GPU runtime.
-- **Picture models** (`qwen_image`, `qwen_image_2_1`, `flux2_klein`) are refused.
+- **Picture models** (`qwen_image`, `qwen_image_2_1`, `flux2_klein`, `moss_image`) are refused.
 - **Disk space.** Building needs room for the models about three times: the
   copy in `build/` (free when it is a hard link), the context the engine
   receives, and the image.

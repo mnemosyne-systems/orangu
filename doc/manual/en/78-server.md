@@ -2517,8 +2517,8 @@ of it is there yet.
 Its role is `config::Role::Video`, fixed by the model exactly as
 `Role::Image` is: `Role::required_by` names it for `ltxv`,
 `Role::fixed_by_model` covers both, `main::fix_role_for_model` refuses a
-conflict either way, the picker greys rows in `model_spec::
-Dimming::VideoModels` under `--video` (from `ModelSupport::video`), and
+conflict either way, the picker lists only the rows `model_spec::
+Dimming::VideoModels` selects under `--video` (from `ModelSupport::video`), and
 `--init` asks the video keys (`init::VideoKeys`, `prompt_video_keys`).
 `bundle` refuses it before the copy.
 
@@ -2707,8 +2707,8 @@ kinds `qwen3tts`, which `list` prints as `Companion (qwen3tts)`.
 Its role is `config::Role::Audio`, fixed by the model exactly as
 `Role::Image` and `Role::Video` are: `Role::required_by` names it for
 `qwen3tts`, `Role::fixed_by_model` covers all three,
-`main::fix_role_for_model` refuses a conflict either way, the picker greys
-rows in `model_spec::Dimming::AudioModels` under `--audio` (from
+`main::fix_role_for_model` refuses a conflict either way, the picker lists
+only the rows `model_spec::Dimming::AudioModels` selects under `--audio` (from
 `ModelSupport::audio`), and `--init` answers `role: audio` on its own and
 asks no keys of its own. `bundle` refuses it before the copy, and
 `prepare_audio` refuses an embedded model in case one reaches it.

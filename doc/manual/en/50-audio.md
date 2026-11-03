@@ -63,8 +63,8 @@ the flag that asks for it:
 orangu-server --audio
 ```
 
-That prints the model table with every model that is not a speech model
-greyed out, so the pick is a speech model. A speech model given on the
+That prints a table of the speech models alone, the most recently used
+one pre-selected, so the pick is a speech model. A speech model given on the
 command line, or named in the configuration, comes up in the `audio`
 role without the flag. The server then reports the codec and the voice
 packs it found:

@@ -107,6 +107,61 @@ pub fn flux2_sigmas(steps: usize, image_seq_len: usize) -> Vec<f32> {
     out
 }
 
+/// MOSS-Image's noise levels — `MOSSImageScheduler.set_timesteps`: `steps`
+/// levels spaced linearly from 1 and shifted by `shift / (1 + (shift - 1)
+/// s)` with the release shift of 5, each then snapped to the nearest of the
+/// thousand levels the model was trained at, consecutive repeats dropped,
+/// and the terminal 0 appended. Snapping can merge levels at large step
+/// counts, so the schedule may hold fewer than `steps + 1` values.
+pub fn moss_sigmas(steps: usize) -> Vec<f32> {
+    assert!(steps > 0, "a schedule needs at least one step");
+    const TOTAL: usize = 1000;
+    const SHIFT: f64 = 5.0;
+    // torch.linspace in single precision: the first half counted up from
+    // `start`, the second down from `end`.
+    let linspace = |start: f32, end: f32, count: usize| -> Vec<f32> {
+        if count == 1 {
+            return vec![start];
+        }
+        let step = (end - start) / (count - 1) as f32;
+        (0..count)
+            .map(|i| {
+                if i < count / 2 {
+                    start + step * i as f32
+                } else {
+                    end - step * (count - 1 - i) as f32
+                }
+            })
+            .collect()
+    };
+    let grid = |count: usize, shift: f64| -> Vec<f32> {
+        let lower = (shift / (TOTAL as f64 + shift - 1.0)) as f32;
+        let shift = shift as f32;
+        linspace(1.0, lower, count)
+            .into_iter()
+            .map(|v| shift * v / (1.0 + (shift - 1.0) * v))
+            .collect()
+    };
+    let mut training = grid(TOTAL, 1.0);
+    training.reverse();
+    let mut out: Vec<f32> = Vec::with_capacity(steps + 1);
+    for s in grid(steps, SHIFT) {
+        let upper = training.partition_point(|&t| t < s).min(TOTAL - 1);
+        let lower = upper.saturating_sub(1);
+        let nearest = if (s - training[lower]).abs() <= (training[upper] - s).abs() {
+            lower
+        } else {
+            upper
+        };
+        let level = training[nearest];
+        if out.last() != Some(&level) {
+            out.push(level);
+        }
+    }
+    out.push(0.0);
+    out
+}
+
 /// diffusers' `compute_empirical_mu` for FLUX.2: two lines in the token
 /// count, for 10 and 200 steps, interpolated linearly in the step count;
 /// past 4300 tokens the 200-step line alone.
@@ -254,6 +309,22 @@ impl Noise {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Against `MOSSImageScheduler.set_timesteps` worked in NumPy: fifty
+    /// steps keep fifty distinct training levels; five hundred collapse to
+    /// 415 where the shifted spacing is finer than the grid.
+    #[test]
+    fn moss_levels_are_shifted_and_snapped_to_the_training_grid() {
+        let s = moss_sigmas(50);
+        assert_eq!(s.len(), 51);
+        let near = |a: f32, b: f32| (a - b).abs() < 2e-6;
+        assert!(near(s[0], 1.0) && near(s[1], 0.996) && near(s[2], 0.992));
+        assert!(near(s[24], 0.84) && near(s[25], 0.829));
+        assert!(near(s[47], 0.193) && near(s[48], 0.115) && near(s[49], 0.024));
+        assert_eq!(s[50], 0.0);
+        assert!(s.windows(2).all(|w| w[0] > w[1]));
+        assert_eq!(moss_sigmas(500).len(), 416);
+    }
 
     /// Against diffusers' `compute_empirical_mu` and the shifted
     /// `np.linspace` it feeds, worked in Python.

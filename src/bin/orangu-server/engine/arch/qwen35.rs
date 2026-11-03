@@ -154,8 +154,10 @@ impl ModelForward for Qwen35Model {
         self.trunk.forward(cache, tokens, start_pos, slot_id)
     }
 
-    fn forward_hidden_states(&self, _tokens: &[u32]) -> Result<Vec<f32>> {
-        anyhow::bail!("embeddings are not yet supported for Qwen3.5 models")
+    /// Every token's hidden state after the final norm — what MOSS-Image
+    /// conditions on (its text encoder is Qwen3.5-9B).
+    fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        self.trunk.hidden_states(tokens)
     }
 
     /// Each layer keeps its own state — an attention layer its KV rows, a

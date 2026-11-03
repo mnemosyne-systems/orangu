@@ -368,6 +368,16 @@ pub const FLUX2_KLEIN_TEXT_ENCODER_TAG: &str = "Q8_0";
 pub const FLUX2_VAE_REPO: &str = "black-forest-labs/FLUX.2-klein-base-4B";
 pub const FLUX2_VAE_FILE: &str = "vae/diffusion_pytorch_model.safetensors";
 
+/// The text encoder a `moss_image` model conditions on: Qwen3.5-9B, whose
+/// final hidden states the transformer reads. `Q8_0` is the quantization
+/// the transformer's own GGUFs were evaluated with.
+pub const MOSS_IMAGE_TEXT_ENCODER_REPO: &str = "unsloth/Qwen3.5-9B-GGUF";
+pub const MOSS_IMAGE_TEXT_ENCODER_TAG: &str = "Q8_0";
+/// MOSS-Image's VAE: FLUX.2's encoder with a smaller decoder, from the
+/// model's own repository.
+pub const MOSS_IMAGE_VAE_REPO: &str = "OpenMOSS-Team/MOSS-Image-Base";
+pub const MOSS_IMAGE_VAE_FILE: &str = "vae/diffusion_pytorch_model.safetensors";
+
 /// Fetches what a picture model (`architecture`, one of
 /// [`crate::model_spec::IMAGE_ARCHITECTURES`]) needs beside it and does not
 /// carry. For `qwen_image`: the Qwen2.5-VL-7B text encoder (a `qwen2vl`
@@ -376,6 +386,7 @@ pub const FLUX2_VAE_FILE: &str = "vae/diffusion_pytorch_model.safetensors";
 /// `qwen_image_2_1`: the Qwen3-VL-8B text encoder with its vision projector
 /// (`mmproj`, for editing a picture) and its own VAE — there is no adapter
 /// for it. For `flux2_klein`: the Qwen3-4B text encoder and the FLUX.2 VAE.
+/// For `moss_image`: the Qwen3.5-9B text encoder and MOSS-Image's VAE.
 /// Each is skipped when the models directory already
 /// holds one — a second quantization of the encoder is a choice, not a
 /// default — so a re-download, or a second checkpoint, fetches nothing
@@ -388,6 +399,31 @@ pub fn download_image_companions(
     architecture: &str,
     progress: Option<Arc<DownloadProgress>>,
 ) -> Result<()> {
+    if architecture == crate::model_spec::MOSS_IMAGE_ARCHITECTURE {
+        if crate::model_spec::find_moss_image_text_encoder(models_dir).is_none() {
+            eprintln!(
+                "Fetching the text encoder a {architecture} model needs \
+                 ({MOSS_IMAGE_TEXT_ENCODER_REPO}:{MOSS_IMAGE_TEXT_ENCODER_TAG})"
+            );
+            download_model_reporting(
+                models_dir,
+                &format!("{MOSS_IMAGE_TEXT_ENCODER_REPO}:{MOSS_IMAGE_TEXT_ENCODER_TAG}"),
+                progress.clone(),
+            )
+            .with_context(|| format!("downloading the {architecture} text encoder"))?;
+        }
+        if crate::model_spec::find_moss_image_vae(models_dir).is_none() {
+            eprintln!("Fetching the VAE a {architecture} model needs ({MOSS_IMAGE_VAE_REPO})");
+            download_repo_file(
+                models_dir,
+                MOSS_IMAGE_VAE_REPO,
+                MOSS_IMAGE_VAE_FILE,
+                progress,
+            )
+            .with_context(|| format!("downloading the {architecture} VAE"))?;
+        }
+        return Ok(());
+    }
     if architecture == crate::model_spec::FLUX2_KLEIN_ARCHITECTURE {
         if crate::model_spec::find_flux2_klein_text_encoder(models_dir).is_none() {
             eprintln!(
@@ -401,7 +437,9 @@ pub fn download_image_companions(
             )
             .with_context(|| format!("downloading the {architecture} text encoder"))?;
         }
-        if crate::model_spec::find_flux2_vae(models_dir).is_none() {
+        if crate::model_spec::find_flux2_vae(models_dir)
+            .is_none_or(|path| crate::model_spec::is_moss_image_vae(&path))
+        {
             eprintln!("Fetching the VAE a {architecture} model needs ({FLUX2_VAE_REPO})");
             download_repo_file(models_dir, FLUX2_VAE_REPO, FLUX2_VAE_FILE, progress)
                 .with_context(|| format!("downloading the {architecture} VAE"))?;

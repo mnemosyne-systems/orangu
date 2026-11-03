@@ -149,6 +149,13 @@ pub const FLUX2_KLEIN_ARCHITECTURE: &str = "flux2_klein";
 /// The width of the text encoder a FLUX.2 [klein] 4B reads: Qwen3-4B's.
 pub const FLUX2_KLEIN_TEXT_ENCODER_WIDTH: u64 = 2560;
 
+/// The architecture of a MOSS-Image diffusion transformer, as its GGUFs
+/// name it.
+pub const MOSS_IMAGE_ARCHITECTURE: &str = "moss_image";
+
+/// The width of the text encoder MOSS-Image reads: Qwen3.5-9B's.
+pub const MOSS_IMAGE_TEXT_ENCODER_WIDTH: u64 = 4096;
+
 /// The prefix the ComfyUI/stable-diffusion.cpp GGUF tooling writes before
 /// every tensor of a diffusion model (`model.diffusion_model.img_in.weight`)
 /// — the `unsloth/Qwen-Image-2.1-GGUF` files keep it.
@@ -197,6 +204,7 @@ pub const IMAGE_ARCHITECTURES: &[&str] = &[
     "qwen_image",
     QWEN_IMAGE_21_ARCHITECTURE,
     FLUX2_KLEIN_ARCHITECTURE,
+    MOSS_IMAGE_ARCHITECTURE,
 ];
 
 /// Whether `architecture` is one of [`IMAGE_ARCHITECTURES`].
@@ -388,9 +396,63 @@ pub fn is_flux2_vae(path: &Path) -> bool {
         && shape_of(&header, "bn.running_mean").is_some_and(|s| s == [128])
 }
 
-/// The first FLUX.2 VAE under `dir`, in path order.
+/// The first FLUX.2 VAE under `dir`, in path order — one with FLUX.2's own
+/// decoder before MOSS-Image's smaller one ([`is_moss_image_vae`]), which
+/// reads the same latents.
 pub fn find_flux2_vae(dir: &Path) -> Option<PathBuf> {
-    first_safetensors(dir, is_flux2_vae)
+    first_safetensors(dir, |path| is_flux2_vae(path) && !is_moss_image_vae(path))
+        .or_else(|| first_safetensors(dir, is_flux2_vae))
+}
+
+/// Whether `path` is a `qwen35` GGUF of Qwen3.5-9B's width (4096) whose
+/// header names it Qwen3.5 — the text encoder a `moss_image` model is
+/// trained on. A fine-tune of the same shape (Ornith 1.5 9B) would load,
+/// but conditions the picture on different states, so it is not taken
+/// unless configured. Judged from its header alone.
+pub fn is_moss_image_text_encoder(path: &Path) -> bool {
+    let Ok(gguf) = GgufFile::open_summary(path) else {
+        return false;
+    };
+    let string = |name: &str| {
+        gguf.metadata.iter().find_map(|(k, v)| match v {
+            crate::gguf::GgufValue::String(s) if k == name => Some(s.to_ascii_lowercase()),
+            _ => None,
+        })
+    };
+    let named_qwen = ["general.basename", "general.name"]
+        .iter()
+        .filter_map(|k| string(k))
+        .any(|name| name.starts_with("qwen3.5"));
+    architecture_of(&gguf).as_deref() == Some("qwen35")
+        && gguf
+            .metadata
+            .iter()
+            .find(|(k, _)| k == "qwen35.embedding_length")
+            .and_then(|(_, v)| v.as_u64())
+            == Some(MOSS_IMAGE_TEXT_ENCODER_WIDTH)
+        && named_qwen
+}
+
+/// Every MOSS-Image text encoder under `dir` (see
+/// [`is_moss_image_text_encoder`]), largest file first.
+pub fn find_moss_image_text_encoder(dir: &Path) -> Option<PathBuf> {
+    largest_gguf(dir, is_moss_image_text_encoder)
+}
+
+/// Whether `path` is MOSS-Image's own VAE: a FLUX.2 VAE ([`is_flux2_vae`])
+/// with the small decoder (96 channels at full size where FLUX.2's has
+/// 128). Both share the encoder and the latent statistics.
+pub fn is_moss_image_vae(path: &Path) -> bool {
+    is_flux2_vae(path)
+        && safetensors_header(path).is_some_and(|header| {
+            shape_of(&header, "decoder.conv_norm_out.weight").is_some_and(|s| s == [96])
+        })
+}
+
+/// The first MOSS-Image VAE under `dir`, in path order. Without one a
+/// FLUX.2 VAE ([`find_flux2_vae`]) decodes the same latents.
+pub fn find_moss_image_vae(dir: &Path) -> Option<PathBuf> {
+    first_safetensors(dir, is_moss_image_vae)
 }
 
 /// Whether `path` is the vision half of Qwen3-VL-8B — the `mmproj-*.gguf`

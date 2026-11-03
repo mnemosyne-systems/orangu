@@ -223,14 +223,14 @@ Only `models` is required.
 
 #### Image models
 
-These apply to a `qwen_image`, `qwen_image_2_1` or `flux2_klein` model. The `image_size`,
+These apply to a `qwen_image`, `qwen_image_2_1`, `flux2_klein` or `moss_image` model. The `image_size`,
 `image_steps`, `image_cfg_scale`, `image_negative_prompt`, `image_strength`
 and `image_format` keys are the defaults for a request that does not set
 its own.
 
 | Key | Required | Description |
 | :-- | :-- | :-- |
-| `text_encoder` | No | The text encoder GGUF (`qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`, `qwen3` for `flux2_klein`). Defaults to the largest one found |
+| `text_encoder` | No | The text encoder GGUF (`qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`, `qwen3` for `flux2_klein`, `qwen35` for `moss_image`). Defaults to the largest one found |
 | `vae` | No | The model's VAE (`.safetensors`). Defaults to the first one found |
 | `vision` | No | The vision projector (`mmproj-*.gguf`) a `qwen_image_2_1` model reads attached pictures with. Defaults to the one beside the text encoder; `none` draws over attached pictures instead |
 | `image_lora` | No | Adapter applied to the picture transformer: `auto` (the default: the Lightning adapter under `models`), `none` (the base model), or the path of a `.safetensors` adapter |

@@ -188,7 +188,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `GET /v1/sessions/{id}/events/stream` | a session's events as they happen, as server-sent events |
 | `POST /v1/completions` | legacy completion, no chat template needed; `cache_prompt`/`id_slot`/`response_format`/`ignore_eos`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled and L2-normalized; carries OpenAI's `usage` |
-| `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image`, `qwen_image_2_1` or `flux2_klein` model; `501` on a language model |
+| `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image`, `qwen_image_2_1`, `flux2_klein` or `moss_image` model; `501` on a language model |
 | `POST /v1/videos`, `GET /v1/videos` | OpenAI's Videos API, on an `ltxv` model: start a clip as a job, or list the jobs; `501` on any other model |
 | `GET /v1/videos/{id}`, `DELETE /v1/videos/{id}` | one job's status and progress; cancel or drop it |
 | `GET /v1/videos/{id}/content` | the finished clip as `video/mp4`, with `Range` |
@@ -565,7 +565,7 @@ tagged `role = embeddings` exists to serve.
 
 #### `POST /v1/images/generations`
 
-Only on a server whose model is a `qwen_image`, `qwen_image_2_1` or `flux2_klein`
+Only on a server whose model is a `qwen_image`, `qwen_image_2_1`, `flux2_klein` or `moss_image`
 diffusion transformer (see
 the *Image generation* section of the server chapter); a language model
 answers `501`.
@@ -1911,7 +1911,7 @@ picture will come out, and how long it will take, before asking for one:
 
 | `image.` | |
 | :-- | :-- |
-| `architecture` | `qwen_image`, `qwen_image_2_1` or `flux2_klein` |
+| `architecture` | `qwen_image`, `qwen_image_2_1`, `flux2_klein` or `moss_image` |
 | `size_unit` | the pixels each side of a picture must be a multiple of: `16`, or `32` for Qwen-Image 2.1 |
 | `turbo` | `true` for a step-distilled checkpoint: Qwen-Image 2.1 Turbo, sampled on its eight-step schedule, or a distilled FLUX.2 [klein] (four steps) |
 | `text_encoder`, `vae` | the companion files the pipeline was loaded with |

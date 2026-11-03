@@ -173,7 +173,7 @@ struct RoleFlags {
     /// Embedding only.
     #[arg(long)]
     embedding: bool,
-    /// Picture generation — a qwen_image, qwen_image_2_1 or flux2_klein model, the only kind this role
+    /// Picture generation — a qwen_image, qwen_image_2_1, flux2_klein or moss_image model, the only kind this role
     /// serves and the only role such a model is served in.
     #[arg(long)]
     image: bool,
@@ -5766,7 +5766,7 @@ fn fix_role_for_model(
                 config::Role::Video => ("video generators (ltxv)", "a video"),
                 config::Role::Audio => ("speech generators (qwen3tts)", "a speech"),
                 _ => (
-                    "picture generators (qwen_image, qwen_image_2_1, flux2_klein)",
+                    "picture generators (qwen_image, qwen_image_2_1, flux2_klein, moss_image)",
                     "an image",
                 ),
             };
@@ -5787,7 +5787,7 @@ fn select_model_interactively(
 ) -> Result<SelectedModel> {
     let models = orangu::model_spec::scan_models_dir(models_dir)
         .with_context(|| format!("scanning {}", models_dir.display()))?;
-    let groups = orangu::model_spec::group_models(&models);
+    let mut groups = orangu::model_spec::group_models(&models);
     if groups.is_empty() {
         bail!(
             "no .gguf models found under {}; download one first (e.g. `orangu-server download <user>/<model>`) or pass one directly: orangu-server <model>",
@@ -5806,7 +5806,34 @@ fn select_model_interactively(
         Some(_) => orangu::model_spec::Dimming::TextModels,
         None => orangu::model_spec::Dimming::Unsupported,
     };
-    let support = model_support(&groups);
+    let mut support = model_support(&groups);
+    let mut filtered = false;
+    // A generator flag lists only the models it can serve: a picture,
+    // video or speech model is what was asked for, and the language
+    // models around it are not a choice.
+    if let Some(kind) = match mode {
+        orangu::model_spec::Dimming::ImageModels => Some("image"),
+        orangu::model_spec::Dimming::VideoModels => Some("video"),
+        orangu::model_spec::Dimming::AudioModels => Some("speech"),
+        _ => None,
+    } {
+        let (kept_groups, kept_support): (Vec<_>, Vec<_>) = groups
+            .into_iter()
+            .zip(support)
+            .filter(|(_, support)| support.selectable(mode))
+            .unzip();
+        groups = kept_groups;
+        support = kept_support;
+        filtered = true;
+        if groups.is_empty() {
+            bail!(
+                "no {kind} models found under {}; download one first (e.g. `orangu-server \
+                 download <user>/<model>`) or pass one directly: orangu-server --{} <model>",
+                models_dir.display(),
+                role.unwrap_or_default().label()
+            );
+        }
+    }
     let last_used =
         orangu::model_registry::last_used_for(groups.iter().map(|group| group.paths.as_slice()));
     print!(
@@ -5886,14 +5913,29 @@ fn select_model_interactively(
     let default = configured.and_then(|spec| match init::nr_of(&groups, spec) {
         Some(nr) if support[nr - 1].selectable(mode) => Some(nr.to_string()),
         Some(_) => None,
+        // Not listed: under a generator flag, a model of another kind (the
+        // usual language model) that the filter left out; otherwise a spec
+        // still to fetch.
+        None if filtered => None,
         None => Some(spec.to_string()),
     });
+    // Otherwise the most recently used row the flag can serve, then its
+    // first.
     let default = default.or_else(|| {
         (mode != orangu::model_spec::Dimming::Unsupported)
             .then(|| {
-                support
-                    .iter()
-                    .position(|support| support.selectable(mode))
+                let selectable = || {
+                    support
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, support)| support.selectable(mode))
+                        .map(|(index, _)| index)
+                };
+                selectable()
+                    .filter_map(|index| last_used[index].map(|at| (at, index)))
+                    .max_by_key(|&(at, index)| (at, std::cmp::Reverse(index)))
+                    .map(|(_, index)| index)
+                    .or_else(|| selectable().next())
                     .map(|index| (index + 1).to_string())
             })
             .flatten()

@@ -2128,6 +2128,29 @@ prompt is the empty one. There is no adapter and no editing: an attached
 picture is a starting point. `orangu-server download
 unsloth/FLUX.2-klein-base-4B-GGUF:Q4_K_M` fetches the three files.
 
+**MOSS-Image** is served the same way: `unsloth/MOSS-Image-Base-GGUF`
+(`list`'s `Yes (moss_image)`). It is a 5-billion-parameter single-stream
+transformer of forty-two blocks sharing one timestep modulation, with a
+two-block text refiner of its own (`engine::image::moss`), and two
+companions found the same way:
+
+- **The text encoder** — Qwen3.5-9B, a `qwen35` GGUF of width 4096 whose
+  header names it Qwen3.5 (any quantization; `download` fetches
+  `unsloth/Qwen3.5-9B-GGUF:Q8_0`). It is the server's language model,
+  read for its final hidden states. The prompt is put in the Qwen3.5 chat
+  template with an open thought, and every token of it conditions the
+  picture.
+- **The VAE** — `vae/diffusion_pytorch_model.safetensors` from
+  `OpenMOSS-Team/MOSS-Image-Base`: FLUX.2's encoder and latent statistics
+  with a smaller decoder. A FLUX.2 VAE is used when it is missing.
+
+Its release settings are fifty steps at guidance 3, the negative pass
+skipping block 22; the schedule's levels are shifted by 5 and snapped to
+the thousand it was trained at. Sizes are multiples of 16; a blank
+negative prompt is the empty one. There is no adapter and no editing.
+`orangu-server download unsloth/MOSS-Image-Base-GGUF:Q8_0` fetches the
+three files.
+
 Everything below applies to every picture model except where it names
 Qwen-Image's own files.
 
@@ -2257,12 +2280,12 @@ An image model is not served in a role you pick: it is always `image`, and
   been, and the banner's `Mode` line says `image`.
 - `orangu-server` with no model prompts from the table as usual; picking
   an image model settles the role, so the role prompt is skipped.
-- `orangu-server --image` greys every row of the table that is not an
-  image model, so only the models the role serves stand out; picking a
-  greyed row is refused. The `Model:` prompt pre-selects the config's
-  `model =` only when the flag serves it; under `--image` beside the
-  usual language-model config it offers the first image model in the
-  table instead, so Enter is a picture generator. The other five flags do
+- `orangu-server --image` lists only the image models, so every row is
+  one the role serves. The `Model:` prompt pre-selects the config's
+  `model =` when it is one of them; beside the usual language-model
+  config it offers the most recently used image model instead (the first,
+  when none has been used), so Enter is a picture generator. With no
+  image model under `models`, it says so and stops. The other five flags do
   the reverse — `--all`, `--code`, `--review`, `--explorer` and
   `--embedding` grey the image models, since a picture generator cannot
   come up in a language model's role: `orangu-server --code 16` is an
@@ -2295,14 +2318,14 @@ is asked none of these.
 
 Six keys set what a picture request gets when it does not say. The
 defaults are the model's own release settings — Qwen-Image 2.1's forty
-unguided steps, Qwen-Image's and FLUX.2 [klein] base's fifty at guidance 4 — except that under a
+unguided steps, Qwen-Image's and FLUX.2 [klein] base's fifty at guidance 4, MOSS-Image's fifty at guidance 3 — except that under a
 Lightning adapter — the default, when one is under `models` — `image_steps`
 and `image_cfg_scale` follow the adapter (its step count, guidance off)
 unless the file sets them:
 
 | `[orangu-server]`       | default                             |                                                                                                                                                                                                                                                                                      |
 | :---------------------- | :---------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `image_size`            | `1024x1024`                         | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch (Qwen-Image, FLUX.2 [klein]); 32 for Qwen-Image 2.1                                                                                                                                                                       |
+| `image_size`            | `1024x1024`                         | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch (Qwen-Image, FLUX.2 [klein], MOSS-Image); 32 for Qwen-Image 2.1                                                                                                                                                                       |
 | `image_steps`           | `50` (2.1: `40`); the adapter's (`8`) under one | denoising steps; the time a picture takes is close to linear in this                                                                                                                                                                                                                 |
 | `image_cfg_scale`       | `4` (2.1: `1`); `1` under an adapter | classifier-free guidance: how far the picture is pushed towards the prompt and away from the negative one. `1` turns guidance off, which halves the work per step                                                                                                                    |
 | `image_negative_prompt` | a single space                      | what the picture is pushed away from; only read when guidance is on                                                                                                                                                                                                                  |
@@ -2530,9 +2553,9 @@ A video model is not served in a role you pick: it is always `video`, and
   role flag comes up in it, and the banner's `Mode` line says `video`.
 - `orangu-server` with no model prompts from the table as usual; picking
   a video model settles the role, so the role prompt is skipped.
-- `orangu-server --video` greys every row of the table that is not a video
-  model and pre-selects the first one, so Enter is a video generator;
-  picking a greyed row is refused. Every other flag greys the video
+- `orangu-server --video` lists only the video models and pre-selects the
+  most recently used one (or the first), so Enter is a video generator.
+  Every other flag greys the video
   models: `--image` or `--code` on an `ltxv` model is an error that says
   so, and so is `--video` on a language model or an image model.
 - Under `--daemon`, the config's `role` key stands in for the flag, with
@@ -2735,8 +2758,8 @@ and `--audio` is the flag that says so. The rules are the image role's:
   no role flag comes up in it, and the banner's `Mode` line says `audio`.
 - `orangu-server` with no model prompts from the table as usual; picking
   a speech model settles the role, so the role prompt is skipped.
-- `orangu-server --audio` greys every row of the table that is not a
-  speech model; picking a greyed row is refused. Every other flag greys
+- `orangu-server --audio` lists only the speech models and pre-selects the
+  most recently used one (or the first). Every other flag greys
   the speech models: `--code` on a `qwen3tts` model is an error that says
   so, and `--audio` on a language model is refused with "`--audio` serves
   speech models only".
@@ -3262,7 +3285,8 @@ attention, over sigmoid-routed experts whose selection is group-limited:
 the experts form `expert_group_count` groups and only the best
 `expert_group_used_count` of them may serve a token), and Qwen-Image
 (`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF`, `flux2_klein`,
-`unsloth/FLUX.2-klein-base-4B-GGUF` with a `qwen3` encoder, and `qwen_image_2_1`,
+`unsloth/FLUX.2-klein-base-4B-GGUF` with a `qwen3` encoder, `moss_image`,
+`unsloth/MOSS-Image-Base-GGUF` with a `qwen35` encoder, and `qwen_image_2_1`,
 `unsloth/Qwen-Image-2.1-GGUF` with a `qwen3vl` encoder — not a language model:
 a dual-stream diffusion transformer that denoises a latent picture under a
 prompt's hidden states, served with a `qwen2vl` text encoder and the

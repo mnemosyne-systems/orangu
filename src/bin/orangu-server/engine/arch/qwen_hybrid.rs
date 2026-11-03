@@ -2187,6 +2187,26 @@ impl<F: HybridFfn> Trunk<F> {
         Ok(x)
     }
 
+    /// Every token's final hidden state, `[n_tokens, n_embd]`: the host
+    /// layer loop over a cache of its own, then the final norm — what a
+    /// picture model conditions on. A folded head's rotation is not applied:
+    /// the residual stream is already in the model's basis.
+    pub(crate) fn hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let n_tokens = tokens.len();
+        anyhow::ensure!(n_tokens > 0, "no tokens to encode");
+        let mut cache = self.new_kv_cache(n_tokens);
+        let x = self.embed(tokens)?;
+        let mut x = self.forward_range(&mut cache, x, n_tokens, 0, 0..self.layers.len(), 0)?;
+        tensor::rmsnorm_inplace(
+            &mut x,
+            &self.output_norm,
+            n_tokens,
+            self.dims.n_embd,
+            self.dims.rms_eps,
+        );
+        Ok(x)
+    }
+
     /// [`Self::forward`]'s head over each of `n_rows` rows of the last
     /// layer's residual stream: the final norm, a folded head's rotation,
     /// the output projection.

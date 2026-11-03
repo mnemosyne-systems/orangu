@@ -95,8 +95,8 @@ flag that asks for it:
 orangu-server --video
 ```
 
-That prints the model table with every model that is not a video model
-greyed out, and pre-selects the first video model, so Enter takes it.
+That prints a table of the video models alone and pre-selects the one
+used most recently (or the first), so Enter takes it.
 The server then reports the companions it found and what a clip at the
 defaults costs:
 

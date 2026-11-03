@@ -63,10 +63,23 @@
 //! ([`scheduler::flux2_sigmas`]) and its guidance is plain — the base
 //! model's release settings are fifty steps at 4, the step-distilled
 //! [klein] four without guidance.
+//!
+//! **MOSS-Image** (`moss_image`, [`Variant::MossImage`]) goes through it
+//! with a fourth: a 5-billion-parameter single-stream transformer
+//! ([`moss`]) conditioned on a Qwen3.5-9B encoder's final hidden states for
+//! the whole chat-framed prompt (the encoder is the server's `qwen35`
+//! language model, read through `ModelForward::forward_hidden_states`),
+//! refined once per prompt by the transformer's own text blocks, and the
+//! FLUX.2 VAE family's latents (its own small-decoder VAE, [`vae_flux2`]).
+//! Its schedule is a fixed shift of 5 snapped to the thousand training
+//! levels ([`scheduler::moss_sigmas`]) and its guidance runs the negative
+//! prompt with one block skipped ([`MOSS_UNCOND_SKIP`]) — fifty steps at
+//! guidance 3.
 
 pub mod codec;
 pub mod flux2;
 pub mod lora;
+pub mod moss;
 pub mod qwen3vl;
 pub mod safetensors;
 pub mod scheduler;
@@ -89,6 +102,7 @@ use std::time::Instant;
 
 pub use codec::ImageFormat;
 use flux2::Flux2Transformer;
+use moss::MossTransformer;
 use scheduler::{Noise, ScheduleConfig};
 use transformer::{ForwardInput, QwenImageTransformer};
 use transformer21::QwenImage21Transformer;
@@ -125,6 +139,16 @@ const FLUX2_PROMPT_TOKENS: usize = 512;
 /// `text_encoder_out_layers`.
 const FLUX2_TEXT_LAYERS: [usize; 3] = [9, 18, 27];
 
+/// MOSS-Image's framing: the Qwen3.5 chat template around a trimmed user
+/// turn, `add_generation_prompt` with `enable_thinking = True` (an open
+/// thought). Nothing is dropped: every token conditions the picture.
+const MOSS_PROMPT_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\n";
+/// `max_sequence_length`: the most of a rendered prompt the encoder reads.
+const MOSS_PROMPT_TOKENS: usize = 4096;
+/// The block (zero-based) the negative branch skips —
+/// `uncond_skip_layers`'s release default.
+pub const MOSS_UNCOND_SKIP: [usize; 1] = [22];
+
 /// Which picture model the pipeline serves — decided by the transformer
 /// file's architecture, and deciding every companion and default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +162,9 @@ pub enum Variant {
     /// `flux2_klein`: FLUX.2 [klein] 4B — dual- then single-stream, Qwen3-4B
     /// encoder, the FLUX.2 VAE.
     Flux2Klein,
+    /// `moss_image`: MOSS-Image — single-stream, 5 billion parameters,
+    /// Qwen3.5-9B encoder, the FLUX.2 latent space.
+    MossImage,
 }
 
 impl Variant {
@@ -147,6 +174,7 @@ impl Variant {
             "qwen_image" => Some(Self::QwenImage),
             orangu::model_spec::QWEN_IMAGE_21_ARCHITECTURE => Some(Self::QwenImage21),
             orangu::model_spec::FLUX2_KLEIN_ARCHITECTURE => Some(Self::Flux2Klein),
+            orangu::model_spec::MOSS_IMAGE_ARCHITECTURE => Some(Self::MossImage),
             _ => None,
         }
     }
@@ -156,6 +184,7 @@ impl Variant {
             Self::QwenImage => "qwen_image",
             Self::QwenImage21 => orangu::model_spec::QWEN_IMAGE_21_ARCHITECTURE,
             Self::Flux2Klein => orangu::model_spec::FLUX2_KLEIN_ARCHITECTURE,
+            Self::MossImage => orangu::model_spec::MOSS_IMAGE_ARCHITECTURE,
         }
     }
 
@@ -165,7 +194,7 @@ impl Variant {
     /// `base` one.
     pub fn is_step_distilled(self, file_name: &str) -> bool {
         match self {
-            Self::QwenImage => false,
+            Self::QwenImage | Self::MossImage => false,
             Self::QwenImage21 => orangu::model_spec::is_turbo(file_name),
             Self::Flux2Klein => orangu::model_spec::is_distilled_klein(file_name),
         }
@@ -175,12 +204,12 @@ impl Variant {
     /// size must be a multiple of: Qwen-Image's VAE cell is 8 pixels and its
     /// transformer packs 2x2 cells into a token; Qwen-Image 2.1's cell is 16
     /// pixels, one token each, and diffusers still rounds to 32. FLUX.2's
-    /// cell is 8 pixels, 2x2 of them a token.
+    /// cell is 8 pixels, 2x2 of them a token, and MOSS-Image's the same.
     pub fn size_unit(self) -> usize {
         match self {
             Self::QwenImage => 2 * SPATIAL_COMPRESSION,
             Self::QwenImage21 => 2 * vae21::SPATIAL_COMPRESSION,
-            Self::Flux2Klein => 2 * vae_flux2::SPATIAL_COMPRESSION,
+            Self::Flux2Klein | Self::MossImage => 2 * vae_flux2::SPATIAL_COMPRESSION,
         }
     }
 
@@ -190,6 +219,7 @@ impl Variant {
             Self::QwenImage => (TEXT_ENCODER_ARCHITECTURE, TEXT_ENCODER_WIDTH),
             Self::QwenImage21 => ("qwen3vl", 4096),
             Self::Flux2Klein => ("qwen3", orangu::model_spec::FLUX2_KLEIN_TEXT_ENCODER_WIDTH),
+            Self::MossImage => ("qwen35", orangu::model_spec::MOSS_IMAGE_TEXT_ENCODER_WIDTH),
         }
     }
 
@@ -205,6 +235,10 @@ impl Variant {
                 orangu::model_download::FLUX2_KLEIN_TEXT_ENCODER_REPO,
                 orangu::model_download::FLUX2_KLEIN_TEXT_ENCODER_TAG,
             ),
+            Self::MossImage => (
+                orangu::model_download::MOSS_IMAGE_TEXT_ENCODER_REPO,
+                orangu::model_download::MOSS_IMAGE_TEXT_ENCODER_TAG,
+            ),
         }
     }
 
@@ -219,6 +253,10 @@ impl Variant {
                 orangu::model_download::FLUX2_VAE_REPO,
                 orangu::model_download::FLUX2_VAE_FILE,
             ),
+            Self::MossImage => (
+                orangu::model_download::MOSS_IMAGE_VAE_REPO,
+                orangu::model_download::MOSS_IMAGE_VAE_FILE,
+            ),
         }
     }
 
@@ -226,7 +264,7 @@ impl Variant {
     /// [`ImageDefaults::default`] for Qwen-Image's. Qwen-Image 2.1's are
     /// forty steps without guidance (`true_cfg_scale = 1.0`, "meant to be
     /// sampled without guidance"); FLUX.2 [klein] base's are fifty at
-    /// guidance 4.
+    /// guidance 4; MOSS-Image's fifty at guidance 3.
     pub fn release_steps_and_cfg(self) -> (usize, f32) {
         match self {
             Self::QwenImage => {
@@ -235,25 +273,28 @@ impl Variant {
             }
             Self::QwenImage21 => (40, 1.0),
             Self::Flux2Klein => (50, 4.0),
+            Self::MossImage => (50, 3.0),
         }
     }
 
     /// The release settings of a step-distilled checkpoint
     /// ([`Pipeline::turbo`]), without guidance: the eight steps Qwen-Image
     /// 2.1 Turbo was distilled for, the four of a distilled FLUX.2 [klein].
+    /// No MOSS-Image checkpoint is step-distilled: its release settings.
     pub fn turbo_steps_and_cfg(self) -> (usize, f32) {
         match self {
             Self::Flux2Klein => (4, 1.0),
+            Self::MossImage => self.release_steps_and_cfg(),
             Self::QwenImage | Self::QwenImage21 => (8, 1.0),
         }
     }
 
     /// The blank a negative prompt left empty is encoded as: a single
     /// space for the Qwen models (what their own examples pass), the empty
-    /// string for FLUX.2, whose pipeline guides against `""`.
+    /// string for FLUX.2 and MOSS-Image, whose pipelines guide against `""`.
     fn blank_negative(self) -> &'static str {
         match self {
-            Self::Flux2Klein => "",
+            Self::Flux2Klein | Self::MossImage => "",
             Self::QwenImage | Self::QwenImage21 => " ",
         }
     }
@@ -267,6 +308,8 @@ impl Variant {
             Self::QwenImage21 => 7.0e9,
             // `4 × 3072² + 3 × 3072 × 9216` per block, twenty-five blocks.
             Self::Flux2Klein => 3.1e9,
+            // `4 × 3072² + 3 × 3072 × 8192` per block, forty-two blocks.
+            Self::MossImage => 4.8e9,
         }
     }
 }
@@ -332,7 +375,8 @@ impl Companions {
             None => find_vae(models_dir, variant)?,
         };
         let vision = match (variant, vision) {
-            (Variant::QwenImage | Variant::Flux2Klein, _) | (_, Some("none")) => None,
+            (Variant::QwenImage | Variant::Flux2Klein | Variant::MossImage, _)
+            | (_, Some("none")) => None,
             (Variant::QwenImage21, Some(path)) => {
                 let path = PathBuf::from(path);
                 let path = if path.is_absolute() {
@@ -364,6 +408,7 @@ fn find_text_encoder(models_dir: &Path, variant: Variant) -> Result<PathBuf> {
         Variant::QwenImage => orangu::model_spec::find_qwen_image_text_encoder(models_dir),
         Variant::QwenImage21 => orangu::model_spec::find_qwen_image21_text_encoder(models_dir),
         Variant::Flux2Klein => orangu::model_spec::find_flux2_klein_text_encoder(models_dir),
+        Variant::MossImage => orangu::model_spec::find_moss_image_text_encoder(models_dir),
     };
     let (architecture, width) = variant.text_encoder();
     let (repo, tag) = variant.text_encoder_download();
@@ -371,6 +416,7 @@ fn find_text_encoder(models_dir: &Path, variant: Variant) -> Result<PathBuf> {
         Variant::QwenImage => "Qwen2.5-VL-7B",
         Variant::QwenImage21 => "Qwen3-VL-8B",
         Variant::Flux2Klein => "Qwen3-4B",
+        Variant::MossImage => "Qwen3.5-9B",
     };
     found.ok_or_else(|| {
         anyhow::anyhow!(
@@ -396,6 +442,13 @@ fn find_vae(models_dir: &Path, variant: Variant) -> Result<PathBuf> {
         Variant::Flux2Klein => (
             orangu::model_spec::find_flux2_vae(models_dir),
             "FLUX.2 VAE (a .safetensors with a 32-channel decoder and its latent batch statistics)",
+        ),
+        // Its own small-decoder VAE, else any FLUX.2 VAE: the same latents.
+        Variant::MossImage => (
+            orangu::model_spec::find_moss_image_vae(models_dir)
+                .or_else(|| orangu::model_spec::find_flux2_vae(models_dir)),
+            "MOSS-Image or FLUX.2 VAE (a .safetensors with a 32-channel decoder and its latent \
+             batch statistics)",
         ),
     };
     let (repo, file) = variant.vae_download();
@@ -479,6 +532,7 @@ fn calibration_tensor(transformer: &LoadedModel) -> &'static str {
         "transformer_blocks.0.img_mlp.gate_up.weight",
         "transformer_blocks.0.img_mlp.proj.weight",
         Flux2Transformer::CALIBRATION_TENSOR,
+        MossTransformer::CALIBRATION_TENSOR,
     ]
     .into_iter()
     .find(|name| transformer.has_tensor(name))
@@ -871,6 +925,10 @@ enum Model {
         /// takes the padding mask and returns inner layers.
         text: qwen3vl::TextModel,
     },
+    MossImage {
+        transformer: MossTransformer,
+        vae: Flux2Vae,
+    },
 }
 
 /// A prompt as the transformer reads it: Qwen-Image's text-encoder hidden
@@ -1021,6 +1079,33 @@ impl Pipeline {
                 )
             })?;
         let (_, text_width) = variant.text_encoder();
+        if variant == Variant::MossImage {
+            ensure!(
+                lora.is_none(),
+                "no adapter is served for {}: set [orangu-server].image_lora = none",
+                variant.architecture()
+            );
+            let transformer = MossTransformer::load(transformer, backend.clone())
+                .context("building the moss_image transformer")?;
+            ensure!(
+                transformer.config.txt_dim == encoder.config().n_embd,
+                "the transformer reads {}-wide text states but the text encoder produces {} \
+                 (MOSS-Image reads Qwen3.5-9B: point [orangu-server].text_encoder at it)",
+                transformer.config.txt_dim,
+                encoder.config().n_embd
+            );
+            let vae = Flux2Vae::load(&companions.vae, backend, vae_precision)
+                .context("loading the VAE")?;
+            return Ok(Self::assemble(
+                Model::MossImage { transformer, vae },
+                variant,
+                encoder,
+                tokenizer,
+                defaults,
+                companions,
+                rate,
+            ));
+        }
         if variant == Variant::Flux2Klein {
             ensure!(
                 lora.is_none(),
@@ -1212,6 +1297,7 @@ impl Pipeline {
             Model::QwenImage { transformer, .. } => &transformer.config,
             Model::QwenImage21 { transformer, .. } => &transformer.config,
             Model::Flux2Klein { transformer, .. } => &transformer.config,
+            Model::MossImage { transformer, .. } => &transformer.config,
         }
     }
 
@@ -1320,10 +1406,50 @@ impl Pipeline {
             .context("running the text encoder")
     }
 
+    /// MOSS-Image's conditioning: the prompt in the Qwen3.5 chat template
+    /// with an open thought, the encoder's final hidden states for every
+    /// token — `[n, 4096]`, before the transformer's text blocks.
+    fn encode_prompt_moss(&self, prompt: &str) -> Result<Vec<f32>> {
+        let rendered = format!(
+            "{PROMPT21_USER_PREFIX}{}{MOSS_PROMPT_SUFFIX}",
+            prompt.trim()
+        );
+        let mut tokens = self.tokenizer.encode(&rendered, false);
+        tokens.truncate(MOSS_PROMPT_TOKENS);
+        ensure!(!tokens.is_empty(), "the prompt encoded to no tokens");
+        let width = self.encoder.config().n_embd;
+        let hidden = self
+            .encoder
+            .forward_hidden_states(&tokens)
+            .context("running the text encoder")?;
+        ensure!(
+            hidden.len() == tokens.len() * width,
+            "text encoder returned the wrong shape"
+        );
+        Ok(hidden)
+    }
+
     /// A prompt as the transformer reads it (see [`Condition`]).
     fn condition(&self, prompt: &str, cancel: &AtomicBool) -> Result<Condition> {
         match &self.model {
             Model::QwenImage { .. } => Ok(Condition::Hidden(self.encode_prompt(prompt)?)),
+            Model::MossImage { transformer, .. } => {
+                let started = Instant::now();
+                let hidden = self.encode_prompt_moss(prompt)?;
+                let encoded = started.elapsed();
+                if cancelled(Some(cancel)) {
+                    bail!("cancelled");
+                }
+                let text = transformer.embed_text(&hidden)?;
+                log::info!(
+                    "orangu-server: [image] prompt: text encoder {:.1}s, text blocks {:.1}s \
+                     ({} tokens)",
+                    encoded.as_secs_f64(),
+                    (started.elapsed() - encoded).as_secs_f64(),
+                    hidden.len() / self.encoder.config().n_embd.max(1),
+                );
+                Ok(Condition::Hidden(text))
+            }
             Model::Flux2Klein { text, .. } => {
                 let started = Instant::now();
                 let hidden = self.encode_prompt_flux2(text, prompt, cancel)?;
@@ -1492,16 +1618,20 @@ impl Pipeline {
             Model::QwenImage { transformer, .. } => transformer.take_stages(),
             Model::QwenImage21 { transformer, .. } => transformer.take_stages(),
             Model::Flux2Klein { transformer, .. } => transformer.take_stages(),
+            Model::MossImage { transformer, .. } => transformer.take_stages(),
         }
     }
 
-    /// One velocity prediction for `latents` under `condition`.
+    /// One velocity prediction for `latents` under `condition`. `negative`
+    /// marks the guidance branch, which MOSS-Image runs with
+    /// [`MOSS_UNCOND_SKIP`] left out.
     fn velocity(
         &self,
         latents: &[f32],
         grid: (usize, usize),
         condition: &Condition,
         sigma: f32,
+        negative: bool,
         cancel: &AtomicBool,
     ) -> Result<Vec<f32>> {
         match (&self.model, condition) {
@@ -1531,17 +1661,26 @@ impl Pipeline {
                     cancel: Some(cancel),
                 })
             }
+            (Model::MossImage { transformer, .. }, Condition::Hidden(txt)) => {
+                transformer.forward(&moss::ForwardInput {
+                    img: latents,
+                    grid,
+                    txt,
+                    sigma,
+                    skip: if negative { &MOSS_UNCOND_SKIP } else { &[] },
+                    cancel: Some(cancel),
+                })
+            }
             _ => bail!("a prompt encoded for one picture model was given to the other"),
         }
     }
 
     /// Classifier-free guidance of `positive` by `negative`: Qwen-Image's
-    /// with its norm rescale ([`guide`]), Qwen-Image 2.1's and FLUX.2's
-    /// plain.
+    /// with its norm rescale ([`guide`]), the others' plain.
     fn guide(&self, positive: &mut [f32], negative: &[f32], scale: f32, token_width: usize) {
         match self.variant {
             Variant::QwenImage => guide(positive, negative, scale, token_width),
-            Variant::QwenImage21 | Variant::Flux2Klein => {
+            Variant::QwenImage21 | Variant::Flux2Klein | Variant::MossImage => {
                 for (p, n) in positive.iter_mut().zip(negative) {
                     *p = n + scale * (*p - n);
                 }
@@ -1596,7 +1735,7 @@ impl Pipeline {
                 normalize_latent21(&mut z);
                 Ok(z)
             }
-            Model::Flux2Klein { vae, .. } => {
+            Model::Flux2Klein { vae, .. } | Model::MossImage { vae, .. } => {
                 let rgb = codec::decode_to_feature(bytes, width, height)
                     .context("reading the attached picture")?;
                 let (mean, logvar) = vae
@@ -1614,8 +1753,8 @@ impl Pipeline {
         }
     }
 
-    /// The picture a finished latent decodes to: RGB for Qwen-Image and
-    /// FLUX.2, RGBA for Qwen-Image 2.1, in `[-1, 1]`.
+    /// The picture a finished latent decodes to: RGB for Qwen-Image, FLUX.2
+    /// and MOSS-Image, RGBA for Qwen-Image 2.1, in `[-1, 1]`.
     fn picture_from_latent(
         &self,
         latents: &[f32],
@@ -1642,7 +1781,7 @@ impl Pipeline {
                 denormalize_latent21(&mut z);
                 vae.decode_unless(&Feature::new(h16, w16, vae21::Z_DIM, z), Some(cancel))
             }
-            Model::Flux2Klein { vae, .. } => {
+            Model::Flux2Klein { vae, .. } | Model::MossImage { vae, .. } => {
                 let (h8, w8) = (
                     height / vae_flux2::SPATIAL_COMPRESSION,
                     width / vae_flux2::SPATIAL_COMPRESSION,
@@ -1765,11 +1904,16 @@ impl Pipeline {
 
         let sigmas = if self.variant == Variant::Flux2Klein {
             scheduler::flux2_sigmas(request.steps, n_tokens)
+        } else if self.variant == Variant::MossImage {
+            scheduler::moss_sigmas(request.steps)
         } else if self.turbo {
             scheduler::resample(&scheduler::QWEN_IMAGE_21_TURBO, request.steps)
         } else {
             scheduler::sigmas(&ScheduleConfig::QWEN_IMAGE, request.steps, n_tokens)
         };
+        // The steps the schedule holds: MOSS-Image's snapping can merge
+        // levels, leaving fewer than were asked for.
+        let steps = sigmas.len() - 1;
         let mut noise = Noise::seeded(seed);
         let token_width = self.transformer_config().in_channels;
         let mut latents = noise.normals(n_tokens * token_width);
@@ -1782,8 +1926,8 @@ impl Pipeline {
                 &mut noise,
                 cancel,
             )?;
-            first_step = scheduler::first_step_for_strength(request.steps, init.strength);
-            if first_step >= request.steps {
+            first_step = scheduler::first_step_for_strength(steps, init.strength);
+            if first_step >= steps {
                 // Strength 0: nothing to run; the picture comes straight back
                 // through the VAE.
                 latents = clean;
@@ -1792,14 +1936,14 @@ impl Pipeline {
             }
         }
 
-        let steps_to_run = request.steps - first_step;
+        let steps_to_run = steps - first_step;
         timings.encode = started.elapsed();
         let loop_started = Instant::now();
         // Steps that may reuse the last pass's residual (task 4): the
         // guided velocity is the cached function, so a reused step skips
         // both passes.
         let mut cache = stepcache::StepCache::new(stepcache::configured(), steps_to_run);
-        for (done, i) in (first_step..request.steps).enumerate() {
+        for (done, i) in (first_step..steps).enumerate() {
             if cancelled(Some(cancel)) {
                 bail!("cancelled");
             }
@@ -1808,9 +1952,11 @@ impl Pipeline {
             let velocity = match reused {
                 Some(velocity) => velocity,
                 None => {
-                    let mut velocity = self.velocity(&latents, grid, &positive, sigma, cancel)?;
+                    let mut velocity =
+                        self.velocity(&latents, grid, &positive, sigma, false, cancel)?;
                     if let Some(negative) = &negative {
-                        let unguided = self.velocity(&latents, grid, negative, sigma, cancel)?;
+                        let unguided =
+                            self.velocity(&latents, grid, negative, sigma, true, cancel)?;
                         self.guide(&mut velocity, &unguided, request.cfg_scale, token_width);
                     }
                     if let Some(cache) = cache.as_mut() {

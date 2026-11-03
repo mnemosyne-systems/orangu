@@ -2604,11 +2604,19 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
             .map(|t| t.dims.as_slice())
             .ok_or_else(|| anyhow!("{architecture}: model is missing tensor '{name}'"))
     };
-    let img_in = dims("img_in.weight")?;
     // FLUX.2 [klein]: a head norm named its own way, and two kinds of block.
     let flux2 = architecture == orangu::model_spec::FLUX2_KLEIN_ARCHITECTURE;
+    // MOSS-Image: the reference's own names (`video_embedder`, `layers.N`).
+    let moss = architecture == orangu::model_spec::MOSS_IMAGE_ARCHITECTURE;
+    let img_in = if moss {
+        dims("video_embedder.weight")?
+    } else {
+        dims("img_in.weight")?
+    };
     let norm_q = if flux2 {
         dims("double_blocks.0.img_attn.norm.query_norm.scale")?
+    } else if moss {
+        dims("layers.0.q_norm.weight")?
     } else {
         dims("transformer_blocks.0.attn.norm_q.weight")?
     };
@@ -2637,6 +2645,8 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
     };
     let n_layer = if flux2 {
         blocks("double_blocks.").unwrap_or(0) + blocks("single_blocks.").unwrap_or(0)
+    } else if moss {
+        blocks("layers.").unwrap_or(0)
     } else {
         blocks("transformer_blocks.").unwrap_or(0)
     };
