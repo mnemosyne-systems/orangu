@@ -58,6 +58,7 @@ pub enum SlashCommand {
     CreateFile,
     DeleteFile,
     MoveFile,
+    Convert,
     CreateDirectory,
     MoveDirectory,
     DeleteDirectory,
@@ -84,6 +85,9 @@ pub enum SlashCommand {
     Build,
     Shell,
     Skills,
+    Agents,
+    Tasks,
+    Fork,
     Developer,
     Committer,
     Graph,
@@ -141,6 +145,9 @@ impl SlashCommand {
             }
             SlashCommand::DeleteFile => "Deletes a file",
             SlashCommand::MoveFile => "Moves a file",
+            SlashCommand::Convert => {
+                "Converts a document by file extension, e.g. Markdown to PDF or ODT to DOCX"
+            }
             SlashCommand::CreateDirectory => "Creates a directory, with optional permissions",
             SlashCommand::MoveDirectory => "Moves a directory and everything under it",
             SlashCommand::DeleteDirectory => "Deletes an empty directory",
@@ -169,6 +176,11 @@ impl SlashCommand {
             SlashCommand::Build => "Builds the workspace project",
             SlashCommand::Shell => "Executes a shell command",
             SlashCommand::Skills => "Lists the discovered Agent Skills",
+            SlashCommand::Agents => "Lists the custom subagents, optionally matching search words",
+            SlashCommand::Tasks => {
+                "Lists this conversation's subagent tasks, shows one, or stops one"
+            }
+            SlashCommand::Fork => "Forks the conversation into a background subagent with a task",
             SlashCommand::Developer => "Puts the prompt in developer mode (the default)",
             SlashCommand::Committer => "Puts the prompt in committer mode: the merge flow",
             SlashCommand::Graph => {

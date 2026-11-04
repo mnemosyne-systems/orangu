@@ -1776,12 +1776,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fontconfig-parser"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbc773e24e02d4ddd8395fd30dc147524273a83e54e0f312d986ea30de5f5646"
+dependencies = [
+ "roxmltree 0.20.0",
+]
+
+[[package]]
 name = "fontdb"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2660c5e9157bf76d2db1294e4a9feba604ef610819a3b591088d0d8392a3290f"
 dependencies = [
+ "fontconfig-parser",
  "log",
+ "memmap2",
  "slotmap",
  "tinyvec",
 ]
@@ -2882,6 +2893,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libreoffice-pure"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "349122fb29f74338f68af0bf42524aee8724e1a533ed49f88abea88490ebe229"
+dependencies = [
+ "lo_app",
+ "lo_base",
+ "lo_calc",
+ "lo_core",
+ "lo_draw",
+ "lo_impress",
+ "lo_math",
+ "lo_odf",
+ "lo_uno",
+ "lo_writer",
+ "lo_zip",
+]
+
+[[package]]
 name = "line-clipping"
 version = "0.3.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2919,6 +2949,141 @@ name = "litrs"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
+
+[[package]]
+name = "lo_app"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "260cfa003b4cdddbbd0a7e3edeb91ad68dd66382e8b430a34f2fac35917d1565"
+dependencies = [
+ "lo_core",
+ "lo_lok",
+ "lo_uno",
+]
+
+[[package]]
+name = "lo_base"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9faba71548343f5ff4b78101a3b563e7a148e9409fb62c6bc2be9df118ec28f3"
+dependencies = [
+ "lo_calc",
+ "lo_core",
+ "lo_odf",
+ "lo_zip",
+]
+
+[[package]]
+name = "lo_calc"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88d1b08b154f53d4e3d8bba6b0a14ed9c4c70ed7f5c1ee99c84bb6a9af9c97d6"
+dependencies = [
+ "lo_core",
+ "lo_odf",
+ "lo_zip",
+]
+
+[[package]]
+name = "lo_core"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c852074883349a49e2e9df5e0409842896f459c0ae34c2f99abcb06abf2e7278"
+dependencies = [
+ "fontdb",
+ "image",
+ "subsetter",
+ "ttf-parser",
+]
+
+[[package]]
+name = "lo_draw"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4333ce4f1f58d1bd9470c2f3670fcc6b2295393478d3e25347424862131046f4"
+dependencies = [
+ "lo_core",
+ "lo_odf",
+ "lo_zip",
+]
+
+[[package]]
+name = "lo_impress"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a95a5eb8ac7cef7170de1c10311a495b38489d4037552f9ce86c0e039f6e5e8"
+dependencies = [
+ "lo_core",
+ "lo_odf",
+ "lo_zip",
+]
+
+[[package]]
+name = "lo_lok"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d284bdf4aea48b9297fa33fa478ae4c40c52f16dfbcd9c406b7b5c1fdb86933e"
+dependencies = [
+ "lo_base",
+ "lo_calc",
+ "lo_core",
+ "lo_draw",
+ "lo_impress",
+ "lo_math",
+ "lo_uno",
+ "lo_writer",
+]
+
+[[package]]
+name = "lo_math"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2228a8e95c2513b8f15b6258f91ee8121f167ac288873d1d4650b2f55f64a09"
+dependencies = [
+ "lo_core",
+ "lo_zip",
+]
+
+[[package]]
+name = "lo_odf"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2876af6ff858e0ea545d6d94c19994022a396b22c669a37d7bf8f2c5a18cca92"
+dependencies = [
+ "lo_core",
+ "lo_math",
+ "lo_zip",
+]
+
+[[package]]
+name = "lo_uno"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4093b811b0ea3de803172ef4fb3cf067bf5b0414fd63c8b09aa87ca6274210dc"
+dependencies = [
+ "lo_core",
+]
+
+[[package]]
+name = "lo_writer"
+version = "0.5.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e817b118e4352b23a34d53d4370bd15aeeabdb5a55814a8d837d92420a600eb"
+dependencies = [
+ "lo_core",
+ "lo_odf",
+ "lo_zip",
+ "unicode-width",
+]
+
+[[package]]
+name = "lo_zip"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bd3437d5ad09ee717778b7010443d5850d747784dd9ffc7b1eefb8fef38732b"
+dependencies = [
+ "lo_core",
+]
 
 [[package]]
 name = "lock_api"
@@ -3229,7 +3394,7 @@ dependencies = [
  "pulldown-cmark",
  "quick-xml",
  "roughr-merman",
- "roxmltree",
+ "roxmltree 0.21.2",
  "rustc-hash 2.1.3",
  "ryu-js",
  "serde",
@@ -3845,6 +4010,7 @@ dependencies = [
  "infer",
  "libc",
  "libloading 0.9.0",
+ "libreoffice-pure",
  "log",
  "markdown",
  "memmap2",
@@ -5174,6 +5340,12 @@ dependencies = [
 
 [[package]]
 name = "roxmltree"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
+
+[[package]]
+name = "roxmltree"
 version = "0.21.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
@@ -5967,6 +6139,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "subsetter"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38803281d1c23166c5ebcb455439a5d2afe711cc909cf88af72448c297756ad6"
+dependencies = [
+ "rustc-hash 2.1.3",
 ]
 
 [[package]]
@@ -6894,7 +7075,7 @@ dependencies = [
  "kurbo",
  "log",
  "pico-args",
- "roxmltree",
+ "roxmltree 0.21.2",
  "simplecss",
  "siphasher",
  "skrifa 0.44.0",

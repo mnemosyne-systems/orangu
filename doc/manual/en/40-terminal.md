@@ -24,6 +24,8 @@ The sync runs in the background so it never delays startup. Its progress and res
 |       | `--committer` | Open the prompt in committer mode, on the merge flow — what `/committer` does. The two are mutually exclusive. |
 | `-t`  | `--theme`     | Apply a theme to the terminal interface for this run. Built-in names and paths to `.theme` files are accepted. |
 | `-p`  | `--prompt`    | Run a single prompt or command and exit — no terminal UI and no session on disk. See One-shot mode below. |
+|       | `--agent NAME` | Run the conversation as the custom agent NAME: its prompt joins the system prompt and its `tools` limit the tools. See Custom agents in the Tools chapter. |
+|       | `--agents JSON` | Define custom agents for this run, as JSON. See Custom agents in the Tools chapter. |
 |       | `--workflow FILE` | Validate and execute every job in a YAML workflow. |
 |       | `--dry-run FILE` | Validate a YAML workflow completely without executing it or loading configuration. |
 | `-q`  | `--quiet`     | Print nothing on success — the exit code is the result. Applies to the modes that print and exit, including workflows. |
@@ -369,7 +371,9 @@ The completion modes are checked in order:
     `/server`, `/list_files`, `/show_file`, `/tools`, `/quit`, and a discovered
     skill such as `/debugging`. When the `drop_down` option is enabled in
     `orangu.conf` (the default), this completion is also visualized as an interactive
-    dropdown menu that intercepts the Up/Down arrow keys.
+    dropdown menu that intercepts the Up/Down arrow keys. `Enter` takes the
+    highlighted entry into the line; when the line already holds it, typed out
+    in full, `Enter` runs the command instead.
 17. Otherwise, complete filesystem entries from the current token relative to the workspace, using the token before the cursor. In committer mode, while the first word is being typed — the empty line included — the merge flow's remaining steps are offered before those entries.
 
 In modes 5, 6, 9, and 10, `abort` moves to the front — and becomes the inline ghost — while that operation (cherry-pick, revert, rebase, or merge) is in progress and stopped on conflicts.
@@ -422,6 +426,7 @@ With `word_wrap = on`, LLM, tool, and `/show_file` output wraps to the visible t
 ### Waiting and exit control
 
 - `Esc` twice within 2 seconds cancels the active request without exiting and keeps queued commands
+- `Ctrl+B` while a subagent runs in the foreground moves it to the background: the request goes on without waiting for it, and its report arrives later (see **Background subagents and tasks** in the Tools chapter)
 - `Ctrl+C` once arms quit mode, shows a warning in the transcript, and clears the current input line
 - `Ctrl+C` again within 2 seconds exits the client
 - `Enter` submits the current input line

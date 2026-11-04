@@ -96,12 +96,12 @@ use commands::{
     AutoReviewTarget, BisectSubcommand, BranchSubcommand, CommandContext, CommandOutcome,
     CommandState, ExportTarget, LocalCommand, LocalError, McpSubcommand, PruneTarget,
     StashSubcommand, add_repository_usage_message, amend_usage_message, cherry_pick_usage_message,
-    close_usage_message, comment_usage_message, commit_usage_message, create_file_usage_message,
-    delete_file_usage_message, get_comments_usage_message, grep_usage_message,
-    issue_create_usage_message, issue_usage_message, mcp_usage_message, merge_usage_message,
-    model_usage_message, move_file_usage_message, open_file_usage_message, parse_local_command,
-    prune_usage_message, pull_usage_message, restore_usage_message, server_usage_message,
-    sorted_model_names, system_prompt,
+    close_usage_message, comment_usage_message, commit_usage_message, convert_usage_message,
+    create_file_usage_message, delete_file_usage_message, get_comments_usage_message,
+    grep_usage_message, issue_create_usage_message, issue_usage_message, mcp_usage_message,
+    merge_usage_message, model_usage_message, move_file_usage_message, open_file_usage_message,
+    parse_local_command, prune_usage_message, pull_usage_message, restore_usage_message,
+    server_usage_message, sorted_model_names, system_prompt,
 };
 use dispatch::*;
 use git::{
@@ -180,6 +180,14 @@ struct Args {
     /// console and exit.
     #[arg(short = 'p', long = "prompt")]
     prompt: Option<String>,
+    /// Run the conversation as the custom agent NAME: its prompt joins the
+    /// system prompt and its `tools` limit the tools.
+    #[arg(long = "agent", value_name = "NAME")]
+    agent: Option<String>,
+    /// Define custom agents for this run, as JSON: an object from agent name
+    /// to `description`, `prompt` and the agent-file fields.
+    #[arg(long = "agents", value_name = "JSON")]
+    agents: Option<String>,
     /// Validate and execute every job in a YAML workflow.
     #[arg(
         long = "workflow",
@@ -194,6 +202,8 @@ struct Args {
             "list",
             "init",
             "prompt",
+            "agent",
+            "agents",
             "shell_completions",
             "build_cheatsheet",
             "build_manual"
@@ -214,6 +224,8 @@ struct Args {
             "list",
             "init",
             "prompt",
+            "agent",
+            "agents",
             "shell_completions",
             "build_cheatsheet",
             "build_manual"
@@ -395,6 +407,14 @@ async fn run() -> Result<()> {
         return Err(anyhow!(refusal));
     }
     let startup_mode = startup_mode(&args);
+    if let Some(json) = &args.agents {
+        orangu::agents::custom::set_session_agents(orangu::agents::custom::parse_session_agents(
+            json,
+        )?);
+    }
+    if let Some(name) = &args.agent {
+        orangu::agents::custom::set_main_agent(name.clone());
+    }
     if args.shell_completions {
         return print_shell_completions(args.quiet);
     }
@@ -609,6 +629,9 @@ async fn run() -> Result<()> {
             llms: &config.llms,
             prime: config.prime,
             mcp_servers: &config.mcp_servers,
+            web_search: &config.web_search,
+            subagent_depth: config.subagent_depth,
+            subagent_background: config.subagent_background,
             slots: slot_registry.clone(),
         },
     )
@@ -664,6 +687,9 @@ async fn run() -> Result<()> {
                         llms: &config.llms,
                         prime: config.prime,
                         mcp_servers: &config.mcp_servers,
+                        web_search: &config.web_search,
+                        subagent_depth: config.subagent_depth,
+                        subagent_background: config.subagent_background,
                         slots: slot_registry.clone(),
                     },
                 )
@@ -1013,6 +1039,9 @@ async fn run() -> Result<()> {
                             llms: &config.llms,
                             prime: config.prime,
                             mcp_servers: &config.mcp_servers,
+                            web_search: &config.web_search,
+                            subagent_depth: config.subagent_depth,
+                            subagent_background: config.subagent_background,
                             slots: slot_registry.clone(),
                         },
                     )
@@ -1535,6 +1564,9 @@ async fn run() -> Result<()> {
             std::time::Duration::from_millis(50)
         } else if sync_active {
             std::time::Duration::from_millis(500)
+        } else if tools.tasks().background_running() {
+            // Deliver a background subagent's report soon after it lands.
+            std::time::Duration::from_secs(1)
         } else {
             IDLE_STATUS_REFRESH_INTERVAL
         };
@@ -1543,12 +1575,28 @@ async fn run() -> Result<()> {
         // they drain through the same queue as commands typed mid-request.
         schedule::enqueue_due_jobs(&mut schedule_last_minute, &mut pending_commands);
 
+        // The status line counts this tab's running background subagents.
+        orangu::subagent_tasks::show_in_status_line(tools.tasks());
+        // Finished background subagents: each report becomes a turn of the
+        // model's own, through the same queue.
+        for notification in tools.tasks().take_notifications() {
+            output_state.push_text(&format!(
+                "Subagent task {} ({}) {}; its report goes to the model.",
+                notification.id,
+                notification.agent,
+                notification.status.name()
+            ));
+            pending_commands.push_back(PendingCommand::notification(notification.message()));
+        }
+
         // Set when this iteration's command came from the scheduler: its `&&`
         // chain id, used to run unattended and to drop the chain's remainder
         // if the command fails.
         let mut current_chain: Option<u64> = None;
+        let mut current_notification = false;
         let next_input = if let Some(queued) = pending_commands.pop_front() {
             current_chain = queued.chain;
+            current_notification = queued.notification;
             queued.text
         } else {
             match read_input(
@@ -1630,44 +1678,50 @@ async fn run() -> Result<()> {
         let mut prompt_input = next_input.clone();
         // Set by a command whose model turn has a deterministic tail.
         let mut prompt_after_turn: Option<commands::AfterTurn> = None;
-        let command_outcome = handle_command(
-            &next_input,
-            CommandState {
-                active_model: &mut active_model,
-                active_model_id: &mut active_model_id,
-                current_endpoint: &mut current_endpoint,
-                session: &mut session,
-                detect_model: &mut detect_model,
-            },
-            CommandContext {
-                startup_model: &startup_model,
-                startup_endpoint: &startup_endpoint,
-                llms: &config.llms,
-                tools: &tools,
-                workspace: &workspace,
-                session_dir: &session_dir,
-                embeddings_server: &embeddings_server,
-                is_coordinator: header_status.is_coordinator,
-                usage_stats: &usage_stats,
-                available_models: &available_models,
-                virtual_width: viewport.virtual_width,
-                auto_rebase: config.auto_rebase,
-                auto_squash: config.auto_squash,
-                compile_workers: config.compile_workers,
-                compression: config.compression,
-                terminal: &config.terminal,
-                forge,
-                review_reports: git::ReviewReports {
-                    review: last_review_report.as_deref(),
-                    auto_review: last_auto_review_report.as_deref(),
-                    review_feedback: Some(&last_review_feedback),
-                    last_was_auto: last_review_was_auto,
+        // A background subagent's report goes to the model as it is: never
+        // read as a command, whatever it happens to start with.
+        let command_outcome = if current_notification {
+            CommandOutcome::Unhandled
+        } else {
+            handle_command(
+                &next_input,
+                CommandState {
+                    active_model: &mut active_model,
+                    active_model_id: &mut active_model_id,
+                    current_endpoint: &mut current_endpoint,
+                    session: &mut session,
+                    detect_model: &mut detect_model,
                 },
-                skills: &skills,
-                semantic_budget_tokens: config.semantic_budget_tokens,
-                config_path: &config_path,
-            },
-        )?;
+                CommandContext {
+                    startup_model: &startup_model,
+                    startup_endpoint: &startup_endpoint,
+                    llms: &config.llms,
+                    tools: &tools,
+                    workspace: &workspace,
+                    session_dir: &session_dir,
+                    embeddings_server: &embeddings_server,
+                    is_coordinator: header_status.is_coordinator,
+                    usage_stats: &usage_stats,
+                    available_models: &available_models,
+                    virtual_width: viewport.virtual_width,
+                    auto_rebase: config.auto_rebase,
+                    auto_squash: config.auto_squash,
+                    compile_workers: config.compile_workers,
+                    compression: config.compression,
+                    terminal: &config.terminal,
+                    forge,
+                    review_reports: git::ReviewReports {
+                        review: last_review_report.as_deref(),
+                        auto_review: last_auto_review_report.as_deref(),
+                        review_feedback: Some(&last_review_feedback),
+                        last_was_auto: last_review_was_auto,
+                    },
+                    skills: &skills,
+                    semantic_budget_tokens: config.semantic_budget_tokens,
+                    config_path: &config_path,
+                },
+            )?
+        };
         // When `/server` (or `/reload`) selects a server, auto-detect an
         // available model on it — exactly like the startup model switch. This
         // runs even when re-selecting the server we are already on. Under a
@@ -1776,6 +1830,9 @@ async fn run() -> Result<()> {
                         llms: &config.llms,
                         prime: config.prime,
                         mcp_servers: &config.mcp_servers,
+                        web_search: &config.web_search,
+                        subagent_depth: config.subagent_depth,
+                        subagent_background: config.subagent_background,
                         slots: slot_registry.clone(),
                     },
                 )
@@ -1840,6 +1897,9 @@ async fn run() -> Result<()> {
                             llms: &config.llms,
                             prime: config.prime,
                             mcp_servers: &config.mcp_servers,
+                            web_search: &config.web_search,
+                            subagent_depth: config.subagent_depth,
+                            subagent_background: config.subagent_background,
                             slots: slot_registry.clone(),
                         },
                     )

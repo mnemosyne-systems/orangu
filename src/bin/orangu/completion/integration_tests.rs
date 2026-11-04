@@ -19,6 +19,20 @@ use std::fs;
 use tempfile::tempdir;
 
 #[test]
+fn completes_both_paths_of_convert() {
+    let workspace = tempdir().expect("workspace");
+    fs::write(workspace.path().join("report.md"), "").expect("report");
+    let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+    for input in ["/convert rep", "/convert report.md rep"] {
+        let (start, _, candidates) =
+            completion_candidates(input, input.len(), workspace.path(), &[], &[], &skills)
+                .expect("convert completion");
+        assert_eq!(start, input.len() - "rep".len(), "{input}");
+        assert_eq!(candidates, vec!["report.md".to_string()], "{input}");
+    }
+}
+
+#[test]
 fn completes_open_file_commands_across_workspace() {
     let workspace = tempdir().expect("workspace");
     fs::write(workspace.path().join("README.md"), "").expect("root readme");
@@ -1510,4 +1524,31 @@ fn merge_flow_puts_its_own_branch_first_among_the_offered_branches() {
         ),
         Some("r-231".to_string())
     );
+}
+
+#[test]
+fn completes_agent_mentions() {
+    let workspace = tempdir().expect("workspace");
+    let agents = workspace.path().join(".orangu/agents");
+    fs::create_dir_all(&agents).expect("agents");
+    fs::write(
+        agents.join("r.md"),
+        "---\nname: reviewer-zz\ndescription: Reviews.\n---\nReview.\n",
+    )
+    .expect("agent");
+    let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+    let input = "ask @agent-review";
+    let (start, _, candidates) =
+        completion_candidates(input, input.len(), workspace.path(), &[], &[], &skills)
+            .expect("mention completion");
+    assert_eq!(start, "ask ".len());
+    assert!(
+        candidates.contains(&"@agent-reviewer-zz".to_string()),
+        "{candidates:?}"
+    );
+    let input = "@agent-explore";
+    let (_, _, candidates) =
+        completion_candidates(input, input.len(), workspace.path(), &[], &[], &skills)
+            .expect("mention completion");
+    assert_eq!(candidates, ["@agent-explore_repository"]);
 }

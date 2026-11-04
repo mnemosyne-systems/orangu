@@ -78,6 +78,21 @@ pub fn completion_candidates(
         .map(|(index, ch)| index + ch.len_utf8())
         .unwrap_or(0);
     let token = &prefix[start..];
+    // `@agent-<name>`: the subagents a prompt can ask for.
+    if let Some(typed) = token.strip_prefix("@agent-") {
+        let names = orangu::subagents::SUBAGENTS
+            .iter()
+            .map(|spec| spec.tool.to_string())
+            .chain([orangu::subagents::DOCUMENT_TOOL.to_string()])
+            .chain(orangu::agents::custom::agent_names(workspace));
+        let mut candidates: Vec<String> = names
+            .filter(|name| name.starts_with(typed))
+            .map(|name| format!("@agent-{name}"))
+            .collect();
+        candidates.sort();
+        candidates.dedup();
+        return Some((start, cursor, candidates));
+    }
     // While the first word is being typed — the empty prompt included — the
     // merge flow's next steps come before the workspace files, so Tab reaches
     // for `switch to main` / `merge <branch>` / ... ahead of a same-prefixed

@@ -33,6 +33,8 @@ Run `orangu -s` to print the completion script for the shell detected from
 |       | `--developer`         | —                       |
 |       | `--committer`         | —                       |
 | `-p`  | `--prompt`            | —                       |
+|       | `--agent`             | —                       |
+|       | `--agents`            | —                       |
 | `-q`  | `--quiet`             | —                       |
 | `-l`  | `--list`              | —                       |
 | `-i`  | `--init`              | —                       |

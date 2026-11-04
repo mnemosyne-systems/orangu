@@ -42,6 +42,14 @@ MCP support currently exposes tools only. Resources and prompts are not exposed;
 | `run_shell_command` | Run a shell command inside the workspace | `command`, optional `cwd`, optional `timeout_seconds` |
 | `expand_context` | Retrieve previously compressed/truncated output using its hash ID | `id` |
 | `semantic_search` | Search workspace code by meaning, refreshing the embedding index first | `query` |
+| `explore_repository` | Have a read-only subagent search the repository | `query` |
+| `write_tests` | Have a subagent write and run tests | `task` |
+| `write_docs` | Have a subagent write documentation | `task` |
+| `write_document` | Have a subagent write a LibreOffice, Markdown or HTML document | `type`, `task` |
+| `convert_document` | Render text into a document, or convert a document, for example to PDF | `target`, either `source` or `content` + `format`, optional `overwrite` |
+| `run_agent` | Have a custom subagent do a task, or list matching ones; offered only when agents are installed | `agent`, `task` |
+| `continue_agent` | Give a finished subagent task a follow-up; it keeps its earlier work. Interactive sessions only | `task`, `message`, optional `background` |
+| `research_web` | Have a subagent answer a question from the workspace or the web, with sources; not offered when `[orangu].web_search` is `off` | `question` |
 
 `semantic_search` uses the same implementation and embeddings server as `/search`.
 It reuses embeddings for unchanged files and refreshes changed or deleted files
@@ -201,12 +209,12 @@ that does not declare one. The licence texts are strings compiled into the
 binary rather than files read from disk, and they are shared with the web
 console's code blocks, which use the same implementation.
 
-**Git.** In a Git repository these tools make their change *with* the Git
-command — `create_file`/`modify_file` stage with `git add`, `move_file`
-moves with `git mv`, `delete_file` deletes with `git rm` — so work is
-staged as it happens. **Nothing is ever committed**; that stays your
-decision (`/commit`). Pass `"git": false` on a call for a plain filesystem
-change.
+**Git.** Nothing is staged automatically: a change is a plain filesystem
+change unless the call passes `"git": true`. Then, in a Git repository, these
+tools make their change *with* the Git command — `create_file`/`modify_file`
+stage with `git add`, `move_file` moves with `git mv`, `delete_file` deletes
+with `git rm`. **Nothing is ever committed**; that stays your decision
+(`/commit`).
 
 ## Workspace restrictions
 
@@ -265,7 +273,7 @@ Important details:
 - If `old_text` occurs more than once and `replace_all` is not set, the tool returns an error saying how many times: the model includes more of the surrounding text, or sets `replace_all`
 - Successful edits return JSON with `path`, `created`, `updated`, `replacements` (how many matches were replaced; `0` for a created or wholly replaced file), `original_bytes`, `new_bytes`, `mode`, and `git`
 - Instead of `old_text`/`new_text`, `edits` may be given — an array of `{start_line, end_line, replacement}` line ranges, exactly as `orangu-server`'s `/v1/modify_file` takes them. `edits` wins if both are supplied
-- In a Git repository the change is staged with `git add`; pass `"git": false` to leave the index alone
+- With `"git": true` in a Git repository, the change is staged with `git add`; by default the index is left alone
 
 ## `list_directory`
 
@@ -359,3 +367,470 @@ Behavior:
 - Output is intercepted and compressed before being sent to the LLM to prevent flooding the context window. Native slash commands (like `/diff`, `/log`, `/build`) execute locally and display their full output to the user, but when this output is injected into the model's context, it is compressed and tracked via a cache identifier to ensure it is only transmitted once if unchanged.
 - Output is returned as pretty-printed JSON with `exit_code`, `stdout`, and `stderr`
 - `stdout` and `stderr` are each truncated to at most 20,000 characters
+
+## Subagents
+
+`explore_repository`, `write_tests`, `write_docs`, `write_document`,
+`research_web` and `run_agent` hand one task to a subagent and return only its
+answer, so the main conversation's context stays small. Each subagent:
+
+- runs in a fresh conversation with its own system prompt. It never sees the
+  main conversation, so the `query` or `task` must be complete in itself
+- gets the model for its role: `explorer` for `explore_repository`, `code` for
+  the writers. It starts from the connection the conversation is using, so it
+  follows `-c` and `/server`. Behind a coordinator that connection is reused
+  and the coordinator picks the model; otherwise a section with that `role` is
+  used (the first by name), falling back to that connection
+- follows the same `AGENTS.md` rules as the main agent (`~/.orangu/AGENTS.md`
+  and the workspace's), except `explore_repository`, which only searches
+- runs at the same time as the other subagents the model starts in the same
+  turn, up to four at once; their answers come back in the order the model
+  asked for them. Other tools in the turn still run one after another, in
+  order. Subagents that write share the workspace, so give concurrent writers
+  separate files
+- has a fixed budget of model requests, whatever `max_tool_rounds` says
+- runs silently: no streaming; `/tasks` shows the tool it is on and the
+  tokens it has used
+- shares the main agent's MCP tools (`write_tests`, `write_docs` and custom
+  agents, as their `tools` allow; `explore_repository`, `research_web` and
+  `write_document` get none), except the tools that ask for approval
+  (`approval_mode = prompt`, or `writes` for a tool not marked read-only):
+  nobody is there to approve them, so they are not offered
+- can load the installed skills with `use_skill` (`write_tests`, `write_docs`
+  and custom agents whose `tools` allow `Skill`): its prompt lists them by
+  name and description, and `use_skill` returns one's instructions, user
+  skills included
+- must end with a `<final_answer>` block, which is all the main agent receives.
+  Without one, the raw reply is returned with a warning
+
+| Tool | Role | Rounds | Workspace access |
+| :-- | :-- | :-- | :-- |
+| `explore_repository` | `explorer` | 6 | read-only |
+| `write_tests` | `code` | 12 | read and write; changes only tests and runs them |
+| `write_docs` | `code` | 8 | read and write; changes only documentation |
+| `write_document` | `code` | 8 | read and write; writes one document |
+| `research_web` | `code` | 10 | read-only; `web_search` and `browse` |
+| `run_agent` | by its `model` or `role` | 15 by default | as its `tools` allow |
+
+The writers change the same workspace as the main agent. Their answer lists
+every file changed (and, for `write_tests`, the command run and its result).
+A subagent that runs out of model requests is asked, without tools, for what
+it got done and what is left, and the main agent receives that marked
+`[Partial: …]` rather than a bare error; whatever a writer already wrote stays
+in the workspace.
+
+Subagents are not offered subagent tools, except custom agents that ask for
+them (see `Agent` under Custom agents), so delegation goes at most
+`[orangu].subagent_depth` levels (three by default) below the main
+conversation.
+Read-only sessions such as `/review` offer none of them.
+
+### Background subagents and tasks
+
+Every subagent run is a task, numbered `t1`, `t2`, … per conversation and
+listed by `/tasks` (see the Core tools chapter). The main agent receives the
+task's id with its answer.
+
+In an interactive session, every subagent tool also takes `background`. With
+`background: true` the call returns at once and the main agent carries on.
+When the subagent finishes, its report arrives as a message of its own: the
+client hands it to the model as the next turn, within a second when idle, or
+after the turn that is running. A report never runs as a command, whatever it
+starts with, and `/pending` lists it as `(subagent report)` while it waits.
+While background tasks run, the status line shows `Tasks: N`.
+`Ctrl+B` moves the subagents the main conversation is waiting for to the
+background, as if they had been started with `background: true`; the turn goes
+on and their reports arrive later. Subagents started by other subagents stay
+where they are. With `[orangu].subagent_background = true`, subagents run in
+the background unless a call says `background: false`.
+`/tasks stop <id>` stops a background task; Esc stops the turn, and with it
+any subagent the turn is waiting for. A stopped task is marked so, sends no
+report, and cannot be continued.
+
+`/fork <task>` starts a background subagent from the whole conversation
+instead of a fresh one (see the Core tools chapter).
+
+`continue_agent` gives a finished task a follow-up `message`. The subagent
+picks up its own conversation where it ended, with its earlier work, on the
+same model and tools, in the foreground or (`background: true`) in the
+background. A task that ran out of model requests can be continued too, to
+finish what its partial answer says is left.
+
+Finished tasks are kept with the session, conversations included, so after
+orangu is restarted and the session resumed (`--resume`), `/tasks` lists them
+and `continue_agent` can still follow one up. A restored task's tools are
+built again as they were (a custom agent's from its file as it is now, so one
+that was removed cannot be continued), on the connection the configuration
+names now. A task that was running when orangu stopped is not kept.
+
+One-shot runs (`--prompt`) and workflow loops have no later turn to deliver a
+report in, so there subagents always run in the foreground and
+`continue_agent` is not offered. Tasks belong to the session that is running:
+they are not kept when orangu exits, and a tab's reports wait while another
+tab is in front.
+
+### Documents
+
+`write_document` starts one subagent per document `type`. Its `task` names
+what to write and, optionally, where and in which format:
+
+| `type` | Written as | Default target | Also on request |
+| :-- | :-- | :-- | :-- |
+| `text` | Markdown, rendered by `convert_document` | `.odt` (Writer) | `.docx`, `.pdf` |
+| `spreadsheet` | CSV, rendered by `convert_document` | `.ods` (Calc) | `.xlsx`, `.pdf` |
+| `presentation` | slide outline, rendered by `convert_document` | `.odp` (Impress) | `.pptx`, `.pdf` |
+| `drawing` | SVG, rendered by `convert_document` | `.odg` (Draw) | `.pdf` |
+| `markdown` | a plain file, by `create_file` | `.md` | `.pdf` |
+| `html` | a plain file, by `create_file` | `.html` | `.pdf` |
+
+The LibreOffice writers never leave a source file behind: the source text goes
+straight into the document. When a PDF is asked for as well, they render it
+from that same source text.
+
+### Web research
+
+`research_web` answers a `question`, looking locally before going to the web.
+Its subagent first checks whether the workspace answers it (code, README,
+docs, vendored dependencies). Otherwise it searches with `web_search`, reads
+the promising pages with `browse`, checks important claims against a second
+source, and ends with the answer and a `Sources:` list of the URLs it relied
+on. It can read the workspace but not change it. The search results and pages
+stay in the subagent's conversation, so only the answer reaches the main one.
+
+**Where searches go.** `[orangu].web_search` is a comma-separated list of
+[SearXNG](https://docs.searxng.org/) instances (by base URL) and public
+engines (`duckduckgo`, `bing`, `google`). They are tried in order until one
+returns results, but every SearXNG instance comes first, whatever order the
+list is written in: a self-hosted instance keeps searches local, and the
+public engines are only the fallback.
+
+```ini
+[orangu]
+# Local SearXNG first, then the public engines.
+web_search = http://localhost:8888, duckduckgo, bing, google
+```
+
+| `web_search` | Searches |
+| :-- | :-- |
+| unset | `duckduckgo`, then `bing`, then `google` |
+| `http://localhost:8888` | only the local SearXNG instance |
+| `http://localhost:8888, duckduckgo, bing` | SearXNG, then DuckDuckGo, then Bing |
+| `off` | nothing: `research_web` is not offered |
+
+A SearXNG instance must offer JSON results (`json` under `search.formats` in
+its `settings.yml`); it is the same backend `orangu-server`'s `web_search`
+server tool uses. The public engines are read from their plain result pages:
+DuckDuckGo's lite page and Bing's results page.
+
+Every request identifies itself as `orangu/<version>`. An engine that answers
+with a challenge, or with a page that needs JavaScript, counts as unavailable
+and the next one is tried; orangu never tries to get past an engine's bot
+checks. Google currently answers such a client with a page that needs
+JavaScript, so in practice it is the last resort that does not answer.
+Querying public engines this way is subject to their terms and rate limits;
+a SearXNG instance avoids both.
+
+**`web_search`**, with a `query`, returns numbered results with title, URL and
+excerpt, and names the engine that answered.
+
+**`browse`** reads the web a page at a time:
+
+| Arguments | Opens |
+| :-- | :-- |
+| `url` | that page |
+| `link` | link number `link` of the current page |
+| `part` | part `part` of the current page (with `url` or `link`: of that page) |
+
+A page is rendered to text once and split into parts of about 6,000
+characters. Each part ends with the links it mentions, numbered and made
+absolute (anchors into the same page are left out), so the next step is
+`link: 7` rather than a copied URL. HTML, plain text, JSON and PDF pages can be
+read, up to 5 MB. Every page read stays cached for the rest of the subagent's
+run (up to 64 pages), so going back to a page or to another part of it is
+answered locally, without a request, and is marked `(cached)`.
+
+Only subagents get `web_search` and `browse`: `research_web`, and custom
+agents whose `tools` include `WebSearch` or `WebFetch` (or that have no
+`tools` field).
+
+### Custom agents
+
+orangu reads custom subagents in the format Claude Code uses, so a collection
+such as
+[awesome-claude-code-subagents](https://github.com/VoltAgent/awesome-claude-code-subagents)
+works as it is. Each agent is a Markdown file: YAML frontmatter, then the
+agent's system prompt.
+
+```markdown
+---
+name: api-designer
+description: Use this agent when designing new APIs or API specifications.
+tools: Read, Write, Edit, Bash, Glob, Grep
+model: sonnet
+---
+
+You are a senior API designer...
+```
+
+Agent files are read recursively, up to five directories deep, from:
+
+| Directory | Scope |
+| :-- | :-- |
+| `~/.claude/agents` | user |
+| `~/.orangu/agents` | user |
+| `<workspace>/.claude/agents` | project |
+| `<workspace>/.orangu/agents` | project |
+| `agents/` of each plugin | plugin |
+
+Plugins are those Claude Code installed (`~/.claude/plugins/installed_plugins.json`:
+every user-scope plugin, and project-scope ones of this workspace, less any
+that `enabledPlugins` turns off in Claude Code's settings) and every
+directory in `~/.orangu/plugins/` and `<workspace>/.orangu/plugins/`. A
+plugin's agents are named `<plugin>:<agent>`, the plugin named by its
+`.claude-plugin/plugin.json` or its directory; a model may leave the plugin
+out while no other agent has the name. As in Claude Code, a plugin's agents
+get no `mcpServers` of their own.
+
+A project agent replaces a user agent of the same name. Agents installed for
+Claude Code are picked up without changes, and a whole collection can be
+cloned (or symlinked) into one of these directories:
+
+```sh
+git clone https://github.com/VoltAgent/awesome-claude-code-subagents \
+    ~/.orangu/agents/voltagent
+```
+
+A Markdown file without both `name` and `description` (a README) is skipped,
+as are hidden directories (`.git`) and directories named `commands`, `tools`,
+`skills` or `hooks`, where a collection keeps its other kinds of extensions.
+No agent may be called `list`. Frontmatter whose YAML does not parse is read
+line by line as `key: value`.
+
+**`tools`** is a comma-separated list or a YAML list. It is an allowlist: the
+agent is offered, and may run, only these tools. Without `tools`, the agent
+gets every tool. **`disallowedTools`**, in the same form, takes tools away
+first, so `disallowedTools: Write, Edit, Bash` makes an agent without `tools`
+read-only.
+
+| Claude Code tool | orangu tools |
+| :-- | :-- |
+| `Read` | `show_file`, `expand_context` |
+| `Glob`, `LS` | `list_directory` |
+| `Grep` | `search_text` |
+| `Write` | `create_file`, `create_directory`, `convert_document` |
+| `Edit`, `MultiEdit` | `modify_file`, `move_file`, `move_directory` |
+| `Bash` | `run_shell_command`, `delete_file`, `delete_directory` |
+| `WebFetch` | `fetch_url`, `browse` |
+| `WebSearch` | `web_search`, `browse` (no search when `[orangu].web_search` is `off`) |
+| `Skill` | `use_skill` |
+| `Agent`, `Task` | the subagent tools: `run_agent`, `explore_repository`, `write_tests`, `write_docs`, `write_document`, `research_web` |
+| `Agent(a, b)` | the built-in subagents it names, and `run_agent` for only the custom agents it names |
+
+orangu's own tool names may be listed too, and MCP tools by their names:
+`mcp__<server>__<tool>` for one tool, `mcp__<server>` for all of a server's
+(in `disallowedTools` too). Anything else, such as `Task`, is unsupported:
+the agent runs without it and is told so, as it is about `WebSearch` when
+`[orangu].web_search` is `off`.
+`search_text` exists only for custom agents: a regular-expression search of
+file contents that respects `.gitignore`, with optional `path`, `glob`,
+`ignore_case` and `max_results`.
+
+**`model`** picks the role, and so the model: `haiku` asks for `explorer`, the
+small fast model, and anything else (`sonnet`, `opus`, `inherit`) for `code`.
+Two fields of orangu's own may be added: `role` (`all`, `code`, `review` or
+`explorer`) overrides that, and `max_tool_rounds` sets the agent's budget of
+model requests (default 15, at most 50).
+
+**`omitClaudeMd: true`** runs the agent without the project's `AGENTS.md`
+rules, which every custom agent follows otherwise.
+
+**`maxTurns`** sets the agent's budget of model requests, like
+`max_tool_rounds` (which wins when both are set). An agent that uses them
+all returns a partial answer, as above.
+
+**Agents that start agents.** An agent whose `tools` list `Agent` (or
+Claude Code's older `Task`) may start subagents itself; `Agent(worker,
+researcher)` limits it to those, so `run_agent` refuses and does not list
+the others. Nesting is asked for: an agent without a `tools` field starts
+none, and `disallowedTools: Agent` forbids it. Subagents go at most
+`[orangu].subagent_depth` levels below the main conversation (three by
+default); an agent at the last level is told it cannot start more. Every run, at any level, is a task of the session in
+`/tasks`. The built-in subagents never start others. With `--agent`, the
+same `Agent` entries decide which subagent tools the conversation keeps.
+
+**`hooks`** runs commands around the agent's tool calls, in Claude Code's
+shape:
+
+```yaml
+hooks:
+  PreToolUse:
+    - matcher: "Bash"
+      hooks:
+        - type: command
+          command: "./scripts/validate-command.sh"
+  PostToolUse:
+    - matcher: "Edit|Write"
+      hooks:
+        - type: command
+          command: "./scripts/run-linter.sh"
+```
+
+A hook command runs through the shell in the workspace, with the call as
+JSON on its standard input: `hook_event_name`, `tool_name` (Claude Code's
+name for the tool, such as `Bash` or `Glob`, when there is one), `tool_input`,
+`cwd`, and for `PostToolUse` `tool_response`. `matcher` is a regular
+expression for the whole tool name, Claude Code's or orangu's; without one,
+or `*`, every tool matches. A `PreToolUse` hook that exits with 2 blocks the
+call, and the agent is told its standard error; a `PostToolUse` hook that
+exits with 2 adds its standard error to the tool's result. Any other exit
+status lets the call go on, and a hook runs for at most 60 seconds. orangu
+runs `PreToolUse` and `PostToolUse` command hooks; other events and hook
+types are listed by `/agents` as not run. The hooks also apply with
+`--agent`.
+
+**`permissionMode: plan`** makes the agent read-only: every tool that
+changes the workspace is taken away. orangu's subagents never ask for
+permission, so the other modes change nothing.
+
+**`background: true`** runs the agent in the background whenever the
+conversation can take its report later (an interactive tab).
+
+**`initialPrompt`** is the first turn of a new conversation run as the
+agent with `--agent`, as if typed, so it may be a command or a skill.
+
+**`isolation: worktree`** runs the agent in a temporary git worktree: a
+checkout of `HEAD` on a branch of its own (`orangu/<agent>-…`), in the
+repository's git directory (`.git/orangu-worktrees/`), so what it changes
+stays out of the workspace. A workspace in a subdirectory of the repository
+is the same subdirectory of the worktree, and a `project` memory stays the
+workspace's. After each run a worktree the agent left as it found it is
+removed with its branch, and the report says it changed no files, whatever
+the agent itself claims. One with commits or changes stays, and the report
+says where and how to merge or remove it. `continue_agent` puts a removed
+worktree back. The workspace must be a git repository with a commit.
+Isolation applies to agents started by `run_agent`, not to `--agent`.
+
+**`color`** is shown by `/agents`. **`effort`** is read but has no effect:
+orangu sends no effort setting to the server.
+
+As in Claude Code, a plugin's agents get no `hooks` and no `permissionMode`.
+
+**`skills`** names skills, as a list or comma-separated, whose instructions
+are part of the agent's prompt from the start, whatever its `tools` say. A
+skill that is not installed is left out, and the agent is told so.
+
+**`mcpServers`** lists MCP servers for the agent, by name or defined inline:
+
+```yaml
+mcpServers:
+  - github                  # a server configured as [mcp.github]
+  - docs:                   # the agent's own, connected for its runs
+      type: http
+      url: http://localhost:8300/mcp
+```
+
+The servers it lists come with the agent even when `tools` does not name
+them. An inline server is connected when the agent starts and needs no
+approval; a configured server of the same name wins over it. orangu speaks
+Streamable HTTP only: a `stdio` or `sse` server, a name that is not
+configured, or a server that cannot be reached is left out, and the agent is
+told which.
+
+**`memory`** gives the agent notes that outlive the task:
+
+| `memory` | Directory |
+| :-- | :-- |
+| `user` | `~/.orangu/agent-memory/<agent>/`, shared by every project |
+| `project` | `<workspace>/.orangu/agent-memory/<agent>/`, meant to be committed |
+| `local` | `<workspace>/.orangu/agent-memory-local/<agent>/`; add it to `.gitignore` |
+
+The start of the directory's `MEMORY.md` (its first 200 lines, at most
+25 KB) is part of the agent's prompt, and the agent rewrites it with
+`save_memory` (at most 64 KB), a tool it gets whatever its `tools` say. The
+agent is told never to store secrets there.
+
+The main agent reaches custom agents through one tool, `run_agent`, offered
+only when at least one agent is installed. `agent` names the agent and `task`
+is a self-contained task. With `agent: "list"`, `task` is search words instead,
+and the best ten matches come back with their descriptions. A whole
+collection therefore costs one tool definition per request, not one per agent.
+An unknown name is answered with the closest matches. Like every other
+subagent, a custom agent starts in a fresh conversation and is asked to end
+with a `<final_answer>` block.
+
+Agent files are read again when they change: an agent added, edited or
+removed applies within seconds, without restarting orangu or opening a new
+tab. A task already running keeps the agent it started with.
+
+**Agents for one run.** `--agents` defines agents as JSON, Claude Code's
+format: an object from agent name to its `description`, its system prompt
+as `prompt`, and any of the fields above. They are offered in every tab of
+the run and win over agent files of the same name.
+
+```sh
+orangu --agents '{"reviewer": {"description": "Reviews code.", "prompt": "You review code for bugs.", "tools": ["Read", "Grep"]}}'
+```
+
+**The whole conversation as an agent.** `--agent <name>` runs the main
+conversation, interactive or `-p`, as an agent: its prompt (with its memory
+and `skills`) joins the system prompt, and its `tools` and `disallowedTools`
+limit the main agent's tools. A `tools` list without the subagent tools
+leaves the conversation without them. The conversation keeps its connection,
+whatever the agent's `model` says.
+
+**Asking for an agent.** `@agent-<name>` in a prompt asks for that agent,
+a custom one or a built-in subagent (`@agent-explore_repository`): the model
+is told to hand the request to it. Tab completes the names. A mention of an
+agent that is not installed is left as typed.
+
+`/agents` lists the installed agents (see the Core tools chapter).
+
+## `convert_document`
+
+`convert_document` writes LibreOffice and Office documents without LibreOffice
+installed, through the pure-Rust
+[libreoffice-pure](https://crates.io/crates/libreoffice-pure) crate. The format
+of `target` comes from its extension. The input is either an existing
+workspace file, `source`, or text, `content`, in a `format`:
+
+```json
+{
+  "target": "budget.ods",
+  "content": "Item,Cost\nRent,1200\nFood,400\nTotal,=SUM(B2:B3)\n",
+  "format": "csv"
+}
+```
+
+```json
+{
+  "source": "budget.ods",
+  "target": "budget.pdf"
+}
+```
+
+| `format` | What it is | Targets |
+| :-- | :-- | :-- |
+| `md`, `html`, `txt` | a text document | `odt`, `docx`, `pdf`, `html`, `md`, `txt` |
+| `csv` | one sheet; the first row is the header, a cell starting with `=` is a formula | `ods`, `xlsx`, `odb`, `pdf`, `html`, `md` |
+| `outline` | slides: `# Title` starts one, `- point` adds a bullet | `odp`, `pptx`, `pdf`, `html`, `md` |
+| `svg` | a drawing | `odg`, `pdf` |
+| `latex`, `mathml` | a formula | `odf`, `pdf` |
+
+Existing documents (`odt`, `docx`, `doc`, `ods`, `xlsx`, `xls`, `odp`, `pptx`,
+`ppt`, `odg`, `odb`, and PDF as a source) convert by extension; `format`
+overrides the source's extension.
+
+Behavior:
+
+- `target` and `source` must stay inside the workspace
+- `overwrite` defaults to `true`
+- No Git command is run
+- HTML comments in Markdown are dropped, so a licence header in a `.md` file
+  never shows up in the document
+- Markdown rendered straight to PDF supports Mermaid, math and images by
+  relative path
+- The result is JSON with `target`, `format`, `bytes_written` and
+  `overwritten`
+- Fidelity is not LibreOffice's own. In particular, reading an existing `.odp`
+  loses the text of its bulleted lists, so render a presentation's PDF from
+  its outline rather than from the `.odp`

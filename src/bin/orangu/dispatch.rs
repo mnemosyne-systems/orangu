@@ -57,7 +57,10 @@ fn create_file_command(
                 .map(|mode| orangu::files::Mode::Text(mode.to_string())),
             overwrite: orangu::files::overwrite_default(),
             parents: true,
-            git: orangu::files::git_default(),
+            // Typed file commands are Git operations the user asked for
+            // (`git add …` reaches here too), so they stage; only the model's
+            // tools and the endpoints default to not staging.
+            git: true,
             // No licence header. This command is a person spelling a file
             // out by hand — writing it, not generating it — unlike the
             // `create_file` tool and the endpoint, which default to one.
@@ -214,6 +217,206 @@ fn file_command<Q, R: FileOperationSummary>(
     match operation(workspace, request) {
         Ok(response) => Ok(CommandOutcome::Output(response.summary())),
         Err(err) => Ok(CommandOutcome::OutputError(format!("Error: {err}"))),
+    }
+}
+
+/// `/tasks`: this conversation's subagent tasks, one task's report, or
+/// stopping a background one.
+fn tasks_command(
+    tasks: &orangu::subagent_tasks::TaskRegistry,
+    subcommand: &crate::commands::TasksSubcommand<'_>,
+) -> CommandOutcome {
+    use crate::commands::TasksSubcommand;
+    match subcommand {
+        TasksSubcommand::List => {
+            let listed = tasks.list();
+            if listed.is_empty() {
+                return CommandOutcome::Output(
+                    "No subagent tasks in this conversation.".to_string(),
+                );
+            }
+            let mut out = String::from("Subagent tasks:\n");
+            for task in listed {
+                let place = if task.background {
+                    "background"
+                } else {
+                    "foreground"
+                };
+                // What a running task is on right now.
+                let now = match (&task.status, &task.last_tool) {
+                    (orangu::subagent_tasks::TaskStatus::Running, Some(tool)) => {
+                        format!(", now {tool}")
+                    }
+                    _ => String::new(),
+                };
+                out.push_str(&format!(
+                    "  {:<4} {:<10} {:<22} {place}, {}, {} tool calls, {}, {}s{now}  {}\n",
+                    task.id,
+                    task.status.name(),
+                    task.agent,
+                    task.model,
+                    task.tool_calls,
+                    token_usage(task.usage),
+                    task.elapsed.as_secs(),
+                    task.summary
+                ));
+            }
+            out.push_str("Show one with /tasks <id>; stop a background one with /tasks stop <id>.");
+            CommandOutcome::Output(out)
+        }
+        TasksSubcommand::Show(id) => match tasks.get(id) {
+            Some(task) => CommandOutcome::Output(format!(
+                "Task {} ({}), {}, {}:\n{}\n\n{}",
+                task.id,
+                task.agent,
+                task.status.name(),
+                token_usage(task.usage),
+                task.summary,
+                match &task.result {
+                    Some(result) => untagged(result),
+                    None if task.activity.trim().is_empty() => "(running; nothing yet)".to_string(),
+                    None => format!("(running; recent activity)\n…{}", task.activity.trim_end()),
+                }
+            )),
+            None => CommandOutcome::OutputError(format!("Error: no subagent task {id}")),
+        },
+        TasksSubcommand::Stop(id) => match tasks.stop(id) {
+            Ok(()) => CommandOutcome::Output(format!("Stopped subagent task {id}.")),
+            Err(err) => CommandOutcome::OutputError(format!("Error: {err}")),
+        },
+    }
+}
+
+/// A report as a person reads it: the `<final_answer>` tags that mark it
+/// for the model left out, along with the blank edges they leave.
+fn untagged(report: &str) -> String {
+    match orangu::subagents::final_answer(report) {
+        Some(block) => {
+            let inner = block
+                .trim_start_matches("<final_answer>")
+                .trim_end_matches("</final_answer>")
+                .trim();
+            report.replacen(block, inner, 1).trim().to_string()
+        }
+        None => report.trim().to_string(),
+    }
+}
+
+/// A task's tokens, read and written: `12.3k in, 850 out`.
+fn token_usage(usage: orangu::llm::TokenUsage) -> String {
+    fn count(n: u64) -> String {
+        match n {
+            0..1_000 => n.to_string(),
+            1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+            _ => format!("{:.1}M", n as f64 / 1e6),
+        }
+    }
+    format!(
+        "{} in, {} out",
+        count(usage.prompt),
+        count(usage.completion)
+    )
+}
+
+/// How many agents `/agents <search words>` shows.
+const AGENTS_SEARCH_LIMIT: usize = 20;
+
+/// The longest description `/agents` prints on an agent's line.
+const AGENTS_DESCRIPTION_CHARS: usize = 100;
+
+/// `/agents [search words]`: the custom subagents `run_agent` offers the
+/// model, or those matching the words, with what each may do; and where
+/// they are looked for when there are none.
+fn agents_listing(
+    agents: &orangu::agents::custom::AgentRegistry,
+    workspace: &std::path::Path,
+    query: Option<&str>,
+) -> String {
+    let shown: Vec<&orangu::agents::custom::CustomAgent> = match query {
+        Some(query) => agents.search(query, AGENTS_SEARCH_LIMIT),
+        None => agents.all().iter().collect(),
+    };
+    let mut out = match query {
+        Some(query) => format!("Custom agents matching '{query}':\n"),
+        None => format!("Custom agents ({}):\n", agents.len()),
+    };
+    if shown.is_empty() {
+        out.push_str("  (None found)\n");
+    }
+    for agent in &shown {
+        let description = agent.description.trim();
+        let description = match description.char_indices().nth(AGENTS_DESCRIPTION_CHARS) {
+            Some((cut, _)) => format!("{}…", &description[..cut]),
+            None => description.to_string(),
+        };
+        let access = if agent.writable() {
+            "writes"
+        } else {
+            "read-only"
+        };
+        let mut traits = vec![
+            agent.source.to_string(),
+            access.to_string(),
+            agent.role().to_string(),
+        ];
+        if agent.background {
+            traits.push("background".to_string());
+        }
+        if let Some(color) = &agent.color {
+            traits.push(color.clone());
+        }
+        out.push_str(&format!(
+            "  {:<28} {description} [{}]\n",
+            agent.name,
+            traits.join(", ")
+        ));
+        let unsupported = agent.unsupported_tools();
+        if !unsupported.is_empty() {
+            out.push_str(&format!(
+                "  {:<28} unsupported tools: {}\n",
+                "",
+                unsupported.join(", ")
+            ));
+        }
+        if !agent.hooks.unsupported.is_empty() {
+            out.push_str(&format!(
+                "  {:<28} hooks not run: {}\n",
+                "",
+                agent.hooks.unsupported.join(", ")
+            ));
+        }
+    }
+    if agents.is_empty() {
+        out.push_str(
+            "Agent files (Markdown with name and description frontmatter) are read from:\n",
+        );
+        for (dir, _) in orangu::agents::custom::AgentRegistry::directories(workspace) {
+            out.push_str(&format!("  {}\n", dir.display()));
+        }
+        out.push_str(
+            "and from plugins: those Claude Code installed, and <plugin>/agents/ in \
+             ~/.orangu/plugins/ and .orangu/plugins/.\n",
+        );
+    }
+    out
+}
+
+/// `/convert <source> <target>`: the `convert_document` tool's conversion,
+/// with both formats taken from the extensions. A bare format as `target`
+/// (`pdf`) writes next to the source, and an existing target is replaced,
+/// since converting again after an edit is the usual case. Success prints
+/// nothing; only an error is reported.
+fn convert_command(workspace: &std::path::Path, source: &str, target: &str) -> CommandOutcome {
+    let request = orangu::office::ConvertRequest {
+        target: orangu::office::command_target(source, target),
+        source: Some(source.to_string()),
+        content: None,
+        format: None,
+        overwrite: true,
+    };
+    match orangu::office::convert_in_workspace(workspace, &request) {
+        Ok(_) => CommandOutcome::Quiet,
+        Err(err) => CommandOutcome::OutputError(format!("Error: {err:#}")),
     }
 }
 
@@ -1408,6 +1611,24 @@ pub(crate) fn handle_command(
             }
             Ok(CommandOutcome::Output(out))
         }
+        LocalCommand::Tasks(subcommand) => Ok(tasks_command(tools.tasks(), &subcommand)),
+        LocalCommand::Fork(task) => Ok(
+            match orangu::subagents::fork(
+                tools,
+                session.messages(),
+                task.as_deref().unwrap_or_default(),
+            ) {
+                Ok(()) => CommandOutcome::Output(
+                    "Forked into the background; /tasks shows it.".to_string(),
+                ),
+                Err(err) => CommandOutcome::OutputError(format!("Error: {err}")),
+            },
+        ),
+        LocalCommand::Agents(query) => Ok(CommandOutcome::Output(agents_listing(
+            &tools.refresh_custom_agents(),
+            workspace,
+            query.as_deref(),
+        ))),
         // Switching mode says nothing: the prompt itself is the answer — the
         // greeting, or the merge flow's next step, on the very next line.
         LocalCommand::Mode(mode) => {
@@ -2110,7 +2331,7 @@ pub(crate) fn handle_command(
             workspace,
             orangu::files::DeleteFileRequest {
                 path: path.to_string(),
-                git: orangu::files::git_default(),
+                git: true,
             },
         ),
         LocalCommand::MoveFile(None) => Ok(CommandOutcome::OutputError(
@@ -2125,9 +2346,15 @@ pub(crate) fn handle_command(
                 mode: None,
                 overwrite: false,
                 parents: true,
-                git: orangu::files::git_default(),
+                git: true,
             },
         ),
+        LocalCommand::Convert(None) => Ok(CommandOutcome::OutputError(
+            convert_usage_message().to_string(),
+        )),
+        LocalCommand::Convert(Some((source, target))) => {
+            Ok(convert_command(workspace, &source, &target))
+        }
         LocalCommand::CreateDirectory(None) => Ok(CommandOutcome::OutputError(
             "Usage: /create_directory <path> [with <mode>]".to_string(),
         )),
@@ -2138,7 +2365,7 @@ pub(crate) fn handle_command(
                 path: path.to_string(),
                 mode: mode.map(|mode| orangu::files::Mode::Text(mode.to_string())),
                 parents: true,
-                git: orangu::files::git_default(),
+                git: true,
             },
         ),
         LocalCommand::MoveDirectory(None) => Ok(CommandOutcome::OutputError(
@@ -2152,7 +2379,7 @@ pub(crate) fn handle_command(
                 to: dst.to_string(),
                 mode: None,
                 parents: true,
-                git: orangu::files::git_default(),
+                git: true,
             },
         ),
         LocalCommand::DeleteDirectory(None) => Ok(CommandOutcome::OutputError(
@@ -2163,7 +2390,7 @@ pub(crate) fn handle_command(
             workspace,
             orangu::files::DeleteDirectoryRequest {
                 path: path.to_string(),
-                git: orangu::files::git_default(),
+                git: true,
             },
         ),
         LocalCommand::CherryPick(None) => Ok(CommandOutcome::OutputError(
@@ -2601,6 +2828,186 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
+    #[tokio::test]
+    async fn tasks_command_lists_shows_and_stops() {
+        use crate::commands::TasksSubcommand;
+        use orangu::subagent_tasks::{TaskRegistry, TaskStatus};
+        let tasks = TaskRegistry::default();
+        match tasks_command(&tasks, &TasksSubcommand::List) {
+            CommandOutcome::Output(out) => {
+                assert_eq!(out, "No subagent tasks in this conversation.")
+            }
+            _ => panic!("expected output"),
+        }
+
+        let done = tasks.start("research_web", "What is X?", "code", false);
+        tasks.count_tool_call(&done, "web_search");
+        tasks.add_usage(
+            &done,
+            orangu::llm::TokenUsage {
+                prompt: 12_345,
+                completion: 850,
+            },
+        );
+        tasks.finish(
+            &done,
+            TaskStatus::Completed,
+            "<final_answer>\nX is a thing.\n</final_answer>\n\n[Worked in a worktree.]",
+        );
+        let running = tasks.start("api-designer", "Design the API", "code", true);
+        tasks.count_tool_call(&running, "modify_file");
+        let handle = tokio::spawn(std::future::pending::<()>());
+        tasks.set_abort(&running, handle.abort_handle());
+
+        let CommandOutcome::Output(list) = tasks_command(&tasks, &TasksSubcommand::List) else {
+            panic!("expected output");
+        };
+        assert!(list.starts_with("Subagent tasks:\n"), "{list}");
+        assert!(list.contains("t1   completed  research_web"), "{list}");
+        assert!(
+            list.contains("foreground, code, 1 tool calls, 12.3k in, 850 out, 0s  What is X?"),
+            "{list}"
+        );
+        assert!(list.contains("t2   running    api-designer"), "{list}");
+        assert!(list.contains(", now modify_file  Design the API"), "{list}");
+        let CommandOutcome::Output(running) =
+            tasks_command(&tasks, &TasksSubcommand::Show("t2".into()))
+        else {
+            panic!("expected output");
+        };
+        assert!(
+            running.ends_with("(running; recent activity)\n…\n[modify_file]"),
+            "{running}"
+        );
+        assert!(list.contains("background"), "{list}");
+
+        let CommandOutcome::Output(shown) =
+            tasks_command(&tasks, &TasksSubcommand::Show("t1".into()))
+        else {
+            panic!("expected output");
+        };
+        assert_eq!(
+            shown,
+            "Task t1 (research_web), completed, 12.3k in, 850 out:\nWhat is X?\n\nX is a thing.\n\n[Worked in a worktree.]"
+        );
+
+        match tasks_command(&tasks, &TasksSubcommand::Stop("t2".into())) {
+            CommandOutcome::Output(out) => assert_eq!(out, "Stopped subagent task t2."),
+            _ => panic!("expected output"),
+        }
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            tasks_command(&tasks, &TasksSubcommand::Stop("t1".into())),
+            CommandOutcome::OutputError(_)
+        ));
+        assert!(matches!(
+            tasks_command(&tasks, &TasksSubcommand::Show("t9".into())),
+            CommandOutcome::OutputError(_)
+        ));
+    }
+
+    #[test]
+    fn agents_listing_shows_access_role_and_unsupported_tools() {
+        let dir = tempdir().expect("agents");
+        fs::write(
+            dir.path().join("a.md"),
+            "---\nname: api-designer\ndescription: Designs REST APIs.\ntools: Read, Write, mcp__x__y, NotebookEdit\n---\nDesign.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("r.md"),
+            "---\nname: researcher\ndescription: Researches.\ntools: Read, Grep\nmodel: haiku\n---\nResearch.\n",
+        )
+        .unwrap();
+        let agents = orangu::agents::custom::AgentRegistry::from_directories(&[(
+            dir.path().to_path_buf(),
+            orangu::agents::custom::AgentSource::Project,
+        )]);
+        let workspace = tempdir().expect("workspace");
+
+        let all = agents_listing(&agents, workspace.path(), None);
+        assert!(all.starts_with("Custom agents (2):\n"), "{all}");
+        assert!(all.contains("api-designer"), "{all}");
+        assert!(
+            all.contains("Designs REST APIs. [project, writes, code]"),
+            "{all}"
+        );
+        assert!(all.contains("unsupported tools: NotebookEdit"), "{all}");
+        assert!(
+            all.contains("Researches. [project, read-only, explorer]"),
+            "{all}"
+        );
+
+        let found = agents_listing(&agents, workspace.path(), Some("research"));
+        assert!(found.contains("researcher"), "{found}");
+        assert!(!found.contains("api-designer"), "{found}");
+
+        let none = agents_listing(
+            &orangu::agents::custom::AgentRegistry::default(),
+            workspace.path(),
+            None,
+        );
+        assert!(none.contains("(None found)"), "{none}");
+        assert!(
+            none.contains(
+                &workspace
+                    .path()
+                    .join(".claude")
+                    .join("agents")
+                    .display()
+                    .to_string()
+            ),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn convert_command_converts_by_extension() {
+        let workspace = tempdir().expect("workspace");
+        fs::write(
+            workspace.path().join("report.md"),
+            "# Report\n\n- one\n- two\n",
+        )
+        .unwrap();
+
+        // Markdown to PDF, with the target given as a bare format.
+        // Success prints nothing.
+        assert!(matches!(
+            convert_command(workspace.path(), "report.md", "pdf"),
+            CommandOutcome::Quiet
+        ));
+        assert!(
+            fs::read(workspace.path().join("report.pdf"))
+                .unwrap()
+                .starts_with(b"%PDF-")
+        );
+
+        // Markdown to ODT and on to DOCX, by full target paths.
+        assert!(matches!(
+            convert_command(workspace.path(), "report.md", "out/report.odt"),
+            CommandOutcome::Quiet
+        ));
+        assert!(matches!(
+            convert_command(workspace.path(), "out/report.odt", "out/report.docx"),
+            CommandOutcome::Quiet
+        ));
+        assert!(workspace.path().join("out/report.docx").exists());
+
+        // Errors are reported, not raised.
+        for (source, target) in [
+            ("missing.md", "pdf"),
+            ("report.md", "../escaped.pdf"),
+            ("report.md", "report.bogus"),
+        ] {
+            match convert_command(workspace.path(), source, target) {
+                CommandOutcome::OutputError(message) => {
+                    assert!(message.starts_with("Error: "), "{message}")
+                }
+                _ => panic!("expected an error for {source} -> {target}"),
+            }
+        }
+    }
+
     #[test]
     fn file_commands_run_the_shared_operations_and_report_staging() {
         let workspace = tempdir().expect("workspace");
@@ -2668,7 +3075,7 @@ mod tests {
                 mode: None,
                 overwrite: false,
                 parents: true,
-                git: orangu::files::git_default(),
+                git: true,
                 license: false,
                 license_id: None,
                 license_holder: None,

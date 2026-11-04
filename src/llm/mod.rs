@@ -94,11 +94,22 @@ pub struct StreamMetrics {
     /// silent wrong answer; every surface that reports a turn should be able
     /// to say it happened.
     pub truncated: bool,
+    /// What one finished response cost, from its final chunk: OpenAI's
+    /// `usage`, or llama.cpp's `timings` counts when there is no `usage`.
+    pub usage: Option<TokenUsage>,
+}
+
+/// Tokens one response read and wrote.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub prompt: u64,
+    pub completion: u64,
 }
 
 impl StreamMetrics {
     pub fn is_empty(&self) -> bool {
         self.prompt_progress.is_none()
+            && self.usage.is_none()
             && self.prompt_per_second.is_none()
             && self.predicted_per_second.is_none()
             && !self.truncated
@@ -113,6 +124,9 @@ impl StreamMetrics {
         }
         if let Some(predicted_per_second) = update.predicted_per_second {
             self.predicted_per_second = Some(predicted_per_second);
+        }
+        if let Some(usage) = update.usage {
+            self.usage = Some(usage);
         }
         // Sticky: one truncated response stays truncated however many further
         // updates arrive after it.

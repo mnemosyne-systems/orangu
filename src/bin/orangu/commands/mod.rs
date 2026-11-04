@@ -628,6 +628,9 @@ pub enum LocalCommand<'a> {
     CreateFile(Option<CreateFileArgs<'a>>),
     DeleteFile(Option<Cow<'a, str>>),
     MoveFile(Option<(Cow<'a, str>, Cow<'a, str>)>),
+    /// `/convert <source> <target>`: formats from the extensions, and a
+    /// bare format as `target` (`pdf`) keeps the source's path.
+    Convert(Option<(Cow<'a, str>, Cow<'a, str>)>),
     /// `/create_directory <path> [with <mode>]`.
     CreateDirectory(Option<(Cow<'a, str>, Option<Cow<'a, str>>)>),
     MoveDirectory(Option<(Cow<'a, str>, Cow<'a, str>)>),
@@ -681,6 +684,14 @@ pub enum LocalCommand<'a> {
     PendingList,
     PendingDelete(Option<usize>),
     Skills,
+    /// `/agents [search words]`: the custom subagents `run_agent` can start.
+    Agents(Option<Cow<'a, str>>),
+    /// `/tasks`, `/tasks <id>`, `/tasks stop <id>`: this conversation's
+    /// subagent tasks.
+    Tasks(TasksSubcommand<'a>),
+    /// `/fork <task>`: a background subagent that starts from the whole
+    /// conversation.
+    Fork(Option<Cow<'a, str>>),
     /// `/developer` and `/committer`: what the prompt is for — writing code, or
     /// landing a reviewed pull request. Only the prompt's own suggestions
     /// change; every command stays available in both (see [`crate::mode`]).
@@ -830,3 +841,14 @@ pub fn sorted_model_names(llms: &HashMap<String, LlmConfiguration>) -> Vec<Strin
 
 #[cfg(test)]
 mod tests;
+
+/// What `/tasks` does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TasksSubcommand<'a> {
+    /// Every task, newest last.
+    List,
+    /// One task's report.
+    Show(Cow<'a, str>),
+    /// Stop a running background task.
+    Stop(Cow<'a, str>),
+}

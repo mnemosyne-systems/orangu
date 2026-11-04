@@ -207,8 +207,9 @@ exactly as before.
 
 Every request orangu sends already says what it's for — `/review` and
 `/auto_review` ask for the `review` role, the explorer subagent asks for
-`explorer`, semantic `/search` asks for `embeddings`, and ordinary chat asks
-for `code` (or `all` if you haven't configured a dedicated `code` profile).
+`explorer`, semantic `/search` asks for `embeddings`, and ordinary chat and the
+`write_tests`/`write_docs` subagents ask for `code` (or `all` if you haven't
+configured a dedicated `code` profile).
 The coordinator reads that and starts (or keeps running) whichever
 `orangu-server` actually backs the requested role, stopping first whatever
 it cannot run beside (with the default `resident = 1`, anything else that is

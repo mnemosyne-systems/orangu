@@ -315,6 +315,17 @@ impl<'a> PromptFrameWidget<'a> {
     }
 }
 
+/// The status line's count of what is waiting: background subagent tasks
+/// still running (`Tasks: N`) and queued commands (`Pending: N`).
+pub(crate) fn queue_text(pending_count: usize, background_tasks: usize) -> Option<String> {
+    let tasks = (background_tasks > 0).then(|| format!("Tasks: {background_tasks}"));
+    let pending = (pending_count > 0).then(|| format!("Pending: {pending_count}"));
+    match (tasks, pending) {
+        (Some(tasks), Some(pending)) => Some(format!("{tasks}   {pending}")),
+        (tasks, pending) => tasks.or(pending),
+    }
+}
+
 /// The status line under the input window, shared by both frames: `branch` and
 /// the activity status (Working/Thinking) on the left, a centered `Graph:` /
 /// `Pending:` group, and the model name flush right. When space runs short the
@@ -370,7 +381,10 @@ fn status_line(
     };
 
     let graph_width = graph_status.map(|_| "Graph: ".chars().count() + 1);
-    let pending_text = (pending_count > 0).then(|| format!("Pending: {pending_count}"));
+    let pending_text = queue_text(
+        pending_count,
+        crate::subagent_tasks::shown_background_count(),
+    );
     let combined_width = match (graph_width, &pending_text) {
         (Some(graph), Some(pending)) => Some(graph + 3 + pending.chars().count()),
         (Some(graph), None) => Some(graph),
@@ -430,5 +444,18 @@ impl<'a> Widget for PromptFrameWidget<'a> {
         } else {
             self.render_modern(area, buf, &theme);
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_text_tests {
+    use super::queue_text;
+
+    #[test]
+    fn queue_text_joins_running_tasks_and_pending_commands() {
+        assert_eq!(queue_text(0, 0), None);
+        assert_eq!(queue_text(2, 0).as_deref(), Some("Pending: 2"));
+        assert_eq!(queue_text(0, 1).as_deref(), Some("Tasks: 1"));
+        assert_eq!(queue_text(3, 2).as_deref(), Some("Tasks: 2   Pending: 3"));
     }
 }

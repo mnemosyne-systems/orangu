@@ -69,7 +69,15 @@ pub struct ClientAppConfiguration {
     /// long lines on one row and inspect them with horizontal panning.
     pub word_wrap: bool,
     pub semantic_budget_tokens: usize,
+    /// How many levels of subagents may run below the main conversation.
+    pub subagent_depth: usize,
+    /// Whether subagents run in the background unless a call says otherwise.
+    pub subagent_background: bool,
     pub theme: String,
+    /// `[orangu].web_search`: where the `research_web` subagent searches, in
+    /// order, local SearXNG instances first (see [`crate::web_search`]).
+    /// Unset means the public engines; empty (`off`) leaves web search out.
+    pub web_search: Vec<crate::web_search::Engine>,
 }
 
 /// A configured Model Context Protocol server that is already running and
@@ -222,6 +230,15 @@ pub fn default_compression() -> bool {
 /// Default `/build` parallelism: `0`, meaning unused — no `-j`/`--jobs` flag is
 /// passed and each toolchain falls back to its own default (Cargo's own
 /// automatic parallelism, a bare serial `make`, ...).
+/// Subagents may start subagents down to three levels below the main
+/// conversation, as in Claude Code.
+pub fn default_subagent_depth() -> usize {
+    3
+}
+
+/// The deepest `subagent_depth` may go.
+pub const MAX_SUBAGENT_DEPTH: usize = 10;
+
 pub fn default_compile_workers() -> usize {
     0
 }
@@ -281,6 +298,13 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         default_world_state_max_bytes,
     )?;
     let compile_workers = parse_client_field(&client, "compile_workers", default_compile_workers)?;
+    let subagent_depth = parse_client_field(&client, "subagent_depth", default_subagent_depth)?;
+    let subagent_background = parse_client_field(&client, "subagent_background", || false)?;
+    if !(1..=MAX_SUBAGENT_DEPTH).contains(&subagent_depth) {
+        return Err(anyhow!(
+            "invalid value for [{CLIENT_SECTION}].subagent_depth: {subagent_depth} (1 to {MAX_SUBAGENT_DEPTH})"
+        ));
+    }
     let system_prompt = client.get("system_prompt").cloned().unwrap_or_default();
     let mcp_servers = parse_mcp_profiles(&mut sections)?;
 
@@ -290,6 +314,8 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         .unwrap_or(16384);
 
     let theme = client.get("theme").cloned().unwrap_or_else(default_theme);
+    let web_search = crate::web_search::parse_engines(client.get("web_search").map(String::as_str))
+        .map_err(|err| anyhow!("invalid value for [{CLIENT_SECTION}].web_search: {err}"))?;
     // `[orangu].model` is the general default model id; a server section's own
     // `model` takes precedence over it.
     let default_model = client
@@ -336,6 +362,8 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
             client.get("auto_squash").map(String::as_str).unwrap_or(""),
         ),
         semantic_budget_tokens,
+        subagent_depth,
+        subagent_background,
         compile_workers,
         terminal: client.get("terminal").cloned().unwrap_or_default(),
         platform: client.get("platform").cloned().unwrap_or_default(),
@@ -344,11 +372,20 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         mouse,
         word_wrap,
         theme,
+        web_search,
     })
 }
 
 /// Remove and parse the sections reserved for running HTTP MCP servers before the
 /// remaining sections are treated as LLM profiles.
+/// Whether `name` may name an MCP server: ASCII letters, digits, `_`, `-`.
+pub fn valid_mcp_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 fn parse_mcp_profiles(
     sections: &mut HashMap<String, HashMap<String, String>>,
 ) -> Result<HashMap<String, McpServerConfiguration>> {
@@ -363,11 +400,7 @@ fn parse_mcp_profiles(
         let values = sections
             .remove(&section_name)
             .expect("MCP section disappeared while parsing");
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        {
+        if !valid_mcp_name(&name) {
             return Err(anyhow!(
                 "invalid MCP server name '{name}'; use ASCII letters, digits, '_' or '-'"
             ));
@@ -990,6 +1023,28 @@ mod tests {
     }
 
     #[test]
+    fn subagent_depth_defaults_to_three_and_is_bounded() {
+        let load = |extra: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu]\nserver = main\n{extra}\n[main]\nendpoint = http://localhost:8100/v1\nmodel = model\n"
+            )
+            .unwrap();
+            load_client_configuration(file.path())
+        };
+        assert_eq!(load("").unwrap().subagent_depth, 3);
+        assert_eq!(load("subagent_depth = 1").unwrap().subagent_depth, 1);
+        for bad in [
+            "subagent_depth = 0",
+            "subagent_depth = 11",
+            "subagent_depth = deep",
+        ] {
+            assert!(load(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn parses_http_mcp_servers_without_treating_them_as_llms() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         writeln!(
@@ -1044,6 +1099,34 @@ mod tests {
         .unwrap();
         let conf = load_client_configuration(file.path()).unwrap();
         assert_eq!(conf.theme, "random");
+    }
+
+    #[test]
+    fn parses_web_search_engines_with_public_ones_by_default() {
+        use crate::web_search::{DEFAULT_ENGINES, Engine};
+        let web_search = |value: Option<&str>| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            let line = value
+                .map(|v| format!("web_search = {v}\n"))
+                .unwrap_or_default();
+            writeln!(
+                file,
+                "[orangu]\nserver = a\n{line}\n[a]\nendpoint = http://x/v1\nmodel = m\n"
+            )
+            .unwrap();
+            load_client_configuration(file.path()).map(|conf| conf.web_search)
+        };
+        assert_eq!(web_search(None).unwrap(), DEFAULT_ENGINES);
+        assert!(web_search(Some("off")).unwrap().is_empty());
+        assert_eq!(
+            web_search(Some("duckduckgo, http://localhost:8888/")).unwrap(),
+            [
+                Engine::Searxng("http://localhost:8888".into()),
+                Engine::DuckDuckGo
+            ]
+        );
+        let err = web_search(Some("altavista")).unwrap_err();
+        assert!(err.to_string().contains("[orangu].web_search"), "{err}");
     }
 
     #[test]

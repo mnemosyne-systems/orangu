@@ -474,8 +474,13 @@ async fn run_persisted_inner(
         config.diff_file_cap,
         None,
     )
-    .with_mcp(mcp.clone());
+    .with_mcp(mcp.clone())
+    .with_workspace_agents()
+    .with_web_search(config.web_search.clone())
+    .with_llms(config.llms.clone())
+    .with_subagent_depth(config.subagent_depth);
     let skills = SkillRegistry::discover(workspace);
+    let tools = tools.with_skills(std::sync::Arc::new(skills.clone()));
     let mut system = build_workspace_system_prompt(&profile, &skills, workspace, None);
     if !mcp.instructions().is_empty() {
         system.push_str("\n\n");

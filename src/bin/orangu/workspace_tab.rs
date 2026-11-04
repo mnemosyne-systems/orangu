@@ -44,6 +44,13 @@ pub(crate) struct TabServerConfig<'a> {
     /// `[orangu].prime`: whether a fresh session primes the server's cache
     /// with its opening when the tab opens.
     pub(crate) prime: bool,
+    /// `[orangu].web_search`: the engines behind `research_web`.
+    pub(crate) web_search: &'a [orangu::web_search::Engine],
+    /// `[orangu].subagent_depth`: how deep subagents may nest.
+    pub(crate) subagent_depth: usize,
+    /// `[orangu].subagent_background`: subagents run in the background by
+    /// default.
+    pub(crate) subagent_background: bool,
 }
 
 /// Everything that belongs to one workspace tab. The run loop reads and mutates
@@ -147,6 +154,9 @@ impl WorkspaceTab {
             mcp_servers,
             slots,
             prime,
+            web_search,
+            subagent_depth,
+            subagent_background,
         } = server_config;
         let workspace_created = if !workspace.exists() {
             std::fs::create_dir_all(&workspace)
@@ -203,12 +213,34 @@ impl WorkspaceTab {
             diff_file_cap,
             Some(session_dir.clone()),
         )
-        .with_mcp(mcp.clone());
+        .with_mcp(mcp.clone())
+        .with_workspace_agents()
+        .with_web_search(web_search.to_vec())
+        .with_llms(config_llms.clone())
+        .with_subagent_depth(subagent_depth)
+        .with_background_default(subagent_background)
+        .with_background_tasks();
+        // `--agent`: the conversation runs as a custom agent.
+        let (tools, agent_prompt) = match orangu::agents::custom::main_agent() {
+            Some(name) => orangu::subagents::as_main_agent(tools, name)?,
+            None => (tools, String::new()),
+        };
+        // Subagent tasks are kept with the session, so `/tasks` and
+        // `continue_agent` reach the ones from before a restart.
+        tools
+            .tasks()
+            .persist_to(session_dir.join("subagent-tasks.json"));
+        // Its `initialPrompt` opens a new conversation, as if typed.
+        let initial_prompt = orangu::agents::custom::main_agent()
+            .filter(|_| !is_resumed)
+            .and_then(|name| orangu::subagents::initial_prompt(&tools, name));
         // What `/license` pinned last time this session ran. Applied before
         // the first request, so a resumed session writes files under the
         // licence it was writing them under when it was left.
         tools.set_licence_choice(session_licence_choice(&session_dir));
         let skills = orangu::skills::SkillRegistry::discover(&workspace);
+        // Skills load through `use_skill`, user skills included.
+        let tools = tools.with_skills(std::sync::Arc::new(skills.clone()));
         let session_hist_path = session_dir.join("history");
         let session_messages_path = session_dir.join("messages");
         let session_metadata_path = session_dir.join("metadata");
@@ -236,6 +268,7 @@ impl WorkspaceTab {
             };
 
             ep.push_str(&orangu::config::load_agents_instructions(&workspace));
+            ep.push_str(&agent_prompt);
             if !mcp.instructions().is_empty() {
                 ep.push_str("\n\n");
                 ep.push_str(&mcp.instructions());
@@ -290,7 +323,10 @@ impl WorkspaceTab {
             skills,
             session,
             output_state,
-            pending_commands: VecDeque::new(),
+            pending_commands: initial_prompt
+                .map(crate::wait::PendingCommand::typed)
+                .into_iter()
+                .collect(),
             usage_stats,
             history,
             session_id,

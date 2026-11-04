@@ -220,6 +220,7 @@ pub fn help_text() -> &'static str {
 /log [number]                                   Show commit log (optionally the latest number of commits) plus a count of uncommitted/untracked changes
 /merge <branch>|abort                           Merge a branch into the current branch, or abort the merge in progress
 /move_file <source> <destination>               Rename or move a tracked file with git mv
+/convert <source> <target|format>               Convert a document by extension (.md .odt .docx .ods .xlsx .odp .pptx .odg .pdf …)
 /pending [delete <n>]                           List queued commands, or delete one by number
 /pull <number>                                  Check out a GitHub/GitLab pull/merge request on a dedicated branch
 /pull_request                                   Create a pull request for the current branch
@@ -239,6 +240,9 @@ pub fn help_text() -> &'static str {
 /statistics [total]                             Show persistent, cross-session activity history and a daily heatmap for this workspace, or every workspace (total)
 /schedule                                       List the cron-style scheduled jobs from ~/.orangu/schedule with their next run times (UTC)
 /skills                                         List discovered Agent Skills; invoke one with /skill-name
+/agents [search words]                          List custom subagents (Claude Code format) from .claude/agents and .orangu/agents
+/tasks [<id>|stop <id>]                         List subagent tasks, show one task's report, or stop a background task
+/fork <task>                                     Fork the conversation into a background subagent that does <task>
 /developer                                      Developer mode (the default)
 /committer                                      Committer mode: the merge flow
 /theme <name>                                   Set this session's UI theme (naming the configured one drops the override)

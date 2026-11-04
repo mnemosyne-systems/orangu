@@ -20,6 +20,86 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 
+/// How many subagents of one turn run at the same time. Local inference
+/// shares one machine between them, so more would mostly queue.
+pub const MAX_PARALLEL_SUBAGENTS: usize = 4;
+
+/// A tool's result as the tool message carries it.
+fn render_tool_result(result: Result<String>) -> String {
+    match result {
+        Ok(result) => result,
+        Err(err) => format!("error: {err:#}"),
+    }
+}
+
+/// Runs subagent `calls` concurrently, at most [`MAX_PARALLEL_SUBAGENTS`] at
+/// a time, and returns their results in call order. Each runs on its own
+/// clone of `tools` (clones share their state), and is aborted if the turn
+/// is.
+async fn execute_concurrently(tools: &ToolExecutor, calls: &[crate::llm::ToolCall]) -> Vec<String> {
+    let calls = calls
+        .iter()
+        .map(|call| {
+            (
+                call.function.name.clone(),
+                call.function.arguments.clone().into_iter().collect(),
+            )
+        })
+        .collect();
+    let tools = tools.clone();
+    run_concurrently(calls, MAX_PARALLEL_SUBAGENTS, move |name, arguments| {
+        let tools = tools.clone();
+        async move { tools.execute(&name, &arguments).await }
+    })
+    .await
+}
+
+/// Runs `run` on every call, at most `limit` at a time, each as its own
+/// task; the rendered results come back in call order. A task that panics
+/// becomes an error result rather than taking the turn down.
+async fn run_concurrently<F, Fut>(
+    calls: Vec<(String, serde_json::Map<String, serde_json::Value>)>,
+    limit: usize,
+    run: F,
+) -> Vec<String>
+where
+    F: Fn(String, serde_json::Map<String, serde_json::Value>) -> Fut,
+    Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+{
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(limit.max(1)));
+    let mut running = tokio::task::JoinSet::new();
+    let mut indices = std::collections::HashMap::new();
+    let count = calls.len();
+    for (index, (name, arguments)) in calls.into_iter().enumerate() {
+        let permits = permits.clone();
+        let call = run(name, arguments);
+        let handle = running.spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            render_tool_result(call.await)
+        });
+        indices.insert(handle.id(), index);
+    }
+    let mut results = vec![None; count];
+    while let Some(joined) = running.join_next_with_id().await {
+        match joined {
+            Ok((id, rendered)) => {
+                if let Some(&index) = indices.get(&id) {
+                    results[index] = Some(rendered);
+                }
+            }
+            Err(err) => {
+                if let Some(&index) = indices.get(&err.id()) {
+                    results[index] = Some(format!("error: subagent failed: {err}"));
+                }
+            }
+        }
+    }
+    results
+        .into_iter()
+        .map(|rendered| rendered.unwrap_or_else(|| "error: subagent did not finish".to_string()))
+        .collect()
+}
+
 /// The contextual fragment compaction expires: a snapshot of the working tree
 /// that was worth its tokens on the turn it announced and worth nothing after.
 const WORLD_STATE_TAG: &str = "world_state_changes";
@@ -91,6 +171,9 @@ pub struct ChatSession {
     probe_client: reqwest::Client,
 
     pub model_verbosity_override: Option<String>,
+
+    /// See [`Self::keep_turn_when_rounds_run_out`].
+    keep_exhausted_turn: bool,
 }
 
 /// The subset of [`LlmConfiguration`] that the [`OpenAiClient`] is built from.
@@ -127,7 +210,16 @@ impl ChatSession {
             probe_client: reqwest::Client::new(),
 
             model_verbosity_override: None,
+            keep_exhausted_turn: false,
         }
+    }
+
+    /// Keeps a turn that runs out of `max_tool_rounds` in the transcript
+    /// instead of rolling it back, so the model can still be asked what it
+    /// got done: a subagent's partial answer.
+    pub fn keep_turn_when_rounds_run_out(mut self) -> Self {
+        self.keep_exhausted_turn = true;
+        self
     }
 
     /// A request that primes the server's prefix cache with this session's
@@ -470,6 +562,8 @@ impl ChatSession {
         J: FnMut(&crate::llm::ToolCall) -> bool,
     {
         self.compact_transcript();
+        // Subagents this turn starts talk to the same connection.
+        tools.set_active_profile(profile);
 
         let key = ClientKey::from_profile(profile);
         if self
@@ -523,23 +617,49 @@ impl ChatSession {
                             .push(ChatMessage::assistant_tool_calls(tool_calls.clone()));
 
                         on_tool_running(true);
-                        for tool_call in tool_calls {
-                            on_tool_call(&tool_call);
+                        let mut index = 0;
+                        while index < tool_calls.len() {
+                            // Consecutive subagent calls are independent of
+                            // each other: run them together. Everything else
+                            // runs in order, as the model asked.
+                            let run_end = (index..tool_calls.len())
+                                .find(|&i| !tools.runs_subagent(&tool_calls[i].function.name))
+                                .unwrap_or(tool_calls.len());
+                            if run_end - index >= 2 {
+                                let batch = &tool_calls[index..run_end];
+                                for tool_call in batch {
+                                    on_tool_call(tool_call);
+                                }
+                                let results = execute_concurrently(tools, batch).await;
+                                for (tool_call, rendered) in batch.iter().zip(results) {
+                                    self.messages
+                                        .push(ChatMessage::tool_result(&tool_call.id, &rendered));
+                                }
+                                index = run_end;
+                                continue;
+                            }
+
+                            let tool_call = &tool_calls[index];
+                            index += 1;
+                            on_tool_call(tool_call);
                             let rendered = if tools.requires_mcp_approval(&tool_call.function.name)
-                                && !on_mcp_approval(&tool_call)
+                                && !on_mcp_approval(tool_call)
                             {
                                 "error: MCP tool call denied by user".to_string()
                             } else {
-                                match tools
-                                    .execute(
-                                        &tool_call.function.name,
-                                        &tool_call.function.arguments.into_iter().collect(),
-                                    )
-                                    .await
-                                {
-                                    Ok(result) => result,
-                                    Err(err) => format!("error: {err:#}"),
-                                }
+                                render_tool_result(
+                                    tools
+                                        .execute(
+                                            &tool_call.function.name,
+                                            &tool_call
+                                                .function
+                                                .arguments
+                                                .clone()
+                                                .into_iter()
+                                                .collect(),
+                                        )
+                                        .await,
+                                )
                             };
 
                             self.messages
@@ -568,19 +688,41 @@ impl ChatSession {
             }
         }
 
-        self.rollback(checkpoint);
-        Err(anyhow!(
-            "model exceeded the configured max_tool_rounds ({})",
-            profile.max_tool_rounds
-        ))
+        if !self.keep_exhausted_turn {
+            self.rollback(checkpoint);
+        }
+        Err(anyhow::Error::new(RoundsExhausted {
+            max: profile.max_tool_rounds,
+        }))
     }
 }
 
+/// [`ChatSession::prompt`] used every round `max_tool_rounds` allows without
+/// the model finishing. Whether the turn is still in the transcript depends
+/// on [`ChatSession::keep_turn_when_rounds_run_out`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundsExhausted {
+    pub max: usize,
+}
+
+impl std::fmt::Display for RoundsExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "model exceeded the configured max_tool_rounds ({})",
+            self.max
+        )
+    }
+}
+
+impl std::error::Error for RoundsExhausted {}
+
 #[cfg(test)]
 mod tests {
-    use super::{ChatSession, strip_stale_fragment};
+    use super::{ChatSession, run_concurrently, strip_stale_fragment};
     use crate::config::LlmConfiguration;
     use crate::context::fragments::ContextualFragment;
+    use crate::test_support::serve_chat_responses;
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
@@ -1051,5 +1193,175 @@ mod tests {
         // The failed exchange is rolled back; only the system prompt remains.
         assert_eq!(session.messages().len(), 1);
         let _ = server.join();
+    }
+
+    /// Two subagent calls in one turn go through the concurrent path, and
+    /// their results come back in the order the model made the calls.
+    #[tokio::test]
+    async fn subagent_calls_of_one_turn_run_together_and_answer_in_order() {
+        let agents_dir = tempfile::tempdir().unwrap();
+        for (file, name, description) in [
+            ("a.md", "api-designer", "Designs REST APIs."),
+            ("r.md", "code-reviewer", "Reviews code quality."),
+        ] {
+            std::fs::write(
+                agents_dir.path().join(file),
+                format!("---\nname: {name}\ndescription: {description}\n---\nPrompt.\n"),
+            )
+            .unwrap();
+        }
+        let agents = crate::agents::custom::AgentRegistry::from_directories(&[(
+            agents_dir.path().to_path_buf(),
+            crate::agents::custom::AgentSource::User,
+        )]);
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = crate::tools::ToolExecutor::new(workspace.path()).with_custom_agents(agents);
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = serve_chat_responses(
+            listener,
+            vec![
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call0","type":"function","function":{"name":"run_agent","arguments":"{\"agent\":\"list\",\"task\":\"review\"}"}},{"index":1,"id":"call1","type":"function","function":{"name":"run_agent","arguments":"{\"agent\":\"list\",\"task\":\"api\"}"}}]},"finish_reason":null}]}
+
+data: [DONE]
+
+"#
+                .to_string(),
+                crate::test_support::text_stream("done"),
+            ],
+        );
+
+        let mut session = ChatSession::new("system");
+        let mut announced = Vec::new();
+        let answer = session
+            .prompt(
+                "find agents",
+                &test_profile(&endpoint),
+                &tools,
+                |_| {},
+                |_| {},
+                |_| {},
+                |call| announced.push(call.id.clone()),
+                |_| false,
+            )
+            .await
+            .expect("turn completes");
+        assert_eq!(answer, "done");
+        assert_eq!(announced, ["call0", "call1"]);
+
+        let results: Vec<(&str, &str)> = session
+            .messages()
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| (m.tool_call_id.as_deref().unwrap(), m.content.as_str()))
+            .collect();
+        assert_eq!(
+            results,
+            [
+                ("call0", "- code-reviewer (writes): Reviews code quality."),
+                ("call1", "- api-designer (writes): Designs REST APIs."),
+            ]
+        );
+        // The executor learned the connection, for subagents to follow.
+        assert_eq!(tools.active_profile().unwrap().endpoint, endpoint);
+        assert_eq!(server.join().expect("server").len(), 2);
+    }
+
+    /// Running out of rounds is a typed error. By default the turn is rolled
+    /// back; a session told to keep it still has the work in its transcript,
+    /// which is what a subagent's partial answer is made from.
+    #[tokio::test]
+    async fn an_exhausted_turn_is_rolled_back_unless_asked_to_keep_it() {
+        const CALL: &str = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call0\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = crate::tools::ToolExecutor::new(workspace.path());
+        for keep in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+            let server = serve_chat_responses(listener, vec![CALL.to_string()]);
+            let mut profile = test_profile(&endpoint);
+            profile.max_tool_rounds = 1;
+            let mut session = ChatSession::new("system");
+            if keep {
+                session = session.keep_turn_when_rounds_run_out();
+            }
+            let error = session
+                .prompt(
+                    "list it",
+                    &profile,
+                    &tools,
+                    |_| {},
+                    |_| {},
+                    |_| {},
+                    |_| {},
+                    |_| false,
+                )
+                .await
+                .expect_err("out of rounds");
+            assert_eq!(
+                error.downcast_ref::<super::RoundsExhausted>(),
+                Some(&super::RoundsExhausted { max: 1 })
+            );
+            let roles: Vec<&str> = session.messages().iter().map(|m| m.role.as_str()).collect();
+            if keep {
+                assert_eq!(roles, ["system", "user", "assistant", "tool"]);
+            } else {
+                assert_eq!(roles, ["system"]);
+            }
+            let _ = server.join();
+        }
+    }
+
+    /// Calls overlap up to the limit, results keep call order, and a call
+    /// that panics becomes an error result.
+    #[tokio::test]
+    async fn run_concurrently_overlaps_up_to_the_limit_in_call_order() {
+        let calls = |n: usize| -> Vec<(String, serde_json::Map<String, serde_json::Value>)> {
+            (0..n)
+                .map(|i| (format!("call{i}"), serde_json::Map::new()))
+                .collect()
+        };
+        let sleepy = |name: String, _| async move {
+            // Later calls finish first, so order cannot come from timing.
+            let index: u64 = name[4..].parse().unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(200 - index * 40)).await;
+            Ok(format!("{name} done"))
+        };
+
+        let start = std::time::Instant::now();
+        let results = run_concurrently(calls(4), 4, sleepy).await;
+        let together = start.elapsed();
+        assert_eq!(
+            results,
+            ["call0 done", "call1 done", "call2 done", "call3 done"]
+        );
+        assert!(
+            together < std::time::Duration::from_millis(400),
+            "{together:?}"
+        );
+
+        let start = std::time::Instant::now();
+        let results = run_concurrently(calls(4), 1, sleepy).await;
+        let one_at_a_time = start.elapsed();
+        assert_eq!(results.len(), 4);
+        assert!(
+            one_at_a_time >= std::time::Duration::from_millis(560),
+            "{one_at_a_time:?}"
+        );
+
+        let results = run_concurrently(calls(2), 2, |name: String, _| async move {
+            if name == "call1" {
+                panic!("boom");
+            }
+            Err::<String, _>(anyhow::anyhow!("no luck"))
+        })
+        .await;
+        assert_eq!(results[0], "error: no luck");
+        assert!(
+            results[1].starts_with("error: subagent failed:"),
+            "{}",
+            results[1]
+        );
     }
 }

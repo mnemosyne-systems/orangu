@@ -24,6 +24,11 @@ Each skill lives in its own directory:
 Project skills override user skills with the same name. Run `/skills` to see
 what orangu found.
 
+The model sees every skill's name and description, and loads one whose
+description matches the task with the `use_skill` tool, which reads user
+skills too, outside the workspace. Subagents can use skills the same way (see
+the Tools chapter).
+
 ## Minimal skill
 
 A skill needs YAML frontmatter followed by Markdown instructions:

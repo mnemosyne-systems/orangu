@@ -702,47 +702,18 @@ impl ServerTools {
         }
     }
 
-    /// A SearXNG instance's JSON results, as (URL, title, excerpt).
+    /// A SearXNG instance's JSON results, as (URL, title, excerpt): the
+    /// same search the terminal's `web_search` tool runs.
     async fn search_searxng(&self, query: &str) -> Result<Vec<(String, String, String)>, String> {
-        let base = &self.backend;
-        let body: Value = self
-            .http
-            .get(
-                reqwest::Url::parse_with_params(
-                    &format!("{}/search", base.trim_end_matches('/')),
-                    [("q", query), ("format", "json")],
-                )
-                .map_err(|err| err.to_string())?,
-            )
-            .send()
+        orangu::web_search::searxng(&self.http, &self.backend, query)
             .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|err| err.to_string())?
-            .json()
-            .await
-            .map_err(|err| err.to_string())?;
-        Ok(body
-            .get("results")
-            .and_then(Value::as_array)
             .map(|results| {
                 results
-                    .iter()
-                    .filter_map(|r| {
-                        Some((
-                            r.get("url")?.as_str()?.to_string(),
-                            r.get("title")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            r.get("content")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                        ))
-                    })
+                    .into_iter()
+                    .map(|result| (result.url, result.title, result.snippet))
                     .collect()
             })
-            .unwrap_or_default())
+            .map_err(|err| err.to_string())
     }
 
     async fn fetch(&mut self, id: &str, input: &Map<String, Value>) -> Ran {

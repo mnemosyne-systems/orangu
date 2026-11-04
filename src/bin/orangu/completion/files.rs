@@ -293,6 +293,11 @@ pub fn open_file_completion_prefix(prefix: &str) -> Option<(usize, &str)> {
     if let Some(path_prefix) = prefix.strip_prefix("/open_file ") {
         return Some(("/open_file ".len(), path_prefix));
     }
+    // Either path of `/convert <source> <target>`.
+    if let Some(args) = prefix.strip_prefix("/convert ") {
+        let (start, token) = last_shell_token(args);
+        return Some(("/convert ".len() + start, token));
+    }
 
     for command_prefix in ["open file ", "open ", "edit file ", "edit "] {
         if let Some(path_prefix) = strip_ascii_prefix(prefix, command_prefix) {

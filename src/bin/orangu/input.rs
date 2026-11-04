@@ -1207,8 +1207,13 @@ pub fn handle_input_event_with_status(
                 }
                 (KeyCode::Enter, KeyModifiers::NONE) => {
                     interrupt_state.reset();
+                    // Enter accepts the selected candidate, unless that is
+                    // already what was typed: then it runs the line, so a
+                    // command typed out in full needs one Enter, not two.
                     if let Some(dropdown) = &input_state.dropdown
                         && dropdown.selected_index < dropdown.candidates.len()
+                        && input_state.buffer.get(dropdown.replacement_start..)
+                            != Some(dropdown.candidates[dropdown.selected_index].0.as_str())
                     {
                         let cmd = &dropdown.candidates[dropdown.selected_index].0;
                         input_state.buffer.truncate(dropdown.replacement_start);
@@ -2543,6 +2548,51 @@ mod tests {
         dropdown.selected_index = 2;
         dropdown.select_next();
         assert_eq!(dropdown.selected_index, 0);
+    }
+
+    #[test]
+    fn enter_completes_a_partial_command_and_runs_a_complete_one() {
+        let workspace = tempdir().expect("workspace");
+        let enter = || {
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            ))
+        };
+        let mut input_state = InputState::default();
+        let mut interrupt_state = InterruptState::default();
+        let mut output_state = OutputState::default();
+        let mut viewport = ViewportState::new(80, 80, 24);
+
+        input_state.set_buffer("/task".to_string());
+        input_state.update_dropdown(test_input_context(workspace.path()).skills, true);
+        let result = handle_input_event(
+            enter(),
+            &mut input_state,
+            &mut interrupt_state,
+            &mut output_state,
+            &mut viewport,
+            test_input_context(workspace.path()),
+        );
+        assert!(result.outcome.is_none(), "a partial command is completed");
+        assert_eq!(input_state.as_str(), "/tasks ");
+
+        input_state.set_buffer("/tasks".to_string());
+        input_state.update_dropdown(test_input_context(workspace.path()).skills, true);
+        assert!(input_state.dropdown.is_some());
+        let result = handle_input_event(
+            enter(),
+            &mut input_state,
+            &mut interrupt_state,
+            &mut output_state,
+            &mut viewport,
+            test_input_context(workspace.path()),
+        );
+        assert!(
+            matches!(result.outcome, Some(InputResult::Submitted(ref line)) if line == "/tasks"),
+            "a complete command runs on the first Enter"
+        );
     }
 
     #[test]

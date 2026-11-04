@@ -203,8 +203,18 @@ impl OneshotSession {
             config.diff_file_cap,
             None,
         )
-        .with_mcp(mcp.clone());
+        .with_mcp(mcp.clone())
+        .with_workspace_agents()
+        .with_web_search(config.web_search.clone())
+        .with_llms(config.llms.clone())
+        .with_subagent_depth(config.subagent_depth);
+        let (tools, agent_prompt) = match orangu::agents::custom::main_agent() {
+            Some(name) => orangu::subagents::as_main_agent(tools, name)?,
+            None => (tools, String::new()),
+        };
         let skills = orangu::skills::SkillRegistry::discover(&workspace);
+        // Skills load through `use_skill`, user skills included.
+        let tools = tools.with_skills(std::sync::Arc::new(skills.clone()));
 
         // The same system prompt the interactive client builds for a tab.
         let mut system = system_prompt(&profile, None).to_string();
@@ -214,6 +224,7 @@ impl OneshotSession {
             system.push_str(&index);
         }
         system.push_str(&orangu::config::load_agents_instructions(&workspace));
+        system.push_str(&agent_prompt);
         if !mcp.instructions().is_empty() {
             system.push_str("\n\n");
             system.push_str(&mcp.instructions());
@@ -270,6 +281,7 @@ impl OneshotSession {
             Resolution::Prompt(text) => (text, None),
             Resolution::PromptThen(text, step) => (text, Some(step)),
         };
+        let prompt = orangu::subagents::with_agent_mentions(&prompt, &self.tools);
 
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(3))
@@ -574,6 +586,7 @@ fn invalid_static_arguments(command: &LocalCommand<'_>) -> bool {
             | LocalCommand::CreateFile(None)
             | LocalCommand::DeleteFile(None)
             | LocalCommand::MoveFile(None)
+            | LocalCommand::Convert(None)
             | LocalCommand::CreateDirectory(None)
             | LocalCommand::MoveDirectory(None)
             | LocalCommand::DeleteDirectory(None)

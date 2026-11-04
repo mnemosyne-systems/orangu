@@ -14,6 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 pub mod agents;
+pub mod browse;
 pub mod build_info;
 pub mod child;
 pub mod compression;
@@ -44,6 +45,7 @@ pub mod npu;
 pub mod npu_cache;
 pub mod npu_ffn;
 pub mod npu_ort;
+pub mod office;
 pub mod os;
 pub mod pdf;
 pub mod profiling;
@@ -53,7 +55,13 @@ pub mod session;
 pub mod shell;
 pub mod shell_completions;
 pub mod skills;
+pub mod subagent_tasks;
+pub mod subagent_worktree;
+pub mod subagents;
+#[cfg(test)]
+mod test_support;
 pub mod tools;
 pub mod tui;
+pub mod web_search;
 pub mod workspace_cache;
 pub mod workspaces;

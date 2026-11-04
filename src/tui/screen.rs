@@ -1402,7 +1402,10 @@ fn render_status_line(
     // alone would, it's shown alone rather than dropped for a Pending count
     // that only matters while a command queue is building up.
     let graph_text = graph_status.map(|status| format!("Graph: {}", indicator(status)));
-    let pending_text = (pending_count > 0).then(|| format!("Pending: {pending_count}"));
+    let pending_text = crate::tui::widgets::queue_text(
+        pending_count,
+        crate::subagent_tasks::shown_background_count(),
+    );
     let combined = match (&graph_text, &pending_text) {
         (Some(graph), Some(pending)) => Some(format!("{graph}   {pending}")),
         (Some(graph), None) => Some(graph.clone()),

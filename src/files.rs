@@ -37,11 +37,12 @@
 //! so each edit is one exact hunk, and adjacent edits never end up with two
 //! hunks fighting over the same context lines.
 //!
-//! When the workspace is inside a Git repository, each change is made *with*
-//! its Git command — `git add`, `git mv`, `git rm` (see [`crate::git_index`])
-//! — so it lands in the index; `git: false` on a request opts back out to a
-//! plain filesystem change. **Nothing is ever committed**: what to commit,
-//! and when, stays the user's decision.
+//! A change is a plain filesystem change unless the request passes
+//! `git: true`: then, inside a Git repository, it is made *with* its Git
+//! command — `git add`, `git mv`, `git rm` (see [`crate::git_index`]) — so it
+//! lands in the index. Nothing is staged automatically, and **nothing is
+//! ever committed**: what to stage and commit, and when, stays the user's
+//! decision.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -56,9 +57,6 @@ pub fn overwrite_default() -> bool {
     true
 }
 
-/// `git` defaults to on: inside a repository, a file's life cycle *is* a
-/// sequence of Git operations, and a caller that wants the plain filesystem
-/// has to say so.
 /// Generated code carries a licence header; a file a person spells out by
 /// hand does not. `true` here because the surfaces that deserialize a
 /// request — the `create_file` tool and the HTTP endpoint — are the
@@ -69,8 +67,10 @@ pub fn license_default() -> bool {
     true
 }
 
+/// `git` defaults to off: nothing is staged automatically, and a caller that
+/// wants the change in the index asks for it with `git: true`.
 pub fn git_default() -> bool {
-    true
+    false
 }
 
 /// The repository to act in for this request: none when the workspace isn't
@@ -1383,10 +1383,9 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
-    // Request builders. Every one defaults `git` to `false` so a test says
-    // explicitly when it is exercising the Git side; the endpoints' own
-    // default is the opposite (`git_default`), which
-    // `the_git_flag_opts_out_of_staging` covers.
+    // Request builders. Every one sets `git` to `false`, the endpoints' own
+    // default (`git_default`, covered by `nothing_is_staged_unless_asked`),
+    // so a test says explicitly when it is exercising the Git side.
     fn create_request(path: &str, content: &str) -> CreateFileRequest {
         CreateFileRequest {
             path: path.to_string(),
@@ -2270,21 +2269,26 @@ mod tests {
         );
     }
 
-    /// `"git": false` is the way back to a pure filesystem change; the
-    /// endpoints' own default is the opposite.
+    /// Nothing is staged automatically: an omitted `git` is a pure
+    /// filesystem change, and only `"git": true` reaches the index.
     #[test]
-    fn the_git_flag_opts_out_of_staging() {
+    fn nothing_is_staged_unless_asked() {
         let dir = git_workspace_with(&[("a.txt", "a\n")]);
 
         // The serde default is what an omitted field gives a real request.
         let parsed: CreateFileRequest =
             serde_json::from_str(r#"{"path": "b.txt", "content": "b\n"}"#).expect("parse");
-        assert!(parsed.git, "git defaults to on");
-
-        let response = create(dir.path(), create_request("c.txt", "c\n")).expect("create");
-        assert!(response.git.is_none(), "opted out: no git outcome");
+        assert!(!parsed.git, "git defaults to off");
+        let response = create(dir.path(), parsed).expect("create");
+        assert!(response.git.is_none(), "not asked: no git outcome");
         assert_eq!(staged(dir.path()), "", "the index was left alone");
-        assert!(dir.path().join("c.txt").exists());
+
+        let mut request = create_request("d.txt", "d\n");
+        request.git = true;
+        let response = create(dir.path(), request).expect("create");
+        assert!(response.git.is_some_and(|git| git.staged), "asked: staged");
+        assert_eq!(staged(dir.path()), "A\td.txt", "only the file asked for");
+        assert!(dir.path().join("b.txt").exists());
     }
 
     /// Outside a repository every endpoint behaves exactly as before, with

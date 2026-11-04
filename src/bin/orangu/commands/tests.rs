@@ -1796,6 +1796,70 @@ fn parses_delete_file_commands() {
 }
 
 #[test]
+fn parses_tasks_commands() {
+    assert!(matches!(
+        parse_local_command("/tasks"),
+        Some(LocalCommand::Tasks(TasksSubcommand::List))
+    ));
+    assert!(matches!(
+        parse_local_command("/tasks t3"),
+        Some(LocalCommand::Tasks(TasksSubcommand::Show(id))) if id == "t3"
+    ));
+    assert!(matches!(
+        parse_local_command("/tasks stop t3"),
+        Some(LocalCommand::Tasks(TasksSubcommand::Stop(id))) if id == "t3"
+    ));
+}
+
+#[test]
+fn parses_agents_commands() {
+    assert!(matches!(
+        parse_local_command("/agents"),
+        Some(LocalCommand::Agents(None))
+    ));
+    assert!(matches!(
+        parse_local_command("/agents   "),
+        Some(LocalCommand::Agents(None))
+    ));
+    match parse_local_command("/agents kubernetes deploy") {
+        Some(LocalCommand::Agents(Some(query))) => assert_eq!(query.as_ref(), "kubernetes deploy"),
+        _ => panic!("expected agents with a query"),
+    }
+}
+
+#[test]
+fn parses_convert_commands() {
+    for input in [
+        "/convert",
+        "/convert ",
+        "/convert report.md",
+        "/convert a b c",
+    ] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::Convert(None))
+            ),
+            "{input}"
+        );
+    }
+    match parse_local_command("/convert report.md report.pdf") {
+        Some(LocalCommand::Convert(Some((source, target)))) => {
+            assert_eq!(source.as_ref(), "report.md");
+            assert_eq!(target.as_ref(), "report.pdf");
+        }
+        _ => panic!("expected convert with source and target"),
+    }
+    match parse_local_command("/convert \"my notes.md\" pdf") {
+        Some(LocalCommand::Convert(Some((source, target)))) => {
+            assert_eq!(source.as_ref(), "my notes.md");
+            assert_eq!(target.as_ref(), "pdf");
+        }
+        _ => panic!("expected quoted source"),
+    }
+}
+
+#[test]
 fn parses_move_file_commands() {
     assert!(matches!(
         parse_local_command("/move_file"),
@@ -2586,5 +2650,21 @@ fn parses_the_directory_commands() {
     assert!(matches!(
         parse_local_command("remove directory build"),
         Some(LocalCommand::DeleteDirectory(_))
+    ));
+}
+
+#[test]
+fn parses_fork_commands() {
+    assert!(matches!(
+        parse_local_command("/fork"),
+        Some(LocalCommand::Fork(None))
+    ));
+    assert!(matches!(
+        parse_local_command("/fork   "),
+        Some(LocalCommand::Fork(None))
+    ));
+    assert!(matches!(
+        parse_local_command("/fork check the other branch too"),
+        Some(LocalCommand::Fork(Some(task))) if task == "check the other branch too"
     ));
 }

@@ -38,7 +38,8 @@ pub(crate) async fn wait_for_response(
     // Move `session` into the background task so the future can outlive this
     // stack frame if the user switches tabs mid-stream.
     let real_session = std::mem::replace(session, ChatSession::new(""));
-    let user_input_owned = user_input.to_string();
+    // `@agent-<name>` asks for that agent: the model is told to delegate.
+    let user_input_owned = orangu::subagents::with_agent_mentions(user_input, tools);
     let profile_owned = profile.clone();
     let tools_clone = tools.clone();
     let streamed_state = Arc::new(Mutex::new(StreamRenderState::default()));
@@ -320,6 +321,18 @@ async fn drive_handle(
                         if let Ok(mut state) = streamed_state.lock() {
                             state.pending_mcp_approval = None;
                         }
+                        redraw = true;
+                        continue;
+                    }
+                    // Ctrl+B: the subagents this turn waits for go on in the
+                    // background, and the turn with them.
+                    if is_move_to_background(&event) {
+                        let moved = orangu::subagent_tasks::detach_shown_foreground();
+                        output_state.push_text(if moved == 0 {
+                            "No subagent is running in the foreground."
+                        } else {
+                            "Moving the running subagent to the background; its report comes later."
+                        });
                         redraw = true;
                         continue;
                     }
@@ -779,6 +792,19 @@ pub(crate) fn render_left_status(
     }
 }
 
+/// Ctrl+B while a turn waits: move its subagents to the background.
+pub(crate) fn is_move_to_background(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(KeyEvent {
+            code: KeyCode::Char('b'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            ..
+        })
+    )
+}
+
 pub(crate) fn is_wait_cancel_escape(event: &Event) -> bool {
     matches!(
         event,
@@ -800,6 +826,9 @@ pub(crate) struct PendingCommand {
     /// unattended (`/auto_review` skips its interactive phases), and when it
     /// fails, the rest of its chain is dropped from the queue.
     pub(crate) chain: Option<u64>,
+    /// A finished background subagent's report: handed to the model as a
+    /// turn of its own, never read as a command.
+    pub(crate) notification: bool,
 }
 
 impl PendingCommand {
@@ -808,6 +837,16 @@ impl PendingCommand {
         Self {
             text: text.into(),
             chain: None,
+            notification: false,
+        }
+    }
+
+    /// A background subagent's report, for the model.
+    pub(crate) fn notification(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            chain: None,
+            notification: true,
         }
     }
 }
@@ -822,6 +861,12 @@ pub(crate) fn format_pending_list(pending: &VecDeque<PendingCommand>) -> String 
     } else {
         let mut lines = vec!["Pending commands:".to_string()];
         for (i, cmd) in pending.iter().enumerate() {
+            if cmd.notification {
+                // A whole report would swamp the list: its task line only.
+                let first = cmd.text.lines().next().unwrap_or_default();
+                lines.push(format!("  {}. {first}  (subagent report)", i + 1));
+                continue;
+            }
             let marker = if cmd.chain.is_some() {
                 "  (scheduled)"
             } else {
@@ -1008,11 +1053,21 @@ mod tests {
             PendingCommand {
                 text: "second".to_string(),
                 chain: Some(7),
+                notification: false,
             },
         ]);
         assert_eq!(
             format_pending_list(&pending),
             "Pending commands:\n  1. first\n  2. second  (scheduled)"
+        );
+
+        // A subagent report shows its first line only.
+        let pending = VecDeque::from(vec![PendingCommand::notification(
+            "<subagent-notification task=\"t1\">\nlong report\n</subagent-notification>",
+        )]);
+        assert_eq!(
+            format_pending_list(&pending),
+            "Pending commands:\n  1. <subagent-notification task=\"t1\">  (subagent report)"
         );
     }
 
@@ -1054,10 +1109,12 @@ mod tests {
             PendingCommand {
                 text: "export auto review".to_string(),
                 chain: Some(1),
+                notification: false,
             },
             PendingCommand {
                 text: "/statistics".to_string(),
                 chain: Some(2),
+                notification: false,
             },
             PendingCommand::typed("typed later"),
         ]);
@@ -1067,6 +1124,18 @@ mod tests {
         assert_eq!(pending[0].chain, Some(2));
         // A chain with no queued remainder drops nothing.
         assert_eq!(drop_chain_remainder(&mut pending, 1), 0);
+    }
+
+    #[test]
+    fn ctrl_b_moves_subagents_to_the_background() {
+        assert!(is_move_to_background(&Event::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL
+        ))));
+        assert!(!is_move_to_background(&Event::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE
+        ))));
     }
 
     #[test]
@@ -1114,6 +1183,7 @@ mod tests {
                 prompt_per_second: Some(15.0),
                 predicted_per_second: None,
                 truncated: false,
+                usage: None,
             },
             None,
             Duration::from_secs(2),
@@ -1133,6 +1203,7 @@ mod tests {
                 prompt_per_second: None,
                 predicted_per_second: None,
                 truncated: false,
+                usage: None,
             },
             None,
             Duration::from_secs(2),
@@ -1152,6 +1223,7 @@ mod tests {
                 prompt_per_second: Some(15.0),
                 predicted_per_second: Some(42.5),
                 truncated: false,
+                usage: None,
             },
             None,
             Duration::from_secs(2),

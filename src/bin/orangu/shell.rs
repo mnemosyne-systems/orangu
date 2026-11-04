@@ -34,6 +34,10 @@ _orangu() {
             compopt -o filenames 2>/dev/null
             return 0
             ;;
+        --agent|--agents)
+            # An agent name, or agents as JSON: nothing to offer.
+            return 0
+            ;;
         --workflow)
             # YAML workflow file.
             COMPREPLY=( $(compgen -f -- "$cur") )
@@ -72,7 +76,7 @@ _orangu() {
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -t --theme -w --workspace -r --resume -a --all --developer --committer -p --prompt --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help -V --version" -- "$cur") )
+            "-c --config -t --theme -w --workspace -r --resume -a --all --developer --committer -p --prompt --agent --agents --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help -V --version" -- "$cur") )
         return 0
     fi
     COMPREPLY=( $(compgen -W "status pause resume clear" -- "$cur") )
@@ -127,6 +131,8 @@ _orangu() {
         '(--developer --committer)--developer[Open the prompt in developer mode (the default)]' \
         '(--developer --committer)--committer[Open the prompt in committer mode]' \
         '(-p --prompt)'{-p,--prompt}'[Run one prompt or command, print the result and exit]:prompt:' \
+        '--agent[Run the conversation as a custom agent]:agent name:' \
+        '--agents[Define custom agents for this run, as JSON]:agents JSON:' \
         '--workflow[Validate and execute every job in a YAML workflow]:workflow file:_files' \
         '--dry-run[Validate the workflow without executing it]' \
         '(-q --quiet)'{-q,--quiet}'[Print nothing on success; the exit code is the result]' \
@@ -173,6 +179,8 @@ complete -c orangu -s a -l all                                            -d 'Re
 complete -c orangu      -l developer                                      -d 'Open the prompt in developer mode (the default)'
 complete -c orangu      -l committer                                      -d 'Open the prompt in committer mode'
 complete -c orangu -s p -l prompt            -x                           -d 'Run one prompt or command, print the result and exit'
+complete -c orangu      -l agent           -x                           -d 'Run the conversation as a custom agent'
+complete -c orangu      -l agents          -x                           -d 'Define custom agents for this run, as JSON'
 complete -c orangu      -l workflow        -r -a '(__fish_complete_path)' -d 'Validate and execute every job in a YAML workflow'
 complete -c orangu      -l dry-run                                        -d 'Validate the workflow without executing it'
 complete -c orangu -s q -l quiet                                          -d 'Print nothing on success; the exit code is the result'
@@ -213,6 +221,8 @@ Register-ArgumentCompleter -Native -CommandName 'orangu' -ScriptBlock {
         @('--developer', 'Open the prompt in developer mode (the default)'),
         @('--committer', 'Open the prompt in committer mode'),
         @('-p', '--prompt', 'Run one prompt or command, print the result and exit'),
+        @('--agent', 'Run the conversation as a custom agent'),
+        @('--agents', 'Define custom agents for this run, as JSON'),
         @('--workflow', 'Validate and execute every job in a YAML workflow'),
         @('--dry-run', 'Validate the workflow without executing it'),
         @('-q', '--quiet', 'Print nothing on success; the exit code is the result'),
@@ -265,6 +275,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu' -ScriptBlock {
         { $_ -in '-r', '--resume' } { return Offer (Sessions) }
         { $_ -in '-t', '--theme' } { return Offer @('classic', 'modern_dark', 'modern_light', 'oranguday', 'tokyonight', 'rosepine-moon', 'random') }
         { $_ -in '-p', '--prompt' } { return }
+        { $_ -in '--agent', '--agents' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

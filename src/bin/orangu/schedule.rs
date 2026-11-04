@@ -291,6 +291,7 @@ pub(crate) fn enqueue_due_jobs(
                     pending.push_back(crate::wait::PendingCommand {
                         text: command.clone(),
                         chain: Some(chain),
+                        notification: false,
                     });
                 }
             }

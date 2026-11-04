@@ -99,6 +99,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/add_repository" => Some(LocalCommand::AddRepository(None)),
         "/merge" => Some(LocalCommand::Merge(None)),
         "/move_file" => Some(LocalCommand::MoveFile(None)),
+        "/convert" => Some(LocalCommand::Convert(None)),
         "/pull" => Some(LocalCommand::Pull(None)),
         "/comment" => Some(LocalCommand::Comment(None)),
         "/close" => Some(LocalCommand::Close(None)),
@@ -133,6 +134,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/quit" => Some(LocalCommand::Quit),
         "/pending" => Some(LocalCommand::PendingList),
         "/skills" => Some(LocalCommand::Skills),
+        "/agents" => Some(LocalCommand::Agents(None)),
+        "/tasks" => Some(LocalCommand::Tasks(TasksSubcommand::List)),
+        "/fork" => Some(LocalCommand::Fork(None)),
         "/developer" => Some(LocalCommand::Mode(crate::mode::PromptMode::Developer)),
         "/committer" => Some(LocalCommand::Mode(crate::mode::PromptMode::Committer)),
         "/graph" => Some(LocalCommand::Graph),
@@ -399,6 +403,37 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                         Cow::Owned(words[1].clone()),
                     ))),
                     _ => LocalCommand::MoveDirectory(None),
+                });
+            }
+            if let Some(task) = input.strip_prefix("/fork ") {
+                let task = task.trim();
+                return Some(LocalCommand::Fork(
+                    (!task.is_empty()).then_some(Cow::Borrowed(task)),
+                ));
+            }
+            if let Some(args) = input.strip_prefix("/tasks ") {
+                let words: Vec<&str> = args.split_whitespace().collect();
+                return Some(LocalCommand::Tasks(match words.as_slice() {
+                    [] => TasksSubcommand::List,
+                    ["stop", id] => TasksSubcommand::Stop(Cow::Borrowed(id)),
+                    [id] => TasksSubcommand::Show(Cow::Borrowed(id)),
+                    _ => TasksSubcommand::List,
+                }));
+            }
+            if let Some(query) = input.strip_prefix("/agents ") {
+                let query = query.trim();
+                return Some(LocalCommand::Agents(
+                    (!query.is_empty()).then_some(Cow::Borrowed(query)),
+                ));
+            }
+            if let Some(args) = input.strip_prefix("/convert ") {
+                let args = args.trim();
+                return Some(match shell_words(args) {
+                    Ok(words) if words.len() == 2 => LocalCommand::Convert(Some((
+                        Cow::Owned(words[0].clone()),
+                        Cow::Owned(words[1].clone()),
+                    ))),
+                    _ => LocalCommand::Convert(None),
                 });
             }
             if let Some(args) = input.strip_prefix("/move_file ") {

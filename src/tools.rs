@@ -36,6 +36,40 @@ pub struct ToolExecutor {
     tool_duration: Arc<Mutex<std::time::Duration>>,
     compression_enabled: bool,
     read_only: bool,
+    /// Whether the subagent tools (`explore_repository`, `write_tests`,
+    /// `write_docs`) are offered. Off inside a subagent, unless a custom
+    /// agent's `Agent` tool lets it nest (see [`Self::nested_under`]).
+    subagents: bool,
+    /// The only tools offered and run, when set: a custom subagent's
+    /// `tools` field (see [`crate::agents::custom`]).
+    allowed_tools: Option<Arc<std::collections::HashSet<String>>>,
+    /// Tools never offered or run, whatever else allows them: a custom
+    /// subagent's `disallowedTools` field.
+    denied_tools: Option<Arc<std::collections::HashSet<String>>>,
+    /// The custom subagents behind `run_agent`; empty offers no such tool.
+    custom_agents: Arc<crate::agents::custom::LiveAgents>,
+    /// Where `web_search` searches (`[orangu].web_search`); empty is no web
+    /// search. The main agent is offered `research_web` when there are any.
+    web_engines: Arc<Vec<crate::web_search::Engine>>,
+    /// A browsing subagent's pages: set, it is offered `browse`, and
+    /// `web_search` when there are engines.
+    browser: Option<Arc<tokio::sync::Mutex<crate::browse::Browser>>>,
+    /// A custom agent's `MEMORY.md`, which `save_memory` rewrites. Outside
+    /// the workspace for a user-scope memory, so it has its own tool rather
+    /// than the workspace-confined file tools.
+    memory_file: Option<PathBuf>,
+    /// Every subagent run of this conversation (`/tasks`, `continue_agent`).
+    tasks: Arc<crate::subagent_tasks::TaskRegistry>,
+    /// Whether subagents may run in the background: only where a client
+    /// delivers their reports later.
+    background_tasks: bool,
+    /// The connection the conversation using this executor is talking to,
+    /// as of its latest request ([`crate::session::ChatSession::prompt`] sets
+    /// it). Subagents start from it, so they follow `-c` and `/server`.
+    active_profile: Arc<Mutex<Option<crate::config::LlmConfiguration>>>,
+    /// The configured server sections, for a subagent whose role has a
+    /// dedicated one.
+    llms: Arc<std::collections::HashMap<String, crate::config::LlmConfiguration>>,
     context_cache: Arc<Mutex<crate::context::ContextCache>>,
     pub compression_metrics: Arc<Mutex<crate::compression::CompressionMetrics>>,
     auto_downsample_lines: usize,
@@ -60,6 +94,28 @@ pub struct ToolExecutor {
     /// Optional workspace-scoped MCP services. Read-only executors never
     /// attach one, so external tools cannot bypass their safety boundary.
     mcp: Option<Arc<crate::mcp::McpManager>>,
+    /// MCP services a custom agent defines for itself (`mcpServers`), next
+    /// to the shared ones.
+    agent_mcp: Option<Arc<crate::mcp::McpManager>>,
+    /// Whether nobody can approve a tool call here (a subagent): MCP tools
+    /// that ask for approval are then not offered at all.
+    mcp_unattended: bool,
+    /// How many subagents deep this executor runs: 0 for the main
+    /// conversation.
+    depth: usize,
+    /// How many levels of subagents may run below the main conversation
+    /// (`[orangu].subagent_depth`).
+    max_depth: usize,
+    /// Whether a subagent call runs in the background unless it says
+    /// otherwise (`[orangu].subagent_background`).
+    background_default: bool,
+    /// The agents `run_agent` may start here, when an agent's
+    /// `Agent(a, b)` names them; `None` for any.
+    startable_agents: Option<Arc<std::collections::HashSet<String>>>,
+    /// The `hooks` of the agent this executor runs, around every call.
+    agent_hooks: Option<Arc<crate::agents::agent_hooks::AgentHooks>>,
+    /// Skills a subagent can load with `use_skill`.
+    skills: Option<Arc<crate::skills::SkillRegistry>>,
     /// The licence generated files are written under — `/license`'s answer
     /// for this session, or [`crate::license::Choice::Auto`] to follow what
     /// the workspace declares.
@@ -93,9 +149,9 @@ struct EditFileRequest {
     old_text: String,
     new_text: String,
     replace_all: Option<bool>,
-    /// Stage the change with `git add` when the workspace is a repository;
-    /// `false` writes the file and leaves the index alone. Defaults to on,
-    /// exactly as the `edits` form (and every other file tool) does.
+    /// `true` stages the change with `git add` when the workspace is a
+    /// repository. Defaults to off, exactly as the `edits` form (and every
+    /// other file tool) does: nothing is staged automatically.
     git: Option<bool>,
 }
 
@@ -139,6 +195,15 @@ impl ToolExecutor {
     pub fn new_read_only(workspace: &Path) -> Self {
         let mut executor = Self::with_config(workspace, true, 300, 20, None);
         executor.read_only = true;
+        executor.subagents = false;
+        executor
+    }
+
+    /// A writable executor for a subagent: every file tool, but no
+    /// subagent tools and no MCP services.
+    pub fn new_for_subagent(workspace: &Path) -> Self {
+        let mut executor = Self::with_config(workspace, true, 300, 20, None);
+        executor.subagents = false;
         executor
     }
 
@@ -155,6 +220,17 @@ impl ToolExecutor {
             tool_duration: Arc::new(Mutex::new(std::time::Duration::ZERO)),
             compression_enabled,
             read_only: false,
+            subagents: true,
+            allowed_tools: None,
+            denied_tools: None,
+            custom_agents: Arc::default(),
+            web_engines: Arc::default(),
+            browser: None,
+            memory_file: None,
+            tasks: Arc::default(),
+            background_tasks: false,
+            active_profile: Arc::default(),
+            llms: Arc::default(),
             context_cache: Arc::new(Mutex::new(crate::context::ContextCache::new())),
             compression_metrics: Arc::new(Mutex::new(
                 crate::compression::CompressionMetrics::default(),
@@ -172,6 +248,14 @@ impl ToolExecutor {
             graph_status: Arc::new(Mutex::new(GraphBuildStatus::default())),
             graph_scans: ScanActivity::default(),
             mcp: None,
+            agent_mcp: None,
+            mcp_unattended: false,
+            agent_hooks: None,
+            skills: None,
+            depth: 0,
+            max_depth: crate::config::default_subagent_depth(),
+            background_default: false,
+            startable_agents: None,
             licence: Arc::new(Mutex::new(crate::license::Choice::default())),
         }
     }
@@ -180,6 +264,136 @@ impl ToolExecutor {
     pub fn with_mcp(mut self, mcp: Arc<crate::mcp::McpManager>) -> Self {
         self.mcp = Some(mcp);
         self
+    }
+
+    /// The MCP services this executor shares with its subagents.
+    pub fn mcp(&self) -> Option<Arc<crate::mcp::McpManager>> {
+        self.mcp.clone()
+    }
+
+    /// Gives a subagent its parent's MCP services, less the tools that ask
+    /// for approval: nobody is there to approve them.
+    pub fn with_subagent_mcp(mut self, mcp: Option<Arc<crate::mcp::McpManager>>) -> Self {
+        self.mcp = mcp;
+        self.mcp_unattended = true;
+        self
+    }
+
+    /// Lets a subagent start subagents of its own, one level below `parent`:
+    /// the agents in `startable`, or any. They share `parent`'s agents,
+    /// server sections, web search and task registry, so `/tasks` lists them.
+    pub fn nested_under(
+        mut self,
+        parent: &ToolExecutor,
+        startable: Option<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.subagents = true;
+        self.depth = parent.depth + 1;
+        self.max_depth = parent.max_depth;
+        self.custom_agents = parent.custom_agents.clone();
+        self.llms = parent.llms.clone();
+        self.web_engines = parent.web_engines.clone();
+        self.tasks = parent.tasks.clone();
+        self.startable_agents = startable.map(Arc::new);
+        self
+    }
+
+    /// Runs `hooks` around every tool call.
+    pub fn with_agent_hooks(mut self, hooks: crate::agents::agent_hooks::AgentHooks) -> Self {
+        self.agent_hooks = (!hooks.is_empty()).then(|| Arc::new(hooks));
+        self
+    }
+
+    /// Runs subagents in the background unless a call says `background:
+    /// false` (where background tasks are possible at all).
+    pub fn with_background_default(mut self, background: bool) -> Self {
+        self.background_default = background;
+        self
+    }
+
+    pub fn background_default(&self) -> bool {
+        self.background_default
+    }
+
+    /// The `background` argument of a subagent tool, with its default when
+    /// that is not `false`.
+    fn background_property(&self) -> Value {
+        if self.background_default {
+            json!({"type": "boolean", "default": true})
+        } else {
+            json!({"type": "boolean"})
+        }
+    }
+
+    /// How many levels of subagents may run below the main conversation.
+    pub fn with_subagent_depth(mut self, depth: usize) -> Self {
+        self.max_depth = depth;
+        self
+    }
+
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
+    /// Limits `run_agent` to the agents in `names`.
+    pub fn with_startable_agents(mut self, names: std::collections::HashSet<String>) -> Self {
+        self.startable_agents = Some(Arc::new(names));
+        self
+    }
+
+    /// How many subagents deep this executor runs: 0 for the main
+    /// conversation.
+    pub fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// Whether `run_agent` may start agent `name` here.
+    pub fn may_start(&self, name: &str) -> bool {
+        self.startable_agents
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| n.eq_ignore_ascii_case(name)))
+    }
+
+    /// Offers `use_skill`, which loads one of `skills`, when there are any.
+    pub fn with_skills(mut self, skills: Arc<crate::skills::SkillRegistry>) -> Self {
+        self.skills = (!skills.all().is_empty()).then_some(skills);
+        self
+    }
+
+    /// Adds the MCP services a custom agent defines itself.
+    pub fn with_agent_mcp(mut self, mcp: Arc<crate::mcp::McpManager>) -> Self {
+        self.agent_mcp = Some(mcp);
+        self.mcp_unattended = true;
+        self
+    }
+
+    /// The instructions of the MCP servers whose tools this executor offers.
+    pub fn mcp_instructions(&self) -> String {
+        let offered: std::collections::HashSet<String> = self
+            .definitions()
+            .into_iter()
+            .map(|def| def.function.name)
+            .collect();
+        self.mcp
+            .iter()
+            .chain(self.agent_mcp.iter())
+            .filter(|mcp| {
+                mcp.definitions()
+                    .iter()
+                    .any(|def| offered.contains(&def.function.name))
+            })
+            .map(|mcp| mcp.instructions())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// The MCP services that offer `name`, if any.
+    fn mcp_for(&self, name: &str) -> Option<&Arc<crate::mcp::McpManager>> {
+        self.mcp
+            .iter()
+            .chain(self.agent_mcp.iter())
+            .find(|mcp| mcp.contains(name))
     }
 
     pub fn configure_semantic_search(
@@ -275,7 +489,7 @@ impl ToolExecutor {
             defs.push(tool(
                 "create_file",
                 "Write content; .pdf renders a searchable PDF. Replaces files unless overwrite=false. \
-                     Stages in Git. New source files may get a licence header; read back before line edits.",
+                     git=true stages it. New source files may get a licence header; read back before line edits.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -294,7 +508,7 @@ impl ToolExecutor {
                 "Edit a file: replace `old_text` with `new_text`, or apply `edits`, each \
                      replacing lines `start_line`..`end_line` (1-based, inclusive, of the \
                      file as it is now; no overlaps; `end_line = start_line - 1` inserts) \
-                     with `replacement`. Staged in Git, never committed.",
+                     with `replacement`. git=true stages it.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -321,7 +535,7 @@ impl ToolExecutor {
             ));
             defs.push(tool(
                 "move_file",
-                "Move or rename a file; `git mv` when tracked.",
+                "Move or rename a file; git=true uses `git mv` when tracked.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -337,7 +551,7 @@ impl ToolExecutor {
             ));
             defs.push(tool(
                 "delete_file",
-                "Delete a file (not a directory); `git rm` when tracked.",
+                "Delete a file (not a directory); git=true uses `git rm` when tracked.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -363,8 +577,8 @@ impl ToolExecutor {
             ));
             defs.push(tool(
                 "move_directory",
-                "Move a directory tree to a path that does not exist yet; `git mv` when \
-                     tracked.",
+                "Move a directory tree to a path that does not exist yet; git=true uses \
+                     `git mv` when tracked.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -390,17 +604,33 @@ impl ToolExecutor {
                 }),
             ));
             defs.push(tool(
-                "explore_repository",
-                "Have a subagent search the repository broadly, keeping your context \
-                     small; returns relevant files and line ranges.",
+                "convert_document",
+                "Convert file `source`, or `content` in `format` (md/html/csv/outline/svg/latex), \
+                     to `target`, typed by extension (odt/ods/odp/odg/docx/xlsx/pptx/pdf).",
                 json!({
                     "type": "object",
                     "properties": {
-                        "query": {"type": "string"}
+                        "target": {"type": "string"},
+                        "source": {"type": "string"},
+                        "content": {"type": "string"},
+                        "format": {"type": "string"},
+                        "overwrite": {"type": "boolean"}
                     },
-                    "required": ["query"]
+                    "required": ["target"]
                 }),
             ));
+            if self.subagents {
+                defs.extend(
+                    crate::subagents::SUBAGENTS
+                        .iter()
+                        .filter(|spec| {
+                            !self.web_engines.is_empty()
+                                || spec.tool != crate::subagents::WEB_RESEARCHER.tool
+                        })
+                        .map(|spec| spec.definition()),
+                );
+                defs.push(crate::subagents::document_definition());
+            }
         }
 
         defs.push(tool(
@@ -501,10 +731,256 @@ impl ToolExecutor {
                 "required": ["query"]
             }),
         ));
-        if let Some(mcp) = &self.mcp {
-            defs.extend(mcp.definitions());
+        for mcp in self.mcp.iter().chain(self.agent_mcp.iter()) {
+            defs.extend(
+                mcp.definitions().into_iter().filter(|def| {
+                    !(self.mcp_unattended && mcp.requires_approval(&def.function.name))
+                }),
+            );
+        }
+        // Searching itself is a subagent's job: results and the pages read
+        // to check them stay out of the main conversation.
+        if self.browser.is_some() {
+            defs.push(tool(
+                "browse",
+                "Open a web page by `url`, or link number `link` of the current page; long \
+                     pages come in parts (`part`). Pages read stay cached.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string"},
+                        "link": {"type": "integer", "minimum": 1},
+                        "part": {"type": "integer", "minimum": 1}
+                    }
+                }),
+            ));
+        }
+        if self.browser.is_some() && !self.web_engines.is_empty() {
+            defs.push(tool(
+                "web_search",
+                "Search the web; returns numbered results with title, URL and excerpt. \
+                     Open one with browse.",
+                json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }),
+            ));
+        }
+        let agents = self.custom_agents.current();
+        if !self.read_only && self.subagents && !agents.is_empty() {
+            defs.push(tool(
+                "run_agent",
+                &format!(
+                    "Have one of {} custom subagents do a self-contained `task`. \
+                     agent=\"list\" with task as search words lists matching agents.",
+                    agents.len()
+                ),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "agent": {"type": "string"},
+                        "task": {"type": "string"}
+                    },
+                    "required": ["agent", "task"]
+                }),
+            ));
+        }
+        // Where subagents can run in the background (an interactive
+        // conversation), every subagent tool takes `background`, and a
+        // finished subagent can be continued.
+        if self.background_tasks && self.subagents && !self.read_only {
+            for def in &mut defs {
+                if self.runs_subagent(&def.function.name)
+                    && let Some(properties) = def
+                        .function
+                        .parameters
+                        .get_mut("properties")
+                        .and_then(Value::as_object_mut)
+                {
+                    properties.insert("background".to_string(), self.background_property());
+                }
+            }
+            defs.push(tool(
+                "continue_agent",
+                "Give finished subagent task `task` (its id, e.g. t3) a follow-up `message`; it \
+                     keeps its earlier work. background=true runs a subagent without waiting; \
+                     its report arrives later as a message.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "task": {"type": "string"},
+                        "message": {"type": "string"},
+                        "background": self.background_property()
+                    },
+                    "required": ["task", "message"]
+                }),
+            ));
+        }
+        if self.skills.is_some() {
+            defs.push(tool(
+                "use_skill",
+                "Load a skill's instructions by `name`, with optional `arguments`.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "arguments": {"type": "string"}
+                    },
+                    "required": ["name"]
+                }),
+            ));
+        }
+        if self.memory_file.is_some() {
+            defs.push(tool(
+                "save_memory",
+                "Replace your persistent memory (MEMORY.md) with `content`: the whole new text.",
+                json!({
+                    "type": "object",
+                    "properties": {"content": {"type": "string"}},
+                    "required": ["content"]
+                }),
+            ));
+        }
+        // Offered only where an allowlist asks for it (a custom agent with
+        // `Grep`): everyone else searches through `run_shell_command`.
+        if let Some(allowed) = &self.allowed_tools {
+            if allowed.contains("search_text") {
+                defs.push(tool(
+                    "search_text",
+                    "Search file contents for a regular expression; respects .gitignore. \
+                         Returns path:line: text.",
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "pattern": {"type": "string"},
+                            "path": {"type": "string"},
+                            "glob": {"type": "string"},
+                            "ignore_case": {"type": "boolean"},
+                            "max_results": {"type": "integer", "minimum": 1}
+                        },
+                        "required": ["pattern"]
+                    }),
+                ));
+            }
+            defs.retain(|def| crate::agents::custom::lists_tool(allowed, &def.function.name));
+        }
+        if let Some(denied) = &self.denied_tools {
+            defs.retain(|def| !crate::agents::custom::lists_tool(denied, &def.function.name));
         }
         defs
+    }
+
+    /// Gives a custom agent its memory: `save_memory` rewrites `file`.
+    pub fn with_memory_file(mut self, file: PathBuf) -> Self {
+        self.memory_file = Some(file);
+        self
+    }
+
+    /// Takes the tools in `denied` away, from what is offered and from what
+    /// runs, whatever else allows them.
+    pub fn with_denied_tools(mut self, denied: std::collections::HashSet<String>) -> Self {
+        self.denied_tools = Some(Arc::new(denied));
+        self
+    }
+
+    /// Restricts this executor to the tools named in `allowed`, both in what
+    /// it offers and in what it runs: a custom subagent's `tools` field.
+    pub fn with_allowed_tools(mut self, allowed: std::collections::HashSet<String>) -> Self {
+        self.allowed_tools = Some(Arc::new(allowed));
+        self
+    }
+
+    /// The SearXNG instance web searches go to, or `None` for no web search.
+    pub fn with_web_search(mut self, engines: Vec<crate::web_search::Engine>) -> Self {
+        self.web_engines = Arc::new(engines);
+        self
+    }
+
+    /// Lets this executor browse: `browse`, and `web_search` with engines.
+    /// For a subagent only; its pages stay cached while it runs.
+    pub fn with_browsing(mut self) -> Self {
+        self.browser = Some(Arc::default());
+        self
+    }
+
+    pub fn web_engines(&self) -> &[crate::web_search::Engine] {
+        &self.web_engines
+    }
+
+    /// The configured server sections subagents may pick a role's from.
+    pub fn with_llms(
+        mut self,
+        llms: std::collections::HashMap<String, crate::config::LlmConfiguration>,
+    ) -> Self {
+        self.llms = Arc::new(llms);
+        self
+    }
+
+    pub fn llms(&self) -> &std::collections::HashMap<String, crate::config::LlmConfiguration> {
+        &self.llms
+    }
+
+    /// Whether tool `name` starts a subagent: such calls in one turn are
+    /// independent of each other, so the chat loop runs them concurrently.
+    pub fn runs_subagent(&self, name: &str) -> bool {
+        name == crate::subagents::DOCUMENT_TOOL
+            || name == "run_agent"
+            || name == "continue_agent"
+            || crate::subagents::find(name).is_some()
+    }
+
+    /// Lets this conversation's subagents run in the background: an
+    /// interactive client, which hands their reports to the model later.
+    pub fn with_background_tasks(mut self) -> Self {
+        self.background_tasks = true;
+        self
+    }
+
+    pub fn background_tasks(&self) -> bool {
+        self.background_tasks
+    }
+
+    /// This conversation's subagent tasks.
+    pub fn tasks(&self) -> &Arc<crate::subagent_tasks::TaskRegistry> {
+        &self.tasks
+    }
+
+    /// Records the connection the conversation is using now.
+    pub fn set_active_profile(&self, profile: &crate::config::LlmConfiguration) {
+        if let Ok(mut active) = self.active_profile.lock() {
+            *active = Some(profile.clone());
+        }
+    }
+
+    /// The connection the conversation used for its latest request, if any.
+    pub fn active_profile(&self) -> Option<crate::config::LlmConfiguration> {
+        self.active_profile
+            .lock()
+            .ok()
+            .and_then(|active| active.clone())
+    }
+
+    /// The custom subagents `run_agent` offers: a fixed set.
+    pub fn with_custom_agents(mut self, agents: crate::agents::custom::AgentRegistry) -> Self {
+        self.custom_agents = Arc::new(crate::agents::custom::LiveAgents::fixed(agents));
+        self
+    }
+
+    /// The custom subagents of the workspace, read again when their files
+    /// change.
+    pub fn with_workspace_agents(mut self) -> Self {
+        self.custom_agents = Arc::new(crate::agents::custom::LiveAgents::watch(&self.workspace));
+        self
+    }
+
+    pub fn custom_agents(&self) -> Arc<crate::agents::custom::AgentRegistry> {
+        self.custom_agents.current()
+    }
+
+    /// The custom subagents, looked for again now.
+    pub fn refresh_custom_agents(&self) -> Arc<crate::agents::custom::AgentRegistry> {
+        self.custom_agents.refresh()
     }
 
     /// The picture at `path` in the workspace — its media type and bytes —
@@ -538,8 +1014,7 @@ impl ToolExecutor {
     }
 
     pub fn requires_mcp_approval(&self, name: &str) -> bool {
-        self.mcp
-            .as_ref()
+        self.mcp_for(name)
             .is_some_and(|mcp| mcp.requires_approval(name))
     }
 
@@ -549,6 +1024,22 @@ impl ToolExecutor {
     }
 
     pub async fn execute(&self, name: &str, arguments: &Map<String, Value>) -> Result<String> {
+        if self
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|allowed| !crate::agents::custom::lists_tool(allowed, name))
+            || self
+                .denied_tools
+                .as_ref()
+                .is_some_and(|denied| crate::agents::custom::lists_tool(denied, name))
+        {
+            return Err(anyhow!("tool '{name}' is not available to this agent"));
+        }
+        if let Some(hooks) = &self.agent_hooks
+            && let Err(reason) = hooks.before(name, arguments, &self.workspace).await
+        {
+            return Err(anyhow!("blocked by a PreToolUse hook: {reason}"));
+        }
         let start = std::time::Instant::now();
         let result = match name {
             "show_file" => self.show_file(arguments).await,
@@ -565,13 +1056,43 @@ impl ToolExecutor {
             "delete_directory" => {
                 self.mutating(|| self.file_operation(crate::files::delete_dir, arguments))
             }
-            "explore_repository" => {
+            _ if name == crate::subagents::DOCUMENT_TOOL
+                || crate::subagents::find(name).is_some() =>
+            {
                 if self.read_only {
                     Err(anyhow::anyhow!("tool not available in read-only mode"))
+                } else if !self.subagents {
+                    Err(anyhow::anyhow!("subagents cannot start subagents"))
+                } else if let Some(spec) = crate::subagents::find(name) {
+                    crate::subagents::run(spec, self, arguments).await
                 } else {
-                    crate::explorer::run_explorer_subagent(&self.workspace, arguments).await
+                    crate::subagents::run_document(self, arguments).await
                 }
             }
+            "convert_document" => self.convert_document(arguments).await,
+            "search_text" => self.search_text(arguments),
+            "save_memory" => self.save_memory(arguments),
+            "web_search" => self.web_search(arguments).await,
+            "browse" => self.browse(arguments).await,
+            "run_agent" => {
+                if self.read_only {
+                    Err(anyhow!("tool not available in read-only mode"))
+                } else if !self.subagents {
+                    Err(anyhow!("subagents cannot start subagents"))
+                } else {
+                    crate::subagents::run_custom(self, arguments).await
+                }
+            }
+            "continue_agent" => {
+                if self.read_only {
+                    Err(anyhow!("tool not available in read-only mode"))
+                } else if !self.subagents {
+                    Err(anyhow!("subagents cannot start subagents"))
+                } else {
+                    crate::subagents::continue_task(self, arguments).await
+                }
+            }
+            "use_skill" => self.use_skill(arguments),
             "list_directory" => self.list_directory(arguments).await,
             "fetch_url" => self.fetch_url(arguments).await,
             "run_shell_command" => self.run_shell_command(arguments).await,
@@ -580,12 +1101,14 @@ impl ToolExecutor {
             "graph_explain" => self.graph_explain(arguments),
             "graph_path" => self.graph_path(arguments),
             "semantic_search" => self.semantic_search(arguments).await,
-            _ if self.mcp.as_ref().is_some_and(|mcp| mcp.contains(name)) => {
-                self.mcp
-                    .as_ref()
-                    .expect("MCP presence checked above")
-                    .execute(name, arguments)
-                    .await
+            _ if let Some(mcp) = self.mcp_for(name) => {
+                if self.mcp_unattended && mcp.requires_approval(name) {
+                    Err(anyhow!(
+                        "MCP tool '{name}' needs approval, which a subagent cannot ask for"
+                    ))
+                } else {
+                    mcp.execute(name, arguments).await
+                }
             }
             _ => Err(anyhow!("unknown tool '{}'", name)),
         };
@@ -597,7 +1120,15 @@ impl ToolExecutor {
         if let Ok(mut d) = self.tool_duration.lock() {
             *d += start.elapsed();
         }
-        result
+        match (&self.agent_hooks, result) {
+            (Some(hooks), Ok(output)) => {
+                match hooks.after(name, arguments, &output, &self.workspace).await {
+                    Some(feedback) => Ok(format!("{output}\n\n[PostToolUse hook]\n{feedback}")),
+                    None => Ok(output),
+                }
+            }
+            (_, result) => result,
+        }
     }
 
     async fn expand_context(&self, arguments: &Map<String, Value>) -> Result<String> {
@@ -811,6 +1342,199 @@ impl ToolExecutor {
         let request: Q = serde_json::from_value(Value::Object(arguments.clone()))
             .map_err(|err| anyhow!("{err}"))?;
         let response = operation(&self.workspace, request).map_err(|err| anyhow!("{err}"))?;
+        Ok(serde_json::to_string(&response)?)
+    }
+
+    /// `web_search`: results for `query` from the first engine that has
+    /// any, local SearXNG instances first.
+    async fn web_search(&self, arguments: &Map<String, Value>) -> Result<String> {
+        if self.web_engines.is_empty() {
+            return Err(anyhow!("web search is off ([orangu].web_search)"));
+        }
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing or invalid 'query' argument"))?;
+        let (engine, results) =
+            crate::web_search::search(&crate::web_search::client(), &self.web_engines, query)
+                .await?;
+        Ok(format!(
+            "{}\n(from {engine})\n",
+            crate::web_search::format_results(query.trim(), &results).trim_end()
+        ))
+    }
+
+    /// `browse`: a page by URL or by link number, or another part of the
+    /// current one, from the cache when it has been read before.
+    async fn browse(&self, arguments: &Map<String, Value>) -> Result<String> {
+        let browser = self
+            .browser
+            .as_ref()
+            .ok_or_else(|| anyhow!("browse is only available to web subagents"))?;
+        let number = |key: &str| -> Result<Option<usize>> {
+            match arguments.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .map(|n| Some(n as usize))
+                    .ok_or_else(|| anyhow!("'{key}' must be a positive number")),
+            }
+        };
+        let url = arguments.get("url").and_then(Value::as_str);
+        let (link, part) = (number("link")?, number("part")?);
+        browser
+            .lock()
+            .await
+            .browse(&crate::web_search::client(), url, link, part)
+            .await
+    }
+
+    /// `save_memory`: replaces the agent's `MEMORY.md`, written to a
+    /// temporary file and renamed into place so a reader never sees half.
+    fn use_skill(&self, arguments: &Map<String, Value>) -> Result<String> {
+        let skills = self
+            .skills
+            .as_ref()
+            .ok_or_else(|| anyhow!("no skills are available here"))?;
+        let name = arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow!("missing or invalid 'name' argument"))?;
+        let skill = skills.find(name).ok_or_else(|| {
+            let names: Vec<&str> = skills.all().iter().map(|s| s.name.as_str()).collect();
+            anyhow!("unknown skill '{name}'; available: {}", names.join(", "))
+        })?;
+        let arguments = arguments
+            .get("arguments")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        Ok(skill.render_activation(arguments))
+    }
+
+    fn save_memory(&self, arguments: &Map<String, Value>) -> Result<String> {
+        const MAX_BYTES: usize = 64 * 1024;
+        let file = self
+            .memory_file
+            .as_ref()
+            .ok_or_else(|| anyhow!("this agent has no memory"))?;
+        let content = arguments
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing or invalid 'content' argument"))?;
+        if content.len() > MAX_BYTES {
+            return Err(anyhow!(
+                "memory is limited to {} KB; keep it short",
+                MAX_BYTES / 1024
+            ));
+        }
+        let dir = file
+            .parent()
+            .ok_or_else(|| anyhow!("memory file has no directory"))?;
+        fs::create_dir_all(dir)?;
+        let mut text = content.trim_end().to_string();
+        text.push('\n');
+        let temporary = dir.join(".MEMORY.md.tmp");
+        fs::write(&temporary, &text)?;
+        fs::rename(&temporary, file)?;
+        Ok(format!("Saved {} bytes to {}", text.len(), file.display()))
+    }
+
+    /// `search_text`: the lines matching a regular expression, below `path`
+    /// (the workspace root by default) in files `.gitignore` does not
+    /// exclude and `glob` (matched against the workspace-relative path)
+    /// selects, as `path:line: text`.
+    fn search_text(&self, arguments: &Map<String, Value>) -> Result<String> {
+        const DEFAULT_RESULTS: usize = 100;
+        const MAX_RESULTS: usize = 500;
+        const MAX_LINE: usize = 300;
+
+        let pattern = arguments
+            .get("pattern")
+            .and_then(Value::as_str)
+            .filter(|pattern| !pattern.is_empty())
+            .ok_or_else(|| anyhow!("missing or invalid 'pattern' argument"))?;
+        let ignore_case = arguments
+            .get("ignore_case")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let regex = regex::RegexBuilder::new(pattern)
+            .case_insensitive(ignore_case)
+            .build()
+            .map_err(|err| anyhow!("invalid pattern: {err}"))?;
+        let glob = arguments
+            .get("glob")
+            .and_then(Value::as_str)
+            .map(|glob| {
+                globset::Glob::new(glob)
+                    .map(|glob| glob.compile_matcher())
+                    .map_err(|err| anyhow!("invalid glob: {err}"))
+            })
+            .transpose()?;
+        let limit = arguments
+            .get("max_results")
+            .and_then(Value::as_u64)
+            .map_or(DEFAULT_RESULTS, |n| n as usize)
+            .clamp(1, MAX_RESULTS);
+        let root = match arguments.get("path").and_then(Value::as_str) {
+            Some(path) => self.resolve_workspace_path(path)?,
+            None => self.workspace.clone(),
+        };
+
+        let mut out = String::new();
+        let mut matches = 0;
+        'files: for entry in ignore::WalkBuilder::new(&root).build().flatten() {
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                continue;
+            }
+            let path = entry.path();
+            let relative = path.strip_prefix(&self.workspace).unwrap_or(path);
+            if glob.as_ref().is_some_and(|glob| !glob.is_match(relative)) {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(path) else {
+                continue; // binary or unreadable
+            };
+            for (index, line) in content.lines().enumerate() {
+                if !regex.is_match(line) {
+                    continue;
+                }
+                if matches == limit {
+                    out.push_str(&format!("[stopped at {limit} matches]\n"));
+                    break 'files;
+                }
+                matches += 1;
+                let line = match line.char_indices().nth(MAX_LINE) {
+                    Some((cut, _)) => format!("{}…", &line[..cut]),
+                    None => line.to_string(),
+                };
+                out.push_str(&format!("{}:{}: {}\n", relative.display(), index + 1, line));
+            }
+        }
+        if matches == 0 {
+            out.push_str("no matches\n");
+        }
+        Ok(out)
+    }
+
+    /// `convert_document`: render or convert a LibreOffice document (see
+    /// [`crate::office`]). Both paths are confined to the workspace, and the
+    /// CPU-bound conversion runs off the async runtime, where a panic in the
+    /// converter becomes an error rather than taking the session down.
+    async fn convert_document(&self, arguments: &Map<String, Value>) -> Result<String> {
+        if self.read_only {
+            return Err(anyhow!("tool not available in read-only mode"));
+        }
+        let request: crate::office::ConvertRequest =
+            serde_json::from_value(Value::Object(arguments.clone()))
+                .map_err(|err| anyhow!("{err}"))?;
+        let workspace = self.workspace.clone();
+        let response = tokio::task::spawn_blocking(move || {
+            crate::office::convert_in_workspace(&workspace, &request)
+        })
+        .await
+        .map_err(|err| anyhow!("document conversion failed: {err}"))??;
         Ok(serde_json::to_string(&response)?)
     }
 
@@ -2042,13 +2766,15 @@ mod file_lifecycle_tool_tests {
 
     /// Every request's prompt carries the definitions, so they stay small:
     /// 6982 characters of JSON (~1700 tokens) once, trimmed to under 4700
-    /// until the graph tools, under 6000 with semantic search included.
+    /// until the graph tools, under 6000 with semantic search included, under
+    /// 6500 with the `write_tests` and `write_docs` subagents, under 7300 with
+    /// `convert_document` and the `write_document` subagents.
     #[test]
     fn the_tool_definitions_stay_small() {
         let workspace = tempfile::tempdir().unwrap();
         let json =
             serde_json::to_string(&ToolExecutor::new(workspace.path()).definitions()).unwrap();
-        assert!(json.len() < 6000, "{} characters", json.len());
+        assert!(json.len() < 7300, "{} characters", json.len());
     }
 
     /// `/license`'s answer reaches the file the model writes — the whole
@@ -2153,6 +2879,541 @@ mod file_lifecycle_tool_tests {
             .await
             .expect_err("read-only");
         assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    fn tool_names(executor: &ToolExecutor) -> Vec<String> {
+        executor
+            .definitions()
+            .into_iter()
+            .map(|def| def.function.name)
+            .collect()
+    }
+
+    /// The main agent is offered every subagent; a read-only executor none.
+    #[test]
+    fn subagent_tools_are_offered_only_to_the_main_writable_executor() {
+        let workspace = tempfile::tempdir().unwrap();
+        // With web search engines, so `research_web` is offered too.
+        let main = tool_names(
+            &ToolExecutor::new(workspace.path())
+                .with_web_search(crate::web_search::DEFAULT_ENGINES.to_vec()),
+        );
+        let read_only = tool_names(&ToolExecutor::new_read_only(workspace.path()));
+        for spec in crate::subagents::SUBAGENTS {
+            assert!(
+                main.contains(&spec.tool.to_string()),
+                "missing: {}",
+                spec.tool
+            );
+            assert!(
+                !read_only.contains(&spec.tool.to_string()),
+                "offered: {}",
+                spec.tool
+            );
+        }
+        let document = crate::subagents::DOCUMENT_TOOL.to_string();
+        assert!(main.contains(&document));
+        assert!(!read_only.contains(&document));
+        assert!(main.contains(&"convert_document".to_string()));
+        assert!(!read_only.contains(&"convert_document".to_string()));
+    }
+
+    fn custom_agents(files: &[(&str, &str)]) -> crate::agents::custom::AgentRegistry {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, content) in files {
+            fs::write(dir.path().join(name), content).unwrap();
+        }
+        crate::agents::custom::AgentRegistry::from_directories(&[(
+            dir.path().to_path_buf(),
+            crate::agents::custom::AgentSource::User,
+        )])
+    }
+
+    /// A one-request HTTP server answering with `body` as JSON, standing in
+    /// for a SearXNG instance; returns its base URL.
+    async fn fake_searxng(body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+        });
+        base
+    }
+
+    /// The main agent gets `research_web` only with engines, and never
+    /// `web_search` or `browse` itself; a browsing subagent gets both.
+    #[tokio::test]
+    async fn web_tools_are_offered_by_engines_and_role() {
+        let workspace = tempfile::tempdir().unwrap();
+        let engines = crate::web_search::DEFAULT_ENGINES.to_vec();
+        let names = |executor: ToolExecutor| tool_names(&executor);
+
+        let without = names(ToolExecutor::new(workspace.path()));
+        for tool in ["research_web", "web_search", "browse"] {
+            assert!(!without.contains(&tool.to_string()), "{tool}");
+        }
+
+        let main = names(ToolExecutor::new(workspace.path()).with_web_search(engines.clone()));
+        assert!(main.contains(&"research_web".to_string()));
+        assert!(!main.contains(&"web_search".to_string()));
+        assert!(!main.contains(&"browse".to_string()));
+
+        let researcher = names(
+            ToolExecutor::new_read_only(workspace.path())
+                .with_web_search(engines.clone())
+                .with_browsing(),
+        );
+        for tool in ["web_search", "browse", "fetch_url"] {
+            assert!(researcher.contains(&tool.to_string()), "{tool}");
+        }
+        assert!(!researcher.contains(&"research_web".to_string()));
+        assert!(!researcher.contains(&"create_file".to_string()));
+
+        // Web search off: still browsing, but no searching.
+        let off = names(ToolExecutor::new_read_only(workspace.path()).with_browsing());
+        assert!(off.contains(&"browse".to_string()));
+        assert!(!off.contains(&"web_search".to_string()));
+
+        // An allowlist without them (a custom agent with neither `WebSearch`
+        // nor `WebFetch`) hides them.
+        let allowed = std::iter::once("show_file".to_string()).collect();
+        let limited = ToolExecutor::new_for_subagent(workspace.path())
+            .with_web_search(engines)
+            .with_browsing()
+            .with_allowed_tools(allowed);
+        assert_eq!(tool_names(&limited), ["show_file"]);
+    }
+
+    #[tokio::test]
+    async fn web_search_returns_numbered_results_and_names_the_engine() {
+        let workspace = tempfile::tempdir().unwrap();
+        let base = fake_searxng(
+            r#"{"results":[{"url":"https://docs.example/a","title":"A","content":"About A."}]}"#,
+        )
+        .await;
+        let engines = vec![crate::web_search::Engine::Searxng(base.clone())];
+        let executor = ToolExecutor::new_read_only(workspace.path())
+            .with_web_search(engines)
+            .with_browsing();
+        let out = executor
+            .execute("web_search", &args(&[("query", json!(" what is A "))]))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "Search results for \"what is A\":\n\n[1] A\nhttps://docs.example/a\nAbout A.\n(from {base})\n"
+            )
+        );
+
+        let err = ToolExecutor::new_read_only(workspace.path())
+            .with_browsing()
+            .execute("web_search", &args(&[("query", json!("x"))]))
+            .await
+            .expect_err("search off");
+        assert!(err.to_string().contains("[orangu].web_search"), "{err}");
+
+        let err = ToolExecutor::new(workspace.path())
+            .execute("browse", &args(&[("url", json!("https://x.example/"))]))
+            .await
+            .expect_err("not a browsing executor");
+        assert!(err.to_string().contains("web subagents"), "{err}");
+        let err = ToolExecutor::new_read_only(workspace.path())
+            .with_browsing()
+            .execute("browse", &args(&[("link", json!("two"))]))
+            .await
+            .expect_err("not a number");
+        assert!(err.to_string().contains("'link'"), "{err}");
+    }
+
+    /// Only an interactive conversation's executor offers `background` on
+    /// the subagent tools and `continue_agent`; elsewhere nothing changes.
+    #[test]
+    fn background_tools_are_offered_only_where_reports_can_arrive() {
+        let workspace = tempfile::tempdir().unwrap();
+        let plain = ToolExecutor::new(workspace.path()).definitions();
+        assert!(!plain.iter().any(|d| d.function.name == "continue_agent"));
+        assert!(plain.iter().all(|d| {
+            d.function.parameters["properties"]
+                .get("background")
+                .is_none()
+        }));
+
+        let interactive = ToolExecutor::new(workspace.path()).with_background_tasks();
+        let defs = interactive.definitions();
+        assert!(defs.iter().any(|d| d.function.name == "continue_agent"));
+        for def in &defs {
+            let has = def.function.parameters["properties"]
+                .get("background")
+                .is_some();
+            assert_eq!(
+                has,
+                interactive.runs_subagent(&def.function.name),
+                "{}",
+                def.function.name
+            );
+        }
+        // A subagent's own executor never gets them.
+        let nested = ToolExecutor::new_for_subagent(workspace.path()).with_background_tasks();
+        assert!(!tool_names(&nested).contains(&"continue_agent".to_string()));
+    }
+
+    /// `save_memory` exists only with a memory file, writes it whole (even
+    /// outside the workspace: a user-scope memory), and refuses an essay.
+    #[tokio::test]
+    async fn save_memory_rewrites_the_agents_memory_file() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        assert!(
+            !tool_names(&ToolExecutor::new_for_subagent(workspace.path()))
+                .contains(&"save_memory".to_string())
+        );
+
+        let file = home.path().join("agent-memory/keeper/MEMORY.md");
+        let executor =
+            ToolExecutor::new_for_subagent(workspace.path()).with_memory_file(file.clone());
+        assert!(tool_names(&executor).contains(&"save_memory".to_string()));
+        executor
+            .execute(
+                "save_memory",
+                &args(&[("content", json!("First note.  \n\n"))]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "First note.\n");
+        executor
+            .execute("save_memory", &args(&[("content", json!("Replaced."))]))
+            .await
+            .unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "Replaced.\n");
+        assert!(!file.with_file_name(".MEMORY.md.tmp").exists());
+
+        let err = executor
+            .execute(
+                "save_memory",
+                &args(&[("content", json!("x".repeat(70_000)))]),
+            )
+            .await
+            .expect_err("too long");
+        assert!(err.to_string().contains("limited"), "{err}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "Replaced.\n");
+    }
+
+    /// `disallowedTools` is a denylist: those tools are neither offered nor
+    /// run, whatever else allows them.
+    #[tokio::test]
+    async fn a_denylist_takes_tools_away_from_what_is_offered_and_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        let denied: std::collections::HashSet<String> = ["create_file", "run_shell_command"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let executor = ToolExecutor::new_for_subagent(workspace.path()).with_denied_tools(denied);
+        let names = tool_names(&executor);
+        assert!(names.contains(&"show_file".to_string()));
+        assert!(names.contains(&"modify_file".to_string()));
+        assert!(!names.contains(&"create_file".to_string()));
+        assert!(!names.contains(&"run_shell_command".to_string()));
+        let err = executor
+            .execute(
+                "create_file",
+                &args(&[("path", json!("b.txt")), ("content", json!("x"))]),
+            )
+            .await
+            .expect_err("denied");
+        assert!(
+            err.to_string().contains("not available to this agent"),
+            "{err}"
+        );
+        assert!(!workspace.path().join("b.txt").exists());
+    }
+
+    /// A custom agent's `tools` field is an allowlist: only those tools are
+    /// offered, and anything else is refused.
+    #[tokio::test]
+    async fn an_allowlist_limits_what_is_offered_and_run() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+        let allowed: std::collections::HashSet<String> = ["show_file", "search_text"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let executor = ToolExecutor::new_for_subagent(workspace.path()).with_allowed_tools(allowed);
+        let mut names = tool_names(&executor);
+        names.sort();
+        assert_eq!(names, ["search_text", "show_file"]);
+
+        let err = executor
+            .execute(
+                "create_file",
+                &args(&[("path", json!("b.txt")), ("content", json!("x"))]),
+            )
+            .await
+            .expect_err("not allowed");
+        assert!(
+            err.to_string().contains("not available to this agent"),
+            "{err}"
+        );
+        assert!(!workspace.path().join("b.txt").exists());
+
+        // search_text is not offered without an allowlist that names it.
+        assert!(
+            !tool_names(&ToolExecutor::new(workspace.path())).contains(&"search_text".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn search_text_finds_lines_and_respects_gitignore_and_glob() {
+        let workspace = tempfile::tempdir().unwrap();
+        // `ignore` honours .gitignore only inside a repository.
+        fs::create_dir(workspace.path().join(".git")).unwrap();
+        fs::write(workspace.path().join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("src/a.rs"),
+            "fn main() {}\nfn Helper() {}\n",
+        )
+        .unwrap();
+        fs::write(workspace.path().join("notes.md"), "fn in prose\n").unwrap();
+        fs::write(workspace.path().join("ignored.rs"), "fn hidden() {}\n").unwrap();
+        let allowed = std::iter::once("search_text".to_string()).collect();
+        let executor = ToolExecutor::new_for_subagent(workspace.path()).with_allowed_tools(allowed);
+
+        let out = executor
+            .execute("search_text", &args(&[("pattern", json!(r"^fn \w+\("))]))
+            .await
+            .unwrap();
+        assert!(out.contains("src/a.rs:1: fn main() {}"), "{out}");
+        assert!(out.contains("src/a.rs:2: fn Helper() {}"), "{out}");
+        assert!(!out.contains("ignored.rs"), "{out}");
+
+        let out = executor
+            .execute(
+                "search_text",
+                &args(&[
+                    ("pattern", json!("FN")),
+                    ("ignore_case", json!(true)),
+                    ("glob", json!("*.md")),
+                ]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out, "notes.md:1: fn in prose\n");
+
+        let out = executor
+            .execute(
+                "search_text",
+                &args(&[("pattern", json!("fn")), ("max_results", json!(1))]),
+            )
+            .await
+            .unwrap();
+        assert!(out.ends_with("[stopped at 1 matches]\n"), "{out}");
+
+        let out = executor
+            .execute("search_text", &args(&[("pattern", json!("zzz"))]))
+            .await
+            .unwrap();
+        assert_eq!(out, "no matches\n");
+
+        assert!(
+            executor
+                .execute("search_text", &args(&[("pattern", json!("("))]))
+                .await
+                .is_err()
+        );
+        assert!(
+            executor
+                .execute(
+                    "search_text",
+                    &args(&[("pattern", json!("x")), ("path", json!("../"))])
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    /// `run_agent` exists only when there are custom agents, lists them by
+    /// search, and names the closest ones for an unknown agent, all without
+    /// a model.
+    #[tokio::test]
+    async fn run_agent_is_offered_with_custom_agents_and_lists_them() {
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(
+            !tool_names(&ToolExecutor::new(workspace.path())).contains(&"run_agent".to_string())
+        );
+
+        let agents = custom_agents(&[
+            (
+                "api.md",
+                "---\nname: api-designer\ndescription: Designs REST APIs.\ntools: Read, Write\n---\nDesign.\n",
+            ),
+            (
+                "rev.md",
+                "---\nname: code-reviewer\ndescription: Reviews code quality.\ntools: Read, Grep\n---\nReview.\n",
+            ),
+        ]);
+        let executor = ToolExecutor::new(workspace.path()).with_custom_agents(agents.clone());
+        assert!(tool_names(&executor).contains(&"run_agent".to_string()));
+        let read_only =
+            ToolExecutor::new_read_only(workspace.path()).with_custom_agents(agents.clone());
+        assert!(!tool_names(&read_only).contains(&"run_agent".to_string()));
+
+        let listing = executor
+            .execute(
+                "run_agent",
+                &args(&[("agent", json!("list")), ("task", json!("review"))]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            listing,
+            "- code-reviewer (read-only): Reviews code quality."
+        );
+
+        let err = executor
+            .execute(
+                "run_agent",
+                &args(&[("agent", json!("api-architect")), ("task", json!("design"))]),
+            )
+            .await
+            .expect_err("unknown");
+        let err = err.to_string();
+        assert!(err.contains("unknown agent 'api-architect'"), "{err}");
+        assert!(
+            err.contains("- api-designer (writes): Designs REST APIs."),
+            "{err}"
+        );
+
+        // A subagent cannot start a custom agent.
+        let nested = ToolExecutor::new_for_subagent(workspace.path()).with_custom_agents(agents);
+        assert!(!tool_names(&nested).contains(&"run_agent".to_string()));
+        let err = nested
+            .execute(
+                "run_agent",
+                &args(&[("agent", json!("api-designer")), ("task", json!("x"))]),
+            )
+            .await
+            .expect_err("nested");
+        assert!(err.to_string().contains("cannot start subagents"), "{err}");
+    }
+
+    /// `convert_document` renders text into a LibreOffice document and that
+    /// document into a PDF, inside the workspace only.
+    #[tokio::test]
+    async fn convert_document_renders_and_converts_within_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new_for_subagent(workspace.path());
+
+        let response = executor
+            .execute(
+                "convert_document",
+                &args(&[
+                    ("target", json!("sheet.ods")),
+                    ("content", json!("Item,Cost\nA,2\nB,3\nTotal,=SUM(B2:B3)\n")),
+                    ("format", json!("csv")),
+                ]),
+            )
+            .await
+            .expect("render");
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["target"], "sheet.ods");
+        assert_eq!(response["format"], "ods");
+
+        executor
+            .execute(
+                "convert_document",
+                &args(&[
+                    ("source", json!("sheet.ods")),
+                    ("target", json!("sheet.pdf")),
+                ]),
+            )
+            .await
+            .expect("to pdf");
+        assert!(
+            fs::read(workspace.path().join("sheet.pdf"))
+                .unwrap()
+                .starts_with(b"%PDF-")
+        );
+
+        let err = executor
+            .execute(
+                "convert_document",
+                &args(&[
+                    ("source", json!("sheet.ods")),
+                    ("target", json!("../out.pdf")),
+                ]),
+            )
+            .await
+            .expect_err("escape");
+        assert!(err.to_string().contains("escapes"), "{err}");
+
+        let err = ToolExecutor::new_read_only(workspace.path())
+            .execute(
+                "convert_document",
+                &args(&[("source", json!("sheet.ods")), ("target", json!("x.pdf"))]),
+            )
+            .await
+            .expect_err("read-only");
+        assert!(err.to_string().contains("read-only"), "{err}");
+    }
+
+    /// A subagent's executor can change the workspace but cannot start
+    /// another subagent unless it is set up to nest.
+    #[tokio::test]
+    async fn subagent_executor_writes_but_cannot_delegate() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new_for_subagent(workspace.path());
+        let names = tool_names(&executor);
+
+        assert!(names.contains(&"create_file".to_string()));
+        assert!(names.contains(&"modify_file".to_string()));
+        for spec in crate::subagents::SUBAGENTS {
+            assert!(
+                !names.contains(&spec.tool.to_string()),
+                "offered: {}",
+                spec.tool
+            );
+            let err = executor
+                .execute(spec.tool, &args(&[(spec.argument, json!("anything"))]))
+                .await
+                .expect_err("nested subagent");
+            assert!(err.to_string().contains("cannot start subagents"), "{err}");
+        }
+        assert!(!names.contains(&crate::subagents::DOCUMENT_TOOL.to_string()));
+        assert!(names.contains(&"convert_document".to_string()));
+        let err = executor
+            .execute(
+                crate::subagents::DOCUMENT_TOOL,
+                &args(&[("type", json!("text")), ("task", json!("anything"))]),
+            )
+            .await
+            .expect_err("nested subagent");
+        assert!(err.to_string().contains("cannot start subagents"), "{err}");
+
+        executor
+            .execute(
+                "create_file",
+                &args(&[
+                    ("path", json!("a.txt")),
+                    ("content", json!("x\n")),
+                    ("git", json!(false)),
+                ]),
+            )
+            .await
+            .expect("subagent may write");
+        assert!(workspace.path().join("a.txt").exists());
     }
 
     /// The whole life cycle through the tool interface, on the same library

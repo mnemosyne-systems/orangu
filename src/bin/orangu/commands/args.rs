@@ -597,6 +597,10 @@ pub fn move_file_usage_message() -> &'static str {
     "Usage: /move_file <source> <destination>. Use /help to see available commands."
 }
 
+pub fn convert_usage_message() -> &'static str {
+    "Usage: /convert <source> <target or format>, e.g. /convert report.md report.pdf or /convert report.odt pdf. Use /help to see available commands."
+}
+
 pub fn add_repository_usage_message() -> &'static str {
     "Usage: /add_repository <user> [<branch>]. Use /help to see available commands."
 }

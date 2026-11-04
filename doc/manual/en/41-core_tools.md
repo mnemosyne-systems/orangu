@@ -62,6 +62,96 @@ Invoke the bundled debugging skill:
 
 \newpage
 
+## /agents
+
+Lists the custom subagents: Markdown agent files in the format Claude Code
+uses, read from `~/.claude/agents`, `~/.orangu/agents`,
+`<workspace>/.claude/agents` and `<workspace>/.orangu/agents`. See **Custom
+agents** in the Tools chapter.
+
+```text
+/agents [search words]
+```
+
+Each line shows the agent's name, the start of its description, and in
+brackets its scope (`user` or `project`), whether it may change the workspace
+(`writes` or `read-only`) and the role its model is chosen by. A second line
+names any tools in its file that orangu cannot give it. With search words,
+only the twenty best matches are shown. When no agent is installed, the
+directories searched are listed instead.
+
+The model starts these agents with the `run_agent` tool; ask for one by name
+("use the api-designer agent to …"), or let the model search for a fitting one.
+
+**Examples**
+
+```text
+/agents
+/agents kubernetes
+/agents security review
+```
+
+\newpage
+
+## /tasks
+
+Lists this conversation's subagent tasks: every subagent run, numbered `t1`,
+`t2`, … (see **Background subagents and tasks** in the Tools chapter).
+
+```text
+/tasks
+/tasks <id>
+/tasks stop <id>
+```
+
+Each line shows the task's id, its status (`running`, `completed`, `partial`,
+`failed` or `stopped`), the subagent, whether it runs in the foreground or the
+background, the model it was given, how many tools it has called, the tokens its model
+requests read and wrote (as the server reports them), how long it has run,
+the tool a running task called last, and the start of its task. `/tasks <id>`
+shows one task's report or, while it runs, the end of what it has written and
+the tools it has called. While background tasks run, the status line shows
+`Tasks: N`.
+`/tasks stop <id>` stops a running background task; a foreground one stops
+with the turn that waits for it (Esc). The 50 most recent finished tasks are
+kept.
+
+**Examples**
+
+```text
+/tasks
+/tasks t3
+/tasks stop t4
+```
+
+\newpage
+
+## /fork
+
+Forks the conversation: a subagent starts from everything said so far, on
+the same model and with the same tools (MCP tools and skills included, but
+no subagents), does the task in the background, and reports like a
+background subagent (see **Background subagents and tasks** in the Tools
+chapter). The conversation goes on at once, untouched; `/tasks` lists the
+fork as `fork`.
+
+```text
+/fork <task>
+```
+
+A fork has up to 15 model requests. It needs a conversation to start from
+and runs only in an interactive session, not with `-p`. It shares the
+workspace, so a fork that changes files and the conversation can collide on
+the same file.
+
+**Examples**
+
+```text
+/fork check whether the other parsers have the same bug
+```
+
+\newpage
+
 ## /tools
 
 Lists the model-facing workspace tools — the file-lifecycle eight (`show_file`, `create_file`, `modify_file`, `move_file`, `delete_file`, `create_directory`, `move_directory`, `delete_directory`), plus `list_directory`, `fetch_url`, and `run_shell_command` — and any connected MCP tools, named `mcp__<server>__<tool>`, that the active model may call. These are the tools described in the Tools chapter and are distinct from the local slash commands documented here.
@@ -775,6 +865,47 @@ open README.md
 open file README.md
 edit src/main.rs
 edit file src/main.rs
+```
+
+\newpage
+
+## /convert
+
+Converts a document to another format, chosen by the file extensions. No
+LibreOffice installation is needed: it is the same pure-Rust conversion as the
+model's `convert_document` tool (see the Tools chapter).
+
+```text
+/convert <source> <target>
+/convert <source> <format>
+```
+
+The second form writes next to the source, with the source's name and the new
+extension. An existing target is replaced, no Git command is run, and nothing
+is printed on success, only an error. Both paths must be inside the workspace,
+and `Tab` completes either one.
+
+| From | To |
+| :-- | :-- |
+| `.md`, `.html`, `.txt`, `.odt`, `.docx`, `.doc`, `.pdf` | `.odt`, `.docx`, `.pdf`, `.html`, `.md`, `.txt` |
+| `.csv`, `.ods`, `.xlsx`, `.xls` | `.ods`, `.xlsx`, `.csv`, `.pdf`, `.html`, `.md` |
+| `.odp`, `.pptx`, `.ppt` | `.odp`, `.pptx`, `.pdf`, `.html`, `.md`, `.svg` |
+| `.svg`, `.odg` | `.odg`, `.pdf`, `.svg` |
+| `.tex`, `.mml`, `.odf` | `.odf`, `.pdf`, `.svg`, `.mml` |
+
+Markdown to PDF supports Mermaid diagrams, math and images by relative path,
+and HTML comments, such as a licence header, are left out. Fidelity is not
+LibreOffice's own; in particular, the text of bulleted lists in an `.odp`
+source is lost.
+
+**Examples**
+
+```text
+/convert README.md README.pdf
+/convert notes.md pdf
+/convert report.odt report.docx
+/convert budget.xlsx ods
+/convert "slides/Q3 review.pptx" pdf
 ```
 
 \newpage

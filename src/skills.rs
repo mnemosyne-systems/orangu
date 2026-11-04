@@ -106,6 +106,7 @@ impl Skill {
     }
 }
 
+#[derive(Debug, Clone, Default)]
 pub struct SkillRegistry {
     skills: Vec<Skill>,
 }
@@ -233,13 +234,31 @@ impl SkillRegistry {
         &self.skills
     }
 
+    /// The skills, by name and description, for a subagent, which loads one
+    /// with the `use_skill` tool (it works for user skills outside the
+    /// workspace, which `show_file` cannot read).
+    pub fn subagent_index(&self) -> String {
+        if self.skills.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from(
+            "<skills>\nSkills are specialized instructions for specific tasks. When your task \
+             matches one, load it with use_skill before proceeding.\n",
+        );
+        for skill in &self.skills {
+            out.push_str(&format!("- {}: {}\n", skill.name, skill.description.trim()));
+        }
+        out.push_str("</skills>");
+        out
+    }
+
     pub fn system_prompt_index(&self) -> String {
         if self.skills.is_empty() {
             return String::new();
         }
 
         let mut out = String::from(
-            "<skills>\nThe following skills provide specialized instructions for specific tasks.\nWhen a task matches a skill's description, load the SKILL.md at the listed location with the show_file tool before proceeding.\nWhen a skill references relative paths, resolve them against the skill directory, which is the parent directory of SKILL.md.\nUsers can also invoke a skill directly with /skill-name.\n\n<available_skills>\n",
+            "<skills>\nThe following skills provide specialized instructions for specific tasks.\nWhen a task matches a skill's description, load it with the use_skill tool (by name) before proceeding.\nWhen a skill references relative paths, resolve them against the skill directory, which is the parent directory of SKILL.md.\nUsers can also invoke a skill directly with /skill-name.\n\n<available_skills>\n",
         );
         for skill in &self.skills {
             out.push_str(&format!(

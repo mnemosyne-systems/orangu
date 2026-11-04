@@ -2321,10 +2321,10 @@ Nothing here is recursive except `move_directory`, which moves a tree
 because a rename inherently does. Everything else touches exactly one file
 or one directory, so a mistyped path costs one entry.
 
-**In a Git repository, these are Git operations** — a file is created,
-modified, moved and deleted with `git add`, `git mv` and `git rm`, so the
-change is staged rather than only written to disk. **Nothing is ever
-committed**; see **Git integration** below.
+**Nothing is staged automatically.** With `"git": true` in a Git repository,
+a file is created, modified, moved and deleted with `git add`, `git mv` and
+`git rm`, so the change is staged rather than only written to disk.
+**Nothing is ever committed**; see **Git integration** below.
 
 Through `orangu-coordinator` they work exactly the same way — it forwards
 them untouched — but the workspace they act in is the backend
@@ -2361,7 +2361,7 @@ Three types recur across the endpoints below:
 | :-- | :-- |
 | *path* | a string, either relative to the workspace (`src/main.rs`) or an absolute path inside it. Never empty |
 | *mode* | in a **request**: an octal string (`"0644"`, `"644"`, `"0o644"`) or the number `chmod` takes (`420`); at most `0o7777`. In a **response**: always the four-digit octal string (`"0644"`), or `null` on a non-Unix platform |
-| *git* | the object described under **Git integration** below, or `null` when the workspace is not a repository or the request passed `"git": false` |
+| *git* | the object described under **Git integration** below, or `null` when the workspace is not a repository or the request did not pass `"git": true` |
 
 Unknown fields in a request body are rejected by neither serde nor these
 handlers — they are ignored. A missing required field, a wrong type, or
@@ -2376,12 +2376,13 @@ malformed JSON is a `400 bad_request` carrying serde's own message.
 | `mode` | optional | permission bits, as an octal string (`"0644"`) or the number `chmod` takes (`420`) |
 | `overwrite` | optional, default `true` | replace the file if it already exists; `false` for create-if-absent |
 | `parents` | optional, default `false` | create missing parent directories |
-| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+| `git` | optional, default `false` | `true` performs the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; otherwise it is a plain filesystem change |
 
 ```sh
 curl -s -X POST http://127.0.0.1:8100/v1/create_file \
   -H 'Content-Type: application/json' \
-  -d '{"path": "src/hello.py", "content": "print(1)\n", "mode": "0640", "parents": true}'
+  -d '{"path": "src/hello.py", "content": "print(1)\n", "mode": "0640", "parents": true,
+       "git": true}'
 ```
 
 ```json
@@ -2417,7 +2418,7 @@ umask decide, exactly as an ordinary `create` would.
 | `edits[].start_line` | required | first line replaced, 1-based |
 | `edits[].end_line` | required | last line replaced, inclusive |
 | `edits[].replacement` | optional, default `""` | the lines to put in their place |
-| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+| `git` | optional, default `false` | `true` performs the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; otherwise it is a plain filesystem change |
 
 Every range refers to the file **as it was read**, not to the numbering
 left behind by an earlier edit in the same request — edits are applied
@@ -2436,7 +2437,8 @@ curl -s -X POST http://127.0.0.1:8100/v1/modify_file \
   -H 'Content-Type: application/json' \
   -d '{"path": "a.txt",
        "edits": [{"start_line": 2, "end_line": 2, "replacement": "TWO\n"},
-                 {"start_line": 4, "end_line": 3, "replacement": "four\n"}]}'
+                 {"start_line": 4, "end_line": 3, "replacement": "four\n"}],
+       "git": true}'
 ```
 
 ```json
@@ -2474,12 +2476,13 @@ A file that isn't valid UTF-8 has no line structure to edit, so it is a
 | `mode` | optional | permission bits to set at the destination; unset keeps what the file already had |
 | `overwrite` | optional, default `false` | replace the destination if it exists |
 | `parents` | optional, default `false` | create missing parent directories of the destination |
-| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+| `git` | optional, default `false` | `true` performs the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; otherwise it is a plain filesystem change |
 
 ```sh
 curl -s -X POST http://127.0.0.1:8100/v1/move_file \
   -H 'Content-Type: application/json' \
-  -d '{"from": "a.txt", "to": "docs/b.txt", "mode": "0600", "parents": true}'
+  -d '{"from": "a.txt", "to": "docs/b.txt", "mode": "0600", "parents": true,
+       "git": true}'
 ```
 
 ```json
@@ -2504,11 +2507,11 @@ to anything outside the tree.
 | Field | | |
 | :-- | :-- | :-- |
 | `path` | required | file to delete |
-| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+| `git` | optional, default `false` | `true` performs the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; otherwise it is a plain filesystem change |
 
 ```sh
 curl -s -X POST http://127.0.0.1:8100/v1/delete_file \
-  -H 'Content-Type: application/json' -d '{"path": "src/hello.py"}'
+  -H 'Content-Type: application/json' -d '{"path": "src/hello.py", "git": true}'
 ```
 
 ```json
@@ -2561,7 +2564,7 @@ here, so it is a `400 not_utf8` rather than a lossy conversion.
 | `path` | required | directory to create |
 | `mode` | optional | permission bits, as an octal string (`"0755"`) or the number `chmod` takes (`493`) |
 | `parents` | optional, default `false` | create missing parent directories too |
-| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+| `git` | optional, default `false` | `true` performs the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; otherwise it is a plain filesystem change |
 
 ```sh
 curl -s -X POST http://127.0.0.1:8100/v1/create_directory \
@@ -2600,7 +2603,7 @@ what `delete_directory` refuses to do.
 | `to` | required | its new path |
 | `mode` | optional | permission bits to set on the moved directory; unset keeps what it had |
 | `parents` | optional, default `false` | create missing parent directories of the destination |
-| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+| `git` | optional, default `false` | `true` performs the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; otherwise it is a plain filesystem change |
 
 ```sh
 curl -s -X POST http://127.0.0.1:8100/v1/move_directory \
@@ -2637,7 +2640,7 @@ workspace root itself cannot be moved.
 | Field | | |
 | :-- | :-- | :-- |
 | `path` | required | directory to delete |
-| `git` | optional, default `true` | perform the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; `false` for a plain filesystem change |
+| `git` | optional, default `false` | `true` performs the change with its Git command (`git add`/`git mv`/`git rm`) when the workspace is a repository; otherwise it is a plain filesystem change |
 
 ```sh
 curl -s -X POST http://127.0.0.1:8100/v1/delete_directory \
@@ -2669,9 +2672,10 @@ a single mistyped path to a single directory.
 
 #### Git integration
 
-When the workspace sits inside a Git repository, every endpoint above
-performs its change **with the matching Git command**, so the result is
-staged rather than merely written:
+Nothing is staged automatically. When a request passes `"git": true` and the
+workspace sits inside a Git repository, the endpoint performs its change
+**with the matching Git command**, so the result is staged rather than merely
+written:
 
 | Endpoint | Git command |
 | :-- | :-- |
@@ -2689,7 +2693,7 @@ deletion is most likely to be wanted. `git mv` is forced only when the
 request itself passed `"overwrite": true`.
 
 Each reply carries a `git` object saying what happened, or `null` when the
-workspace isn't a repository:
+request did not pass `"git": true` or the workspace isn't a repository:
 
 ```json
 {"from":"a.txt","to":"sub/b.txt","mode":"0644","overwritten":false,

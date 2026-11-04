@@ -142,6 +142,7 @@ rustls-native-certs = "0.8"
 httparse = "1"
 chrono-tz = "0.10.4"
 hmac = "0.13.0"
+libreoffice-pure = "0.5.8"
 
 [features]
 rocm = ["dep:cubecl-hip-sys"]

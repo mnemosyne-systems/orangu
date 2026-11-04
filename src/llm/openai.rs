@@ -14,8 +14,8 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use super::{
-    ChatMessage, LlmResponse, StreamMetrics, StreamPromptProgress, ToolCall, ToolCallFunction,
-    ToolDefinition,
+    ChatMessage, LlmResponse, StreamMetrics, StreamPromptProgress, TokenUsage, ToolCall,
+    ToolCallFunction, ToolDefinition,
 };
 use crate::config::LlmConfiguration;
 use anyhow::{Result, anyhow};
@@ -63,6 +63,8 @@ struct OpenAiStreamResponse {
     timings: Option<OpenAiTimings>,
     #[serde(default)]
     prompt_progress: Option<OpenAiPromptProgress>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
     /// An error the server ran into *after* it had already answered `200 OK`
     /// and started streaming — the only channel it has left to say so.
     ///
@@ -118,6 +120,18 @@ struct OpenAiTimings {
     prompt_per_second: Option<f64>,
     #[serde(default)]
     predicted_per_second: Option<f64>,
+    #[serde(default)]
+    prompt_n: Option<u64>,
+    #[serde(default)]
+    predicted_n: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,6 +385,29 @@ fn stream_metrics_from_response(response: &OpenAiStreamResponse) -> StreamMetric
             time_ms: progress.time_ms,
         });
     }
+    // Counted once a response: from the chunk that finishes it, or from
+    // OpenAI's separate usage chunk (no choices) after it.
+    let finishing = response.choices.iter().any(|c| c.finish_reason.is_some());
+    if finishing || (response.choices.is_empty() && response.usage.is_some()) {
+        metrics.usage = match (&response.usage, &response.timings) {
+            (Some(usage), _) => Some(TokenUsage {
+                prompt: usage.prompt_tokens,
+                completion: usage.completion_tokens,
+            }),
+            (
+                None,
+                Some(OpenAiTimings {
+                    prompt_n: Some(prompt),
+                    predicted_n: Some(completion),
+                    ..
+                }),
+            ) => Some(TokenUsage {
+                prompt: *prompt,
+                completion: *completion,
+            }),
+            _ => None,
+        };
+    }
     metrics
 }
 
@@ -622,6 +659,47 @@ mod tests {
     }
 
     #[test]
+    fn the_final_chunk_reports_token_usage_once() {
+        let usage_of = |event: &str| {
+            let mut metrics = Vec::new();
+            process_stream_event(
+                &[event.to_string()],
+                &mut String::new(),
+                &mut Vec::new(),
+                &mut |_| {},
+                &mut |update: StreamMetrics| metrics.push(update),
+            )
+            .expect("event");
+            metrics.into_iter().find_map(|m| m.usage)
+        };
+        let tokens = |prompt, completion| Some(TokenUsage { prompt, completion });
+        // OpenAI's `usage`, on the finishing chunk or in a chunk of its own.
+        assert_eq!(
+            usage_of(
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":7}}"#
+            ),
+            tokens(120, 7)
+        );
+        assert_eq!(
+            usage_of(r#"{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}"#),
+            tokens(5, 2)
+        );
+        // llama.cpp's running `timings` counts, from the finishing chunk only.
+        assert_eq!(
+            usage_of(
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"timings":{"prompt_n":30,"predicted_n":4}}"#
+            ),
+            tokens(30, 4)
+        );
+        assert_eq!(
+            usage_of(
+                r#"{"choices":[{"delta":{"content":"a"}}],"timings":{"prompt_n":30,"predicted_n":1}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn stream_event_extracts_llama_cpp_metrics() {
         let mut content = String::new();
         let mut tool_calls = Vec::new();
@@ -648,6 +726,7 @@ mod tests {
                 prompt_per_second: Some(32.3),
                 predicted_per_second: Some(52.9),
                 truncated: false,
+                usage: None,
             }]
         );
     }
