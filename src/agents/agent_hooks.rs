@@ -263,7 +263,6 @@ async fn run(command: &str, payload: &Value, workspace: &Path) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::ToolExecutor;
 
     fn hooks(yaml: &str) -> AgentHooks {
         AgentHooks::parse(&serde_yaml::from_str(yaml).unwrap())
@@ -294,6 +293,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_pre_hook_blocks_with_exit_2_and_a_post_hook_speaks_up() {
+        use crate::tools::ToolExecutor;
+
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("a.txt"), "hello\n").unwrap();
         let tools = ToolExecutor::new_for_subagent(workspace.path()).with_agent_hooks(hooks(

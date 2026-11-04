@@ -1509,7 +1509,12 @@ impl ToolExecutor {
                     Some((cut, _)) => format!("{}…", &line[..cut]),
                     None => line.to_string(),
                 };
-                out.push_str(&format!("{}:{}: {}\n", relative.display(), index + 1, line));
+                out.push_str(&format!(
+                    "{}:{}: {}\n",
+                    crate::files::to_slash(relative),
+                    index + 1,
+                    line
+                ));
             }
         }
         if matches == 0 {
