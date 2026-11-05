@@ -506,7 +506,9 @@ technically valid JSON, and a caller asking for a record and receiving
 With `{"type": "json_schema", "json_schema": {"schema": {…}}}` the output is
 held to the **schema**, not just to JSON: a required property cannot be left
 out, an undeclared one cannot be added, an `integer` cannot be written as
-`36.5`, and an `enum` value cannot be anything else. What a schema may use:
+`36.5`, and an `enum` value cannot be anything else. A `strict` tool's arguments
+are checked against at most about a million sub-schemas, past which the check
+fails as too complex. What a schema may use:
 
 - `type` — one, or a list such as `["string", "null"]` — with `properties`,
   `required` and `additionalProperties` for an object, and `items`,

@@ -162,6 +162,43 @@ are not cached there, so they skip, exactly as an unset `ORANGU_TEST_*_MODEL`
 already makes them skip. The dequant fixture skips the same way when absent
 (`read_ggml_reference` returns `None` with a note on stderr).
 
+## Fuzzing
+
+The parsers that take input from outside have fuzz targets, which run as
+ordinary tests on the stable toolchain: the GGUF reader, a vocabulary loaded
+from a damaged file, the tokenizer's text path, chat templates, the JSON Schema
+compiler and validator, tool-call parsing, and stop strings. `cargo test` gives
+each one a few hundred inputs. For a campaign, use a debug build, whose overflow
+checks turn arithmetic on untrusted numbers into findings, and one target at a
+time, as a stack overflow takes the whole process with it:
+
+```sh
+ulimit -v 16000000
+ORANGU_FUZZ_SECONDS=300 ORANGU_FUZZ_OUT=/tmp/fuzz \
+    cargo test --bin orangu-server fuzz_chat_template -- --test-threads=1 --nocapture
+ORANGU_FUZZ_SECONDS=300 ORANGU_FUZZ_OUT=/tmp/fuzz \
+    cargo test --lib fuzz_gguf_reader -- --test-threads=1 --nocapture
+```
+
+| Variable | Meaning |
+| :--- | :--- |
+| `ORANGU_FUZZ_SECONDS` | How long a target runs. Unset, it gets its few hundred inputs |
+| `ORANGU_FUZZ_OUT` | Where inputs that fail are saved. `<target>.current` is the one running, which is what is left after a stack overflow or running out of memory |
+| `ORANGU_FUZZ_SEED` | Runs repeat exactly for one seed. Change it to look elsewhere |
+| `ORANGU_FUZZ_INPUT_SECONDS` | How long one input may run before it counts as a hang (default `20`). A template can use about a minute of its limit in a debug build, so give that target more |
+| `ORANGU_FUZZ_TEMPLATES` | A directory of real templates to add to the seeds |
+
+The fuzzer (`src/fuzzing.rs`) mutates its seeds without coverage feedback, so it
+finds what good seeds and a dictionary lead it to, and a clean run does not show a
+target has no bugs. Turn a finding into an ordinary regression test beside the
+code it was in. The targets are in `src/bin/orangu-server/fuzz_targets.rs` and
+`src/gguf.rs`.
+
+Two things are limited because of what these found, and `fuel_leaves_real_templates_alone`
+checks the first against real templates when `ORANGU_TEST_TEMPLATES` names a
+directory of them: `TEMPLATE_FUEL`, the instructions one render may run, and
+`MAX_TEMPLATE_BYTES`, the size of a template.
+
 ## Documentation workflow
 
 The manual sources live under `doc/manual/en` (one file per chapter), the cheat

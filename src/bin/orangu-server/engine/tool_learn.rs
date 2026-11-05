@@ -94,20 +94,29 @@ fn common_suffix_len(a: &str, b: &str) -> usize {
         .sum()
 }
 
+/// The most text one rendered call may be: a real one is a few dozen bytes, and
+/// reading its shape looks at every brace in it.
+const MAX_CALL_BYTES: usize = 16 * 1024;
+
 /// What a call adds to a turn: `with` is the turn rendered with the call and
 /// `without` the same turn without it. What surrounds a turn's text can be on
 /// both sides of the call, and the shortest head that fits is the right split:
 /// a turn's closing `</s>` and a call's opening `<call>` start alike.
+///
+/// A head can be as long as what the two share at the start, and a tail as long
+/// as what they share at the end, so the shortest head is what the tail leaves.
 fn call_text<'a>(with: &'a str, without: &str) -> Option<&'a str> {
-    (0..=without.len())
-        .filter(|&i| without.is_char_boundary(i))
-        .find_map(|i| {
-            let (head, tail) = without.split_at(i);
-            (with.len() >= head.len() + tail.len()
-                && with.starts_with(head)
-                && with.ends_with(tail))
-            .then(|| &with[head.len()..with.len() - tail.len()])
-        })
+    if with.len() < without.len() {
+        return None;
+    }
+    let shared = |a: &mut dyn Iterator<Item = (u8, u8)>| a.take_while(|(x, y)| x == y).count();
+    let start = shared(&mut with.bytes().zip(without.bytes()));
+    let end = shared(&mut with.bytes().rev().zip(without.bytes().rev()));
+    let mut head = without.len().saturating_sub(end);
+    while !without.is_char_boundary(head) {
+        head += 1;
+    }
+    (head <= start).then(|| &with[head..with.len() - (without.len() - head)])
 }
 
 /// Where the probe's arguments are in `text`, as a JSON object starting at or
@@ -231,7 +240,10 @@ impl LearnedCalls {
         let plain = reply(render(None)?);
         let one = reply(render(Some(json!([call()])))?);
         let region = call_text(&one, &plain)?.trim();
-        if region.is_empty() || tool_calls::first_opener(region).is_some() {
+        if region.is_empty()
+            || region.len() > MAX_CALL_BYTES
+            || tool_calls::first_opener(region).is_some()
+        {
             return None;
         }
         let (open, close, shape) = read_shape(region)?;
@@ -461,6 +473,46 @@ impl LearnedReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every split, the slow way: what [`call_text`] has to agree with.
+    fn call_text_by_trying<'a>(with: &'a str, without: &str) -> Option<&'a str> {
+        (0..=without.len())
+            .filter(|&i| without.is_char_boundary(i))
+            .find_map(|i| {
+                let (head, tail) = without.split_at(i);
+                (with.len() >= without.len() && with.starts_with(head) && with.ends_with(tail))
+                    .then(|| &with[head.len()..with.len() - tail.len()])
+            })
+    }
+
+    #[test]
+    fn a_call_is_what_the_turn_gains_at_any_split() {
+        let pieces = ["", "a", "ab", "</s>", "<call>", "\u{e9}", "\u{4f60}x"];
+        for head in pieces {
+            for call in pieces {
+                for tail in pieces {
+                    let with = format!("{head}{call}{tail}");
+                    for without in [format!("{head}{tail}"), format!("{tail}{head}")] {
+                        assert_eq!(
+                            call_text(&with, &without),
+                            call_text_by_trying(&with, &without),
+                            "{with:?} {without:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A template can render as much as it likes around its call.
+    #[test]
+    fn a_large_render_takes_no_longer_than_reading_it() {
+        let without = "x".repeat(4 << 20);
+        let with = format!("{}CALL{}", &without[..1 << 20], &without[1 << 20..]);
+        let started = std::time::Instant::now();
+        assert_eq!(call_text(&with, &without).map(str::len), Some(4));
+        assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+    }
 
     /// A template teaching one call syntax, through its `tool_calls` branch.
     fn template(call: &str) -> ChatTemplate {

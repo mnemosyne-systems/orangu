@@ -501,6 +501,7 @@ pub struct Tokenizer {
     ///
     /// The same set [`Tokenizer::is_special`] hides on the way out: a marker
     /// this cannot produce is a marker that filter can never catch.
+    special_matcher: Option<aho_corasick::AhoCorasick>,
     special_tokens: Vec<(String, u32)>,
     /// Ids of every CONTROL / USER_DEFINED token (BOS/EOS/pad plus a chat
     /// format's structural markers — gemma-4's `<|turn>`/`<turn|>`/
@@ -856,8 +857,18 @@ impl Tokenizer {
             .enumerate()
             .filter(|&(_, &ty)| is_structural_token_type(ty))
             .filter_map(|(id, _)| tokens.get(id).map(|tok| (tok.clone(), id as u32)))
+            // A token of no text would match everywhere.
+            .filter(|(tok, _)| !tok.is_empty())
             .collect();
         special_tokens.sort_by_key(|(tok, _)| std::cmp::Reverse(tok.len()));
+        let special_matcher = (!special_tokens.is_empty())
+            .then(|| {
+                aho_corasick::AhoCorasick::builder()
+                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                    .build(special_tokens.iter().map(|(tok, _)| tok))
+            })
+            .transpose()
+            .context("building the special-token matcher")?;
 
         let special_ids: FxHashSet<u32> = token_types
             .iter()
@@ -889,6 +900,7 @@ impl Tokenizer {
             ignore_merges,
             right_aligned_digits,
             special_tokens,
+            special_matcher,
             special_ids,
             bos_token,
             eos_token,
@@ -1087,34 +1099,24 @@ impl Tokenizer {
     /// longest-match-first, so those bypass BPE entirely — matching
     /// llama.cpp's own special-token handling in `llama-vocab.cpp`.
     fn split_on_special_tokens<'a>(&self, text: &'a str) -> Vec<Segment<'a>> {
-        if self.special_tokens.is_empty() {
+        let Some(matcher) = &self.special_matcher else {
             return vec![Segment::Plain(text)];
-        }
+        };
+        // One pass over the text, however many special tokens the vocabulary
+        // has and however many of them a request spells out.
         let mut segments = Vec::new();
-        let mut rest = text;
-        while !rest.is_empty() {
-            // Earliest occurrence across every special token; on a tie
-            // (two candidates starting at the same position) the longer one
-            // wins, since `self.special_tokens` is sorted longest-first and
-            // this scan keeps the first (not later) match at a given
-            // earliest position.
-            let earliest = self
-                .special_tokens
-                .iter()
-                .filter_map(|(special, id)| {
-                    rest.find(special.as_str()).map(|pos| (pos, special, *id))
-                })
-                .min_by_key(|(pos, special, _)| (*pos, std::cmp::Reverse(special.len())));
-
-            let Some((pos, special, id)) = earliest else {
-                segments.push(Segment::Plain(rest));
-                break;
-            };
-            if pos > 0 {
-                segments.push(Segment::Plain(&rest[..pos]));
+        let mut at = 0;
+        for found in matcher.find_iter(text) {
+            if found.start() > at {
+                segments.push(Segment::Plain(&text[at..found.start()]));
             }
-            segments.push(Segment::Special(id));
-            rest = &rest[pos + special.len()..];
+            segments.push(Segment::Special(
+                self.special_tokens[found.pattern().as_usize()].1,
+            ));
+            at = found.end();
+        }
+        if at < text.len() || segments.is_empty() {
+            segments.push(Segment::Plain(&text[at..]));
         }
         segments
     }
@@ -2074,6 +2076,62 @@ mod tests {
         let generic = regex::Regex::new(super::SPLIT_PATTERN).unwrap();
         let generic_digits: Vec<&str> = generic.find_iter("2026").map(|m| m.as_str()).collect();
         assert_eq!(generic_digits, vec!["2026"]);
+    }
+
+    /// A vocabulary with `specials` control tokens, for what they cost to find.
+    fn with_specials(specials: &[String]) -> Tokenizer {
+        let mut tokens: Vec<String> = super::byte_to_unicode_table()
+            .iter()
+            .map(char::to_string)
+            .collect();
+        tokens.extend_from_slice(specials);
+        let types = (0..tokens.len())
+            .map(|i| GgufValue::I32(if i < 256 { 1 } else { 3 }))
+            .collect();
+        let strings = |items: &[String]| {
+            GgufValue::Array(items.iter().map(|t| GgufValue::String(t.clone())).collect())
+        };
+        Tokenizer::from_gguf(&GgufFile {
+            version: 3,
+            metadata: vec![
+                ("tokenizer.ggml.tokens".to_string(), strings(&tokens)),
+                ("tokenizer.ggml.merges".to_string(), strings(&[])),
+                (
+                    "tokenizer.ggml.token_type".to_string(),
+                    GgufValue::Array(types),
+                ),
+            ],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        })
+        .unwrap()
+    }
+
+    /// The longest special token at the earliest place wins, with text between
+    /// them kept, and a token with no text never matches.
+    #[test]
+    fn special_tokens_are_found_earliest_and_longest_first() {
+        let tokenizer = with_specials(&["<a>".to_string(), "<a>b".to_string(), String::new()]);
+        let [a, ab] = [256u32, 257];
+        assert_eq!(tokenizer.encode("<a>", false), [a]);
+        assert_eq!(tokenizer.encode("<a>b", false), [ab]);
+        assert_eq!(tokenizer.encode("<a><a>b<a>", false), [a, ab, a]);
+        assert_eq!(tokenizer.encode("x<a>y", false).len(), 3);
+        assert!(tokenizer.encode("", false).is_empty());
+    }
+
+    /// A request full of special tokens is a client's to send, and the
+    /// vocabulary can hold thousands: finding them has to stay linear.
+    #[test]
+    fn a_request_full_of_special_tokens_takes_no_longer_than_reading_it() {
+        let specials: Vec<String> = (0..5000).map(|i| format!("<|unused{i}|>")).collect();
+        let tokenizer = with_specials(&specials);
+        let text = specials[17].repeat((1 << 20) / specials[17].len());
+        let started = std::time::Instant::now();
+        let ids = tokenizer.encode(&text, false);
+        assert_eq!(ids.len(), (1 << 20) / specials[17].len());
+        assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
     }
 
     fn words_for_pre(pre: &str, text: &str) -> Vec<String> {

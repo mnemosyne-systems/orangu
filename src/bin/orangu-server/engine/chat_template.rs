@@ -211,6 +211,46 @@ pub struct Reasoning<'a> {
     pub effort_is_default: bool,
 }
 
+/// The largest template this compiles, some five times the largest in use. The
+/// compiler's constant folding is quadratic in a chain of operators, so this is
+/// also what bounds how long a hostile template can hold up a server's start.
+const MAX_TEMPLATE_BYTES: usize = 256 * 1024;
+
+/// A stack for compiling a template of [`MAX_TEMPLATE_BYTES`], at about a
+/// kilobyte a level in a debug build. The compiler
+/// recurses once per operator in a chain like `a - a - a`, which has no limit
+/// but the source's length. Only what a compile touches is ever committed.
+const COMPILE_STACK_BYTES: usize = 512 * 1024 * 1024;
+
+/// Compiles on a stack that a hostile template cannot run off the end of.
+fn compile_template(
+    mut env: Environment<'static>,
+    source: String,
+) -> std::result::Result<Environment<'static>, String> {
+    if source.len() > MAX_TEMPLATE_BYTES {
+        return Err(format!(
+            "invalid chat template: {} bytes is more than the {MAX_TEMPLATE_BYTES} allowed",
+            source.len()
+        ));
+    }
+    std::thread::Builder::new()
+        .name("template-compile".to_string())
+        .stack_size(COMPILE_STACK_BYTES)
+        .spawn(move || match env.add_template_owned("chat", source) {
+            Ok(()) => Ok(env),
+            Err(err) => Err(format!("invalid chat template: {err}")),
+        })
+        .map_err(|err| format!("invalid chat template: no thread to compile it on: {err}"))?
+        .join()
+        .unwrap_or_else(|_| Err("invalid chat template: compiling it panicked".to_string()))
+}
+
+/// How many instructions one render may run: what stops a template that never
+/// finishes, in about ten seconds. A real template can be quadratic in the
+/// messages, as `gemma-4`'s is at some 30 million instructions for 5000 of them,
+/// and refusing a real conversation is worse than a hostile model being slow.
+const TEMPLATE_FUEL: u64 = 100_000_000;
+
 impl ChatTemplate {
     /// The call syntax read off this template, for a model no hand-written
     /// parser reads. See [`super::tool_learn`].
@@ -222,6 +262,8 @@ impl ChatTemplate {
 
     pub fn new(source: String) -> Self {
         let mut env = Environment::new();
+        // A template comes in a model file and runs on every request.
+        env.set_fuel(Some(TEMPLATE_FUEL));
         env.add_function("raise_exception", |msg: String| {
             Err::<String, minijinja::Error>(minijinja::Error::new(
                 minijinja::ErrorKind::InvalidOperation,
@@ -240,10 +282,7 @@ impl ChatTemplate {
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         let source = generation_tags_as_if(&source);
         let source = parenthesize_call_kwarg_conditionals(&source).into_owned();
-        let env = match env.add_template_owned("chat", source) {
-            Ok(()) => Ok(env),
-            Err(err) => Err(format!("invalid chat template: {err}")),
-        };
+        let env = compile_template(env, source);
         let mut template = Self {
             env,
             nine_char_ids: false,
@@ -709,7 +748,8 @@ fn generation_tags_as_if(source: &str) -> std::borrow::Cow<'_, str> {
     while let Some(open) = rest.find("{%") {
         out.push_str(&rest[..open]);
         let tag = &rest[open..];
-        let Some(close) = tag.find("%}") else {
+        // After the opener: in `{%}` the two overlap.
+        let Some(close) = tag[2..].find("%}").map(|at| at + 2) else {
             rest = tag;
             break;
         };
@@ -1009,6 +1049,101 @@ fn strftime_now(fmt: &str) -> String {
         .replace("%b", abbrev)
         .replace("%B", full)
         .replace(PERCENT, "%")
+}
+
+#[cfg(test)]
+mod hostile_template_tests {
+    use super::*;
+
+    /// A chain of operators nests as deeply as it is long, which no bracket
+    /// count would see, and every kind of chain has to compile or be refused.
+    #[test]
+    fn a_long_chain_cannot_overflow_the_stack() {
+        let length = MAX_TEMPLATE_BYTES / 32;
+        for link in ["- 1 ", "|e ", ".a ", "~ 1 ", "and 1 "] {
+            let chain = link.repeat(length / link.len());
+            let template = ChatTemplate::new(format!("{{{{ x {chain} }}}}"));
+            let _ = template.render(&[], true, "", "", Default::default());
+        }
+    }
+
+    #[test]
+    fn a_template_past_the_size_limit_is_refused() {
+        let template = ChatTemplate::new("x".repeat(MAX_TEMPLATE_BYTES + 1));
+        let error = template
+            .render(&[], true, "", "", Default::default())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("allowed"), "{error:#}");
+    }
+
+    /// The fuel has to stop only what never finishes: a conversation longer than
+    /// a context window holds, through each real template, must still render.
+    ///
+    /// `ORANGU_TEST_TEMPLATES=<dir> cargo test --release --bin orangu-server
+    /// fuel_leaves_real -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs ORANGU_TEST_TEMPLATES"]
+    fn fuel_leaves_real_templates_alone() {
+        let dir = std::env::var("ORANGU_TEST_TEMPLATES").expect("a directory of templates");
+        let tools: serde_json::Value =
+            serde_json::json!((0..64).map(|i| serde_json::json!({
+            "type": "function", "function": {"name": format!("tool{i}"), "description": "d",
+            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}},
+        })).collect::<Vec<_>>());
+        let mut messages = vec![ChatMessage::text("system", "be brief")];
+        for i in 0..2_500 {
+            messages.push(ChatMessage::text("user", &format!("question {i}")));
+            messages.push(ChatMessage::text("assistant", "an answer"));
+        }
+        messages.push(ChatMessage::text("user", "last"));
+        let (mut rendered, mut refused, mut out_of_fuel) = (0, 0, Vec::new());
+        let mut slowest = std::time::Duration::ZERO;
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let Ok(source) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let started = std::time::Instant::now();
+            let result = ChatTemplate::new(source).render_with_tools(
+                &messages,
+                true,
+                "<s>",
+                "</s>",
+                Reasoning::default(),
+                Some(&tools),
+            );
+            slowest = slowest.max(started.elapsed());
+            match result {
+                Ok(_) => rendered += 1,
+                Err(error) if format!("{error:#}").contains("fuel") => {
+                    out_of_fuel.push(entry.file_name())
+                }
+                Err(_) => refused += 1,
+            }
+        }
+        println!("{rendered} rendered, {refused} refused otherwise, slowest {slowest:?}");
+        assert!(out_of_fuel.is_empty(), "out of fuel: {out_of_fuel:?}");
+    }
+
+    /// An opener and closer that share a character are not a tag to read, in a
+    /// template the generation rewrite looks through.
+    #[test]
+    fn a_tag_opener_overlapping_its_closer_is_only_a_bad_template() {
+        let template = ChatTemplate::new("{% generation %}{%}{% endgeneration %}".to_string());
+        let _ = template.render(&[], true, "", "", Default::default());
+    }
+
+    /// A loop that would not end in a lifetime ends with an error instead.
+    #[test]
+    fn a_template_that_never_finishes_runs_out_of_fuel() {
+        let forever = "{% for a in range(10000) %}{% for b in range(10000) %}\
+                       {% for c in range(10000) %}x{% endfor %}{% endfor %}{% endfor %}";
+        let template = ChatTemplate::new(forever.to_string());
+        assert!(
+            template
+                .render(&[], true, "", "", Default::default())
+                .is_err()
+        );
+    }
 }
 
 #[cfg(test)]

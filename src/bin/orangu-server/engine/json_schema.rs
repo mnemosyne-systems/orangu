@@ -59,7 +59,7 @@
 //! diverge.
 
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::engine::constraint::JsonPrefix;
@@ -82,6 +82,9 @@ const MAX_WHITESPACE: u8 = 32;
 /// How deep unions and references may nest before a value starts — the
 /// guard against a reference that names only itself.
 const MAX_UNION_DEPTH: usize = 32;
+
+/// The most sub-schemas [`validate`] applies to one value, however they nest.
+const MAX_CHECK_STEPS: usize = 1 << 20;
 
 #[derive(Debug)]
 enum Node {
@@ -484,12 +487,28 @@ impl Schema {
     }
 
     /// Begins a value of `node` with byte `b`.
-    fn start(&self, mut t: Thread, node: NodeId, b: u8, depth: usize, out: &mut Vec<Thread>) {
+    fn start(&self, t: Thread, node: NodeId, b: u8, depth: usize, out: &mut Vec<Thread>) {
+        self.start_once(t, node, b, depth, out, &mut HashSet::new());
+    }
+
+    /// [`Self::start`], going through each union once. Descending into a union
+    /// changes nothing about the thread, so a second visit starts the same
+    /// threads again, and a union that names itself several times would make
+    /// the visits exponential in the depth allowed.
+    fn start_once(
+        &self,
+        mut t: Thread,
+        node: NodeId,
+        b: u8,
+        depth: usize,
+        out: &mut Vec<Thread>,
+        seen: &mut HashSet<NodeId>,
+    ) {
         match &self.nodes[node] {
             Node::Union(branches) => {
-                if depth < MAX_UNION_DEPTH {
+                if depth < MAX_UNION_DEPTH && seen.insert(node) {
                     for &branch in branches {
-                        self.start(t.clone(), branch, b, depth + 1, out);
+                        self.start_once(t.clone(), branch, b, depth + 1, out, seen);
                     }
                 }
             }
@@ -823,7 +842,7 @@ impl SchemaPrefix {
 /// `$ref` into the same document, `minLength`/`maxLength`, `pattern` and
 /// `minimum`/`maximum`.
 pub fn validate(schema: &Value, value: &Value) -> Result<(), String> {
-    check(schema, schema, value, "", 0)
+    check(schema, schema, value, "", 0, &mut { MAX_CHECK_STEPS })
 }
 
 fn kind_of(value: &Value) -> &'static str {
@@ -851,11 +870,18 @@ fn check(
     value: &Value,
     at: &str,
     depth: usize,
+    steps: &mut usize,
 ) -> Result<(), String> {
     let place = if at.is_empty() { "the input" } else { at };
     if depth > 64 {
         return Err(format!("{place}: the schema nests too deeply to check"));
     }
+    // Trying each branch of a union is exponential in the depth where the
+    // branches lead back to the union, which a request's schema can arrange.
+    let Some(left) = steps.checked_sub(1) else {
+        return Err(format!("{place}: the schema is too complex to check"));
+    };
+    *steps = left;
     let schema = match schema {
         Value::Bool(true) => return Ok(()),
         Value::Bool(false) => return Err(format!("{place}: no value is allowed here")),
@@ -867,7 +893,7 @@ fn check(
             .strip_prefix('#')
             .and_then(|pointer| root.pointer(pointer))
             .ok_or_else(|| format!("{place}: the schema's $ref {reference} names nothing"))?;
-        check(root, target, value, at, depth + 1)?;
+        check(root, target, value, at, depth + 1, steps)?;
     }
     if let Some(types) = schema.get("type") {
         let allowed: Vec<&str> = match types {
@@ -900,7 +926,7 @@ fn check(
         if let Some(branches) = schema.get(key).and_then(Value::as_array)
             && !branches
                 .iter()
-                .any(|b| check(root, b, value, at, depth + 1).is_ok())
+                .any(|b| check(root, b, value, at, depth + 1, steps).is_ok())
         {
             return Err(format!(
                 "{place}: matches none of the schema's alternatives"
@@ -909,7 +935,7 @@ fn check(
     }
     if let Some(all) = schema.get("allOf").and_then(Value::as_array) {
         for branch in all {
-            check(root, branch, value, at, depth + 1)?;
+            check(root, branch, value, at, depth + 1, steps)?;
         }
     }
     match value {
@@ -931,12 +957,14 @@ fn check(
             for (key, field) in fields {
                 let path = format!("{at}/{key}");
                 match properties.and_then(|p| p.get(key)) {
-                    Some(sub) => check(root, sub, field, &path, depth + 1)?,
+                    Some(sub) => check(root, sub, field, &path, depth + 1, steps)?,
                     None => match schema.get("additionalProperties") {
                         Some(Value::Bool(false)) => {
                             return Err(format!("{place}: `{key}` is not one of its properties"));
                         }
-                        Some(sub @ Value::Object(_)) => check(root, sub, field, &path, depth + 1)?,
+                        Some(sub @ Value::Object(_)) => {
+                            check(root, sub, field, &path, depth + 1, steps)?
+                        }
                         _ => {}
                     },
                 }
@@ -956,7 +984,7 @@ fn check(
             }
             if let Some(sub) = schema.get("items") {
                 for (i, item) in items.iter().enumerate() {
-                    check(root, sub, item, &format!("{at}/{i}"), depth + 1)?;
+                    check(root, sub, item, &format!("{at}/{i}"), depth + 1, steps)?;
                 }
             }
         }
@@ -999,6 +1027,29 @@ fn check(
 
 #[cfg(test)]
 mod tests {
+    /// A union naming itself many times is many paths to the same place: it
+    /// has to take about as long as naming itself once.
+    #[test]
+    fn a_union_of_references_to_itself_is_not_exponential() {
+        let schema = serde_json::json!({
+            "$defs": {"n": {"anyOf": [
+                {"type": "null"},
+                {"$ref": "#/$defs/n"}, {"$ref": "#/$defs/n"},
+                {"$ref": "#/$defs/n"}, {"$ref": "#/$defs/n"},
+            ]}},
+            "$ref": "#/$defs/n",
+        });
+        let started = std::time::Instant::now();
+        let mut prefix =
+            super::SchemaPrefix::new(std::sync::Arc::new(super::compile(&schema).unwrap()));
+        assert!(prefix.push_bytes(b"null"));
+        assert!(prefix.is_complete());
+        // Null satisfies it, at once; anything else has to try the branches.
+        assert!(super::validate(&schema, &serde_json::json!(null)).is_ok());
+        assert!(super::validate(&schema, &serde_json::json!(1)).is_err());
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+    }
+
     use super::*;
 
     /// A finished value is checked whole, in any key order, and the error

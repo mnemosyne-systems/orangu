@@ -28,6 +28,8 @@ pub mod explorer;
 pub mod files;
 pub mod files_http;
 pub mod format;
+#[cfg(test)]
+mod fuzzing;
 pub mod gguf;
 pub mod gguf_write;
 pub mod git_index;

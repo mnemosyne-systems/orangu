@@ -133,8 +133,12 @@ pub struct TensorInfo {
 }
 
 impl TensorInfo {
+    /// How many elements the dimensions multiply to, or [`u64::MAX`] where a
+    /// damaged file's dimensions go past that.
     pub fn element_count(&self) -> u64 {
-        self.dims.iter().product()
+        self.dims
+            .iter()
+            .fold(1, |count, &dim| count.saturating_mul(dim))
     }
 
     pub fn shape(&self) -> String {
@@ -148,6 +152,18 @@ impl TensorInfo {
             .join(" x ")
     }
 }
+
+/// The most dimensions a tensor may have. The format's readers allow four; the
+/// margin is for a format extension, and the limit is against a file claiming
+/// four billion of them, each of which would be allocated up front.
+const MAX_TENSOR_DIMS: u32 = 16;
+
+/// The largest `general.alignment`: far past any real file's, and small enough
+/// that what is computed from it cannot overflow.
+const MAX_ALIGNMENT: u64 = 1 << 30;
+
+/// How deeply arrays may nest in a metadata value. Real files stop at one.
+const MAX_ARRAY_DEPTH: u32 = 16;
 
 #[derive(Debug)]
 pub struct GgufFile {
@@ -245,6 +261,7 @@ impl GgufFile {
         let mut reader = Reader {
             inner,
             bytes_read: 0,
+            array_depth: 0,
             pending_array: None,
         };
 
@@ -285,6 +302,11 @@ impl GgufFile {
         for _ in 0..tensor_count {
             let name = reader.read_string()?;
             let n_dims = reader.read_u32()?;
+            if n_dims > MAX_TENSOR_DIMS {
+                bail!(
+                    "tensor `{name}` has {n_dims} dimensions, more than the {MAX_TENSOR_DIMS} allowed"
+                );
+            }
             let mut dims = Vec::with_capacity(n_dims as usize);
             for _ in 0..n_dims {
                 dims.push(reader.read_u64()?);
@@ -306,8 +328,10 @@ impl GgufFile {
             .filter(|&a| a > 0)
             .unwrap_or(DEFAULT_ALIGNMENT);
 
-        let position = reader.bytes_read;
-        let data_offset = position.div_ceil(alignment) * alignment;
+        if !alignment.is_power_of_two() || alignment > MAX_ALIGNMENT {
+            bail!("general.alignment of {alignment} is not a power of two up to {MAX_ALIGNMENT}");
+        }
+        let data_offset = reader.bytes_read.div_ceil(alignment) * alignment;
         resolve_mxfp8(
             &mut tensors,
             alignment,
@@ -350,6 +374,9 @@ impl GgufFile {
 struct Reader<R> {
     inner: R,
     bytes_read: u64,
+    /// Arrays inside the value being read: each is a call deeper, and twelve
+    /// bytes of input can ask for another.
+    array_depth: u32,
     /// An array header `skip_array_over` read and did not skip, for the
     /// `read_value` that follows it.
     pending_array: Option<(u32, u64)>,
@@ -364,7 +391,15 @@ trait GgufSource: Read {
 
 impl GgufSource for BufReader<File> {
     fn skip(&mut self, n: u64) -> std::io::Result<()> {
-        self.seek_relative(n as i64)
+        // Past `i64::MAX` the cast would come out negative and seek backwards,
+        // over bytes this has read already.
+        let n = i64::try_from(n).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("skipping {n} bytes is past the end of any file"),
+            )
+        })?;
+        self.seek_relative(n)
     }
 }
 
@@ -475,6 +510,14 @@ impl<R: GgufSource> Reader<R> {
         Ok(self.read_u8()? != 0)
     }
 
+    fn enter_array(&mut self) -> Result<()> {
+        if self.array_depth >= MAX_ARRAY_DEPTH {
+            bail!("arrays nested more than {MAX_ARRAY_DEPTH} deep");
+        }
+        self.array_depth += 1;
+        Ok(())
+    }
+
     /// Skips the bytes of one value of `value_type` without building it.
     fn skip_value(&mut self, value_type: u32) -> Result<()> {
         let fixed: u64 = match value_type {
@@ -494,7 +537,9 @@ impl<R: GgufSource> Reader<R> {
             9 => {
                 let elem_type = self.read_u32()?;
                 let len = self.read_u64()?;
+                self.enter_array()?;
                 self.skip_array(elem_type, len)?;
+                self.array_depth -= 1;
                 0
             }
             other => bail!("unknown GGUF metadata value type {other}"),
@@ -532,7 +577,7 @@ impl<R: GgufSource> Reader<R> {
         self.inner
             .skip(n)
             .with_context(|| format!("skipping {n} bytes"))?;
-        self.bytes_read += n;
+        self.bytes_read = self.bytes_read.saturating_add(n);
         Ok(())
     }
 
@@ -561,8 +606,20 @@ impl<R: GgufSource> Reader<R> {
         if len > MAX_STRING_BYTES {
             bail!("string metadata value of {len} bytes exceeds the {MAX_STRING_BYTES}-byte limit");
         }
-        let mut buf = vec![0u8; len as usize];
-        self.read_exact(&mut buf)?;
+        // Grown as the bytes arrive: a length is only a claim until they do, and
+        // a small file can make it.
+        let mut buf = Vec::new();
+        (&mut self.inner)
+            .take(len)
+            .read_to_end(&mut buf)
+            .context("unexpected end of file")?;
+        if buf.len() as u64 != len {
+            bail!(
+                "unexpected end of file: string of {len} bytes holds {}",
+                buf.len()
+            );
+        }
+        self.bytes_read += len;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
@@ -592,10 +649,12 @@ impl<R: GgufSource> Reader<R> {
                         (elem_type, len)
                     }
                 };
+                self.enter_array()?;
                 let mut items = Vec::new();
                 for _ in 0..len {
                     items.push(self.read_value(elem_type)?);
                 }
+                self.array_depth -= 1;
                 Ok(GgufValue::Array(items))
             }
             10 => Ok(GgufValue::U64(self.read_u64()?)),
@@ -896,6 +955,130 @@ pub fn ggml_type_name(ggml_type: u32) -> String {
         Some(Some(name)) => name.to_string(),
         Some(None) => format!("reserved({ggml_type})"),
         None => format!("unknown({ggml_type})"),
+    }
+}
+
+#[cfg(test)]
+mod fuzz_tests {
+    use super::*;
+    use crate::fuzzing::{GgufBytes, fuzz};
+    use std::io::Cursor;
+
+    fn seeds() -> Vec<Vec<u8>> {
+        let mut plain = GgufBytes::new(3, 4);
+        plain
+            .kv_string("general.architecture", "llama")
+            .kv_u32("general.alignment", 32)
+            .kv_strings("tokenizer.ggml.tokens", &["a".to_string(), "b".to_string()]);
+        plain.string("scores").u32(9).u32(6).u64(2).u32(0).u32(0);
+        plain
+            .tensor("a.weight", &[4, 8], 0, 0)
+            .tensor("b.weight", &[32, 64], 43, 128)
+            .tensor("c.weight", &[], 8, 4096);
+        let mut nested = GgufBytes::new(0, 1);
+        nested.string("nested").u32(9);
+        for _ in 0..8 {
+            nested.u32(9).u64(1);
+        }
+        nested.u32(4).u64(1).u32(7);
+        let mut scalars = GgufBytes::new(1, 12);
+        for (i, ty) in (0u32..=7).chain(10..=12).enumerate() {
+            scalars.string(&format!("k{i}")).u32(ty);
+            scalars.0.extend_from_slice(
+                &[0x11; 8][..match ty {
+                    0 | 1 | 7 => 1,
+                    2 | 3 => 2,
+                    4..=6 => 4,
+                    _ => 8,
+                }],
+            );
+        }
+        scalars.kv_string("general.alignment", "x");
+        scalars.tensor("t", &[u64::from(u32::MAX), 2], 1, 8);
+        vec![plain.0, nested.0, scalars.0, b"GGUF".to_vec()]
+    }
+
+    fn reads(bytes: &[u8]) -> Result<GgufFile> {
+        GgufFile::read_with(Cursor::new(bytes), None, Some(bytes.len() as u64))
+    }
+
+    #[test]
+    fn arrays_nested_past_the_limit_are_refused_rather_than_recursed_into() {
+        let nested = |depth: usize| {
+            let mut file = GgufBytes::new(0, 1);
+            file.string("nested").u32(9);
+            for _ in 1..depth {
+                file.u32(9).u64(1);
+            }
+            file.u32(4).u64(1).u32(7);
+            file.0
+        };
+        assert!(reads(&nested(MAX_ARRAY_DEPTH as usize)).is_ok());
+        let deep = nested(1_000_000);
+        for limit in [None, Some(0)] {
+            let error = GgufFile::read_with(Cursor::new(&deep), limit, None).unwrap_err();
+            assert!(format!("{error:#}").contains("nested"), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn a_small_file_cannot_claim_memory_it_does_not_hold() {
+        // Four billion dimensions, none of them there.
+        let mut file = GgufBytes::new(1, 0);
+        file.string("t").u32(u32::MAX);
+        assert!(format!("{:#}", reads(&file.0).unwrap_err()).contains("dimensions"));
+        // A gigabyte of string, in a dozen bytes.
+        let mut file = GgufBytes::new(1, 0);
+        file.u64(1 << 30);
+        assert!(reads(&file.0).is_err());
+    }
+
+    #[test]
+    fn numbers_too_large_to_compute_with_are_errors_or_saturate() {
+        let mut file = GgufBytes::new(1, 1);
+        file.string("general.alignment").u32(10).u64(u64::MAX);
+        file.tensor("t", &[u64::MAX, u64::MAX], 1, 8);
+        assert!(format!("{:#}", reads(&file.0).unwrap_err()).contains("alignment"));
+
+        let mut file = GgufBytes::new(1, 0);
+        file.tensor("t", &[u64::MAX, u64::MAX], 43, 8);
+        let read = reads(&file.0).unwrap();
+        assert_eq!(read.tensors[0].element_count(), u64::MAX);
+    }
+
+    /// A file off the internet: every shape of damage has to come back as an
+    /// error, without taking the process down on the way.
+    #[test]
+    fn fuzz_gguf_reader() {
+        let array = [b"\x09\x00\x00\x00".as_slice(), &[0xff; 8]].concat();
+        let nest = [9u32.to_le_bytes(), 1u32.to_le_bytes()].concat();
+        fuzz(
+            "gguf_reader",
+            seeds(),
+            &[
+                b"general.alignment",
+                b"general.architecture",
+                &array,
+                &nest,
+                b"\x08\x00\x00\x00",
+            ],
+            1 << 22,
+            |input| {
+                for limit in [None, Some(1)] {
+                    let len = Some(input.len() as u64);
+                    let Ok(file) = GgufFile::read_with(Cursor::new(input), limit, len) else {
+                        continue;
+                    };
+                    let _ = file.type_element_totals();
+                    let _ = file.is_clip_projector();
+                    for tensor in &file.tensors {
+                        let _ = tensor.element_count();
+                        let _ = tensor.shape();
+                    }
+                }
+                let _ = GgufFile::read_from(std::io::BufReader::new(input));
+            },
+        );
     }
 }
 

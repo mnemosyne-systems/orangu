@@ -37,6 +37,12 @@ mod device_lost;
 #[cfg(test)]
 mod doc_tables;
 mod engine;
+#[cfg(test)]
+mod fuzz_targets;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../fuzzing.rs"]
+mod fuzzing;
 mod http;
 mod init;
 mod npu_tool;

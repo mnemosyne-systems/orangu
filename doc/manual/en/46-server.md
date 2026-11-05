@@ -2088,6 +2088,20 @@ local Prometheus. Its `host` defaults to `[orangu-server].host` (and follows
 does. `--metrics` overrides the config file's port for one run, the same way
 `--port`/`--web` do.
 
+### Damaged and hostile model files
+
+A model file comes from outside, and the server treats what it holds that way. A
+damaged GGUF is refused with an error at `list`, `show` or startup: a tensor with
+more than 16 dimensions, arrays nested more than 16 deep, a `general.alignment`
+that is not a power of two up to 1 GiB, or a string or array running past the end
+of the file.
+
+A chat template is limited too. One over 256 KiB is refused, and one render may
+run 100 million instructions, which stops a template that never finishes in about
+ten seconds. A request that hits either limit gets an error. The limit is far past
+a real conversation: the costliest template in use, `gemma-4`'s, takes around 30
+million for 5000 messages.
+
 ### Context shift
 
 Without this setting, a prompt longer than the context window is refused, and a
