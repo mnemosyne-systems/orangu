@@ -4006,6 +4006,15 @@ pub trait ModelForward: Send + Sync {
     /// indices stay global; the layers outside the range are present but
     /// hold nothing. The default is the whole model's cache, which is
     /// correct and merely larger than it has to be.
+    /// Asks for the memory `cache`'s sequence needs to reach `positions`,
+    /// before a prompt that long starts. A model whose layers are on other
+    /// machines, which cannot be seen running out from here, is the one that
+    /// can answer [`crate::engine::generate::NoRoomForPrompt`].
+    fn admit_prompt(&self, cache: &KvCache, positions: usize) -> Result<()> {
+        let _ = (cache, positions);
+        Ok(())
+    }
+
     fn new_kv_cache_for_layers(&self, layers: std::ops::Range<usize>, capacity: usize) -> KvCache {
         let _ = layers;
         self.new_kv_cache(capacity)

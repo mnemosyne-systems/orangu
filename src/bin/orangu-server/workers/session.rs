@@ -70,7 +70,13 @@ pub struct SessionStore {
     /// through it.
     node: String,
     sessions: Mutex<HashMap<u64, Arc<Mutex<Session>>>>,
+    /// How long a session has gone unused before a prompt with no room may
+    /// take its place. Shorter would catch a session between two forwards.
+    evictable_after: Duration,
 }
+
+/// [`SessionStore::evictable_after`].
+const EVICTABLE_AFTER: Duration = Duration::from_secs(30);
 
 impl SessionStore {
     pub fn new(pipeline: Arc<LayerPipeline>, capacity: usize, max_sessions: usize) -> Self {
@@ -80,7 +86,14 @@ impl SessionStore {
             max_sessions,
             node: "loopback".to_string(),
             sessions: Mutex::new(HashMap::new()),
+            evictable_after: EVICTABLE_AFTER,
         }
+    }
+
+    #[cfg(test)]
+    pub fn evictable_after(mut self, after: Duration) -> Self {
+        self.evictable_after = after;
+        self
     }
 
     pub fn named(mut self, node: impl Into<String>) -> Self {
@@ -96,6 +109,12 @@ impl SessionStore {
     #[cfg(test)]
     pub fn layers(&self) -> Range<usize> {
         self.pipeline.layers()
+    }
+
+    /// What this node has promised and not yet written.
+    #[cfg(test)]
+    pub fn promised_bytes(&self) -> u64 {
+        self.pipeline.room().promised_bytes()
     }
 
     /// Sessions currently held.
@@ -148,6 +167,12 @@ impl SessionStore {
                 self.release(session);
                 Message::Release { session }
             }
+            Message::Reserve { session, positions } => {
+                match self.reserve(session, positions as usize) {
+                    Ok(()) => Message::Reserve { session, positions },
+                    Err(error) => Message::Error(error),
+                }
+            }
             Message::Fork { from, to, len } => match self.fork(from, to, len as usize) {
                 Ok(()) => Message::Fork { from, to, len },
                 Err(error) => Message::Error(error),
@@ -178,6 +203,64 @@ impl SessionStore {
                 format!("unexpected message {:?}", std::mem::discriminant(&other)),
             )),
         }
+    }
+
+    /// Promises `session` memory for `positions` here and on the workers
+    /// below, letting go of conversations nobody is using if that makes room:
+    /// one taken up again is rebuilt by its parent. `0` takes a promise back.
+    pub fn reserve(&self, session: u64, positions: usize) -> Result<(), WorkerError> {
+        if positions == 0 {
+            self.pipeline.room().forget(session);
+            let _ = self.pipeline.reserve_below(session, 0);
+            return Ok(());
+        }
+        while let Err(short) = self.pipeline.room().reserve(session, positions) {
+            if !self.evict_oldest_idle(session) {
+                return Err(self.error(ErrorCode::OutOfMemory, short.to_string()));
+            }
+        }
+        self.pipeline
+            .reserve_below(session, positions)
+            .map_err(|error| {
+                self.pipeline.room().forget(session);
+                match error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<WorkerError>())
+                {
+                    Some(below) if below.code == ErrorCode::OutOfMemory => {
+                        let mut below = below.clone();
+                        below.path.insert(0, self.node.clone());
+                        below
+                    }
+                    _ => self.error(ErrorCode::ChildLost, format!("{error:#}")),
+                }
+            })
+    }
+
+    /// Lets go of the session unused for longest, other than `keep`; whether
+    /// there was one to let go of. Not one running, or still owed memory for
+    /// a prompt on its way.
+    fn evict_oldest_idle(&self, keep: u64) -> bool {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock().unwrap();
+        let oldest = sessions
+            .iter()
+            .filter(|(id, _)| **id != keep && !self.pipeline.room().owes(**id))
+            .filter_map(|(id, session)| {
+                let used = session.try_lock().ok()?.last_used;
+                (now.duration_since(used) >= self.evictable_after).then_some((*id, used))
+            })
+            .min_by_key(|(_, used)| *used)
+            .map(|(id, _)| id);
+        let Some(id) = oldest else {
+            return false;
+        };
+        let removed = sessions.remove(&id);
+        drop(sessions);
+        self.pipeline.room().forget(id);
+        log::info!("orangu-server: workers: session {id} let go to make room for a prompt");
+        drop(removed);
+        true
     }
 
     /// Starts session `to` with a copy of `from`'s first `len` positions:
@@ -265,6 +348,7 @@ impl SessionStore {
 
     /// Frees `session` here and, through its cache, on every worker below.
     pub fn release(&self, session: u64) {
+        self.pipeline.room().forget(session);
         let removed = self.sessions.lock().unwrap().remove(&session);
         // Dropped after the map's lock is let go: dropping the cache
         // releases the session on this node's own workers.
@@ -287,6 +371,9 @@ impl SessionStore {
             .collect();
         let removed: Vec<_> = stale.iter().filter_map(|id| sessions.remove(id)).collect();
         drop(sessions);
+        for id in &stale {
+            self.pipeline.room().forget(*id);
+        }
         removed.len()
     }
 
@@ -498,6 +585,7 @@ mod tests {
     use super::*;
     use crate::workers::pipeline::fixture::{self, N_CTX, N_EMBD};
     use crate::workers::protocol::{ActivationFormat, Rows};
+    use crate::workers::room::KvRoom;
     use crate::workers::stage::LoopbackStage;
 
     fn store(max_sessions: usize) -> SessionStore {
@@ -691,5 +779,129 @@ mod tests {
         let err = middle.forward(forward(2, 0, &[1])).unwrap_err();
         assert_eq!(err.code, ErrorCode::Busy);
         assert_eq!(err.path, ["middle", "leaf"]);
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    /// A store with `free` as its machine's memory, a position costing 1 MiB.
+    fn with_room(free: impl Fn() -> u64 + Send + Sync + 'static) -> SessionStore {
+        let pipeline = LayerPipeline::new(fixture::model(), 1..3, vec![])
+            .unwrap()
+            .with_room(KvRoom::with_free_memory(MIB, Box::new(free)));
+        SessionStore::new(Arc::new(pipeline), N_CTX, 8).named("w1:8400")
+    }
+
+    fn reserve(store: &SessionStore, session: u64, positions: u32) -> Message {
+        store.handle(Message::Reserve { session, positions })
+    }
+
+    #[test]
+    fn a_prompt_with_no_room_is_refused_saying_where_and_by_how_much() {
+        let store = with_room(|| 10 * MIB);
+        assert_eq!(
+            reserve(&store, 1, 10),
+            Message::Reserve {
+                session: 1,
+                positions: 10
+            }
+        );
+        let Message::Error(error) = reserve(&store, 2, 11) else {
+            panic!("not refused");
+        };
+        assert_eq!(error.code, ErrorCode::OutOfMemory);
+        assert_eq!(error.path, vec!["w1:8400".to_string()]);
+        assert!(error.message.contains("11.00 MiB"), "{error}");
+    }
+
+    #[test]
+    fn a_forward_settles_what_was_promised_and_a_release_gives_it_back() {
+        let store = with_room(|| 10 * MIB);
+        assert!(matches!(reserve(&store, 1, 3), Message::Reserve { .. }));
+        assert_eq!(store.pipeline.room().promised_bytes(), 3 * MIB);
+        store.forward(forward(1, 0, &[1, 2])).unwrap();
+        assert_eq!(store.pipeline.room().promised_bytes(), MIB);
+        store.release(1);
+        assert_eq!(store.pipeline.room().promised_bytes(), 0);
+    }
+
+    #[test]
+    fn asking_for_nothing_takes_a_promise_back() {
+        let store = with_room(|| 10 * MIB);
+        assert!(matches!(reserve(&store, 1, 10), Message::Reserve { .. }));
+        assert!(matches!(reserve(&store, 1, 0), Message::Reserve { .. }));
+        assert_eq!(store.pipeline.room().promised_bytes(), 0);
+        assert!(matches!(reserve(&store, 2, 10), Message::Reserve { .. }));
+    }
+
+    /// Memory that frees up as sessions go, as it does when their rows are
+    /// dropped: `room` holds `free`, plus `each` for every session let go of
+    /// of the `sessions` it started with.
+    fn room_as_sessions_go(
+        each: u64,
+        count: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> impl Fn() -> u64 + Send + Sync + 'static {
+        use std::sync::atomic::Ordering;
+        move || each * count.fetch_add(1, Ordering::Relaxed) as u64
+    }
+
+    #[test]
+    fn a_conversation_nobody_is_using_makes_room_oldest_first() {
+        let store = with_room(room_as_sessions_go(
+            10 * MIB,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        ))
+        .evictable_after(Duration::ZERO);
+        store.forward(forward(1, 0, &[1])).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        store.forward(forward(2, 0, &[1])).unwrap();
+        assert!(matches!(reserve(&store, 3, 10), Message::Reserve { .. }));
+        let held = store.sessions.lock().unwrap();
+        assert!(!held.contains_key(&1), "the oldest goes first");
+        assert!(held.contains_key(&2), "and no more than it takes");
+    }
+
+    #[test]
+    fn a_conversation_in_recent_use_is_not_let_go() {
+        let store = with_room(|| 0);
+        store.forward(forward(1, 0, &[1])).unwrap();
+        assert!(matches!(reserve(&store, 2, 1), Message::Error(_)));
+        assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn a_session_with_a_prompt_on_its_way_is_not_let_go() {
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(100 * MIB));
+        let reading = free.clone();
+        let store = with_room(move || reading.load(std::sync::atomic::Ordering::Relaxed))
+            .evictable_after(Duration::ZERO);
+        store.forward(forward(1, 0, &[1])).unwrap();
+        assert!(matches!(reserve(&store, 1, 50), Message::Reserve { .. }));
+        free.store(MIB, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(reserve(&store, 2, 60), Message::Error(_)));
+        assert_eq!(store.len(), 1, "it is still owed");
+    }
+
+    /// The last stage refuses: the node's own promise goes too, the refusal
+    /// keeps the path it came by, and the answer is the worker's own.
+    #[test]
+    fn a_refusal_from_below_gives_back_this_node_s_promise() {
+        let below = LayerPipeline::new(fixture::model(), 3..fixture::N_LAYER, vec![])
+            .unwrap()
+            .with_room(KvRoom::with_free_memory(MIB, Box::new(|| 0)));
+        let below = Arc::new(SessionStore::new(Arc::new(below), N_CTX, 8).named("w1:8400"));
+        let stage = LoopbackStage::new(below, ActivationFormat::F32);
+        let pipeline = LayerPipeline::new(fixture::model(), 1..3, vec![Box::new(stage)])
+            .unwrap()
+            .with_room(KvRoom::with_free_memory(MIB, Box::new(|| 100 * MIB)));
+        let store = SessionStore::new(Arc::new(pipeline), N_CTX, 8).named("w0:8400");
+        let Message::Error(error) = reserve(&store, 1, 10) else {
+            panic!("not refused");
+        };
+        assert_eq!(error.code, ErrorCode::OutOfMemory);
+        assert_eq!(
+            error.path,
+            vec!["w0:8400".to_string(), "w1:8400".to_string()]
+        );
+        assert_eq!(store.pipeline.room().promised_bytes(), 0);
     }
 }

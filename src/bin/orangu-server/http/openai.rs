@@ -466,6 +466,9 @@ async fn collect(
                 break;
             }
             StreamEvent::Overloaded => return Err(Box::new(crate::http::overloaded_response())),
+            StreamEvent::NoRoom(message) => {
+                return Err(Box::new(crate::http::no_room_response(message)));
+            }
             StreamEvent::Error(err) => {
                 return Err(Box::new(
                     (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
@@ -1676,7 +1679,7 @@ pub async fn chat_completions(
                     yield sse(&json!({"error": crate::http::OVERLOADED_MESSAGE}));
                     return;
                 }
-                StreamEvent::Error(err) => {
+                StreamEvent::Error(err) | StreamEvent::NoRoom(err) => {
                     yield sse(&json!({"error": err}));
                     return;
                 }
@@ -2325,7 +2328,7 @@ pub async fn completions(
                         yield sse(&json!({"error": crate::http::OVERLOADED_MESSAGE}));
                         return;
                     }
-                    StreamEvent::Error(err) => {
+                    StreamEvent::Error(err) | StreamEvent::NoRoom(err) => {
                         yield sse(&json!({"error": err}));
                         return;
                     }

@@ -402,6 +402,9 @@ pub enum StreamEvent {
     /// `Retry-After`, which a client can act on, where a `500` invites a
     /// bug report.
     Overloaded,
+    /// A node has no memory for the prompt's KV cache ([`NoRoomForPrompt`]): a
+    /// `503` saying which node and by how much.
+    NoRoom(String),
     /// Emitted after each prefill chunk, while the prompt is still being
     /// processed. Until this existed the only progress report was the `Done`
     /// event at the very end, so a client had nothing to show during the part
@@ -1681,6 +1684,18 @@ fn run_leg(
 
     let prompt_start = Instant::now();
     let total_prompt = req.prompt_tokens.len();
+    // Before any of it runs. Its prompt and the first answer token's row, as
+    // the paged pool promises: `max_tokens` is a cap, not a requirement.
+    if !resuming
+        && let Some(held) = cache.as_ref()
+        && let Err(err) = model.admit_prompt(held, total_prompt + 1)
+    {
+        let _ = tx.send(match err.downcast::<NoRoomForPrompt>() {
+            Ok(no_room) => StreamEvent::NoRoom(no_room.0),
+            Err(err) => StreamEvent::Error(format!("{err:?}")),
+        });
+        return Ok(None);
+    }
     let progress_tx = tx.clone();
     let mut on_chunk = |processed: usize| {
         // A client that hung up mid-prompt stops the prefill at the next
@@ -1769,6 +1784,10 @@ fn run_leg(
                 reused_len,
                 0,
             );
+            return Ok(None);
+        }
+        Err(err) if err.is::<NoRoomForPrompt>() => {
+            let _ = tx.send(StreamEvent::NoRoom(err.to_string()));
             return Ok(None);
         }
         Err(err) => {
@@ -3292,6 +3311,19 @@ fn chunk_policy() -> ChunkPolicy {
 /// A prefill stopped between chunks because its client went away.
 #[derive(Debug)]
 struct PrefillCancelled;
+
+/// A node has no memory for a prompt's KV cache, and said so before running
+/// it (`ModelForward::admit_prompt`).
+#[derive(Debug)]
+pub struct NoRoomForPrompt(pub String);
+
+impl std::fmt::Display for NoRoomForPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoRoomForPrompt {}
 
 impl std::fmt::Display for PrefillCancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -6172,6 +6204,7 @@ mod tests {
                 | StreamEvent::Logprob(_) => {}
                 StreamEvent::Done { .. } => ok = true,
                 StreamEvent::Error(e) => panic!("unexpected generation error: {e}"),
+                StreamEvent::NoRoom(e) => panic!("unexpected refusal: {e}"),
                 StreamEvent::Overloaded => panic!("unexpected refusal: these pools are unbounded"),
             }
         }
@@ -6946,6 +6979,7 @@ mod tests {
                     finish_reason,
                 } => done = Some((stats, finish_reason)),
                 StreamEvent::Error(e) => panic!("unexpected generation error: {e}"),
+                StreamEvent::NoRoom(e) => panic!("unexpected refusal: {e}"),
                 StreamEvent::Overloaded => panic!("unexpected refusal"),
             }
         }
@@ -8688,6 +8722,92 @@ mod tests {
             rx.recv().await.is_none(),
             "the channel must close after the one error event, not send anything further"
         );
+    }
+
+    /// A model that has no room for any prompt, and panics if one runs.
+    struct RefusingModel {
+        inner: PanickingModel,
+        asked: Mutex<Option<usize>>,
+    }
+
+    impl ModelForward for RefusingModel {
+        fn config(&self) -> &ModelConfig {
+            self.inner.config()
+        }
+
+        fn new_kv_cache(&self, capacity: usize) -> KvCache {
+            self.inner.new_kv_cache(capacity)
+        }
+
+        fn forward(
+            &self,
+            cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+            slot_id: usize,
+        ) -> Result<Vec<f32>> {
+            self.inner.forward(cache, tokens, start_pos, slot_id)
+        }
+
+        fn forward_hidden_states(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+            self.inner.forward_hidden_states(tokens)
+        }
+
+        fn admit_prompt(&self, _cache: &KvCache, positions: usize) -> Result<()> {
+            *self.asked.lock().unwrap() = Some(positions);
+            Err(anyhow::Error::new(NoRoomForPrompt(
+                "OutOfMemory: no room (at w1:8400)".to_string(),
+            )))
+        }
+    }
+
+    /// Asked for its prompt and one answer token, whatever `max_tokens` says,
+    /// and refused before anything runs: the client gets the reason.
+    #[tokio::test]
+    async fn a_prompt_with_no_room_is_refused_before_it_runs() {
+        let model = Arc::new(RefusingModel {
+            inner: PanickingModel::new(),
+            asked: Mutex::new(None),
+        });
+        let engine = Engine {
+            mtp: None,
+            paged_kv: None,
+            metrics: Arc::new(crate::engine::metrics::ServerMetrics::new()),
+            draft: None,
+            model: model.clone(),
+            tokenizer: Arc::new(letter_tokenizer(8)),
+            chat_template_source: None,
+            chat_template: None,
+            recurrent: false,
+            slots: SlotPool::new(1),
+            prefix_cache: None,
+            decode_batcher: Arc::new(crate::engine::decode_batch::DecodeBatcher::new()),
+            slot_store: None,
+            role: crate::config::Role::default(),
+            reasoning_effort: None,
+            live_stats: false,
+            context_shift: None,
+            image: None,
+            video: None,
+            audio: None,
+            vision: None,
+            switch: None,
+        };
+        let mut rx = engine
+            .generate(GenerateRequest {
+                prompt_tokens: vec![1, 2, 3],
+                sampling: greedy_params(),
+                max_tokens: 4000,
+                cache_prompt: true,
+                ..Default::default()
+            })
+            .await;
+        match rx.recv().await {
+            Some(StreamEvent::NoRoom(message)) => assert!(message.contains("w1:8400"), "{message}"),
+            _ => panic!("expected the refusal"),
+        }
+        assert!(rx.recv().await.is_none());
+        assert_eq!(*model.asked.lock().unwrap(), Some(4));
     }
 
     /// An ordinary panic keeps its full detail (the test above proves that

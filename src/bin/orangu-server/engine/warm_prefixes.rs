@@ -252,6 +252,7 @@ pub async fn warm_up(
                     break;
                 }
                 crate::engine::generate::StreamEvent::Error(_)
+                | crate::engine::generate::StreamEvent::NoRoom(_)
                 | crate::engine::generate::StreamEvent::Overloaded => break,
                 _ => {}
             }

@@ -683,6 +683,9 @@ impl Node {
                 serde_json::json!({
                     "address": link.addr,
                     "connected": info.is_some(),
+                    // Its failures in a row, and how long they leave it out.
+                    "failures_in_a_row": link.failures_in_a_row(),
+                    "left_out_seconds": link.out_for().map(|left| left.as_secs()),
                     "node": info.as_ref().map(|i| i.node.clone()),
                     "subtree_nodes": info.as_ref().map(|i| i.capacity.subtree_nodes),
                     "features": info.as_ref().map(|i| super::protocol::feature_names(i.features)),
@@ -705,6 +708,10 @@ impl Node {
             "quant": self.settings.quant,
             "plan": plan,
             "workers": workers,
+            // Memory this node has promised prompts on their way, and the
+            // prompts its tree refused for lack of it.
+            "kv_promised_bytes": self.top.read().unwrap().0.room().promised_bytes(),
+            "kv_refusals": super::room::refused(),
             // This node's processors and speed, and what the last
             // plan's shares followed.
             "setup": setups_json(&self.settings.capacity.setups[..1])[0],
@@ -911,6 +918,15 @@ impl Node {
         if path.len() < MAX_DEPTH {
             let mut missing = Vec::new();
             for link in &self.links {
+                if let Some(left) = link.out_for() {
+                    log::debug!(
+                        "orangu-server: worker {} left out for {} s more",
+                        link.addr,
+                        left.as_secs()
+                    );
+                    missing.push(link.addr.clone());
+                    continue;
+                }
                 match link.ensure_connected(secret, path) {
                     Ok(info) => candidates.push((link.clone(), info)),
                     // Said once per outage: a worker that stays away is
@@ -929,6 +945,9 @@ impl Node {
             let mut spares = self.standby_links.iter();
             for lost in missing {
                 for link in spares.by_ref() {
+                    if link.out_for().is_some() {
+                        continue;
+                    }
                     match link.ensure_connected(secret, path) {
                         Ok(info) => {
                             candidates.push((link.clone(), info));
@@ -1146,7 +1165,8 @@ impl Node {
         let secret = self.settings.secret.as_deref();
         let mut standing = self.standing_in.lock().unwrap();
         for link in &self.standby_links {
-            if standing.iter().any(|(_, standby)| *standby == link.addr) {
+            if standing.iter().any(|(_, standby)| *standby == link.addr) || link.out_for().is_some()
+            {
                 continue;
             }
             if let Err(error) = link.ensure_connected(secret, path) {
@@ -2408,6 +2428,9 @@ impl Node {
     /// While a standby stands in for a lost worker, only when that worker
     /// answers again: a plan without it would drop the standby too, and
     /// shrink the tree to what is left.
+    ///
+    /// A worker left out for its failures is not tried, only planned out if
+    /// the plan still has it.
     fn missing_and_due(&self) -> bool {
         if self.planning.lock().unwrap().elapsed() < self.settings.readmit {
             return false;
@@ -2421,8 +2444,15 @@ impl Node {
             .map(|a| a.path.clone())
             .unwrap_or_else(|| vec![self.id.clone()]);
         let secret = self.settings.secret.as_deref();
+        let used = self.used.lock().unwrap().clone();
         self.links.iter().any(|link| {
-            !link.is_connected() && (!standing || link.ensure_connected(secret, &path).is_ok())
+            if link.is_connected() {
+                return false;
+            }
+            if link.out_for().is_some() {
+                return used.contains(&link.addr);
+            }
+            !standing || link.ensure_connected(secret, &path).is_ok()
         })
     }
 
@@ -2522,6 +2552,15 @@ impl PipelineSource for Node {
 
     fn head_on_last(&self) -> bool {
         self.head_on_last.load(Ordering::Acquire)
+    }
+
+    fn served_whole(&self) {
+        let used = self.used.lock().unwrap();
+        for link in self.links.iter().chain(&self.standby_links) {
+            if link.is_connected() && used.contains(&link.addr) {
+                link.forgive();
+            }
+        }
     }
 
     fn observed_decode(&self, parts: &[(String, Duration)], tokens: usize) {
@@ -3713,5 +3752,363 @@ mod tests {
         assert!(err.message.contains("loop"), "{err}");
         a.stop();
         b.stop();
+    }
+
+    /// A proxy in front of a worker that cuts the connection at the next
+    /// `cuts` forwards: the worker's side first, so it has let its parent go
+    /// by the time the parent finds out.
+    struct Flaky {
+        addr: String,
+        cuts: Arc<AtomicUsize>,
+        dials: Arc<AtomicUsize>,
+        /// Reservations it has passed on.
+        asked: Arc<AtomicUsize>,
+    }
+
+    fn flaky(worker: &Arc<Node>, cuts: usize) -> Flaky {
+        let target = worker.local_addr().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let cuts = Arc::new(AtomicUsize::new(cuts));
+        let dials = Arc::new(AtomicUsize::new(0));
+        let asked = Arc::new(AtomicUsize::new(0));
+        let (left, dialled, reservations) = (cuts.clone(), dials.clone(), asked.clone());
+        std::thread::spawn(move || {
+            for parent in listener.incoming() {
+                let Ok(parent) = parent else { return };
+                dialled.fetch_add(1, Ordering::Relaxed);
+                let left = left.clone();
+                let reservations = reservations.clone();
+                std::thread::spawn(move || {
+                    let mut to_worker = TcpStream::connect(target).unwrap();
+                    let mut from_worker = to_worker.try_clone().unwrap();
+                    let mut to_parent = parent.try_clone().unwrap();
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from_worker, &mut to_parent);
+                    });
+                    let mut from_parent = BufReader::new(parent.try_clone().unwrap());
+                    while let Ok((id, message, _)) = read_frame(&mut from_parent) {
+                        if matches!(message, Message::Reserve { .. }) {
+                            reservations.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if matches!(message, Message::Forward(_) | Message::ForwardBatch(_))
+                            && left
+                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                    n.checked_sub(1)
+                                })
+                                .is_ok()
+                        {
+                            break;
+                        }
+                        if write_message(&mut to_worker, id, &message).is_err() {
+                            break;
+                        }
+                    }
+                    let _ = to_worker.shutdown(std::net::Shutdown::Both);
+                    std::thread::sleep(Duration::from_millis(100));
+                    let _ = parent.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        Flaky {
+            addr,
+            cuts,
+            dials,
+            asked,
+        }
+    }
+
+    fn top_over(flaky: &Flaky) -> Arc<Node> {
+        node_with(
+            settings("top", vec![flaky.addr.clone()], None),
+            Variant::default(),
+        )
+    }
+
+    /// Long enough for the watch to try a missing worker: it waits for the
+    /// node to be quiet, and `readmit` is 200 ms here.
+    const PAST_QUIET: Duration = Duration::from_millis(QUIET.as_millis() as u64 + 800);
+
+    /// A worker that takes every assignment and loses every forward: the
+    /// request is answered without it, and it is neither dialled nor planned
+    /// for again.
+    #[test]
+    fn a_worker_failing_every_request_is_left_out() {
+        let worker = node("worker", &[], Variant::default());
+        let proxy = flaky(&worker, usize::MAX);
+        let top = top_over(&proxy);
+        let tokens = fixture::tokens();
+        let split = top.delegating_model().unwrap();
+        assert!(top.plan().iter().any(|e| e.node == "worker"));
+
+        assert_eq!(
+            run(split.as_ref(), &tokens, 5),
+            run(fixture::model().as_ref(), &tokens, 5),
+        );
+        assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
+        let dials = proxy.dials.load(Ordering::Relaxed);
+        let plans = top.metrics.plans.load(Ordering::Relaxed);
+        std::thread::sleep(PAST_QUIET);
+        assert_eq!(proxy.dials.load(Ordering::Relaxed), dials, "dialled again");
+        assert_eq!(
+            top.metrics.plans.load(Ordering::Relaxed),
+            plans,
+            "planned again"
+        );
+        assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
+        top.stop();
+        worker.stop();
+    }
+
+    fn worker_status(node: &Node) -> serde_json::Value {
+        node.status()["workers"][0].clone()
+    }
+
+    /// Runs a request and reports it finished, as the engine does.
+    fn request(model: &Arc<DelegatingModel>, tokens: &[u32]) {
+        let mut cache = model.new_kv_cache(N_CTX);
+        model.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
+        for (pos, token) in tokens.iter().enumerate().skip(5) {
+            model.forward(&mut cache, &[*token], pos, 0).unwrap();
+        }
+        cache.request_finished();
+    }
+
+    #[test]
+    fn the_status_says_who_is_left_out() {
+        let worker = node("worker", &[], Variant::default());
+        let proxy = flaky(&worker, usize::MAX);
+        let top = top_over(&proxy);
+        let split = top.delegating_model().unwrap();
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 0);
+        assert!(worker_status(&top)["left_out_seconds"].is_null());
+        request(&split, &fixture::tokens());
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 2);
+        let left = worker_status(&top)["left_out_seconds"].as_u64().unwrap();
+        assert!((60..=120).contains(&left), "{left}");
+        assert!(top.unready().is_none(), "serving without it");
+        top.stop();
+        worker.stop();
+    }
+
+    /// Dies once a request and comes back: the replay finishes each request,
+    /// and is no reason to forgive it.
+    #[test]
+    fn a_request_finished_by_a_replay_does_not_forgive() {
+        let worker = node("worker", &[], Variant::default());
+        let proxy = flaky(&worker, 1);
+        let top = top_over(&proxy);
+        let tokens = fixture::tokens();
+        let split = top.delegating_model().unwrap();
+        request(&split, &tokens);
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 1);
+        assert!(top.plan().iter().any(|e| e.node == "worker"));
+
+        proxy.cuts.store(1, Ordering::Relaxed);
+        request(&split, &tokens);
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 2);
+        assert!(worker_status(&top)["left_out_seconds"].is_u64());
+        assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
+        top.stop();
+        worker.stop();
+    }
+
+    #[test]
+    fn a_request_served_whole_forgives() {
+        let worker = node("worker", &[], Variant::default());
+        let proxy = flaky(&worker, 1);
+        let top = top_over(&proxy);
+        let tokens = fixture::tokens();
+        let split = top.delegating_model().unwrap();
+        request(&split, &tokens);
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 1);
+        request(&split, &tokens);
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 0);
+
+        proxy.cuts.store(1, Ordering::Relaxed);
+        request(&split, &tokens);
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 1, "starts over");
+        assert!(worker_status(&top)["left_out_seconds"].is_null());
+        top.stop();
+        worker.stop();
+    }
+
+    /// Decoding here alone, a request's part on the tree ends with its
+    /// prompt, and no finish is reported for the cache that comes back.
+    #[test]
+    fn a_prompt_handed_over_whole_forgives() {
+        let hybrid = Variant {
+            hybrid: true,
+            ..Variant::default()
+        };
+        let worker = node("worker", &[], hybrid);
+        let proxy = flaky(&worker, 1);
+        let mut with = settings("top", vec![proxy.addr.clone()], None);
+        with.decode = DecodeOn::Top;
+        let top = node_with(with, hybrid);
+        let tokens = fixture::tokens();
+        let split = top.delegating_model().unwrap();
+        assert!(top.decode_alone(), "{}", top.status());
+        request(&split, &tokens);
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 1);
+        request(&split, &tokens);
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 0);
+        top.stop();
+        worker.stop();
+    }
+
+    /// Its wait over, a worker is taken back between requests; failing again
+    /// it is left out for longer, its failures still counted.
+    #[test]
+    fn a_worker_is_taken_back_when_its_wait_ends() {
+        let worker = node("worker", &[], Variant::default());
+        let proxy = flaky(&worker, usize::MAX);
+        let top = top_over(&proxy);
+        let tokens = fixture::tokens();
+        let split = top.delegating_model().unwrap();
+        request(&split, &tokens);
+        assert!(worker_status(&top)["left_out_seconds"].is_u64());
+
+        top.links[0].end_wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !top.plan().iter().any(|e| e.node == "worker") {
+            assert!(Instant::now() < deadline, "not taken back");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        request(&split, &tokens);
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 3);
+        let left = worker_status(&top)["left_out_seconds"].as_u64().unwrap();
+        assert!((120..=240).contains(&left), "{left}");
+        assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
+
+        // Healthy by the next try: it serves, and that forgives it.
+        proxy.cuts.store(0, Ordering::Relaxed);
+        top.links[0].end_wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !top.plan().iter().any(|e| e.node == "worker") {
+            assert!(Instant::now() < deadline, "not taken back");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        request(&split, &tokens);
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 0);
+        top.stop();
+        worker.stop();
+    }
+
+    /// A worker left out with no request running still leaves the plan: the
+    /// node would say it is short of a worker for as long as the wait lasts.
+    #[test]
+    fn a_worker_left_out_while_idle_leaves_the_plan() {
+        let worker = node("worker", &[], Variant::default());
+        let top = node("top", &[&worker], Variant::default());
+        assert!(top.plan().iter().any(|e| e.node == "worker"));
+        top.links[0].count_failure();
+        top.links[0].count_failure();
+        top.links[0].disconnect();
+        assert!(top.unready().is_some());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while top.unready().is_some() {
+            assert!(Instant::now() < deadline, "still in the plan");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
+        top.stop();
+        worker.stop();
+    }
+
+    /// A worker that says it is busy is working, and comes back when free.
+    #[test]
+    fn a_refusal_is_no_failure() {
+        let worker = node("worker", &[], Variant::default());
+        let first = node("first", &[&worker], Variant::default());
+        let second = node("second", &[&worker], Variant::default());
+        assert!(first.plan().iter().any(|e| e.node == "worker"));
+        assert_eq!(describe(&second.plan()), format!("second 0..{N_LAYER}"));
+        std::thread::sleep(Duration::from_millis(800));
+        assert_eq!(worker_status(&second)["failures_in_a_row"], 0);
+        assert!(worker_status(&second)["left_out_seconds"].is_null());
+        for n in [&second, &first, &worker] {
+            n.stop();
+        }
+    }
+
+    /// A worker failing below the top is left out by the node above it. That
+    /// node stays in the plan: its connection never failed.
+    #[test]
+    fn a_failing_worker_below_the_top_is_left_out_there() {
+        let leaf = node("leaf", &[], Variant::default());
+        let proxy = flaky(&leaf, usize::MAX);
+        let middle = node_with(
+            settings("middle", vec![proxy.addr.clone()], None),
+            Variant::default(),
+        );
+        let top = node("top", &[&middle], Variant::default());
+        let tokens = fixture::tokens();
+        let split = top.delegating_model().unwrap();
+        assert!(top.plan().iter().any(|e| e.node == "leaf"));
+        assert_eq!(
+            run(split.as_ref(), &tokens, 5),
+            run(fixture::model().as_ref(), &tokens, 5),
+        );
+        assert!(worker_status(&middle)["left_out_seconds"].is_u64());
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 0);
+        let plan = top.plan();
+        assert!(plan.iter().any(|e| e.node == "middle"), "{plan:?}");
+        assert!(!plan.iter().any(|e| e.node == "leaf"), "{plan:?}");
+        let dials = proxy.dials.load(Ordering::Relaxed);
+        std::thread::sleep(PAST_QUIET);
+        assert_eq!(proxy.dials.load(Ordering::Relaxed), dials, "dialled again");
+        top.stop();
+        middle.stop();
+        leaf.stop();
+    }
+
+    /// A worker refusing a prompt for memory, over a real connection and on
+    /// this machine's real memory: nobody has failed, the connection stays,
+    /// the plan stands, and the next request runs.
+    #[test]
+    fn a_prompt_refused_for_memory_costs_the_worker_nothing() {
+        let worker = node("worker", &[], Variant::default());
+        let mut with = settings("top", vec![worker.local_addr().unwrap().to_string()], None);
+        with.local_layers = LocalLayers::Count(0);
+        let top = node_with(with, Variant::default());
+        let split = top.delegating_model().unwrap();
+        let tokens = fixture::tokens();
+        let plan = describe(&top.plan());
+        let plans = top.metrics.plans.load(Ordering::Relaxed);
+
+        let cache = split.new_kv_cache(N_CTX);
+        let error = split.admit_prompt(&cache, u32::MAX as usize).unwrap_err();
+        assert!(error.is::<crate::engine::generate::NoRoomForPrompt>());
+        assert!(error.to_string().contains("OutOfMemory"), "{error}");
+        drop(cache);
+
+        assert_eq!(worker_status(&top)["failures_in_a_row"], 0);
+        assert_eq!(worker_status(&top)["connected"], true);
+        assert_eq!(describe(&top.plan()), plan);
+        assert_eq!(top.metrics.plans.load(Ordering::Relaxed), plans);
+        assert_eq!(top.metrics.recoveries.load(Ordering::Relaxed), 0);
+        assert!(top.status()["kv_refusals"].as_u64().unwrap() > 0);
+        request(&split, &tokens);
+        top.stop();
+        worker.stop();
+    }
+
+    /// A worker lost after the promise: the rebuild on the new plan asks
+    /// again, for the same length.
+    #[test]
+    fn a_rebuilt_sequence_asks_for_its_room_again() {
+        let worker = node("worker", &[], Variant::default());
+        let proxy = flaky(&worker, 1);
+        let top = top_over(&proxy);
+        let tokens = fixture::tokens();
+        let split = top.delegating_model().unwrap();
+        let mut cache = split.new_kv_cache(N_CTX);
+        split.admit_prompt(&cache, 6).unwrap();
+        assert_eq!(proxy.asked.load(Ordering::Relaxed), 1);
+        split.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
+        assert_eq!(proxy.asked.load(Ordering::Relaxed), 2);
+        top.stop();
+        worker.stop();
     }
 }

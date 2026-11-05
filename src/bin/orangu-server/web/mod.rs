@@ -1069,7 +1069,7 @@ async fn send_message(
                         .data(serde_json::json!({"error": crate::http::OVERLOADED_MESSAGE}).to_string()));
                     break;
                 }
-                StreamEvent::Error(err) => {
+                StreamEvent::Error(err) | StreamEvent::NoRoom(err) => {
                     yield Ok(axum::response::sse::Event::default()
                         .data(json!({"type": "error", "message": err}).to_string()));
                     break;

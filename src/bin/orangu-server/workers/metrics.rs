@@ -103,11 +103,16 @@ pub fn render(node: &NodeMetrics, assigned: bool, links: &[LinkSnapshot<'_>]) ->
          # HELP orangu_server_workers_takeovers_total Times a standby took over a lost \
          worker's layers.\n\
          # TYPE orangu_server_workers_takeovers_total counter\n\
-         orangu_server_workers_takeovers_total {}\n",
+         orangu_server_workers_takeovers_total {}\n\
+         # HELP orangu_server_workers_kv_refusals_total Prompts refused because a node of the \
+         tree has no memory for their KV cache.\n\
+         # TYPE orangu_server_workers_kv_refusals_total counter\n\
+         orangu_server_workers_kv_refusals_total {}\n",
         u8::from(assigned),
         node.plans.load(Ordering::Relaxed),
         node.recoveries.load(Ordering::Relaxed),
         node.takeovers.load(Ordering::Relaxed),
+        super::room::refused(),
     ));
     if links.is_empty() {
         return out;

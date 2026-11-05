@@ -966,6 +966,7 @@ pub(super) async fn serve_generation(
                     break;
                 }
                 StreamEvent::Overloaded => return crate::http::overloaded_response(),
+                StreamEvent::NoRoom(message) => return crate::http::no_room_response(message),
                 StreamEvent::Error(err) => {
                     return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
                 }
@@ -1015,7 +1016,7 @@ pub(super) async fn serve_generation(
                         .data(serde_json::json!({"error": crate::http::OVERLOADED_MESSAGE}).to_string()));
                     break;
                 }
-                StreamEvent::Error(err) => {
+                StreamEvent::Error(err) | StreamEvent::NoRoom(err) => {
                     yield Ok(axum::response::sse::Event::default()
                         .data(serde_json::json!({"error": err}).to_string()));
                 }

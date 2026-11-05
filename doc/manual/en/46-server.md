@@ -2666,8 +2666,19 @@ machines without a `secret` is warned about at startup.
   about 30 seconds, once no request has run for two seconds, and never in
   the middle of one. A slot's conversation continued after that is
   replayed through the new plan once.
+- Two failures in a row leave a worker out for 2 minutes, doubling up to 30.
+  A failure is a connection lost with a request out, or a failed handshake on
+  a connection the worker took; a worker that cannot be reached or that refuses
+  does not count. A request served without a replay forgives the workers it
+  used, and so does an hour without a failure. `/v1/workers` shows
+  `failures_in_a_row` and `left_out_seconds`.
 - Until the plan is repaired, `/ready` answers `503` with
   `a worker was lost`.
+
+**A prompt a node cannot hold is refused before it runs.** The top-level node
+asks every node for room for the whole prompt and one answer token. A node
+that has too little, even after letting go of conversations idle for 30 seconds,
+sends back a `503` naming itself and the shortfall.
 
 **A conversation's next turn reuses its rows on the workers.** Each slot
 keeps its last conversation, as a single server does. On a top-level node

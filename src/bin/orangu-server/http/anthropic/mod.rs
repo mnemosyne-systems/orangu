@@ -1761,6 +1761,11 @@ async fn drive_turns(
                 StreamEvent::Overloaded => {
                     return Err(Box::new(rewrap(crate::http::overloaded_response()).await));
                 }
+                StreamEvent::NoRoom(message) => {
+                    return Err(Box::new(
+                        rewrap(crate::http::no_room_response(message)).await,
+                    ));
+                }
                 StreamEvent::Error(err) => {
                     return Err(Box::new(error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,

@@ -44,7 +44,8 @@ pub const PROTOCOL_VERSION: u16 = 2;
 /// Optional extensions this build understands, one bit each: a parent
 /// sends a child a message of an extension only when the child's
 /// `HelloAck` advertised its bit, so peers without it still talk.
-pub const FEATURES: u64 = FEATURE_FORK | FEATURE_ROWS | FEATURE_HEAD | FEATURE_ECHO | FEATURE_STATE;
+pub const FEATURES: u64 =
+    FEATURE_FORK | FEATURE_ROWS | FEATURE_HEAD | FEATURE_ECHO | FEATURE_STATE | FEATURE_ROOM;
 
 /// [`Message::Fork`]: a worker copies one session's rows into another.
 pub const FEATURE_FORK: u64 = 1;
@@ -71,6 +72,9 @@ pub const FEATURE_SWITCH: u64 = 16;
 /// alone too.
 pub const FEATURE_STATE: u64 = 32;
 
+/// It answers [`Message::Reserve`]. Without it a prompt goes down unasked.
+pub const FEATURE_ROOM: u64 = 64;
+
 /// The extensions `features` advertises, by name, for `/v1/workers`.
 pub fn feature_names(features: u64) -> Vec<&'static str> {
     [
@@ -80,6 +84,7 @@ pub fn feature_names(features: u64) -> Vec<&'static str> {
         (FEATURE_ECHO, "echo"),
         (FEATURE_SWITCH, "switch"),
         (FEATURE_STATE, "state"),
+        (FEATURE_ROOM, "room"),
     ]
     .into_iter()
     .filter(|(bit, _)| features & bit != 0)
@@ -605,6 +610,15 @@ pub enum Message {
     Release {
         session: u64,
     },
+    /// Promise `session` memory for `positions`, on this worker and every
+    /// worker below it, before a prompt that long starts. Answered with the
+    /// same message, or [`ErrorCode::OutOfMemory`] having promised nothing
+    /// anywhere; `0` takes a promise back. Only sent to a child that advertised
+    /// [`FEATURE_ROOM`].
+    Reserve {
+        session: u64,
+        positions: u32,
+    },
     /// Start session `to` with the first `len` positions of session `from`,
     /// copied, on this worker and every worker below it. Answered with the
     /// same message, or an error when `from` is unknown or does not hold
@@ -680,6 +694,7 @@ mod tag {
     pub const LAYER_ROWS: u8 = 19;
     pub const ECHO: u8 = 20;
     pub const LAYER_STATE: u8 = 21;
+    pub const RESERVE: u8 = 22;
 }
 
 struct Writer(Vec<u8>);
@@ -1031,6 +1046,11 @@ impl Message {
                 w.u64(*session);
                 tag::RELEASE
             }
+            Self::Reserve { session, positions } => {
+                w.u64(*session);
+                w.u32(*positions);
+                tag::RESERVE
+            }
             Self::Fork { from, to, len } => {
                 w.u64(*from);
                 w.u64(*to);
@@ -1168,6 +1188,10 @@ impl Message {
                 len: r.u32()?,
             },
             tag::RELEASE => Self::Release { session: r.u64()? },
+            tag::RESERVE => Self::Reserve {
+                session: r.u64()?,
+                positions: r.u32()?,
+            },
             tag::FORK => Self::Fork {
                 from: r.u64()?,
                 to: r.u64()?,
@@ -1403,6 +1427,10 @@ mod tests {
             kv_dim: 2,
             len: 1,
             data: vec![0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64, 0, 0, 128, 64],
+        });
+        round_trip(Message::Reserve {
+            session: 1,
+            positions: 4096,
         });
         round_trip(Message::Fork {
             from: 3,

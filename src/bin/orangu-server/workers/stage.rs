@@ -286,6 +286,21 @@ impl<E: Exchange> Stage for MessageStage<E> {
         let _ = self.exchange.exchange(&Message::Release { session });
     }
 
+    fn reserve(&self, session: u64, positions: usize) -> Result<()> {
+        if self.exchange.features() & super::protocol::FEATURE_ROOM == 0 {
+            return Ok(());
+        }
+        let positions = u32::try_from(positions)?;
+        match self
+            .exchange
+            .exchange(&Message::Reserve { session, positions })?
+        {
+            Message::Reserve { .. } => Ok(()),
+            Message::Error(error) => Err(anyhow!(error)),
+            other => bail!("unexpected reply to a reservation: {other:?}"),
+        }
+    }
+
     fn fork(&self, from: u64, to: u64, len: usize) -> Result<()> {
         ensure!(
             self.exchange.features() & super::protocol::FEATURE_FORK != 0,

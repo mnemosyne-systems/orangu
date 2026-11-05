@@ -262,6 +262,14 @@ pub fn too_long_response(message: String) -> axum::response::Response {
     (axum::http::StatusCode::BAD_REQUEST, message).into_response()
 }
 
+/// The HTTP answer to a prompt a node has no memory for right now. `503`, as
+/// the request is sound and a shorter one, or the same one when the node has
+/// more free, can work; no `Retry-After`, since waiting alone may not help.
+pub fn no_room_response(message: String) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (axum::http::StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+}
+
 /// Prompts at least this long are tokenised on a blocking thread.
 const ENCODE_INLINE_BYTES: usize = 16 * 1024;
 

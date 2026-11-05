@@ -24,7 +24,9 @@
 //! pyramid, and nothing here needs to know how deep it goes.
 
 use super::protocol::{ErrorCode, Rows, WorkerError};
+use super::room::{self, KvRoom};
 use crate::engine::arch::{DecodeRow, ModelForward};
+use crate::engine::generate::NoRoomForPrompt;
 use crate::engine::kv_cache::{KvCache, LayerHold, RemoteLayers, RemoteSession};
 use crate::engine::loader::ModelConfig;
 use anyhow::{Result, ensure};
@@ -59,6 +61,14 @@ pub trait Stage: Send + Sync {
 
     /// `session` is over.
     fn release(&self, session: u64);
+
+    /// Promises `session` memory for `positions` here and below (`0` takes a
+    /// promise back). A stage that cannot ask promises nothing, and refuses
+    /// nothing.
+    fn reserve(&self, session: u64, positions: usize) -> Result<()> {
+        let _ = (session, positions);
+        Ok(())
+    }
 
     /// Starts session `to` with a copy of `from`'s first `len` positions,
     /// here and below. A stage that cannot says so.
@@ -134,6 +144,8 @@ pub struct LayerPipeline {
     /// Each sequence's queue of forwards still on their way through the
     /// stages — see [`Tail`].
     tails: Mutex<HashMap<u64, Tail>>,
+    /// What this node has promised of its memory for its own layers.
+    room: KvRoom,
 }
 
 /// `ORANGU_WORKERS_PIPELINE=0`: every forward waits for the whole tree, as
@@ -421,12 +433,14 @@ impl LayerPipeline {
                 model.config().architecture
             );
         }
+        let room = KvRoom::of(model.as_ref(), &local);
         Ok(Self {
             model,
             local,
             stages: stages.into_iter().map(Arc::from).collect(),
             name: "local".to_string(),
             tails: Mutex::new(HashMap::new()),
+            room,
         })
     }
 
@@ -440,7 +454,15 @@ impl LayerPipeline {
             stages: Vec::new(),
             name: "local".to_string(),
             tails: Mutex::new(HashMap::new()),
+            room: KvRoom::with_free_memory(0, Box::new(|| u64::MAX)),
         }
+    }
+
+    /// The same, with its room as a test has it.
+    #[cfg(test)]
+    pub fn with_room(mut self, room: KvRoom) -> Self {
+        self.room = room;
+        self
     }
 
     /// The layers this node runs itself.
@@ -539,6 +561,7 @@ impl LayerPipeline {
         {
             trace.add(&self.name, started.elapsed());
         }
+        self.room.wrote(session, start_pos + tokens.len());
         if let Some(remote) = cache.remote.as_mut() {
             remote.len = start_pos + tokens.len();
         }
@@ -787,6 +810,24 @@ impl LayerPipeline {
 }
 
 impl LayerPipeline {
+    pub fn room(&self) -> &KvRoom {
+        &self.room
+    }
+
+    /// Promises `session` memory for `positions` on every stage below this
+    /// node. One refusal takes back what the others promised.
+    pub fn reserve_below(&self, session: u64, positions: usize) -> Result<()> {
+        for (i, stage) in self.stages.iter().enumerate() {
+            if let Err(error) = stage.reserve(session, positions) {
+                for asked in &self.stages[..i] {
+                    let _ = asked.reserve(session, 0);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     /// Starts session `to` on every stage with a copy of `from`'s first
     /// `len` positions — after whatever `from` still has queued.
     pub fn fork(&self, from: u64, to: u64, len: usize) -> Result<()> {
@@ -822,6 +863,7 @@ impl RemoteLayers for LayerPipeline {
     }
 
     fn release(&self, session: u64) {
+        self.room.forget(session);
         // After whatever the sequence still has queued, so a release never
         // overtakes a forward of its own on the way to a worker.
         match self.tails.lock().unwrap().remove(&session) {
@@ -879,6 +921,12 @@ pub trait PipelineSource: Send + Sync {
     fn head_on_last(&self) -> bool {
         false
     }
+
+    /// A request ran on the current pipeline from start to finish, with no
+    /// replay: whatever failed before is behind the workers it used. One that
+    /// finished only by a replay says nothing, or a worker that dies once a
+    /// request and comes back would be forgiven every time.
+    fn served_whole(&self) {}
 }
 
 /// One pipeline, for good.
@@ -904,6 +952,11 @@ struct SessionState {
     tokens: Vec<u32>,
     /// Its cache has room for every layer's rows, to decode here alone.
     full: bool,
+    /// Replayed onto a new pipeline since the last request finished: the
+    /// request running now did not go through in one piece.
+    rebuilt: bool,
+    /// The positions its prompt was promised, for a rebuild to ask for again.
+    promised: usize,
     prefill: Trace,
     decode: Trace,
 }
@@ -960,15 +1013,22 @@ impl RemoteLayers for SessionOwner {
     /// Where the request's time went, logged as it ends: its session may
     /// live on, carried to the slot's next request.
     fn request_finished(&self, session: u64) -> Vec<(String, Duration)> {
+        let generation = self.source.current().1;
         let traced = self
             .sessions
             .lock()
             .unwrap()
             .get_mut(&session)
-            .map(SessionState::log_trace);
-        let Some((parts, prefill, decode)) = traced else {
+            .map(|state| {
+                let whole = !std::mem::take(&mut state.rebuilt) && state.generation == generation;
+                (whole, state.log_trace())
+            });
+        let Some((whole, (parts, prefill, decode))) = traced else {
             return Vec::new();
         };
+        if whole && prefill.forwards + decode.forwards > 0 {
+            self.source.served_whole();
+        }
         if decode.tokens > 0 {
             self.source.observed_decode(&decode.parts, decode.tokens);
         }
@@ -1021,6 +1081,14 @@ fn recoverable(error: &anyhow::Error) -> bool {
                 ErrorCode::ChildLost | ErrorCode::UnknownSession | ErrorCode::PositionMismatch
             )
         })
+}
+
+/// Whether `error` is a node saying it has no room for a prompt.
+fn out_of_memory(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WorkerError>())
+        .is_some_and(|e| e.code == ErrorCode::OutOfMemory)
 }
 
 /// Whether `error` is a worker not holding the session at all.
@@ -1146,6 +1214,8 @@ impl DelegatingModel {
                 generation,
                 tokens,
                 full,
+                rebuilt: false,
+                promised: 0,
                 prefill: Trace::default(),
                 decode: Trace::default(),
             },
@@ -1240,6 +1310,18 @@ impl DelegatingModel {
         })();
         match result {
             Ok(bytes) => {
+                // The tree's part of the request is over, and no finish will
+                // be reported for a cache with no remote rows.
+                let generation = self.source.current().1;
+                let whole = self
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .get(&session)
+                    .is_some_and(|state| !state.rebuilt && state.generation == generation);
+                if whole {
+                    self.source.served_whole();
+                }
                 cache.remote = None;
                 cache.whole = true;
                 log::debug!(
@@ -1260,6 +1342,40 @@ impl DelegatingModel {
         }
     }
 
+    /// Asks this node and every node below for `positions` of `session`. Only
+    /// a node saying it has no room is an answer: one that fails to reply
+    /// fails the forward that follows, which recovers as usual.
+    fn ask_for_room(
+        &self,
+        pipeline: &LayerPipeline,
+        cache: &KvCache,
+        session: u64,
+        positions: usize,
+    ) -> Result<()> {
+        // A paged cache was admitted by the pool its rows live in.
+        if !cache.is_paged()
+            && let Err(short) = pipeline.room().reserve(session, positions)
+        {
+            let name = &pipeline.name;
+            room::note_refused();
+            return Err(anyhow::Error::new(NoRoomForPrompt(format!(
+                "OutOfMemory: {short} (at {name})"
+            ))));
+        }
+        match pipeline.reserve_below(session, positions) {
+            Err(error) if out_of_memory(&error) => {
+                pipeline.room().forget(session);
+                room::note_refused();
+                Err(anyhow::Error::new(NoRoomForPrompt(format!("{error:#}"))))
+            }
+            Err(error) => {
+                log::debug!("orangu-server: workers: no answer on memory: {error:#}");
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+        }
+    }
+
     /// Replaces `cache` with one on `pipeline` holding the same first
     /// `start_pos` tokens, by running them through it again.
     fn rebuild(
@@ -1274,7 +1390,7 @@ impl DelegatingModel {
             .as_ref()
             .map(|r| (r.id, r.capacity))
             .ok_or_else(|| anyhow::anyhow!("a cache this model did not make"))?;
-        let (tokens, full) = {
+        let (tokens, full, promised) = {
             let sessions = self.sessions.lock().unwrap();
             let state = sessions
                 .get(&old)
@@ -1284,10 +1400,21 @@ impl DelegatingModel {
                 "the sequence holds {} tokens, and the forward starts at {start_pos}",
                 state.tokens.len()
             );
-            (state.tokens[..start_pos].to_vec(), state.full)
+            (
+                state.tokens[..start_pos].to_vec(),
+                state.full,
+                state.promised,
+            )
         };
         *cache = self.cache_on(pipeline, generation, capacity, tokens.clone(), full);
         let session = cache.remote.as_ref().map_or(0, |r| r.id);
+        if let Some(state) = self.sessions.lock().unwrap().get_mut(&session) {
+            state.rebuilt = true;
+            state.promised = promised;
+        }
+        if promised > 0 {
+            self.ask_for_room(pipeline, cache, session, promised)?;
+        }
         for (i, chunk) in tokens.chunks(REPLAY_CHUNK).enumerate() {
             let hidden = self.model.embed(chunk)?;
             pipeline.run(cache, session, hidden, chunk, i * REPLAY_CHUNK, Rows::Last)?;
@@ -1422,6 +1549,29 @@ impl DelegatingModel {
 impl ModelForward for DelegatingModel {
     fn config(&self) -> &ModelConfig {
         self.model.config()
+    }
+
+    fn admit_prompt(&self, cache: &KvCache, positions: usize) -> Result<()> {
+        let Some(session) = cache.remote.as_ref().map(|r| r.id) else {
+            return Ok(());
+        };
+        let (pipeline, generation) = self.source.current();
+        // A sequence left on an older plan is rebuilt by its first forward,
+        // which asks then.
+        let fresh = {
+            let mut sessions = self.sessions.lock().unwrap();
+            match sessions.get_mut(&session) {
+                Some(state) => {
+                    state.promised = positions;
+                    state.generation == generation
+                }
+                None => false,
+            }
+        };
+        if !fresh {
+            return Ok(());
+        }
+        self.ask_for_room(&pipeline, cache, session, positions)
     }
 
     /// Handed over, the model's own batch samples as it would; on the tree
@@ -2276,6 +2426,156 @@ mod tests {
         fn decode_alone(&self) -> bool {
             true
         }
+    }
+
+    const MIB: u64 = 1 << 20;
+
+    fn room_of(free: u64) -> KvRoom {
+        KvRoom::with_free_memory(MIB, Box::new(move || free))
+    }
+
+    fn store_over(layers: Range<usize>, free: u64, name: &str) -> Arc<SessionStore> {
+        let pipeline = LayerPipeline::new(fixture::model(), layers, vec![])
+            .unwrap()
+            .with_room(room_of(free));
+        Arc::new(SessionStore::new(Arc::new(pipeline), N_CTX, 8).named(name))
+    }
+
+    fn over(store: &Arc<SessionStore>) -> Box<dyn Stage> {
+        Box::new(LoopbackStage::new(store.clone(), ActivationFormat::F32))
+    }
+
+    /// A worker that cannot hold the prompt says so before any of it runs,
+    /// and the error names it: what the client is told.
+    #[test]
+    fn a_prompt_a_worker_cannot_hold_is_refused_before_any_of_it_runs() {
+        let worker = store_over(1..N_LAYER, 10 * MIB, "w1:8400");
+        let split = DelegatingModel::new(Arc::new(
+            LayerPipeline::new(fixture::model(), 0..1, vec![over(&worker)])
+                .unwrap()
+                .with_room(room_of(u64::MAX)),
+        ))
+        .unwrap();
+        let cache = split.new_kv_cache(N_CTX);
+        let refused_before = room::refused();
+        split.admit_prompt(&cache, 10).unwrap();
+        let cache = split.new_kv_cache(N_CTX);
+        let error = split.admit_prompt(&cache, 11).unwrap_err();
+        let error = error.downcast::<NoRoomForPrompt>().unwrap();
+        assert!(error.0.contains("w1:8400"), "{}", error.0);
+        assert!(error.0.contains("OutOfMemory"), "{}", error.0);
+        assert!(room::refused() > refused_before);
+        assert_eq!(worker.len(), 0, "nothing ran");
+    }
+
+    /// The node asking has rows of its own to find room for, and refuses
+    /// before troubling the workers.
+    #[test]
+    fn this_node_can_refuse_for_its_own_layers() {
+        let worker = store_over(1..N_LAYER, 100 * MIB, "w1:8400");
+        let split = DelegatingModel::new(Arc::new(
+            LayerPipeline::new(fixture::model(), 0..1, vec![over(&worker)])
+                .unwrap()
+                .named("top")
+                .with_room(room_of(MIB)),
+        ))
+        .unwrap();
+        let cache = split.new_kv_cache(N_CTX);
+        let error = split.admit_prompt(&cache, 2).unwrap_err();
+        assert!(error.to_string().contains("(at top)"), "{error}");
+    }
+
+    /// The second worker refuses: the first gives back what it promised.
+    #[test]
+    fn one_refusal_takes_back_what_the_other_workers_promised() {
+        let first = store_over(1..2, 100 * MIB, "w1:8400");
+        let second = store_over(2..N_LAYER, MIB, "w2:8400");
+        let pipeline =
+            LayerPipeline::new(fixture::model(), 0..1, vec![over(&first), over(&second)])
+                .unwrap()
+                .with_room(room_of(u64::MAX));
+        let split = DelegatingModel::new(Arc::new(pipeline)).unwrap();
+        let cache = split.new_kv_cache(N_CTX);
+        let error = split.admit_prompt(&cache, 5).unwrap_err();
+        assert!(error.to_string().contains("w2:8400"), "{error}");
+        assert_eq!(first.promised_bytes(), 0);
+    }
+
+    /// A stage that fails to answer has refused nothing: the forward after it
+    /// finds the fault and recovers as it always has.
+    #[test]
+    fn a_stage_that_does_not_answer_on_memory_has_not_refused() {
+        struct Gone(Range<usize>);
+        impl Stage for Gone {
+            fn layers(&self) -> Range<usize> {
+                self.0.clone()
+            }
+            fn name(&self) -> String {
+                "gone".to_string()
+            }
+            fn forward(
+                &self,
+                _session: u64,
+                _hidden: Vec<f32>,
+                _tokens: &[u32],
+                _start_pos: usize,
+                _rows: Rows,
+            ) -> Result<Vec<f32>> {
+                anyhow::bail!("not used here")
+            }
+            fn truncate(&self, _session: u64, _len: usize) {}
+            fn release(&self, _session: u64) {}
+            fn reserve(&self, _session: u64, _positions: usize) -> Result<()> {
+                Err(anyhow::Error::new(WorkerError::new(
+                    ErrorCode::ChildLost,
+                    "the connection closed",
+                )))
+            }
+        }
+        let split = DelegatingModel::new(Arc::new(
+            LayerPipeline::new(fixture::model(), 0..1, vec![Box::new(Gone(1..N_LAYER))]).unwrap(),
+        ))
+        .unwrap();
+        let cache = split.new_kv_cache(N_CTX);
+        assert!(split.admit_prompt(&cache, 5).is_ok());
+    }
+
+    /// A worker of a release before this one is not asked at all, which would
+    /// end the connection, and the prompt goes down as it used to.
+    #[test]
+    fn a_worker_that_cannot_answer_is_not_asked() {
+        struct Older(Arc<AtomicUsize>);
+        impl crate::workers::stage::Exchange for Older {
+            fn exchange(
+                &self,
+                _message: &crate::workers::protocol::Message,
+            ) -> Result<crate::workers::protocol::Message> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                anyhow::bail!("unexpected message")
+            }
+            fn name(&self) -> String {
+                "older".to_string()
+            }
+            fn features(&self) -> u64 {
+                crate::workers::protocol::FEATURES & !crate::workers::protocol::FEATURE_ROOM
+            }
+        }
+        let asked = Arc::new(AtomicUsize::new(0));
+        let stage = crate::workers::stage::MessageStage::over(
+            Older(asked.clone()),
+            1..N_LAYER,
+            ActivationFormat::F32,
+        );
+        assert!(Stage::reserve(&stage, 1, 5).is_ok());
+        assert_eq!(asked.load(Ordering::Relaxed), 0);
+    }
+
+    /// A sequence with no remote rows has no tree to ask.
+    #[test]
+    fn a_cache_with_nothing_on_the_tree_needs_no_asking() {
+        let split = delegating(0..N_LAYER, vec![]);
+        let cache = KvCache::new(1, 4, 2);
+        assert!(split.admit_prompt(&cache, 1 << 30).is_ok());
     }
 
     /// A source whose last node applies the output head.

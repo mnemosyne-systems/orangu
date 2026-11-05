@@ -336,8 +336,8 @@ server's.
 ## Watching a tree
 
 - `GET /v1/workers` on any node: its role, the layers it runs, the plan
-  below it, each configured worker's connection, and any worker the plan
-  lost.
+  below it, each configured worker's connection and failures in a row, how
+  long those leave it out, and any worker the plan lost.
 - **Settings › Workers** in the web console: the same, as tables.
 - `GET /ready`: `serving a parent orangu-server` on a worker;
   `a worker was lost` on a node whose plan lost one and has not repaired
@@ -399,6 +399,56 @@ A worker that comes back is taken back by the node above it within about
 30 seconds, once no request has run for two seconds, never in the middle
 of one. A conversation that continues after that is replayed through the
 new plan once, and reuses its rows from then on.
+
+A worker that keeps failing is left out for a while, so it does not cost every
+request a new plan and a replay. Two failures in a row leave it out for 2
+minutes, and each further failure doubles that, up to 30 minutes. A request
+served start to finish without a replay forgives the workers it used, and so
+does an hour without a failure. A node below the top sees no request finish, so
+only the hour forgives there.
+
+A failure is a connection lost with a request out, or a worker that takes the
+connection and fails the handshake. A worker that cannot be reached, or one
+that refuses (it serves another parent, or its secret differs), is no failure,
+and a machine that restarts comes back as usual. While a worker is left out,
+the node plans without it: a `standby` fills in if there is one, otherwise the
+others take its layers, and any over their budgets are paged in from disk. A
+worker you have repaired stays out until its wait ends, or until you restart
+the node above it. `/v1/workers` shows each worker's `failures_in_a_row`
+and `left_out_seconds`.
+
+## When a prompt does not fit
+
+A node's KV cache grows as a prompt runs, so a prompt too long for a worker's
+memory would run until the kernel killed that worker. Before a prompt starts,
+the top-level node asks every node for room for all of it, plus one answer
+token. Each node compares what its own layers need with its free memory, less
+5% and less what it has promised prompts still running.
+
+If a node has too little free, it first lets go of conversations nobody has used
+for 30 seconds, oldest first; one taken up later is replayed. If that is not
+enough, the client gets a `503` naming the node and how much it is short:
+
+```text
+OutOfMemory: the prompt's KV cache needs 272.70 MiB here, with 137.40 MiB free
+and 0 B promised to other sequences: send a shorter prompt, or give this node
+more memory (at beta:8400)
+```
+
+Nothing has run by then, no worker counts as failed, and the plan stands.
+`/v1/workers` shows `kv_promised_bytes` and `kv_refusals`, and `/metrics` shows
+`orangu_server_workers_kv_refusals_total`.
+
+Free memory takes in page cache, as the kernel can take it back, and a cgroup v2
+limit where there is one, so this holds in a container. Some limits:
+
+- `max_tokens` is a cap and not a promise, so a long answer can still run a node
+  out of memory.
+- Only a worker that lists `room` under `features` in `/v1/workers` is asked. An
+  older one is sent the prompt unasked, as before.
+- A node with a GPU counts its device copy against host memory. A card with its
+  own memory is held to host memory too, so it can refuse early, and the card's
+  own room is not checked on a worker.
 
 ## Machines that clock down
 

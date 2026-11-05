@@ -40,6 +40,7 @@ pub mod node;
 pub mod pipeline;
 pub mod plan;
 pub mod protocol;
+pub mod room;
 pub mod session;
 pub mod speed;
 pub mod stage;

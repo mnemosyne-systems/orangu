@@ -117,6 +117,75 @@ impl Read for HeardReader {
     }
 }
 
+/// Failures in a row that leave a worker out of the plans.
+const FAILURES_TO_LEAVE_OUT: u32 = 2;
+/// How long the first time, doubling with every failure after that.
+const FIRST_OUT: Duration = Duration::from_secs(2 * 60);
+const LONGEST_OUT: Duration = Duration::from_secs(30 * 60);
+/// A failure this long after the last one starts the count over. A node below
+/// the top sees no request finish, so nothing else forgives its workers.
+const FORGOTTEN: Duration = Duration::from_secs(60 * 60);
+
+/// A worker's failures in a row, and until when they leave it out.
+///
+/// What counts: a connection lost with a request out, and a worker that takes
+/// the connection and fails the handshake. Each costs a request a replay, or
+/// planning a wait. A worker that cannot be dialled costs neither, and one
+/// that refuses is working: both come back as soon as they can.
+#[derive(Default)]
+struct Backoff {
+    failures: u32,
+    last: Option<Instant>,
+    out_until: Option<Instant>,
+}
+
+impl Backoff {
+    /// Counts a failure at `now`; how long it leaves the worker out, if it does.
+    fn failed(&mut self, now: Instant) -> Option<Duration> {
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) >= FORGOTTEN)
+        {
+            self.failures = 0;
+        }
+        self.failures = self.failures.saturating_add(1);
+        self.last = Some(now);
+        let doublings = self.failures.checked_sub(FAILURES_TO_LEAVE_OUT)?;
+        let out = FIRST_OUT
+            .checked_mul(1u32 << doublings.min(16))
+            .map_or(LONGEST_OUT, |out| out.min(LONGEST_OUT));
+        self.out_until = Some(now + out);
+        Some(out)
+    }
+
+    /// How much longer the worker is left out, at `now`.
+    fn out_for(&self, now: Instant) -> Option<Duration> {
+        self.out_until
+            .and_then(|until| until.checked_duration_since(now))
+            .filter(|left| !left.is_zero())
+    }
+}
+
+/// A worker's [`Backoff`], shared with its connections.
+struct Failures {
+    addr: String,
+    backoff: Mutex<Backoff>,
+}
+
+impl Failures {
+    fn note(&self) {
+        let mut backoff = self.backoff.lock().unwrap();
+        if let Some(out) = backoff.failed(Instant::now()) {
+            log::warn!(
+                "orangu-server: worker {} failed {} times in a row; left out for {} s",
+                self.addr,
+                backoff.failures,
+                out.as_secs()
+            );
+        }
+    }
+}
+
 /// What the worker said about itself in the handshake.
 #[derive(Clone, Debug, Default)]
 pub struct ChildInfo {
@@ -146,12 +215,28 @@ struct Connection {
     /// Requests out that the worker answers from its read loop, where it
     /// answers no ping until it is done.
     unwatched: AtomicUsize,
+    failures: Arc<Failures>,
 }
 
 impl Connection {
-    /// Ends the connection, failing every request still waiting on it.
+    /// Ends the connection, failing every request still waiting on it. Counts
+    /// against the worker once, however many were waiting, and not at all if
+    /// none was: a worker going away idle has cost nothing.
     fn fail(&self, error: &WorkerError) {
+        let waiting = !self.pending.lock().unwrap().is_empty();
+        if !self.dead.swap(true, Ordering::Relaxed) && waiting {
+            self.failures.note();
+        }
+        self.end(error);
+    }
+
+    /// Ends the connection because this node is done with it.
+    fn let_go(&self, error: &WorkerError) {
         self.dead.store(true, Ordering::Relaxed);
+        self.end(error);
+    }
+
+    fn end(&self, error: &WorkerError) {
         let _ = self.tcp.shutdown(std::net::Shutdown::Both);
         for (_, waiter) in self.pending.lock().unwrap().drain() {
             let _ = waiter.try_send(Err(error.clone()));
@@ -180,6 +265,7 @@ pub struct ChildLink {
     unreachable: AtomicBool,
     /// Why the last plan left it out, said once until the reason changes.
     left_out: Mutex<Option<String>>,
+    failures: Arc<Failures>,
 }
 
 impl ChildLink {
@@ -195,8 +281,13 @@ impl ChildLink {
         connect_timeout: Duration,
         tls: Option<Tls>,
     ) -> Self {
+        let addr = addr.into();
         Self {
-            addr: addr.into(),
+            failures: Arc::new(Failures {
+                addr: addr.clone(),
+                backoff: Mutex::default(),
+            }),
+            addr,
             timeout,
             silence: SILENCE.min(timeout),
             connect_timeout,
@@ -231,6 +322,37 @@ impl ChildLink {
     /// failure since it was last reached.
     pub fn note_unreachable(&self) -> bool {
         !self.unreachable.swap(true, Ordering::Relaxed)
+    }
+
+    /// How much longer plans leave the worker out for its failures.
+    pub fn out_for(&self) -> Option<Duration> {
+        self.failures
+            .backoff
+            .lock()
+            .unwrap()
+            .out_for(Instant::now())
+    }
+
+    /// The failures counted against the worker since it was last forgiven.
+    pub fn failures_in_a_row(&self) -> u32 {
+        self.failures.backoff.lock().unwrap().failures
+    }
+
+    /// A request ran on the worker from start to finish.
+    pub fn forgive(&self) {
+        *self.failures.backoff.lock().unwrap() = Backoff::default();
+    }
+
+    /// A failure with no connection to fail.
+    #[cfg(test)]
+    pub fn count_failure(&self) {
+        self.failures.note();
+    }
+
+    /// The wait is over, its failures still counted.
+    #[cfg(test)]
+    pub fn end_wait(&self) {
+        self.failures.backoff.lock().unwrap().out_until = None;
     }
 
     /// The live connection when there is one made with the same `path`,
@@ -277,7 +399,7 @@ impl ChildLink {
 
     pub fn disconnect(&self) {
         if let Some(connection) = self.connection.lock().unwrap().take() {
-            connection.fail(&self.lost("disconnected"));
+            connection.let_go(&self.lost("disconnected"));
         }
         *self.info.lock().unwrap() = None;
     }
@@ -308,6 +430,23 @@ impl ChildLink {
                 None => "no address to connect to".to_string(),
             })
         })?;
+        let shook = self.handshake(stream, secret, path);
+        if shook
+            .as_ref()
+            .is_err_and(|error| error.code == ErrorCode::ChildLost)
+        {
+            self.failures.note();
+        }
+        shook
+    }
+
+    /// The handshake over a connection just dialled.
+    fn handshake(
+        &self,
+        stream: TcpStream,
+        secret: Option<&str>,
+        path: &[String],
+    ) -> Result<ChildInfo, WorkerError> {
         let _ = stream.set_nodelay(true);
         // A worker answers the handshake straight away, whatever it is doing,
         // and a hung process's kernel still accepts a dial. Planning waits on
@@ -380,6 +519,7 @@ impl ChildLink {
             dead: AtomicBool::new(false),
             heard,
             unwatched: AtomicUsize::new(0),
+            failures: self.failures.clone(),
         });
         {
             let connection = connection.clone();
@@ -783,5 +923,109 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::ChildLost);
         assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+    }
+
+    #[test]
+    fn failures_in_a_row_leave_a_worker_out_for_longer_each_time() {
+        let now = Instant::now();
+        let mut backoff = Backoff::default();
+        assert_eq!(backoff.failed(now), None, "once is not left out");
+        assert_eq!(backoff.out_for(now), None);
+        let minutes = [2, 4, 8, 16, 30, 30, 30];
+        for m in minutes {
+            assert_eq!(backoff.failed(now), Some(Duration::from_secs(m * 60)));
+        }
+        assert_eq!(backoff.out_for(now), Some(LONGEST_OUT));
+        assert_eq!(backoff.out_for(now + LONGEST_OUT), None, "the wait ends");
+        backoff.failures = u32::MAX;
+        assert_eq!(backoff.failed(now), Some(LONGEST_OUT), "never overflows");
+    }
+
+    #[test]
+    fn a_failure_long_after_the_last_starts_the_count_over() {
+        let now = Instant::now();
+        let mut backoff = Backoff::default();
+        backoff.failed(now);
+        assert_eq!(
+            backoff.failed(now + FORGOTTEN - Duration::from_secs(1)),
+            Some(FIRST_OUT)
+        );
+        let later = now + FORGOTTEN * 3;
+        assert_eq!(backoff.failed(later), None);
+        assert_eq!(backoff.failures, 1);
+    }
+
+    #[test]
+    fn a_worker_that_cannot_be_dialled_is_not_counted() {
+        let addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().to_string()
+        };
+        let link = ChildLink::new(addr, PATIENT, SHORT);
+        for _ in 0..3 {
+            assert!(link.connect(None, &["top".to_string()]).is_err());
+        }
+        assert_eq!(link.failures_in_a_row(), 0);
+        assert_eq!(link.out_for(), None);
+    }
+
+    #[test]
+    fn a_worker_failing_the_handshake_is_counted() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            // Takes every dial and closes it.
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+        let link = ChildLink::new(addr, PATIENT, SHORT);
+        let path = ["top".to_string()];
+        assert!(link.connect(None, &path).is_err());
+        assert_eq!(link.failures_in_a_row(), 1);
+        assert_eq!(link.out_for(), None);
+        assert!(link.connect(None, &path).is_err());
+        assert!(link.out_for().is_some_and(|left| left > FIRST_OUT / 2));
+        link.forgive();
+        assert_eq!(link.failures_in_a_row(), 0);
+        assert_eq!(link.out_for(), None);
+    }
+
+    #[test]
+    fn a_connection_lost_counts_once_however_many_requests_were_out() {
+        let addr = worker(|_reader, stream| {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+        let link = Arc::new(link_to(addr));
+        let waiting: Vec<_> = (0..4)
+            .map(|_| {
+                let link = link.clone();
+                std::thread::spawn(move || link.request(&truncate()))
+            })
+            .collect();
+        for request in waiting {
+            assert!(request.join().unwrap().is_err());
+        }
+        assert_eq!(link.failures_in_a_row(), 1);
+    }
+
+    #[test]
+    fn a_connection_ended_with_nothing_out_is_not_counted() {
+        let addr = worker(|_reader, stream| {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+        let link = link_to(addr);
+        let deadline = Instant::now() + PATIENT;
+        while link.is_connected() {
+            assert!(Instant::now() < deadline, "the close was not seen");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(link.failures_in_a_row(), 0, "closed by the worker");
+
+        let addr = worker(|_reader, _stream| std::thread::sleep(SHORT));
+        let link = link_to(addr);
+        link.disconnect();
+        assert_eq!(link.failures_in_a_row(), 0, "let go by this node");
     }
 }

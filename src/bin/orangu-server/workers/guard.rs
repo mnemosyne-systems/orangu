@@ -265,6 +265,10 @@ impl Stage for GuardedStage {
         self.current().0.layer_rows(session, layer, len)
     }
 
+    fn reserve(&self, session: u64, positions: usize) -> Result<()> {
+        self.current().0.reserve(session, positions)
+    }
+
     fn fork(&self, from: u64, to: u64, len: usize) -> Result<()> {
         self.current().0.fork(from, to, len)?;
         let mut kept = self.kept.lock().unwrap();
