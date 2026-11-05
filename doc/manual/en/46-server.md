@@ -2674,6 +2674,8 @@ machines without a `secret` is warned about at startup.
   `failures_in_a_row` and `left_out_seconds`.
 - Until the plan is repaired, `/ready` answers `503` with
   `a worker was lost`.
+- A worker that hears nothing from its parent for 60 seconds takes it for gone,
+  lets go of its layers and serves its own API again.
 
 **A prompt a node cannot hold is refused before it runs.** The top-level node
 asks every node for room for the whole prompt and one answer token. A node

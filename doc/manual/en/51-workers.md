@@ -400,6 +400,13 @@ A worker that comes back is taken back by the node above it within about
 of one. A conversation that continues after that is replayed through the
 new plan once, and reuses its rows from then on.
 
+A worker does the same for its parent. A parent pings every 5 seconds while
+idle and more often with a request out, so a worker that hears nothing for 60
+seconds takes it for gone: it lets go of its layers and sessions, serves its own
+API again and accepts another parent. A node with workers of its own goes on as
+top-level over them. A parent that was only stalled that long finds the worker
+lost, plans again, and takes it back as usual.
+
 A worker that keeps failing is left out for a while, so it does not cost every
 request a new plan and a replay. Two failures in a row leave it out for 2
 minutes, and each further failure doubles that, up to 30 minutes. A request
@@ -436,8 +443,9 @@ more memory (at beta:8400)
 ```
 
 Nothing has run by then, no worker counts as failed, and the plan stands.
-`/v1/workers` shows `kv_promised_bytes` and `kv_refusals`, and `/metrics` shows
-`orangu_server_workers_kv_refusals_total`.
+`/v1/workers` shows `kv_refusals` for the tree and `kv_promised_bytes` for this
+node's own layers (a worker's promises do not show on its parent), and
+`/metrics` shows `orangu_server_workers_kv_refusals_total`.
 
 Free memory takes in page cache, as the kernel can take it back, and a cgroup v2
 limit where there is one, so this holds in a container. Some limits:

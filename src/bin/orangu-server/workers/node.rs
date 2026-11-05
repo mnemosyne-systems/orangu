@@ -67,6 +67,12 @@ const SESSION_IDLE: Duration = Duration::from_secs(600);
 /// to be downloaded first (`[workers].download = range`).
 const ASSIGN_TIMEOUT: Duration = Duration::from_secs(3600);
 
+/// How long a parent may say nothing. It pings every 5 s while idle and more
+/// often with a request out, so this is a dozen pings missed: a machine gone, or
+/// a process stopped. Generous, as a parent paging heavily can stall for a while,
+/// and letting it go costs a new plan and every session.
+pub const PARENT_SILENCE: Duration = Duration::from_secs(60);
+
 /// How long a node goes without a forward before it counts as between
 /// requests, and may take a returning worker back. Sessions a parent keeps
 /// for a slot's next request live far longer and do not count: a plan made
@@ -154,6 +160,9 @@ pub struct NodeSettings {
     pub offload: Offload,
     /// How often idle workers are pinged.
     pub maintenance: Duration,
+    /// How long a parent may say nothing before this node takes it for gone
+    /// ([`PARENT_SILENCE`]).
+    pub parent_silence: Duration,
     /// How often a top-level node missing a worker tries to take it back,
     /// between requests.
     pub readmit: Duration,
@@ -578,6 +587,14 @@ impl Node {
             std::thread::Builder::new()
                 .name("orangu-workers-listen".to_string())
                 .spawn(move || node.accept(listener))?;
+        }
+        // Before the first plan, which can take minutes: a worker connected
+        // early hears nothing else meanwhile.
+        for link in node.links.iter().chain(&node.standby_links) {
+            let (node, link) = (node.clone(), link.clone());
+            std::thread::Builder::new()
+                .name("orangu-workers-ping".to_string())
+                .spawn(move || node.ping_worker(&link))?;
         }
         if node.delegates() {
             node.plan_top();
@@ -2036,14 +2053,35 @@ impl Node {
         else {
             return;
         };
-        // A parent may be idle for as long as it likes.
-        let _ = split.tcp.set_read_timeout(None);
+        // A parent that lost its power closes nothing, and a worker held by
+        // one keeps its layers, its API off and every other parent away. A
+        // live one pings ([`Self::ping_worker`]). Limited per read and per
+        // write, so a large frame on a slow link is not cut short.
+        let silence = self.settings.parent_silence;
+        let _ = split.tcp.set_read_timeout(Some(silence));
+        let _ = split.tcp.set_write_timeout(Some(silence));
+        let Ok(tcp) = split.tcp.try_clone().map(Arc::new) else {
+            return;
+        };
         let writer = Arc::new(Mutex::new(writer));
         let answer = |writer: &Mutex<Box<dyn Write + Send>>, id: u64, reply: &Message| {
             let mut writer = writer.lock().unwrap();
             write_message(&mut **writer, id, reply).is_ok()
         };
-        while let Ok((id, message, _)) = read_frame(&mut reader) {
+        loop {
+            let (id, message) = match read_frame(&mut reader) {
+                Ok((id, message, _)) => (id, message),
+                Err(error) => {
+                    if timed_out(&error) {
+                        log::warn!(
+                            "orangu-server: nothing heard from the parent for {} s; it is taken \
+                             for gone",
+                            silence.as_secs()
+                        );
+                    }
+                    break;
+                }
+            };
             if self.stop.load(Ordering::Relaxed) {
                 break;
             }
@@ -2075,6 +2113,7 @@ impl Node {
                     // parent. One sequence's forwards never overlap each
                     // other — its parent waits for each before the next.
                     let writer = writer.clone();
+                    let tcp = tcp.clone();
                     let spawned = std::thread::Builder::new()
                         .name("orangu-workers-forward".to_string())
                         .spawn(move || {
@@ -2087,7 +2126,11 @@ impl Node {
                                 crate::engine::cpu_pools::for_request(|| store.handle(message));
                             super::clock::hold();
                             let mut writer = writer.lock().unwrap();
-                            let _ = write_message(&mut **writer, id, &reply);
+                            // Part of a frame may have gone: nothing after it
+                            // could be read.
+                            if write_message(&mut **writer, id, &reply).is_err() {
+                                let _ = tcp.shutdown(std::net::Shutdown::Both);
+                            }
                         });
                     if spawned.is_err() {
                         break;
@@ -2206,14 +2249,23 @@ impl Node {
         Some(hello.path)
     }
 
-    /// Pings idle workers, reclaims forgotten sessions, and — as top-level,
-    /// between requests — takes back workers that were lost.
+    /// Pings a worker or standby while it is idle, which tells it this node is
+    /// alive ([`NodeSettings::parent_silence`]) and this node that it is. On a
+    /// thread per worker, away from [`Self::watch`], which plans: a ping waits
+    /// for its answer, and a hung worker or a long plan would silence this node
+    /// to the others.
+    fn ping_worker(&self, link: &ChildLink) {
+        while !self.stop.load(Ordering::Relaxed) {
+            std::thread::sleep(self.settings.maintenance);
+            link.ping_if_idle();
+        }
+    }
+
+    /// Reclaims forgotten sessions and — as top-level, between requests — takes
+    /// back workers that were lost.
     fn watch(self: Arc<Self>) {
         while !self.stop.load(Ordering::Relaxed) {
             std::thread::sleep(self.settings.maintenance);
-            for link in &self.links {
-                link.ping_if_idle();
-            }
             let store = self
                 .assignment
                 .lock()
@@ -2694,6 +2746,20 @@ pub fn describe(entries: &[PlanEntry]) -> String {
         .join(", ")
 }
 
+/// Whether `error` is a read running into its limit, rather than a connection
+/// ending.
+fn timed_out(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2726,6 +2792,7 @@ mod tests {
             offload: Offload::Always,
             split: true,
             maintenance: Duration::from_millis(50),
+            parent_silence: Duration::from_secs(30),
             readmit: Duration::from_millis(200),
             tls: None,
             prompt_weights: prompt_weights::PromptWeights::File,
@@ -3763,6 +3830,9 @@ mod tests {
         dials: Arc<AtomicUsize>,
         /// Reservations it has passed on.
         asked: Arc<AtomicUsize>,
+        /// Set: the parent's frames go no further, and nothing closes. What the
+        /// worker sees of a parent that lost its power.
+        mute: Arc<AtomicBool>,
     }
 
     fn flaky(worker: &Arc<Node>, cuts: usize) -> Flaky {
@@ -3772,6 +3842,8 @@ mod tests {
         let cuts = Arc::new(AtomicUsize::new(cuts));
         let dials = Arc::new(AtomicUsize::new(0));
         let asked = Arc::new(AtomicUsize::new(0));
+        let mute = Arc::new(AtomicBool::new(false));
+        let muted = mute.clone();
         let (left, dialled, reservations) = (cuts.clone(), dials.clone(), asked.clone());
         std::thread::spawn(move || {
             for parent in listener.incoming() {
@@ -3779,6 +3851,7 @@ mod tests {
                 dialled.fetch_add(1, Ordering::Relaxed);
                 let left = left.clone();
                 let reservations = reservations.clone();
+                let muted = muted.clone();
                 std::thread::spawn(move || {
                     let mut to_worker = TcpStream::connect(target).unwrap();
                     let mut from_worker = to_worker.try_clone().unwrap();
@@ -3788,6 +3861,9 @@ mod tests {
                     });
                     let mut from_parent = BufReader::new(parent.try_clone().unwrap());
                     while let Ok((id, message, _)) = read_frame(&mut from_parent) {
+                        if muted.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         if matches!(message, Message::Reserve { .. }) {
                             reservations.fetch_add(1, Ordering::Relaxed);
                         }
@@ -3815,6 +3891,7 @@ mod tests {
             cuts,
             dials,
             asked,
+            mute,
         }
     }
 
@@ -4110,5 +4187,186 @@ mod tests {
         assert_eq!(proxy.asked.load(Ordering::Relaxed), 2);
         top.stop();
         worker.stop();
+    }
+
+    const QUICK_SILENCE: Duration = Duration::from_millis(600);
+
+    /// A node that gives a silent parent [`QUICK_SILENCE`]. The others get
+    /// longer, as a test on a busy machine can stall that long.
+    fn quick(name: &str, workers: &[&Arc<Node>]) -> Arc<Node> {
+        let mut with = settings(
+            name,
+            workers
+                .iter()
+                .map(|w| w.local_addr().unwrap().to_string())
+                .collect(),
+            None,
+        );
+        with.parent_silence = QUICK_SILENCE;
+        node_with(with, Variant::default())
+    }
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn parent_link(worker: &Arc<Node>) -> ChildLink {
+        ChildLink::with_tls(
+            worker.local_addr().unwrap().to_string(),
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+            None,
+        )
+    }
+
+    /// The parent did its handshake and has said nothing since: the worker
+    /// stops waiting, and another parent can have it.
+    #[test]
+    fn a_parent_gone_silent_is_let_go() {
+        let worker = quick("worker", &[]);
+        let first = parent_link(&worker);
+        first.connect(None, &["first".to_string()]).unwrap();
+        let second = parent_link(&worker);
+        let refused = second.connect(None, &["second".to_string()]).unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Busy);
+        until("still held by the first", || {
+            second.connect(None, &["second".to_string()]).is_ok()
+        });
+        worker.stop();
+    }
+
+    /// Pings alone keep a parent, however long it asks for nothing else.
+    #[test]
+    fn a_parent_that_only_pings_is_kept() {
+        let worker = quick("worker", &[]);
+        let first = parent_link(&worker);
+        first.connect(None, &["first".to_string()]).unwrap();
+        let until_then = Instant::now() + QUICK_SILENCE * 3;
+        while Instant::now() < until_then {
+            assert_eq!(first.ping_if_idle(), Some(true));
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let second = parent_link(&worker);
+        let refused = second.connect(None, &["second".to_string()]).unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Busy);
+        worker.stop();
+    }
+
+    /// Nothing closes when a parent loses power. The worker gives up its
+    /// layers and serves its own API again.
+    #[test]
+    fn a_worker_lets_go_of_its_layers_when_its_parent_goes_silent() {
+        let worker = quick("worker", &[]);
+        let proxy = flaky(&worker, 0);
+        let top = top_over(&proxy);
+        assert!(top.plan().iter().any(|e| e.node == "worker"));
+        assert!(worker.is_assigned());
+        std::thread::sleep(QUICK_SILENCE * 2);
+        assert!(worker.is_assigned(), "the parent pings, through the proxy");
+        proxy.mute.store(true, Ordering::Relaxed);
+        until("still assigned", || !worker.is_assigned());
+        assert!(worker.unready().is_none(), "{:?}", worker.unready());
+        top.stop();
+        worker.stop();
+    }
+
+    /// A node below the top whose parent goes silent is top-level again, over
+    /// the workers it has, as it is when a parent closes.
+    #[test]
+    fn a_middle_node_goes_on_with_its_workers_when_its_parent_goes_silent() {
+        let leaf = node("leaf", &[], Variant::default());
+        let middle = quick("middle", &[&leaf]);
+        let proxy = flaky(&middle, 0);
+        let top = top_over(&proxy);
+        assert!(top.plan().iter().any(|e| e.node == "leaf"));
+        proxy.mute.store(true, Ordering::Relaxed);
+        until("still assigned", || !middle.is_assigned());
+        until("not planned again", || covered(&middle.plan()) == N_LAYER);
+        assert!(middle.plan().iter().any(|e| e.node == "leaf"));
+        top.stop();
+        middle.stop();
+        leaf.stop();
+    }
+
+    /// One worker takes seconds over its assignment, as one fetching its
+    /// layers does: the workers waiting while that happens go on hearing from
+    /// their parent, which has not even started yet.
+    #[test]
+    fn a_long_plan_does_not_silence_the_parent() {
+        let patient = quick("patient", &[]);
+        assert_eq!(patient.next_connection.load(Ordering::Relaxed), 1);
+        // Does the handshake, sits on the assignment, and fails it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let slow = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            read_message(&mut reader).unwrap();
+            let budget = 1u64 << 30;
+            let ack = Message::HelloAck(HelloAck {
+                version: PROTOCOL_VERSION,
+                features: 0,
+                nonce: [0; 32],
+                proof: [0; 32],
+                node: "slow".to_string(),
+                subtree: vec!["slow".to_string()],
+                capacity: Capacity {
+                    budget_bytes: budget,
+                    subtree_budget_bytes: budget,
+                    ..Capacity::default()
+                },
+                model: None,
+            });
+            write_message(&mut writer, 0, &ack).unwrap();
+            read_message(&mut reader).unwrap();
+            write_message(&mut writer, 0, &Message::Ready).unwrap();
+            read_message(&mut reader).unwrap();
+            std::thread::sleep(QUICK_SILENCE * 3);
+            drop(stream);
+        });
+        let started = Instant::now();
+        let top = node_with(
+            settings(
+                "top",
+                vec![patient.local_addr().unwrap().to_string(), slow],
+                None,
+            ),
+            Variant::default(),
+        );
+        assert!(started.elapsed() >= QUICK_SILENCE * 3, "not held up");
+        assert_eq!(
+            patient.next_connection.load(Ordering::Relaxed),
+            2,
+            "it went back for the worker it had lost"
+        );
+        assert!(top.plan().iter().any(|e| e.node == "patient"));
+        top.stop();
+        patient.stop();
+    }
+
+    /// A standby standing in is a worker like any other, and hears the same.
+    #[test]
+    fn a_standby_standing_in_goes_on_hearing_from_its_parent() {
+        let worker = node("worker", &[], Variant::default());
+        let standby = quick("standby", &[]);
+        let mut with = settings("top", vec![worker.local_addr().unwrap().to_string()], None);
+        with.standby = vec![standby.local_addr().unwrap().to_string()];
+        let top = node_with(with, Variant::default());
+        let tokens = fixture::tokens();
+        let split = top.delegating_model().unwrap();
+        let mut cache = split.new_kv_cache(N_CTX);
+        split.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
+        worker.stop();
+        split.forward(&mut cache, &tokens[5..6], 5, 0).unwrap();
+        assert!(standby.is_assigned());
+        std::thread::sleep(QUICK_SILENCE * 3);
+        assert!(standby.is_assigned(), "let go for silence");
+        top.stop();
+        standby.stop();
     }
 }

@@ -4445,6 +4445,7 @@ fn start_workers_node(
         offload: workers_conf.offload,
         split,
         maintenance: std::time::Duration::from_secs(5),
+        parent_silence: workers::node::PARENT_SILENCE,
         readmit: std::time::Duration::from_secs(30),
         tls: workers::transport::Tls::from_paths(
             workers_conf
