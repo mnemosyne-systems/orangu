@@ -365,6 +365,11 @@ server's.
 
 ## When a machine goes away
 
+A machine that loses power or its network closes nothing, so while a request
+is out a node pings the worker below it. A worker that says nothing for 15
+seconds counts as lost. A worker that is only slow goes on answering, and has
+until `timeout` for a decode step, and longer for a prompt's forward.
+
 A request in flight is not lost with a worker. The top-level node plans
 again over the workers that still answer, rebuilds the conversation on the
 new plan by running its tokens through again, and carries on. Tokens
@@ -426,8 +431,9 @@ without. Nodes like that keep each other's cores busy anyway.
   request at the same time. And a long prompt is pipelined: while one
   machine works on a chunk of it, the one before it already works on the
   next chunk. The top cuts the prompt into 128-token parts for this
-  (`ORANGU_WORKERS_CHUNK`). `ORANGU_WORKERS_PIPELINE=0` turns the
-  pipelining off.
+  (`ORANGU_WORKERS_CHUNK`). A node keeps two parts per stage below it and
+  holds the next one back until there is room (`ORANGU_WORKERS_WINDOW`; `0`
+  is no bound). `ORANGU_WORKERS_PIPELINE=0` turns the pipelining off.
   On one board, a pipelined tree of three 4-thread nodes prefilled a
   2041-token prompt 2.2× faster than without pipelining.
   One decode step of every slot goes as a single message per worker

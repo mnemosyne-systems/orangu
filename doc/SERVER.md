@@ -1543,8 +1543,12 @@ machines without a `secret` is warned about at startup.
   at a small accuracy cost). On a gigabit link the format hardly shows:
   a 128-token part of Llama-3.2-3B is 7 ms of `f16` on the wire against
   about a second of compute. Choose `q8_0` for slow links such as Wi-Fi.
-- `timeout` — seconds one forward may take on a worker, its whole subtree
-  included, before the worker counts as lost (default `60`).
+- `timeout` — seconds one decode step may take on a worker that still
+  answers, its whole subtree included, before the worker counts as lost
+  (default `60`). A prompt's forward gets four times this, and once more for
+  each further 128 tokens. A worker that says nothing at all for 15 seconds
+  (or `timeout`, if shorter) with a request out counts as lost sooner, whatever
+  this is set to.
 - `connect_timeout` — seconds reaching a worker may take (default `10`).
 - `download` — `full` (the default) or `range`. With `range`, on a node with
   no workers of its own and no copy of the model, the model is fetched in
@@ -1719,7 +1723,10 @@ in the background, so a long prompt is pipelined: stage *k* works on chunk
 *i* while stage *k+1* works on chunk *i−1*. A failure there answers the
 sequence's next forward, where recovery takes over. The top cuts a prompt
 into 128-token parts for this (`ORANGU_WORKERS_CHUNK`; `0` keeps the
-engine's chunks). `ORANGU_WORKERS_PIPELINE=0` turns the pipelining off.
+engine's chunks). A node keeps two parts per stage below it and holds the next
+one back until there is room, so a slow stage slows the nodes above it rather
+than leaving a backlog (`ORANGU_WORKERS_WINDOW`; `0` is no bound).
+`ORANGU_WORKERS_PIPELINE=0` turns the pipelining off.
 
 **Clock.** A node waits in bursts while the nodes below compute, and a
 frequency governor then clocks its cores down: on the development board a

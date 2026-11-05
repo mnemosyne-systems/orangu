@@ -22,11 +22,16 @@
 //! worker computes one, it can already be sent the next.
 //!
 //! Any failure to reach the worker — a refused dial, a closed connection, a
-//! reply that does not come within `[workers].timeout` — is reported as
-//! [`ErrorCode::ChildLost`] naming its address, and drops the connection
-//! with every request still waiting on it: after a timeout nobody knows
-//! where in the stream the other side is, so the only safe next step is a
-//! fresh handshake, which planning does.
+//! worker silent while a request is out, a reply that does not come within
+//! its limit — is reported as [`ErrorCode::ChildLost`] naming its address,
+//! and drops the connection with every request still waiting on it: after a
+//! timeout nobody knows where in the stream the other side is, so the only
+//! safe next step is a fresh handshake, which planning does.
+//!
+//! A dead worker and a slow one are told apart. A machine that loses power
+//! closes nothing, so while a request is out the link pings, and any byte
+//! from the worker counts as a sign of life ([`SILENCE`]). `[workers].timeout`
+//! is left for a worker that answers pings and never finishes ([`forward_limit`]).
 
 use super::auth;
 use super::metrics::LinkMetrics;
@@ -40,7 +45,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -48,6 +53,69 @@ use std::time::{Duration, Instant};
 /// What a parent echoes off a new worker to time the link: 4 MiB, 13 ms
 /// each way at 2.5 Gbit/s.
 const ECHO_BYTES: usize = 4 << 20;
+
+/// How long a worker may say nothing while a request is out. It answers
+/// pings from its read loop, whatever its forwards are doing, so this is
+/// independent of how much work a request is.
+const SILENCE: Duration = Duration::from_secs(15);
+
+/// How many other parts a forward carrying a prompt may wait behind on the
+/// worker, which holds that many for the stages below it.
+const PARTS_AHEAD: usize = 3;
+
+/// The longest a request of `tokens` may take on a worker that answers
+/// pings. A decode step gets `timeout`. A prompt's forward gets it for each
+/// 128 tokens and for each part it may wait behind, since its time grows with
+/// both and a slow worker is not a lost one.
+fn forward_limit(timeout: Duration, tokens: usize) -> Duration {
+    if tokens <= 1 {
+        return timeout;
+    }
+    timeout.saturating_mul((PARTS_AHEAD + tokens.div_ceil(128)) as u32)
+}
+
+/// When a connection last heard anything from its worker.
+struct LastHeard {
+    start: Instant,
+    millis: AtomicU64,
+}
+
+impl LastHeard {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            millis: AtomicU64::new(0),
+        }
+    }
+
+    fn now(&self) {
+        self.millis
+            .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn since(&self) -> Duration {
+        self.start
+            .elapsed()
+            .saturating_sub(Duration::from_millis(self.millis.load(Ordering::Relaxed)))
+    }
+}
+
+/// A connection's reads, each noted in [`LastHeard`] as it happens, so that a
+/// frame slow to arrive is a sign of life before it has ended.
+struct HeardReader {
+    inner: Box<dyn Read + Send>,
+    heard: Arc<LastHeard>,
+}
+
+impl Read for HeardReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.heard.now();
+        }
+        Ok(n)
+    }
+}
 
 /// What the worker said about itself in the handshake.
 #[derive(Clone, Debug, Default)]
@@ -74,6 +142,10 @@ struct Connection {
     pending: Mutex<HashMap<u64, SyncSender<Answer>>>,
     next_id: AtomicU64,
     dead: AtomicBool,
+    heard: Arc<LastHeard>,
+    /// Requests out that the worker answers from its read loop, where it
+    /// answers no ping until it is done.
+    unwatched: AtomicUsize,
 }
 
 impl Connection {
@@ -95,6 +167,8 @@ pub struct ChildLink {
     /// The worker's address as `[workers].workers` lists it.
     pub addr: String,
     timeout: Duration,
+    /// How long a worker may say nothing while a request is out.
+    silence: Duration,
     connect_timeout: Duration,
     tls: Option<Tls>,
     pub metrics: LinkMetrics,
@@ -124,6 +198,7 @@ impl ChildLink {
         Self {
             addr: addr.into(),
             timeout,
+            silence: SILENCE.min(timeout),
             connect_timeout,
             tls,
             metrics: LinkMetrics::default(),
@@ -234,13 +309,25 @@ impl ChildLink {
             })
         })?;
         let _ = stream.set_nodelay(true);
-        // The handshake may take no longer than a request.
+        // A worker answers the handshake straight away, whatever it is doing,
+        // and a hung process's kernel still accepts a dial. Planning waits on
+        // this, and a request on planning.
         stream
-            .set_read_timeout(Some(self.timeout))
+            .set_read_timeout(Some(self.silence))
+            .map_err(|e| self.lost(e))?;
+        // A worker that stopped reading fills the socket's buffers, and a
+        // write would then wait for as long as TCP keeps retrying. This holds
+        // per write, so a large frame on a slow link is not cut short.
+        stream
+            .set_write_timeout(Some(self.silence))
             .map_err(|e| self.lost(e))?;
         let split = transport::client(self.tls.as_ref(), stream, &self.addr)
             .map_err(|e| self.lost(format!("TLS: {e:#}")))?;
-        let mut reader = BufReader::new(split.reader);
+        let heard = Arc::new(LastHeard::new());
+        let mut reader = BufReader::new(Box::new(HeardReader {
+            inner: split.reader,
+            heard: heard.clone(),
+        }) as Box<dyn Read + Send>);
         let mut writer = split.writer;
         let mut round_trip = |message: &Message| -> Result<Message, WorkerError> {
             write_message(&mut *writer, 0, message).map_err(|e| self.lost(e))?;
@@ -291,6 +378,8 @@ impl ChildLink {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             dead: AtomicBool::new(false),
+            heard,
+            unwatched: AtomicUsize::new(0),
         });
         {
             let connection = connection.clone();
@@ -298,6 +387,18 @@ impl ChildLink {
             std::thread::Builder::new()
                 .name("orangu-workers-link".to_string())
                 .spawn(move || read_answers(connection, reader, lost))
+                .map_err(|e| self.lost(e))?;
+        }
+        {
+            let connection = connection.clone();
+            let silence = self.silence;
+            let lost = self.lost(format!(
+                "nothing heard for {} s with a request out",
+                silence.as_secs()
+            ));
+            std::thread::Builder::new()
+                .name("orangu-workers-watch".to_string())
+                .spawn(move || keep_watch(connection, silence, lost))
                 .map_err(|e| self.lost(e))?;
         }
         let mut info = ChildInfo {
@@ -362,16 +463,34 @@ impl ChildLink {
     /// A failure — the connection's, or no answer in time — ends the
     /// connection.
     pub fn request(&self, message: &Message) -> Result<Message, WorkerError> {
-        self.request_within(message, self.timeout)
+        let tokens = match message {
+            Message::Forward(forward) => forward.tokens.len(),
+            Message::ForwardBatch(forwards) => {
+                forwards.iter().map(|f| f.tokens.len()).max().unwrap_or(0)
+            }
+            _ => 0,
+        };
+        self.send_and_wait(message, forward_limit(self.timeout, tokens))
     }
 
-    /// [`Self::request`], waiting up to `timeout` for the answer rather
-    /// than the link's own.
+    /// A request the worker answers from its read loop, which answers no
+    /// ping until it is done: an assignment, which may include a download.
+    /// Silence means nothing here, and only `timeout` bounds it.
     pub fn request_within(
         &self,
         message: &Message,
         timeout: Duration,
     ) -> Result<Message, WorkerError> {
+        let Some(connection) = self.live() else {
+            return Err(self.lost("not connected"));
+        };
+        connection.unwatched.fetch_add(1, Ordering::Relaxed);
+        let reply = self.send_and_wait(message, timeout);
+        connection.unwatched.fetch_sub(1, Ordering::Relaxed);
+        reply
+    }
+
+    fn send_and_wait(&self, message: &Message, limit: Duration) -> Result<Message, WorkerError> {
         let Some(connection) = self.live() else {
             return Err(self.lost("not connected"));
         };
@@ -393,7 +512,7 @@ impl ChildLink {
             Ok(bytes) => self.metrics.sent(bytes),
             Err(e) => return failed(self.lost(e)),
         }
-        match rx.recv_timeout(timeout) {
+        match rx.recv_timeout(limit) {
             Ok(Ok((reply, bytes))) => {
                 self.metrics.received(bytes);
                 if matches!(message, Message::Forward(_) | Message::ForwardBatch(_)) {
@@ -404,7 +523,7 @@ impl ChildLink {
             Ok(Err(error)) => failed(error),
             Err(RecvTimeoutError::Timeout) => failed(self.lost(format!(
                 "no answer within {} s ([workers].timeout)",
-                self.timeout.as_secs()
+                limit.as_secs()
             ))),
             Err(RecvTimeoutError::Disconnected) => failed(self.lost("the connection closed")),
         }
@@ -423,6 +542,41 @@ impl ChildLink {
             self.request(&Message::Ping { nonce }),
             Ok(Message::Pong { nonce: n }) if n == nonce
         ))
+    }
+}
+
+/// The watch thread: while a request is out, pings the worker, and ends the
+/// connection when `silence` goes by with nothing heard. An idle connection
+/// is not watched: [`ChildLink::ping_if_idle`] makes a request of it, and
+/// that request is.
+fn keep_watch(connection: Arc<Connection>, silence: Duration, lost: WorkerError) {
+    while connection.is_live() {
+        std::thread::sleep(silence / 6);
+        let waiting = !connection.pending.lock().unwrap().is_empty();
+        if !waiting || connection.unwatched.load(Ordering::Relaxed) > 0 {
+            // The clock starts when there is something to hear.
+            connection.heard.now();
+            continue;
+        }
+        let Ok(mut writer) = connection.writer.try_lock() else {
+            // A frame is going out, which the socket's write timeout watches,
+            // and the worker reads frames in turn before it answers a ping.
+            connection.heard.now();
+            continue;
+        };
+        if connection.heard.since() >= silence {
+            drop(writer);
+            connection.fail(&lost);
+            return;
+        }
+        // Nobody waits for this one: the reader drops the answer, having
+        // noted that it came.
+        let nonce = connection.next_id.fetch_add(1, Ordering::Relaxed);
+        if write_message(&mut **writer, nonce, &Message::Ping { nonce }).is_err() {
+            drop(writer);
+            connection.fail(&lost);
+            return;
+        }
     }
 }
 
@@ -457,5 +611,177 @@ impl Exchange for std::sync::Arc<ChildLink> {
 
     fn features(&self) -> u64 {
         self.info().map_or(0, |info| info.features)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    const PATIENT: Duration = Duration::from_secs(30);
+    const SHORT: Duration = Duration::from_millis(300);
+
+    /// A worker that does the handshake and then whatever `then` says, over
+    /// the socket it was given. Returns its address.
+    fn worker(then: impl FnOnce(BufReader<TcpStream>, TcpStream) + Send + 'static) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            read_message(&mut reader).unwrap();
+            let ack = Message::HelloAck(super::super::protocol::HelloAck {
+                version: PROTOCOL_VERSION,
+                features: 0,
+                nonce: [0; 32],
+                proof: [0; 32],
+                node: "worker".to_string(),
+                subtree: vec!["worker".to_string()],
+                capacity: Capacity::default(),
+                model: None,
+            });
+            write_message(&mut writer, 0, &ack).unwrap();
+            read_message(&mut reader).unwrap();
+            write_message(&mut writer, 0, &Message::Ready).unwrap();
+            then(reader, writer);
+        });
+        addr
+    }
+
+    fn link_to(addr: String) -> ChildLink {
+        let mut link = ChildLink::new(addr, PATIENT, Duration::from_secs(2));
+        link.silence = SHORT;
+        link.connect(None, &["top".to_string()]).unwrap();
+        link
+    }
+
+    fn truncate() -> Message {
+        Message::Truncate { session: 1, len: 0 }
+    }
+
+    #[test]
+    fn a_forward_is_allowed_for_its_size_and_what_it_waits_behind() {
+        let timeout = Duration::from_secs(60);
+        assert_eq!(forward_limit(timeout, 0), timeout);
+        assert_eq!(forward_limit(timeout, 1), timeout);
+        // The short last part of a prompt waits behind the parts before it.
+        assert_eq!(forward_limit(timeout, 2), 4 * timeout);
+        assert_eq!(forward_limit(timeout, 128), 4 * timeout);
+        assert_eq!(forward_limit(timeout, 256), 5 * timeout);
+    }
+
+    /// A machine that lost power closes nothing: reads go on, answers never
+    /// come. That is told within the silence, not the forward's timeout.
+    #[test]
+    fn a_silent_worker_is_lost_long_before_the_timeout() {
+        let addr = worker(|mut reader, _writer| while read_frame(&mut reader).is_ok() {});
+        let link = link_to(addr);
+        let started = Instant::now();
+        let error = link.request(&truncate()).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ChildLost);
+        assert_eq!(error.path, vec![link.addr.clone()]);
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+        assert!(!link.is_connected());
+    }
+
+    /// Slow is not dead: a worker that answers pings keeps its link for as
+    /// long as its forward takes.
+    #[test]
+    fn a_worker_answering_pings_may_take_its_time() {
+        let addr = worker(|mut reader, mut writer| {
+            let started = Instant::now();
+            let mut pending = None;
+            while let Ok((id, message, _)) = read_frame(&mut reader) {
+                match message {
+                    Message::Ping { nonce } => {
+                        write_message(&mut writer, id, &Message::Pong { nonce }).unwrap();
+                    }
+                    _ => pending = Some(id),
+                }
+                if started.elapsed() > 4 * SHORT
+                    && let Some(id) = pending.take()
+                {
+                    write_message(&mut writer, id, &Message::Ready).unwrap();
+                }
+            }
+        });
+        let link = link_to(addr);
+        let started = Instant::now();
+        assert_eq!(link.request(&truncate()).unwrap(), Message::Ready);
+        assert!(started.elapsed() >= 2 * SHORT, "it answered too soon");
+        assert!(link.is_connected());
+    }
+
+    /// Bytes are a sign of life: a frame longer in the arriving than the
+    /// silence does not lose the worker, though no frame has ended.
+    #[test]
+    fn a_frame_on_its_way_counts_as_a_sign_of_life() {
+        let addr = worker(|mut reader, mut writer| {
+            let (id, _, _) = read_frame(&mut reader).unwrap();
+            let frame = Message::Echo {
+                data: vec![1; 1 << 10],
+            }
+            .to_frame(id);
+            for piece in frame.chunks(frame.len() / 10) {
+                writer.write_all(piece).unwrap();
+                std::thread::sleep(SHORT / 2);
+            }
+        });
+        let link = link_to(addr);
+        assert!(matches!(
+            link.request(&truncate()),
+            Ok(Message::Echo { .. })
+        ));
+    }
+
+    /// A worker does an assignment in its read loop, downloads and all, and
+    /// answers no ping meanwhile; it is given all of the time asked for.
+    #[test]
+    fn an_assignment_is_not_held_to_the_silence() {
+        let addr = worker(|mut reader, mut writer| {
+            let (id, _, _) = read_frame(&mut reader).unwrap();
+            std::thread::sleep(4 * SHORT);
+            write_message(&mut writer, id, &Message::Ready).unwrap();
+            while read_frame(&mut reader).is_ok() {}
+        });
+        let link = link_to(addr);
+        assert_eq!(
+            link.request_within(&truncate(), PATIENT).unwrap(),
+            Message::Ready
+        );
+    }
+
+    /// A hung process's kernel still accepts a dial. Planning waits on the
+    /// handshake while a request waits on planning, so it is held to the
+    /// silence as well.
+    #[test]
+    fn a_worker_silent_in_the_handshake_is_not_waited_for() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut link = ChildLink::new(addr, PATIENT, Duration::from_secs(2));
+        link.silence = SHORT;
+        let started = Instant::now();
+        let error = link.connect(None, &["top".to_string()]).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ChildLost);
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
+    }
+
+    /// A worker that stopped reading fills the socket's buffers. A frame
+    /// larger than they hold ends in an error, not a write that never
+    /// returns.
+    #[test]
+    fn a_stalled_socket_does_not_hold_a_request() {
+        let addr = worker(|_reader, _writer| std::thread::sleep(Duration::from_secs(15)));
+        let link = link_to(addr);
+        let started = Instant::now();
+        let error = link
+            .request(&Message::Echo {
+                data: vec![0; 256 << 20],
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ChildLost);
+        assert!(started.elapsed() < Duration::from_secs(5), "{error}");
     }
 }

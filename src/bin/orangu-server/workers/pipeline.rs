@@ -161,6 +161,25 @@ fn sub_chunk() -> usize {
 /// 48.3 s at 64, **47.8 s at 128**, 48.7 s at 256.
 const DEFAULT_SUB_CHUNK: usize = 128;
 
+/// `ORANGU_WORKERS_WINDOW`: how many prompt parts nobody waits for a node
+/// keeps per stage below it before it holds the next one back; `0` is no
+/// bound, for comparison.
+fn window() -> usize {
+    static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        std::env::var("ORANGU_WORKERS_WINDOW")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(DEFAULT_WINDOW)
+    })
+}
+
+/// [`window`] when unset: one part being worked on and one ready to follow,
+/// so a stage never waits for this node. More only lengthens what the
+/// prompt's last part waits behind, and holds more rows in memory; the
+/// slowest stage sets the pace whatever the queue.
+const DEFAULT_WINDOW: usize = 2;
+
 type Reply = mpsc::SyncSender<Result<Vec<f32>, WorkerError>>;
 
 enum Job {
@@ -196,6 +215,9 @@ struct Tail {
     queued: Arc<std::sync::atomic::AtomicUsize>,
     poison: Arc<Mutex<Option<WorkerError>>>,
     released: Arc<std::sync::atomic::AtomicBool>,
+    /// One slot per forward nobody waits for, freed once it is through the
+    /// last stage. `None` when the queue is not bounded.
+    room: Option<mpsc::SyncSender<()>>,
 }
 
 impl Tail {
@@ -204,6 +226,13 @@ impl Tail {
         let queued = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let poison: Arc<Mutex<Option<WorkerError>>> = Arc::new(Mutex::new(None));
         let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (room, mut freed) = match window() * stages.len() {
+            0 => (None, None),
+            slots => {
+                let (room, freed) = mpsc::sync_channel::<()>(slots);
+                (Some(room), Some(freed))
+            }
+        };
         // One thread per stage, each handing what it made to the next: the
         // first stage is on a prompt's next part while the second is still
         // on this one. A single thread running every stage in turn left the
@@ -223,6 +252,7 @@ impl Tail {
                 next
             });
             let (count, failed, over) = (queued.clone(), poison.clone(), released.clone());
+            let freed = if i == last { freed.take() } else { None };
             let _ = std::thread::Builder::new()
                 .name("orangu-workers-tail".to_string())
                 .spawn(move || {
@@ -269,6 +299,8 @@ impl Tail {
                                         count.fetch_sub(1, Ordering::Relaxed);
                                         if let Some(reply) = reply {
                                             let _ = reply.send(result);
+                                        } else if let Some(freed) = &freed {
+                                            let _ = freed.recv();
                                         }
                                     }
                                 }
@@ -299,6 +331,7 @@ impl Tail {
             queued,
             poison,
             released,
+            room,
         }
     }
 
@@ -528,6 +561,9 @@ impl LayerPipeline {
         if queued || (rows == Rows::None && pipelining()) {
             let wait = rows != Rows::None;
             let (reply, answer) = mpsc::sync_channel(1);
+            if !wait {
+                self.wait_for_room(session);
+            }
             self.enqueue(
                 session,
                 Job::Run {
@@ -594,6 +630,24 @@ impl LayerPipeline {
             .unwrap()
             .get(&session)
             .and_then(|tail| tail.poison.lock().unwrap().clone())
+    }
+
+    /// Holds a forward nobody waits for until `session`'s queue has room,
+    /// starting the queue when it has none. Only this sequence waits: the
+    /// lock is let go first. A queue whose last stage is gone frees nothing
+    /// more and sends nothing back, which ends the wait.
+    fn wait_for_room(&self, session: u64) {
+        let room = self
+            .tails
+            .lock()
+            .unwrap()
+            .entry(session)
+            .or_insert_with(|| Tail::start(session, self.stages.clone()))
+            .room
+            .clone();
+        if let Some(room) = room {
+            let _ = room.send(());
+        }
     }
 
     /// Queues `job` for `session`, starting its queue when it has none.
@@ -3039,6 +3093,42 @@ mod tests {
         }
         let want = model.forward(&mut alone, &tokens[20..], 20, 0).unwrap();
         assert_eq!(got, want);
+    }
+
+    /// A stage slower than this node holds it back: parts wait here rather
+    /// than pile up behind the stage. A worker's own queue is what the last
+    /// part waits behind on its parent's clock, so the queue's length has to
+    /// be bounded for that clock to mean anything. The answer does not change.
+    #[test]
+    fn a_slow_stage_holds_the_parts_back() {
+        let model = fixture::model();
+        let slow = Slow::new(Box::new(LoopbackStage::new(
+            Arc::new(SessionStore::new(
+                Arc::new(LayerPipeline::new(model.clone(), 1..4, vec![]).unwrap()),
+                N_CTX,
+                8,
+            )),
+            ActivationFormat::F32,
+        )));
+        let done = slow.forwards.clone();
+        let tree = delegating(0..1, vec![Box::new(slow) as Box<dyn Stage>]).with_sub_chunk(2);
+        let tokens: Vec<u32> = (0..41u32).map(|t| (t * 7) % 60 + 1).collect();
+        let mut cache = tree.new_kv_cache(N_CTX);
+        tree.forward_no_logits(&mut cache, &tokens[..40], 0, 0)
+            .unwrap();
+        let waiting = 20 - done.load(Ordering::Relaxed);
+        assert!(waiting <= 2, "{waiting} parts were left behind the stage");
+        let got = tree.forward(&mut cache, &tokens[40..], 40, 0).unwrap();
+        let mut alone = model.new_kv_cache(N_CTX);
+        for at in (0..40).step_by(2) {
+            model
+                .forward_no_logits(&mut alone, &tokens[at..at + 2], at, 0)
+                .unwrap();
+        }
+        assert_eq!(
+            got,
+            model.forward(&mut alone, &tokens[40..], 40, 0).unwrap()
+        );
     }
 
     /// A sequence dropped with a prompt still queued for its workers — a
