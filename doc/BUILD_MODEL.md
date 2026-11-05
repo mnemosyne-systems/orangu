@@ -397,7 +397,7 @@ toolchain's HF-style checkpoint directory.
 Build llama.cpp with the **Vulkan** backend — it runs on essentially any
 AMD GPU (including older or integrated ones, unlike ROCm's narrower
 supported-card list) and is what the rest of orangu's own docs assume for
-AMD hardware (see [SERVER.md](SERVER.md)):
+AMD hardware (see the [GPU backend](manual/en/46-server.md#gpu-backend) section):
 
 ```sh
 git clone https://github.com/ggml-org/llama.cpp
@@ -449,7 +449,7 @@ done
 | `Q2_K` | 2.6 | VRAM is extremely tight; expect a real quality drop |
 | `Q3_K_M` | 3.4 | Tight VRAM, better than `Q2_K` |
 | `Q4_0` | 4.5 | Legacy/simple 4-bit; `Q4_K_M` is almost always better at the same size |
-| `Q4_K_M` | 4.8 | The default sweet spot — `orangu-server`'s own preferred quant, see [SERVER.md](SERVER.md) |
+| `Q4_K_M` | 4.8 | The default sweet spot — `orangu-server`'s own preferred quant, see [`download`](manual/en/46-server.md#gguf-inventory) |
 | `Q5_K_M` | 5.7 | Noticeably closer to F16 quality, modest size increase |
 | `Q6_K` | 6.6 | Near-lossless, for when VRAM allows it |
 | `Q8_0` | 8.5 | Effectively lossless; `orangu-server`'s second-choice default |
@@ -578,8 +578,8 @@ path = "src/bin/sft.rs"
 ```
 
 The `wgpu` feature builds against Vulkan — it runs on essentially any AMD
-GPU (matching this project's own AMD/Vulkan preference for llama.cpp, see
-[SERVER.md](SERVER.md)) and is the default. The `ndarray` feature is a
+GPU (matching this project's own AMD/Vulkan preference, see
+[GPU backend](manual/en/46-server.md#gpu-backend)) and is the default. The `ndarray` feature is a
 pure-CPU backend, used only for the smoke test below. If your Burn version
 ships a ROCm/HIP backend directly (via `cubecl-hip` or similar — check
 `burn`'s current docs, the crate/feature name has moved around across

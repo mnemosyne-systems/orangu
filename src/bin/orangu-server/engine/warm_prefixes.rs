@@ -241,6 +241,7 @@ pub async fn warm_up(
                 cache_point: None,
                 background: true,
                 reasoning_budget: None,
+                ..Default::default()
             })
             .await;
         let mut ok = false;

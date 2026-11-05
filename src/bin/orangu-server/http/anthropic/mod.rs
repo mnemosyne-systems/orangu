@@ -58,6 +58,7 @@ use super::openai::{
 };
 use crate::engine::chat_template::{ChatMessage, Reasoning};
 use crate::engine::generate::{FinishReason, GenerateRequest, GenerateStats, StreamEvent};
+use crate::engine::text_stop::StopMatcher;
 use crate::engine::tool_calls;
 
 /// The largest `/v1/messages` body accepted, as Anthropic's own limit.
@@ -490,11 +491,72 @@ const PROBE_TOOL: &str = "orangu_probe_tool";
 /// tool when `name` is `None` — in this model's own call syntax.
 ///
 /// Found by rendering one call through the chat template and reading back
-/// where it starts: the opener (`tool_calls`' formats), and for a named
-/// tool everything up to the end of the name. `None` when the template
-/// renders no call this server recognises, and the choice is then the
-/// model's.
-fn tool_call_prefix(state: &AppState, name: Option<&str>) -> Option<String> {
+/// where it starts: everything up to the end of the name for a named tool, and
+/// up to where the name goes for any tool, so that what the model has left to
+/// choose is which tool rather than whether to make a call. Only the opener
+/// where the name does not come first. `None` when the template renders no
+/// call this server recognises, and the choice is then the model's.
+pub(crate) fn tool_call_prefix(state: &AppState, name: Option<&str>) -> Option<String> {
+    let probe = probe_call(state)?;
+    match name {
+        None => {
+            let head = probe.head();
+            Some(if probe.name_comes_later() {
+                probe.opener
+            } else {
+                head.to_string()
+            })
+        }
+        Some(name) => {
+            let end = probe.call_at + PROBE_TOOL.len();
+            Some(probe.rendered[probe.at..end].replace(PROBE_TOOL, name))
+        }
+    }
+}
+
+/// What a reply forced by [`tool_call_prefix`] for any tool may go on with:
+/// each declared name, and the character the call's syntax puts after a name.
+/// Empty where the forced text does not reach the name, as there is then no
+/// telling where in the reply the name will be.
+pub(crate) fn declared_call_starts(state: &AppState, names: &[String]) -> Vec<Vec<u8>> {
+    let Some(probe) = probe_call(state) else {
+        return Vec::new();
+    };
+    let after = probe.rendered[probe.call_at + PROBE_TOOL.len()..]
+        .chars()
+        .next();
+    match after {
+        Some(after) if !probe.name_comes_later() => names
+            .iter()
+            .map(|name| format!("{name}{after}").into_bytes())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A call this model's template rendered, to read its syntax from.
+struct ProbedCall {
+    rendered: String,
+    /// Where the call begins in `rendered`.
+    at: usize,
+    /// Where the tool's name is in `rendered`.
+    call_at: usize,
+    opener: String,
+}
+
+impl ProbedCall {
+    fn head(&self) -> &str {
+        &self.rendered[self.at..self.call_at]
+    }
+
+    /// Whether arguments come before the name.
+    fn name_comes_later(&self) -> bool {
+        let head = self.head();
+        head.contains("argument") || head.contains("parameter")
+    }
+}
+
+fn probe_call(state: &AppState) -> Option<ProbedCall> {
     let template = state.engine.chat_template.as_ref()?;
     let probe_tools = json!([{"type": "function", "function": {
         "name": PROBE_TOOL, "parameters": {"type": "object", "properties": {}},
@@ -517,14 +579,18 @@ fn tool_call_prefix(state: &AppState, name: Option<&str>) -> Option<String> {
     // The call is the probe's last mention — the tool list and a template's
     // own instructions, which can spell the opener too, come before it.
     let call_at = rendered.rfind(PROBE_TOOL)?;
-    let (at, opener) = tool_calls::last_opener(&rendered[..call_at])?;
-    match name {
-        None => Some(opener.to_string()),
-        Some(name) => {
-            let end = at + rendered[at..].find(PROBE_TOOL)? + PROBE_TOOL.len();
-            Some(rendered[at..end].replace(PROBE_TOOL, name))
-        }
-    }
+    let learned = template.learned_calls();
+    let (at, opener) = tool_calls::last_opener(&rendered[..call_at]).or_else(|| {
+        let opener = learned.as_deref()?.opener();
+        Some((rendered[..call_at].rfind(opener)?, opener))
+    })?;
+    let opener = opener.to_string();
+    Some(ProbedCall {
+        rendered,
+        at,
+        call_at,
+        opener,
+    })
 }
 
 /// `thinking.budget_tokens` of a request that turns thinking on: the most
@@ -595,62 +661,6 @@ fn reasoning_for<'a>(
     Some((reasoning, suppress))
 }
 
-/// Holds back generated text that might be the start of a stop sequence,
-/// and reports the first one that is completed.
-struct StopMatcher {
-    stops: Vec<String>,
-    held: String,
-}
-
-impl StopMatcher {
-    fn new(stops: &[String]) -> Self {
-        Self {
-            stops: stops.iter().filter(|s| !s.is_empty()).cloned().collect(),
-            held: String::new(),
-        }
-    }
-
-    /// Takes the next piece of text. Returns what is safe to emit and, once
-    /// a stop sequence has been written, which one — the text before it is
-    /// the last there is.
-    fn push(&mut self, text: &str) -> (String, Option<String>) {
-        if self.stops.is_empty() {
-            return (text.to_string(), None);
-        }
-        self.held.push_str(text);
-        let first = self
-            .stops
-            .iter()
-            .filter_map(|s| self.held.find(s.as_str()).map(|at| (at, s)))
-            .min_by_key(|(at, _)| *at);
-        if let Some((at, stop)) = first {
-            let stop = stop.clone();
-            let emit = self.held[..at].to_string();
-            self.held.clear();
-            return (emit, Some(stop));
-        }
-        // Keep the longest tail of `held` that some stop sequence starts with.
-        let keep = self
-            .held
-            .char_indices()
-            .map(|(i, _)| i)
-            .find(|&i| {
-                let tail = &self.held[i..];
-                self.stops.iter().any(|s| s.starts_with(tail))
-            })
-            .unwrap_or(self.held.len());
-        let emit = self.held[..keep].to_string();
-        self.held.drain(..keep);
-        (emit, None)
-    }
-
-    /// What is still held back when generation ends: it never became a stop
-    /// sequence, so it belongs to the answer.
-    fn finish(&mut self) -> String {
-        std::mem::take(&mut self.held)
-    }
-}
-
 fn stop_reason(finish: FinishReason, saw_calls: bool, stop: Option<&str>) -> &'static str {
     if stop.is_some() {
         "stop_sequence"
@@ -718,8 +728,13 @@ struct Prompt {
     /// The tool-call opener the first reply is made to begin with, for a
     /// `tool_choice` that requires a call.
     prefix: Option<String>,
+    /// What the first turn may go on with after `prefix`.
+    reply_starts: Vec<Vec<u8>>,
     /// `disable_parallel_tool_use`: the reply makes at most one client call.
     single_call: bool,
+    /// The call syntax read off the chat template, for a model no parser
+    /// reads: only when the request declared tools.
+    learned: Option<Arc<crate::engine::tool_learn::LearnedCalls>>,
     /// The schema the reply is held to, from `output_config.format`.
     json_schema: Option<Arc<crate::engine::json_schema::Schema>>,
     /// The response's `container`, when the request runs code.
@@ -1137,6 +1152,10 @@ async fn prepare(
     let tools = (!tools.is_empty()).then_some(Value::Array(tools));
     // A continued reply has already begun, so it cannot also be made to
     // begin with a call.
+    let learned = tools
+        .as_ref()
+        .and_then(|_| state.engine.chat_template.as_ref())
+        .and_then(|template| template.learned_calls());
     let prefix = match (&tools, &continue_from) {
         (Some(_), None) => match choice.and_then(|c| c.get("type")).and_then(Value::as_str) {
             Some("any") => tool_call_prefix(state, None),
@@ -1147,6 +1166,14 @@ async fn prepare(
             _ => None,
         },
         _ => None,
+    };
+    // Only the reply's first turn begins with what `prefix` forced.
+    let reply_starts = match (
+        &prefix,
+        choice.and_then(|c| c.get("type")).and_then(Value::as_str),
+    ) {
+        (Some(_), Some("any")) => declared_call_starts(state, &tool_names),
+        _ => Vec::new(),
     };
     let single_call = choice
         .and_then(|c| c.get("disable_parallel_tool_use"))
@@ -1190,6 +1217,8 @@ async fn prepare(
         tools,
         server,
         prefix,
+        reply_starts,
+        learned,
         single_call,
         json_schema,
         container: container_json,
@@ -1291,7 +1320,7 @@ async fn start(
     }
     let prompt = prepare(state, headers, req.prompt, true).await?;
     let first = render_turn(state, &prompt, true).await?;
-    if let Some(rejection) = crate::http::reject_oversized_context(first.tokens.len()) {
+    if let Some(rejection) = crate::http::reject_oversized_context(state, first.tokens.len()) {
         return Err(Box::new(rewrap(rejection).await));
     }
     let sampling = sampling_for(
@@ -1303,6 +1332,7 @@ async fn start(
             min_p: req.min_p,
             repeat_penalty: req.repeat_penalty,
             seed: req.seed,
+            ..Default::default()
         },
     );
     Ok(Prepared {
@@ -1640,6 +1670,11 @@ async fn drive_turns(
     loop {
         let first = turn == 0;
         let prompt_len = rendered.tokens.len();
+        let mut learned = prepared
+            .prompt
+            .learned
+            .clone()
+            .map(crate::engine::tool_learn::LearnedReader::new);
         let mut rx = state
             .engine
             .generate(GenerateRequest {
@@ -1650,6 +1685,11 @@ async fn drive_turns(
                 stop_token_ids: state.engine.tokenizer.stop_token_ids(),
                 json_output: false,
                 json_schema: prepared.prompt.json_schema.clone(),
+                reply_starts: if first {
+                    prepared.prompt.reply_starts.clone()
+                } else {
+                    Vec::new()
+                },
                 cache_prompt: prepared.cache_prompt,
                 id_slot: prepared.id_slot,
                 timings_per_token: false,
@@ -1657,13 +1697,24 @@ async fn drive_turns(
                 cache_point: rendered.cache_point,
                 background: false,
                 reasoning_budget: thinking_budget(&prepared.prompt.fields),
+                call_markers: prepared
+                    .prompt
+                    .learned
+                    .as_deref()
+                    .map(|learned| learned.markers())
+                    .unwrap_or_default(),
+                ..Default::default()
             })
             .await;
         // A forced call's opener is read as if the model had written it.
-        let mut pending = if first {
+        let opener = if first {
             prepared.prompt.prefix.clone().unwrap_or_default()
         } else {
             String::new()
+        };
+        let mut pending = match learned.as_mut() {
+            Some(reader) => reader.push(&opener),
+            None => opener,
         };
         let mut this_turn = Turn::default();
         let mut hit = None;
@@ -1674,7 +1725,10 @@ async fn drive_turns(
                 StreamEvent::Reasoning(text) => sink(Piece::Thinking(text)),
                 StreamEvent::Token(text) => {
                     let (safe, stop) = stops.push(&text);
-                    pending.push_str(&safe);
+                    match learned.as_mut() {
+                        Some(reader) => pending.push_str(&reader.push(&safe)),
+                        None => pending.push_str(&safe),
+                    }
                     if stop.is_some() {
                         hit = stop;
                         break;
@@ -1693,7 +1747,9 @@ async fn drive_turns(
                         break;
                     }
                 }
-                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
+                StreamEvent::PromptProgress { .. }
+                | StreamEvent::Timings(_)
+                | StreamEvent::Logprob(_) => {}
                 StreamEvent::Done {
                     finish_reason,
                     stats: done,
@@ -1716,7 +1772,14 @@ async fn drive_turns(
         // Dropping the receiver is what stops a generation cut short by a
         // stop sequence or a single call.
         drop(rx);
-        pending.push_str(&stops.finish());
+        let held = stops.finish();
+        match learned.as_mut() {
+            Some(reader) => {
+                pending.push_str(&reader.push(&held));
+                pending.push_str(&reader.finish());
+            }
+            None => pending.push_str(&held),
+        }
         // A call the model ended the reply on is a call, closer or not.
         if hit.is_none() && finish == FinishReason::Stop {
             pending = tool_calls::close_trailing(&pending);
@@ -1872,7 +1935,8 @@ async fn drive_turns(
             });
         }
         rendered = render_turn(state, &prepared.prompt, false).await?;
-        if let Some(rejection) = crate::http::reject_oversized_context(rendered.tokens.len()) {
+        if let Some(rejection) = crate::http::reject_oversized_context(state, rendered.tokens.len())
+        {
             return Err(Box::new(rewrap(rejection).await));
         }
     }

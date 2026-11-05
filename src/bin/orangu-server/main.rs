@@ -34,6 +34,8 @@ mod bundle;
 mod config;
 mod daemon;
 mod device_lost;
+#[cfg(test)]
+mod doc_tables;
 mod engine;
 mod http;
 mod init;
@@ -2616,7 +2618,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     let prefix_cache = crate::engine::env::flag_on("ORANGU_PREFIX_CACHE")
         .then(|| Arc::new(engine::prefix_cache::PrefixCache::new(PREFIX_CACHE_ENTRIES)));
 
-    // The paged KV pool (`ORANGU_PAGED_KV=1`), and the index that gives its
+    // The paged KV pool (on unless `ORANGU_PAGED_KV=0`), and the index that gives its
     // pages a content identity. Both or neither: a pool without an index pages
     // without sharing, which is the cost of paging for none of the benefit.
     //
@@ -3125,6 +3127,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         // request's completed line and nothing in between, and a daemon on
         // the console has `/dev/null` for a stdout.
         live_stats: conf.log.is_console() && !args.daemon,
+        context_shift: conf.context_shift,
         image,
         video,
         audio: None,
@@ -3319,6 +3322,7 @@ fn prepare_audio(start: AudioStart<'_>) -> Result<Prepared> {
         role,
         reasoning_effort,
         live_stats: conf.log.is_console() && !daemon,
+        context_shift: conf.context_shift,
         image: None,
         video: None,
         audio: Some(pipeline),

@@ -68,6 +68,7 @@ should not have a `[web]` section at all.
 | `GET /v1/coordinator` | once per endpoint to tell a coordinator from a plain server, then every status cycle against a confirmed coordinator |
 | `GET /v1/models` | startup model detection, `/model` completion, `/server`, and as the health check against a plain server |
 | `POST /v1/chat/completions` | every prompt and every tool round trip |
+| `POST /infill` | `/infill` |
 | `POST /v1/embeddings` | `/search`, when a server has the `embeddings` role (or the default `all` role) |
 | `GET /props` | once per endpoint, to learn the slot count for pinning |
 | `POST /slots/{id}?action=save\|restore` | to keep a workspace tab's KV cache across restarts |
@@ -150,6 +151,9 @@ easy to miss looking down a table:
 - **`https`** — when `tls_cert`/`tls_key` are set, every endpoint is served
   over TLS on the same port; there is no plaintext listener alongside.
 
+`/v1/chat/completions` and `/v1/completions` answer **`400`** to a field they
+do not honour, naming it: see **What the OpenAI endpoints refuse**.
+
 And one that applies to the generating endpoints: an `embedding`-role server
 answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 **`501`** naming the mode, rather than pretending to generate. A speech
@@ -162,7 +166,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | :-- | :-- |
 | `GET /v1/models` | the one model this process serves, readable by OpenAI and Anthropic clients |
 | `GET /v1/models/{id}` | that model, when `id` names it; `404` otherwise |
-| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; `tools`/`tool_calls` and `response_format` (`json_object`, `json_schema`); `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; needs a chat template; disabled under `--embedding` |
+| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; `tools`/`tool_choice`/`tool_calls` with arguments streamed as they are written; `stop`, `n`, `logprobs`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `response_format` (`json_object`, `json_schema`); `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; needs a chat template; disabled under `--embedding` |
 | `POST /v1/messages` | Anthropic's Messages API: streaming (SSE) and non-streaming; content blocks and PDF documents, `tools`/`tool_choice`/`tool_use`, continued replies, `stop_sequences`, `thinking`/`effort`; needs a chat template |
 | `POST /v1/messages/count_tokens` | the prompt token count a `/v1/messages` request would have |
 | `POST /v1/messages/batches`, `GET /v1/messages/batches` | Anthropic's Message Batches API: submit many `/v1/messages` requests at once, or list the batches |
@@ -186,7 +190,10 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `GET`, `POST`, `DELETE /v1/sessions/{id}`, `POST /v1/sessions/{id}/archive` | one session; update, delete or archive it |
 | `POST /v1/sessions/{id}/events`, `GET /v1/sessions/{id}/events` | send a session events (a message, a tool result, an interrupt), or list its events |
 | `GET /v1/sessions/{id}/events/stream` | a session's events as they happen, as server-sent events |
-| `POST /v1/completions` | legacy completion, no chat template needed; `cache_prompt`/`id_slot`/`response_format`/`ignore_eos`; disabled under `--embedding` |
+| `/v1/sessions/{id}/threads…` | a multiagent session's threads and their events (see **Multiagent sessions**) |
+| `/v1/deployments…`, `/v1/deployment_runs…` | scheduled deployments and their runs (see **Scheduled deployments**) |
+| `/v1/webhook_endpoints…` | webhook endpoints (see **Webhooks**) |
+| `POST /v1/completions` | legacy completion, no chat template needed; `stop`, `n`, `logprobs`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `cache_prompt`/`id_slot`/`response_format`/`ignore_eos`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled and L2-normalized; carries OpenAI's `usage` |
 | `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image`, `qwen_image_2_1`, `flux2_klein` or `moss_image` model; `501` on a language model |
 | `POST /v1/videos`, `GET /v1/videos` | OpenAI's Videos API, on an `ltxv` model: start a clip as a job, or list the jobs; `501` on any other model |
@@ -202,7 +209,8 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `POST /slots/{id_slot}` | `?action=save\|restore` — persist or reload that slot's KV cache |
 | `GET /metrics` | Prometheus text: gauges, latency histograms, outcome and token counters |
-| `POST /completion` | native, streaming; `cache_prompt`/`id_slot`; disabled under `--embedding` |
+| `POST /completion` | native, streaming; `stop`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `cache_prompt`/`id_slot`; disabled under `--embedding` |
+| `POST /infill` | code completion at a cursor, for a model with fill-in-the-middle tokens; `501` on any other |
 | `POST /embedding` | native embeddings |
 | `POST /tokenize`, `POST /detokenize` | text to token ids and back |
 | `POST /logits` | teacher-forced next-token log-probabilities after every prefix of a text |
@@ -210,6 +218,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `POST /v1/create_file` … `/v1/delete_directory` | the eight file-lifecycle endpoints |
 | `GET /moe-stats` | mixture-of-experts counters since the previous call, and reset |
 | `GET /gpu-timings` | per-stage GPU timings since the previous call, and reset |
+| `GET /decode-stages` | per-stage forward-pass timings since the previous call, and reset |
 | `GET /model-cache` | how much of the model is in the page cache right now |
 | `POST /model-cache/drop` | evict the model from the page cache; loopback-only |
 | `POST /v1/shutdown` | stop the server; loopback-only |
@@ -254,23 +263,28 @@ and points at `/v1/completions`.
 | :-- | :-- | :-- |
 | `messages` | `[]` | the conversation, in OpenAI's shape |
 | `stream` | `false` | SSE instead of one JSON body |
-| `max_tokens` | `8192` | response-length cap, clamped to what is left of the context window; reaching it reports `finish_reason: "length"` |
-| `temperature`, `top_p` | role's own | OpenAI's sampler fields |
-| `top_k`, `min_p`, `repeat_penalty`, `seed` | role's own | the rest of the sampler |
+| `max_tokens`, `max_completion_tokens` | `8192` | response-length cap, clamped to what is left of the context window; reaching it reports `finish_reason: "length"` |
+| `temperature`, `top_p`, `seed` | role's own | OpenAI's sampler fields |
+| `presence_penalty`, `frequency_penalty` | `0` | subtracted from the logits of recent tokens, from `-2` to `2` |
+| `logit_bias` | — | token id to a bias from `-100` to `100` |
+| `top_k`, `min_p`, `repeat_penalty` | role's own | the rest of the sampler |
+| `stop` | — | a string or an array of them: text that ends the reply |
+| `n` | `1` | how many choices to generate |
+| `logprobs`, `top_logprobs` | `false`, `0` | each token's log probability, and up to 20 alternatives |
+| `reasoning_effort` | role's own | `none`, `minimal`, `low`, `medium`, `high` or `xhigh`, passed to the template |
 | `cache_prompt` | `true` | may this request reuse an already-computed KV prefix |
 | `id_slot` | — | pin to one slot |
 | `timings_per_token` | `false` | attach `timings` to every streamed chunk |
 | `return_progress` | `false` | emit `prompt_progress` chunks during prefill |
 | `response_format` | — | `{"type": "json_object"}` constrains output to JSON |
 | `tools` | — | OpenAI's tool array, handed to the chat template |
+| `tool_choice` | `auto` | whether the reply may, must or must not call a tool |
+| `parallel_tool_calls` | `true` | `false`: at most one call, and the reply ends with it |
 
-`top_k`, `min_p`, `repeat_penalty` and `seed` are **not** OpenAI's fields, and
-they are accepted anyway: the sampler has knobs OpenAI's schema has no word
-for, and an unknown key is dropped silently rather than rejected. A caller
-sending `repeat_penalty` and seeing no change would conclude the penalty does
-nothing, when in fact the value never arrived. Every sampler field is
-optional in the strict sense — leaving one out keeps the role's default, which
-is not the same as setting it to zero, since `temperature: 0.0` is greedy and
+`top_k`, `min_p` and `repeat_penalty` are not OpenAI's fields: the sampler has
+knobs OpenAI's schema has no word for. Every sampler field is optional in the
+strict sense — leaving one out keeps the role's default, which is not the same
+as setting it to zero, since `temperature: 0.0` is greedy and
 `repeat_penalty: 1.0` is off.
 
 A non-streaming reply is `chat.completion`:
@@ -285,6 +299,85 @@ A non-streaming reply is `chat.completion`:
 A streaming reply is a series of `chat.completion.chunk` events, each carrying
 a `delta`, ending with a chunk that carries `finish_reason` (plus `usage`,
 `timings` and `prompt_progress`) and then `[DONE]`.
+
+##### What the OpenAI endpoints refuse
+
+`/v1/chat/completions` and `/v1/completions` answer `400` to a field they do not
+honour, in OpenAI's error shape, naming it:
+
+```json
+{"error":{"message":"/v1/chat/completions: unknown field `grammar`, expected one of `messages`, … A field this server does not honour is refused rather than ignored.","type":"invalid_request_error","param":null,"code":null}}
+```
+
+A dropped field looks to a client exactly like a knob with no effect, and a
+client whose `stop` is dropped gets output it did not ask for.
+
+Fields that change nothing about what is generated are accepted and do nothing:
+`model`, `user`, `metadata`, `store`, `service_tier`, `stream_options`,
+`prompt_cache_key`, `safety_identifier`, and on chat `modalities`. On
+`/v1/completions`, so are `timings_per_token`, `echo: false` and `best_of: 1`;
+those two at any other value are refused. The last chunk of a stream always
+carries `usage`.
+
+##### `stop`
+
+Text that ends the reply when written. It may span tokens: text is held back
+until a match is ruled out, so nothing of a stop string reaches the client, in a
+stream or otherwise, and generation really ends there, freeing the slot. The
+reply reports `finish_reason: "stop"`. A reasoning model's thinking is not
+read for stop strings.
+
+##### `presence_penalty`, `frequency_penalty` and `logit_bias`
+
+The two penalties look at the same window as `repeat_penalty`, the last 64
+tokens, and subtract from a token's logit: `presence_penalty` once if the token
+occurs there, `frequency_penalty` once per occurrence. A negative value favours
+what was already said. `logit_bias` maps a token id, as a string, to a value
+added to its logit before anything else looks at it: `-100` in effect bans a
+token and `100` in effect forces it.
+
+```json
+{"messages":[…],"frequency_penalty":0.4,"logit_bias":{"1734":-100}}
+```
+
+An id past the model's vocabulary, or a value out of range, is a `400`. A
+request using any of these samples on the host rather than on the device, since
+the device's fast paths apply only `repeat_penalty` and `top_k`.
+
+##### `logprobs` and `top_logprobs`
+
+`logprobs: true` reports each token of the reply, and `top_logprobs` (up to 20)
+that many alternatives at each position:
+
+```json
+"logprobs":{"content":[{"token":" Paris","logprob":-0.012,"bytes":[32,80,97,114,105,115],
+  "top_logprobs":[{"token":" Paris","logprob":-0.012,"bytes":[32,80,97,114,105,115]}]}],
+  "refusal":null}
+```
+
+Each figure is the model's own, over the whole vocabulary, before temperature,
+penalties, bias and truncation: those decide what is picked, and a figure that
+moved with them could not be compared across requests. `bytes` is there because
+a token can end half way through a character. A stream sends each token's entry
+in a chunk of its own, with an empty `delta`, after the chunk carrying its text.
+Text a stop string took away has no entries; reasoning and hidden structural
+tokens have none either. Like the penalties, this samples on the host.
+
+##### `n`
+
+How many choices to generate, up to 128: one prompt fanned out over the slots,
+so with one slot they run in turn and with several they run side by side,
+sharing decode steps where the model batches them. Each has a seed of its own,
+`seed + index`, so sampled choices differ; greedy ones are normally identical.
+Choices running side by side are not bit-reproducible: how they batch moves a
+logit in its last digits, which decides a pick where two tokens are nearly tied.
+For a repeatable result, send `n: 1` with the seed you want. `n > 1` cannot be
+combined with `id_slot`.
+
+`usage` counts the prompt once and sums the replies. A stream labels each chunk
+with its choice's `index`, gives each choice its own `finish_reason` chunk, and
+sends `usage` and `timings` in a last chunk with empty `choices` before
+`[DONE]`.
 
 ##### `reasoning_content`
 
@@ -511,12 +604,70 @@ mistaken for a request to invoke one, and a model asked to *write* a tool call
 has to be able to. A span that opens and never closes, or whose body matches
 none of the forms, is also left as content rather than silently dropped.
 
+**A syntax with no parser here** is read off the model's own chat template. The
+template's branch that renders `tool_calls` is by construction what the model
+was trained to write, so the first request declaring tools renders a known call
+through it and notes where the name, keys and values land: a JSON object naming
+the function, a name followed by JSON arguments, or a name followed by key/value
+tags. A new family's calls therefore work before a parser is written for it, on
+this endpoint and on `/v1/messages`. A template whose call is already readable
+learns nothing, so a hand-written parser always wins. A syntax with no opening
+delimiter is not learned, for the reason above. Such a call's arguments arrive
+in one delta, when it closes.
+
 A turn that produced calls reports `finish_reason: "tool_calls"` and carries
-them in `choices[0].message.tool_calls` (non-streaming) or in a
-`delta.tool_calls` chunk (streaming). `function.arguments` is a JSON
-**string**, as OpenAI specifies. Streaming emits each call complete in one
-delta rather than character by character, since a call is only recognised once
-it is fully written.
+them in `choices[0].message.tool_calls` (non-streaming) or in
+`delta.tool_calls` chunks (streaming). `function.arguments` is a JSON
+**string**, as OpenAI specifies.
+
+**Streaming.** A call's first delta has its `index`, `id`, `type` and
+`function.name`, with empty `arguments`; later deltas have the `index` and the
+next piece of `function.arguments`. Join the pieces by `index`:
+
+```json
+{"tool_calls":[{"index":0,"id":"call-1755600000-0","type":"function","function":{"name":"create_file","arguments":""}}]}
+{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.rs\",\"content\":\"fn "}}]}
+{"tool_calls":[{"index":0,"function":{"arguments":"main() {}\"}"}}]}
+```
+
+A call is only known to be one when it closes, so a call cut off by the length
+limit, or one the parsers cannot read, has already been partly sent. Its
+arguments stay unfinished JSON, which cannot be run by mistake, and the span
+follows as ordinary content. Check that `function.arguments` parses before
+running a call; `finish_reason` is `tool_calls` only if at least one call
+finished. `orangu` drops such a call and keeps the text.
+
+**`tool_choice`** decides what the reply may do with the tools:
+
+| Value | |
+| :-- | :-- |
+| `"auto"` | the model decides |
+| `"none"` | the tools are left out of the prompt, and nothing the reply writes is read as a call |
+| `"required"` | the reply begins with a call of some tool |
+| `{"type": "function", "function": {"name": "…"}}` | the reply begins with a call of that function |
+
+A call is required by making the reply begin with one: the call's text up to
+where the name goes, and for a named function the name too, is written after the
+generation prompt in the model's own syntax. Under `required` with several
+tools, the choice among them is the model's, and the name it writes is held to
+the names in `tools`. A syntax that writes the arguments before the name has no
+such hold, since the reply cannot be read for the name while it is written, so
+there a model can still name a tool it was not given. With one tool, `required`
+names it. The arguments are always the model's.
+
+A required call can still come back as text. If a model breaks the call's syntax
+after the name, for example by leaving out the closing brace or the closer, the
+reply has no `tool_calls`: its `content` holds what was written, and
+`finish_reason` is `stop`. A client that needs a call should check for one.
+These are `400`s: an unknown value, a name not in `tools`, `required` with no
+tools, a template that renders no call this server can read, and a required call
+together with a `response_format`.
+
+**`parallel_tool_calls: false`** limits the reply to one call, and generation
+ends at that call's closer.
+
+A tool's parameter schema is passed to the template and not enforced: a call's
+arguments are what the model wrote, and a client should validate them.
 
 #### `POST /v1/completions`
 
@@ -528,8 +679,12 @@ through.
 | Field | Default | |
 | :-- | :-- | :-- |
 | `prompt` | *required* | the raw prompt, sent to the tokenizer as-is |
-| `max_tokens` | `256` | response-length cap |
+| `max_tokens`, `n_predict` | `256` | response-length cap |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `seed` | role's own | the sampler, as above |
+| `presence_penalty`, `frequency_penalty`, `logit_bias` | — | as above |
+| `stop` | — | as above |
+| `n` | `1` | as above |
+| `logprobs` | — | how many alternatives to list per token, up to 20; `0` lists the tokens alone |
 | `stream` | `false` | SSE instead of one JSON body |
 | `ignore_eos` | `false` | keep generating to `max_tokens` even if the model emits EOS |
 | `cache_prompt` | `true` | as above |
@@ -542,7 +697,9 @@ would otherwise have stopped on.
 
 The reply is `text_completion`, with the generated text in
 `choices[0].text` — one JSON body, or a stream of chunks ending with a final
-chunk carrying `usage`/`timings`/`prompt_progress` and then `[DONE]`.
+chunk carrying `usage`/`timings`/`prompt_progress` and then `[DONE]`. `logprobs`
+follows this endpoint's own shape, parallel arrays per choice: `tokens`,
+`token_logprobs`, `top_logprobs` and `text_offset`.
 
 #### `POST /v1/embeddings`
 
@@ -1100,7 +1257,10 @@ which the response does not repeat. Trailing whitespace on it is trimmed.
 **Forced tool calls.** `any` and `tool` begin the reply with the model's own
 tool-call syntax, found by rendering a sample call through the chat template.
 A template that renders no call this server recognises leaves the choice to
-the model. A continued reply is never forced.
+the model. A continued reply is never forced. Under `any`, the name is held to
+the declared tools, as for [`required`](#post-v1chatcompletions) on the OpenAI
+endpoint, and a model that then breaks the call's syntax produces text rather
+than a `tool_use` block.
 
 The response is a `message`:
 
@@ -1777,7 +1937,10 @@ from generation, nor a cache hit from real work:
 
 - **`usage`** (OpenAI's shape) — `prompt_tokens`, `completion_tokens`,
   `total_tokens`, and `prompt_tokens_details.cached_tokens` for the part of
-  the prompt served from the prefix cache.
+  the prompt served from the prefix cache. Under a context shift (see the
+  _Inference server_ chapter), `context_dropped_tokens` says how many tokens of
+  the conversation were dropped; `timings` carries it too. It is left out when
+  nothing was.
 - **`timings`** (the ecosystem's shape, field for field) — `prompt_n`,
   `prompt_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`,
   `predicted_per_second` and their per-token equivalents. These are the same
@@ -2150,10 +2313,14 @@ field names:
 | `n_predict` | `256` | response-length cap |
 | `stream` | `false` | SSE instead of one JSON body |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `seed` | role's own | the sampler |
+| `presence_penalty`, `frequency_penalty`, `logit_bias` | — | as on `/v1/chat/completions` |
+| `stop` | — | as on `/v1/chat/completions` |
 | `cache_prompt` | `true` | as on `/v1/chat/completions` |
 | `id_slot` | — | as on `/v1/chat/completions` |
+| `n_keep` | `context_keep` | how many of the first tokens a context shift keeps |
 
-Non-streaming, the reply is `{"content": "…", "stop": true, "timings": {…}}`.
+Non-streaming, the reply is `{"content": "…", "stop": true, "finish_reason": …,
+"timings": {…}}`.
 This endpoint has one text field and no message shape to split a reasoning
 model's thinking out into, so — unlike `/v1/chat/completions` — thinking
 stays in `content`, which is what a caller who prefilled `<think>` here
@@ -2162,6 +2329,64 @@ Streaming, each event is `{"content": "…", "stop": false}` and the last is
 `{"content": "", "stop": true, "finish_reason": …, "timings": {…},
 "prompt_progress": {…}}`. There is no `response_format` here — structured
 output is a `/v1/…` feature.
+
+#### `POST /infill`
+
+Code completion at a cursor: the text before and after it go in, and what
+belongs between them comes out. Needs a model whose vocabulary has
+fill-in-the-middle tokens: the `tokenizer.ggml.fim_pre_token_id`,
+`fim_suf_token_id` and `fim_mid_token_id` keys or, in a file written without
+them, tokens spelled the way those vocabularies spell them, such as
+`<|fim_prefix|>`, `<fim_prefix>` or `<PRE>`. Any other model answers `501`.
+
+| Field | Default | |
+| :-- | :-- | :-- |
+| `input_prefix` | *required* | the text before the cursor |
+| `input_suffix` | *required* | the text after the cursor |
+| `prompt` | `""` | what was typed after the prefix, which the completion continues |
+| `input_extra` | `[]` | other files for context: `[{"filename": …, "text": …}]` |
+| `filename`, `repo` | `"file"`, `"project"` | the cursor's file and the repository's name, written in front of the cursor when `input_extra` is sent |
+| `n_indent` | the cursor line's | a line indented less than this ends the completion; `0` turns that off |
+| `n_predict` | `256` | response-length cap |
+| `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty`, `seed` | role's own | the sampler |
+| `stop` | — | as on `/v1/chat/completions` |
+| `stream`, `cache_prompt`, `id_slot`, `n_keep` | `false`, `true`, —, `context_keep` | as on `/completion` |
+
+The reply has the shape of `/completion`'s. Unknown fields are ignored, as on
+the other native endpoints, so an editor plugin may send its own.
+
+```sh
+curl http://localhost:8100/infill -d '{
+  "input_prefix": "def add(a, b):\n    ",
+  "input_suffix": "\n\nprint(add(1, 2))\n",
+  "input_extra": [{"filename": "util.py", "text": "def sub(a, b):\n    return a - b\n"}],
+  "n_predict": 64,
+  "temperature": 0
+}'
+```
+
+**The prompt** holds up to 2048 tokens around the cursor, three quarters before
+it, and either side may use what the other leaves. A side too long keeps the
+part nearest the cursor. `input_extra` goes in front, and takes what that window
+and twice `n_predict` leave of the context. The text is encoded as text: a file
+that spells a special token cannot end its own prefix.
+
+**Where a completion ends:**
+
+- at the model's own stop tokens, or at another of the frame's tokens (pad,
+  repository, file separator);
+- at a line indented less than `n_indent`, on the line that left the block. The
+  cursor's own line is not judged, and neither is a blank line;
+- at a line equal to the first non-blank line of `input_suffix`, which is the
+  model writing what already follows.
+
+The two line rules hold a line back until its indentation is known, and neither
+sends the line that ends the completion.
+
+Point an editor plugin that speaks this shape at `http://host:port/infill`. For
+`input_extra`, the knowledge graph and semantic search are natural sources:
+`/graph` and `/search` in the terminal, or the `/infill` command there, which
+sends the files the graph couples most strongly to the file it completes.
 
 #### `POST /embedding`
 
@@ -2177,7 +2402,8 @@ curl -s localhost:8100/tokenize -H 'Content-Type: application/json' \
 ```
 
 `tokenize` takes `content` and an optional `add_special` (default `false`, for
-the model's own BOS-style framing) and answers `{"tokens": [...]}`.
+the model's own BOS-style framing, which a model that asks for no BOS does not
+get) and answers `{"tokens": [...]}`.
 `detokenize` takes `{"tokens": [...]}` and answers `{"content": "…"}`, with
 the model's tokenization-space cleanup applied — so a round trip gives back
 readable text rather than the tokenizer's internal spelling.
@@ -2201,9 +2427,13 @@ in arithmetic. `orangu-bench --kl` compares two such answers.
 | `tokens` | — | the exact token ids to run; wins over `content` |
 | `rows` | 1 | positions a pass: 1 runs each as a decode step, 2–64 in multi-position passes, the path speculative verification takes |
 | `top` | 32 | candidates per position, 1–256 |
+| `score` | `false` | also answer `scores`, the log-probability of each actual next token |
 
 The answer is `{"tokens": [...], "rows": N, "positions": [[[id, logprob], …], …], "seconds": S}`,
-one entry per token. The run takes a request slot and waits for one like any
+one entry per token. With `score`, `scores` has one entry for each token after the
+first: the log-probability of `tokens[i + 1]` after the first `i + 1` tokens, over
+the whole vocabulary, whether or not it is among the `top` candidates.
+`orangu-bench`'s scoring modes are built on it. The run takes a request slot and waits for one like any
 other request; its cache is its own and is not kept.
 
 #### `POST /apply-template`
@@ -2265,6 +2495,16 @@ alone cannot separate a change that moves fewer bytes from one that moves the
 same bytes faster, and on a model whose weights stream from disk it cannot see
 either one over the I/O. `major_faults_window` is the only honest signal that
 the weights came from the disk rather than the page cache.
+
+The `store` block says where routed experts' weights came from. These
+variables govern it and what surrounds it:
+
+| Variable | Effect |
+| :--- | :--- |
+| `ORANGU_EXPERT_CACHE_GB` | Size of an in-process expert weight cache, in GiB. `0` or unset reads weights straight from the memory mapping and leaves placement to the OS page cache, except on a model the server reads with `O_DIRECT` by itself, which gets a 1 GiB cache to land those reads in. Set it only for a model that does not fit in RAM; below that, the page cache already holds every expert. |
+| `ORANGU_EXPERT_CACHE_POLICY` | Replacement rule: `lfru` (frequency-first with an admission margin), `lfu` (the same scoring, admitting every miss), or the default `lru`. Where experts do not fit, a routing pass is a scan, and recency can evict every expert before it comes round again. `/moe-stats` reports the rule in force. |
+| `ORANGU_EXPERT_BUDGET` | Cap on distinct experts evaluated per layer at decode. **Changes what the model computes**, and is off by default. It never applies to prefill and never leaves a position with nothing routed. |
+| `ORANGU_PREFETCH_K` | Prefetches the top `k` of the next layer's predicted routing, which `route_ahead.accuracy` scores. `0`, the default, predicts and fetches nothing. |
 
 `stats.layer_calls: 0` means no MoE layer ran in the window — a dense model,
 or an empty window; `store.hit_rate` and `route_ahead.accuracy` are `null`

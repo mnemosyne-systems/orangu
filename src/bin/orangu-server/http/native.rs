@@ -32,7 +32,6 @@ use std::sync::Arc;
 use super::AppState;
 use crate::engine::chat_template::ChatMessage;
 use crate::engine::generate::{FinishReason, GenerateRequest, StreamEvent};
-use crate::engine::sampling::SamplingParams;
 
 /// `GET /health` — this process is alive.
 ///
@@ -691,7 +690,10 @@ pub async fn tokenize(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TokenizeRequest>,
 ) -> impl IntoResponse {
-    let tokens = state.engine.tokenizer.encode(&req.content, req.add_special);
+    // A BOS only where this model asks for one: tokenizing with `add_special`
+    // gives what a prompt would be.
+    let tokenizer = &state.engine.tokenizer;
+    let tokens = tokenizer.encode(&req.content, req.add_special && tokenizer.wants_bos());
     Json(TokenizeResponse { tokens })
 }
 
@@ -711,6 +713,9 @@ pub struct LogitsRequest {
     /// Candidates kept per position.
     #[serde(default = "default_logits_top")]
     top: usize,
+    /// Also answer the log-probability of each actual next token.
+    #[serde(default)]
+    score: bool,
 }
 
 fn one() -> usize {
@@ -728,6 +733,9 @@ pub struct LogitsResponse {
     /// After each prefix of `tokens`, `[id, log-probability]` pairs, most
     /// likely first.
     positions: Vec<Vec<(u32, f32)>>,
+    /// With `score`: the log-probability of `tokens[i + 1]` after each prefix.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scores: Option<Vec<f32>>,
     seconds: f64,
 }
 
@@ -739,7 +747,10 @@ pub async fn logits(
     use crate::engine::teacher::{MAX_ROWS, MAX_TOP};
     let tokens = match (req.tokens, req.content) {
         (Some(tokens), _) => tokens,
-        (None, Some(content)) => state.engine.tokenizer.encode(&content, true),
+        (None, Some(content)) => {
+            let tokenizer = &state.engine.tokenizer;
+            tokenizer.encode(&content, tokenizer.wants_bos())
+        }
         (None, None) => {
             return (StatusCode::BAD_REQUEST, "give `content` or `tokens`").into_response();
         }
@@ -768,10 +779,11 @@ pub async fn logits(
         .teacher_forced(tokens.clone(), req.rows, req.top)
         .await
     {
-        Ok(positions) => Json(LogitsResponse {
+        Ok((positions, scores)) => Json(LogitsResponse {
             tokens,
             rows: req.rows,
             positions,
+            scores: req.score.then_some(scores),
             seconds: started.elapsed().as_secs_f64(),
         })
         .into_response(),
@@ -807,6 +819,9 @@ pub struct CompletionRequest {
     /// name and default (`true`) on its own native endpoint too.
     #[serde(default = "super::openai::default_cache_prompt")]
     cache_prompt: bool,
+    /// How many of the first tokens a context shift keeps.
+    #[serde(default)]
+    n_keep: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
@@ -818,6 +833,15 @@ pub struct CompletionRequest {
     #[serde(default)]
     repeat_penalty: Option<f32>,
     #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    logit_bias: Option<std::collections::HashMap<String, f32>>,
+    /// See `openai::ChatCompletionRequest::stop`.
+    #[serde(default)]
+    stop: Option<super::openai::StopField>,
+    #[serde(default)]
     seed: Option<u64>,
     #[serde(default)]
     stream: bool,
@@ -826,7 +850,7 @@ pub struct CompletionRequest {
     id_slot: Option<usize>,
 }
 
-fn default_n_predict() -> usize {
+pub(super) fn default_n_predict() -> usize {
     256
 }
 
@@ -860,46 +884,84 @@ pub async fn completion(
         state.engine.tokenizer.wants_bos(),
     )
     .await;
-    if let Some(rejection) = super::reject_oversized_context(tokens.len()) {
+    if let Some(rejection) = super::reject_oversized_context(&state, tokens.len()) {
         return rejection;
     }
     let role = super::openai::request_role(&state, &headers);
-    let sampling = sampling_from(&req, role);
+    let logit_bias = match super::openai::parse_logit_bias(
+        req.logit_bias.as_ref(),
+        state.engine.tokenizer.vocab_size(),
+    ) {
+        Ok(bias) => bias,
+        Err(message) => return super::openai::invalid_request(message),
+    };
+    let sampling = super::openai::sampling_for(
+        role,
+        super::openai::RequestSampling {
+            temperature: req.temperature,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            min_p: req.min_p,
+            repeat_penalty: req.repeat_penalty,
+            seed: req.seed,
+            presence_penalty: req.presence_penalty,
+            frequency_penalty: req.frequency_penalty,
+            logit_bias,
+        },
+    );
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
-    let mut rx = state
-        .engine
-        .generate(GenerateRequest {
-            // These endpoints have no structured-output field of their own.
-            json_output: false,
-            json_schema: None,
+    serve_generation(
+        &state,
+        GenerateRequest {
             prompt_tokens: tokens,
             sampling,
             max_tokens: req.n_predict,
             stop_token_ids,
             cache_prompt: req.cache_prompt,
             id_slot: req.id_slot,
-            timings_per_token: false,
+            n_keep: req.n_keep,
             role: Some(role),
-            cache_point: None,
-            background: false,
-            reasoning_budget: None,
-        })
-        .await;
+            stop: crate::engine::text_stop::StopRules {
+                strings: super::openai::StopField::strings(req.stop),
+                infill: None,
+            },
+            ..Default::default()
+        },
+        req.stream,
+    )
+    .await
+}
 
-    if !req.stream {
+/// A generation answered the way the native endpoints answer: `/completion`
+/// and `/infill`.
+pub(super) async fn serve_generation(
+    state: &Arc<AppState>,
+    request: GenerateRequest,
+    stream: bool,
+) -> axum::response::Response {
+    let mut rx = state.engine.generate(request).await;
+
+    if !stream {
         let mut content = String::new();
         let mut timings = serde_json::Value::Null;
+        let mut finish = None;
         let mut done = None;
         while let Some(event) = rx.recv().await {
             match event {
-                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
+                StreamEvent::PromptProgress { .. }
+                | StreamEvent::Timings(_)
+                | StreamEvent::Logprob(_) => {}
                 // `/completion` is llama.cpp's raw endpoint: one `content`
                 // field, no message shape to split reasoning out into, so
                 // the thinking stays where it has always been. The chat
                 // endpoints are where a caller gets the two apart.
                 StreamEvent::Token(text) | StreamEvent::Reasoning(text) => content.push_str(&text),
-                StreamEvent::Done { stats, .. } => {
+                StreamEvent::Done {
+                    stats,
+                    finish_reason,
+                } => {
                     timings = super::openai::timings_json(&stats);
+                    finish = Some(finish_reason_str(finish_reason));
                     done = Some(stats);
                     break;
                 }
@@ -913,16 +975,22 @@ pub async fn completion(
             .engine
             .tokenizer
             .clean_up_tokenization_spaces(&content);
-        let response =
-            Json(serde_json::json!({"content": content, "stop": true, "timings": timings}))
-                .into_response();
+        let response = Json(serde_json::json!({
+            "content": content,
+            "stop": true,
+            "finish_reason": finish,
+            "timings": timings,
+        }))
+        .into_response();
         return super::openai::with_server_timing(response, done.as_ref());
     }
 
     let stream = async_stream::stream! {
         while let Some(event) = rx.recv().await {
             match event {
-                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
+                StreamEvent::PromptProgress { .. }
+                | StreamEvent::Timings(_)
+                | StreamEvent::Logprob(_) => {}
                 // See the non-streaming arm above: one field, no shape.
                 StreamEvent::Token(text) | StreamEvent::Reasoning(text) => {
                     yield Ok::<_, std::convert::Infallible>(
@@ -955,29 +1023,6 @@ pub async fn completion(
         }
     };
     axum::response::sse::Sse::new(stream).into_response()
-}
-
-fn sampling_from(req: &CompletionRequest, role: crate::config::Role) -> SamplingParams {
-    let mut sampling = SamplingParams::default_for_role(role);
-    if let Some(v) = req.temperature {
-        sampling.temperature = v;
-    }
-    if let Some(v) = req.top_p {
-        sampling.top_p = v;
-    }
-    if let Some(v) = req.top_k {
-        sampling.top_k = v;
-    }
-    if let Some(v) = req.min_p {
-        sampling.min_p = v;
-    }
-    if let Some(v) = req.repeat_penalty {
-        sampling.repeat_penalty = v;
-    }
-    if let Some(v) = req.seed {
-        sampling.seed = v;
-    }
-    sampling
 }
 
 pub fn finish_reason_str(reason: FinishReason) -> &'static str {

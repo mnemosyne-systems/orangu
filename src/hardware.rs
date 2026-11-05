@@ -1446,7 +1446,7 @@ const THERMAL_ADVISORY_FRACTION: f32 = 0.9;
 /// every start, and an AMD card left at `power_dpm_force_performance_level
 /// = auto` is documented rather than warned about, since a machine with
 /// several cards printed a line per card on every start to say the same
-/// thing about each. See `doc/SERVER.md`.
+/// thing about each. See `doc/manual/en/46-server.md`.
 pub fn power_advisories(power: &PowerInfo) -> Vec<String> {
     let mut out = Vec::new();
 

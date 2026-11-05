@@ -18,7 +18,7 @@
 
 use axum::{
     Json,
-    extract::State,
+    extract::{FromRequest, Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -28,14 +28,17 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::AppState;
+use super::chat_choice::{CallRules, ChoiceStream, split_whole};
 use super::native::finish_reason_str;
 use crate::engine::chat_template::{ChatMessage, Reasoning};
 use crate::engine::generate::{GenerateRequest, GenerateStats, StreamEvent};
 use crate::engine::image::ImageEvent;
 use crate::engine::loader::PoolingType;
-use crate::engine::sampling::SamplingParams;
+use crate::engine::sampling::{SamplingParams, TokenLogprob};
+use crate::engine::text_stop::StopRules;
 use crate::engine::tool_calls;
 use base64::Engine as _;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 /// How long an answer may get when the request does not say — the
 /// `max_tokens` default for `/v1/chat/completions`, clamped afterwards to
@@ -65,14 +68,18 @@ pub(crate) const DEFAULT_MAX_TOKENS: usize = 8192;
 
 /// OpenAI's `usage` object.
 pub(crate) fn usage_json(stats: &GenerateStats) -> serde_json::Value {
-    json!({
+    let mut usage = json!({
         "prompt_tokens": stats.prompt_tokens,
         "completion_tokens": stats.generated_tokens,
         "total_tokens": stats.prompt_tokens + stats.generated_tokens,
         // OpenAI's own field for the part of the prompt served from cache;
         // `prompt_progress` below carries the same number in llama.cpp's shape.
         "prompt_tokens_details": {"cached_tokens": stats.cached_tokens},
-    })
+    });
+    if stats.dropped_tokens > 0 {
+        usage["context_dropped_tokens"] = stats.dropped_tokens.into();
+    }
+    usage
 }
 
 /// llama.cpp's `timings` object, field for field, so a client (this
@@ -99,6 +106,9 @@ pub(crate) fn timings_json(stats: &GenerateStats) -> serde_json::Value {
         "predicted_per_token_ms": predicted_ms / (stats.generated_tokens.max(1) as f64),
         "predicted_per_second": stats.generate_tokens_per_second(),
     });
+    if stats.dropped_tokens > 0 {
+        timings["context_dropped_tokens"] = stats.dropped_tokens.into();
+    }
     if !stats.workers.is_empty() {
         timings["workers"] = stats
             .workers
@@ -238,7 +248,414 @@ pub(crate) fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Fields of OpenAI's schema that change nothing about what this server
+/// generates, on any endpoint: who is asking, what to call it, and how the
+/// platform behind OpenAI's own API should treat it. Everything else a request
+/// names is a field the request's struct has, or it is refused.
+const NO_EFFECT_FIELDS: &[&str] = &[
+    "model",
+    "user",
+    "metadata",
+    "store",
+    "service_tier",
+    "stream_options",
+    "prompt_cache_key",
+    "safety_identifier",
+];
+
+/// The most choices one request may ask for, as in OpenAI's schema.
+const MAX_CHOICES: usize = 128;
+
+/// The most alternatives per token `logprobs` may list, as in OpenAI's schema.
+const MAX_TOP_LOGPROBS: usize = 20;
+
+/// A request body of an OpenAI endpoint, whose struct refuses what it does not
+/// have: see [`OpenAiBody`].
+pub(crate) trait OpenAiRequest: serde::de::DeserializeOwned {
+    const ENDPOINT: &'static str;
+
+    /// Whether this field and value can be dropped as changing nothing.
+    fn no_effect(key: &str, _value: &serde_json::Value) -> bool {
+        NO_EFFECT_FIELDS.contains(&key)
+    }
+}
+
+/// OpenAI's shape for a request that is refused.
+pub(crate) fn invalid_request(message: impl Into<String>) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": {
+            "message": message.into(),
+            "type": "invalid_request_error",
+            "param": null,
+            "code": null,
+        }})),
+    )
+        .into_response()
+}
+
+/// `T` read from a JSON body, with anything it cannot honour answered with a
+/// `400` naming the field. A field left out of the schema and dropped looks to
+/// the client exactly like a knob that does nothing, and a client that sends
+/// `stop` and gets it ignored has output it did not ask for.
+fn parse_body<T: OpenAiRequest>(bytes: &[u8]) -> Result<T, String> {
+    let mut value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|err| format!("{}: the body is not JSON: {err}", T::ENDPOINT))?;
+    let Some(fields) = value.as_object_mut() else {
+        return Err(format!("{}: the body is not a JSON object", T::ENDPOINT));
+    };
+    fields.retain(|key, value| !T::no_effect(key, value));
+    serde_json::from_value(value).map_err(|err| {
+        let refused = if err.to_string().starts_with("unknown field") {
+            " A field this server does not honour is refused rather than ignored."
+        } else {
+            ""
+        };
+        format!("{}: {err}.{refused}", T::ENDPOINT)
+    })
+}
+
+/// The extractor for [`parse_body`].
+pub struct OpenAiBody<T>(pub(crate) T);
+
+impl<S: Send + Sync, T: OpenAiRequest> FromRequest<S> for OpenAiBody<T> {
+    type Rejection = axum::response::Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(IntoResponse::into_response)?;
+        parse_body::<T>(&bytes)
+            .map(OpenAiBody)
+            .map_err(invalid_request)
+    }
+}
+
+/// OpenAI's `stop`: one string or several.
+#[derive(Deserialize, Debug, PartialEq)]
+#[serde(untagged)]
+pub(crate) enum StopField {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl StopField {
+    /// The strings of an optional `stop`, the empty ones left out.
+    pub(crate) fn strings(field: Option<StopField>) -> Vec<String> {
+        let strings = match field {
+            None => Vec::new(),
+            Some(StopField::One(one)) => vec![one],
+            Some(StopField::Many(many)) => many,
+        };
+        strings.into_iter().filter(|s| !s.is_empty()).collect()
+    }
+}
+
+/// A `presence_penalty` or `frequency_penalty` in OpenAI's range.
+fn check_penalty(name: &str, value: Option<f32>) -> Result<(), String> {
+    match value {
+        Some(v) if !(-2.0..=2.0).contains(&v) => {
+            Err(format!("{name} must be between -2 and 2, not {v}"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `logit_bias`, a map from token id to a bias, as this vocabulary's ids.
+pub(crate) fn parse_logit_bias(
+    bias: Option<&std::collections::HashMap<String, f32>>,
+    vocab_size: usize,
+) -> Result<Vec<(u32, f32)>, String> {
+    let Some(bias) = bias else {
+        return Ok(Vec::new());
+    };
+    let mut parsed = Vec::with_capacity(bias.len());
+    for (id, &value) in bias {
+        let token: u32 = id
+            .parse()
+            .map_err(|_| format!("logit_bias: `{id}` is not a token id"))?;
+        if token as usize >= vocab_size {
+            return Err(format!(
+                "logit_bias: token {token} is past this model's {vocab_size} tokens"
+            ));
+        }
+        if !(-100.0..=100.0).contains(&value) {
+            return Err(format!(
+                "logit_bias: {value} for token {token} is not between -100 and 100"
+            ));
+        }
+        parsed.push((token, value));
+    }
+    parsed.sort_by_key(|(token, _)| *token);
+    Ok(parsed)
+}
+
+/// `n`, checked: how many choices to generate.
+fn choices_of(n: Option<usize>, id_slot: Option<usize>) -> Result<usize, String> {
+    let n = n.unwrap_or(1);
+    if !(1..=MAX_CHOICES).contains(&n) {
+        return Err(format!("n must be between 1 and {MAX_CHOICES}, not {n}"));
+    }
+    if n > 1 && id_slot.is_some() {
+        return Err("n > 1 runs on several slots, so it cannot be pinned with id_slot".into());
+    }
+    Ok(n)
+}
+
+/// A sampler for choice `index`: the same request with a seed of its own, so
+/// that sampled choices differ and each one is still reproducible.
+fn seeded(sampling: &SamplingParams, index: usize) -> SamplingParams {
+    SamplingParams {
+        seed: sampling.seed.wrapping_add(index as u64),
+        ..sampling.clone()
+    }
+}
+
+/// What a request cost across its choices: the prompt once, the replies summed.
+fn total_usage(stats: &[GenerateStats]) -> serde_json::Value {
+    let Some(first) = stats.first() else {
+        return json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+    };
+    let completion: usize = stats.iter().map(|s| s.generated_tokens).sum();
+    let mut usage = json!({
+        "prompt_tokens": first.prompt_tokens,
+        "completion_tokens": completion,
+        "total_tokens": first.prompt_tokens + completion,
+        "prompt_tokens_details": {"cached_tokens": first.cached_tokens},
+    });
+    let dropped = stats.iter().map(|s| s.dropped_tokens).max().unwrap_or(0);
+    if dropped > 0 {
+        usage["context_dropped_tokens"] = dropped.into();
+    }
+    usage
+}
+
+/// One choice's whole output.
+#[derive(Default)]
+struct Collected {
+    text: String,
+    reasoning: String,
+    logprobs: Vec<TokenLogprob>,
+    finish: Option<crate::engine::generate::FinishReason>,
+    stats: Option<GenerateStats>,
+}
+
+/// Reads one generation to its end. With `merge_reasoning`, reasoning stays in
+/// the text: a raw completion has one field to put it in.
+async fn collect(
+    rx: &mut UnboundedReceiver<StreamEvent>,
+    merge_reasoning: bool,
+) -> Result<Collected, Box<axum::response::Response>> {
+    let mut got = Collected::default();
+    while let Some(event) = rx.recv().await {
+        match event {
+            StreamEvent::Token(text) => got.text.push_str(&text),
+            StreamEvent::Reasoning(text) if merge_reasoning => got.text.push_str(&text),
+            StreamEvent::Reasoning(text) => got.reasoning.push_str(&text),
+            StreamEvent::Logprob(record) => got.logprobs.push(record),
+            // Progress and per-token timings only mean something to a reader
+            // watching the stream; a whole response already carries the final
+            // `timings`/`usage`.
+            StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
+            StreamEvent::Done {
+                finish_reason,
+                stats,
+            } => {
+                got.finish = Some(finish_reason);
+                got.stats = Some(stats);
+                break;
+            }
+            StreamEvent::Overloaded => return Err(Box::new(crate::http::overloaded_response())),
+            StreamEvent::Error(err) => {
+                return Err(Box::new(
+                    (StatusCode::INTERNAL_SERVER_ERROR, err).into_response(),
+                ));
+            }
+        }
+    }
+    Ok(got)
+}
+
+/// The next event of any live generation, and whose. Reads from a different one
+/// first each time, so one fast choice cannot starve the others. `None` once
+/// all are over. A generation is over at its `Done` or when its channel closes.
+async fn next_event(
+    rxs: &mut [Option<UnboundedReceiver<StreamEvent>>],
+    turn: &mut usize,
+) -> Option<(usize, StreamEvent)> {
+    let found = std::future::poll_fn(|cx| {
+        let len = rxs.len();
+        let mut live = false;
+        for offset in 0..len {
+            let index = (*turn + offset) % len;
+            let Some(rx) = rxs[index].as_mut() else {
+                continue;
+            };
+            match rx.poll_recv(cx) {
+                std::task::Poll::Ready(Some(event)) => {
+                    *turn = (index + 1) % len;
+                    return std::task::Poll::Ready(Some((index, event)));
+                }
+                std::task::Poll::Ready(None) => rxs[index] = None,
+                std::task::Poll::Pending => live = true,
+            }
+        }
+        if live {
+            std::task::Poll::Pending
+        } else {
+            std::task::Poll::Ready(None)
+        }
+    })
+    .await;
+    if let Some((index, StreamEvent::Done { .. })) = &found {
+        rxs[*index] = None;
+    }
+    found
+}
+
+fn sse(value: &serde_json::Value) -> Result<axum::response::sse::Event, std::convert::Infallible> {
+    Ok(axum::response::sse::Event::default().data(value.to_string()))
+}
+
+/// A token as text and bytes: a token can end half way through a character.
+fn token_entry(bytes: &[Vec<u8>], id: u32) -> (String, &[u8]) {
+    let raw = bytes.get(id as usize).map_or(&[][..], Vec::as_slice);
+    (String::from_utf8_lossy(raw).into_owned(), raw)
+}
+
+/// One entry of a chat response's `logprobs.content`.
+fn chat_logprob(bytes: &[Vec<u8>], record: &TokenLogprob) -> serde_json::Value {
+    let (token, raw) = token_entry(bytes, record.id);
+    let top: Vec<_> = record
+        .top
+        .iter()
+        .map(|&(id, logprob)| {
+            let (token, raw) = token_entry(bytes, id);
+            json!({"token": token, "logprob": logprob, "bytes": raw})
+        })
+        .collect();
+    json!({"token": token, "logprob": record.logprob, "bytes": raw, "top_logprobs": top})
+}
+
+/// A legacy completion's `logprobs`, parallel arrays. `offset` is where these
+/// tokens' text starts in the choice's text, and moves past them.
+fn legacy_logprobs(
+    bytes: &[Vec<u8>],
+    records: &[TokenLogprob],
+    offset: &mut usize,
+) -> serde_json::Value {
+    let mut tokens = Vec::with_capacity(records.len());
+    let mut offsets = Vec::with_capacity(records.len());
+    let mut top = Vec::with_capacity(records.len());
+    for record in records {
+        let (token, raw) = token_entry(bytes, record.id);
+        offsets.push(*offset);
+        *offset += raw.len();
+        tokens.push(token);
+        top.push(
+            record
+                .top
+                .iter()
+                .map(|&(id, logprob)| (token_entry(bytes, id).0, json!(logprob)))
+                .collect::<serde_json::Map<_, _>>(),
+        );
+    }
+    json!({
+        "tokens": tokens,
+        "token_logprobs": records.iter().map(|r| r.logprob).collect::<Vec<_>>(),
+        "top_logprobs": top,
+        "text_offset": offsets,
+    })
+}
+
+/// `tool_choice`, read.
+#[derive(Clone, Debug, PartialEq)]
+enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    Named(String),
+}
+
+/// The names in a request's `tools`.
+fn declared_tools(tools: Option<&serde_json::Value>) -> Vec<&str> {
+    tools
+        .and_then(|t| t.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.pointer("/function/name").and_then(|n| n.as_str()))
+        .collect()
+}
+
+/// Reads `tool_choice`, which only makes sense against the tools declared.
+fn parse_tool_choice(
+    choice: Option<&serde_json::Value>,
+    tools: Option<&serde_json::Value>,
+) -> Result<ToolChoice, String> {
+    let declared = declared_tools(tools);
+    let parsed = match choice {
+        None | Some(serde_json::Value::Null) => ToolChoice::Auto,
+        Some(serde_json::Value::String(mode)) => match mode.as_str() {
+            "auto" => ToolChoice::Auto,
+            "none" => ToolChoice::None,
+            "required" => ToolChoice::Required,
+            other => {
+                return Err(format!(
+                    "tool_choice `{other}` is not one of auto, none, required, or a named function"
+                ));
+            }
+        },
+        Some(named) => match (
+            named.get("type").and_then(|t| t.as_str()),
+            named.pointer("/function/name").and_then(|n| n.as_str()),
+        ) {
+            (Some("function"), Some(name)) => ToolChoice::Named(name.to_string()),
+            _ => {
+                return Err(format!(
+                    "tool_choice {named} is not one of auto, none, required, or                      {{\"type\": \"function\", \"function\": {{\"name\": …}}}}"
+                ));
+            }
+        },
+    };
+    match &parsed {
+        ToolChoice::Required if declared.is_empty() => {
+            Err("tool_choice `required` needs at least one tool in `tools`".into())
+        }
+        ToolChoice::Named(name) if !declared.contains(&name.as_str()) => Err(format!(
+            "tool_choice names `{name}`, which is not in `tools`"
+        )),
+        // With one tool, requiring a call is naming it.
+        ToolChoice::Required if declared.len() == 1 => {
+            Ok(ToolChoice::Named(declared[0].to_string()))
+        }
+        _ => Ok(parsed),
+    }
+}
+
+impl OpenAiRequest for ChatCompletionRequest {
+    const ENDPOINT: &'static str = "/v1/chat/completions";
+
+    fn no_effect(key: &str, _value: &serde_json::Value) -> bool {
+        // Which outputs to produce follows from the model served here.
+        NO_EFFECT_FIELDS.contains(&key) || key == "modalities"
+    }
+}
+
+impl OpenAiRequest for CompletionsRequest {
+    const ENDPOINT: &'static str = "/v1/completions";
+
+    fn no_effect(key: &str, value: &serde_json::Value) -> bool {
+        NO_EFFECT_FIELDS.contains(&key)
+            // The last chunk carries the timings whether or not this asks.
+            || key == "timings_per_token"
+            // The two legacy fields at the values that ask for nothing extra.
+            || (key == "echo" && *value == json!(false))
+            || (key == "best_of" && *value == json!(1))
+    }
+}
+
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     #[serde(default)]
     messages: Vec<ChatMessage>,
@@ -250,21 +667,44 @@ pub struct ChatCompletionRequest {
     top_p: Option<f32>,
     /// The rest of the sampler, under the same names `/completion` uses.
     ///
-    /// These are not OpenAI's fields, and that is the point: the sampler
-    /// has knobs OpenAI's schema has no word for, and a request that names
-    /// one it cannot reach is **silently ignored** rather than rejected —
-    /// `serde` drops unknown keys. That failure mode is worse than the gap
-    /// it comes from: a caller sending `repeat_penalty` and seeing no change
-    /// concludes the penalty does nothing, when in fact the value never
-    /// arrived. It cost a real debugging session exactly that way.
+    /// These are not OpenAI's fields: the sampler has knobs OpenAI's schema
+    /// has no word for.
     #[serde(default)]
     top_k: Option<usize>,
     #[serde(default)]
     min_p: Option<f32>,
     #[serde(default)]
     repeat_penalty: Option<f32>,
+    /// OpenAI's flat penalties: over the same window as `repeat_penalty`, from
+    /// -2 to 2. See `SamplingParams`.
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    /// Token id (as a string, JSON having no other key) to a bias from -100 to
+    /// 100, added to its logit before anything else looks at it.
+    #[serde(default)]
+    logit_bias: Option<std::collections::HashMap<String, f32>>,
+    /// Text that ends the reply when written. Not sent; the stop may span
+    /// tokens, and text is held back until a match is ruled out.
+    #[serde(default)]
+    stop: Option<StopField>,
+    /// Report each token's log probability, with `top_logprobs` alternatives.
+    #[serde(default)]
+    logprobs: Option<bool>,
+    #[serde(default)]
+    top_logprobs: Option<usize>,
+    /// How many choices to generate, each on a slot of its own.
+    #[serde(default)]
+    n: Option<usize>,
     #[serde(default)]
     max_tokens: Option<usize>,
+    /// OpenAI's newer name for `max_tokens`.
+    #[serde(default)]
+    max_completion_tokens: Option<usize>,
+    /// How hard a reasoning model should think, passed to its template.
+    #[serde(default)]
+    reasoning_effort: Option<String>,
     #[serde(default)]
     seed: Option<u64>,
     /// OpenAI's audio output options (`{"voice": ..., "format": ...}`),
@@ -303,6 +743,13 @@ pub struct ChatCompletionRequest {
     /// be one a model's own template could no longer see.
     #[serde(default)]
     tools: Option<serde_json::Value>,
+    /// Whether the reply may, must, or must not call a tool: `auto`, `none`,
+    /// `required`, or `{"type": "function", "function": {"name": …}}`.
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
+    /// `false`: at most one call, and the reply ends with it.
+    #[serde(default)]
+    parallel_tool_calls: Option<bool>,
 }
 
 /// Where `head`'s tokens end in `tokens`, if they are a strict prefix of them
@@ -475,37 +922,6 @@ pub(crate) fn reject_unknown_slot(
         )
             .into_response()
     })
-}
-
-/// OpenAI's `tool_calls` array. `index` is what a streaming client
-/// accumulates deltas by, so it counts calls across the whole response rather
-/// than restarting per chunk. Each call carries a whole `function` object in
-/// one delta — this server recognises a call only once it is completely
-/// written, so there is never a partial one to stream.
-fn tool_calls_json_from(
-    calls: &[tool_calls::ParsedToolCall],
-    created: u64,
-    first_index: usize,
-) -> serde_json::Value {
-    serde_json::Value::Array(
-        calls
-            .iter()
-            .enumerate()
-            .map(|(n, call)| {
-                let index = first_index + n;
-                json!({
-                    "index": index,
-                    "id": format!("call-{created}-{index}"),
-                    "type": "function",
-                    "function": {"name": call.name, "arguments": call.arguments},
-                })
-            })
-            .collect(),
-    )
-}
-
-fn tool_calls_json(calls: &[tool_calls::ParsedToolCall], created: u64) -> serde_json::Value {
-    tool_calls_json_from(calls, created, 0)
 }
 
 /// The header an `orangu-coordinator` names a request's role in.
@@ -824,10 +1240,43 @@ pub(crate) fn encode_with_pictures(
     Ok(tokens)
 }
 
+/// What a request's reasoning settings render as, when it set any.
+fn reasoning_of<'a>(
+    state: &'a AppState,
+    role: crate::config::Role,
+    effort: Option<&str>,
+) -> Result<Option<(Reasoning<'a>, bool)>, String> {
+    let Some(effort) = effort else {
+        return Ok(None);
+    };
+    let mut reasoning = state.engine.reasoning_as(role);
+    let mut suppress = role.suppresses_reasoning();
+    let named = match effort {
+        "none" => {
+            reasoning.enabled = Some(false);
+            suppress = true;
+            None
+        }
+        "minimal" | "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" | "xhigh" => Some("high"),
+        other => {
+            return Err(format!(
+                "reasoning_effort `{other}` is not one of none, minimal, low, medium, high, xhigh"
+            ));
+        }
+    };
+    if let Some(named) = named {
+        reasoning.effort = Some(named);
+        reasoning.effort_is_default = false;
+    }
+    Ok(Some((reasoning, suppress)))
+}
+
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<ChatCompletionRequest>,
+    OpenAiBody(req): OpenAiBody<ChatCompletionRequest>,
 ) -> axum::response::Response {
     let role = request_role(&state, &headers);
     if !state.engine.role.allows_generation() {
@@ -839,6 +1288,31 @@ pub async fn chat_completions(
             ),
         )
             .into_response();
+    }
+    // A model that answers with a picture, a clip or speech generates no
+    // tokens for these to apply to.
+    if state.engine.image.is_some() || state.engine.video.is_some() || state.engine.audio.is_some()
+    {
+        let needs_text = [
+            ("n", req.n.is_some_and(|n| n != 1)),
+            ("logprobs", req.logprobs == Some(true)),
+            (
+                "stop",
+                !StopField::strings(match &req.stop {
+                    Some(StopField::One(one)) => Some(StopField::One(one.clone())),
+                    Some(StopField::Many(many)) => Some(StopField::Many(many.clone())),
+                    None => None,
+                })
+                .is_empty(),
+            ),
+            ("logit_bias", req.logit_bias.is_some()),
+            ("tool_choice", req.tool_choice.is_some()),
+        ];
+        if let Some((field, _)) = needs_text.iter().find(|(_, set)| *set) {
+            return invalid_request(format!(
+                "`{field}` applies to generated text, and this model does not generate text"
+            ));
+        }
     }
     // An image model answers a chat turn with a picture — see `image_chat`.
     if state.engine.image.is_some() {
@@ -855,6 +1329,83 @@ pub async fn chat_completions(
     if let Some(rejection) = reject_unknown_slot(&state, req.id_slot) {
         return rejection;
     }
+    let n = match choices_of(req.n, req.id_slot) {
+        Ok(n) => n,
+        Err(message) => return invalid_request(message),
+    };
+    let logprobs = match (req.logprobs.unwrap_or(false), req.top_logprobs) {
+        (_, Some(top)) if top > MAX_TOP_LOGPROBS => {
+            return invalid_request(format!(
+                "top_logprobs must be at most {MAX_TOP_LOGPROBS}, not {top}"
+            ));
+        }
+        (false, Some(top)) if top > 0 => {
+            return invalid_request("top_logprobs needs logprobs: true");
+        }
+        (true, top) => Some(top.unwrap_or(0)),
+        (false, _) => None,
+    };
+    let bias = parse_logit_bias(req.logit_bias.as_ref(), state.engine.tokenizer.vocab_size());
+    let bias = match bias.and_then(|bias| {
+        check_penalty("presence_penalty", req.presence_penalty)?;
+        check_penalty("frequency_penalty", req.frequency_penalty)?;
+        Ok(bias)
+    }) {
+        Ok(bias) => bias,
+        Err(message) => return invalid_request(message),
+    };
+    let tool_choice = match parse_tool_choice(req.tool_choice.as_ref(), req.tools.as_ref()) {
+        Ok(choice) => choice,
+        Err(message) => return invalid_request(message),
+    };
+    let reasoning = match reasoning_of(&state, role, req.reasoning_effort.as_deref()) {
+        Ok(reasoning) => reasoning,
+        Err(message) => return invalid_request(message),
+    };
+    let withheld = tool_choice == ToolChoice::None;
+    let tools = req.tools.as_ref().filter(|_| !withheld);
+    let requires_call = matches!(tool_choice, ToolChoice::Required | ToolChoice::Named(_));
+    if requires_call && wants_json(req.response_format.as_ref()) {
+        return invalid_request(
+            "a reply that must call a tool cannot also be held to a response_format",
+        );
+    }
+    // A call is required by making the reply begin with one. A template whose
+    // call nothing here can read gives no way to do that, and answering as if
+    // the requirement had been met would be worse than saying so.
+    let prefix = match &tool_choice {
+        ToolChoice::Required => super::anthropic::tool_call_prefix(&state, None),
+        ToolChoice::Named(name) => super::anthropic::tool_call_prefix(&state, Some(name)),
+        _ => None,
+    };
+    // Which tool is the model's to choose, among the declared ones.
+    let reply_starts = match &tool_choice {
+        ToolChoice::Required => {
+            let names: Vec<String> = declared_tools(tools)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            super::anthropic::declared_call_starts(&state, &names)
+        }
+        _ => Vec::new(),
+    };
+    if requires_call && prefix.is_none() {
+        return invalid_request(
+            "this model's chat template renders no tool call this server can read, so a call \
+             cannot be required of it",
+        );
+    }
+    let learned = tools
+        .filter(|t| !matches!(t.as_array(), Some(a) if a.is_empty()))
+        .and_then(|_| state.engine.chat_template.as_ref())
+        .and_then(|template| template.learned_calls());
+    let single = req.parallel_tool_calls == Some(false);
+    let rules = CallRules {
+        withheld,
+        single,
+        learned: learned.clone(),
+        prefix: prefix.clone(),
+    };
     let RenderedChat {
         tokens,
         cache_point,
@@ -862,8 +1413,12 @@ pub async fn chat_completions(
         &state,
         role,
         &req.messages,
-        req.tools.as_ref(),
-        RenderOptions::default(),
+        tools,
+        RenderOptions {
+            reasoning,
+            suffix: prefix.as_deref(),
+            ..Default::default()
+        },
     )
     .await
     {
@@ -880,151 +1435,185 @@ pub async fn chat_completions(
             min_p: req.min_p,
             repeat_penalty: req.repeat_penalty,
             seed: req.seed,
+            presence_penalty: req.presence_penalty,
+            frequency_penalty: req.frequency_penalty,
+            logit_bias: bias,
         },
     );
-    let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    let max_tokens = req
+        .max_tokens
+        .or(req.max_completion_tokens)
+        .unwrap_or(DEFAULT_MAX_TOKENS);
     let json_schema = match response_schema(req.response_format.as_ref()) {
         Ok(schema) => schema,
         Err(rejection) => return *rejection,
     };
-    if let Some(rejection) = crate::http::reject_oversized_context(tokens.len()) {
+    if let Some(rejection) = crate::http::reject_oversized_context(&state, tokens.len()) {
         return rejection;
     }
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
     let created = unix_now();
     let model = state.model_label.clone();
+    let mut stop = StopRules {
+        strings: StopField::strings(req.stop),
+        infill: None,
+    };
+    // A reply limited to one call ends at the first one's closer: the rest of
+    // it would be generated for nobody. What the cut leaves is read as a call
+    // the reply ended on.
+    if single && !withheld {
+        stop.strings
+            .extend(tool_calls::closers().map(str::to_string));
+        if let Some(close) = learned
+            .as_deref()
+            .map(|l| l.closer())
+            .filter(|c| !c.is_empty())
+        {
+            stop.strings.push(close.to_string());
+        }
+    }
+    let call_markers = learned.as_deref().map_or(Vec::new(), |l| l.markers());
+    let json_output = wants_json(req.response_format.as_ref());
 
-    let mut rx = state
-        .engine
-        .generate(GenerateRequest {
-            prompt_tokens: tokens,
-            sampling,
-            max_tokens,
-            stop_token_ids,
-            json_output: wants_json(req.response_format.as_ref()),
-            json_schema,
-            cache_prompt: req.cache_prompt,
-            id_slot: req.id_slot,
-            timings_per_token: req.stream && req.timings_per_token,
-            role: Some(role),
-            cache_point,
-            background: false,
-            reasoning_budget: None,
-        })
-        .await;
+    let mut rxs = Vec::with_capacity(n);
+    for index in 0..n {
+        rxs.push(
+            state
+                .engine
+                .generate(GenerateRequest {
+                    prompt_tokens: tokens.clone(),
+                    sampling: seeded(&sampling, index),
+                    max_tokens,
+                    stop_token_ids: stop_token_ids.clone(),
+                    json_output,
+                    json_schema: json_schema.clone(),
+                    reply_starts: reply_starts.clone(),
+                    n_keep: None,
+                    context_shift: None,
+                    dropped_tokens: 0,
+                    cache_prompt: req.cache_prompt,
+                    id_slot: req.id_slot,
+                    timings_per_token: req.stream && req.timings_per_token,
+                    role: Some(role),
+                    cache_point,
+                    background: false,
+                    reasoning_budget: None,
+                    stop: stop.clone(),
+                    logprobs,
+                    call_markers: call_markers.clone(),
+                })
+                .await,
+        );
+    }
+    let token_bytes = logprobs.map(|_| state.engine.tokenizer.token_bytes_shared());
 
     if !req.stream {
-        let mut content = String::new();
-        let mut reasoning = String::new();
-        let mut finish_reason = "stop";
-        let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
-        let mut timings = serde_json::Value::Null;
-        let mut done = None;
-        while let Some(event) = rx.recv().await {
-            match event {
-                StreamEvent::Token(text) => content.push_str(&text),
-                StreamEvent::Reasoning(text) => reasoning.push_str(&text),
-                // Progress and per-token timings only mean something to a
-                // reader watching the stream; a whole response already
-                // carries the final `timings`/`usage`.
-                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
-                StreamEvent::Done {
-                    finish_reason: fr,
-                    stats,
-                } => {
-                    finish_reason = finish_reason_str(fr);
-                    usage = usage_json(&stats);
-                    timings = timings_json(&stats);
-                    done = Some(stats);
-                    break;
-                }
-                StreamEvent::Overloaded => return crate::http::overloaded_response(),
-                StreamEvent::Error(err) => {
-                    return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
-                }
+        let tokenizer = &state.engine.tokenizer;
+        let mut choices = Vec::with_capacity(n);
+        let mut all_stats = Vec::with_capacity(n);
+        for (index, rx) in rxs.iter_mut().enumerate() {
+            let got = match collect(rx, false).await {
+                Ok(got) => got,
+                Err(rejection) => return *rejection,
+            };
+            let finish = got
+                .finish
+                .unwrap_or(crate::engine::generate::FinishReason::Stop);
+            let split = split_whole(&got.text, &rules, finish, |text| {
+                tokenizer.clean_up_tokenization_spaces(text)
+            });
+            // The whole answer is in hand, so this is where it gets tidied: the
+            // blank line a model leaves between its prose and a call it made is
+            // layout around a span that is no longer there.
+            let visible = if split.has_calls() {
+                split.content.trim()
+            } else {
+                &split.content
+            };
+            let mut message = json!({"role": "assistant", "content": visible});
+            // `reasoning_content` is where DeepSeek put a reasoning model's
+            // thinking and where llama-server puts it under
+            // `--reasoning-format deepseek`; a client that does not know the
+            // field ignores it and sees the answer alone, which is the point.
+            // Absent rather than empty when there was no thinking, so "this
+            // model does not reason" and "it reasoned about nothing" stay
+            // distinguishable.
+            if !got.reasoning.is_empty() {
+                message["reasoning_content"] =
+                    json!(tokenizer.clean_up_tokenization_spaces(&got.reasoning));
             }
-        }
-        let content = state
-            .engine
-            .tokenizer
-            .clean_up_tokenization_spaces(&content);
-        let split = tool_calls::split(&content);
-        // The whole answer is in hand, so this is where it gets tidied: the
-        // blank line a model leaves between its prose and a call it made is
-        // layout around a span that is no longer there.
-        let visible = if split.has_calls() {
-            split.content.trim()
-        } else {
-            &split.content
-        };
-        let mut message = json!({"role": "assistant", "content": visible});
-        // `reasoning_content` is where DeepSeek put a reasoning model's
-        // thinking and where llama-server puts it under
-        // `--reasoning-format deepseek`; a client that does not know the
-        // field ignores it and sees the answer alone, which is the point.
-        // Absent rather than empty when there was no thinking, so "this
-        // model does not reason" and "it reasoned about nothing" stay
-        // distinguishable.
-        if !reasoning.is_empty() {
-            message["reasoning_content"] = json!(
-                state
-                    .engine
-                    .tokenizer
-                    .clean_up_tokenization_spaces(&reasoning)
-            );
-        }
-        if split.has_calls() {
-            message["tool_calls"] = tool_calls_json(&split.calls, created);
-            // OpenAI's contract: a turn that called tools finishes for that
-            // reason, whatever the sampler stopped on. A client keying off
-            // `"stop"` would treat the calls as a finished answer.
-            finish_reason = "tool_calls";
+            let mut finish_reason = finish_reason_str(finish);
+            if split.has_calls() {
+                message["tool_calls"] =
+                    super::chat_choice::whole_calls(&split.calls, created, index, 0);
+                // OpenAI's contract: a turn that called tools finishes for that
+                // reason, whatever the sampler stopped on. A client keying off
+                // `"stop"` would treat the calls as a finished answer.
+                finish_reason = "tool_calls";
+            }
+            let mut choice = json!({
+                "index": index,
+                "message": message,
+                "finish_reason": finish_reason,
+            });
+            if let Some(bytes) = &token_bytes {
+                choice["logprobs"] = json!({
+                    "content": got.logprobs.iter().map(|r| chat_logprob(bytes, r)).collect::<Vec<_>>(),
+                    "refusal": null,
+                });
+            }
+            choices.push(choice);
+            all_stats.extend(got.stats);
         }
         let response = Json(json!({
             "id": format!("chatcmpl-{created}"),
             "object": "chat.completion",
             "created": created,
             "model": model,
-            "choices": [{
-                "index": 0,
-                "message": message,
-                "finish_reason": finish_reason,
-            }],
-            "usage": usage,
-            "timings": timings,
+            "choices": choices,
+            "usage": total_usage(&all_stats),
+            "timings": all_stats.first().map(timings_json),
         }))
         .into_response();
-        return with_server_timing(response, done.as_ref());
+        return with_server_timing(response, all_stats.first());
     }
 
     let return_progress = req.return_progress;
     let stream = async_stream::stream! {
         let id = format!("chatcmpl-{created}");
+        let chunk = |index: usize, delta: serde_json::Value, finish: Option<&str>| json!({
+            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+            "choices": [{"index": index, "delta": delta, "finish_reason": finish}],
+        });
+        let mut rxs: Vec<_> = rxs.into_iter().map(Some).collect();
+        let mut turn = 0usize;
+        let mut all_stats: Vec<GenerateStats> = Vec::with_capacity(n);
         // Tool-call syntax has to be recognised before it is forwarded, and a
-        // delimiter arrives a few tokens at a time. `pending` holds back text
-        // that might still turn into a call; everything else streams straight
-        // through, so an ordinary answer is not delayed at all.
-        let mut pending = String::new();
-        let mut emitted_calls = 0usize;
-        let mut saw_calls = false;
-        loop {
-            let Some(event) = rx.recv().await else { break };
+        // delimiter arrives a few tokens at a time; a `ChoiceStream` holds back
+        // text that might still turn into a call and nothing else, so an
+        // ordinary answer is not delayed at all.
+        let mut choices: Vec<ChoiceStream> = (0..n)
+            .map(|index| ChoiceStream::new(rules.clone(), created, index))
+            .collect();
+        for (index, choice) in choices.iter_mut().enumerate() {
+            for delta in choice.start() {
+                yield sse(&chunk(index, delta, None));
+            }
+        }
+        while let Some((index, event)) = next_event(&mut rxs, &mut turn).await {
             match event {
                 StreamEvent::PromptProgress { total, cached, processed, elapsed } => {
-                    if return_progress {
+                    if return_progress && index == 0 {
                         // llama.cpp's shape, so a client reads mid-prefill
                         // progress from either server the same way.
-                        let chunk = json!({
-                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                            "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
-                            "prompt_progress": {
-                                "total": total,
-                                "cache": cached,
-                                "processed": processed,
-                                "time_ms": elapsed.as_millis() as i64,
-                            },
+                        let mut progress = chunk(index, json!({}), None);
+                        progress["prompt_progress"] = json!({
+                            "total": total,
+                            "cache": cached,
+                            "processed": processed,
+                            "time_ms": elapsed.as_millis() as i64,
                         });
-                        yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
+                        yield sse(&progress);
                     }
                 }
                 StreamEvent::Timings(stats) => {
@@ -1032,12 +1621,9 @@ pub async fn chat_completions(
                     // next content delta: content can be held back for a
                     // while by the tool-call splitter above, and a decode
                     // rate that arrives in bursts is worse than none.
-                    let chunk = json!({
-                        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": null}],
-                        "timings": timings_json(&stats),
-                    });
-                    yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
+                    let mut timed = chunk(index, json!({}), None);
+                    timed["timings"] = timings_json(&stats);
+                    yield sse(&timed);
                 }
                 // Reasoning streams straight through in its own delta field,
                 // bypassing the tool-call splitter entirely: a call is
@@ -1046,87 +1632,65 @@ pub async fn chat_completions(
                 // to see whether it turns into one would delay the only
                 // thing there is to show during a long think.
                 StreamEvent::Reasoning(text) => {
-                    let chunk = json!({
-                        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}],
-                    });
-                    yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
+                    yield sse(&chunk(index, json!({"reasoning_content": text}), None));
                 }
                 StreamEvent::Token(text) => {
-                    pending.push_str(&text);
-                    if tool_calls::may_be_partial(&pending) {
-                        continue;
+                    for delta in choices[index].push(&text) {
+                        yield sse(&chunk(index, delta, None));
                     }
-                    let split = tool_calls::split(&pending);
-                    pending.clear();
-                    if !split.content.is_empty() {
-                        let chunk = json!({
-                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                            "choices": [{"index": 0, "delta": {"content": split.content}, "finish_reason": null}],
-                        });
-                        yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
-                    }
-                    if split.has_calls() {
-                        saw_calls = true;
-                        let calls = tool_calls_json_from(&split.calls, created, emitted_calls);
-                        emitted_calls += split.calls.len();
-                        let chunk = json!({
-                            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                            "choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": null}],
-                        });
-                        yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
+                }
+                StreamEvent::Logprob(record) => {
+                    if let Some(bytes) = &token_bytes {
+                        let mut entry = chunk(index, json!({}), None);
+                        entry["choices"][0]["logprobs"] =
+                            json!({"content": [chat_logprob(bytes, &record)], "refusal": null});
+                        yield sse(&entry);
                     }
                 }
                 StreamEvent::Done { finish_reason, stats } => {
                     // Whatever is still held back never became a call. It is
                     // the model's output and belongs in the answer.
-                    if !pending.is_empty() {
-                        let split = tool_calls::split(&pending);
-                        if !split.content.is_empty() {
-                            let chunk = json!({
-                                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                "choices": [{"index": 0, "delta": {"content": split.content}, "finish_reason": null}],
-                            });
-                            yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
-                        }
-                        if split.has_calls() {
-                            saw_calls = true;
-                            let calls = tool_calls_json_from(&split.calls, created, emitted_calls);
-                            let chunk = json!({
-                                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                                "choices": [{"index": 0, "delta": {"tool_calls": calls}, "finish_reason": null}],
-                            });
-                            yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
-                        }
+                    let (deltas, reason) = choices[index].finish(finish_reason);
+                    for delta in deltas {
+                        yield sse(&chunk(index, delta, None));
                     }
+                    let mut last = chunk(index, json!({}), Some(reason));
                     // The final chunk carries what the request cost, in both
                     // OpenAI's shape (`usage`) and llama.cpp's (`timings`,
                     // `prompt_progress`) — a streaming client otherwise has
                     // only its own wall clock, which cannot separate prefill
-                    // from decode or a cache hit from real work.
-                    let reason = if saw_calls { "tool_calls" } else { finish_reason_str(finish_reason) };
-                    let chunk = json!({
-                        "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
-                        "usage": usage_json(&stats),
-                        "timings": timings_json(&stats),
-                        "prompt_progress": prompt_progress_json(&stats),
-                    });
-                    yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
-                    yield Ok(axum::response::sse::Event::default().data("[DONE]"));
-                    break;
+                    // from decode or a cache hit from real work. Several
+                    // choices share one figure, sent once they are all over.
+                    if n == 1 {
+                        last["usage"] = usage_json(&stats);
+                        last["timings"] = timings_json(&stats);
+                        last["prompt_progress"] = prompt_progress_json(&stats);
+                    }
+                    all_stats.push(stats);
+                    yield sse(&last);
+                    if all_stats.len() == n {
+                        break;
+                    }
                 }
                 StreamEvent::Overloaded => {
-                    yield Ok(axum::response::sse::Event::default()
-                        .data(serde_json::json!({"error": crate::http::OVERLOADED_MESSAGE}).to_string()));
-                    break;
+                    yield sse(&json!({"error": crate::http::OVERLOADED_MESSAGE}));
+                    return;
                 }
                 StreamEvent::Error(err) => {
-                    yield Ok(axum::response::sse::Event::default().data(json!({"error": err}).to_string()));
-                    break;
+                    yield sse(&json!({"error": err}));
+                    return;
                 }
             }
         }
+        if n > 1 {
+            yield sse(&json!({
+                "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+                "choices": [],
+                "usage": total_usage(&all_stats),
+                "timings": all_stats.first().map(timings_json),
+            }));
+        }
+        yield Ok(axum::response::sse::Event::default().data("[DONE]"));
     };
     axum::response::sse::Sse::new(stream).into_response()
 }
@@ -1469,6 +2033,7 @@ async fn audio_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::r
 /// meaning "zero". A `temperature` of `0.0` is greedy and a `repeat_penalty`
 /// of `1.0` is off, so the difference between "unset" and "set to the
 /// neutral value" is real and cannot be collapsed.
+#[derive(Default)]
 pub(crate) struct RequestSampling {
     pub(crate) temperature: Option<f32>,
     pub(crate) top_p: Option<f32>,
@@ -1476,6 +2041,9 @@ pub(crate) struct RequestSampling {
     pub(crate) min_p: Option<f32>,
     pub(crate) repeat_penalty: Option<f32>,
     pub(crate) seed: Option<u64>,
+    pub(crate) presence_penalty: Option<f32>,
+    pub(crate) frequency_penalty: Option<f32>,
+    pub(crate) logit_bias: Vec<(u32, f32)>,
 }
 
 /// The role's defaults with a request's overrides applied.
@@ -1505,20 +2073,29 @@ pub(crate) fn sampling_for(role: crate::config::Role, req: RequestSampling) -> S
     if let Some(v) = req.seed {
         sampling.seed = v;
     }
+    if let Some(v) = req.presence_penalty {
+        sampling.presence_penalty = v;
+    }
+    if let Some(v) = req.frequency_penalty {
+        sampling.frequency_penalty = v;
+    }
+    sampling.logit_bias = req.logit_bias;
     sampling
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompletionsRequest {
     prompt: String,
     #[serde(default)]
     max_tokens: Option<usize>,
+    /// The native endpoint's name for `max_tokens`, which a client written
+    /// against both sends beside it.
+    #[serde(default)]
+    n_predict: Option<usize>,
     #[serde(default)]
     temperature: Option<f32>,
-    /// The rest of the sampler — see [`ChatCompletionRequest::top_k`] for why
-    /// these are here and why their absence was worse than a gap. This
-    /// endpoint had *only* `temperature`, so a request setting `top_k` or
-    /// `repeat_penalty` here was accepted and discarded.
+    /// The rest of the sampler — see [`ChatCompletionRequest::top_k`].
     #[serde(default)]
     top_p: Option<f32>,
     #[serde(default)]
@@ -1527,11 +2104,26 @@ pub struct CompletionsRequest {
     min_p: Option<f32>,
     #[serde(default)]
     repeat_penalty: Option<f32>,
+    /// See [`ChatCompletionRequest::presence_penalty`].
+    #[serde(default)]
+    presence_penalty: Option<f32>,
+    #[serde(default)]
+    frequency_penalty: Option<f32>,
+    #[serde(default)]
+    logit_bias: Option<std::collections::HashMap<String, f32>>,
+    /// See [`ChatCompletionRequest::stop`].
+    #[serde(default)]
+    stop: Option<StopField>,
+    /// This schema's `logprobs` is the number of alternatives per token.
+    #[serde(default)]
+    logprobs: Option<usize>,
+    /// See [`ChatCompletionRequest::n`].
+    #[serde(default)]
+    n: Option<usize>,
     #[serde(default)]
     seed: Option<u64>,
-    /// Not part of OpenAI's completions schema, accepted anyway for the same
-    /// reason the sampler fields above are: a caller that reaches for it and
-    /// is silently ignored concludes the feature does not work.
+    /// Not part of OpenAI's completions schema: the sampler and the constraint
+    /// are the same engine here, so it does what it does on chat.
     #[serde(default)]
     response_format: Option<serde_json::Value>,
     #[serde(default)]
@@ -1554,7 +2146,7 @@ pub struct CompletionsRequest {
 pub async fn completions(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(req): Json<CompletionsRequest>,
+    OpenAiBody(req): OpenAiBody<CompletionsRequest>,
 ) -> axum::response::Response {
     let role = request_role(&state, &headers);
     if let Some(rejection) = super::audio::reject_text_endpoint(&state, "/v1/completions") {
@@ -1573,6 +2165,24 @@ pub async fn completions(
     if let Some(rejection) = reject_unknown_slot(&state, req.id_slot) {
         return rejection;
     }
+    let n = match choices_of(req.n, req.id_slot) {
+        Ok(n) => n,
+        Err(message) => return invalid_request(message),
+    };
+    if let Some(top) = req.logprobs.filter(|&top| top > MAX_TOP_LOGPROBS) {
+        return invalid_request(format!(
+            "logprobs must be at most {MAX_TOP_LOGPROBS}, not {top}"
+        ));
+    }
+    let bias = parse_logit_bias(req.logit_bias.as_ref(), state.engine.tokenizer.vocab_size());
+    let bias = match bias.and_then(|bias| {
+        check_penalty("presence_penalty", req.presence_penalty)?;
+        check_penalty("frequency_penalty", req.frequency_penalty)?;
+        Ok(bias)
+    }) {
+        Ok(bias) => bias,
+        Err(message) => return invalid_request(message),
+    };
     // The file's own answer, not `true`: a model trained without a
     // BOS gets a prompt one token longer than the same text is
     // anywhere else, and only the continuation shows it.
@@ -1591,14 +2201,17 @@ pub async fn completions(
             min_p: req.min_p,
             repeat_penalty: req.repeat_penalty,
             seed: req.seed,
+            presence_penalty: req.presence_penalty,
+            frequency_penalty: req.frequency_penalty,
+            logit_bias: bias,
         },
     );
-    let max_tokens = req.max_tokens.unwrap_or(256);
+    let max_tokens = req.max_tokens.or(req.n_predict).unwrap_or(256);
     let json_schema = match response_schema(req.response_format.as_ref()) {
         Ok(schema) => schema,
         Err(rejection) => return *rejection,
     };
-    if let Some(rejection) = crate::http::reject_oversized_context(tokens.len()) {
+    if let Some(rejection) = crate::http::reject_oversized_context(&state, tokens.len()) {
         return rejection;
     }
     // `ignore_eos` drops the EOS stop token so generation runs the full
@@ -1610,30 +2223,54 @@ pub async fn completions(
     };
     let created = unix_now();
     let model = state.model_label.clone();
+    let stop = StopRules {
+        strings: StopField::strings(req.stop),
+        infill: None,
+    };
+    let json_output = wants_json(req.response_format.as_ref());
 
-    let mut rx = state
-        .engine
-        .generate(GenerateRequest {
-            prompt_tokens: tokens,
-            sampling,
-            max_tokens,
-            stop_token_ids,
-            json_output: wants_json(req.response_format.as_ref()),
-            json_schema,
-            cache_prompt: req.cache_prompt,
-            id_slot: req.id_slot,
-            timings_per_token: false,
-            role: Some(role),
-            cache_point: None,
-            background: false,
-            reasoning_budget: None,
-        })
-        .await;
+    let mut rxs = Vec::with_capacity(n);
+    for index in 0..n {
+        rxs.push(
+            state
+                .engine
+                .generate(GenerateRequest {
+                    prompt_tokens: tokens.clone(),
+                    sampling: seeded(&sampling, index),
+                    max_tokens,
+                    stop_token_ids: stop_token_ids.clone(),
+                    json_output,
+                    json_schema: json_schema.clone(),
+                    reply_starts: Vec::new(),
+                    n_keep: None,
+                    context_shift: None,
+                    dropped_tokens: 0,
+                    cache_prompt: req.cache_prompt,
+                    id_slot: req.id_slot,
+                    timings_per_token: false,
+                    role: Some(role),
+                    cache_point: None,
+                    background: false,
+                    reasoning_budget: None,
+                    stop: stop.clone(),
+                    logprobs: req.logprobs,
+                    call_markers: Vec::new(),
+                })
+                .await,
+        );
+    }
+    let token_bytes = req
+        .logprobs
+        .map(|_| state.engine.tokenizer.token_bytes_shared());
 
     if req.stream {
         let stream = async_stream::stream! {
-            loop {
-                let Some(event) = rx.recv().await else { break };
+            let id = format!("cmpl-{created}");
+            let mut rxs: Vec<_> = rxs.into_iter().map(Some).collect();
+            let mut turn = 0usize;
+            let mut offsets = vec![0usize; n];
+            let mut all_stats: Vec<GenerateStats> = Vec::with_capacity(n);
+            while let Some((index, event)) = next_event(&mut rxs, &mut turn).await {
                 match event {
                     StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
                     // A raw completion has one field to put text in and no
@@ -1641,81 +2278,108 @@ pub async fn completions(
                     // in it — a caller that prefilled `<think>` here asked
                     // for exactly that text back.
                     StreamEvent::Token(text) | StreamEvent::Reasoning(text) => {
-                        let chunk = json!({
-                            "id": format!("cmpl-{created}"), "object": "text_completion", "created": created,
-                            "model": model, "choices": [{"index": 0, "text": text, "finish_reason": null}],
-                        });
-                        yield Ok::<_, std::convert::Infallible>(axum::response::sse::Event::default().data(chunk.to_string()));
+                        yield sse(&json!({
+                            "id": id, "object": "text_completion", "created": created,
+                            "model": model,
+                            "choices": [{"index": index, "text": text, "finish_reason": null}],
+                        }));
                     }
-                    StreamEvent::Done { stats, .. } => {
+                    StreamEvent::Logprob(record) => {
+                        if let Some(bytes) = &token_bytes {
+                            let logprobs = legacy_logprobs(
+                                bytes,
+                                std::slice::from_ref(&record),
+                                &mut offsets[index],
+                            );
+                            yield sse(&json!({
+                                "id": id, "object": "text_completion", "created": created,
+                                "model": model,
+                                "choices": [{"index": index, "text": "", "logprobs": logprobs,
+                                             "finish_reason": null}],
+                            }));
+                        }
+                    }
+                    StreamEvent::Done { finish_reason, stats } => {
                         // A final chunk before `[DONE]`, carrying the same
                         // cost figures the chat endpoint reports — this is
                         // the endpoint `orangu-bench` measures through, so
                         // it is where prefill numbers have to come from.
-                        let chunk = json!({
-                            "id": format!("cmpl-{created}"), "object": "text_completion", "created": created,
-                            "model": model, "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
-                            "usage": usage_json(&stats),
-                            "timings": timings_json(&stats),
-                            "prompt_progress": prompt_progress_json(&stats),
+                        let mut last = json!({
+                            "id": id, "object": "text_completion", "created": created,
+                            "model": model,
+                            "choices": [{"index": index, "text": "",
+                                         "finish_reason": finish_reason_str(finish_reason)}],
                         });
-                        yield Ok(axum::response::sse::Event::default().data(chunk.to_string()));
-                        yield Ok(axum::response::sse::Event::default().data("[DONE]"));
-                        break;
+                        if n == 1 {
+                            last["usage"] = usage_json(&stats);
+                            last["timings"] = timings_json(&stats);
+                            last["prompt_progress"] = prompt_progress_json(&stats);
+                        }
+                        all_stats.push(stats);
+                        yield sse(&last);
+                        if all_stats.len() == n {
+                            break;
+                        }
                     }
                     StreamEvent::Overloaded => {
-                        yield Ok(axum::response::sse::Event::default()
-                            .data(serde_json::json!({"error": crate::http::OVERLOADED_MESSAGE}).to_string()));
-                        break;
+                        yield sse(&json!({"error": crate::http::OVERLOADED_MESSAGE}));
+                        return;
                     }
                     StreamEvent::Error(err) => {
-                        yield Ok(axum::response::sse::Event::default().data(json!({"error": err}).to_string()));
-                        break;
+                        yield sse(&json!({"error": err}));
+                        return;
                     }
                 }
             }
+            if n > 1 {
+                yield sse(&json!({
+                    "id": id, "object": "text_completion", "created": created, "model": model,
+                    "choices": [],
+                    "usage": total_usage(&all_stats),
+                    "timings": all_stats.first().map(timings_json),
+                }));
+            }
+            yield Ok(axum::response::sse::Event::default().data("[DONE]"));
         };
         return axum::response::sse::Sse::new(stream).into_response();
     }
 
-    let mut text = String::new();
-    let mut finish_reason = "stop";
-    let mut usage = json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
-    let mut timings = serde_json::Value::Null;
-    let mut done = None;
-    while let Some(event) = rx.recv().await {
-        match event {
-            StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
-            // See the streaming arm above: one field, no message shape.
-            StreamEvent::Token(t) | StreamEvent::Reasoning(t) => text.push_str(&t),
-            StreamEvent::Done {
-                finish_reason: fr,
-                stats,
-            } => {
-                finish_reason = finish_reason_str(fr);
-                usage = usage_json(&stats);
-                timings = timings_json(&stats);
-                done = Some(stats);
-                break;
-            }
-            StreamEvent::Overloaded => return crate::http::overloaded_response(),
-            StreamEvent::Error(err) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, err).into_response();
-            }
+    let mut choices = Vec::with_capacity(n);
+    let mut all_stats = Vec::with_capacity(n);
+    for (index, rx) in rxs.iter_mut().enumerate() {
+        // See the streaming arm above: one field, no message shape.
+        let got = match collect(rx, true).await {
+            Ok(got) => got,
+            Err(rejection) => return *rejection,
+        };
+        let text = state
+            .engine
+            .tokenizer
+            .clean_up_tokenization_spaces(&got.text);
+        let mut choice = json!({
+            "index": index,
+            "text": text,
+            "finish_reason": finish_reason_str(
+                got.finish.unwrap_or(crate::engine::generate::FinishReason::Stop),
+            ),
+        });
+        if let Some(bytes) = &token_bytes {
+            choice["logprobs"] = legacy_logprobs(bytes, &got.logprobs, &mut 0);
         }
+        choices.push(choice);
+        all_stats.extend(got.stats);
     }
-    let text = state.engine.tokenizer.clean_up_tokenization_spaces(&text);
     let response = Json(json!({
         "id": format!("cmpl-{created}"),
         "object": "text_completion",
         "created": created,
         "model": model,
-        "choices": [{"index": 0, "text": text, "finish_reason": finish_reason}],
-        "usage": usage,
-        "timings": timings,
+        "choices": choices,
+        "usage": total_usage(&all_stats),
+        "timings": all_stats.first().map(timings_json),
     }))
     .into_response();
-    with_server_timing(response, done.as_ref())
+    with_server_timing(response, all_stats.first())
 }
 
 #[derive(Deserialize)]
@@ -1882,6 +2546,7 @@ mod tests {
         GenerateStats {
             prompt_tokens: 200,
             cached_tokens: 50,
+            dropped_tokens: 0,
             prompt_time: Duration::from_millis(4000),
             generated_tokens: 30,
             generate_time: Duration::from_millis(1000),
@@ -1892,23 +2557,12 @@ mod tests {
     /// Every sampler field a request can name must actually reach the
     /// sampler, on **both** OpenAI-compatible endpoints.
     ///
-    /// This is the test whose absence cost a debugging session. `serde`
-    /// drops unknown keys, so an endpoint that lacks a field accepts a
-    /// request naming it and silently ignores the value — indistinguishable,
-    /// from the client's side, from a knob that genuinely does nothing.
-    /// `/v1/completions` honoured `temperature` alone; a `repeat_penalty` or
-    /// `top_k` sent to it went nowhere, and the conclusion drawn was that the
-    /// repetition penalty was not the cause of a garbling it was in fact
-    /// causing.
-    ///
     /// Deserializing real JSON rather than constructing the structs is the
     /// point: a field that exists on the struct but is spelled differently on
     /// the wire fails here and nowhere else.
     #[test]
     fn every_sampler_field_a_request_names_reaches_the_sampler() {
-        let body = serde_json::json!({
-            "prompt": "hi",
-            "messages": [],
+        let sampler = serde_json::json!({
             "temperature": 0.25,
             "top_p": 0.6,
             "top_k": 7,
@@ -1918,10 +2572,15 @@ mod tests {
         });
         let role = crate::config::Role::All;
 
+        let with = |key: &str, value: serde_json::Value| {
+            let mut body = sampler.clone();
+            body[key] = value;
+            body
+        };
         let chat: ChatCompletionRequest =
-            serde_json::from_value(body.clone()).expect("chat request parses");
-        let completions: CompletionsRequest =
-            serde_json::from_value(body).expect("completions request parses");
+            serde_json::from_value(with("messages", json!([]))).expect("chat request parses");
+        let completions: CompletionsRequest = serde_json::from_value(with("prompt", json!("hi")))
+            .expect("completions request parses");
 
         for (label, got) in [
             (
@@ -1935,6 +2594,7 @@ mod tests {
                         min_p: chat.min_p,
                         repeat_penalty: chat.repeat_penalty,
                         seed: chat.seed,
+                        ..Default::default()
                     },
                 ),
             ),
@@ -1949,6 +2609,7 @@ mod tests {
                         min_p: completions.min_p,
                         repeat_penalty: completions.repeat_penalty,
                         seed: completions.seed,
+                        ..Default::default()
                     },
                 ),
             ),
@@ -1983,6 +2644,7 @@ mod tests {
                 min_p: empty.min_p,
                 repeat_penalty: empty.repeat_penalty,
                 seed: empty.seed,
+                ..Default::default()
             },
         );
         let default = SamplingParams::default_for_role(crate::config::Role::All);
@@ -1992,6 +2654,366 @@ mod tests {
             got.repeat_penalty, 1.0,
             "the repetition penalty must default to off"
         );
+    }
+
+    fn refusal<T: OpenAiRequest>(body: serde_json::Value) -> String {
+        match parse_body::<T>(body.to_string().as_bytes()) {
+            Ok(_) => panic!("{body} was accepted"),
+            Err(message) => message,
+        }
+    }
+
+    /// A field this server cannot honour is answered, by name. A client that
+    /// sends one and hears nothing has output it did not ask for.
+    #[test]
+    fn an_unknown_field_is_refused_by_name() {
+        for (field, value) in [
+            ("grammar", json!("root ::= \"a\"")),
+            ("functions", json!([])),
+            ("mirostat", json!(2)),
+        ] {
+            let message = refusal::<ChatCompletionRequest>(json!({"messages": [], field: value}));
+            assert!(message.contains(field), "{message}");
+            assert!(message.contains("/v1/chat/completions"), "{message}");
+            assert!(message.contains("refused rather than ignored"), "{message}");
+        }
+        let message = refusal::<CompletionsRequest>(json!({"prompt": "a", "typical_p": 0.9}));
+        assert!(message.contains("typical_p"), "{message}");
+    }
+
+    /// The other half of the same rule: what every SDK sends and changes
+    /// nothing here must not cost its user a `400`.
+    #[test]
+    fn what_changes_nothing_is_accepted() {
+        let fields = json!({
+            "model": "m", "user": "u", "metadata": {"a": "b"}, "store": false,
+            "service_tier": "auto", "stream_options": {"include_usage": true},
+            "prompt_cache_key": "k", "safety_identifier": "s",
+        });
+        let with = |mut extra: serde_json::Value| {
+            for (key, value) in fields.as_object().unwrap() {
+                extra[key] = value.clone();
+            }
+            extra.to_string()
+        };
+        parse_body::<ChatCompletionRequest>(
+            with(json!({"messages": [], "modalities": ["text"]})).as_bytes(),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+        parse_body::<CompletionsRequest>(
+            with(json!({"prompt": "a", "echo": false, "best_of": 1, "timings_per_token": true}))
+                .as_bytes(),
+        )
+        .unwrap_or_else(|err| panic!("{err}"));
+    }
+
+    /// `echo` and `best_of` at values that do ask for something are refused:
+    /// accepting those would be ignoring them.
+    #[test]
+    fn legacy_fields_that_ask_for_something_are_refused() {
+        for body in [
+            json!({"prompt": "a", "echo": true}),
+            json!({"prompt": "a", "best_of": 3}),
+            json!({"prompt": "a", "suffix": "b"}),
+        ] {
+            refusal::<CompletionsRequest>(body);
+        }
+    }
+
+    /// Every request this project's own clients send has to keep working.
+    #[test]
+    fn what_this_projects_clients_send_is_accepted() {
+        parse_body::<CompletionsRequest>(
+            json!({
+                "prompt": "p", "max_tokens": 1, "n_predict": 1, "temperature": 0, "stream": true,
+                "cache_prompt": false, "ignore_eos": true, "timings_per_token": true, "model": "m",
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap_or_else(|err| panic!("orangu-bench: {err}"));
+        parse_body::<ChatCompletionRequest>(
+            json!({
+                "model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": true,
+                "tools": [], "max_tokens": 8, "timings_per_token": true, "return_progress": true,
+                "id_slot": 0, "temperature": 0, "cache_prompt": true,
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap_or_else(|err| panic!("orangu: {err}"));
+    }
+
+    #[test]
+    fn a_body_that_is_not_an_object_is_refused() {
+        assert!(
+            parse_body::<CompletionsRequest>(b"not json").is_err_and(|e| e.contains("not JSON"))
+        );
+        assert!(
+            parse_body::<CompletionsRequest>(b"[1]")
+                .is_err_and(|e| e.contains("not a JSON object"))
+        );
+    }
+
+    #[test]
+    fn stop_is_one_string_or_several_and_empty_ones_do_nothing() {
+        let stop = |body: serde_json::Value| {
+            let req: ChatCompletionRequest =
+                parse_body(body.to_string().as_bytes()).unwrap_or_else(|err| panic!("{err}"));
+            StopField::strings(req.stop)
+        };
+        assert_eq!(stop(json!({"stop": "a"})), ["a"]);
+        assert_eq!(stop(json!({"stop": ["a", "", "b"]})), ["a", "b"]);
+        assert!(stop(json!({"stop": null})).is_empty());
+        assert!(stop(json!({})).is_empty());
+        assert!(stop(json!({"stop": ""})).is_empty());
+    }
+
+    /// The new penalties, the bias and the stop reach the engine on both.
+    #[test]
+    fn the_new_sampler_fields_parse_on_both_endpoints() {
+        let body = json!({
+            "prompt": "a", "messages": [],
+            "presence_penalty": 0.5, "frequency_penalty": -0.5,
+            "logit_bias": {"7": -100, "3": 2.5}, "stop": ["x"], "n": 2,
+        });
+        let chat: ChatCompletionRequest = serde_json::from_value({
+            let mut b = body.clone();
+            b.as_object_mut().unwrap().remove("prompt");
+            b
+        })
+        .unwrap();
+        let completion: CompletionsRequest = serde_json::from_value({
+            let mut b = body;
+            b.as_object_mut().unwrap().remove("messages");
+            b
+        })
+        .unwrap();
+        for (bias, presence, frequency) in [
+            (
+                &chat.logit_bias,
+                chat.presence_penalty,
+                chat.frequency_penalty,
+            ),
+            (
+                &completion.logit_bias,
+                completion.presence_penalty,
+                completion.frequency_penalty,
+            ),
+        ] {
+            assert_eq!(
+                parse_logit_bias(bias.as_ref(), 10).unwrap(),
+                [(3, 2.5), (7, -100.0)]
+            );
+            let got = sampling_for(
+                crate::config::Role::All,
+                RequestSampling {
+                    presence_penalty: presence,
+                    frequency_penalty: frequency,
+                    logit_bias: parse_logit_bias(bias.as_ref(), 10).unwrap(),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(got.presence_penalty, 0.5);
+            assert_eq!(got.frequency_penalty, -0.5);
+            assert_eq!(got.logit_bias.len(), 2);
+        }
+    }
+
+    #[test]
+    fn logit_bias_and_penalties_out_of_range_are_refused() {
+        let bias = |entries: serde_json::Value| {
+            let map: std::collections::HashMap<String, f32> =
+                serde_json::from_value(entries).unwrap();
+            parse_logit_bias(Some(&map), 10)
+        };
+        assert!(
+            bias(json!({"word": 1}))
+                .unwrap_err()
+                .contains("not a token id")
+        );
+        assert!(
+            bias(json!({"10": 1}))
+                .unwrap_err()
+                .contains("past this model")
+        );
+        assert!(
+            bias(json!({"1": 101}))
+                .unwrap_err()
+                .contains("between -100 and 100")
+        );
+        assert!(parse_logit_bias(None, 10).unwrap().is_empty());
+        assert!(check_penalty("presence_penalty", Some(2.5)).is_err());
+        assert!(check_penalty("presence_penalty", Some(-2.0)).is_ok());
+        assert!(check_penalty("presence_penalty", None).is_ok());
+    }
+
+    #[test]
+    fn the_number_of_choices_is_checked() {
+        assert_eq!(choices_of(None, Some(0)), Ok(1));
+        assert_eq!(choices_of(Some(3), None), Ok(3));
+        assert!(choices_of(Some(0), None).is_err());
+        assert!(choices_of(Some(MAX_CHOICES + 1), None).is_err());
+        assert!(
+            choices_of(Some(2), Some(0))
+                .unwrap_err()
+                .contains("id_slot")
+        );
+    }
+
+    /// Sampled choices must differ, and a seed must still reproduce them.
+    #[test]
+    fn each_choice_has_a_seed_of_its_own() {
+        let sampling = SamplingParams {
+            seed: 41,
+            ..Default::default()
+        };
+        assert_eq!(seeded(&sampling, 0).seed, 41);
+        assert_eq!(seeded(&sampling, 3).seed, 44);
+        let top = SamplingParams {
+            seed: u64::MAX,
+            ..Default::default()
+        };
+        assert_eq!(seeded(&top, 1).seed, 0);
+    }
+
+    /// One prompt, however many replies: `prompt_tokens` is not multiplied.
+    #[test]
+    fn usage_counts_the_prompt_once_and_sums_the_replies() {
+        assert_eq!(total_usage(&[stats()]), usage_json(&stats()));
+        let two = total_usage(&[stats(), stats()]);
+        assert_eq!(two["prompt_tokens"], 200);
+        assert_eq!(two["completion_tokens"], 60);
+        assert_eq!(two["total_tokens"], 260);
+        assert_eq!(total_usage(&[])["total_tokens"], 0);
+    }
+
+    fn tools() -> serde_json::Value {
+        json!([{"type": "function", "function": {"name": "read", "parameters": {}}}])
+    }
+
+    #[test]
+    fn tool_choice_reads_every_form_openai_defines() {
+        let t = tools();
+        let parse = |choice: serde_json::Value| parse_tool_choice(Some(&choice), Some(&t));
+        assert_eq!(parse_tool_choice(None, None), Ok(ToolChoice::Auto));
+        assert_eq!(parse(json!(null)), Ok(ToolChoice::Auto));
+        assert_eq!(parse(json!("auto")), Ok(ToolChoice::Auto));
+        assert_eq!(parse(json!("none")), Ok(ToolChoice::None));
+        // With one tool there is only one call to require.
+        assert_eq!(
+            parse(json!("required")),
+            Ok(ToolChoice::Named("read".to_string()))
+        );
+        let two = json!([
+            {"type": "function", "function": {"name": "read"}},
+            {"type": "function", "function": {"name": "write"}},
+        ]);
+        assert_eq!(
+            parse_tool_choice(Some(&json!("required")), Some(&two)),
+            Ok(ToolChoice::Required)
+        );
+        assert_eq!(
+            parse(json!({"type": "function", "function": {"name": "read"}})),
+            Ok(ToolChoice::Named("read".to_string()))
+        );
+    }
+
+    /// A requirement that cannot be met is refused, not quietly dropped.
+    #[test]
+    fn a_tool_choice_that_cannot_be_met_is_refused() {
+        let t = tools();
+        let parse = |choice: serde_json::Value| parse_tool_choice(Some(&choice), Some(&t));
+        assert!(parse(json!("always")).unwrap_err().contains("`always`"));
+        assert!(
+            parse(json!({"type": "function", "function": {"name": "write"}}))
+                .unwrap_err()
+                .contains("`write`")
+        );
+        assert!(parse(json!({"type": "allowed_tools"})).is_err());
+        assert!(
+            parse_tool_choice(Some(&json!("required")), None)
+                .unwrap_err()
+                .contains("at least one tool")
+        );
+        // Saying none needs nothing to say it about.
+        assert_eq!(
+            parse_tool_choice(Some(&json!("none")), None),
+            Ok(ToolChoice::None)
+        );
+    }
+
+    fn bytes() -> Vec<Vec<u8>> {
+        vec![b"a".to_vec(), b"bc".to_vec(), vec![0xC3]]
+    }
+
+    fn record(id: u32) -> TokenLogprob {
+        TokenLogprob {
+            id,
+            logprob: -0.5,
+            top: vec![(1, -0.25), (0, -0.5)],
+        }
+    }
+
+    #[test]
+    fn a_chat_logprob_is_in_openais_shape() {
+        let entry = chat_logprob(&bytes(), &record(0));
+        assert_eq!(entry["token"], "a");
+        assert_eq!(entry["logprob"], -0.5);
+        assert_eq!(entry["bytes"], json!([97]));
+        assert_eq!(entry["top_logprobs"][0]["token"], "bc");
+        assert_eq!(entry["top_logprobs"][0]["bytes"], json!([98, 99]));
+    }
+
+    /// A token ending half way through a character: `bytes` is what lets a
+    /// client put the character back together.
+    #[test]
+    fn a_token_that_ends_mid_character_keeps_its_bytes() {
+        let entry = chat_logprob(&bytes(), &record(2));
+        assert_eq!(entry["bytes"], json!([0xC3]));
+        assert_eq!(chat_logprob(&bytes(), &record(99))["bytes"], json!([]));
+    }
+
+    #[test]
+    fn legacy_logprobs_are_parallel_arrays_with_running_offsets() {
+        let mut offset = 0;
+        let got = legacy_logprobs(&bytes(), &[record(1), record(0)], &mut offset);
+        assert_eq!(got["tokens"], json!(["bc", "a"]));
+        assert_eq!(got["token_logprobs"], json!([-0.5, -0.5]));
+        assert_eq!(got["text_offset"], json!([0, 2]));
+        assert_eq!(got["top_logprobs"][0]["bc"], -0.25);
+        assert_eq!(offset, 3);
+    }
+
+    /// Choices are read as they come, none starves, and the merge ends only
+    /// when every one has.
+    #[tokio::test]
+    async fn the_merge_takes_turns_and_ends_with_the_last_choice() {
+        let (a_tx, a_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (b_tx, b_rx) = tokio::sync::mpsc::unbounded_channel();
+        for tx in [&a_tx, &b_tx] {
+            for text in ["1", "2"] {
+                tx.send(StreamEvent::Token(text.to_string())).unwrap();
+            }
+        }
+        let mut rxs = vec![Some(a_rx), Some(b_rx)];
+        let mut turn = 0;
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            let (index, _) = next_event(&mut rxs, &mut turn).await.unwrap();
+            order.push(index);
+        }
+        assert_eq!(order, [0, 1, 0, 1]);
+        drop(a_tx);
+        b_tx.send(StreamEvent::Done {
+            finish_reason: crate::engine::generate::FinishReason::Stop,
+            stats: stats(),
+        })
+        .unwrap();
+        let (index, _) = next_event(&mut rxs, &mut turn).await.unwrap();
+        assert_eq!(index, 1);
+        assert!(rxs[1].is_none(), "a choice is over at its Done");
+        assert!(next_event(&mut rxs, &mut turn).await.is_none());
     }
 
     #[test]
@@ -2058,6 +3080,7 @@ mod tests {
         let empty = GenerateStats {
             prompt_tokens: 0,
             cached_tokens: 0,
+            dropped_tokens: 0,
             prompt_time: Duration::ZERO,
             generated_tokens: 0,
             generate_time: Duration::ZERO,

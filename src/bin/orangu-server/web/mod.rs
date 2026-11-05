@@ -986,6 +986,7 @@ async fn send_message(
             // notion of a slot; any free one is right.
             id_slot: None,
             timings_per_token: false,
+            ..Default::default()
         })
         .await;
 
@@ -1020,7 +1021,9 @@ async fn send_message(
         loop {
             let Some(event) = rx.recv().await else { break };
             match event {
-                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
+                StreamEvent::PromptProgress { .. }
+                | StreamEvent::Timings(_)
+                | StreamEvent::Logprob(_) => {}
                 StreamEvent::Reasoning(text) => {
                     reasoning.push_str(&text);
                     let html = render::render_reasoning_to_html(&reasoning);

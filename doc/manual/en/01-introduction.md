@@ -24,6 +24,7 @@ speaks the OpenAI-compatible API. See *A complete stack* below.
 * Workspace-scoped file tools — show, create, modify, move, and delete files and directories, staged through Git only when asked
 * Workspace-aware Git and forge tools (commit, rebase, push, pull requests, issues, comments) for the whole change-and-review loop
 * Several projects open at once as workspace tabs, each with its own session, scrollback, and history
+* Code completion at a place in a file (`/infill`), on models with fill-in-the-middle tokens
 * Knowledge graph of the codebase (`/graph`), semantic search by meaning (`/search`), and duplicate-code detection across more than 20 languages (`/duplicates`)
 * Context compression — AST-aware downsampling, a diff engine, secret redaction, and transcript compaction to protect the context window
 * Agent Skills (`SKILL.md`) and workspace memory (`AGENTS.md`) merged into the model's context

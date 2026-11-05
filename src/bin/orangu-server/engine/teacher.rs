@@ -42,8 +42,28 @@ pub const MAX_TOP: usize = 256;
 /// most likely first.
 pub type TopLogprobs = Vec<(u32, f32)>;
 
+/// [`teacher_forced`], with the log-probability of each actual next token: the
+/// answer's `i`th score is that of `tokens[i + 1]`, which the `top` candidates
+/// need not include.
+pub fn teacher_scored(
+    model: &dyn ModelForward,
+    tokens: &[u32],
+    rows: usize,
+    top: usize,
+    slot_id: usize,
+) -> Result<(Vec<TopLogprobs>, Vec<f32>)> {
+    let mut scores = Vec::with_capacity(tokens.len().saturating_sub(1));
+    let positions = run(model, tokens, rows, top, slot_id, |at, logits| {
+        if let Some(&next) = tokens.get(at + 1) {
+            scores.push(logprob_of(logits, next));
+        }
+    })?;
+    Ok((positions, scores))
+}
+
 /// The `top` most likely next tokens after every prefix of `tokens`, run
 /// `rows` positions a pass in a fresh cache.
+#[cfg(test)]
 pub fn teacher_forced(
     model: &dyn ModelForward,
     tokens: &[u32],
@@ -51,23 +71,52 @@ pub fn teacher_forced(
     top: usize,
     slot_id: usize,
 ) -> Result<Vec<TopLogprobs>> {
+    run(model, tokens, rows, top, slot_id, |_, _| {})
+}
+
+fn run(
+    model: &dyn ModelForward,
+    tokens: &[u32],
+    rows: usize,
+    top: usize,
+    slot_id: usize,
+    mut each: impl FnMut(usize, &[f32]),
+) -> Result<Vec<TopLogprobs>> {
     let rows = rows.clamp(1, MAX_ROWS);
     let mut cache = model.new_kv_cache(tokens.len().max(1));
     let mut out = Vec::with_capacity(tokens.len());
     for (i, part) in tokens.chunks(rows).enumerate() {
         let pos = i * rows;
         if rows == 1 {
-            out.push(top_logprobs(
-                &model.forward(&mut cache, part, pos, slot_id)?,
-                top,
-            ));
+            let logits = model.forward(&mut cache, part, pos, slot_id)?;
+            each(pos, &logits);
+            out.push(top_logprobs(&logits, top));
         } else {
-            for row in model.forward_verify(&mut cache, part, pos, slot_id)? {
+            for (offset, row) in model
+                .forward_verify(&mut cache, part, pos, slot_id)?
+                .into_iter()
+                .enumerate()
+            {
+                each(pos + offset, &row);
                 out.push(top_logprobs(&row, top));
             }
         }
     }
     Ok(out)
+}
+
+/// `id`'s log-probability over the whole row.
+fn logprob_of(logits: &[f32], id: u32) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let log_z = max as f64
+        + logits
+            .iter()
+            .map(|&l| ((l - max) as f64).exp())
+            .sum::<f64>()
+            .ln();
+    logits
+        .get(id as usize)
+        .map_or(f32::NEG_INFINITY, |&l| (l as f64 - log_z) as f32)
 }
 
 /// The `top` largest entries of `logits` as log-probabilities over the
@@ -96,6 +145,19 @@ pub fn top_logprobs(logits: &[f32], top: usize) -> TopLogprobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tokens_score_is_its_probability_over_the_whole_row() {
+        let logits = [0.0f32, 2.0, 1.0, -1.0];
+        let z: f64 = logits.iter().map(|&l| (l as f64).exp()).sum();
+        // Whichever token is asked about, in or out of any top candidates.
+        assert!((logprob_of(&logits, 3) as f64 - (-1.0 - z.ln())).abs() < 1e-6);
+        assert_eq!(logprob_of(&logits, 3), {
+            let row = top_logprobs(&logits, 4);
+            row.iter().find(|t| t.0 == 3).unwrap().1
+        });
+        assert_eq!(logprob_of(&logits, 9), f32::NEG_INFINITY);
+    }
 
     #[test]
     fn the_top_entries_are_normalised_over_the_whole_row() {

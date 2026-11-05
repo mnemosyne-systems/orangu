@@ -509,6 +509,67 @@ runs of one build on one device are the floor to compare against: a device
 whose sums run in a different order from run to run does not reach zero
 against itself.
 
+### Scoring modes — how good are the model's predictions?
+
+Throughput says how fast a model runs, and `--kl` says whether a change moved its
+answers. These three modes say how good the answers are, which is what tells
+quantizations of one model apart. They all run teacher-forced through `/logits`,
+so nothing is generated and no sampler is involved.
+
+| Flag | Default | |
+| :-- | :-- | :-- |
+| `--perplexity PATH` | — | score this text file |
+| `--ppl-ctx N` | `512` | tokens in each window |
+| `--ppl-chunks N` | every whole window | windows to run |
+| `--hellaswag PATH` | — | score this HellaSwag file |
+| `--winogrande PATH` | — | score this WinoGrande file |
+| `--score-tasks N` | every task | tasks to run |
+| `--score-rows N` | `1` | positions a pass: `1` runs decode steps, up to `64` runs verify passes |
+
+```sh
+orangu-bench --perplexity wiki.test.raw --ppl-chunks 100 --score-rows 64
+orangu-bench --hellaswag hellaswag_val_full.txt --score-tasks 400
+orangu-bench --winogrande winogrande-debiased-eval.csv
+```
+
+`--score-rows 64` is several times faster than the default, because a pass reads
+its tokens together, and it suits perplexity, where small differences average out.
+The paths use different kernels, though, and a task score turns on which ending
+comes out ahead, so a wider pass can flip a close task. Use the default for a task
+score you mean to quote, and compare only runs made with the same value.
+
+**Perplexity** is `e` to the mean negative log-probability of each token given the
+ones before it; lower is better. The text is split into windows of `--ppl-ctx`
+tokens, each starting afresh, with its first token replaced by the BOS where the
+model has one. Only each window's second half is scored, so that every scored token
+has context behind it. The report gives the perplexity with its standard error.
+Perplexity depends on the text, the window and how the text was tokenized, so
+compare only figures from the same three.
+
+**HellaSwag** asks which of four endings really followed a passage, and scores an
+ending by the mean log-probability of its tokens. The file has six lines a task:
+the passage, the index of the right ending, and the four endings.
+
+**WinoGrande** asks which of two choices fits the gap in a sentence. A choice is
+scored by how likely the rest of the sentence is after it, leaving out the last
+token; when three tokens or fewer follow the gap, the choice's own tokens count
+too. The file is CSV: an index, the sentence with a `_` for the gap, the two
+choices, and the right one (`1` or `2`). Lines that do not read as a task are
+counted and skipped.
+
+Both report accuracy with a 95% Wilson interval. `--score-tasks` takes the same
+tasks each run, spread through the file rather than from its start, because these
+files keep related tasks together. A full HellaSwag run is 10042 tasks, and a
+small sample has a wide interval: two results whose intervals overlap do not show
+a difference. WinoGrande's score reads every token's probability from its own
+sentence, so it can differ slightly from a tool that does otherwise for the second
+choice of a sentence with little after the gap.
+
+The datasets are not bundled. `wiki.test.raw` is in the WikiText-2 archive, and
+the HellaSwag and WinoGrande validation sets are published in these text forms on
+Hugging Face and GitHub. Results are recorded in the history as modes
+`perplexity`, `hellaswag` and `winogrande`.
+
 ### Decode CPU per token (`--decode-cpu`)
 
 Reports the **server's own CPU time per generated token**, read from
@@ -1323,6 +1384,13 @@ Options:
       --kl-top <N>                     Candidates `--kl` keeps per position [default: 32]
       --kl-tokens <N>                  Tokens `--kl` runs [default: 1024]
       --kl-text <PATH>                 The text `--kl` runs. Default: the chat fixture's system prompt and turns
+      --perplexity <PATH>              Perplexity mode: score this text file through `/logits`
+      --ppl-ctx <N>                    Tokens in each `--perplexity` window [default: 512]
+      --ppl-chunks <N>                 Windows `--perplexity` runs. Default: all of the file
+      --hellaswag <PATH>               HellaSwag mode: score this six-lines-a-task file through `/logits`
+      --winogrande <PATH>              WinoGrande mode: score this CSV file through `/logits`
+      --score-tasks <N>                Tasks `--hellaswag` and `--winogrande` run. Default: all of the file
+      --score-rows <N>                 Positions a pass for the scoring modes: 1 runs decode steps, more runs verify passes [default: 1]
       --pp-continue-base <N>           Prompt length (tokens) to prime the prefix cache with for `--pp-continue` [default: 512]
       --embed <LIST>                   Embedding mode: prompt lengths to sweep against /v1/embeddings
       --image <LIST>                   Image mode: square picture sizes (pixels, multiples of 16) to sweep against /v1/images/generations

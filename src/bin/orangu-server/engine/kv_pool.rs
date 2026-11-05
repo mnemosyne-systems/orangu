@@ -92,7 +92,7 @@
 //! decides *which* pages a new request should be given, and the device-side
 //! mirror, are separate pieces built on top of this one.
 //!
-//! Off unless `ORANGU_PAGED_KV` is on.
+//! On unless `ORANGU_PAGED_KV=0` turns it off.
 
 // Nothing in the forward pass calls this yet — the flag reader and the page
 // geometry are used only by this module's own tests until `LayerCache` learns

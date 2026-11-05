@@ -476,6 +476,7 @@ pub fn bundled_configuration(
         // A bundle serves whoever runs it; refusing on its owner's behalf is
         // not a decision it can make.
         queue_limit: 0,
+        context_shift: None,
         context: None,
         // A bundle carries one model. Pairing it with a draft would mean
         // embedding a second, which is a different product decision than
@@ -1085,6 +1086,10 @@ pub struct ServerConfiguration {
     /// before the server starts refusing with `503`; [`DEFAULT_QUEUE_LIMIT`]
     /// unset, and `0` queues without bound.
     pub queue_limit: usize,
+    /// `[orangu-server].context_shift`, `context_keep` and
+    /// `context_shift_drop`: what to do when a conversation outgrows the
+    /// context window. `None` refuses or stops, as it does unset.
+    pub context_shift: Option<crate::engine::context_shift::ContextShift>,
     /// `[orangu-server].context`: the context, in tokens, one request must
     /// be able to hold on the device. Unset, the model's layers all go to
     /// the card when they fit and the context is whatever the card has
@@ -1375,6 +1380,41 @@ pub fn default_server_config_path() -> Option<PathBuf> {
 
     let config_path = home::home_dir()?.join(".orangu/orangu-server.conf");
     config_path.exists().then_some(config_path)
+}
+
+/// `[orangu-server].context_shift` and the two keys that shape it.
+fn parse_context_shift(
+    section: &HashMap<String, String>,
+) -> Result<Option<crate::engine::context_shift::ContextShift>> {
+    let on = match section.get("context_shift") {
+        Some(value) => parse_bool(SERVER_SECTION, "context_shift", value)?,
+        None => false,
+    };
+    let keep = match section.get("context_keep") {
+        Some(value) => value
+            .trim()
+            .parse::<usize>()
+            .map_err(|err| anyhow!("invalid value for [{SERVER_SECTION}].context_keep: {err}"))?,
+        None => 0,
+    };
+    let drop_fraction = match section.get("context_shift_drop") {
+        Some(value) => value
+            .trim()
+            .parse::<f32>()
+            .ok()
+            .filter(|f| *f > 0.0 && *f <= 1.0)
+            .ok_or_else(|| {
+                anyhow!(
+                    "invalid value for [{SERVER_SECTION}].context_shift_drop: {value} \
+                     (a fraction above 0, up to 1)"
+                )
+            })?,
+        None => 0.5,
+    };
+    Ok(on.then_some(crate::engine::context_shift::ContextShift {
+        keep,
+        drop_fraction,
+    }))
 }
 
 /// How many requests may wait for a slot when `queue_limit` is not set: a
@@ -1761,6 +1801,8 @@ pub fn load_server_configuration(
         None => DEFAULT_QUEUE_LIMIT,
     };
 
+    let context_shift = parse_context_shift(&section)?;
+
     let context = match section.get("context") {
         Some(value) => {
             let context = value
@@ -2082,6 +2124,7 @@ pub fn load_server_configuration(
         kv_cache,
         read_size,
         queue_limit,
+        context_shift,
         context,
         draft_model,
         draft_tokens,
@@ -4042,6 +4085,45 @@ mod tests {
         let mut zero = tempfile::NamedTempFile::new().unwrap();
         writeln!(zero, "[orangu-server]\nmodels = /srv/models\ncontext = 0\n").unwrap();
         assert!(load_server_configuration(zero.path(), None, false).is_err());
+    }
+
+    /// A context shift is off unless asked for, its shape keys alone do not
+    /// turn it on, and a value that cannot be meant stops the server.
+    #[test]
+    fn loads_the_context_shift_keys() {
+        let load = |body: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /srv/models\n{body}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+        assert_eq!(load("").unwrap().context_shift, None);
+        assert_eq!(load("context_keep = 64\n").unwrap().context_shift, None);
+        assert_eq!(load("context_shift = no\n").unwrap().context_shift, None);
+        assert_eq!(
+            load("context_shift = yes\n").unwrap().context_shift,
+            Some(crate::engine::context_shift::ContextShift {
+                keep: 0,
+                drop_fraction: 0.5,
+            })
+        );
+        assert_eq!(
+            load("context_shift = on\ncontext_keep = 64\ncontext_shift_drop = 0.25\n")
+                .unwrap()
+                .context_shift,
+            Some(crate::engine::context_shift::ContextShift {
+                keep: 64,
+                drop_fraction: 0.25,
+            })
+        );
+        for bad in [
+            "context_shift = sometimes\n",
+            "context_keep = many\n",
+            "context_shift_drop = 0\n",
+            "context_shift_drop = 1.5\n",
+            "context_shift_drop = half\n",
+        ] {
+            assert!(load(bad).is_err(), "{bad}");
+        }
     }
 
     /// One device runs the model unless something says otherwise — a config

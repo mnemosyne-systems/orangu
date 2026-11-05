@@ -573,6 +573,7 @@ fn invalid_static_arguments(command: &LocalCommand<'_>) -> bool {
     ) || matches!(
         command,
         LocalCommand::Grep(None)
+            | LocalCommand::Infill(None)
             | LocalCommand::Search(None)
             | LocalCommand::Pull(None)
             | LocalCommand::Comment(None)
@@ -630,7 +631,8 @@ async fn run_outcome(
         // the way any other command-line tool does.
         CommandOutcome::OutputError(message) => Err(anyhow!("{}", message.trim_end())),
         CommandOutcome::Blocking(work) => {
-            console.block(&work()?);
+            // Off the runtime's thread: the work may drive a future of its own.
+            console.block(&tokio::task::spawn_blocking(work).await??);
             Ok(Resolution::Handled)
         }
         CommandOutcome::Streaming(work, _control) => {

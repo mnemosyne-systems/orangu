@@ -1,7 +1,7 @@
 # The inference engine: a contributor's map
 
-`orangu-server` carries twenty architecture modules across twenty-three servable
-architecture families — twenty language models, two diffusion
+`orangu-server` carries twenty architecture modules across twenty-four servable
+architecture families — twenty-one language models, two diffusion
 transformers, one for pictures and one for video, and one speech model, each
 of the last three with a module of its own outside `engine::arch` — and six
 device backends.
@@ -195,6 +195,18 @@ it cannot decode fails inside a matmul partway through the first request,
 where the error has no useful context. Declaring the truth makes it a startup
 error naming the type.
 
+### Weight types by backend
+
+| Backend | Reads |
+| :-- | :-- |
+| CPU | F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, I32, IQ1_M, BF16, Q4_0_4_4, Q4_0_4_8, Q4_0_8_8, IQ4_NL_4_4, IQ4_NL_4_8, IQ4_NL_8_8, MXFP4, NVFP4, Q2_0, F8_E4M3, IQ1_XS, IQ1_XXS, IQ1_XXXS |
+| Vulkan, Metal, DX12 | F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, BF16, MXFP4, Q2_0 |
+| CUDA, ROCm, OpenCL | F32, F16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ4_NL, IQ3_S, IQ2_S, IQ4_XS, IQ1_M, BF16 |
+
+`doc_tables.rs` holds this table, the architecture counts and the HTTP endpoint
+table to the code. A change to a route, an `ArchFamily` variant or a backend's
+`supports_type` fails there until the documentation follows.
+
 ## Testing conventions
 
 The engine's tests are unusually load-bearing, because almost nothing here
@@ -244,13 +256,12 @@ Architectures, by what they are rather than by name:
 Twenty-seven modules above, twenty architecture modules: `qwen_hybrid`, `kda`,
 `hyper`, `indexer`, `dsa`, `ffn` and `position` are shared parts, not
 architectures of their own.
-Twenty-four `ArchFamily` variants, twenty-three *servable* families: `dflash` is a
+Twenty-five `ArchFamily` variants, twenty-four *servable* families: `dflash` is a
 module and a variant but resolves to the model it drafts for rather than
 serving itself, and `QwenImage`, `Ltxv` and `Qwen3Tts` are variants whose
 modules live outside `engine::arch` altogether (below). Those are the two
-conventions every count in the documentation uses — check them against this
-table and `ArchFamily` rather than against another prose count, which is how
-they drifted apart before.
+conventions every count in the documentation uses, and `doc_tables.rs` holds
+those counts to `ArchFamily`.
 
 One family is not in the table because it is not a `ModelForward`:
 `qwen_image`, Qwen-Image's diffusion transformer, lives in `engine::image`.

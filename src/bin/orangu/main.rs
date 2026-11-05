@@ -23,6 +23,7 @@ mod dispatch;
 mod docs;
 mod export;
 mod git;
+mod infill;
 mod information;
 mod init;
 mod input;

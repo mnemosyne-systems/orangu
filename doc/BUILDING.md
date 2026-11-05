@@ -76,7 +76,8 @@ not out of the host, so cross-bundled output names itself correctly without an
 
 Releases ship the ordinary binaries only — a bundle is as large as the model
 inside it, so it is built locally from whichever model suits the machine. See
-the *Bundling* section of [SERVER.md](SERVER.md).
+the *Bundling* section of the
+[server chapter](manual/en/46-server.md#bundling-the-server-and-a-model-as-one-file).
 
 ## AVX2 / SSE4.2
 

@@ -210,6 +210,7 @@ pub fn help_text() -> &'static str {
 /fetch [remote]                                 Fetch from a remote with git fetch (Tab completes git remotes; defaults to the first remote)
 /get_comments -i <number>|-p <number>           List comments on a GitHub/GitLab issue or pull request with gh/glab
 /grep <pattern>                                 Search the workspace with git grep
+/infill <file>:<line>[:<column>]                Show what the model would write at a place in a file
 /graph                                          Write an HTML visualization of the codebase Knowledge Graph
 /graph diff                                     Write an HTML visualization of branch-changed symbols plus one-hop neighbours
 /graph explain <symbol>                         Explain a graph symbol, its degree, community, and evidence-tagged connections

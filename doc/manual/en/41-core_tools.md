@@ -1663,6 +1663,31 @@ visualize codebase
 
 \newpage
 
+## /infill
+
+Shows what the model would write at a place in a file, through the server's
+`POST /infill`. It changes nothing, and the completion does not enter the
+conversation.
+
+```text
+/infill <file>:<line>[:<column>]
+```
+
+Lines and columns count from 1, and columns count characters; with no column,
+the cursor is at the end of the line. The file has to be inside the workspace.
+Once the knowledge graph is built, the request also carries the start of the
+three files it couples most strongly to this one.
+
+The active server's model needs fill-in-the-middle tokens, and a model without
+them answers with a message saying so.
+
+**Examples**
+
+```text
+/infill src/main.rs:42
+/infill src/main.rs:42:17
+```
+
 ## /search
 
 The model can also request semantic search through the `semantic_search` tool,

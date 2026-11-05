@@ -56,14 +56,14 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--streams-depth|--interference|--chat|--chat-fixture|--kl|--kl-rows|--kl-top|--kl-tokens|--kl-text|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--streams-depth|--interference|--chat|--chat-fixture|--kl|--kl-rows|--kl-top|--kl-tokens|--kl-text|--perplexity|--ppl-ctx|--ppl-chunks|--hellaswag|--winogrande|--score-tasks|--score-rows|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
             return 0
             ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-depth --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --kl --kl-rows --kl-top --kl-tokens --kl-text --shared-prefix --shared-prefix-tokens \
+            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-depth --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --kl --kl-rows --kl-top --kl-tokens --kl-text --perplexity --ppl-ctx --ppl-chunks --hellaswag --winogrande --score-tasks --score-rows --shared-prefix --shared-prefix-tokens \
              --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --sweep-as-given --write-profile --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels --chart-grid --chart-overlay \
@@ -108,6 +108,13 @@ _orangu_bench() {
         '--kl-top[Candidates --kl keeps per position]:n:' \
         '--kl-tokens[Tokens --kl runs]:n:' \
         '--kl-text[The text --kl runs]:file:_files' \
+        '--perplexity[Score this text file]:file:_files' \
+        '--ppl-ctx[Tokens in each --perplexity window]:n:' \
+        '--ppl-chunks[Windows --perplexity runs]:n:' \
+        '--hellaswag[Score this HellaSwag file]:file:_files' \
+        '--winogrande[Score this WinoGrande file]:file:_files' \
+        '--score-tasks[Tasks the scoring modes run]:n:' \
+        '--score-rows[Positions a pass for the scoring modes]:n:' \
         '--shared-prefix[Shared-prefix mode: stream counts that all send the SAME long prefix]:list:' \
         '--shared-prefix-tokens[Length in tokens of the prefix --shared-prefix streams have in common]:n:' \
         '--shared-prefix-cold[Shared-prefix mode: every round sends a prefix the server has not seen, so all streams arrive cold]' \
@@ -212,6 +219,13 @@ complete -c orangu-bench -l kl-rows                -r -d 'Positions per --kl pas
 complete -c orangu-bench -l kl-top                 -r -d 'Candidates --kl keeps per position'
 complete -c orangu-bench -l kl-tokens              -r -d 'Tokens --kl runs'
 complete -c orangu-bench -l kl-text                -r -d 'The text --kl runs'
+complete -c orangu-bench -l perplexity             -r -d 'Score this text file'
+complete -c orangu-bench -l ppl-ctx                -r -d 'Tokens in each --perplexity window'
+complete -c orangu-bench -l ppl-chunks             -r -d 'Windows --perplexity runs'
+complete -c orangu-bench -l hellaswag              -r -d 'Score this HellaSwag file'
+complete -c orangu-bench -l winogrande             -r -d 'Score this WinoGrande file'
+complete -c orangu-bench -l score-tasks            -r -d 'Tasks the scoring modes run'
+complete -c orangu-bench -l score-rows             -r -d 'Positions a pass for the scoring modes'
 complete -c orangu-bench -l shared-prefix          -x -d 'Shared-prefix mode: stream counts that all send the SAME long prefix'
 complete -c orangu-bench -l shared-prefix-tokens   -x -d 'Length in tokens of the prefix --shared-prefix streams have in common'
 complete -c orangu-bench -l shared-prefix-cold        -d 'Shared-prefix mode: every round sends a prefix the server has not seen, so all streams arrive cold'
@@ -325,6 +339,13 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--kl-top', 'Candidates --kl keeps per position'),
         @('--kl-tokens', 'Tokens --kl runs'),
         @('--kl-text', 'The text --kl runs'),
+        @('--perplexity', 'Score this text file'),
+        @('--ppl-ctx', 'Tokens in each --perplexity window'),
+        @('--ppl-chunks', 'Windows --perplexity runs'),
+        @('--hellaswag', 'Score this HellaSwag file'),
+        @('--winogrande', 'Score this WinoGrande file'),
+        @('--score-tasks', 'Tasks the scoring modes run'),
+        @('--score-rows', 'Positions a pass for the scoring modes'),
         @('--shared-prefix', 'Shared-prefix mode: stream counts that all send the SAME long prefix'),
         @('--shared-prefix-tokens', 'Length in tokens of the prefix --shared-prefix streams have in common'),
         @('--shared-prefix-cold', 'Shared-prefix mode: every round sends a prefix the server has not seen, so all streams arrive cold'),
@@ -412,7 +433,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         { $_ -in '--history', '--chart', '--table', '--storage-file', '--download-dir', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--streams-depth', '--interference', '--chat', '--chat-fixture', '--kl', '--kl-rows', '--kl-top', '--kl-tokens', '--kl-text', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--streams-depth', '--interference', '--chat', '--chat-fixture', '--kl', '--kl-rows', '--kl-top', '--kl-tokens', '--kl-text', '--perplexity', '--ppl-ctx', '--ppl-chunks', '--hellaswag', '--winogrande', '--score-tasks', '--score-rows', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

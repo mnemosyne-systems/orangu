@@ -1013,6 +1013,19 @@ each is meant to be loaded _alongside_ a base model, not to stand in as one,
 so neither gets a row, and both go with the repo once its last model is
 deleted.
 
+`QUANT` is the quantization the model's file name states: the trailing run
+of letters, digits and underscores after the last `-` or `.`, once any shard
+suffix is stripped. That is the same tag a `:quant` suffix names, so the two
+always agree. It is shown only when it reads as a quantization (`Q4_K_M`,
+`IQ2_XXS`, `TQ1_0`, `F16`, ...). A name that ends in something else
+(`gemma-4-E2B-it`) falls back to the `ggml_type` holding the most tensor
+_elements_ across every shard. The fallback is coarser, which is why the name
+wins when there is one: a real `Q4_K_M` model can have `Q5_K` or `Q6_K` as its
+most common type, and the fallback cannot tell `Q4_K_S` from `Q4_K_M`, since
+both store most tensors as `Q4_K`. A file that fails to parse (a truncated
+download, or not a GGUF file) is still listed, with its error in place of
+`QUANT` and `SIZE`, so one bad file does not stop the scan.
+
 `SUPPORTED` says whether this build can actually load the model's
 architecture — `Yes (<arch>)` or `No (<arch>)`, where `<arch>` is the GGUF
 `general.architecture` (e.g. `qwen3`, `gemma4`, `glm-dsa`). A `No` row (like
@@ -1178,6 +1191,7 @@ multi-shard model is deleted atomically rather than leaving orphans behind:
 ```sh
 orangu-server delete 3                                     # NR from `list`
 orangu-server delete unsloth/Qwen3-Coder-Next-GGUF          # MODEL from `list`
+orangu-server delete Qwen3-Coder-30B-A3B-Instruct.gguf      # bare name under `models`
 orangu-server delete                                        # no argument: interactive
 ```
 
@@ -1261,7 +1275,8 @@ that would carry `(Refresh)` in `list`. Already-current and hand-copied models
 are left alone. A repository that could not be reached is reported and
 skipped: an unknown remote state is never treated as stale, so an offline or
 partly unreachable run does not delete models speculatively. `--all` cannot
-be combined with a model argument.
+be combined with a model argument. `refresh` does not prompt, and accepts
+`-y`/`--yes` without effect.
 
 ## Bundling: the server and a model as one file
 
@@ -1524,6 +1539,7 @@ api_key = a-long-random-string
 tls_cert = ~/certs/cert.pem
 tls_key = ~/certs/key.pem
 queue_limit = 16
+context_shift = no
 backend = auto
 device = auto
 kv_cache = f16
@@ -1660,6 +1676,12 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   `sessions/`. Default `~/.orangu/api`.
   What is stored there stays until it is deleted through the API — a
   container until 30 days after its last use.
+- `context_shift` — `yes` lets a conversation outgrow the context window, by
+  dropping its oldest tokens, instead of refusing the prompt or ending the reply
+  at the window (default `no`; see **Context shift** below). `context_keep` is
+  how many of the first tokens always stay (default `0`, which keeps the first
+  token only), and `context_shift_drop` is the share of the rest one step drops
+  (default `0.5`).
 - `queue_limit` — how many requests may **wait** for a slot before the server
   starts refusing (default `16`; `0` is unbounded). Beyond the limit a request is
   answered immediately with `503 Service Unavailable` and `Retry-After: 1`
@@ -1885,7 +1907,10 @@ orangu-server: [adapt] npu: not used (ORANGU_NPU_FFN=1 uses it anyway) — a fee
   log a daemon logs nothing at all. Fatal `error:` lines the process exits on
   stay on stderr — they are for the terminal that started it — and a
   subcommand's own output (`list`, `show`, ...) is not logging and is
-  unaffected. A coordinator logging to a file hands the same file to every
+  unaffected. `INFO` lines are what the console prints on stdout, `WARN` and
+  `ERROR` what it prints on stderr. Rotate the file with whatever the machine
+  already rotates logs with; the keys are read once at startup, so a
+  rotated-away file is picked up again on the next start. A coordinator logging to a file hands the same file to every
   `orangu-server` it starts (see the Coordinator chapter), and the two append
   to it line by line.
 
@@ -1911,6 +1936,9 @@ shown.
 | `port`                  | `8100`                                     | HTTP API port                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `role`                  | `all`                                      | `all`, `code`, `review`, `explorer`, `embedding`, `image`, `video`, `audio`; read under `--daemon`, an image model is always `image`, a video model always `video`, a speech model always `audio`                                                                                                                                                                                                                                                                                                    |
 | `slots`                 | `4`; `1` review/image/video/audio, `8` embedding | concurrent requests, each with its own KV cache                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `context_shift`         | `no`                                       | drop the oldest tokens when a conversation outgrows the window, instead of refusing or stopping |
+| `context_keep`          | `0`                                        | first tokens a context shift always keeps; at least the first token, at most half the window |
+| `context_shift_drop`    | `0.5`                                      | share of the tokens after those that one step of a context shift drops, above `0`, up to `1` |
 | `queue_limit`           | `16`                                       | requests allowed to wait for a slot before `503`; `0` is unbounded                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `context`               | —                                          | tokens one request must fit on the device; set, layers move to the host until the card has room for that much KV cache                                                                                                                                                                                                                                                                                                                                                                               |
 | `api_key`               | —                                          | bearer token every request must carry; unset leaves the server open                                                                                                                                                                                                                                                                                                                                                                                                                                  |
@@ -2059,6 +2087,66 @@ local Prometheus. Its `host` defaults to `[orangu-server].host` (and follows
 `--host`); set `[prometheus].host` to bind it elsewhere, as `[web].host`
 does. `--metrics` overrides the config file's port for one run, the same way
 `--port`/`--web` do.
+
+### Context shift
+
+Without this setting, a prompt longer than the context window is refused, and a
+reply that fills the window ends there with `finish_reason: "length"`. With
+`context_shift = yes`, the server drops the conversation's oldest tokens and
+carries on instead:
+
+```ini
+[orangu-server]
+context_shift = yes
+context_keep = 256
+context_shift_drop = 0.5
+```
+
+The window is the model's context length, or the device's room for one request
+where that is less. The first `context_keep` tokens always stay, because that is
+where a system prompt is. Set it to cover yours: the default keeps only the first
+token, so a long conversation otherwise loses its instructions. `/completion` and
+`/infill` can set their own `n_keep` per request.
+
+**What is dropped is gone.** The model can no longer see those tokens, so it can
+lose track of what it was told earlier. A cut also falls wherever the count
+lands, usually in the middle of a message, not between turns. That is why this is
+off by default, and why a client that can summarize its own history, as `orangu`
+does, gets better results by doing that first. With this on, a too-long prompt is
+no longer refused, so a client that shortens a prompt in response to that refusal
+never sees one: its whole prompt is cut here instead. `/auto_review` is one, and
+loses the start of a too-long review rather than a file's surrounding context.
+
+**During a reply**, when the window fills, the server drops one step and reads
+what stays again before writing the next token. The reply pauses for that read,
+and otherwise continues as if nothing happened: stop strings, `logprobs`, a
+required tool call's name and a JSON constraint all carry on from where they
+were. `max_tokens` still ends the reply. The read covers every family, recurrent
+and hybrid models too, because the state is computed from the kept tokens rather
+than patched, so the tokens after a shift are the ones a fresh request for that
+shorter conversation produces. A model whose layers other nodes hold (see
+**The `[workers]` section**) does not shift during a reply, and ends it at the
+window as usual.
+
+**Across turns, reuse is automatic.** Steps have a fixed size, so where the cuts
+fall depends only on the window and on how long the conversation is. When a
+client sends the whole conversation again next turn, the same cut is made, the
+trimmed prompt begins with what the previous turn left in the cache, and only the
+new tokens are read. There is nothing to turn on. The exception is a turn that
+adds enough to pass the next step: it cuts again, and everything after that cut
+is read afresh. A larger `context_shift_drop` makes those turns rarer and each of
+them drop more.
+
+Reuse only ever takes rows computed from exactly the same tokens in the same
+order. A client that shortens its own history produces a different sequence, and
+the part after its change is read afresh. Rows after a dropped stretch were
+computed while the model could see that stretch, so splicing them onto a shorter
+conversation would give answers that differ from a fresh read, and the server
+does not do it.
+
+A reply reports what was dropped, as `context_dropped_tokens` in `usage` and
+`timings`, and the log has a line for each shift. `prompt_tokens` counts what was
+left of the prompt after the cut, and the two together are what the client sent.
 
 ### Speculative decoding (`draft_model`)
 
@@ -4672,7 +4760,9 @@ not have `web` enabled at all.
 ```sh
 orangu-server prune            # list sessions, pick one (or 'all') interactively
 orangu-server prune all        # delete every non-active session
-orangu-server prune <uuid>     # a specific session, by NR or full id
+orangu-server prune 3          # NR from prune's own listing
+orangu-server prune <uuid>     # a specific session id
+orangu-server prune all -y     # skip the confirmation prompt
 ```
 
 `prune` deletes chat sessions from `~/.orangu/server/sessions/`. Needs no
@@ -4687,10 +4777,12 @@ session-liveness because a slot file is named by the _client's_ session id,
 which the server can't cross-reference. With no argument, it lists
 the rest as a numbered table, newest first, and prompts for an `NR` or
 `all`; `all` deletes every remaining session except **active** ones —
-sessions a currently-running `orangu-server` is still using, checked live
-against the process table each time `prune` runs, not a snapshot from
-startup. Naming an active session explicitly refuses rather than deleting
-it. `-y`/`--yes` skips the confirmation prompt, the same flag `delete` uses.
+sessions a currently-running `orangu-server` is still using. Each session
+directory holds a `session.json` naming the process that last touched it, and
+a session is active when that process is still running, checked by pid _and_
+start time so that a reused pid does not count. The check runs against the
+process table each time `prune` runs, not from a snapshot taken at startup.
+Naming an active session explicitly refuses rather than deleting it. `-y`/`--yes` skips the confirmation prompt, the same flag `delete` uses.
 
 ## Shutting it down
 
@@ -4712,9 +4804,10 @@ Every generation endpoint reports what the request cost — `usage` in OpenAI's
 shape, `timings` and `prompt_progress` in the ecosystem's — so a client never
 has to infer it from its own wall clock, which cannot separate prompt
 processing from generation, nor a cache hit from real work. Those objects,
-and the request fields that shape a turn (`cache_prompt`, `id_slot`,
-`timings_per_token`, `return_progress`, `response_format`, `tools`), are
-documented in the _HTTP endpoints_ chapter.
+and the request fields that shape a turn (`stop`, `n`, `logprobs`, `logit_bias`,
+`cache_prompt`, `id_slot`, `timings_per_token`, `return_progress`,
+`response_format`, `tools`, `tool_choice`), are documented in the _HTTP
+endpoints_ chapter, which is the one place each is described.
 
 ## Endpoint reference
 
@@ -4727,7 +4820,7 @@ that apply to all of them.
 ## Scope
 
 Text-in/text-out GGUF chat, completion, and embedding models — and one
-text-to-image model, one text-to-video model and one text-to-speech model — for twenty-three
+text-to-image model, one text-to-video model and one text-to-speech model — for twenty-four
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
 _text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way; and
@@ -5001,8 +5094,8 @@ Kimi-Linear factors the same gate into two matrices. The delta-net state is
 what dominates memory: a fixed `kda.head_dim`-squared matrix per head per
 recurrent layer, about 440 MiB per sequence for Kimi-K3, allocated up front
 and independent of context length. The multimodal projector these repos ship
-alongside the text weights (`mmproj-*.gguf`) is not used; multimodal input is
-out of scope for every architecture here.
+alongside the text weights (`mmproj-*.gguf`) is not used: gemma-4 is the only
+family here that reads pictures.
 
 GLM with DeepSeek sparse attention (`glm-dsa`) runs on the CPU path only.
 Its block shape is an ordinary pre-norm transformer, and its FFN is the same
@@ -5184,8 +5277,8 @@ sliding-window layers only**: the full-attention quarter rotates nothing,
 and nothing in the file says so. Its output logits are scaled
 (`logit_scale`) and then soft-capped (`final_logit_softcapping`), and its
 token embeddings are normalized on the way in. The multimodal projector
-shipped beside the text weights (`mmproj-*.gguf`) is not used, as for
-every architecture here.
+shipped beside the text weights (`mmproj-*.gguf`) is not used: gemma-4 is the
+only family here that reads pictures.
 
 This model's prompt format is worth knowing about, because an assistant
 turn is several _messages_ rather than one. The chat template ends the
@@ -5287,7 +5380,7 @@ Its vocabulary is padded — `inkling.unpadded_vocab_size` names how many of
 its rows are real tokens — and the padding rows are masked out of the
 logits, since one of them can otherwise win an argmax and decode to
 nothing. The audio and image inputs the model was trained for are out of
-scope, as multimodal input is for every architecture here: the
+scope, as they are for every architecture but gemma-4: the
 `mmproj-*.gguf` shipped beside the text weights is a separate model this
 server does not load, and the audio embedding table is not part of the text
 GGUF at all.
@@ -5487,8 +5580,9 @@ grow into, so a build without them rejects such a file rather than
 misreading it; `list` prints anything in that gap as `reserved(N)` for the
 same reason.
 
-Not yet built, and out of scope for now: multimodal input, `/infill`,
-`/rerank`, LoRA hot-swap, and slot save/restore.
+Not yet built, and out of scope for now: `/rerank`, LoRA for language models,
+and audio input. Pictures reach a gemma-4 model through `image_url` parts, and
+slots are saved and restored with `POST /slots/{id}?action=save|restore`.
 
 See the Developer information chapter for how the GPU backends, request
 scheduler, model forward passes, and GGUF inventory tooling work

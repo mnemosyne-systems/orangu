@@ -59,6 +59,7 @@ mod interference;
 mod kl;
 mod moe;
 mod points;
+mod score;
 mod tuning_profile;
 use orangu::profiling::profile;
 mod report;
@@ -249,6 +250,34 @@ struct Args {
     /// The text `--kl` runs. Default: the chat fixture's system prompt and turns.
     #[arg(long, value_name = "PATH")]
     kl_text: Option<PathBuf>,
+
+    /// Perplexity mode: score this text file through `/logits`.
+    #[arg(long, value_name = "PATH")]
+    perplexity: Option<PathBuf>,
+
+    /// Tokens in each `--perplexity` window.
+    #[arg(long, default_value_t = 512, value_name = "N")]
+    ppl_ctx: usize,
+
+    /// Windows `--perplexity` runs. Default: all of the file.
+    #[arg(long, value_name = "N")]
+    ppl_chunks: Option<usize>,
+
+    /// HellaSwag mode: score this six-lines-a-task file through `/logits`.
+    #[arg(long, value_name = "PATH")]
+    hellaswag: Option<PathBuf>,
+
+    /// WinoGrande mode: score this CSV file through `/logits`.
+    #[arg(long, value_name = "PATH")]
+    winogrande: Option<PathBuf>,
+
+    /// Tasks `--hellaswag` and `--winogrande` run. Default: all of the file.
+    #[arg(long, value_name = "N")]
+    score_tasks: Option<usize>,
+
+    /// Positions a pass for the scoring modes: 1 runs decode steps, more runs verify passes.
+    #[arg(long, default_value_t = 1, value_name = "N")]
+    score_rows: usize,
 
     /// Curve mode: one generation of this many tokens, bucketed by context; 0 disables.
     #[arg(long, default_value_t = 0, value_name = "N")]
@@ -2007,7 +2036,14 @@ fn workload_detail(args: &Args) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let points = if let Some(path) = &args.kl {
+    let points = if let Some(path) = args
+        .perplexity
+        .as_ref()
+        .or(args.hellaswag.as_ref())
+        .or(args.winogrande.as_ref())
+    {
+        format!("scoring {}, {} a pass", path.display(), args.score_rows)
+    } else if let Some(path) = &args.kl {
         format!(
             "{} teacher-forced tokens, {} a pass, against {}",
             args.kl_tokens,
@@ -3168,6 +3204,15 @@ fn measure(
 
     if let Some(path) = &args.kl {
         return kl::run_kl(client, args, path, label);
+    }
+    if let Some(path) = &args.perplexity {
+        return score::run_perplexity(client, args, path, label);
+    }
+    if let Some(path) = &args.hellaswag {
+        return score::run_hellaswag(client, args, path, label);
+    }
+    if let Some(path) = &args.winogrande {
+        return score::run_winogrande(client, args, path, label);
     }
 
     if args.chat > 0 {
@@ -4342,6 +4387,12 @@ fn workload_name(args: &Args) -> String {
         )
     } else if !args.embed.is_empty() {
         format!("embeddings {}", list(&args.embed))
+    } else if args.perplexity.is_some() {
+        format!("perplexity window {}", args.ppl_ctx)
+    } else if args.hellaswag.is_some() {
+        "hellaswag".to_string()
+    } else if args.winogrande.is_some() {
+        "winogrande".to_string()
     } else if args.kl.is_some() {
         format!("kl {} tokens rows {}", args.kl_tokens, args.kl_rows)
     } else if args.chat > 0 {

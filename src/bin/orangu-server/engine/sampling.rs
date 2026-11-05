@@ -28,9 +28,17 @@ pub struct SamplingParams {
     /// [`Self::repeat_last_n`]. **`1.0` — off — by default**, matching the
     /// reference implementation; see [`Default`].
     pub repeat_penalty: f32,
-    /// How many of the most recent generated tokens the repeat penalty
-    /// looks at.
+    /// How many of the most recent tokens the penalties look at.
     pub repeat_last_n: usize,
+    /// Subtracted from the logit of any token seen in the last
+    /// [`Self::repeat_last_n`] tokens, however often. `0.0` is off; a negative
+    /// value favours what was already said.
+    pub presence_penalty: f32,
+    /// Subtracted from the logit of a token once per time it occurs in the
+    /// last [`Self::repeat_last_n`] tokens. `0.0` is off.
+    pub frequency_penalty: f32,
+    /// Added to a token's logit before anything else looks at it.
+    pub logit_bias: Vec<(u32, f32)>,
     pub seed: u64,
 }
 
@@ -67,6 +75,9 @@ impl Default for SamplingParams {
             min_p: 0.05,
             repeat_penalty: 1.0,
             repeat_last_n: 64,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            logit_bias: Vec::new(),
             seed: 0,
         }
     }
@@ -104,6 +115,8 @@ enum Grammar {
     Json(crate::engine::constraint::JsonPrefix),
     /// A document a JSON Schema describes.
     Schema(Box<crate::engine::json_schema::SchemaPrefix>),
+    /// The start of a reply, held to one of a fixed set of strings.
+    OneOf(crate::engine::constraint::OneOfPrefix),
 }
 
 impl Grammar {
@@ -111,6 +124,7 @@ impl Grammar {
         match self {
             Self::Json(g) => g.is_complete(),
             Self::Schema(g) => g.is_complete(),
+            Self::OneOf(g) => g.is_complete(),
         }
     }
 
@@ -118,6 +132,7 @@ impl Grammar {
         match self {
             Self::Json(g) => g.allows(bytes),
             Self::Schema(g) => g.allows(bytes),
+            Self::OneOf(g) => g.allows(bytes),
         }
     }
 
@@ -125,6 +140,7 @@ impl Grammar {
         match self {
             Self::Json(g) => g.push_bytes(bytes),
             Self::Schema(g) => g.push_bytes(bytes),
+            Self::OneOf(g) => g.push_bytes(bytes),
         }
     }
 }
@@ -162,6 +178,25 @@ impl Constraint {
             token_bytes,
             stop_ids,
         }
+    }
+
+    /// Holds the start of the reply to one of `candidates`, and lets go after
+    /// it: the rest of the reply is the model's own.
+    pub fn one_of(
+        candidates: Vec<Vec<u8>>,
+        token_bytes: std::sync::Arc<Vec<Vec<u8>>>,
+        stop_ids: Vec<u32>,
+    ) -> Self {
+        Self {
+            grammar: Grammar::OneOf(crate::engine::constraint::OneOfPrefix::new(candidates)),
+            token_bytes,
+            stop_ids,
+        }
+    }
+
+    /// Whether this constraint has nothing left to hold.
+    fn is_released(&self) -> bool {
+        matches!(&self.grammar, Grammar::OneOf(g) if g.is_finished())
     }
 
     /// Whether this token may be sampled next.
@@ -211,6 +246,50 @@ impl Constraint {
     }
 }
 
+/// The model's own distribution at one generated position, in log
+/// probabilities: what `logprobs` reports.
+///
+/// Taken over the whole vocabulary from the logits as the model wrote them,
+/// before temperature, penalties, bias and truncation: those decide what gets
+/// picked, and a figure that moved with them could not be compared across
+/// requests.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TokenLogprob {
+    pub id: u32,
+    pub logprob: f32,
+    /// The most likely tokens at this position, most likely first.
+    pub top: Vec<(u32, f32)>,
+}
+
+impl TokenLogprob {
+    fn from_logits(logits: &[f32], id: u32, top: usize) -> Self {
+        let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let norm = logits.iter().map(|v| (v - max).exp()).sum::<f32>().ln();
+        let logprob_of = |v: f32| v - max - norm;
+        let mut best: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i as u32, v))
+            .collect();
+        let top = top.min(best.len());
+        if top > 0 && top < best.len() {
+            best.select_nth_unstable_by(top - 1, |a, b| b.1.total_cmp(&a.1));
+        }
+        best.truncate(top);
+        best.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (_, v) in best.iter_mut() {
+            *v = logprob_of(*v);
+        }
+        Self {
+            id,
+            logprob: logits
+                .get(id as usize)
+                .map_or(f32::NEG_INFINITY, |&v| logprob_of(v)),
+            top: best,
+        }
+    }
+}
+
 pub struct Sampler {
     params: SamplingParams,
     /// `None` for an unconstrained request, which is every request that did
@@ -219,6 +298,13 @@ pub struct Sampler {
     /// The token the next pick is, whatever the logits say — see
     /// [`Self::force`].
     forced: Option<u32>,
+    /// How many alternatives a recorded [`TokenLogprob`] lists; `None` when
+    /// the request did not ask for any.
+    logprobs: Option<usize>,
+    /// The picks made and not yet claimed by [`Self::take_logprob`]. A pick
+    /// comes ahead of the token's turn to be emitted, by several tokens when a
+    /// speculative step verifies a draft.
+    recorded: std::collections::VecDeque<TokenLogprob>,
 }
 
 impl Sampler {
@@ -227,12 +313,31 @@ impl Sampler {
             params,
             constraint: None,
             forced: None,
+            logprobs: None,
+            recorded: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Records each pick's [`TokenLogprob`], listing `top` alternatives.
+    pub fn with_logprobs(mut self, top: usize) -> Self {
+        self.logprobs = Some(top);
+        self
+    }
+
+    /// The record of the pick that chose `id`, when it is next in line. A token
+    /// no pick chose has none: [`Self::force`] writes one without looking at
+    /// the logits.
+    pub fn take_logprob(&mut self, id: u32) -> Option<TokenLogprob> {
+        if self.recorded.front()?.id == id {
+            self.recorded.pop_front()
+        } else {
+            None
         }
     }
 
     /// Makes `token` the next pick, once — how a reasoning budget closes
     /// the reasoning. The steps until then sample here rather than on the
-    /// device, as [`Self::is_constrained`] says.
+    /// device, as [`Self::needs_host_logits`] says.
     pub fn force(&mut self, token: u32) {
         self.forced = Some(token);
     }
@@ -243,11 +348,17 @@ impl Sampler {
         self
     }
 
-    /// Whether a constraint is in force — the decode loop's cue that its GPU
-    /// argmax fast path cannot be used, since that samples without ever
-    /// consulting the mask.
-    pub fn is_constrained(&self) -> bool {
-        self.constraint.is_some() || self.forced.is_some()
+    /// Whether a pick needs every logit on the host — the decode loop's cue
+    /// that its GPU fast paths cannot be used, since they know the repeat
+    /// penalty and `top_k` and nothing else: not a grammar's mask, a forced
+    /// token, a bias, the other two penalties, or what `logprobs` reports.
+    pub fn needs_host_logits(&self) -> bool {
+        self.constraint.is_some()
+            || self.forced.is_some()
+            || self.logprobs.is_some()
+            || !self.params.logit_bias.is_empty()
+            || self.params.presence_penalty != 0.0
+            || self.params.frequency_penalty != 0.0
     }
 
     /// `true` iff `sample` would take its argmax fast path (`temperature
@@ -281,15 +392,30 @@ impl Sampler {
             return id;
         }
         let id = self.pick(logits, recent_tokens, pos);
-        if let Some(constraint) = self.constraint.as_mut() {
-            constraint.accept(id);
+        self.accept_into_constraint(id);
+        if let Some(top) = self.logprobs {
+            self.recorded
+                .push_back(TokenLogprob::from_logits(logits, id, top));
         }
         id
     }
 
+    /// Commits a chosen token to the constraint, and drops one that has let
+    /// go, so that the steps after it can use the device's fast paths again.
+    fn accept_into_constraint(&mut self, id: u32) {
+        if let Some(constraint) = self.constraint.as_mut() {
+            constraint.accept(id);
+            if constraint.is_released() {
+                self.constraint = None;
+            }
+        }
+    }
+
     fn pick(&mut self, logits: &[f32], recent_tokens: &[u32], pos: usize) -> u32 {
         let mut logits: Vec<f32> = logits.to_vec();
+        apply_logit_bias(&mut logits, &self.params.logit_bias);
         apply_repeat_penalty(&mut logits, recent_tokens, &self.params);
+        apply_occurrence_penalties(&mut logits, recent_tokens, &self.params);
 
         if self.params.temperature <= 0.0 {
             return match &self.constraint {
@@ -376,8 +502,8 @@ impl Sampler {
 
     /// How many candidates the device may pre-select for this sampler — its
     /// `top_k` when the whole pick can be made from those alone, `0` when
-    /// it cannot (greedy, no `top_k`, a `top_k` past the device's cap, or a
-    /// grammar, whose fallback needs the whole vocabulary). See
+    /// it cannot (greedy, no `top_k`, a `top_k` past the device's cap, or
+    /// [`Self::needs_host_logits`]). See
     /// [`Self::sample_from_candidates`].
     pub fn device_top_k(&self) -> u32 {
         const CAP: usize = 64;
@@ -387,7 +513,7 @@ impl Sampler {
         if *OFF.get_or_init(|| crate::engine::env::flag_on("ORANGU_NO_DEVICE_TOPK")) {
             return 0;
         }
-        if self.is_greedy() || self.constraint.is_some() {
+        if self.is_greedy() || self.needs_host_logits() {
             return 0;
         }
         let k = self.params.top_k;
@@ -414,9 +540,7 @@ impl Sampler {
         apply_top_p(&mut candidates, self.params.top_p);
         apply_min_p(&mut candidates, self.params.min_p);
         let id = self.draw(&candidates, pos);
-        if let Some(constraint) = self.constraint.as_mut() {
-            constraint.accept(id);
-        }
+        self.accept_into_constraint(id);
         id
     }
 }
@@ -487,6 +611,37 @@ fn apply_repeat_penalty(logits: &mut [f32], recent_tokens: &[u32], params: &Samp
             } else {
                 *v * params.repeat_penalty
             };
+        }
+    }
+}
+
+/// Adds each token's bias to its logit. An id past the vocabulary is refused
+/// where the request is read; one that reaches here does nothing.
+fn apply_logit_bias(logits: &mut [f32], bias: &[(u32, f32)]) {
+    for &(id, value) in bias {
+        if let Some(v) = logits.get_mut(id as usize) {
+            *v += value;
+        }
+    }
+}
+
+/// `presence_penalty` and `frequency_penalty`, over the same window as the
+/// repeat penalty. Unlike it they subtract, so they treat a token the same
+/// whichever side of zero its logit is on.
+fn apply_occurrence_penalties(logits: &mut [f32], recent_tokens: &[u32], params: &SamplingParams) {
+    if (params.presence_penalty == 0.0 && params.frequency_penalty == 0.0)
+        || recent_tokens.is_empty()
+    {
+        return;
+    }
+    let start = recent_tokens.len().saturating_sub(params.repeat_last_n);
+    let mut counts: rustc_hash::FxHashMap<u32, u32> = rustc_hash::FxHashMap::default();
+    for &tok in &recent_tokens[start..] {
+        *counts.entry(tok).or_default() += 1;
+    }
+    for (tok, count) in counts {
+        if let Some(v) = logits.get_mut(tok as usize) {
+            *v -= params.presence_penalty + params.frequency_penalty * count as f32;
         }
     }
 }
@@ -685,6 +840,138 @@ mod tests {
         assert!(draws.iter().all(|&d| (0.0..1.0).contains(&d)));
     }
 
+    fn greedy() -> SamplingParams {
+        SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn presence_penalty_counts_a_token_once_and_frequency_per_occurrence() {
+        let params = |presence_penalty, frequency_penalty| SamplingParams {
+            presence_penalty,
+            frequency_penalty,
+            ..greedy()
+        };
+        let recent = [0, 0, 0, 1];
+        let mut logits = vec![10.0, 10.0, 8.0];
+        apply_occurrence_penalties(&mut logits, &recent, &params(1.0, 0.0));
+        assert_eq!(logits, [9.0, 9.0, 8.0]);
+        let mut logits = vec![10.0, 10.0, 8.0];
+        apply_occurrence_penalties(&mut logits, &recent, &params(0.0, 1.0));
+        assert_eq!(logits, [7.0, 9.0, 8.0]);
+        // A negative penalty favours what was said.
+        let mut sampler = Sampler::new(params(-2.0, 0.0));
+        assert_eq!(sampler.sample(&[1.0, 2.0, 0.0], &[0], 1), 0);
+    }
+
+    /// A penalty looks at the repeat window and not at the whole history.
+    #[test]
+    fn occurrence_penalties_stop_at_the_repeat_window() {
+        let params = SamplingParams {
+            frequency_penalty: 1.0,
+            repeat_last_n: 2,
+            ..greedy()
+        };
+        let mut logits = vec![5.0, 5.0];
+        apply_occurrence_penalties(&mut logits, &[0, 0, 0, 1, 1], &params);
+        assert_eq!(logits, [5.0, 3.0]);
+    }
+
+    /// A bias decides the pick before temperature, on both paths.
+    #[test]
+    fn logit_bias_can_ban_a_token_and_can_force_one() {
+        let logits = [5.0, 1.0, 0.0];
+        for temperature in [0.0, 0.8] {
+            let bias = |logit_bias| SamplingParams {
+                temperature,
+                logit_bias,
+                ..Default::default()
+            };
+            let mut banned = Sampler::new(bias(vec![(0, -100.0), (2, -100.0)]));
+            assert_eq!(banned.sample(&logits, &[], 0), 1);
+            let mut forced = Sampler::new(bias(vec![(2, 100.0)]));
+            assert_eq!(forced.sample(&logits, &[], 0), 2);
+        }
+        // An id past the vocabulary is nothing, not a panic.
+        let mut outside = Sampler::new(SamplingParams {
+            logit_bias: vec![(99, 100.0)],
+            ..greedy()
+        });
+        assert_eq!(outside.sample(&logits, &[], 0), 0);
+    }
+
+    /// What the device cannot do must keep the pick on the host: a greedy
+    /// device argmax would otherwise answer without any of it.
+    #[test]
+    fn what_only_the_host_can_do_takes_the_device_paths_away() {
+        let top_k = SamplingParams::default();
+        assert!(!Sampler::new(top_k.clone()).needs_host_logits());
+        assert!(Sampler::new(top_k.clone()).device_top_k() > 0);
+        for params in [
+            SamplingParams {
+                presence_penalty: 0.5,
+                ..top_k.clone()
+            },
+            SamplingParams {
+                frequency_penalty: 0.5,
+                ..top_k.clone()
+            },
+            SamplingParams {
+                logit_bias: vec![(0, 1.0)],
+                ..top_k.clone()
+            },
+        ] {
+            let sampler = Sampler::new(params);
+            assert!(sampler.needs_host_logits());
+            assert_eq!(sampler.device_top_k(), 0);
+        }
+        let asked = Sampler::new(top_k).with_logprobs(0);
+        assert!(asked.needs_host_logits());
+        assert_eq!(asked.device_top_k(), 0);
+    }
+
+    /// The figures are the model's: temperature and bias move the pick, never
+    /// what is reported about it.
+    #[test]
+    fn logprobs_report_the_models_own_distribution() {
+        let logits = [2.0f32, 1.0, 0.0, -1.0];
+        let mut sampler = Sampler::new(SamplingParams {
+            logit_bias: vec![(2, 100.0)],
+            ..greedy()
+        })
+        .with_logprobs(2);
+        assert_eq!(sampler.sample(&logits, &[], 0), 2);
+        let record = sampler.take_logprob(2).expect("recorded");
+
+        let exp: Vec<f32> = logits.iter().map(|v| v.exp()).collect();
+        let sum: f32 = exp.iter().sum();
+        assert!((record.logprob - (exp[2] / sum).ln()).abs() < 1e-5);
+        assert_eq!(record.id, 2);
+        assert_eq!(record.top.len(), 2);
+        assert_eq!(record.top[0].0, 0, "most likely first");
+        assert_eq!(record.top[1].0, 1);
+        assert!((record.top[0].1 - (exp[0] / sum).ln()).abs() < 1e-5);
+        assert!(sampler.take_logprob(2).is_none(), "claimed once");
+    }
+
+    /// Picks made ahead of their turn, as a verified draft makes them, are
+    /// claimed in order; a token no pick chose has no record and takes nobody
+    /// else's.
+    #[test]
+    fn logprob_records_are_claimed_in_the_order_they_were_picked() {
+        let mut sampler = Sampler::new(greedy()).with_logprobs(0);
+        assert_eq!(sampler.sample(&[1.0, 2.0], &[], 0), 1);
+        assert_eq!(sampler.sample(&[2.0, 1.0], &[], 1), 0);
+        assert!(sampler.take_logprob(7).is_none());
+        assert_eq!(sampler.take_logprob(1).map(|r| r.id), Some(1));
+        sampler.force(5);
+        assert_eq!(sampler.sample(&[1.0, 2.0], &[], 2), 5);
+        assert!(sampler.take_logprob(5).is_none());
+        assert_eq!(sampler.take_logprob(0).map(|r| r.id), Some(0));
+    }
+
     #[test]
     fn top_p_keeps_at_least_one_candidate() {
         let mut candidates = vec![(0u32, 0.9f32), (1, 0.05), (2, 0.05)];
@@ -713,6 +1000,64 @@ mod constraint_tests {
         ])
     }
     const EOS: u32 = 99;
+
+    fn tool_name_sampler(temperature: f32) -> Sampler {
+        let names = vec![b"ab\"".to_vec(), b"abc\"".to_vec()];
+        let table = Arc::new(vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec(),
+            b"\"".to_vec(),
+            b"zz".to_vec(),
+            b"bc\",".to_vec(),
+            Vec::new(),
+        ]);
+        let params = SamplingParams {
+            temperature,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            ..Default::default()
+        };
+        Sampler::new(params).with_constraint(Constraint::one_of(names, table, vec![6]))
+    }
+
+    /// The model wants the undeclared token, then to stop, then something
+    /// else again; only a declared name can come out, and what follows it is
+    /// the model's own, with the device's fast paths available again.
+    #[test]
+    fn a_tool_name_comes_out_declared_and_then_the_constraint_lets_go() {
+        for temperature in [0.0, 0.7] {
+            let mut sampler = tool_name_sampler(temperature);
+            assert!(sampler.needs_host_logits());
+            let prefers = |wanted: usize, second: usize| {
+                let mut logits = vec![-50.0_f32; 7];
+                logits[wanted] = 50.0;
+                logits[second] = 40.0;
+                logits
+            };
+            assert_eq!(sampler.sample(&prefers(4, 0), &[], 0), 0);
+            assert!(sampler.needs_host_logits());
+            assert_eq!(sampler.sample(&prefers(6, 1), &[], 1), 1);
+            assert_eq!(sampler.sample(&prefers(4, 3), &[], 2), 3);
+            assert!(!sampler.needs_host_logits());
+            assert_eq!(sampler.sample(&prefers(4, 0), &[], 3), 4);
+        }
+    }
+
+    /// One token can hold a name's last letters and what comes after them.
+    #[test]
+    fn a_token_may_run_past_the_end_of_a_tool_name() {
+        let mut sampler = tool_name_sampler(0.0);
+        let mut logits = vec![-50.0_f32; 7];
+        logits[0] = 1.0;
+        assert_eq!(sampler.sample(&logits, &[], 0), 0);
+        let mut logits = vec![-50.0_f32; 7];
+        logits[5] = 1.0;
+        assert_eq!(sampler.sample(&logits, &[], 1), 5);
+        assert!(!sampler.needs_host_logits());
+    }
 
     fn json_constraint() -> Constraint {
         Constraint::json(vocab(), vec![EOS])

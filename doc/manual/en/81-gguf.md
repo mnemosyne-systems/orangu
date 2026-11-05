@@ -135,7 +135,8 @@ only do if no earlier position ever saw a later one.
 The vocabulary is trained with the *same* pre-tokenizer split that a reader
 applies. `SPLIT_PATTERN` in `vocab.rs` is the generic pattern, and the file
 declares `tokenizer.ggml.pre = "gpt-2"`, which is what the reader resolves
-to that pattern.
+to that pattern. Both also leave the last character of a whitespace run for
+the word after it, so an indented line's word takes a space with it.
 
 Getting this wrong does not fail loudly. It produces merges that the
 encoder can never reproduce, so every prompt tokenizes into sequences the

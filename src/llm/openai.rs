@@ -438,22 +438,26 @@ fn finalize_stream_response(
     content: String,
     tool_calls: Vec<PartialToolCall>,
 ) -> Result<LlmResponse> {
-    if !tool_calls.is_empty() {
-        let mapped_calls = tool_calls
-            .into_iter()
-            .map(|tc| {
-                let arguments = parse_tool_arguments(&tc.arguments)?;
-                let name = tc.name;
-                Ok(ToolCall {
-                    id: tc.id.unwrap_or_else(|| format!("call_{name}")),
-                    tool_type: tc.tool_type.unwrap_or_else(|| "function".to_string()),
-                    function: ToolCallFunction { name, arguments },
-                })
+    // A call whose arguments are not whole JSON was cut off while it was being
+    // written: by the response cap, or by a span the server could not read. It
+    // is never run, so half a file is never written; the reply's text stands
+    // instead, and the cap reaches the user as `StreamMetrics::truncated`.
+    let mapped_calls: Vec<ToolCall> = tool_calls
+        .into_iter()
+        .filter_map(|tc| {
+            let arguments = parse_tool_arguments(&tc.arguments).ok()?;
+            let name = tc.name;
+            Some(ToolCall {
+                id: tc.id.unwrap_or_else(|| format!("call_{name}")),
+                tool_type: tc.tool_type.unwrap_or_else(|| "function".to_string()),
+                function: ToolCallFunction { name, arguments },
             })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(LlmResponse::ToolCalls(mapped_calls))
-    } else {
+        })
+        .collect();
+    if mapped_calls.is_empty() {
         Ok(LlmResponse::Text(content))
+    } else {
+        Ok(LlmResponse::ToolCalls(mapped_calls))
     }
 }
 
@@ -468,6 +472,45 @@ fn parse_tool_arguments(arguments: &str) -> Result<HashMap<String, serde_json::V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn partial(name: &str, arguments: &str) -> PartialToolCall {
+        PartialToolCall {
+            id: Some(format!("id-{name}")),
+            tool_type: None,
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        }
+    }
+
+    /// A call cut off while it was being written must not run: run with what
+    /// arrived, it would write half a file. The text is the reply.
+    #[test]
+    fn a_tool_call_cut_off_in_its_arguments_is_not_run() {
+        let response = finalize_stream_response(
+            "text".to_string(),
+            vec![partial("create_file", "{\"content\":\"fn main() {")],
+        )
+        .expect("not an error");
+        assert!(matches!(response, LlmResponse::Text(text) if text == "text"));
+    }
+
+    /// A finished call beside it still runs.
+    #[test]
+    fn a_finished_tool_call_beside_a_cut_off_one_still_runs() {
+        let response = finalize_stream_response(
+            String::new(),
+            vec![
+                partial("read_file", "{\"path\":\"a\"}"),
+                partial("create_file", "{\"content\":\"x"),
+            ],
+        )
+        .expect("not an error");
+        let LlmResponse::ToolCalls(calls) = response else {
+            panic!("expected the finished call");
+        };
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+    }
 
     #[test]
     fn stream_event_appends_text_deltas() {

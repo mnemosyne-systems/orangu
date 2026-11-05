@@ -24,6 +24,7 @@ form (`commit "..."`, `push`) works just as well.
 | `add a retry to the HTTP client` | Just ask. Tab completes paths, and `#` starts a line that stays local. |
 | `/debugging <what to reproduce>` | Run a skill from `~/.orangu/skills/`. `/skills` lists them. |
 | `/graph` `/search <meaning>` | Knowledge graph of the codebase; semantic search by meaning, not by string. |
+| `/infill <file>:<line>[:<column>]` | What the model would write at that place in the file; changes nothing. |
 | `/duplicates` | Structurally similar functions across 20+ languages, entirely local. |
 | `/build` `/shell cargo test` | Build with the detected toolchain; run anything inside the workspace. |
 | `AGENTS.md` `SKILL.md` | Workspace memory and reusable skills, merged into the model's context. |

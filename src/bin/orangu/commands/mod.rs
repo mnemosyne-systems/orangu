@@ -570,6 +570,7 @@ pub enum LocalCommand<'a> {
     SetVerbosity(&'a str),
     Diff(Option<Cow<'a, str>>),
     Grep(Option<Cow<'a, str>>),
+    Infill(Option<Cow<'a, str>>),
     Search(Option<Cow<'a, str>>),
     Review,
     /// `/auto_review [<file>|all] [immediate] [deep]`: the review target (the

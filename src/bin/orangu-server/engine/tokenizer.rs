@@ -49,11 +49,10 @@
 //!   unbroken run, letting `▁`-marked vocab tokens define word boundaries
 //!   implicitly instead of a regex splitting them first.
 //!
-//! Not implemented: per-architecture pre-tokenizer regex variants beyond
-//! gpt2/gemma4 (`tokenizer.ggml.pre`, e.g. `"llama3"` vs `"deepseek-
-//! coder"` split text slightly differently around digits/whitespace). One
-//! reasonable default pre-tokenizer regex (close to GPT-2's own) is used
-//! for every `"gpt2"`-model vocab.
+//! A `"gpt2"`-model vocab splits text into words before merging them. How is
+//! a property of `tokenizer.ggml.pre`: see [`split_pattern_for_pre`] for the
+//! patterns and [`WordSplitter`] for how they run. A `pre` value not listed
+//! there takes the generic pattern.
 
 use anyhow::{Context, Result, anyhow};
 use orangu::gguf::{GgufFile, GgufValue};
@@ -71,12 +70,8 @@ const NO_TOKEN: u32 = u32::MAX;
 /// GPT-2's own pre-tokenizer split pattern: contractions, then runs of
 /// letters/digits/other-non-space (each optionally preceded by one space,
 /// so the space stays attached to what follows), then any remaining
-/// whitespace. GPT-2's original pattern distinguishes trailing whitespace
-/// via a negative lookahead (`\s+(?!\S)`); the `regex` crate doesn't support
-/// look-around, so that distinction is dropped here — the only observable
-/// difference is how a run of 2+ consecutive spaces before a word splits
-/// (bundled as one whitespace token here, rather than keeping the last
-/// space attached to the following word).
+/// whitespace. Its `\s+` stands for upstream's `\s+(?!\S)|\s+`: see
+/// [`WordSplitter`] for the look-ahead this crate cannot compile.
 const SPLIT_PATTERN: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+";
 
 /// Llama 3's pre-tokenizer (`tokenizer.ggml.pre` = `llama3`/`llama-bpe`/…),
@@ -94,11 +89,6 @@ const SPLIT_PATTERN: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p
 /// turn, and the 1B/3B Instruct models answered "What is the capital of
 /// France?" by echoing dates back (`"The 2021\nThe\nThe"`) instead of
 /// answering.
-///
-/// As with [`SPLIT_PATTERN`], upstream's trailing-whitespace alternative
-/// `\s+(?!\S)` is dropped — the `regex` crate has no look-around — leaving
-/// the same minor difference in how a run of 2+ spaces before a word
-/// splits.
 const SPLIT_PATTERN_LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
 
 /// GPT-4o's pre-tokenizer (`tokenizer.ggml.pre` = `gpt-4o`, e.g.
@@ -171,10 +161,7 @@ fn right_aligned_digit_groups(run: &str) -> Vec<&str> {
 /// blank line between paragraphs is two pre-tokens here and one elsewhere.
 /// The contraction set is the usual seven, case-insensitively.
 ///
-/// As with the other patterns here, upstream's trailing-whitespace
-/// alternative `\s+(?!\S)` is dropped — the `regex` crate has no
-/// look-around — leaving the same minor difference in how a run of 2+
-/// spaces before a word splits. Upstream also sets `clean_spaces = false`,
+/// Upstream also sets `clean_spaces = false`,
 /// which needs no code here: that cleanup pass is `"gemma4"`-only in this
 /// module, so a `"gpt2"`-shaped vocab already skips it.
 const SPLIT_PATTERN_BAILINGMOE: &str = r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+";
@@ -183,14 +170,48 @@ const SPLIT_PATTERN_BAILINGMOE: &str = r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][e
 /// and `joyai-llm`, which DeepSeek-V4.1 ships), from upstream's
 /// `LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM` arm.
 ///
-/// Upstream runs three expressions in sequence — digit runs of up to
-/// three, then CJK runs, then the word/punctuation split — each re-splitting
-/// the pieces of the one before. One leftmost-first alternation does the
-/// same here: digits come first so no later alternative can start on one,
-/// and the letter class subtracts the CJK ranges so a Latin word never runs
-/// on into a CJK one. As elsewhere in this module the trailing-whitespace
-/// look-ahead `\s+(?!\S)` is dropped.
-const SPLIT_PATTERN_DEEPSEEK3: &str = r"\p{N}{1,3}|[一-龥぀-ゟ゠-ヿ]+|[!-/:-@\[-`{-~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}--[一-龥぀-ゟ゠-ヿ]]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+";
+/// Upstream runs three expressions in sequence, each re-splitting the pieces
+/// of the one before: [`DEEPSEEK3_STAGES`] and then this.
+const SPLIT_PATTERN_DEEPSEEK3: &str = r"[!-/:-@\[-`{-~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// What runs before [`SPLIT_PATTERN_DEEPSEEK3`]: digit runs of up to three,
+/// then CJK runs.
+const DEEPSEEK3_STAGES: &[&str] = &[r"\p{N}{1,3}", r"[一-龥぀-ゟ゠-ヿ]+"];
+
+/// The Qwen2 pre-tokenizer (`tokenizer.ggml.pre` = `qwen2`, which Qwen2.5 and
+/// Qwen3 ship), from upstream's `LLAMA_VOCAB_PRE_TYPE_QWEN2` arm: digits **one
+/// at a time**, and a line break stays on the punctuation before it.
+const SPLIT_PATTERN_QWEN2: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// `tokenizer.ggml.pre` values upstream routes to the Qwen2 split.
+const QWEN2_PRE_TYPES: &[&str] = &[
+    "qwen2",
+    "deepseek-r1-qwen",
+    "kormo",
+    "f2llmv2",
+    "stablelm2",
+    "hunyuan",
+    "megrez",
+    "solar-open",
+];
+
+/// The Qwen3.5 pre-tokenizer (`qwen35`, which Qwen3.5 and later ship):
+/// [`SPLIT_PATTERN_QWEN2`] with combining marks kept on their letters.
+const SPLIT_PATTERN_QWEN35: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// `tokenizer.ggml.pre` values upstream routes to the generic pattern with
+/// digits first split one at a time ([`DIGIT_AT_A_TIME_STAGES`]).
+const DIGIT_AT_A_TIME_PRE_TYPES: &[&str] = &[
+    "starcoder",
+    "refact",
+    "command-r",
+    "smollm",
+    "codeshell",
+    "exaone",
+    "minerva-7b",
+];
+
+const DIGIT_AT_A_TIME_STAGES: &[&str] = &[r"\p{N}"];
 
 /// `tokenizer.ggml.pre` values upstream routes to the DeepSeek-V3 split
 /// (its `deepseek-v3` and `joyai-llm` names). Neither sets `ignore_merges`.
@@ -296,7 +317,118 @@ fn split_pattern_for_pre(pre: &str) -> (&'static str, bool) {
     if DEEPSEEK3_PRE_TYPES.contains(&pre) {
         return (SPLIT_PATTERN_DEEPSEEK3, false);
     }
+    if QWEN2_PRE_TYPES.contains(&pre) {
+        return (SPLIT_PATTERN_QWEN2, false);
+    }
+    if pre == "qwen35" {
+        return (SPLIT_PATTERN_QWEN35, false);
+    }
     (SPLIT_PATTERN, false)
+}
+
+/// What a `tokenizer.ggml.pre` value runs before its split pattern.
+fn split_stages_for_pre(pre: &str) -> &'static [&'static str] {
+    if DEEPSEEK3_PRE_TYPES.contains(&pre) {
+        DEEPSEEK3_STAGES
+    } else if DIGIT_AT_A_TIME_PRE_TYPES.contains(&pre) {
+        DIGIT_AT_A_TIME_STAGES
+    } else {
+        &[]
+    }
+}
+
+/// One expression of a [`WordSplitter`].
+struct SplitStage {
+    re: Regex,
+    /// Whether the pattern has an alternative for whitespace up to a line
+    /// break (`\s*[\r\n]`), which then keeps what it matched.
+    has_line_break_run: bool,
+}
+
+/// Splits text into the words BPE merges.
+///
+/// The expressions run in order, each re-splitting the pieces of the one
+/// before, and text an expression does not match stays a piece of its own.
+///
+/// **The look-ahead.** Upstream's patterns end in `\s+(?!\S)|\s+`, which this
+/// crate cannot compile, so they end in `\s+` here and [`Self::word_end`] does
+/// the rest. It matters beyond runs of spaces: the rule leaves the last
+/// whitespace character for what follows it, so in `\n    x` the word `x` takes
+/// a space with it. That is most indented lines of code.
+struct WordSplitter {
+    stages: Vec<SplitStage>,
+}
+
+impl WordSplitter {
+    fn new(leading: &[&str], pattern: &str) -> Result<Self> {
+        let stages = leading
+            .iter()
+            .chain(std::iter::once(&pattern))
+            .map(|&expression| {
+                Ok(SplitStage {
+                    re: Regex::new(expression).context("building tokenizer split regex")?,
+                    has_line_break_run: expression.contains(r"\s*[\r\n]"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { stages })
+    }
+
+    fn split<'a>(&self, text: &'a str) -> Vec<&'a str> {
+        let mut pieces = vec![text];
+        for stage in &self.stages {
+            let mut split = Vec::with_capacity(pieces.len());
+            for piece in pieces {
+                stage.split_into(piece, &mut split);
+            }
+            pieces = split;
+        }
+        pieces
+    }
+}
+
+impl SplitStage {
+    fn split_into<'a>(&self, piece: &'a str, out: &mut Vec<&'a str>) {
+        let mut at = 0;
+        while at < piece.len() {
+            let Some(found) = self.re.find_at(piece, at) else {
+                out.push(&piece[at..]);
+                return;
+            };
+            if found.start() > at {
+                out.push(&piece[at..found.start()]);
+            }
+            let end = self.word_end(piece, found.start(), found.end());
+            out.push(&piece[found.start()..end]);
+            at = end;
+        }
+    }
+
+    /// Where a match really ends: `\s+(?!\S)` gives back the last character of
+    /// a whitespace run with something after it. Where nothing follows in this
+    /// piece, the run stays whole, as it does where the run is one character,
+    /// the alternative `\s+` taking it.
+    fn word_end(&self, piece: &str, start: usize, end: usize) -> usize {
+        let word = &piece[start..end];
+        let Some((last_at, last)) = word.char_indices().next_back() else {
+            // No expression here matches nothing, but a loop that did not
+            // advance would never end.
+            return piece[start..]
+                .chars()
+                .next()
+                .map_or(piece.len(), |c| start + c.len_utf8());
+        };
+        let followed = piece[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace());
+        let kept = self.has_line_break_run && matches!(last, '\r' | '\n');
+        if last_at > 0 && followed && !kept && word.chars().all(char::is_whitespace) {
+            start + last_at
+        } else {
+            end
+        }
+    }
 }
 
 /// The control token that opens a *reasoning* message body, for a
@@ -351,7 +483,7 @@ pub struct Tokenizer {
     merge_map: FxHashMap<(u32, u32), (u32, u32)>,
     byte_to_char: [char; 256],
     char_to_byte: FxHashMap<char, u8>,
-    split_re: Regex,
+    splitter: WordSplitter,
     /// Upstream's `vocab.get_ignore_merges()`: when a whole pre-tokenized
     /// word is *itself* a vocab token, emit it directly instead of running
     /// the merge loop over its bytes. Set for every `LLAMA3_PRE_TYPES`
@@ -379,6 +511,12 @@ pub struct Tokenizer {
     special_ids: FxHashSet<u32>,
     pub bos_token: Option<u32>,
     pub eos_token: Option<u32>,
+    fim_prefix: Option<u32>,
+    fim_suffix: Option<u32>,
+    fim_middle: Option<u32>,
+    fim_pad: Option<u32>,
+    fim_repo: Option<u32>,
+    fim_separator: Option<u32>,
     /// `tokenizer.ggml.eot_token_id` — the "end of turn" token, which for a
     /// chat format can be a *different* id from `eos_token` (gemma-4 ends an
     /// assistant turn with `<turn|>` = 106, while `<eos>` = 1). Generation
@@ -543,6 +681,23 @@ thread_local! {
     static BPE_SCRATCH: RefCell<BpeScratch> = RefCell::new(BpeScratch::default());
 }
 
+/// A vocabulary's fill-in-the-middle tokens: from the
+/// `tokenizer.ggml.fim_*_token_id` keys, or for a file written without them,
+/// from the spellings fill-in-the-middle vocabularies use. A token spelled that
+/// way exists for this and nothing else, so the vocabulary has still declared
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FimTokens {
+    pub prefix: u32,
+    pub suffix: u32,
+    pub middle: u32,
+    pub pad: Option<u32>,
+    /// Opens a repository's name, in a prompt holding several files.
+    pub repo: Option<u32>,
+    /// Opens a file's name, in a prompt holding several files.
+    pub separator: Option<u32>,
+}
+
 impl Tokenizer {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let tokens = string_array(gguf, "tokenizer.ggml.tokens")
@@ -561,6 +716,10 @@ impl Tokenizer {
         let (split_pattern, ignore_merges) = match vocab_kind {
             VocabKind::Gpt2Byte => split_pattern_for_pre(pre.as_str()),
             _ => (SPLIT_PATTERN, false),
+        };
+        let split_stages = match vocab_kind {
+            VocabKind::Gpt2Byte => split_stages_for_pre(pre.as_str()),
+            _ => &[],
         };
         let right_aligned_digits = vocab_kind == VocabKind::Gpt2Byte
             && RIGHT_ALIGNED_DIGIT_PRE_TYPES.contains(&pre.as_str());
@@ -616,6 +775,71 @@ impl Tokenizer {
             .flatten();
         let eos_token = metadata_u32(gguf, "tokenizer.ggml.eos_token_id");
         let eot_token = metadata_u32(gguf, "tokenizer.ggml.eot_token_id");
+        let fim = |keys: &[&str], spellings: &[&str]| {
+            keys.iter()
+                .find_map(|key| metadata_u32(gguf, &format!("tokenizer.ggml.{key}")))
+                .or_else(|| spellings.iter().find_map(|s| token_to_id.get(*s).copied()))
+        };
+        let fim_prefix = fim(
+            &["fim_pre_token_id", "prefix_token_id"],
+            &[
+                "<|fim_prefix|>",
+                "<fim-prefix>",
+                "<fim_prefix>",
+                "<\u{ff5c}fim\u{2581}begin\u{ff5c}>",
+                "<PRE>",
+                "\u{2581}<PRE>",
+                "[PREFIX]",
+            ],
+        );
+        let fim_suffix = fim(
+            &["fim_suf_token_id", "suffix_token_id"],
+            &[
+                "<|fim_suffix|>",
+                "<fim-suffix>",
+                "<fim_suffix>",
+                "<\u{ff5c}fim\u{2581}hole\u{ff5c}>",
+                "<SUF>",
+                "\u{2581}<SUF>",
+                "[SUFFIX]",
+            ],
+        );
+        let fim_middle = fim(
+            &["fim_mid_token_id", "middle_token_id"],
+            &[
+                "<|fim_middle|>",
+                "<fim-middle>",
+                "<fim_middle>",
+                "<\u{ff5c}fim\u{2581}end\u{ff5c}>",
+                "<MID>",
+                "\u{2581}<MID>",
+                "[MIDDLE]",
+            ],
+        );
+        let fim_pad = fim(
+            &["fim_pad_token_id"],
+            &["<|fim_pad|>", "<fim-pad>", "<fim_pad>", "<PAD>"],
+        );
+        let fim_repo = fim(
+            &["fim_rep_token_id"],
+            &[
+                "<|fim_repo|>",
+                "<|repo_name|>",
+                "<fim-repo>",
+                "<REPO>",
+                "<reponame>",
+            ],
+        );
+        let fim_separator = fim(
+            &["fim_sep_token_id"],
+            &[
+                "<|fim_sep|>",
+                "<|file_sep|>",
+                "<fim-sep>",
+                "<SEP>",
+                "<filename>",
+            ],
+        );
         let add_eos_token = metadata_u32(gguf, "tokenizer.ggml.add_eos_token").unwrap_or(0) != 0;
         let add_bos_token = match metadata_u32(gguf, "tokenizer.ggml.add_bos_token") {
             Some(v) => v != 0,
@@ -661,13 +885,19 @@ impl Tokenizer {
             merge_map,
             byte_to_char,
             char_to_byte,
-            split_re: Regex::new(split_pattern).context("building tokenizer split regex")?,
+            splitter: WordSplitter::new(split_stages, split_pattern)?,
             ignore_merges,
             right_aligned_digits,
             special_tokens,
             special_ids,
             bos_token,
             eos_token,
+            fim_prefix,
+            fim_suffix,
+            fim_middle,
+            fim_pad,
+            fim_repo,
+            fim_separator,
             eot_token,
             add_eos_token,
             add_bos_token,
@@ -703,6 +933,18 @@ impl Tokenizer {
     /// it has one (matching llama.cpp's default `add_bos` behavior for a
     /// chat/completion request).
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<u32> {
+        self.encode_segments(self.split_on_special_tokens(text), add_bos)
+    }
+
+    /// [`Self::encode`] for text a user wrote rather than a template: what
+    /// spells a special token in it is that spelling, not the token. A source
+    /// file that mentions `<|fim_middle|>` must not be able to end its own
+    /// prefix.
+    pub fn encode_literal(&self, text: &str) -> Vec<u32> {
+        self.encode_segments(vec![Segment::Plain(text)], false)
+    }
+
+    fn encode_segments(&self, segments: Vec<Segment<'_>>, add_bos: bool) -> Vec<u32> {
         let mut ids = Vec::new();
         if add_bos && let Some(bos) = self.bos_token {
             ids.push(bos);
@@ -713,7 +955,7 @@ impl Tokenizer {
         // token`), only consulted by `VocabKind::SpmUnigram`'s space-
         // prefix handling below.
         let mut is_prev_special = true;
-        for segment in self.split_on_special_tokens(text) {
+        for segment in segments {
             match segment {
                 Segment::Special(id) => {
                     ids.push(id);
@@ -755,8 +997,7 @@ impl Tokenizer {
         // Reused across words so `ignore_merges`' whole-word lookup doesn't
         // allocate per pre-token; untouched entirely when the flag is off.
         let mut mapped = String::new();
-        let words = self.split_re.find_iter(text).flat_map(|m| {
-            let word = m.as_str();
+        let words = self.splitter.split(text).into_iter().flat_map(|word| {
             let digits = self.right_aligned_digits && word.chars().all(char::is_numeric);
             let (whole, grouped) = if digits {
                 (None, Some(right_aligned_digit_groups(word)))
@@ -918,6 +1159,20 @@ impl Tokenizer {
     /// about content: no model emits `<eos>` or `<|tool_response>` as
     /// prose. A vocabulary without such a token is unaffected.
     const NAMED_END_TOKENS: [&'static str; 2] = ["<eos>", "<|tool_response>"];
+
+    /// The tokens that frame a fill-in-the-middle prompt, or `None` when this
+    /// vocabulary cannot make one: it has to have all of prefix, suffix and
+    /// middle. See [`FimTokens`].
+    pub fn fim_tokens(&self) -> Option<FimTokens> {
+        Some(FimTokens {
+            prefix: self.fim_prefix?,
+            suffix: self.fim_suffix?,
+            middle: self.fim_middle?,
+            pad: self.fim_pad,
+            repo: self.fim_repo,
+            separator: self.fim_separator,
+        })
+    }
 
     pub fn stop_token_ids(&self) -> Vec<u32> {
         let mut ids = Vec::with_capacity(3);
@@ -1821,10 +2076,18 @@ mod tests {
         assert_eq!(generic_digits, vec!["2026"]);
     }
 
-    /// The DeepSeek-V3 split as one alternation must give the pieces the
-    /// three sequential expressions give: digit runs of three, CJK runs on
-    /// their own even inside a Latin word, an ASCII punctuation mark glued
-    /// to the letters after it, and spaces kept in front of a word.
+    fn words_for_pre(pre: &str, text: &str) -> Vec<String> {
+        let (pattern, _) = super::split_pattern_for_pre(pre);
+        let splitter = super::WordSplitter::new(super::split_stages_for_pre(pre), pattern)
+            .expect("the patterns compile");
+        let words: Vec<String> = splitter.split(text).iter().map(|w| w.to_string()).collect();
+        assert_eq!(words.concat(), text, "{pre} lost text");
+        words
+    }
+
+    /// The DeepSeek-V3 split: digit runs of three, CJK runs on their own even
+    /// inside a Latin word, an ASCII punctuation mark glued to the letters
+    /// after it, and spaces kept in front of a word.
     #[test]
     fn the_deepseek3_pre_tokenizer_splits_digits_cjk_and_words() {
         let (pattern, ignore_merges) = super::split_pattern_for_pre("joyai-llm");
@@ -1832,10 +2095,7 @@ mod tests {
         assert!(!ignore_merges);
         assert_eq!(super::split_pattern_for_pre("deepseek-v3").0, pattern);
 
-        let re = regex::Regex::new(pattern).expect("the pattern compiles");
-        let split = |text: &str| -> Vec<String> {
-            re.find_iter(text).map(|m| m.as_str().to_string()).collect()
-        };
+        let split = |text| words_for_pre("joyai-llm", text);
         assert_eq!(split("12345"), ["123", "45"]);
         assert_eq!(split("abc中文def"), ["abc", "中文", "def"]);
         assert_eq!(
@@ -1843,6 +2103,66 @@ mod tests {
             ["The", " capital", " of", " France", " is"]
         );
         assert_eq!(split("x.y = 1;\n"), ["x", ".y", " =", " ", "1", ";\n"]);
+    }
+
+    /// The last whitespace character before a word goes with the word, which
+    /// is the shape of every indented line of code. A pattern with a line-break
+    /// alternative keeps a break whole; the generic one hands back that too.
+    #[test]
+    fn the_whitespace_before_a_word_stays_with_the_word() {
+        for pre in ["qwen2", "qwen35", "llama-bpe", "gpt-4o", "tekken"] {
+            assert_eq!(words_for_pre(pre, "\n    x"), ["\n", "   ", " x"], "{pre}");
+        }
+        assert_eq!(words_for_pre("gpt-2", "\n    x"), ["\n   ", " x"]);
+        assert_eq!(words_for_pre("gpt-2", "\n\nx"), ["\n", "\n", "x"]);
+        assert_eq!(words_for_pre("qwen2", "\n\nx"), ["\n\n", "x"]);
+        assert_eq!(words_for_pre("qwen2", "a  b"), ["a", " ", " b"]);
+        // One whitespace character has nothing to give back, and a run with
+        // nothing after it stays whole.
+        assert_eq!(words_for_pre("qwen2", "\tx"), ["\tx"]);
+        assert_eq!(words_for_pre("gpt-2", "\tx"), ["\t", "x"]);
+        assert_eq!(words_for_pre("qwen2", "x   "), ["x", "   "]);
+        assert_eq!(words_for_pre("qwen2", "   "), ["   "]);
+        // Whitespace in front of a symbol, as in ` \n = Robert`.
+        assert_eq!(
+            words_for_pre("qwen2", " \n = Robert"),
+            [" \n", " =", " Robert"]
+        );
+    }
+
+    /// Every Qwen pre-tokenizer takes digits one at a time, which the generic
+    /// pattern does not, and a line break stays on the punctuation before it.
+    #[test]
+    fn the_qwen_pre_tokenizers_are_their_own() {
+        for pre in ["qwen2", "qwen35"] {
+            assert_eq!(words_for_pre(pre, "x 2024"), ["x", " ", "2", "0", "2", "4"]);
+            assert_eq!(words_for_pre(pre, "f();\n"), ["f", "();\n"]);
+            assert_eq!(words_for_pre(pre, "don't"), ["don", "'t"]);
+        }
+        assert_eq!(words_for_pre("gpt-2", "x 2024"), ["x", " 2024"]);
+        // The two differ on a combining mark.
+        assert_eq!(words_for_pre("qwen35", "e\u{301}a"), ["e\u{301}a"]);
+        assert_eq!(words_for_pre("qwen2", "e\u{301}a"), ["e", "\u{301}a"]);
+        for pre in ["deepseek-r1-qwen", "megrez"] {
+            assert_eq!(
+                super::split_pattern_for_pre(pre).0,
+                super::SPLIT_PATTERN_QWEN2,
+                "{pre}"
+            );
+        }
+    }
+
+    /// A stage's pieces bound the next stage: its digits come apart first, so
+    /// the generic pattern never sees a space beside one.
+    #[test]
+    fn a_stage_splits_what_the_one_before_left() {
+        assert_eq!(
+            words_for_pre("smollm", "ab 123"),
+            ["ab", " ", "1", "2", "3"]
+        );
+        // The whitespace run ends its piece, so it stays whole.
+        assert_eq!(words_for_pre("smollm", "a  1"), ["a", "  ", "1"]);
+        assert_eq!(words_for_pre("smollm", "a  b"), ["a", " ", " b"]);
     }
 
     #[test]

@@ -12,7 +12,7 @@ section.
 
 Each program's `-i`/`--init` writes its file under `~/.orangu/`.
 `orangu-server` switches accept `yes`/`no`, `true`/`false`, `on`/`off` and
-`1`/`0`; the client's are listed per key. [SERVER.md](SERVER.md) and
+`1`/`0`; the client's are listed per key. The [server chapter](manual/en/46-server.md#configuration) and
 [COORDINATOR.md](COORDINATOR.md) describe the servers' keys at more length.
 
 ## orangu
@@ -194,6 +194,7 @@ Only `models` is required.
 | `port` | No | HTTP API port. Defaults to `8100` |
 | `role` | No | Role the server is tuned for: `all`, `code`, `review`, `explorer`, `embedding`, `image`, `video`, or `audio`. Read only under `--daemon`; otherwise the command-line flag (or `all`) decides. An image model is always served as `image`, a video model as `video`, a speech model as `audio` |
 | `slots` | No | Concurrent requests, each with its own KV cache. Defaults to `8` for `embedding` and `1` for every other role; must be at least `1` |
+| `context_shift` | No | `yes` drops a conversation's oldest tokens when it outgrows the context window, instead of refusing or stopping. Defaults to `no`. `context_keep` (default `0`) and `context_shift_drop` (default `0.5`) shape it. See the server chapter's *Context shift*. |
 | `queue_limit` | No | Requests allowed to wait for a slot before the server answers `503`. Defaults to `0`, unbounded |
 | `context` | No | Context, in tokens, one request must be able to hold on the device. Unset, every layer goes to the card when it fits and the context is what is left; set, layers move to the host until the card has room for this much KV cache. Must be at least `1` |
 | `api_key` | No | Bearer token every API request must carry. Unset leaves the server open. `ORANGU_API_KEY` takes precedence |

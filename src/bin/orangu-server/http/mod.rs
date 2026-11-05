@@ -20,7 +20,9 @@
 
 pub mod anthropic;
 pub mod audio;
+mod chat_choice;
 pub mod images;
+pub mod infill;
 pub mod native;
 pub mod openai;
 pub mod public_net;
@@ -305,7 +307,11 @@ pub async fn encode_off_runtime(
 /// answer is still free. Past this point the prompt is on its way to a device
 /// that answers an oversized request by stalling until its driver resets it,
 /// taking every other request on the process with it.
-pub fn reject_oversized_context(prompt_tokens: usize) -> Option<Response> {
+pub fn reject_oversized_context(state: &AppState, prompt_tokens: usize) -> Option<Response> {
+    // A context shift cuts such a prompt to fit rather than refusing it.
+    if state.engine.context_shift.is_some() {
+        return None;
+    }
     let ceiling = crate::engine::generate::kv_device_token_ceiling()?;
     if crate::engine::generate::prompt_fits_device(prompt_tokens, ceiling) {
         return None;
@@ -352,6 +358,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/detokenize", post(native::detokenize))
         .route("/logits", post(native::logits))
         .route("/completion", post(native::completion))
+        .route("/infill", post(infill::infill))
         .route("/embedding", post(native::embedding))
         .route("/apply-template", post(native::apply_template))
         .route("/v1/models", get(openai::list_models))
@@ -815,6 +822,7 @@ mod tests {
             "/slots",
             "/props",
             "/completion",
+            "/infill",
         ] {
             assert!(!OPEN_PATHS.contains(&closed), "{closed} must require a key");
         }

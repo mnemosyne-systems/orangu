@@ -112,7 +112,7 @@ Most local AI workflows cobble together disparate clients and engines. **orangu*
 | :--- | :--- | :--- |
 | **`orangu`** | Terminal UI, Git & workspace tools, `/review`, knowledge graph, context compression | [Terminal Reference](doc/manual/en/40-terminal.md) · [Core Tools](doc/manual/en/41-core_tools.md) |
 | **`orangu-coordinator`** | On-demand proxy that boots/stops `orangu-server` and swaps models to fit single-GPU VRAM | [Coordinator Guide](doc/COORDINATOR.md) |
-| **`orangu-server`** | Native GGUF inference engine (CPU, Vulkan, Metal, CUDA, ROCm), OpenAI API, web console | [Server Guide](doc/SERVER.md) |
+| **`orangu-server`** | Native GGUF inference engine (CPU, Vulkan, Metal, CUDA, ROCm), OpenAI API, web console | [Server Manual](doc/manual/en/46-server.md) |
 | **`orangu-bench`** | Throughput & latency benchmarking harness across OpenAI-compatible servers | [Benchmarking Manual](doc/manual/en/79-bench.md) |
 | **`orangu-gguf`** | Model pretraining, corpus packing, and GGUF quantization tool (`Q6_K` down to `IQ1`) | [Model Building Guide](doc/BUILD_MODEL.md) |
 
@@ -133,14 +133,15 @@ orangu turns your terminal into a complete code-review workstation against your 
 ### Native GGUF Inference Engine (`orangu-server`)
 
 A high-performance inference engine built entirely in Rust:
-- **Broad Architecture Coverage**: Runs 21 servable model families, including Llama, Mistral, Qwen (dense & MoE), Gemma (including Gemma 4 MoE), DeepSeek-V4, GLM, Kimi-K3, Muse-Spark, Phi, Nemotron-H, text-to-image diffusion models (`Qwen-Image`), the `LTX-2.5` audio-video model, and the `Qwen3-TTS` speech model.
+- **Broad Architecture Coverage**: Runs 24 servable model families, including Llama, Mistral, Qwen (dense & MoE), Gemma (including Gemma 4 MoE), DeepSeek-V4, GLM, Kimi-K3, Muse-Spark, Phi, Nemotron-H, text-to-image diffusion models (`Qwen-Image`), the `LTX-2.5` audio-video model, and the `Qwen3-TTS` speech model.
 - **Hardware Acceleration**: CPU, **Vulkan** (AMD, NVIDIA, Intel), **Metal** (macOS Apple Silicon native), **CUDA**, and **ROCm**.
 - **Quantization Support**: Native dequantization for `F32`/`F16`/`BF16`, `Q4_0`-`Q8_0`, K-quants (`Q2_K`-`Q6_K`), I-quants (`IQ4_XS` to sub-1.5-bit `IQ1_XXXS`), and Prism's ternary `PQ2_0`/`PTQ1_0`.
 - **Text, Image, Video & Speech Generation**: Serves `/v1/chat/completions`, `/v1/embeddings`, `/v1/images/generations` (with the `--image` deployment role) via Qwen-Image (with transparency support), `/v1/videos` (with the `--video` deployment role) via LTX-2.5: MP4 clips of AV1 video with a FLAC sound track, and `/v1/audio/speech` (with the `--audio` deployment role) via Qwen3-TTS: speech in a voice from a voice pack, as WAV, FLAC or raw PCM.
+- **Code Completion and the OpenAI Surface**: `/infill` completes code at a cursor on models with fill-in-the-middle tokens. The chat and completion endpoints honour `stop`, `n`, `logprobs`, `logit_bias`, the penalties and `tool_choice`, stream tool arguments as they are written, and refuse a field they do not honour instead of ignoring it.
 - **Single-File Bundles**: Package the server and a model into a standalone binary with `orangu-server bundle <model>`.
 - **Built-in Web Console**: Optional browser chat interface with live tokens/sec, syntax highlighting, and model switching.
 
-*See [doc/SERVER.md](doc/SERVER.md), [doc/manual/en/46-server.md](doc/manual/en/46-server.md), [doc/manual/en/48-image.md](doc/manual/en/48-image.md), [doc/manual/en/49-video.md](doc/manual/en/49-video.md), and [doc/manual/en/50-audio.md](doc/manual/en/50-audio.md) for architecture internals, image, video and speech generation, and backends.*
+*See [doc/manual/en/46-server.md](doc/manual/en/46-server.md), [doc/manual/en/48-image.md](doc/manual/en/48-image.md), [doc/manual/en/49-video.md](doc/manual/en/49-video.md), and [doc/manual/en/50-audio.md](doc/manual/en/50-audio.md) for architecture internals, image, video and speech generation, and backends.*
 
 ### Extensibility: MCP, Skills & Agent Memory
 
@@ -228,7 +229,7 @@ orangu includes an **embedded offline manual** accessible anytime directly from 
 Additional documentation and guides:
 - [Getting Started Guide](doc/GETTING_STARTED.md)
 - [Configuration Reference](doc/CONFIGURATION.md) · [Configuration Manual](doc/manual/en/20-configuration.md)
-- [Inference Server Guide](doc/SERVER.md) · [Server Manual](doc/manual/en/46-server.md) · [Server Internals](doc/manual/en/78-server.md)
+- [Server Manual](doc/manual/en/46-server.md) · [Developer map of the server](doc/SERVER.md) · [Server Internals](doc/manual/en/78-server.md)
 - [Image Generation Manual](doc/manual/en/48-image.md) · [Video Generation Manual](doc/manual/en/49-video.md) · [Speech Generation Manual](doc/manual/en/50-audio.md)
 - [Coordinator Guide](doc/COORDINATOR.md) · [Coordinator Manual](doc/manual/en/44-coordinator.md) · [Coordinator Internals](doc/manual/en/76-coordinator.md)
 - [Container Image Manual](doc/manual/en/52-container.md): the coordinator, the server and your models in one Podman or Docker image

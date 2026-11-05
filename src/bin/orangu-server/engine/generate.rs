@@ -57,6 +57,8 @@ pub struct GenerateStats {
     pub prompt_time: Duration,
     pub generated_tokens: usize,
     pub generate_time: Duration,
+    /// Tokens the context shift dropped from this conversation.
+    pub dropped_tokens: usize,
     /// Where the request's forwards spent their time in a tree of workers
     /// (`crate::workers`): this node's own layers and each worker's round
     /// trip, prefill and decode together, in pipeline order. Empty when the
@@ -107,6 +109,16 @@ pub struct GenerateRequest {
     /// A JSON Schema the output is held to — a stricter `json_output`, which
     /// it takes the place of when both are set.
     pub json_schema: Option<Arc<crate::engine::json_schema::Schema>>,
+    /// What the reply must begin with, one of these: a required tool call's
+    /// name and the character after it. Empty holds nothing.
+    pub reply_starts: Vec<Vec<u8>>,
+    /// How many of the first tokens a context shift keeps, in place of the
+    /// server's `context_keep`.
+    pub n_keep: Option<usize>,
+    /// `[orangu-server].context_shift`, set by the engine.
+    pub context_shift: Option<super::context_shift::ContextShift>,
+    /// Tokens the context shift has dropped from this request so far.
+    pub dropped_tokens: usize,
     pub max_tokens: usize,
     pub stop_token_ids: Vec<u32>,
     /// Whether this request may reuse an already-computed KV cache for
@@ -166,6 +178,18 @@ pub struct GenerateRequest {
     /// that closes its reasoning is the next one it writes. `None` leaves
     /// the reasoning as long as the model makes it.
     pub reasoning_budget: Option<usize>,
+    /// What ends the generation on the text it writes. The text that ends it
+    /// is not sent. Reasoning is not read: it is not the reply.
+    pub stop: super::text_stop::StopRules,
+    /// Send a [`StreamEvent::Logprob`] per token of the reply, listing this
+    /// many alternatives. `None` keeps a pick free to run on the device.
+    pub logprobs: Option<usize>,
+    /// Text a tool call is spelled with on this model, beyond what
+    /// [`tool_calls::marker_text`] knows: a special token whose spelling
+    /// occurs in one of these is sent rather than hidden, so a call the
+    /// template taught the model can be read back. See
+    /// [`super::tool_learn`].
+    pub call_markers: Vec<String>,
 }
 
 impl Default for GenerateRequest {
@@ -175,6 +199,10 @@ impl Default for GenerateRequest {
             sampling: SamplingParams::default(),
             json_output: false,
             json_schema: None,
+            reply_starts: Vec::new(),
+            n_keep: None,
+            context_shift: None,
+            dropped_tokens: 0,
             max_tokens: 0,
             stop_token_ids: Vec::new(),
             cache_prompt: true,
@@ -184,7 +212,164 @@ impl Default for GenerateRequest {
             cache_point: None,
             background: false,
             reasoning_budget: None,
+            stop: Default::default(),
+            logprobs: None,
+            call_markers: Vec::new(),
         }
+    }
+}
+
+/// The reply's text on its way out: through the request's stop rules, each
+/// token's log probability following its text.
+struct ReplyText<'a> {
+    tx: &'a mpsc::UnboundedSender<StreamEvent>,
+    gate: super::text_stop::TextGate,
+    /// Records whose text is still held, with where that text ends.
+    held_logprobs: VecDeque<(super::sampling::TokenLogprob, usize)>,
+    written: usize,
+    released: usize,
+}
+
+/// A [`ReplyText`] between two legs of one reply.
+struct ReplyState {
+    gate: super::text_stop::TextGate,
+    held_logprobs: VecDeque<(super::sampling::TokenLogprob, usize)>,
+    written: usize,
+    released: usize,
+}
+
+impl ReplyState {
+    fn new(rules: &super::text_stop::StopRules) -> Self {
+        Self {
+            gate: super::text_stop::TextGate::new(rules),
+            held_logprobs: VecDeque::new(),
+            written: 0,
+            released: 0,
+        }
+    }
+}
+
+/// What a reply's text has reached, carried across a context shift.
+struct CarriedText {
+    header: MessageHeader,
+    reasoning_tokens: usize,
+    budget_spent: bool,
+    decoder: crate::engine::tokenizer::StreamDecoder,
+    reply: ReplyState,
+}
+
+/// What a request's stats have added up to across its legs.
+#[derive(Default)]
+struct Tally {
+    generated: usize,
+    generate_time: Duration,
+    /// The first leg's prompt tokens, cached tokens and prompt time: the
+    /// figures that describe the prompt the client sent.
+    first: Option<(usize, usize, Duration)>,
+    last_token_at: Option<Instant>,
+    workers: Vec<(String, Duration)>,
+    /// Dropped by the shift ending this leg.
+    dropped: usize,
+}
+
+/// What goes on across a context shift.
+struct Carried {
+    sampler: Sampler,
+    text: CarriedText,
+    tally: Tally,
+}
+
+/// A reply that filled the window and goes on from a shorter prompt.
+struct Shifted {
+    req: GenerateRequest,
+    carried: Carried,
+}
+
+/// Drops what a request's prompt has no room for, when a context shift is on.
+fn trim_to_window(req: &mut GenerateRequest, n_ctx_train: usize) {
+    let window = context_window(n_ctx_train);
+    if let Some(shift) = req.context_shift
+        && let Some((trimmed, dropped)) = shift.trim(&req.prompt_tokens, window, req.n_keep)
+    {
+        req.prompt_tokens = trimmed;
+        req.dropped_tokens += dropped;
+        // The conversation it marks is not the one this prompt holds.
+        req.cache_point = None;
+    }
+}
+
+/// The tokens one request's cache can hold: the model's context, or the
+/// device's room where that is less.
+fn context_window(n_ctx_train: usize) -> usize {
+    let window = n_ctx_train.max(1);
+    kv_device_token_ceiling().map_or(window, |ceiling| window.min(ceiling))
+}
+
+impl<'a> ReplyText<'a> {
+    fn resume(tx: &'a mpsc::UnboundedSender<StreamEvent>, state: ReplyState) -> Self {
+        let ReplyState {
+            gate,
+            held_logprobs,
+            written,
+            released,
+        } = state;
+        Self {
+            tx,
+            gate,
+            held_logprobs,
+            written,
+            released,
+        }
+    }
+
+    fn into_state(self) -> ReplyState {
+        ReplyState {
+            gate: self.gate,
+            held_logprobs: self.held_logprobs,
+            written: self.written,
+            released: self.released,
+        }
+    }
+
+    fn release(&mut self, text: String) {
+        self.released += text.len();
+        if !text.is_empty() {
+            let _ = self.tx.send(StreamEvent::Token(text));
+        }
+        while self
+            .held_logprobs
+            .front()
+            .is_some_and(|(_, end)| *end <= self.released)
+        {
+            if let Some((record, _)) = self.held_logprobs.pop_front() {
+                let _ = self.tx.send(StreamEvent::Logprob(record));
+            }
+        }
+    }
+
+    /// Takes one token's text. `true` when a rule ends the generation here.
+    fn push(&mut self, text: String, logprob: Option<super::sampling::TokenLogprob>) -> bool {
+        self.written += text.len();
+        if let Some(record) = logprob {
+            self.held_logprobs.push_back((record, self.written));
+        }
+        if self.gate.is_open() {
+            self.release(text);
+            return false;
+        }
+        let passed = self.gate.push(&text);
+        self.release(passed.text);
+        passed.stop
+    }
+
+    /// Whatever is held, once the text it might have joined up with is over:
+    /// a reasoning body has begun, or the generation ended.
+    fn flush(&mut self) {
+        let rest = self.gate.finish();
+        self.written = self.released + rest.len();
+        self.release(rest);
+        // Records of text the rules dropped have nothing left to follow.
+        self.held_logprobs.clear();
     }
 }
 
@@ -234,6 +419,10 @@ pub enum StreamEvent {
     /// this project's own client did, by re-tokenising the whole accumulated
     /// answer on every redraw.
     Timings(GenerateStats),
+    /// The token whose text was just sent, when the request asked for
+    /// [`GenerateRequest::logprobs`]. Follows the text it describes, and is
+    /// not sent for text a stop rule took away.
+    Logprob(super::sampling::TokenLogprob),
     Done {
         stats: GenerateStats,
         finish_reason: FinishReason,
@@ -315,8 +504,8 @@ pub struct Engine {
     /// reuse source for the next request on that slot (independent of the
     /// cross-slot `prefix_cache` pool). See that module's own doc comment.
     pub slot_store: Option<Arc<super::slot_store::SlotStore>>,
-    /// The paged KV pool and its prefix index (`ORANGU_PAGED_KV=1`), or `None`
-    /// for the per-request contiguous caches this engine has always used.
+    /// The paged KV pool and its prefix index (on unless `ORANGU_PAGED_KV=0`),
+    /// or `None` for per-request contiguous caches.
     ///
     /// Both together or neither. A pool without an index pages without
     /// sharing, which pays paging's indirection for none of its benefit; an
@@ -353,6 +542,8 @@ pub struct Engine {
     /// line either way; this is the one piece of output that is not a log
     /// record, because it is not a line.
     pub live_stats: bool,
+    /// `[orangu-server].context_shift`.
+    pub context_shift: Option<super::context_shift::ContextShift>,
     /// The Qwen-Image pipeline, when the served model is a `qwen_image`
     /// diffusion transformer. Then [`Self::model`] and [`Self::tokenizer`]
     /// are its **text encoder** — a real `qwen2vl` language model, loaded
@@ -557,7 +748,7 @@ impl Engine {
         tokens: Vec<u32>,
         rows: usize,
         top: usize,
-    ) -> Result<Vec<super::teacher::TopLogprobs>, String> {
+    ) -> Result<(Vec<super::teacher::TopLogprobs>, Vec<f32>), String> {
         let guard = self
             .slots
             .try_acquire()
@@ -566,7 +757,7 @@ impl Engine {
         let model = self.serving().model;
         tokio::task::spawn_blocking(move || {
             super::cpu_pools::for_request(move || {
-                super::teacher::teacher_forced(model.as_ref(), &tokens, rows, top, guard.id())
+                super::teacher::teacher_scored(model.as_ref(), &tokens, rows, top, guard.id())
             })
         })
         .await
@@ -619,6 +810,9 @@ impl Engine {
         let role = req.role.unwrap_or(process_role);
         let metrics = self.metrics.clone();
         let live_stats = self.live_stats;
+        let mut req = req;
+        req.context_shift = self.context_shift;
+        trim_to_window(&mut req, model.config().n_ctx_train);
         // Before the spawn, not inside it: what an operator means by "how long
         // did this request take" starts when the request arrives, and a task
         // that has not been scheduled yet is already waiting.
@@ -1084,6 +1278,63 @@ fn run(
     guard: &super::scheduler::SlotGuard,
     req: GenerateRequest,
     role: crate::config::Role,
+    process_role: crate::config::Role,
+    live_stats: bool,
+    metrics: &super::metrics::ServerMetrics,
+    arrived: Instant,
+    tx: mpsc::UnboundedSender<StreamEvent>,
+    prefix_claim: Option<super::prefix_index::Claim>,
+    prompt_pages: Option<PromptPages>,
+) -> Result<()> {
+    let leg = |req, claim, pages, carried| {
+        run_leg(
+            model,
+            tokenizer,
+            draft,
+            mtp,
+            prefix_cache,
+            slot_store,
+            paged_kv,
+            decode_batcher,
+            guard,
+            req,
+            role,
+            process_role,
+            live_stats,
+            metrics,
+            arrived,
+            tx.clone(),
+            claim,
+            pages,
+            carried,
+        )
+    };
+    // Each leg ends at the reply's end, or where the window filled.
+    let mut ran = leg(req, prefix_claim, prompt_pages, None)?;
+    while let Some(shifted) = ran {
+        ran = leg(shifted.req, None, None, Some(shifted.carried))?;
+    }
+    Ok(())
+}
+
+/// One stretch of a request: its prompt read and as much of its reply written
+/// as the window has room for.
+#[allow(clippy::too_many_arguments)]
+fn run_leg(
+    model: &dyn ModelForward,
+    tokenizer: &Tokenizer,
+    draft: Option<&DraftModel>,
+    mtp: Option<&MtpDraft>,
+    prefix_cache: Option<&PrefixCache>,
+    slot_store: Option<&super::slot_store::SlotStore>,
+    paged_kv: Option<&(
+        Arc<super::kv_pool::KvPool>,
+        Arc<super::prefix_index::PrefixIndex>,
+    )>,
+    decode_batcher: &super::decode_batch::DecodeBatcher,
+    guard: &super::scheduler::SlotGuard,
+    req: GenerateRequest,
+    role: crate::config::Role,
     // This process's own role, for the one line that reports when a request
     // was served under another — see the completion line below.
     process_role: crate::config::Role,
@@ -1100,21 +1351,29 @@ fn run(
     // `wait_for_prompt_pages` — traded for the request's own promise for
     // its whole length, or given back where it takes none.
     prompt_pages: Option<PromptPages>,
-) -> Result<()> {
+    // What goes on from the leg before, when the window filled during it.
+    carried: Option<Carried>,
+) -> Result<Option<Shifted>> {
+    let resuming = carried.is_some();
+    let (carried_sampler, carried_text, mut tally) = match carried {
+        Some(c) => (Some(c.sampler), Some(c.text), c.tally),
+        None => (None, None, Tally::default()),
+    };
     let mut outcome = OutcomeGuard {
         metrics,
         arrived,
         finished: None,
     };
     let config = model.config();
-    let capacity = (req.prompt_tokens.len() + req.max_tokens).min(config.n_ctx_train.max(1));
+    let answer_room = req.max_tokens.saturating_sub(tally.generated);
+    let capacity = (req.prompt_tokens.len() + answer_room).min(config.n_ctx_train.max(1));
     if req.prompt_tokens.len() > capacity {
         let _ = tx.send(StreamEvent::Error(format!(
             "prompt ({} tokens) exceeds the model's context length ({})",
             req.prompt_tokens.len(),
             config.n_ctx_train
         )));
-        return Ok(());
+        return Ok(None);
     }
     // The device's room bounds the capacity the same way the model's context
     // length just did: `max_tokens` is a cap on the answer, and a cap that
@@ -1134,7 +1393,7 @@ fn run(
                 req.prompt_tokens.len(),
                 req.prompt_tokens.len().saturating_add(1),
             )));
-            return Ok(());
+            return Ok(None);
         }
         Some(ceiling) => capacity.min(ceiling),
         None => capacity,
@@ -1304,8 +1563,13 @@ fn run(
     // reassignment stands in for a borrow everywhere else, at zero real
     // cost (this is never actually `None` except mid-swap).
     let mut cache = Some(new_cache);
-    let mut sampler = Sampler::new(req.sampling);
-    if let Some(schema) = req.json_schema.clone() {
+    let mut sampler = carried_sampler.unwrap_or_else(|| Sampler::new(req.sampling.clone()));
+    if let Some(top) = req.logprobs.filter(|_| !resuming) {
+        sampler = sampler.with_logprobs(top);
+    }
+    if resuming {
+        // Its constraint has followed the reply so far, and goes on from there.
+    } else if let Some(schema) = req.json_schema.clone() {
         sampler = sampler.with_constraint(crate::engine::sampling::Constraint::schema(
             schema,
             tokenizer.token_bytes_shared(),
@@ -1316,6 +1580,12 @@ fn run(
         // request and shared from then on, so an unconstrained deployment
         // never pays for it.
         sampler = sampler.with_constraint(crate::engine::sampling::Constraint::json(
+            tokenizer.token_bytes_shared(),
+            req.stop_token_ids.clone(),
+        ));
+    } else if !req.reply_starts.is_empty() {
+        sampler = sampler.with_constraint(crate::engine::sampling::Constraint::one_of(
+            req.reply_starts.clone(),
             tokenizer.token_bytes_shared(),
             req.stop_token_ids.clone(),
         ));
@@ -1423,6 +1693,11 @@ fn run(
         // Cached tokens never went through a forward pass, so they are
         // already "processed" as far as a progress bar is concerned —
         // otherwise a mostly-cached prompt appears to start at zero and jump.
+        // A shift's reading happens in the middle of the reply, whose prompt
+        // has long been reported as read.
+        if resuming {
+            return Ok(());
+        }
         let _ = progress_tx.send(StreamEvent::PromptProgress {
             total: total_prompt,
             cached: reused_len,
@@ -1494,7 +1769,7 @@ fn run(
                 reused_len,
                 0,
             );
-            return Ok(());
+            return Ok(None);
         }
         Err(err) => {
             // `{err:?}` (anyhow's chain-plus-backtrace Debug format, not
@@ -1504,7 +1779,7 @@ fn run(
             // add, matching the detail a panic's own captured backtrace
             // (`panic_capture`) gives for a debug report worth saving.
             let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
-            return Ok(());
+            return Ok(None);
         }
     };
     if let Some((pool, index)) = paged_kv
@@ -1541,23 +1816,38 @@ fn run(
     let mut next = sampler.sample(&logits, &history, history.len());
 
     let generate_start = Instant::now();
-    let mut generated = 0usize;
+    let mut generated = tally.generated;
     let finish_reason;
+    // The prompt the next leg reads, when the window filled during this one.
+    let mut shifted_prompt: Option<Vec<u32>> = None;
     let mut last_report = Instant::now();
     let mut reported = false;
     let mut spec_buf: VecDeque<u32> = VecDeque::new();
     let mut draft_control = super::draft_control::DraftControl::new();
     let mut spec_accepted = 0usize;
     let mut spec_steps = 0usize;
-    let mut header = MessageHeader::for_prompt(tokenizer, &req.prompt_tokens, role);
-    let (mut reasoning_tokens, mut budget_spent) = (0usize, false);
-    // One decoder for the whole stream, not one call per token: a character
-    // wider than a byte is routinely several tokens, and decoding each of them
-    // alone replaces both halves. See `tokenizer::StreamDecoder`.
-    let mut decoder = crate::engine::tokenizer::StreamDecoder::default();
+    let CarriedText {
+        mut header,
+        reasoning_tokens: carried_reasoning,
+        budget_spent: carried_budget,
+        // One decoder for the whole stream, not one call per token: a character
+        // wider than a byte is routinely several tokens, and decoding each of
+        // them alone replaces both halves. See `tokenizer::StreamDecoder`.
+        mut decoder,
+        reply: carried_reply,
+    } = carried_text.unwrap_or_else(|| CarriedText {
+        header: MessageHeader::for_prompt(tokenizer, &req.prompt_tokens, role),
+        reasoning_tokens: 0,
+        budget_spent: false,
+        decoder: crate::engine::tokenizer::StreamDecoder::default(),
+        reply: ReplyState::new(&req.stop),
+    });
+    let (mut reasoning_tokens, mut budget_spent) = (carried_reasoning, carried_budget);
+    let mut reply = ReplyText::resume(&tx, carried_reply);
+    let mut stopped_on_text = false;
     // When the previous token was produced, so the gap to the next one can be
     // observed. `None` until there is a previous one to measure from.
-    let mut last_token_at: Option<Instant> = None;
+    let mut last_token_at: Option<Instant> = tally.last_token_at;
     // This slot decodes with the others from here on — one forward for all
     // of them per step (`engine::decode_batch`). Only the plain path: a
     // draft or a multi-token head steps on its own schedule.
@@ -1577,6 +1867,7 @@ fn run(
         }
         history.push(next);
         generated += 1;
+        let logprob = sampler.take_logprob(next);
         guard.set_generated_tokens(generated);
         // Time to first token counts from arrival, so it carries the queue
         // wait and the prefill together — which is what an interactive caller
@@ -1612,10 +1903,16 @@ fn run(
                 // read by `engine::tool_calls`; the HTTP layer removes the
                 // whole span from what the user sees, so this never reaches
                 // a chat client as content.
-                None => tokenizer
-                    .token_text(next)
-                    .and_then(tool_calls::marker_text)
-                    .map(str::to_string),
+                None => tokenizer.token_text(next).and_then(|token| {
+                    tool_calls::marker_text(token)
+                        .map(str::to_string)
+                        .or_else(|| {
+                            req.call_markers
+                                .iter()
+                                .any(|marker| marker.contains(token))
+                                .then(|| token.to_string())
+                        })
+                }),
             }
         } else {
             // Suppressed while this is a message *header* (the recipient the
@@ -1624,11 +1921,17 @@ fn run(
             header.observe_text(decoder.push(tokenizer, next))
         };
         if let Some(text) = emitted {
-            let _ = tx.send(if header.in_reasoning() {
-                StreamEvent::Reasoning(text)
-            } else {
-                StreamEvent::Token(text)
-            });
+            if header.in_reasoning() {
+                reply.flush();
+                let _ = tx.send(StreamEvent::Reasoning(text));
+            } else if reply.push(text, logprob) {
+                // Stopped by what it wrote, the token that finished the text
+                // is not in the cache: a stop token is not either.
+                history.pop();
+                stopped_on_text = true;
+                finish_reason = FinishReason::Stop;
+                break;
+            }
         }
         // A reasoning budget spent: the next token closes the reasoning.
         if let Some(budget) = req.reasoning_budget
@@ -1665,7 +1968,7 @@ fn run(
                 reused_len,
                 generated,
             );
-            return Ok(());
+            return Ok(None);
         }
         // Not after the first token: it was sampled from the prefill's own
         // logits, so `generate_time` at that point is a few microseconds of
@@ -1679,6 +1982,7 @@ fn run(
                 prompt_time,
                 generated_tokens: generated,
                 generate_time: generate_start.elapsed(),
+                dropped_tokens: req.dropped_tokens,
                 workers: Vec::new(),
             }));
         }
@@ -1689,6 +1993,7 @@ fn run(
                 prompt_time,
                 generated_tokens: generated,
                 generate_time: generate_start.elapsed(),
+                dropped_tokens: req.dropped_tokens,
                 workers: Vec::new(),
             };
             // \x1b[K ("erase to end of line") clears any leftover tail from
@@ -1705,6 +2010,20 @@ fn run(
             reported = true;
         }
         if history.len() >= capacity {
+            // Only a window that filled before the reply's own cap can shift,
+            // and only where this node holds all of the state.
+            if generated < req.max_tokens
+                && cache.as_ref().is_some_and(KvCache::can_roll_back)
+                && let Some((keep, step)) = req
+                    .context_shift
+                    .and_then(|shift| shift.plan(context_window(config.n_ctx_train), req.n_keep))
+                && keep + step < history.len()
+            {
+                let mut prompt = history[..keep].to_vec();
+                prompt.extend_from_slice(&history[keep + step..]);
+                shifted_prompt = Some(prompt);
+                tally.dropped += step;
+            }
             finish_reason = FinishReason::Length;
             break;
         }
@@ -1749,7 +2068,7 @@ fn run(
                         reused_len,
                         generated,
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
                 StepRoom::Yield => {
                     drop(batch_registration.take());
@@ -1782,11 +2101,11 @@ fn run(
                                 reused_len,
                                 generated,
                             );
-                            return Ok(());
+                            return Ok(None);
                         }
                         Err(err) => {
                             let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
-                            return Ok(());
+                            return Ok(None);
                         }
                     }
                     // A head that reads the served model's states from its
@@ -1855,7 +2174,7 @@ fn run(
                 Ok(None) => None,
                 Err(err) => {
                     let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         } else {
@@ -1878,7 +2197,7 @@ fn run(
             // the device find those `k` (`top_k` below) and read back a few
             // dozen pairs instead of the whole vocabulary.
             let device_top_k = sampler.device_top_k();
-            let greedy_sample = (!sampler.is_constrained()
+            let greedy_sample = (!sampler.needs_host_logits()
                 && (sampler.is_greedy() || device_top_k > 0))
                 .then(|| GreedySampleParams {
                     recent_tokens: &history[recent_start..],
@@ -1955,7 +2274,7 @@ fn run(
                 }
                 Err(err) => {
                     let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         };
@@ -1964,17 +2283,30 @@ fn run(
     // Generation can stop part-way through a character — a token limit, a stop
     // token — and those bytes are still bytes the model produced. Sent through
     // the same filter every other token's text goes through, so a stream that
-    // ends mid-header stays withheld.
-    if let Some(text) = header.observe_text(decoder.flush())
-        && !text.is_empty()
-    {
-        let _ = tx.send(if header.in_reasoning() {
-            StreamEvent::Reasoning(text)
-        } else {
-            StreamEvent::Token(text)
-        });
+    // ends mid-header stays withheld. A shift is not the end of it: the reply
+    // goes on, and those bytes with it.
+    if !stopped_on_text && shifted_prompt.is_none() {
+        if let Some(text) = header.observe_text(decoder.flush())
+            && !text.is_empty()
+        {
+            if header.in_reasoning() {
+                let _ = tx.send(StreamEvent::Reasoning(text));
+            } else {
+                stopped_on_text = reply.push(text, None);
+            }
+        }
+        if !stopped_on_text {
+            reply.flush();
+        }
     }
-    let generate_time = generate_start.elapsed();
+    // A shift's reading is time the reply spent waiting, not a prompt's.
+    let generate_time = generate_start.elapsed()
+        + tally.generate_time
+        + if resuming {
+            prompt_time
+        } else {
+            Duration::ZERO
+        };
     if spec_steps > 0 {
         // Draft acceptance: `spec_accepted` drafted tokens confirmed across
         // `spec_steps` forwards, i.e. this many extra tokens produced beyond the
@@ -2065,13 +2397,57 @@ fn run(
         }
     }
 
+    tally.workers.extend(workers);
+    let dropped_tokens = req.dropped_tokens + tally.dropped;
+    let (prompt_tokens, cached_tokens, prompt_time) =
+        tally
+            .first
+            .unwrap_or((req.prompt_tokens.len(), reused_len, prompt_time));
+    if let Some(prompt_tokens_next) = shifted_prompt {
+        log::info!(
+            "orangu-server: [slot {}] context shift: {} tokens dropped so far, reading {} again",
+            guard.id(),
+            dropped_tokens,
+            prompt_tokens_next.len()
+        );
+        // The request has not ended, so there is nothing to count yet: the
+        // last leg's outcome is the request's.
+        std::mem::forget(outcome);
+        return Ok(Some(Shifted {
+            carried: Carried {
+                sampler,
+                text: CarriedText {
+                    header,
+                    reasoning_tokens,
+                    budget_spent,
+                    decoder,
+                    reply: reply.into_state(),
+                },
+                tally: Tally {
+                    generated,
+                    generate_time,
+                    first: Some((prompt_tokens, cached_tokens, prompt_time)),
+                    last_token_at,
+                    workers: tally.workers,
+                    dropped: 0,
+                },
+            },
+            req: GenerateRequest {
+                prompt_tokens: prompt_tokens_next,
+                cache_point: None,
+                dropped_tokens,
+                ..req
+            },
+        }));
+    }
     let stats = GenerateStats {
-        prompt_tokens: req.prompt_tokens.len(),
-        cached_tokens: reused_len,
+        prompt_tokens,
+        cached_tokens,
         prompt_time,
         generated_tokens: generated,
         generate_time,
-        workers,
+        dropped_tokens,
+        workers: tally.workers,
     };
     // A prefix another request left in the cache, reused here: worth
     // prefilling again after a restart (`engine::warm_prefixes`).
@@ -2111,7 +2487,7 @@ fn run(
         stats,
         finish_reason,
     });
-    Ok(())
+    Ok(None)
 }
 
 /// The recipient text that marks a message as the model's own reasoning
@@ -5791,7 +6167,9 @@ mod tests {
         while let Ok(event) = rx.try_recv() {
             match event {
                 StreamEvent::Token(t) | StreamEvent::Reasoning(t) => text.push_str(&t),
-                StreamEvent::PromptProgress { .. } | StreamEvent::Timings(_) => {}
+                StreamEvent::PromptProgress { .. }
+                | StreamEvent::Timings(_)
+                | StreamEvent::Logprob(_) => {}
                 StreamEvent::Done { .. } => ok = true,
                 StreamEvent::Error(e) => panic!("unexpected generation error: {e}"),
                 StreamEvent::Overloaded => panic!("unexpected refusal: these pools are unbounded"),
@@ -5847,6 +6225,7 @@ mod tests {
             cache_point: None,
             background: false,
             reasoning_budget: None,
+            ..Default::default()
         };
         let draft = DraftModel {
             model: draft,
@@ -5904,6 +6283,7 @@ mod tests {
             cache_point: None,
             background: false,
             reasoning_budget: None,
+            ..Default::default()
         };
         run(
             model,
@@ -5984,6 +6364,7 @@ mod tests {
             cache_point: None,
             background: false,
             reasoning_budget: None,
+            ..Default::default()
         };
         run(
             model,
@@ -6496,6 +6877,262 @@ mod tests {
             1 + turn2_suffix.len() + 2,
             "reuse must skip turn 1's first 7 cached positions, forwarding only its own uncached 8th token, the new suffix, and this turn's own 2 real decode steps"
         );
+    }
+
+    /// What a request produced under a context shift.
+    struct ShiftRun {
+        text: String,
+        finish: FinishReason,
+        stats: GenerateStats,
+        logprobs: usize,
+        progress_events: usize,
+    }
+
+    /// One request with a shift on, its prompt trimmed as the engine does.
+    fn run_shifting(
+        model: &DeterministicModel,
+        prefix_cache: Option<&PrefixCache>,
+        paged: Option<&(
+            Arc<crate::engine::kv_pool::KvPool>,
+            Arc<crate::engine::prefix_index::PrefixIndex>,
+        )>,
+        customize: impl FnOnce(&mut GenerateRequest),
+    ) -> ShiftRun {
+        let tokenizer = letter_tokenizer(model.config.n_vocab);
+        let slots = SlotPool::new(1);
+        let guard = pollster::block_on(slots.acquire());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut req = GenerateRequest {
+            sampling: greedy_params(),
+            cache_prompt: true,
+            context_shift: Some(crate::engine::context_shift::ContextShift {
+                keep: 2,
+                drop_fraction: 0.5,
+            }),
+            ..Default::default()
+        };
+        customize(&mut req);
+        trim_to_window(&mut req, model.config.n_ctx_train);
+        run(
+            model,
+            &tokenizer,
+            None,
+            None,
+            prefix_cache,
+            None,
+            paged,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
+            &guard,
+            req,
+            crate::config::Role::default(),
+            crate::config::Role::default(),
+            false,
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
+            tx,
+            None,
+            None,
+        )
+        .unwrap();
+        let (mut text, mut done, mut logprobs, mut progress_events) = (String::new(), None, 0, 0);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                StreamEvent::Token(t) | StreamEvent::Reasoning(t) => text.push_str(&t),
+                StreamEvent::Logprob(_) => logprobs += 1,
+                StreamEvent::PromptProgress { .. } => progress_events += 1,
+                StreamEvent::Timings(_) => {}
+                StreamEvent::Done {
+                    stats,
+                    finish_reason,
+                } => done = Some((stats, finish_reason)),
+                StreamEvent::Error(e) => panic!("unexpected generation error: {e}"),
+                StreamEvent::Overloaded => panic!("unexpected refusal"),
+            }
+        }
+        let (stats, finish) = done.expect("a request ends with Done");
+        ShiftRun {
+            text,
+            finish,
+            stats,
+            logprobs,
+            progress_events,
+        }
+    }
+
+    fn small_window(mut model: DeterministicModel, window: usize) -> DeterministicModel {
+        model.config.n_ctx_train = window;
+        model
+    }
+
+    fn letter_ids(text: &str) -> Vec<u32> {
+        text.chars().map(|c| c as u32 - 'a' as u32).collect()
+    }
+
+    /// Off, a reply ends where the window does. On, it reaches its own cap,
+    /// with no token lost or repeated at any of the shifts.
+    #[test]
+    fn a_reply_goes_past_the_window_only_with_a_shift() {
+        let model = small_window(DeterministicModel::new(26), 16);
+        let prompt = vec![1u32, 2, 3, 4, 5];
+        let off = run_shifting(&model, None, None, |req| {
+            req.prompt_tokens = prompt.clone();
+            req.max_tokens = 60;
+            req.context_shift = None;
+        });
+        assert_eq!(off.stats.generated_tokens, 16 - prompt.len());
+        assert_eq!(off.stats.dropped_tokens, 0);
+
+        let on = run_shifting(&model, None, None, |req| {
+            req.prompt_tokens = prompt.clone();
+            req.max_tokens = 60;
+        });
+        assert_eq!(on.stats.generated_tokens, 60);
+        assert_eq!(on.text.len(), 60);
+        assert!(matches!(on.finish, FinishReason::Length));
+        assert!(on.stats.dropped_tokens > 0);
+        assert!(on.text.starts_with(&off.text));
+        // The stats describe the prompt the client sent.
+        assert_eq!(on.stats.prompt_tokens, prompt.len());
+    }
+
+    /// Each token after a shift is the one a cold request for the trimmed
+    /// conversation answers with. Nothing of what was dropped survives in the
+    /// state, attention rows or recurrent, and the paged path agrees.
+    fn shifted_tokens_match_a_cold_read(model: &DeterministicModel, paged: bool) {
+        let plan = crate::engine::context_shift::ContextShift {
+            keep: 2,
+            drop_fraction: 0.5,
+        };
+        let window = model.config.n_ctx_train;
+        let (keep, step) = plan.plan(window, None).unwrap();
+        let prompt = vec![1u32, 2, 3, 4, 5];
+        let pool = paged.then(|| paged_pool_for(model));
+        let shifted = run_shifting(model, None, pool.as_ref(), |req| {
+            req.prompt_tokens = prompt.clone();
+            req.max_tokens = 50;
+        });
+        let mut live = prompt;
+        for (i, expected) in letter_ids(&shifted.text).into_iter().enumerate() {
+            let cold = run_shifting(model, None, None, |req| {
+                req.prompt_tokens = live.clone();
+                req.max_tokens = 1;
+                req.context_shift = None;
+            });
+            assert_eq!(letter_ids(&cold.text), vec![expected], "token {i}");
+            live.push(expected);
+            if live.len() >= window {
+                live.drain(keep..keep + step);
+            }
+        }
+    }
+
+    #[test]
+    fn a_shifted_reply_reads_as_a_cold_request_would() {
+        shifted_tokens_match_a_cold_read(&small_window(DeterministicModel::new(26), 16), false);
+    }
+
+    #[test]
+    fn a_shifted_reply_reads_as_a_cold_request_would_with_recurrent_layers() {
+        shifted_tokens_match_a_cold_read(&small_window(DeterministicModel::hybrid(26), 16), false);
+    }
+
+    #[test]
+    fn a_shifted_reply_reads_as_a_cold_request_would_on_the_paged_path() {
+        shifted_tokens_match_a_cold_read(&small_window(DeterministicModel::new(26), 16), true);
+    }
+
+    /// A prompt longer than the window is answered from what stays of it, and
+    /// says how much did not.
+    #[test]
+    fn a_prompt_over_the_window_is_cut_rather_than_refused() {
+        let model = small_window(DeterministicModel::new(26), 16);
+        let long: Vec<u32> = (0..40).map(|i| i % 26).collect();
+        let run = run_shifting(&model, None, None, |req| {
+            req.prompt_tokens = long.clone();
+            req.max_tokens = 3;
+        });
+        assert_eq!(run.stats.generated_tokens, 3);
+        assert_eq!(run.stats.prompt_tokens + run.stats.dropped_tokens, 40);
+        assert!(run.stats.prompt_tokens < 16);
+    }
+
+    /// The automatic cache reuse: the next turn sends the whole conversation
+    /// again, and its trimmed prompt finds the shifted reply's rows waiting.
+    #[test]
+    fn the_turn_after_a_shift_reuses_what_the_shift_read() {
+        let model = small_window(DeterministicModel::new(26), 32);
+        let pool = PrefixCache::new(4);
+        let prompt: Vec<u32> = (1..21).collect();
+        let first = run_shifting(&model, Some(&pool), None, |req| {
+            req.prompt_tokens = prompt.clone();
+            req.max_tokens = 20;
+        });
+        assert!(
+            first.stats.dropped_tokens > 0,
+            "the reply must have shifted"
+        );
+
+        let mut conversation = prompt;
+        conversation.extend(letter_ids(&first.text));
+        conversation.extend([7, 8]);
+        let forwarded_before = model.forwarded_tokens.load(Ordering::Relaxed);
+        let second = run_shifting(&model, Some(&pool), None, |req| {
+            req.prompt_tokens = conversation.clone();
+            req.max_tokens = 1;
+        });
+        // All but the last token of the reply (whose row a reply never makes)
+        // and the two new tokens came from the cache.
+        assert_eq!(second.stats.prompt_tokens - second.stats.cached_tokens, 3);
+        assert_eq!(
+            model.forwarded_tokens.load(Ordering::Relaxed) - forwarded_before,
+            3
+        );
+        // And it answers as a cold read of the same trimmed prompt does.
+        let cold = run_shifting(&model, None, None, |req| {
+            req.prompt_tokens = conversation.clone();
+            req.max_tokens = 1;
+        });
+        assert_eq!(second.text, cold.text);
+    }
+
+    /// A reply's own state goes across a shift: a stop string that spans one,
+    /// a held-back record for every token, and no second prompt report.
+    #[test]
+    fn a_reply_keeps_its_state_across_a_shift() {
+        let model = small_window(DeterministicModel::new(26), 16);
+        let prompt = vec![1u32, 2, 3, 4, 5];
+        let whole = run_shifting(&model, None, None, |req| {
+            req.prompt_tokens = prompt.clone();
+            req.max_tokens = 40;
+            req.logprobs = Some(0);
+        });
+        assert_eq!(whole.logprobs, 40);
+        assert!(whole.stats.dropped_tokens > 0);
+        assert_eq!(
+            whole.progress_events,
+            whole_first_leg_progress(&model, &prompt)
+        );
+
+        // The first shift falls after the eleventh generated token.
+        let spanning = whole.text[9..13].to_string();
+        let first_seen = whole.text.find(&spanning).unwrap();
+        let stopped = run_shifting(&model, None, None, |req| {
+            req.prompt_tokens = prompt.clone();
+            req.max_tokens = 40;
+            req.stop.strings = vec![spanning.clone()];
+        });
+        assert_eq!(stopped.text, whole.text[..first_seen]);
+        assert!(matches!(stopped.finish, FinishReason::Stop));
+    }
+
+    /// The prompt reports of the same request with no shift.
+    fn whole_first_leg_progress(model: &DeterministicModel, prompt: &[u32]) -> usize {
+        run_shifting(model, None, None, |req| {
+            req.prompt_tokens = prompt.to_vec();
+            req.max_tokens = 1;
+            req.context_shift = None;
+        })
+        .progress_events
     }
 
     /// `cache_prompt: false` must put every prompt token through a real
@@ -8004,6 +8641,7 @@ mod tests {
             role: crate::config::Role::default(),
             reasoning_effort: None,
             live_stats: false,
+            context_shift: None,
             image: None,
             video: None,
             audio: None,
@@ -8026,6 +8664,7 @@ mod tests {
                 cache_point: None,
                 background: false,
                 reasoning_budget: None,
+                ..Default::default()
             })
             .await;
 
@@ -8124,6 +8763,245 @@ mod tests {
             calls < 5,
             "kept generating for a client that had gone: {calls} forward calls"
         );
+    }
+
+    /// Everything a request sends, with `draft` verifying when given.
+    fn events_of(
+        model: &DeterministicModel,
+        tokenizer: &Tokenizer,
+        draft: Option<&DraftModel>,
+        req: GenerateRequest,
+    ) -> Vec<StreamEvent> {
+        let slots = SlotPool::new(1);
+        let guard = pollster::block_on(slots.acquire());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(
+            model,
+            tokenizer,
+            draft,
+            None,
+            None,
+            None,
+            None,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
+            &guard,
+            req,
+            crate::config::Role::default(),
+            crate::config::Role::default(),
+            false,
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
+            tx,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn text_of(events: &[StreamEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Token(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn logprobs_of(events: &[StreamEvent]) -> Vec<&crate::engine::sampling::TokenLogprob> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Logprob(record) => Some(record),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn finish_of(events: &[StreamEvent]) -> (FinishReason, usize) {
+        events
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Done {
+                    finish_reason,
+                    stats,
+                } => Some((*finish_reason, stats.generated_tokens)),
+                _ => None,
+            })
+            .expect("a Done event")
+    }
+
+    fn stop_request(strings: Vec<String>, max_tokens: usize) -> GenerateRequest {
+        GenerateRequest {
+            prompt_tokens: vec![1, 2, 3],
+            sampling: greedy_params(),
+            max_tokens,
+            stop: crate::engine::text_stop::StopRules {
+                strings,
+                infill: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// A stop string spanning tokens ends the generation there, as a stop, and
+    /// none of it is sent. The generation really ends: nothing runs past it for
+    /// a caller who only sees less text.
+    #[test]
+    fn a_stop_string_ends_the_generation_and_is_not_sent() {
+        let tokenizer = letter_tokenizer(8);
+        let plain = events_of(
+            &DeterministicModel::new(8),
+            &tokenizer,
+            None,
+            stop_request(Vec::new(), 40),
+        );
+        let whole = text_of(&plain);
+        assert_eq!(finish_of(&plain).0, FinishReason::Length);
+        // Two tokens from the middle, at the first place they occur.
+        let stop = whole[10..12].to_string();
+        let at = whole.find(&stop).unwrap();
+
+        let model = DeterministicModel::new(8);
+        let events = events_of(&model, &tokenizer, None, stop_request(vec![stop], 40));
+        assert_eq!(text_of(&events), whole[..at]);
+        let (finish, generated) = finish_of(&events);
+        assert_eq!(finish, FinishReason::Stop);
+        assert_eq!(generated, at + 2, "the tokens that wrote the stop count");
+        assert!(
+            model.forward_calls.load(Ordering::Relaxed) < 40,
+            "kept generating past the stop"
+        );
+    }
+
+    /// Text held back as a possible stop reaches the client when the length
+    /// limit ends the reply first.
+    #[test]
+    fn text_held_for_a_stop_string_is_sent_when_the_reply_ends_otherwise() {
+        let tokenizer = letter_tokenizer(8);
+        let whole = text_of(&events_of(
+            &DeterministicModel::new(8),
+            &tokenizer,
+            None,
+            stop_request(Vec::new(), 12),
+        ));
+        // What the reply ends on, followed by a token it never writes.
+        let held = format!("{}\u{1}", &whole[11..]);
+        let events = events_of(
+            &DeterministicModel::new(8),
+            &tokenizer,
+            None,
+            stop_request(vec![held], 12),
+        );
+        assert_eq!(text_of(&events), whole);
+        assert_eq!(finish_of(&events).0, FinishReason::Length);
+    }
+
+    /// With a draft verifying, tokens are picked ahead of their turn. What is
+    /// reported about each has to stay with it: the same tokens, in order, as
+    /// plain decoding reports.
+    #[test]
+    fn a_draft_never_changes_what_logprobs_report() {
+        let tokenizer = letter_tokenizer(8);
+        let request = || GenerateRequest {
+            logprobs: Some(2),
+            ..stop_request(Vec::new(), 30)
+        };
+        let plain = events_of(&DeterministicModel::new(8), &tokenizer, None, request());
+        let draft = DraftModel {
+            model: Arc::new(DeterministicModel::new(8)),
+            tokens: 4,
+            label: "test-draft".to_string(),
+        };
+        let drafted = events_of(
+            &DeterministicModel::new(8),
+            &tokenizer,
+            Some(&draft),
+            request(),
+        );
+        assert_eq!(text_of(&plain), text_of(&drafted));
+        let ids = |events: &[StreamEvent]| {
+            logprobs_of(events)
+                .iter()
+                .map(|r| (r.id, r.top.len()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&plain), ids(&drafted));
+        assert_eq!(ids(&plain).len(), 30, "one per generated token");
+        let text: String = logprobs_of(&plain)
+            .iter()
+            .filter_map(|r| tokenizer.token_text(r.id))
+            .collect();
+        assert_eq!(text, text_of(&plain), "each record is its own token's");
+    }
+
+    /// A stop takes its text away, and what is reported about that text with
+    /// it: `logprobs` describes the reply the client got.
+    #[test]
+    fn logprobs_stop_with_the_text() {
+        let tokenizer = letter_tokenizer(8);
+        let whole = text_of(&events_of(
+            &DeterministicModel::new(8),
+            &tokenizer,
+            None,
+            stop_request(Vec::new(), 40),
+        ));
+        let stop = whole[10..12].to_string();
+        let at = whole.find(&stop).unwrap();
+        let events = events_of(
+            &DeterministicModel::new(8),
+            &tokenizer,
+            None,
+            GenerateRequest {
+                logprobs: Some(0),
+                ..stop_request(vec![stop], 40)
+            },
+        );
+        assert_eq!(text_of(&events), whole[..at]);
+        assert_eq!(logprobs_of(&events).len(), at);
+    }
+
+    /// Nothing is recorded for a request that did not ask, and what the sampler
+    /// needs the host for stays off.
+    #[test]
+    fn no_logprobs_are_sent_unless_asked_for() {
+        let events = events_of(
+            &DeterministicModel::new(8),
+            &letter_tokenizer(8),
+            None,
+            stop_request(Vec::new(), 5),
+        );
+        assert!(logprobs_of(&events).is_empty());
+    }
+
+    /// A special token is hidden unless the request's call syntax spells it:
+    /// a call taught by the template has to reach what reads it.
+    #[test]
+    fn a_special_token_the_learned_syntax_spells_is_sent() {
+        let tokenizer = suppressed_tokenizer(8);
+        let request = |call_markers| GenerateRequest {
+            call_markers,
+            ..stop_request(Vec::new(), 16)
+        };
+        let hidden = events_of(
+            &DeterministicModel::new(8),
+            &tokenizer,
+            None,
+            request(vec![]),
+        );
+        assert_eq!(text_of(&hidden), "");
+        let shown = events_of(
+            &DeterministicModel::new(8),
+            &tokenizer,
+            None,
+            request(vec!["abcdefgh".to_string()]),
+        );
+        assert!(!text_of(&shown).is_empty());
     }
 
     /// **The property the whole feature rests on.** A draft model may only
@@ -8236,6 +9114,7 @@ mod tests {
                 repeat_penalty: 1.0,
                 repeat_last_n: 0,
                 seed,
+                ..SamplingParams::default()
             };
             let plain = run_request_sampling(
                 &DeterministicModel::new(8),
@@ -8359,6 +9238,7 @@ mod tests {
             repeat_penalty: 1.0,
             repeat_last_n: 0,
             seed: 7,
+            ..SamplingParams::default()
         };
         for sampling in [greedy_params(), sampled] {
             let baseline = DeterministicModel::new(9);

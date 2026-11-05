@@ -177,6 +177,9 @@ pub struct ChatTemplate {
     /// Whether the template takes a tool call's arguments only as JSON text
     /// (it joins them to a string with `+`).
     text_arguments: bool,
+    /// The call syntax this template teaches, when no parser knows it: read
+    /// once, on the first request that declares tools.
+    learned_calls: std::sync::OnceLock<Option<std::sync::Arc<super::tool_learn::LearnedCalls>>>,
 }
 
 /// What a request wants from a reasoning model: whether it should think at
@@ -209,6 +212,14 @@ pub struct Reasoning<'a> {
 }
 
 impl ChatTemplate {
+    /// The call syntax read off this template, for a model no hand-written
+    /// parser reads. See [`super::tool_learn`].
+    pub fn learned_calls(&self) -> Option<std::sync::Arc<super::tool_learn::LearnedCalls>> {
+        self.learned_calls
+            .get_or_init(|| super::tool_learn::LearnedCalls::learn(self).map(std::sync::Arc::new))
+            .clone()
+    }
+
     pub fn new(source: String) -> Self {
         let mut env = Environment::new();
         env.add_function("raise_exception", |msg: String| {
@@ -237,6 +248,7 @@ impl ChatTemplate {
             env,
             nine_char_ids: false,
             text_arguments: false,
+            learned_calls: std::sync::OnceLock::new(),
         };
         let object = || serde_json::json!({"k": "v"});
         let text = || serde_json::json!("{\"k\": \"v\"}");

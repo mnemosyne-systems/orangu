@@ -2007,6 +2007,24 @@ pub(crate) fn handle_command(
             }
             Err(err) => Ok(local_command_error(err)),
         },
+        LocalCommand::Infill(None) => Ok(CommandOutcome::OutputError(
+            crate::infill::USAGE.to_string(),
+        )),
+        LocalCommand::Infill(Some(argument)) => {
+            let Some(location) = crate::infill::parse_location(&argument) else {
+                return Ok(CommandOutcome::OutputError(
+                    crate::infill::USAGE.to_string(),
+                ));
+            };
+            let profile = llms[active_model].clone();
+            let workspace = workspace.to_path_buf();
+            let graph = tools.graph_store.clone();
+            Ok(CommandOutcome::Blocking(Box::new(move || {
+                tokio::runtime::Handle::current().block_on(crate::infill::complete_at(
+                    &profile, &workspace, &location, &graph,
+                ))
+            })))
+        }
         LocalCommand::Search(None) => Ok(CommandOutcome::OutputError(
             "Usage: /search <query>".to_string(),
         )),

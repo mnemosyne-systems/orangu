@@ -45,7 +45,7 @@ use std::{cmp::Reverse, collections::BinaryHeap, fs, path::Path};
 
 /// The generic GPT-2-shaped pre-tokenizer split, character for character
 /// what a `"gpt2"` vocabulary with an unrecognised `tokenizer.ggml.pre` is
-/// read back with.
+/// read back with, and with the same treatment of its `\s+`: see [`word_end`].
 pub const SPLIT_PATTERN: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+";
 
 /// What the split pattern's character classes are, for one ASCII byte.
@@ -124,11 +124,18 @@ impl Splitter {
         }
     }
 
-    /// The compiled pattern, for the differential test that keeps the
-    /// scanner honest.
+    /// The pieces by the pattern alone, for the differential test that keeps
+    /// the scanner honest.
     #[cfg(test)]
-    pub fn pattern(&self) -> &regex::Regex {
-        &self.pattern
+    pub fn by_pattern<'t>(&self, text: &'t str) -> Vec<&'t str> {
+        let mut pieces = Vec::new();
+        let mut at = 0;
+        while let Some(m) = self.pattern.find_at(text, at) {
+            let end = word_end(text, m.start(), m.end());
+            pieces.push(&text[m.start()..end]);
+            at = end;
+        }
+        pieces
     }
 
     /// The end of the match starting at `at`, or `None` when deciding it
@@ -211,17 +218,37 @@ impl<'t> Iterator for Pieces<'_, 't> {
             return None;
         }
         let bytes = self.text.as_bytes();
-        if let Some(end) = Splitter::ascii_match(bytes, self.at) {
-            let piece = &self.text[self.at..end];
-            self.at = end;
-            return Some(piece);
+        let end = match Splitter::ascii_match(bytes, self.at) {
+            Some(end) => end,
+            None => {
+                // Every character matches one alternative or another, so the
+                // pattern always matches at `at` — never past it.
+                let m = self.splitter.pattern.find_at(self.text, self.at)?;
+                debug_assert_eq!(m.start(), self.at);
+                m.end()
+            }
+        };
+        let end = word_end(self.text, self.at, end);
+        let piece = &self.text[self.at..end];
+        self.at = end;
+        Some(piece)
+    }
+}
+
+/// Where a match really ends. The reader's split is `\s+(?!\S)|\s+`, and this
+/// crate cannot compile the look-ahead: a whitespace run with something after
+/// it gives back its last character, which goes with the word that follows.
+fn word_end(text: &str, start: usize, end: usize) -> usize {
+    let word = &text[start..end];
+    let followed = text[end..]
+        .chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace());
+    match word.char_indices().next_back() {
+        Some((last_at, _)) if last_at > 0 && followed && word.chars().all(char::is_whitespace) => {
+            start + last_at
         }
-        // Every character matches one alternative or another, so the
-        // pattern always matches at `at` — never past it.
-        let m = self.splitter.pattern.find_at(self.text, self.at)?;
-        debug_assert_eq!(m.start(), self.at);
-        self.at = m.end();
-        Some(m.as_str())
+        _ => end,
     }
 }
 
@@ -876,11 +903,7 @@ mod tests {
             "'\u{e9}",
         ] {
             let scanned: Vec<&str> = splitter.split(text).collect();
-            let matched: Vec<&str> = splitter
-                .pattern()
-                .find_iter(text)
-                .map(|m| m.as_str())
-                .collect();
+            let matched: Vec<&str> = splitter.by_pattern(text);
             assert_eq!(scanned, matched, "disagreed on {text:?}");
             // Whatever it splits into, it must still be the whole input.
             assert_eq!(scanned.concat(), text);
@@ -926,11 +949,7 @@ mod tests {
                 };
                 let text = &text[..text.len().min(1 << 20)];
                 let scanned: Vec<&str> = splitter.split(text).collect();
-                let matched: Vec<&str> = splitter
-                    .pattern()
-                    .find_iter(text)
-                    .map(|m| m.as_str())
-                    .collect();
+                let matched: Vec<&str> = splitter.by_pattern(text);
                 assert_eq!(scanned, matched, "disagreed on {}", path.display());
                 files += 1;
                 bytes += text.len();
@@ -950,14 +969,23 @@ mod tests {
         for (at, _) in SPLIT_CASES.char_indices() {
             let tail = &SPLIT_CASES[at..];
             let scanned: Vec<&str> = splitter.split(tail).take(4).collect();
-            let matched: Vec<&str> = splitter
-                .pattern()
-                .find_iter(tail)
-                .take(4)
-                .map(|m| m.as_str())
-                .collect();
+            let matched: Vec<&str> = splitter.by_pattern(tail).into_iter().take(4).collect();
             assert_eq!(scanned, matched, "disagreed starting at byte {at}");
         }
+    }
+
+    /// What a reader does with whitespace before a word, which is what the
+    /// merges have to be trained on: an indented line's word takes a space.
+    #[test]
+    fn the_last_whitespace_before_a_word_goes_with_the_word() {
+        let splitter = Splitter::new().unwrap();
+        let split = |text| splitter.split(text).collect::<Vec<_>>();
+        assert_eq!(split("\n    x"), ["\n   ", " x"]);
+        assert_eq!(split("a  b"), ["a", " ", " b"]);
+        assert_eq!(split("\n\nx"), ["\n", "\n", "x"]);
+        assert_eq!(split("\tx"), ["\t", "x"]);
+        assert_eq!(split("x   "), ["x", "   "]);
+        assert_eq!(split("\n  \u{e9}"), ["\n ", " \u{e9}"]);
     }
 
     #[test]

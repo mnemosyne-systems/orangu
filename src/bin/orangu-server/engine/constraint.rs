@@ -471,6 +471,52 @@ impl JsonPrefix {
     }
 }
 
+/// The start of a reply held to one of a fixed set of byte strings: a tool
+/// call's name, followed by whatever the call's syntax puts after a name.
+///
+/// A token may run past the end of a string, since a tokenizer can hold a
+/// name's last letters and the punctuation after it in one token.
+#[derive(Clone, Debug)]
+pub struct OneOfPrefix {
+    candidates: Vec<Vec<u8>>,
+    taken: Vec<u8>,
+}
+
+impl OneOfPrefix {
+    pub fn new(candidates: Vec<Vec<u8>>) -> Self {
+        Self {
+            candidates,
+            taken: Vec::new(),
+        }
+    }
+
+    pub fn allows(&self, bytes: &[u8]) -> bool {
+        let next = [self.taken.as_slice(), bytes].concat();
+        self.compatible(&next)
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> bool {
+        self.taken.extend_from_slice(bytes);
+        self.compatible(&self.taken)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.candidates.iter().any(|c| self.taken.starts_with(c))
+    }
+
+    /// Whether nothing is left to hold: a string is complete, or a token the
+    /// sampler had no legal alternative to has left all of them behind.
+    pub fn is_finished(&self) -> bool {
+        self.is_complete() || !self.compatible(&self.taken)
+    }
+
+    fn compatible(&self, text: &[u8]) -> bool {
+        self.candidates
+            .iter()
+            .any(|c| c.starts_with(text) || text.starts_with(c))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

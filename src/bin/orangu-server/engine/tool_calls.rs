@@ -225,6 +225,14 @@ fn recover_unopened(text: &str) -> Option<(usize, Vec<ParsedToolCall>, &str)> {
     Some((body_start, parsed, &text[at + CLOSE.len()..]))
 }
 
+/// Every delimiter that ends a call, for a reply that ends at its first one.
+pub fn closers() -> impl Iterator<Item = &'static str> {
+    FORMATS
+        .iter()
+        .map(|(_, close, _)| *close)
+        .filter(|close| !close.is_empty())
+}
+
 /// Where the first tool-call opener in `text` starts, and which one it is.
 pub fn first_opener(text: &str) -> Option<(usize, &'static str)> {
     next_opener(text).map(|(at, open, _, _)| (at, open))
@@ -608,7 +616,7 @@ fn take_between<'a>(rest: &mut &'a str, open: &str, close: &str) -> Option<&'a s
 /// structures as JSON, with nothing marking which is which. Trying JSON first
 /// keeps an object an object; falling back to a string keeps a sentence a
 /// sentence rather than dropping the argument.
-fn scalar_or_json(raw: &str) -> Value {
+pub(crate) fn scalar_or_json(raw: &str) -> Value {
     let trimmed = raw.trim();
     match serde_json::from_str::<Value>(trimmed) {
         Ok(value) => value,
