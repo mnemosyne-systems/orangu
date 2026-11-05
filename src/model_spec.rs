@@ -23,7 +23,7 @@ use crate::format::format_bytes;
 use crate::gguf::{GgufFile, ggml_type_name};
 use anyhow::{Context, Result};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -43,14 +43,17 @@ pub struct ModelSummary {
 /// non-models are deliberately excluded so only real, distinct models are
 /// counted and listed:
 ///
-/// - **Duplicate underlying files.** A model cache (Hugging Face's hub
-///   cache in particular) can reference the exact same downloaded bytes
-///   from more than one directory — most commonly two snapshot revisions of
-///   one repo whose ref moved without the file's content changing, where
-///   the cache reuses (symlinks to) the already-downloaded blob rather than
-///   fetching it again. Resolving each candidate to its real, symlink-free
-///   path and keeping only the first occurrence collapses these back down
-///   to one entry per physical file.
+/// - **Duplicate models.** A model cache (Hugging Face's hub cache in
+///   particular) can reference the exact same downloaded bytes from more
+///   than one directory — most commonly two snapshot revisions of one repo
+///   whose ref moved without the file's content changing, where the cache
+///   reuses (symlinks to) the already-downloaded blob rather than fetching
+///   it again. A model whose shards all resolve to real, symlink-free files
+///   of another model is dropped whole: an identical set keeps the first,
+///   and a smaller one is what a superseded revision leaves behind once
+///   its own shards are gone. A model with any file of its own is not a
+///   duplicate: two quantizations of one repo can share a table shard, and
+///   each still needs every shard it names.
 /// - **Companion sidecars.** A multimodal projector ("mmproj", see
 ///   [`GgufFile::is_clip_projector`]) and a multi-token-prediction draft
 ///   head (`MTP/mtp-*.gguf`, see [`crate::model_download::is_mtp_head`])
@@ -85,11 +88,11 @@ pub fn scan_models_dir(dir: &Path) -> Result<Vec<ModelSummary>> {
         .collect();
     paths.sort();
 
-    let mut seen_targets = std::collections::HashSet::new();
+    let duplicate_models = duplicate_models(&paths);
+
     let mut summaries = Vec::new();
     for path in paths {
-        let real_path = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        if !seen_targets.insert(real_path) {
+        if duplicate_models.contains(&model_group_key(&path)) {
             continue;
         }
 
@@ -118,6 +121,29 @@ pub fn scan_models_dir(dir: &Path) -> Result<Vec<ModelSummary>> {
     }
 
     Ok(summaries)
+}
+
+/// The models among `paths` that hold no file of their own, see
+/// [`scan_models_dir`].
+fn duplicate_models(paths: &[PathBuf]) -> HashSet<(PathBuf, String)> {
+    let mut targets_by_model: BTreeMap<(PathBuf, String), BTreeSet<PathBuf>> = BTreeMap::new();
+    for path in paths {
+        targets_by_model
+            .entry(model_group_key(path))
+            .or_default()
+            .insert(std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()));
+    }
+    let models: Vec<_> = targets_by_model.into_iter().collect();
+    models
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, targets))| {
+            models.iter().enumerate().any(|(other, (_, candidate))| {
+                targets.is_subset(candidate) && (targets.len() < candidate.len() || other < *index)
+            })
+        })
+        .map(|(_, (key, _))| key.clone())
+        .collect()
 }
 
 /// The architecture an opened header's tensor names spell out (see
@@ -1117,9 +1143,9 @@ pub fn resolve_refresh_target(models_dir: &Path, requested: &str) -> Result<Mode
 /// a repo's ref can move without a file's content changing, in which case
 /// the cache reuses (symlinks to), rather than re-fetches, the
 /// already-downloaded blob (`scan_models_dir`'s own dedup logic collapses
-/// that pair down to one listed file, so the *other* snapshot's symlink —
+/// that pair down to one listed model, so the *other* snapshot's symlink —
 /// not part of `group`, since it was never listed — must not be left
-/// dangling). Empty snapshot/model directories left behind are removed
+/// dangling), and two quantizations can share a shard outright. Empty snapshot/model directories left behind are removed
 /// too, walking up from each deleted path but never past `models_dir`
 /// itself, which is left alone regardless of what remains inside it.
 ///
@@ -1541,6 +1567,14 @@ impl ModelGroup {
     }
 }
 
+/// The (parent directory, shard-suffix-stripped file stem) pair naming the
+/// model a file belongs to.
+fn model_group_key(path: &Path) -> (PathBuf, String) {
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    (parent, shard_group_label(stem).to_string())
+}
+
 /// Collapses a multi-part model's shard files (`name-00001-of-00004.gguf`,
 /// `name-00002-of-00004.gguf`, ...) into a single [`ModelGroup`]: one entry
 /// per model rather than one per shard, with `size_bytes` summed across
@@ -1577,28 +1611,16 @@ pub fn group_models(models: &[ModelSummary]) -> Vec<ModelGroup> {
 
     let mut groups: BTreeMap<(PathBuf, String), Accumulator> = BTreeMap::new();
     for model in models {
-        let parent = model
-            .path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        let stem = model
-            .path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("");
-        let shard_label = shard_group_label(stem).to_string();
-
-        let acc = groups
-            .entry((parent, shard_label.clone()))
-            .or_insert_with(|| Accumulator {
-                representative_path: model.path.clone(),
-                paths: Vec::new(),
-                shard_label,
-                size_bytes: 0,
-                type_totals: HashMap::new(),
-                errors: Vec::new(),
-            });
+        let key = model_group_key(&model.path);
+        let shard_label = key.1.clone();
+        let acc = groups.entry(key).or_insert_with(|| Accumulator {
+            representative_path: model.path.clone(),
+            paths: Vec::new(),
+            shard_label,
+            size_bytes: 0,
+            type_totals: HashMap::new(),
+            errors: Vec::new(),
+        });
         acc.paths.push(model.path.clone());
         acc.size_bytes += model.size_bytes;
         match &model.error {
@@ -2567,6 +2589,155 @@ mod tests {
 
         let models = scan_models_dir(dir.path()).unwrap();
         assert_eq!(models.len(), 1);
+    }
+
+    /// Hugging Face-style cache holding two three-shard quantizations of one
+    /// repo that share their last shard, one blob per shard.
+    #[cfg(unix)]
+    fn write_quants_sharing_a_shard(root: &Path) -> PathBuf {
+        let repo = root.join("models--org--model");
+        let snapshot = repo.join("snapshots/rev1");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        for (quant, parts) in [
+            ("IQ1_M", ["m1", "m2", "shared"]),
+            ("IQ1_S", ["s1", "s2", "shared"]),
+        ] {
+            let dir = snapshot.join(format!("UD-{quant}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for (index, blob) in parts.iter().enumerate() {
+                let target = repo.join("blobs").join(blob);
+                write_minimal_gguf(&target, "llama", None);
+                let shard = index + 1;
+                let link = dir.join(format!("model-UD-{quant}-{shard:05}-of-00003.gguf"));
+                std::os::unix::fs::symlink(&target, link).unwrap();
+            }
+        }
+        repo
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quantizations_sharing_a_shard_each_list_every_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        write_quants_sharing_a_shard(dir.path());
+
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        assert_eq!(groups.len(), 2);
+        let shard_size = std::fs::metadata(dir.path().join("models--org--model/blobs/shared"))
+            .unwrap()
+            .len();
+        for group in &groups {
+            assert_eq!(group.paths.len(), 3, "{}", group.label);
+            assert_eq!(group.size_bytes, 3 * shard_size, "{}", group.label);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quantizations_sharing_a_shard_match_the_repo_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        write_quants_sharing_a_shard(dir.path());
+        let files = ["IQ1_M", "IQ1_S"]
+            .iter()
+            .zip([["m1", "m2", "shared"], ["s1", "s2", "shared"]])
+            .flat_map(|(quant, oids)| {
+                oids.into_iter().enumerate().map(move |(index, oid)| {
+                    crate::model_download::RepoFile {
+                        path: format!("UD-{quant}/model-UD-{quant}-{:05}-of-00003.gguf", index + 1),
+                        oid: oid.to_string(),
+                        size: 0,
+                    }
+                })
+            })
+            .collect();
+        let updates = HashMap::from([(
+            "org/model".to_string(),
+            crate::model_download::RepoUpdateInfo {
+                commit: "rev1".to_string(),
+                files,
+            },
+        )]);
+
+        for group in group_models(&scan_models_dir(dir.path()).unwrap()) {
+            assert!(!group.is_behind(&updates), "{}", group.label);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_a_quantization_keeps_the_shard_another_one_shares() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = write_quants_sharing_a_shard(dir.path());
+
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        delete_model(dir.path(), &groups[0]).unwrap();
+
+        assert!(repo.join("blobs/shared").exists());
+        let left = group_models(&scan_models_dir(dir.path()).unwrap());
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].paths.len(), 3);
+        assert!(left[0].paths.iter().all(|path| path.exists()));
+
+        delete_model(dir.path(), &left[0]).unwrap();
+        assert!(!repo.exists(), "nothing else referenced the shared shard");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collapses_a_multi_part_model_repeated_across_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs = dir.path().join("blobs");
+        std::fs::create_dir(&blobs).unwrap();
+        for rev in ["rev1", "rev2"] {
+            std::fs::create_dir(dir.path().join(rev)).unwrap();
+        }
+        for (blob, shard) in [("a", 1), ("b", 2)] {
+            write_minimal_gguf(&blobs.join(blob), "llama", None);
+            for rev in ["rev1", "rev2"] {
+                let link = dir
+                    .path()
+                    .join(rev)
+                    .join(format!("model-{shard:05}-of-00002.gguf"));
+                std::os::unix::fs::symlink(blobs.join(blob), link).unwrap();
+            }
+        }
+
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].paths.len(), 2);
+        assert!(groups[0].paths[0].starts_with(dir.path().join("rev1")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_revision_left_with_only_shards_of_a_newer_one_is_not_a_model() {
+        // Whichever revision sorts first, the complete model is the row.
+        for (leftover, complete) in [("rev1", "rev2"), ("rev2", "rev1")] {
+            let dir = tempfile::tempdir().unwrap();
+            let blobs = dir.path().join("blobs");
+            std::fs::create_dir(&blobs).unwrap();
+            for rev in [leftover, complete] {
+                std::fs::create_dir(dir.path().join(rev)).unwrap();
+            }
+            for (blob, shard) in [("a", 1), ("b", 2), ("c", 3)] {
+                write_minimal_gguf(&blobs.join(blob), "llama", None);
+                let name = format!("model-{shard:05}-of-00003.gguf");
+                std::os::unix::fs::symlink(blobs.join(blob), dir.path().join(complete).join(&name))
+                    .unwrap();
+                if shard > 1 {
+                    std::os::unix::fs::symlink(
+                        blobs.join(blob),
+                        dir.path().join(leftover).join(&name),
+                    )
+                    .unwrap();
+                }
+            }
+
+            let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+            assert_eq!(groups.len(), 1, "{complete} is the complete revision");
+            assert_eq!(groups[0].paths.len(), 3);
+            assert!(groups[0].paths[0].starts_with(dir.path().join(complete)));
+        }
     }
 
     #[test]

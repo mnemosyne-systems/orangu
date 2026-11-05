@@ -378,6 +378,7 @@ const SWEEP_FORMATS: &[(&str, u32)] = &[
     ("IQ4_XS", crate::engine::quant::GGML_TYPE_IQ4_XS),
     ("IQ3_S", crate::engine::quant::GGML_TYPE_IQ3_S),
     ("IQ2_S", crate::engine::quant::GGML_TYPE_IQ2_S),
+    ("Q2_0", crate::engine::quant::GGML_TYPE_Q2_0),
     ("PQ2_0", crate::engine::quant::GGML_TYPE_PQ2_0),
     ("PTQ1_0", crate::engine::quant::GGML_TYPE_PTQ1_0),
     ("Q6_K", crate::engine::quant::GGML_TYPE_Q6_K),

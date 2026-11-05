@@ -3768,6 +3768,7 @@ pub(crate) const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_IQ4_NL,
     crate::engine::quant::GGML_TYPE_IQ4_XS,
     crate::engine::quant::GGML_TYPE_MXFP4,
+    crate::engine::quant::GGML_TYPE_Q2_0,
     crate::engine::quant::GGML_TYPE_PQ2_0,
     crate::engine::quant::GGML_TYPE_PTQ1_0,
 ];

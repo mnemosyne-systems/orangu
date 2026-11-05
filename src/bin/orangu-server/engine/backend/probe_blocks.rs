@@ -54,8 +54,8 @@ use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
-    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
-    GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 pub(crate) fn next_byte(seed: &mut u64) -> u8 {
@@ -134,6 +134,10 @@ pub(crate) fn build_block(ggml_type: u32, seed: &mut u64) -> Vec<u8> {
         t if t == GGML_TYPE_Q8_0 => {
             out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
             out.extend(next_bytes(seed, 32));
+        }
+        t if t == GGML_TYPE_Q2_0 => {
+            out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+            out.extend(next_bytes(seed, 16));
         }
         // Prism's 128-element ternary pair: `PQ2_0` is `d` then 32 bytes of
         // 2-bit fields; `PTQ1_0` is 26 bytes of base-3 trits with `d`

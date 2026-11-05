@@ -21,8 +21,8 @@ use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
-    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
-    GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 /// The RMSNorm width rule must reproduce every width it was measured at,
@@ -1481,6 +1481,7 @@ fn block_elems(ggml_type: u32) -> usize {
         {
             32
         }
+        t if t == GGML_TYPE_Q2_0 => 64,
         t if t == GGML_TYPE_PQ2_0 || t == GGML_TYPE_PTQ1_0 => 128,
         _ => 256,
     }
@@ -2300,6 +2301,12 @@ fn cross_check_decode(ggml_type: u32, in_dim: usize) {
 fn decode_matvec_matches_cpu_backend_for_the_ternary_types_model_shaped() {
     cross_check_decode(GGML_TYPE_PTQ1_0, 5120);
     cross_check_decode(GGML_TYPE_PQ2_0, 5120);
+}
+
+#[test]
+fn decode_matvec_matches_cpu_backend_for_q2_0_model_shaped() {
+    cross_check_decode(GGML_TYPE_Q2_0, 640);
+    cross_check_decode(GGML_TYPE_Q2_0, 5120);
 }
 
 #[test]
@@ -3744,6 +3751,18 @@ fn matmul_matches_cpu_backend_for_mxfp4() {
 /// exercised. `out_dim = 5` keeps a trailing row for the multi-row
 /// block-hoisted kernel's tail.
 #[test]
+fn matmul_matches_cpu_backend_for_q2_0() {
+    cross_check(GGML_TYPE_Q2_0, 5120, 5);
+    cross_check(GGML_TYPE_Q2_0, 64, 3);
+    // A routed expert's `ffn_down_exps` shape: 180-byte rows, and blocks at
+    // half-word offsets within them.
+    cross_check(GGML_TYPE_Q2_0, 640, 2560);
+    cross_check(GGML_TYPE_Q2_0, 2048, 2055);
+    // Wide enough for the four-row block-hoisted variant.
+    cross_check(GGML_TYPE_Q2_0, 1024, 2048);
+}
+
+#[test]
 fn matmul_matches_cpu_backend_for_pq2_0() {
     cross_check(GGML_TYPE_PQ2_0, 5120, 5);
     cross_check(GGML_TYPE_PQ2_0, 128, 3);
@@ -3783,6 +3802,11 @@ fn a_wide_words_type_projection_is_computed_in_full_by_the_batched_matmul() {
 }
 
 /// The cooperative-tiled (prefill) path over the same two types.
+#[test]
+fn matmul_matches_cpu_backend_cooperative_path_q2_0() {
+    cross_check_n_tokens(GGML_TYPE_Q2_0, 1024, 64, 130);
+}
+
 #[test]
 fn matmul_matches_cpu_backend_cooperative_path_pq2_0() {
     cross_check_n_tokens(GGML_TYPE_PQ2_0, 1024, 64, 130);

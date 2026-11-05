@@ -49,8 +49,8 @@ use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
     GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
-    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0,
-    GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K,
+    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
 };
 
 /// Storage/uniform bindings every shader shares, plus byte- and half-float-
@@ -1975,6 +1975,21 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 }
 "#;
 
+/// `block_q2_0`: mirrors `quant::unpack_block_q2_0` — one `f16` scale then
+/// 16 bytes of four 2-bit fields each, field `k % 4` of byte `k / 4`, `0..=3`
+/// standing for `-1..=2`.
+const Q2_0_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 18u;
+const BLOCK_ELEMS: u32 = 64u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let d = f16_to_f32(read_u8(byte_offset) | (read_u8(byte_offset + 1u) << 8u));
+    let byte = read_u8(byte_offset + 2u + (k >> 2u));
+    let q = (byte >> ((k & 3u) * 2u)) & 3u;
+    return (f32(q) - 1.0) * d;
+}
+"#;
+
 /// `block_ptq1_0`: mirrors `quant::unpack_block_ptq1_0` — `TQ1_0`'s base-3
 /// trits at group 128 with the `f16` scale **last** (byte 26). Element `k`
 /// is trit `n` (most significant first) of one byte: `k < 80` is byte
@@ -3570,6 +3585,30 @@ fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
 }
 "#;
 
+/// `block_q2_0` for [`block_hoisted_suffix`], read as words: a lane's 16
+/// elements are the four 2-bit fields of each of four consecutive bytes —
+/// one word of the payload — against four `vec4` activations. The block is
+/// 18 bytes, so the word and the scale go through the unaligned readers.
+const Q2_0_WORDS_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 18u;
+const BLOCK_ELEMS: u32 = 64u;
+const LANES_PER_BLOCK: u32 = 4u;
+// One byte's four fields as `-1..=2`, in element order.
+fn fields4(b: u32) -> vec4<f32> {
+    return vec4<f32>(f32(b & 3u), f32((b >> 2u) & 3u), f32((b >> 4u) & 3u), f32(b >> 6u)) - vec4<f32>(1.0);
+}
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_at(byte_offset));
+    let w = read_u32_at(byte_offset + 2u + 4u * sub);
+    let xi = (x_off + 16u * sub) / 4u;
+    var acc: f32 = dot(fields4(w & 0xFFu), xv(xi));
+    acc = acc + dot(fields4((w >> 8u) & 0xFFu), xv(xi + 1u));
+    acc = acc + dot(fields4((w >> 16u) & 0xFFu), xv(xi + 2u));
+    acc = acc + dot(fields4(w >> 24u), xv(xi + 3u));
+    return acc * d;
+}
+"#;
+
 /// `block_ptq1_0` for [`block_hoisted_suffix`], read as words. The block is
 /// 28 bytes — seven words, always word-aligned — with the scale in the top
 /// half of the last. Sixteen lanes per block and **no branch**: every lane
@@ -5032,6 +5071,7 @@ fn block_hoisted_words_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_WORDS_MIDDLE,
         t if t == GGML_TYPE_IQ3_S => IQ3_S_WORDS_MIDDLE,
         t if t == GGML_TYPE_IQ2_S => IQ2_S_WORDS_MIDDLE,
+        t if t == GGML_TYPE_Q2_0 => Q2_0_WORDS_MIDDLE,
         t if t == GGML_TYPE_PQ2_0 => PQ2_0_WORDS_MIDDLE,
         t if t == GGML_TYPE_PTQ1_0 => PTQ1_0_WORDS_MIDDLE,
         _ => return None,
@@ -5289,6 +5329,25 @@ fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
 }
 "#;
 
+/// `block_q2_0` on the integer dot: a lane is one payload word, each of its
+/// bytes spread to four signed fields against one activation word.
+const Q2_0_I8_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 18u;
+const BLOCK_ELEMS: u32 = 64u;
+const LANES_PER_BLOCK: u32 = 4u;
+fn fields4_i8(b: u32) -> u32 {
+    let nib = (b | (b << 12u)) & 0x000F000Fu;
+    return sub_bytes((nib | (nib << 6u)) & 0x03030303u, 0x01010101u);
+}
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let d = f16_to_f32(read_u16_even(byte_offset));
+    let w = read_u32_at(byte_offset + 2u + 4u * sub);
+    let q = vec4<u32>(fields4_i8(w & 0xFFu), fields4_i8((w >> 8u) & 0xFFu), fields4_i8((w >> 16u) & 0xFFu), fields4_i8(w >> 24u));
+    let e = x_off + sub * 16u;
+    return q8_scale(e) * d * f32(idot4(q, q8_words(e)));
+}
+"#;
+
 /// See [`Q4_0_I8_MIDDLE`]; `m` is the stored minimum, applied through
 /// the four activations' quant sum.
 const Q4_1_I8_MIDDLE: &str = r#"
@@ -5366,6 +5425,7 @@ fn block_hoisted_i8_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_I8_MIDDLE,
         t if t == GGML_TYPE_IQ3_S => IQ3_S_I8_MIDDLE,
         t if t == GGML_TYPE_IQ2_S => IQ2_S_I8_MIDDLE,
+        t if t == GGML_TYPE_Q2_0 => Q2_0_I8_MIDDLE,
         t if t == GGML_TYPE_Q4_0 => Q4_0_I8_MIDDLE,
         t if t == GGML_TYPE_Q4_1 => Q4_1_I8_MIDDLE,
         t if t == GGML_TYPE_Q5_0 => Q5_0_I8_MIDDLE,
@@ -5552,6 +5612,7 @@ fn coop_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ4_NL => IQ4_NL_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_COOP_MIDDLE,
         t if t == GGML_TYPE_MXFP4 => MXFP4_COOP_MIDDLE,
+        t if t == GGML_TYPE_Q2_0 => Q2_0_COOP_MIDDLE,
         t if t == GGML_TYPE_PQ2_0 => PQ2_0_COOP_MIDDLE,
         t if t == GGML_TYPE_PTQ1_0 => PTQ1_0_COOP_MIDDLE,
         _ => return None,

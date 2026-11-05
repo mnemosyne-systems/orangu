@@ -48,10 +48,11 @@ use super::quant;
 use super::quant::unpack_block_pq2_0_neon;
 use super::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_NVFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
-    GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
-    GGML_TYPE_Q8_0, PQ2_0_BLOCK_BYTES, PTQ1_0_BLOCK_BYTES, QK_PRISM, get_scale_min_k4, read_f16,
-    unpack_block_pq2_0, unpack_block_ptq1_0, unpack_q3_k_scales,
+    GGML_TYPE_NVFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q2_K,
+    GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, PQ2_0_BLOCK_BYTES, PTQ1_0_BLOCK_BYTES, Q2_0_BLOCK_BYTES,
+    QK_PRISM, QK2_0, get_scale_min_k4, read_f16, unpack_block_pq2_0, unpack_block_ptq1_0,
+    unpack_block_q2_0, unpack_q3_k_scales,
 };
 use rayon::prelude::*;
 
@@ -283,6 +284,7 @@ pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
         }
         GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
         | GGML_TYPE_IQ4_XS => in_dim.is_multiple_of(256),
+        GGML_TYPE_Q2_0 => in_dim.is_multiple_of(QK2_0),
         GGML_TYPE_PQ2_0 | GGML_TYPE_PTQ1_0 => in_dim.is_multiple_of(QK_PRISM),
         GGML_TYPE_NVFP4 => in_dim.is_multiple_of(NVFP4_BLOCK),
         _ => false,
@@ -387,6 +389,7 @@ pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedR
         GGML_TYPE_Q4_K => unpack_q4_k(row, out),
         GGML_TYPE_Q5_K => unpack_q5_k(row, out),
         GGML_TYPE_Q6_K => unpack_q6_k(row, out),
+        GGML_TYPE_Q2_0 => unpack_q2_0(row, out),
         GGML_TYPE_PQ2_0 => unpack_pq2_0(row, out),
         GGML_TYPE_PTQ1_0 => unpack_ptq1_0(row, out),
         // Unreachable via `supports`, but a wrong answer here would be a
@@ -1426,6 +1429,23 @@ fn unpack_q4_0(row: &[u8], out: &mut UnpackedRow) {
         unpack_block_q4_0(&block[2..], w);
         out.scale[b] = dw;
         out.min[b] = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------- Q2_0
+
+/// `Q2_0` into the generic [`UnpackedRow`] form: the block's one scale
+/// repeated across its two 32-groups, no `min`.
+fn unpack_q2_0(row: &[u8], out: &mut UnpackedRow) {
+    out.has_min = false;
+    for (b, block) in row.as_chunks::<Q2_0_BLOCK_BYTES>().0.iter().enumerate() {
+        let dw = read_f16(block, 0);
+        let w: &mut [i8; QK2_0] = (&mut out.q[b * QK2_0..(b + 1) * QK2_0]).try_into().unwrap();
+        unpack_block_q2_0(&block[2..], w);
+        for s in 0..QK2_0 / 32 {
+            out.scale[b * (QK2_0 / 32) + s] = dw;
+            out.min[b * (QK2_0 / 32) + s] = 0.0;
+        }
     }
 }
 
@@ -5617,6 +5637,7 @@ pub fn supports_flat(ggml_type: u32, in_dim: usize) -> bool {
             | GGML_TYPE_Q5_0
             | GGML_TYPE_Q4_0
             | GGML_TYPE_IQ4_NL
+            | GGML_TYPE_Q2_0
             | GGML_TYPE_PQ2_0
             | GGML_TYPE_PTQ1_0
     ) && in_dim.is_multiple_of(ACT_BLOCK)
@@ -6240,6 +6261,7 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
         match ggml_type {
             GGML_TYPE_Q8_0 => return unsafe { dot_q8_0_avx2(row, act) },
             GGML_TYPE_Q4_0 => return unsafe { dot_q4_0_avx2(row, act) },
+            GGML_TYPE_Q2_0 => return unsafe { dot_q2_0_avx2(row, act) },
             GGML_TYPE_Q5_0 => return unsafe { dot_q5_x_avx2::<false>(row, act) },
             GGML_TYPE_Q5_1 => return unsafe { dot_q5_x_avx2::<true>(row, act) },
             _ => {}
@@ -6257,6 +6279,7 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
         GGML_TYPE_Q5_K => dot_q5_k::<ISA>(row, act),
         GGML_TYPE_Q6_K => dot_q6_k::<ISA>(row, act),
         GGML_TYPE_IQ4_XS => dot_iq4_xs::<ISA>(row, act),
+        GGML_TYPE_Q2_0 => dot_q2_0::<ISA>(row, act),
         GGML_TYPE_PQ2_0 => dot_pq2_0::<ISA>(row, act),
         GGML_TYPE_PTQ1_0 => dot_ptq1_0::<ISA>(row, act),
         GGML_TYPE_NVFP4 => dot_nvfp4::<ISA>(row, act),
@@ -6920,6 +6943,38 @@ unsafe fn dot_q4_0_avx2(row: &[u8], act: &ActQ8) -> f32 {
     }
 }
 
+/// `Q2_0`: [`dot_q4_0_avx2`]'s dot over the two 32-element activation
+/// blocks one weight block spans, under the one weight scale.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_q2_0_avx2(row: &[u8], act: &ActQ8) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let ones = _mm256_set1_epi16(1);
+        let mut accf = _mm256_setzero_ps();
+        for (b, block) in row.as_chunks::<Q2_0_BLOCK_BYTES>().0.iter().enumerate() {
+            let dw = read_f16(block, 0);
+            let qs: &[u8; QK2_0 / 4] = block[2..].try_into().unwrap();
+            let [w0, w1, w2, w3] = quant::unpack_q2_0_sse2(qs);
+            let ab = 2 * b;
+            for (s, w) in [_mm256_set_m128i(w1, w0), _mm256_set_m128i(w3, w2)]
+                .into_iter()
+                .enumerate()
+            {
+                let x = _mm256_loadu_si256(act.q.as_ptr().add((ab + s) * 32) as *const __m256i);
+                let p = _mm256_maddubs_epi16(_mm256_abs_epi8(x), _mm256_sign_epi8(w, x));
+                let sum = _mm256_madd_epi16(p, ones);
+                accf = _mm256_fmadd_ps(
+                    _mm256_set1_ps(dw * act.d[ab + s]),
+                    _mm256_cvtepi32_ps(sum),
+                    accf,
+                );
+            }
+        }
+        hsum_ps_avx2(accf)
+    }
+}
+
 /// `Q5_0` and `Q5_1` (`WITH_MIN`) a 32-block per pass: the nibbles with
 /// the fifth bit set from `qh` as [`unpack_block_q5_bits_avx2`] sets it,
 /// left **unsigned** (0..31) so the multiply is a plain `vpmaddubsw`
@@ -7022,6 +7077,25 @@ fn dot_q4_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
         let dw = read_f16(block, 0);
         unpack_block_q4_0_isa::<ISA>(&block[2..], &mut w);
         total += dw * act.d[b] * dot32::<ISA>(&w, &act.q[b * 32..]) as f32;
+    }
+    total
+}
+
+/// `block_q2_0`, 64 elements: one `f16` scale over two 32-element activation
+/// blocks. Symmetric (`-1..=2`), so each integer dot is scaled by its own
+/// activation scale and both are summed under the one weight scale.
+fn dot_q2_0<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    let mut total = 0f32;
+    let mut w = [0i8; QK2_0];
+    for (b, block) in row.as_chunks::<Q2_0_BLOCK_BYTES>().0.iter().enumerate() {
+        let dw = read_f16(block, 0);
+        unpack_block_q2_0(&block[2..], &mut w);
+        let mut sum = 0f32;
+        for s in 0..QK2_0 / ACT_BLOCK {
+            let ab = b * (QK2_0 / ACT_BLOCK) + s;
+            sum += act.d[ab] * dot32::<ISA>(&w[s * ACT_BLOCK..], &act.q[ab * ACT_BLOCK..]) as f32;
+        }
+        total += dw * sum;
     }
     total
 }
@@ -8579,6 +8653,7 @@ mod tests {
             GGML_TYPE_Q5_K => (176, 256),
             GGML_TYPE_Q6_K => (210, 256),
             GGML_TYPE_IQ4_XS => (136, 256),
+            GGML_TYPE_Q2_0 => (18, 64),
             GGML_TYPE_PQ2_0 => (34, 128),
             GGML_TYPE_PTQ1_0 => (28, 128),
             GGML_TYPE_NVFP4 => (36, 64),
@@ -8614,7 +8689,7 @@ mod tests {
                 GGML_TYPE_Q3_K => block[108..110].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_Q6_K => block[208..210].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
-                GGML_TYPE_PQ2_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_Q2_0 | GGML_TYPE_PQ2_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 // `PTQ1_0` is the other type with a trailing `d`.
                 GGML_TYPE_PTQ1_0 => block[26..28].copy_from_slice(&[0x00, 0x30]),
                 // Four UE4M3 sub-block scales, kept finite and nonzero
@@ -8804,6 +8879,7 @@ mod tests {
             GGML_TYPE_Q5_K => (176, 256),
             GGML_TYPE_Q6_K => (210, 256),
             GGML_TYPE_IQ4_XS => (136, 256),
+            GGML_TYPE_Q2_0 => (18, 64),
             GGML_TYPE_PQ2_0 => (34, 128),
             GGML_TYPE_PTQ1_0 => (28, 128),
             GGML_TYPE_NVFP4 => (36, 64),
@@ -8824,7 +8900,7 @@ mod tests {
                 }
                 GGML_TYPE_Q3_K => block[108..110].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_Q6_K => block[208..210].copy_from_slice(&[0x00, 0x30]),
-                GGML_TYPE_PQ2_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_Q2_0 | GGML_TYPE_PQ2_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_PTQ1_0 => block[26..28].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_NVFP4 => {
                     for (i, s) in block[0..4].iter_mut().enumerate() {
@@ -9775,6 +9851,55 @@ mod tests {
             check(GGML_TYPE_Q4_0, 32, seed);
             check(GGML_TYPE_Q4_0, 896, seed);
             check(GGML_TYPE_Q4_0, 4864, seed);
+        }
+    }
+
+    /// `Q2_0`: 64-element blocks. 640 is the width a routed expert's
+    /// `ffn_down_exps` carries it at; 64 is one block, and 5120 is wide
+    /// enough for a kernel's whole-register passes to repeat.
+    #[test]
+    fn q2_0_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_Q2_0, 64, seed);
+            check(GGML_TYPE_Q2_0, 640, seed);
+            check(GGML_TYPE_Q2_0, 5120, seed);
+        }
+    }
+
+    /// The row-wide `AVX2` kernel against the per-32 form, over every 2-bit
+    /// pattern and a scale that changes per block: both dot the same integers
+    /// under the same scales, so they agree to a few ulps of the row's sum.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn q2_0_avx2_kernel_matches_the_portable_one() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+        for in_dim in [64usize, 640, 5120] {
+            for seed in [3u32, 11, 2718] {
+                let n_block = in_dim / QK2_0;
+                let mut row = pseudo_bytes(n_block * Q2_0_BLOCK_BYTES, seed);
+                for (b, block) in row
+                    .as_chunks_mut::<Q2_0_BLOCK_BYTES>()
+                    .0
+                    .iter_mut()
+                    .enumerate()
+                {
+                    let d = 0.125 * (1.0 + (b % 7) as f32 / 8.0);
+                    block[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                }
+                let x: Vec<f32> = (0..in_dim)
+                    .map(|i| ((i as f32 + seed as f32) * 0.37).sin() * (1.0 + (i / 32) as f32))
+                    .collect();
+                let act = quantize_act(&x);
+                let portable = dot_row_impl::<ISA_BASELINE>(GGML_TYPE_Q2_0, &row, &act);
+                let simd = unsafe { dot_q2_0_avx2(&row, &act) };
+                let tolerance = 1e-5 * (1.0 + portable.abs());
+                assert!(
+                    (portable - simd).abs() <= tolerance,
+                    "in_dim {in_dim} seed {seed}: {portable} vs {simd}"
+                );
+            }
         }
     }
 
@@ -10733,6 +10858,7 @@ mod tests {
         let (block_bytes, block_elems, d_at) = match ggml_type {
             GGML_TYPE_Q8_0 => (34, 32, 0),     // 2 + 32
             GGML_TYPE_IQ4_NL => (18, 32, 0),   // 2 + 16
+            GGML_TYPE_Q2_0 => (18, 64, 0),     // 2 + 16
             GGML_TYPE_PQ2_0 => (34, 128, 0),   // 2 + 32
             GGML_TYPE_PTQ1_0 => (28, 128, 26), // 24 + 2 + 2, scale last
             _ => (22, 32, 0),                  // Q5_0: 2 + 4 + 16
@@ -10859,6 +10985,7 @@ mod tests {
             (GGML_TYPE_Q8_0, [896usize, 4864]),
             (GGML_TYPE_Q5_0, [896, 4864]),
             (GGML_TYPE_IQ4_NL, [896, 4864]),
+            (GGML_TYPE_Q2_0, [64, 640]),
             (GGML_TYPE_PQ2_0, [128, 5120]),
             (GGML_TYPE_PTQ1_0, [128, 5120]),
         ] {
@@ -10972,6 +11099,7 @@ mod tests {
             (GGML_TYPE_Q8_0, 896usize),
             (GGML_TYPE_Q5_0, 896),
             (GGML_TYPE_IQ4_NL, 896),
+            (GGML_TYPE_Q2_0, 640),
             (GGML_TYPE_PQ2_0, 5120),
             (GGML_TYPE_PTQ1_0, 128),
         ] {

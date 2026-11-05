@@ -257,15 +257,21 @@ skipped rather than listed.
 Two further filters run in `scan_models_dir` itself, before any shard
 grouping, so only unique models are ever counted or listed:
 
-- **Duplicate-file collapsing.** All matching paths are collected and
-  sorted first, then each is resolved with `std::fs::canonicalize` (which
-  follows symlinks to their real target) into a `seen_targets: HashSet`;
-  a path whose canonical target was already seen is skipped. This matters
-  because the Hugging Face hub cache can reference the exact same blob from
-  more than one `snapshots/<rev>/` directory — when a repo's ref moves but a
-  file's content doesn't change, the cache creates a new snapshot folder
-  that symlinks to the already-downloaded blob rather than re-fetching it,
-  so without this step a single physical download could count twice.
+- **Duplicate-model collapsing.** All matching paths are collected and
+  sorted first, then resolved with `std::fs::canonicalize` (which follows
+  symlinks to their real target) into one target set per model, keyed the
+  same way `group_models` keys a row. A model whose target set is contained
+  in another model's is skipped: for two identical sets the first is kept,
+  and a smaller set is what a superseded revision leaves behind once its own
+  shards are gone. This matters because the Hugging Face hub cache
+  can reference the exact same blob from more than one `snapshots/<rev>/`
+  directory — when a repo's ref moves but a file's content doesn't change,
+  the cache creates a new snapshot folder that symlinks to the
+  already-downloaded blob rather than re-fetching it, so without this step
+  a single physical download could count twice. The comparison is per model,
+  not per file, because two quantizations of one repo can share a table
+  shard: each row then lists every shard it needs and its full size, and the
+  shared bytes appear in both rows.
 - **Multimodal projector ("mmproj") exclusion.** After a file parses
   successfully, `GgufFile::is_clip_projector` is checked
   (`general.architecture == "clip"`, identified the same way the reference
@@ -1147,7 +1153,7 @@ footprint stays close to its file size.
 directly from ggml's own `ggml-common.h`/`ggml-quants.c`
 (`dequantize_row_*`), not reimplemented from a description, so the CPU
 path is bit-for-bit compatible with what other GGUF loaders read. Supported
-types: the floats (`F32`, `F16`, `BF16`), the legacy quants (`Q4_0`,
+types: the floats (`F32`, `F16`, `BF16`), the legacy quants (`Q2_0`, `Q4_0`,
 `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`), the whole K-quant family (`Q2_K` through
 `Q6_K`), and the `IQ*` codebook quants (`IQ1_S`, `IQ1_M`, `IQ1_XS`,
 `IQ1_XXS`, `IQ1_XXXS`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`,

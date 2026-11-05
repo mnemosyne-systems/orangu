@@ -4816,7 +4816,7 @@ latent upscaler; see **Video generation**), and Qwen3-TTS (`qwen3tts`,
 `cstr/qwen3-tts-1.7b-base-GGUF` — a Qwen3 decoder that writes a 12 Hz
 speech codec's codes one frame at a time, served with the codec and a
 voice pack beside it; see **Speech generation**) — using
-`F32`/`F16`/`BF16`/`F8_E4M3`/`MXFP8`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`NVFP4`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
+`F32`/`F16`/`BF16`/`F8_E4M3`/`MXFP8`/`Q8_0`/`Q4_0`/`Q5_0`/`MXFP4`/`NVFP4`/`Q2_0`/`PQ2_0`/`PTQ1_0`/`Q2_K`/`Q3_K`/`Q4_K`/`Q5_K`/`Q6_K` and the
 `IQ1_S`/`IQ1_M`/`IQ1_XS`/`IQ1_XXS`/`IQ1_XXXS`/`IQ2_XXS`/`IQ2_XS`/`IQ2_S`/`IQ3_XXS`/`IQ3_S`/`IQ4_NL`/`IQ4_XS` tensors. Weight matrices and embedding tables are read lazily from the
 memory-mapped file (dequantized one row at a time, on demand) rather than
 eagerly resident, so even large models fit in modest RAM. A model split

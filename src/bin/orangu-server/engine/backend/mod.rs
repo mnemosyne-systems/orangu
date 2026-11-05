@@ -1113,8 +1113,8 @@ pub trait Backend: Send + Sync {
     /// `F8_E4M3` and `MXFP8` (`quant`'s 43/144), and `NVFP4` (40); the
     /// vendor backends
     /// (`CudaBackend`/`RocmBackend`/`OpenClBackend`, which share one shader
-    /// source) lack those, `MXFP4`, and Prism's ternary `PQ2_0`/`PTQ1_0`
-    /// (`quant`'s 142/143). The vendor list is a strict subset of
+    /// source) lack those, `MXFP4`, `Q2_0`, and Prism's ternary `PQ2_0`/
+    /// `PTQ1_0` (`quant`'s 142/143). The vendor list is a strict subset of
     /// Vulkan's, and the test holds it that way on purpose — Vulkan is the
     /// backend with hardware to verify a kernel on, so a new one lands there
     /// first.
@@ -1477,7 +1477,7 @@ mod tests {
             .collect();
         assert_eq!(
             vulkan_only,
-            ["MXFP4", "PQ2_0", "PTQ1_0"],
+            ["MXFP4", "Q2_0", "PQ2_0", "PTQ1_0"],
             "the set of types Vulkan has a kernel for and the vendor backends do \
              not has changed; update `Backend::supports_type`'s doc to match"
         );
@@ -1499,8 +1499,8 @@ mod tests {
         assert_eq!(
             gap(vendor),
             [
-                "MXFP4", "NVFP4", "F8_E4M3", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS", "PQ2_0", "PTQ1_0",
-                "MXFP8"
+                "MXFP4", "NVFP4", "Q2_0", "F8_E4M3", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS", "PQ2_0",
+                "PTQ1_0", "MXFP8"
             ],
             "the set of types the CPU path reads and the vendor backends have no \
              kernel for has changed; update `Backend::supports_type`'s doc to match"

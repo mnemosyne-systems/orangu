@@ -20,7 +20,7 @@
 //! reads.
 //!
 //! Supported: the float types (`F32`, `F16`, `BF16`), the legacy
-//! round-number quants (`Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`), the whole
+//! round-number quants (`Q2_0`, `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`, `Q8_0`), the whole
 //! K-quant family
 //! (`Q2_K` through `Q6_K`), and the `IQ*` codebook quants a mixed
 //! "dynamic" release reaches for at the low end (`IQ1_S`, `IQ1_M`,
@@ -108,6 +108,7 @@ pub(crate) const GGML_TYPE_MXFP4: u32 = 39;
 /// per-tensor global scale NVFP4 also has is not in the block; a file that
 /// needs it carries it beside the weight (`ffn_*_exps.scale`).
 pub(crate) const GGML_TYPE_NVFP4: u32 = 40;
+pub(crate) const GGML_TYPE_Q2_0: u32 = 42;
 /// OCP FP8 E4M3: one byte per element, no block scale — 4 exponent bits
 /// (bias 7), 3 mantissa bits, subnormals, and `0x7F`/`0xFF` as NaN.
 pub(crate) const GGML_TYPE_F8_E4M3: u32 = 43;
@@ -149,6 +150,10 @@ const QK_MXFP4: usize = 32;
 const QK_MXFP8: usize = 32;
 const QK_NVFP4: usize = 64;
 const QK_NVFP4_SUB: usize = 16;
+/// Elements per `Q2_0` block.
+pub(crate) const QK2_0: usize = 64;
+/// `block_q2_0`: `{ d: f16, qs: [u8; 16] }` — four 2-bit fields per byte.
+pub(crate) const Q2_0_BLOCK_BYTES: usize = 2 + QK2_0 / 4;
 /// Elements per `PQ2_0`/`PTQ1_0` block — the one thing that separates them
 /// from ggml's own `Q2_0` (64) and `TQ1_0` (256).
 pub(crate) const QK_PRISM: usize = 128;
@@ -179,6 +184,7 @@ pub(crate) fn block_layout(ggml_type: u32) -> Option<(usize, usize)> {
         GGML_TYPE_I32 => Some((4, 1)),
         GGML_TYPE_BF16 => Some((2, 1)),
         GGML_TYPE_F8_E4M3 => Some((1, 1)),
+        GGML_TYPE_Q2_0 => Some((Q2_0_BLOCK_BYTES, QK2_0)),
         GGML_TYPE_Q4_0 => Some((2 + QK4_0 / 2, QK4_0)),
         GGML_TYPE_Q4_1 => Some((2 + 2 + QK4_1 / 2, QK4_1)),
         GGML_TYPE_Q5_0 => Some((2 + 4 + QK5_0 / 2, QK5_0)),
@@ -507,6 +513,7 @@ pub fn dequantize_into(
         GGML_TYPE_IQ2_S => dequantize_iq2_s(bytes, element_count, out),
         GGML_TYPE_IQ3_XXS => dequantize_iq3_xxs(bytes, element_count, out),
         GGML_TYPE_IQ3_S => dequantize_iq3_s(bytes, element_count, out),
+        GGML_TYPE_Q2_0 => dequantize_q2_0(bytes, element_count, out),
         GGML_TYPE_PQ2_0 => dequantize_pq2_0(bytes, element_count, out),
         GGML_TYPE_PTQ1_0 => dequantize_ptq1_0(bytes, element_count, out),
         // Deliberately not dequantized here. A repacked row's blocks are
@@ -815,12 +822,23 @@ pub(crate) fn unpack_block_pq2_0_scalar(qs: &[u8], w: &mut [i8; QK_PRISM]) {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub(crate) unsafe fn unpack_block_pq2_0_neon(qs: &[u8], w: &mut [i8; QK_PRISM]) {
+    unsafe {
+        for half in 0..2 {
+            unpack_block_q2_0_neon(qs.as_ptr().add(16 * half), w.as_mut_ptr().add(64 * half));
+        }
+    }
+}
+
+/// [`unpack_block_pq2_0_neon`]'s one step: 16 bytes of fields to 64 weights.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn unpack_block_q2_0_neon(qs: *const u8, w: *mut i8) {
     use std::arch::aarch64::*;
     unsafe {
         let mask = vdupq_n_u8(0x03);
         let one = vdupq_n_s8(1);
-        for half in 0..2 {
-            let packed = vld1q_u8(qs.as_ptr().add(16 * half));
+        {
+            let packed = vld1q_u8(qs);
             let f0 = vandq_u8(packed, mask);
             let f1 = vandq_u8(vshrq_n_u8::<2>(packed), mask);
             let f2 = vandq_u8(vshrq_n_u8::<4>(packed), mask);
@@ -839,10 +857,90 @@ pub(crate) unsafe fn unpack_block_pq2_0_neon(qs: &[u8], w: &mut [i8; QK_PRISM]) 
             ];
             for (k, v) in out.iter().enumerate() {
                 let signed = vsubq_s8(vreinterpretq_s8_u16(*v), one);
-                vst1q_s8(w.as_mut_ptr().add(64 * half + 16 * k), signed);
+                vst1q_s8(w.add(16 * k), signed);
             }
         }
     }
+}
+
+/// One `Q2_0` block's 16 payload bytes as its 64 weights, field `k % 4` of
+/// byte `k / 4`, `0..=3` standing for `-1..=2`.
+#[inline(always)]
+pub(crate) fn unpack_block_q2_0(qs: &[u8], w: &mut [i8; QK2_0]) {
+    let qs: &[u8; QK2_0 / 4] = qs[..QK2_0 / 4].try_into().unwrap();
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        // Safety: SSE2 is architecturally mandatory on x86_64, and `qs` and
+        // `w` are 16 and 64 bytes long.
+        unsafe {
+            for (k, v) in unpack_q2_0_sse2(qs).iter().enumerate() {
+                _mm_storeu_si128(w.as_mut_ptr().add(16 * k) as *mut __m128i, *v);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        // Safety: NEON is architecturally mandatory on aarch64, and `qs` and
+        // `w` are 16 and 64 bytes long.
+        unsafe { unpack_block_q2_0_neon(qs.as_ptr(), w.as_mut_ptr()) };
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    unpack_block_q2_0_scalar(qs, w);
+}
+
+/// The reference form of [`unpack_block_q2_0`].
+#[cfg_attr(any(target_arch = "x86_64", target_arch = "aarch64"), allow(dead_code))]
+#[inline(always)]
+pub(crate) fn unpack_block_q2_0_scalar(qs: &[u8; QK2_0 / 4], w: &mut [i8; QK2_0]) {
+    for (j, &byte) in qs.iter().enumerate() {
+        w[4 * j] = (byte & 0x03) as i8 - 1;
+        w[4 * j + 1] = ((byte >> 2) & 0x03) as i8 - 1;
+        w[4 * j + 2] = ((byte >> 4) & 0x03) as i8 - 1;
+        w[4 * j + 3] = (byte >> 6) as i8 - 1;
+    }
+}
+
+/// One `Q2_0` block's weights as four 16-element vectors, in element order:
+/// a byte's four fields split out, then two rounds of unpack to put them
+/// back next to each other.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub(crate) unsafe fn unpack_q2_0_sse2(qs: &[u8; QK2_0 / 4]) -> [std::arch::x86_64::__m128i; 4] {
+    use std::arch::x86_64::*;
+    unsafe {
+        let mask = _mm_set1_epi8(0x03);
+        let one = _mm_set1_epi8(1);
+        let packed = _mm_loadu_si128(qs.as_ptr() as *const __m128i);
+        let f0 = _mm_and_si128(packed, mask);
+        let f1 = _mm_and_si128(_mm_srli_epi16::<2>(packed), mask);
+        let f2 = _mm_and_si128(_mm_srli_epi16::<4>(packed), mask);
+        let f3 = _mm_and_si128(_mm_srli_epi16::<6>(packed), mask);
+        let lo01 = _mm_unpacklo_epi8(f0, f1);
+        let hi01 = _mm_unpackhi_epi8(f0, f1);
+        let lo23 = _mm_unpacklo_epi8(f2, f3);
+        let hi23 = _mm_unpackhi_epi8(f2, f3);
+        [
+            _mm_sub_epi8(_mm_unpacklo_epi16(lo01, lo23), one),
+            _mm_sub_epi8(_mm_unpackhi_epi16(lo01, lo23), one),
+            _mm_sub_epi8(_mm_unpacklo_epi16(hi01, hi23), one),
+            _mm_sub_epi8(_mm_unpackhi_epi16(hi01, hi23), one),
+        ]
+    }
+}
+
+/// `block_q2_0`: `{ d: f16, qs: [u8; 16] }`, 64 elements — mirrors ggml's
+/// `dequantize_row_q2_0` exactly.
+fn dequantize_q2_0(bytes: &[u8], element_count: usize, out: &mut Vec<f32>) {
+    out.clear();
+    out.reserve(element_count);
+    let mut w = [0i8; QK2_0];
+    for block in bytes.as_chunks::<Q2_0_BLOCK_BYTES>().0 {
+        let d = read_f16(block, 0);
+        unpack_block_q2_0(&block[2..], &mut w);
+        out.extend(w.iter().map(|&q| q as f32 * d));
+    }
+    out.truncate(element_count);
 }
 
 /// `block_pq2_0`: `{ d: f16, qs: [u8; 32] }`, 128 elements — mirrors the
@@ -1957,7 +2055,7 @@ mod tests {
         let Some(cases) = ggml_reference_cases() else {
             return;
         };
-        assert_eq!(cases.len(), 20, "fixture should cover 20 types");
+        assert_eq!(cases.len(), 21, "fixture should cover 21 types");
 
         for (ggml_type, block_elems, raw, want) in cases {
             let name = ggml_type_name(ggml_type);
@@ -2327,6 +2425,37 @@ mod tests {
         assert_eq!(block.len(), PQ2_0_BLOCK_BYTES);
         let out = dequantize(GGML_TYPE_PQ2_0, &block, 128).unwrap();
         assert_eq!(out, x);
+    }
+
+    /// `Q2_0` is the same 2-bit field at group 64: an 18-byte block, so the
+    /// second block's scale is what a wrong stride reads as weights.
+    #[test]
+    fn dequantize_q2_0_reads_two_bit_fields_at_group_64() {
+        assert_eq!(block_layout(GGML_TYPE_Q2_0), Some((18, 64)));
+        let mut bytes = f16::from_f32(1.0).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 16]);
+        bytes[2] = 0b11_10_01_00; // elements 0..4 = -1, 0, +1, +2
+        bytes[17] = 0b00_01_10_11; // elements 60..64 = +2, +1, 0, -1
+        bytes.extend_from_slice(&f16::from_f32(0.5).to_le_bytes());
+        bytes.extend_from_slice(&[0b10_10_10_10u8; 16]); // every element +1
+        let out = dequantize(GGML_TYPE_Q2_0, &bytes, 128).unwrap();
+        assert_eq!(out[..4], [-1.0, 0.0, 1.0, 2.0]);
+        assert!(out[4..60].iter().all(|&v| v == -1.0), "{out:?}");
+        assert_eq!(out[60..64], [2.0, 1.0, 0.0, -1.0]);
+        assert!(out[64..].iter().all(|&v| v == 0.5), "{out:?}");
+    }
+
+    /// The SIMD unpack against the scalar reference: every byte value in
+    /// every position of the block.
+    #[test]
+    fn q2_0_unpack_matches_the_scalar_reference() {
+        for start in 0..=255u8 {
+            let qs: [u8; QK2_0 / 4] = std::array::from_fn(|i| start.wrapping_add(i as u8 * 17));
+            let (mut fast, mut reference) = ([0i8; QK2_0], [0i8; QK2_0]);
+            unpack_block_q2_0(&qs, &mut fast);
+            unpack_block_q2_0_scalar(&qs, &mut reference);
+            assert_eq!(fast, reference, "start {start}");
+        }
     }
 
     /// `PTQ1_0` is `TQ1_0`'s trit packing at group 128, scale last. The
