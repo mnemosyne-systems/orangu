@@ -2474,12 +2474,10 @@ impl Node {
         Some(off.join(", "))
     }
 
-    /// Whether a configured worker is not connected, and it is time to try
-    /// taking it back.
-    ///
-    /// While a standby stands in for a lost worker, only when that worker
-    /// answers again: a plan without it would drop the standby too, and
-    /// shrink the tree to what is left.
+    /// Whether a plan is due: a configured worker is not connected, and either
+    /// it answers now or the plan still has it. A worker that stays gone is
+    /// tried every `readmit` and costs nothing more: a plan would drop every
+    /// conversation here for the same plan, and a standby standing in for it.
     ///
     /// A worker left out for its failures is not tried, only planned out if
     /// the plan still has it.
@@ -2487,7 +2485,6 @@ impl Node {
         if self.planning.lock().unwrap().elapsed() < self.settings.readmit {
             return false;
         }
-        let standing = !self.standing_in.lock().unwrap().is_empty();
         let path = self
             .assignment
             .lock()
@@ -2497,15 +2494,24 @@ impl Node {
             .unwrap_or_else(|| vec![self.id.clone()]);
         let secret = self.settings.secret.as_deref();
         let used = self.used.lock().unwrap().clone();
-        self.links.iter().any(|link| {
+        let mut tried = false;
+        let due = self.links.iter().any(|link| {
             if link.is_connected() {
                 return false;
             }
-            if link.out_for().is_some() {
-                return used.contains(&link.addr);
+            if used.contains(&link.addr) {
+                return true;
             }
-            !standing || link.ensure_connected(secret, &path).is_ok()
-        })
+            if link.out_for().is_some() {
+                return false;
+            }
+            tried = true;
+            link.ensure_connected(secret, &path).is_ok()
+        });
+        if tried && !due {
+            *self.planning.lock().unwrap() = Instant::now();
+        }
+        due
     }
 
     /// Plans the assigned range again over the workers there are now — the
@@ -3586,6 +3592,148 @@ mod tests {
         for n in [&top, &middle, &back] {
             n.stop();
         }
+    }
+
+    /// A worker that stays gone costs nothing once it is planned out: the node
+    /// above it does not plan again until it answers, as a plan would drop every
+    /// conversation that node holds, on every node above it too.
+    #[test]
+    fn a_worker_that_stays_gone_is_not_planned_for_again() {
+        let leaf = node("leaf", &[], Variant::default());
+        let middle = node("middle", &[&leaf], Variant::default());
+        let top = node("top", &[&middle], Variant::default());
+        let split = top.delegating_model().unwrap();
+        leaf.stop();
+        let tokens = fixture::tokens();
+        run(split.as_ref(), &tokens, 5);
+        assert!(!middle.plan().iter().any(|e| e.node == "leaf"));
+        // A conversation kept across several `readmit`s (200 ms here).
+        let mut cache = split.new_kv_cache(N_CTX);
+        split.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
+        let plans = (
+            middle.metrics.plans.load(Ordering::Relaxed),
+            top.metrics.plans.load(Ordering::Relaxed),
+        );
+        let recoveries = top.metrics.recoveries.load(Ordering::Relaxed);
+        // Past `QUIET`, which a node waits for before it plans.
+        std::thread::sleep(Duration::from_secs(4));
+        split.forward(&mut cache, &tokens[5..6], 5, 0).unwrap();
+        assert_eq!(
+            plans,
+            (
+                middle.metrics.plans.load(Ordering::Relaxed),
+                top.metrics.plans.load(Ordering::Relaxed),
+            )
+        );
+        assert_eq!(top.metrics.recoveries.load(Ordering::Relaxed), recoveries);
+        top.stop();
+        middle.stop();
+    }
+
+    /// The same at the top, whose plans start every conversation over.
+    #[test]
+    fn a_worker_that_stays_gone_is_not_planned_for_again_by_the_top() {
+        let a = node("a", &[], Variant::default());
+        let b = node("b", &[], Variant::default());
+        let top = node("top", &[&a, &b], Variant::default());
+        let split = top.delegating_model().unwrap();
+        b.stop();
+        let tokens = fixture::tokens();
+        run(split.as_ref(), &tokens, 5);
+        assert!(!top.plan().iter().any(|e| e.node == "b"));
+        std::thread::sleep(Duration::from_millis(500));
+        let plans = top.metrics.plans.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(plans, top.metrics.plans.load(Ordering::Relaxed));
+        top.stop();
+        a.stop();
+    }
+
+    /// The terms `node` plans under, and it plans `layers` as a plan in progress
+    /// does: its workers have their new layers, and it is not yet using them.
+    fn half_planned(node: &Node, layers: Range<usize>, path: &[String], terms: Terms) {
+        let planned = node.plan_subtree(layers, path, terms).unwrap();
+        drop(planned);
+    }
+
+    /// A request that meets a plan in progress — a worker on its new layers, and
+    /// this node's pipeline on the old ones — goes on over the new plan, and the
+    /// worker is not blamed for it.
+    #[test]
+    fn a_request_during_a_plan_goes_on_over_the_new_one() {
+        let worker = node("worker", &[], Variant::default());
+        let top = node("top", &[&worker], Variant::default());
+        let tokens = fixture::tokens();
+        let whole = run(fixture::model().as_ref(), &tokens, 5);
+        let split = top.delegating_model().unwrap();
+        let mut cache = split.new_kv_cache(N_CTX);
+        split.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
+
+        let terms = Terms {
+            n_ctx: top.settings.n_ctx,
+            slots: top.settings.slots,
+            activations: top.settings.activations,
+            weights: *top.decision.get().unwrap(),
+        };
+        half_planned(&top, 0..N_LAYER - 1, std::slice::from_ref(&top.id), terms);
+
+        let mut worst = 0f32;
+        for (pos, token) in tokens.iter().enumerate().skip(5) {
+            let got = split.forward(&mut cache, &[*token], pos, 0).unwrap();
+            for (a, b) in got.iter().zip(&whole[pos - 4]) {
+                worst = worst.max((a - b).abs());
+            }
+        }
+        assert!(worst < 1e-3, "{worst}");
+        assert_eq!(covered(&top.plan()), N_LAYER);
+        assert_eq!(top.status()["workers"][0]["failures_in_a_row"], 0);
+        top.stop();
+        worker.stop();
+    }
+
+    /// The same below the top: the middle node's plan is in progress, it cannot
+    /// plan for its parent, and the top gets past it.
+    #[test]
+    fn a_request_during_a_plan_below_the_top_goes_on() {
+        let leaf = node("leaf", &[], Variant::default());
+        let middle = node("middle", &[&leaf], Variant::default());
+        let top = node("top", &[&middle], Variant::default());
+        let tokens = fixture::tokens();
+        let whole = run(fixture::model().as_ref(), &tokens, 5);
+        let split = top.delegating_model().unwrap();
+        let mut cache = split.new_kv_cache(N_CTX);
+        split.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
+
+        let (layers, terms, path) = {
+            let assignment = middle.assignment.lock().unwrap();
+            let assignment = assignment.as_ref().unwrap();
+            (
+                assignment.layers.clone(),
+                assignment.terms,
+                assignment.path.clone(),
+            )
+        };
+        half_planned(&middle, layers.start..layers.end - 1, &path, terms);
+
+        let mut worst = 0f32;
+        for (pos, token) in tokens.iter().enumerate().skip(5) {
+            let got = split.forward(&mut cache, &[*token], pos, 0).unwrap();
+            for (a, b) in got.iter().zip(&whole[pos - 4]) {
+                worst = worst.max((a - b).abs());
+            }
+        }
+        assert!(worst < 1e-3, "{worst}");
+        assert_eq!(covered(&top.plan()), N_LAYER);
+        for n in [&top, &middle] {
+            assert_eq!(
+                n.status()["workers"][0]["failures_in_a_row"],
+                0,
+                "{}",
+                n.settings.name
+            );
+            n.stop();
+        }
+        leaf.stop();
     }
 
     /// A batched decode step that loses a worker declines, with every row

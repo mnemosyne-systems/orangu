@@ -1069,8 +1069,9 @@ const RECOVERIES: usize = 2;
 const REPLAY_CHUNK: usize = 256;
 
 /// Whether `error` is part of the tree going away — a lost worker, or one
-/// that no longer holds the session (it restarted) — which a new plan can
-/// get past, as opposed to a refusal it cannot.
+/// that no longer holds the session (it restarted) — or changing, a worker
+/// already on a plan this node is still making: a new plan gets past those, as
+/// opposed to a refusal it cannot.
 fn recoverable(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -1078,7 +1079,10 @@ fn recoverable(error: &anyhow::Error) -> bool {
         .is_some_and(|e| {
             matches!(
                 e.code,
-                ErrorCode::ChildLost | ErrorCode::UnknownSession | ErrorCode::PositionMismatch
+                ErrorCode::ChildLost
+                    | ErrorCode::UnknownSession
+                    | ErrorCode::PositionMismatch
+                    | ErrorCode::LayersChanged
             )
         })
 }

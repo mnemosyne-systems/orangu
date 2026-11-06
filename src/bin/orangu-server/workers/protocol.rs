@@ -475,6 +475,10 @@ pub enum ErrorCode {
     Unsupported,
     ContextFull,
     Internal,
+    /// A reply over other layers than this node planned: a worker already on
+    /// the plan in progress. A node that does not know this code reads
+    /// [`Self::Internal`].
+    LayersChanged,
 }
 
 impl ErrorCode {
@@ -490,6 +494,7 @@ impl ErrorCode {
             Self::Unsupported => 8,
             Self::ContextFull => 9,
             Self::Internal => 10,
+            Self::LayersChanged => 11,
         }
     }
 
@@ -506,6 +511,7 @@ impl ErrorCode {
             7 => Self::Unauthorized,
             8 => Self::Unsupported,
             9 => Self::ContextFull,
+            11 => Self::LayersChanged,
             _ => Self::Internal,
         }
     }

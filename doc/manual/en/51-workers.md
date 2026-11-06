@@ -165,8 +165,11 @@ Machines of one kind round alike: the top-level node measures whether
 prompts go through `bf16` or `int8` copies of the weights (`prompt_weights`)
 and hands that choice to every worker with its layers, and each node copies
 only the layers it runs. A worker whose cores lack the instruction keeps the
-file's weights and rounds as those do. To compare a tree with one server
-exactly, set `activations = f32` on the top-level node.
+file's weights and rounds as those do. To compare a tree with one server,
+set `activations = f32` on the top-level node and `ORANGU_SPECULATIVE=0` on
+both, since a verify pass computes its rows as a prompt does and runs only
+while it pays. On Llama-3.2-3B Q4_K_M that matched exactly for prompts up to
+62 tokens, but not at 112 or more.
 
 Shares follow speed, as far as memory holds. At start each node times the
 model's first layers on the processor its layers run on — a decode step
@@ -375,7 +378,12 @@ again over the workers that still answer, rebuilds the conversation on the
 new plan by running its tokens through again, and carries on. Tokens
 already sent stay sent. The rebuilt cache comes from one prefill rather
 than token by token, so a greedy continuation can pick a different
-near-tie from the one an uninterrupted run would have.
+near-tie from the one an uninterrupted run would have. This is not the
+tree's doing: a prompt's kernels and a decode step's quantize activations
+differently, so one server does the same when it reuses a retained prompt.
+On Llama-3.2-3B Q4_K_M the two differ by up to 0.9 in log-probability among
+a token's 20 likeliest alternatives. A rebuilt conversation holds what one
+prefill of its tokens holds on a single server.
 
 A spare machine makes that cheaper. List it as a standby on the node
 above the worker it should cover:

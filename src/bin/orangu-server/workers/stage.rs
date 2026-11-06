@@ -118,17 +118,20 @@ impl<E: Exchange> MessageStage<E> {
     ) -> Result<Vec<f32>> {
         let layers = &self.layers;
         ensure!(
-            result.session == session
-                && result.step == step
-                && result.layer_start as usize == layers.start
-                && result.layer_end as usize == layers.end,
-            "a reply for session {} step {} layers {}..{} answered session {session} step {step} \
-             layers {layers:?}",
+            result.session == session && result.step == step,
+            "a reply for session {} step {} answered session {session} step {step}",
             result.session,
-            result.step,
-            result.layer_start,
-            result.layer_end
+            result.step
         );
+        if result.layer_start as usize != layers.start || result.layer_end as usize != layers.end {
+            return Err(anyhow!(WorkerError::new(
+                ErrorCode::LayersChanged,
+                format!(
+                    "a reply for layers {}..{} answered layers {layers:?}",
+                    result.layer_start, result.layer_end
+                ),
+            )));
+        }
         let wanted = rows.count(n_tokens);
         ensure!(
             result.hidden.rows as usize == wanted,
@@ -263,8 +266,11 @@ impl<E: Exchange> Stage for MessageStage<E> {
                     .zip(expected)
                     .map(|(result, (session, step, n, rows))| {
                         let result = result?;
-                        self.accept(result, session, step, n, rows)
-                            .map_err(|e| WorkerError::new(ErrorCode::Internal, format!("{e:#}")))
+                        self.accept(result, session, step, n, rows).map_err(|e| {
+                            e.downcast::<WorkerError>().unwrap_or_else(|e| {
+                                WorkerError::new(ErrorCode::Internal, format!("{e:#}"))
+                            })
+                        })
                     })
                     .collect())
             }
