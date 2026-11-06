@@ -112,6 +112,10 @@ pub struct GenerateRequest {
     /// What the reply must begin with, one of these: a required tool call's
     /// name and the character after it. Empty holds nothing.
     pub reply_starts: Vec<Vec<u8>>,
+    /// A grammar the reply is held to.
+    pub grammar: Option<Arc<crate::engine::grammar::Grammar>>,
+    /// What holds the reply's tool calls to the tools it declared.
+    pub calls: Option<Arc<crate::engine::tool_learn::CallGrammar>>,
     /// How many of the first tokens a context shift keeps, in place of the
     /// server's `context_keep`.
     pub n_keep: Option<usize>,
@@ -200,6 +204,8 @@ impl Default for GenerateRequest {
             json_output: false,
             json_schema: None,
             reply_starts: Vec::new(),
+            grammar: None,
+            calls: None,
             n_keep: None,
             context_shift: None,
             dropped_tokens: 0,
@@ -758,9 +764,20 @@ impl Engine {
             .await
             .ok_or("every slot is busy and the queue is full")?;
         let model = self.serving().model;
+        let formats = self
+            .paged_kv
+            .as_ref()
+            .and_then(|(pool, _)| pool.host_formats());
         tokio::task::spawn_blocking(move || {
             super::cpu_pools::for_request(move || {
-                super::teacher::teacher_scored(model.as_ref(), &tokens, rows, top, guard.id())
+                super::teacher::teacher_scored(
+                    model.as_ref(),
+                    &tokens,
+                    rows,
+                    top,
+                    guard.id(),
+                    formats,
+                )
             })
         })
         .await
@@ -1586,12 +1603,30 @@ fn run_leg(
             tokenizer.token_bytes_shared(),
             req.stop_token_ids.clone(),
         ));
-    } else if !req.reply_starts.is_empty() {
+    } else if let Some(grammar) = req.grammar.clone() {
+        sampler = sampler.with_constraint(crate::engine::sampling::Constraint::grammar(
+            grammar,
+            tokenizer.token_bytes_shared(),
+            req.stop_token_ids.clone(),
+        ));
+    } else if !req.reply_starts.is_empty()
+        && req
+            .calls
+            .as_ref()
+            .is_none_or(|calls| calls.initial.is_none())
+    {
         sampler = sampler.with_constraint(crate::engine::sampling::Constraint::one_of(
             req.reply_starts.clone(),
             tokenizer.token_bytes_shared(),
             req.stop_token_ids.clone(),
         ));
+    }
+    if !resuming && let Some(calls) = req.calls.clone() {
+        sampler = sampler.with_calls(
+            calls,
+            tokenizer.token_bytes_shared(),
+            req.stop_token_ids.clone(),
+        );
     }
     let mut history = req.prompt_tokens.clone();
 
@@ -1886,6 +1921,7 @@ fn run_leg(
         }
         history.push(next);
         generated += 1;
+        sampler.set_reasoning(header.in_reasoning());
         let logprob = sampler.take_logprob(next);
         guard.set_generated_tokens(generated);
         // Time to first token counts from arrival, so it carries the queue
@@ -2149,7 +2185,15 @@ fn run_leg(
         let wide = echo
             && drafter.as_ref().is_some_and(Drafter::has_echo_draft)
             && draft_control.echo_wide();
+        // A verify that would run on the host, over rows the devices of a split
+        // model are keeping, has nothing to read: this step is a plain one.
+        let rows_in_reach = model.vulkan_backend().is_some()
+            || model.verifies_rows_on_split_devices()
+            || cache
+                .as_ref()
+                .is_some_and(|cache| cache.host_holds_rows(start_pos));
         let speculated = if spec_buf.is_empty()
+            && rows_in_reach
             && let Some(drafter) = drafter.as_mut()
             && (drafter.verifies_with_states()
                 || draft_control.should_verify(
@@ -2275,7 +2319,10 @@ fn run_leg(
                 cache.commit_pages();
             }
             match outcome {
-                Ok(ForwardOutcome::Token(t)) => t,
+                Ok(ForwardOutcome::Token(t)) => {
+                    sampler.note_device_pick(t);
+                    t
+                }
                 Ok(ForwardOutcome::Candidates(c)) => {
                     sampler.sample_from_candidates(c, history.len())
                 }

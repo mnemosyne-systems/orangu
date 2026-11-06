@@ -428,6 +428,26 @@ fn attention_on_host(
         n_tokens,
         ..
     } = *params;
+    let wide = n_tokens >= crate::engine::attention_tiled::min_tokens();
+    let mixed = wide && crate::engine::attention_tiled::mixed_available(head_dim);
+    let tiled = wide
+        && crate::engine::attention_tiled::supports(head_dim)
+        && crate::engine::attention_tiled::enabled();
+    // A compact pool's sealed rows are read as `f32`, one layer at a time,
+    // except where the decode split reads its own chunks.
+    let compact = cache.has_compact_rows();
+    if compact && (mixed || tiled || !every_window_splits(n_tokens, &window)) {
+        let spans = (0..n_tokens)
+            .map(&window)
+            .filter(|(start, end)| end >= start);
+        if let Some((from, to)) = spans.fold(None, |span: Option<(usize, usize)>, (start, end)| {
+            Some(span.map_or((start, end + 1), |(from, to)| {
+                (from.min(start), to.max(end + 1))
+            }))
+        }) {
+            cache.decode_sealed_rows(from, to);
+        }
+    }
     // Deliberately no `clear` — see `multi_head_attention`'s contract: it
     // fills every row it is given, empty windows included, so pre-zeroing
     // here is a second full pass over a buffer the kernel is about to write.
@@ -440,8 +460,7 @@ fn attention_on_host(
     // `bf16`, the `f32` tiles elsewhere. Narrower passes — and decode —
     // keep the one-query loop.
     let group_size = n_head.div_ceil(n_head_kv);
-    let wide = n_tokens >= crate::engine::attention_tiled::min_tokens();
-    if wide && crate::engine::attention_tiled::mixed_available(head_dim) {
+    if mixed {
         crate::engine::attention_tiled::attention_mixed(
             out,
             q,
@@ -452,10 +471,7 @@ fn attention_on_host(
             params.scale,
             window,
         );
-    } else if wide
-        && crate::engine::attention_tiled::supports(head_dim)
-        && crate::engine::attention_tiled::enabled()
-    {
+    } else if tiled {
         crate::engine::attention_tiled::attention_tiled(
             out,
             q,
@@ -477,6 +493,9 @@ fn attention_on_host(
             params.scale,
             window,
         );
+    }
+    if compact {
+        cache.release_decoded_rows();
     }
     Ran::OnCpu
 }
@@ -603,6 +622,31 @@ fn attention_batched<const N: usize, W>(
         }
     }
 
+    // A few queries over a compact pool, such as a draft's verification: each
+    // reads its own chunks, as one query does.
+    let n_tokens = out.len() / row;
+    if cache.has_compact_rows() && every_window_splits(n_tokens, &window) {
+        for (t, (out_t, q_t)) in out
+            .chunks_exact_mut(row)
+            .zip(q.chunks_exact(row))
+            .enumerate()
+        {
+            let (window_start, window_end) = window(t);
+            attention_decode_split::<N>(
+                out_t,
+                q_t,
+                cache,
+                n_head,
+                group_size,
+                head_dim,
+                scale,
+                window_start,
+                window_end + 1 - window_start,
+            );
+        }
+        return;
+    }
+
     out.par_chunks_mut(row)
         .enumerate()
         .for_each_init(Vec::<f32>::new, |scores, (t, out_t)| {
@@ -719,10 +763,101 @@ type ChunkPartial = (usize, usize, Vec<(f32, f32)>, Vec<f32>);
 /// — below this the one-thread pass is shorter than a fork and join.
 const DECODE_SPLIT_MIN_POS: usize = 64;
 
+/// Whether all of a pass's query windows are long enough for
+/// [`attention_decode_split`].
+fn every_window_splits(n_tokens: usize, window: &impl Fn(usize) -> (usize, usize)) -> bool {
+    (0..n_tokens).all(|t| {
+        let (start, end) = window(t);
+        (end + 1).saturating_sub(start) >= DECODE_SPLIT_MIN_POS
+    })
+}
+
 /// Positions per task of [`attention_decode_split`]: K and V of a chunk
 /// are a few hundred KiB, a fair share of the window for a pool of
 /// sixteen at a thousand positions and still several tasks at a hundred.
 const DECODE_SPLIT_CHUNK: usize = 128;
+
+/// Floats of one head's keys, or of its values, in a task of
+/// [`attention_decode_split`]: together they stay well inside a core's
+/// second-level cache whatever the head's width, and a wide head's short window
+/// still spreads over the pool.
+const DECODE_SPLIT_CHUNK_FLOATS: usize = 128 * 128;
+
+/// Fewest positions in such a task.
+const DECODE_SPLIT_MIN_CHUNK: usize = 16;
+
+thread_local! {
+    /// A worker's keys and values of one [`attention_decode_split`] chunk of a
+    /// compact pool, small enough to stay in its cache between decode and use.
+    static CHUNK_ROWS: std::cell::Cell<(Vec<f32>, Vec<f32>)> = const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+}
+
+/// One chunk's share of [`attention_decode_split`], over rows `key` and `value`
+/// give by offset: per head of `q` the score maximum and the sum of exponentials
+/// against it, and the weighted V sums.
+#[inline(always)]
+fn chunk_attention<'a, const N: usize>(
+    q: &[f32],
+    head_dim: usize,
+    scale: f32,
+    c_len: usize,
+    key: impl Fn(usize) -> &'a [f32],
+    value: impl Fn(usize) -> &'a [f32],
+) -> (Vec<(f32, f32)>, Vec<f32>) {
+    let heads = q.len() / head_dim;
+    let mut scores = vec![0f32; heads * c_len];
+    let mut offset = 0;
+    while offset + N <= c_len {
+        let kh: [&[f32]; N] = std::array::from_fn(|j| key(offset + j));
+        for (hi, qh) in q.chunks_exact(head_dim).enumerate() {
+            let got = tensor::dot_multi(qh, kh);
+            for (j, sc) in got.iter().enumerate() {
+                scores[hi * c_len + offset + j] = sc * scale;
+            }
+        }
+        offset += N;
+    }
+    while offset < c_len {
+        let kh = key(offset);
+        for (hi, qh) in q.chunks_exact(head_dim).enumerate() {
+            scores[hi * c_len + offset] = tensor::dot(qh, kh) * scale;
+        }
+        offset += 1;
+    }
+    let mut stats = Vec::with_capacity(heads);
+    for hi in 0..heads {
+        let row = &mut scores[hi * c_len..(hi + 1) * c_len];
+        let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut l = 0f32;
+        for v in row.iter_mut() {
+            *v = (*v - m).exp();
+            l += *v;
+        }
+        stats.push((m, l));
+    }
+    let mut acc = vec![0f32; heads * head_dim];
+    let mut offset = 0;
+    while offset + N <= c_len {
+        let vh: [&[f32]; N] = std::array::from_fn(|j| value(offset + j));
+        for hi in 0..heads {
+            let weights: [f32; N] = std::array::from_fn(|j| scores[hi * c_len + offset + j]);
+            tensor::axpy_multi(&mut acc[hi * head_dim..(hi + 1) * head_dim], vh, weights);
+        }
+        offset += N;
+    }
+    while offset < c_len {
+        let vh = value(offset);
+        for hi in 0..heads {
+            tensor::axpy_inplace(
+                &mut acc[hi * head_dim..(hi + 1) * head_dim],
+                vh,
+                scores[hi * c_len + offset],
+            );
+        }
+        offset += 1;
+    }
+    (stats, acc)
+}
 
 /// One query's attention with the window split into position chunks, one
 /// task per (K/V head, chunk), each keeping its own softmax statistics —
@@ -750,7 +885,10 @@ fn attention_decode_split<const N: usize>(
     n_pos: usize,
 ) {
     let n_kv = n_head.div_ceil(group_size);
-    let n_chunks = n_pos.div_ceil(DECODE_SPLIT_CHUNK);
+    let compact = cache.has_compact_rows();
+    let chunk_pos =
+        (DECODE_SPLIT_CHUNK_FLOATS / head_dim).clamp(DECODE_SPLIT_MIN_CHUNK, DECODE_SPLIT_CHUNK);
+    let n_chunks = n_pos.div_ceil(chunk_pos);
     // Per (kv head, chunk): for each head of the group, (max, sum) and
     // the `head_dim` accumulator.
     let partials: Vec<ChunkPartial> = (0..n_kv * n_chunks)
@@ -758,71 +896,42 @@ fn attention_decode_split<const N: usize>(
         .map(|task| {
             let kv_head = task / n_chunks;
             let chunk = task % n_chunks;
-            let c_start = chunk * DECODE_SPLIT_CHUNK;
-            let c_len = (n_pos - c_start).min(DECODE_SPLIT_CHUNK);
+            let c_start = chunk * chunk_pos;
+            let c_len = (n_pos - c_start).min(chunk_pos);
+            let first = window_start + c_start;
             let h_start = kv_head * group_size;
             let h_end = ((kv_head + 1) * group_size).min(n_head);
-            let heads = h_end - h_start;
-            let mut scores = vec![0f32; heads * c_len];
-            let mut offset = 0;
-            while offset + N <= c_len {
-                let p = window_start + c_start + offset;
-                let kh: [&[f32]; N] =
-                    std::array::from_fn(|j| cache.key_at(p + j, kv_head, head_dim));
-                for (hi, h) in (h_start..h_end).enumerate() {
-                    let qh = &q[h * head_dim..(h + 1) * head_dim];
-                    let got = tensor::dot_multi(qh, kh);
-                    for (j, sc) in got.iter().enumerate() {
-                        scores[hi * c_len + offset + j] = sc * scale;
-                    }
+            let heads = &q[h_start * head_dim..h_end * head_dim];
+            let (stats, acc) = if compact {
+                let (mut k, mut v) = CHUNK_ROWS.take();
+                // Only ever grown: refilling what a shorter chunk cut off is
+                // a write of zeroes the decode overwrites.
+                let floats = c_len * head_dim;
+                if k.len() < floats {
+                    k.resize(floats, 0.0);
+                    v.resize(floats, 0.0);
                 }
-                offset += N;
-            }
-            while offset < c_len {
-                let p = window_start + c_start + offset;
-                let kh = cache.key_at(p, kv_head, head_dim);
-                for (hi, h) in (h_start..h_end).enumerate() {
-                    let qh = &q[h * head_dim..(h + 1) * head_dim];
-                    scores[hi * c_len + offset] = tensor::dot(qh, kh) * scale;
-                }
-                offset += 1;
-            }
-            let mut stats = Vec::with_capacity(heads);
-            for hi in 0..heads {
-                let row = &mut scores[hi * c_len..(hi + 1) * c_len];
-                let m = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut l = 0f32;
-                for v in row.iter_mut() {
-                    *v = (*v - m).exp();
-                    l += *v;
-                }
-                stats.push((m, l));
-            }
-            let mut acc = vec![0f32; heads * head_dim];
-            let mut offset = 0;
-            while offset + N <= c_len {
-                let p = window_start + c_start + offset;
-                let vh: [&[f32]; N] =
-                    std::array::from_fn(|j| cache.value_at(p + j, kv_head, head_dim));
-                for hi in 0..heads {
-                    let weights: [f32; N] =
-                        std::array::from_fn(|j| scores[hi * c_len + offset + j]);
-                    tensor::axpy_multi(&mut acc[hi * head_dim..(hi + 1) * head_dim], vh, weights);
-                }
-                offset += N;
-            }
-            while offset < c_len {
-                let p = window_start + c_start + offset;
-                let vh = cache.value_at(p, kv_head, head_dim);
-                for hi in 0..heads {
-                    tensor::axpy_inplace(
-                        &mut acc[hi * head_dim..(hi + 1) * head_dim],
-                        vh,
-                        scores[hi * c_len + offset],
-                    );
-                }
-                offset += 1;
-            }
+                cache.read_head_rows(first, c_len, kv_head, head_dim, &mut k, &mut v);
+                let result = chunk_attention::<N>(
+                    heads,
+                    head_dim,
+                    scale,
+                    c_len,
+                    |offset| &k[offset * head_dim..][..head_dim],
+                    |offset| &v[offset * head_dim..][..head_dim],
+                );
+                CHUNK_ROWS.set((k, v));
+                result
+            } else {
+                chunk_attention::<N>(
+                    heads,
+                    head_dim,
+                    scale,
+                    c_len,
+                    |offset| cache.key_at(first + offset, kv_head, head_dim),
+                    |offset| cache.value_at(first + offset, kv_head, head_dim),
+                )
+            };
             (kv_head, chunk, stats, acc)
         })
         .collect();
@@ -877,6 +986,76 @@ mod tests {
             (false, w) => {
                 let half = w / 2;
                 (pos.saturating_sub(half), (pos + half).min(n_tokens - 1))
+            }
+        }
+    }
+
+    /// Attention over a compact pool answers exactly as over plain rows, on
+    /// each kernel a window can reach: a wide pass, one query at a shallow
+    /// depth, and one query deep enough to be split over the pool.
+    #[test]
+    fn a_compact_pool_answers_like_plain_rows() {
+        use crate::engine::kv_pool::{HostFormats, KvPool, LayerGeometry, Policy};
+        use crate::engine::kv_rows::RowFormat;
+        use std::sync::Arc;
+        const HEAD: usize = 32;
+        use crate::engine::kv_cache::KvCache;
+        let backend = crate::engine::backend::CpuBackend;
+        let pool = Arc::new(KvPool::with_formats(
+            64,
+            16,
+            vec![LayerGeometry {
+                kv_dim: HEAD,
+                stride: 1,
+                ring: None,
+            }],
+            Policy::Lru,
+            Some(HostFormats {
+                k: RowFormat::F32,
+                v: RowFormat::F32,
+            }),
+        ));
+        let mut plain = KvCache::new_with_strided_dims(512, &[(HEAD, 1)]);
+        let mut compact = KvCache::new_with_strided_dims(512, &[(HEAD, 1)])
+            .try_into_paged(pool, 0)
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        let mut seed = 1u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(2654435761).wrapping_add(11);
+            (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+        };
+        for _ in 0..200 {
+            let k: Vec<f32> = (0..HEAD).map(|_| next()).collect();
+            let v: Vec<f32> = (0..HEAD).map(|_| next()).collect();
+            plain.layers[0].push(&k, &v);
+            compact.layers[0].push(&k, &v);
+        }
+        for (n_tokens, start_pos) in [(100usize, 100usize), (1, 40), (1, 199), (4, 196)] {
+            let q: Vec<f32> = (0..n_tokens * HEAD).map(|_| next()).collect();
+            let params = Params {
+                backend: &backend,
+                device: 0,
+                n_head: 1,
+                n_head_kv: 1,
+                head_dim: HEAD,
+                scale: 0.5,
+                causal: true,
+                n_swa: 0,
+                start_pos,
+                n_tokens,
+            };
+            let window = |t: usize| (0, start_pos + t);
+            let (mut want, mut got) = (Vec::new(), Vec::new());
+            attention(&mut want, &q, &mut plain.layers[0], &params, window);
+            attention(&mut got, &q, &mut compact.layers[0], &params, window);
+            // A long window's queries take the decode split over compact rows,
+            // which matches the one-thread pass to float reassociation.
+            assert_eq!(want.len(), got.len());
+            for (want, got) in want.iter().zip(&got) {
+                assert!(
+                    (want - got).abs() <= 1e-5,
+                    "{n_tokens} tokens from {start_pos}: {want} against {got}"
+                );
             }
         }
     }

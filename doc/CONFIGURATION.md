@@ -196,7 +196,7 @@ Only `models` is required.
 | `slots` | No | Concurrent requests, each with its own KV cache. Defaults to `8` for `embedding` and `1` for every other role; must be at least `1` |
 | `context_shift` | No | `yes` drops a conversation's oldest tokens when it outgrows the context window, instead of refusing or stopping. Defaults to `no`. `context_keep` (default `0`) and `context_shift_drop` (default `0.5`) shape it. See the server chapter's *Context shift*. |
 | `queue_limit` | No | Requests allowed to wait for a slot before the server answers `503`. Defaults to `0`, unbounded |
-| `context` | No | Context, in tokens, one request must be able to hold on the device. Unset, every layer goes to the card when it fits and the context is what is left; set, layers move to the host until the card has room for this much KV cache. Must be at least `1` |
+| `context` | No | Context, in tokens, one request must be able to hold on the device. Unset, every layer goes to the card when it fits and the context is what is left, unless that is under 2048 tokens; set, layers move to the host until the card has room for this much KV cache. Must be at least `1` |
 | `api_key` | No | Bearer token every API request must carry. Unset leaves the server open. `ORANGU_API_KEY` takes precedence |
 | `tls_cert` | No | PEM certificate for serving HTTPS. Needs `tls_key`; set both or neither |
 | `tls_key` | No | PEM private key for serving HTTPS. Needs `tls_cert` |
@@ -214,7 +214,8 @@ Only `models` is required.
 | `device` | No | Which device: an index, part of its name, or `auto` (the default). An unknown device is reported at startup with the list of devices that exist |
 | `device_split` | No | Spread one model across several devices: `off` (the default), `auto`, `all`, or a ratio list such as `3,1` |
 | `threads` | No | CPU worker threads. Unset uses one per logical core; must be at least `1` |
-| `kv_cache` | No | Storage of the KV cache's device mirror: `f16` (the default), `q8_0`, or `f32` |
+| `kv_cache` | No | Storage of the KV cache: `f16` (the default), `q8_0`, or `f32` on a Vulkan-family device; on the CPU backend `q8_0` compacts it and the others leave it `f32` |
+| `kv_cache_values` | No | CPU backend only: storage of KV values where it differs from the keys: `f32`, `q8_0`, or `q4_0`. A GPU backend refuses it |
 | `read_size` | No | Size, in KiB, an explicit read of a model file is widened to. Defaults to `8192` (8 MiB); must be a multiple of `4`, and `4` disables widening |
 | `prefill_backend` | No | Where multi-token prompt passes run: `auto` (the default: the backend that is faster on a prompt-shaped GEMM timed at load), `device` (where decode runs), or `cpu` (prompts on the CPU, decode on the device). `ORANGU_HYBRID_PREFILL_CPU=1` is `cpu` |
 | `prompt_weights` | No | How the weights a prompt multiplies on the CPU are held: `auto` (the default: copies in the format the cores' matrix instructions use, kept when they measure at least 10% faster at load and fit in half the free memory), `copy` (the copies, unmeasured), or `file` (the file's own weights, no copy) |

@@ -59,7 +59,7 @@ The wizard asks for every `[orangu-server]` key. Each prompt shows its default i
 | `tls_cert` | *(none)* | PEM certificate for HTTPS; blank serves plain HTTP. A certificate asks for its `tls_key`. |
 | `slots` | `4` (`1` for `review`, `8` for `embedding`) | Concurrent requests, each with its own KV cache; decoding requests share one forward pass a step. |
 | `queue_limit` | `16` | Requests allowed to wait for a slot before `503`; `0` is unbounded. |
-| `context` | *(none)* | Tokens one request must be able to hold on the card; blank takes whatever the card has left. |
+| `context` | *(none)* | Tokens one request must be able to hold on the card; blank takes whatever the card has left, moving layers to the host if that is under 2048. |
 | `kv_cache` | `f16` | `f16`, `q8_0`, or `f32`. |
 | `draft_model` | *(none)* | A smaller model for speculative decoding. Naming one asks `draft_tokens` (`4`). |
 | `reasoning_effort` | *(none)* | Passed to the chat template; blank leaves the template's own default. |

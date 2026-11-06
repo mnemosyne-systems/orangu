@@ -166,7 +166,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | :-- | :-- |
 | `GET /v1/models` | the one model this process serves, readable by OpenAI and Anthropic clients |
 | `GET /v1/models/{id}` | that model, when `id` names it; `404` otherwise |
-| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; `tools`/`tool_choice`/`tool_calls` with arguments streamed as they are written; `stop`, `n`, `logprobs`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `response_format` (`json_object`, `json_schema`); `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; needs a chat template; disabled under `--embedding` |
+| `POST /v1/chat/completions` | streaming (SSE) and non-streaming; `tools`/`tool_choice`/`tool_calls` with arguments streamed as they are written and held to each tool's schema; `grammar`; `stop`, `n`, `logprobs`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `response_format` (`json_object`, `json_schema`); `cache_prompt`/`id_slot`/`timings_per_token`/`return_progress`; needs a chat template; disabled under `--embedding` |
 | `POST /v1/messages` | Anthropic's Messages API: streaming (SSE) and non-streaming; content blocks and PDF documents, `tools`/`tool_choice`/`tool_use`, continued replies, `stop_sequences`, `thinking`/`effort`; needs a chat template |
 | `POST /v1/messages/count_tokens` | the prompt token count a `/v1/messages` request would have |
 | `POST /v1/messages/batches`, `GET /v1/messages/batches` | Anthropic's Message Batches API: submit many `/v1/messages` requests at once, or list the batches |
@@ -193,7 +193,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `/v1/sessions/{id}/threads…` | a multiagent session's threads and their events (see **Multiagent sessions**) |
 | `/v1/deployments…`, `/v1/deployment_runs…` | scheduled deployments and their runs (see **Scheduled deployments**) |
 | `/v1/webhook_endpoints…` | webhook endpoints (see **Webhooks**) |
-| `POST /v1/completions` | legacy completion, no chat template needed; `stop`, `n`, `logprobs`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `cache_prompt`/`id_slot`/`response_format`/`ignore_eos`; disabled under `--embedding` |
+| `POST /v1/completions` | legacy completion, no chat template needed; `grammar`, `stop`, `n`, `logprobs`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `cache_prompt`/`id_slot`/`response_format`/`ignore_eos`; disabled under `--embedding` |
 | `POST /v1/embeddings` | pooled and L2-normalized; carries OpenAI's `usage` |
 | `POST /v1/images/generations` | OpenAI's Images API, on a `qwen_image`, `qwen_image_2_1`, `flux2_klein` or `moss_image` model; `501` on a language model |
 | `POST /v1/videos`, `GET /v1/videos` | OpenAI's Videos API, on an `ltxv` model: start a clip as a job, or list the jobs; `501` on any other model |
@@ -209,7 +209,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `POST /slots/{id_slot}` | `?action=save\|restore` — persist or reload that slot's KV cache |
 | `GET /metrics` | Prometheus text: gauges, latency histograms, outcome and token counters |
-| `POST /completion` | native, streaming; `stop`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `cache_prompt`/`id_slot`; disabled under `--embedding` |
+| `POST /completion` | native, streaming; `grammar`, `stop`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `cache_prompt`/`id_slot`; disabled under `--embedding` |
 | `POST /infill` | code completion at a cursor, for a model with fill-in-the-middle tokens; `501` on any other |
 | `POST /embedding` | native embeddings |
 | `POST /tokenize`, `POST /detokenize` | text to token ids and back |
@@ -274,6 +274,7 @@ and points at `/v1/completions`.
 | `reasoning_effort` | role's own | `none`, `minimal`, `low`, `medium`, `high` or `xhigh`, passed to the template |
 | `cache_prompt` | `true` | may this request reuse an already-computed KV prefix |
 | `id_slot` | — | pin to one slot |
+| `grammar` | — | GBNF the reply is held to: see below |
 | `timings_per_token` | `false` | attach `timings` to every streamed chunk |
 | `return_progress` | `false` | emit `prompt_progress` chunks during prefill |
 | `response_format` | — | `{"type": "json_object"}` constrains output to JSON |
@@ -306,7 +307,7 @@ a `delta`, ending with a chunk that carries `finish_reason` (plus `usage`,
 honour, in OpenAI's error shape, naming it:
 
 ```json
-{"error":{"message":"/v1/chat/completions: unknown field `grammar`, expected one of `messages`, … A field this server does not honour is refused rather than ignored.","type":"invalid_request_error","param":null,"code":null}}
+{"error":{"message":"/v1/chat/completions: unknown field `mirostat`, expected one of `messages`, … A field this server does not honour is refused rather than ignored.","type":"invalid_request_error","param":null,"code":null}}
 ```
 
 A dropped field looks to a client exactly like a knob with no effect, and a
@@ -522,15 +523,28 @@ order**, each optional one either present or skipped, and no others. An
 object without `properties` takes any keys, valued as
 `additionalProperties` says (`false` allows only `{}`).
 
-Annotations and value checks — `description`, `title`, `format`, `pattern`,
-`minLength`, `minimum`, `uniqueItems` and the like — are accepted and not
-enforced. Keywords that change the shape in ways the constraint cannot
-follow — `not`, `if`/`then`/`else`, `patternProperties`, a many-schema
-`allOf`, `prefixItems` and the like — make the request a `400` naming the
-keyword, as do a `$ref` outside the schema and a `required` name that
-`properties` lacks. The schema is not added to the prompt here: describe
-what you want in the messages too, or the model writes the right keys while
-pausing in whitespace before each one.
+Value checks are enforced as the reply is written:
+
+- `minLength`, `maxLength` and `pattern` for a string. A pattern is read as
+  anchored only where it says `^` or `$`. Groups, classes, `\\d`/`\\w`/`\\s`,
+  alternation and repetition work; look-around, back-references and word
+  boundaries make the request a `400`.
+- `format` for `date`, `time`, `date-time`, `uuid` and `ipv4`. Any other format
+  is an annotation, as the JSON Schema specification has it.
+- `minimum`, `maximum`, `exclusiveMinimum` and `exclusiveMaximum` for a number.
+  An `integer` takes any bound. A `number` needs whole-number bounds and is then
+  written without an exponent.
+- A value check with no `type` says what kind of value it is about, so
+  `{"pattern": "^a+$"}` means a string.
+
+A string can have one of a `pattern`, a checked `format`, or lengths. Annotations
+such as `description` and `title` change nothing. Keywords that cannot be
+followed — `not`, `if`/`then`/`else`, `patternProperties`, a many-schema `allOf`,
+`prefixItems`, `multipleOf`, `uniqueItems: true`, `minProperties` and the like —
+make the request a `400` naming the keyword, as do a `$ref` outside the schema
+and a `required` name that `properties` lacks. The schema is not added to the
+prompt here: describe what you want in the messages too, or the model writes the
+right keys while pausing in whitespace before each one.
 
 Two limits worth knowing. A constrained request cannot use the GPU's argmax
 fast path, which picks tokens without consulting the constraint, so each step
@@ -650,17 +664,24 @@ finished. `orangu` drops such a call and keeps the text.
 
 A call is required by making the reply begin with one: the call's text up to
 where the name goes, and for a named function the name too, is written after the
-generation prompt in the model's own syntax. Under `required` with several
-tools, the choice among them is the model's, and the name it writes is held to
-the names in `tools`. A syntax that writes the arguments before the name has no
-such hold, since the reply cannot be read for the name while it is written, so
-there a model can still name a tool it was not given. With one tool, `required`
-names it. The arguments are always the model's.
+generation prompt in the model's own syntax. With one tool, `required` names it.
 
-A required call can still come back as text. If a model breaks the call's syntax
-after the name, for example by leaving out the closing brace or the closer, the
-reply has no `tool_calls`: its `content` holds what was written, and
-`finish_reason` is `stop`. A client that needs a call should check for one.
+**Tool schemas.** On a model whose call syntax has JSON arguments, every call is
+held to the tools declared, whether required or not: only a tool in `tools` can be
+named, and its arguments are held to its `parameters`, including their value
+checks, in declared order, through to the call's closer. Text around calls is not
+touched, and runs at full speed, as the hold starts when a call opens and ends when
+it closes. A tool whose schema cannot be followed keeps the hold on its name and
+takes any object as arguments. An opener inside reasoning is only a mention.
+
+On a syntax whose arguments are not JSON, such as `gemma-4`'s or the XML-style
+ones, a call is not held this way. Only the name of a required call is, and where
+the arguments come before the name, not even that. A model can then break the
+call's syntax after the name, which leaves the reply with no `tool_calls`: its
+`content` holds what was written, and `finish_reason` is `stop`. A client that
+needs a call should check for one. A call cut off by `max_tokens` is unfinished on
+any syntax.
+
 These are `400`s: an unknown value, a name not in `tools`, `required` with no
 tools, a template that renders no call this server can read, and a required call
 together with a `response_format`.
@@ -668,8 +689,27 @@ together with a `response_format`.
 **`parallel_tool_calls: false`** limits the reply to one call, and generation
 ends at that call's closer.
 
-A tool's parameter schema is passed to the template and not enforced: a call's
-arguments are what the model wrote, and a client should validate them.
+**`grammar`** holds the reply to a grammar in GBNF, as text:
+
+```json
+{"messages": [...], "grammar": "root ::= (\"yes\" | \"no\") \".\"\n"}
+```
+
+| Syntax | Means |
+| :-- | :-- |
+| `name ::= …` | a rule; the reply must match `root` |
+| `"text"`, `[a-z]`, `[^a-z]`, `.` | text, a character class, any character. Escapes: `\\n`, `\\t`, `\\r`, `\\\\`, `\\"`, `\\x41`, `\\u00e9`, `\\U0001F600` |
+| `a b`, `a \| b`, `( … )` | sequence, alternatives, grouping |
+| `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` | repetition, up to 16384 |
+| `# …` | a comment |
+
+A grammar that cannot be read is a `400` saying where and why, as is one with a
+rule that calls itself before reading anything. Token references (`<[1000]>`,
+`<think>`) are refused: a grammar here is over a reply's text. A grammar cannot be
+combined with a `response_format` or a required tool call. Once the grammar is
+satisfied and can read nothing more, the reply ends. Where it could go on, ending
+or going on is the model's choice. As with a schema, it cannot use the GPU's argmax
+fast path, and a model has to be asked for the same thing in the prompt.
 
 #### `POST /v1/completions`
 
@@ -691,6 +731,7 @@ through.
 | `ignore_eos` | `false` | keep generating to `max_tokens` even if the model emits EOS |
 | `cache_prompt` | `true` | as above |
 | `id_slot` | — | as above |
+| `grammar` | — | as above |
 | `response_format` | — | as above |
 
 `ignore_eos` exists for benchmarks: timing a fixed number of decode steps at a
@@ -1259,10 +1300,8 @@ which the response does not repeat. Trailing whitespace on it is trimmed.
 **Forced tool calls.** `any` and `tool` begin the reply with the model's own
 tool-call syntax, found by rendering a sample call through the chat template.
 A template that renders no call this server recognises leaves the choice to
-the model. A continued reply is never forced. Under `any`, the name is held to
-the declared tools, as for [`required`](#post-v1chatcompletions) on the OpenAI
-endpoint, and a model that then breaks the call's syntax produces text rather
-than a `tool_use` block.
+the model. Calls are held to the declared tools and their `input_schema` as
+described under **Tool schemas** in `/v1/chat/completions`. A continued reply is never forced.
 
 The response is a `message`:
 
@@ -2320,6 +2359,7 @@ field names:
 | `cache_prompt` | `true` | as on `/v1/chat/completions` |
 | `id_slot` | — | as on `/v1/chat/completions` |
 | `n_keep` | `context_keep` | how many of the first tokens a context shift keeps |
+| `grammar` | — | GBNF the reply is held to, as on `/v1/chat/completions` |
 
 Non-streaming, the reply is `{"content": "…", "stop": true, "finish_reason": …,
 "timings": {…}}`.
@@ -2436,7 +2476,9 @@ one entry per token. With `score`, `scores` has one entry for each token after t
 first: the log-probability of `tokens[i + 1]` after the first `i + 1` tokens, over
 the whole vocabulary, whether or not it is among the `top` candidates.
 `orangu-bench`'s scoring modes are built on it. The run takes a request slot and waits for one like any
-other request; its cache is its own and is not kept.
+other request; its cache is its own and is not kept, and stores its rows as
+`kv_cache` and `kv_cache_values` say on the CPU backend, so a score measures the
+storage the server is serving with.
 
 #### `POST /apply-template`
 

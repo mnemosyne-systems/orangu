@@ -730,6 +730,8 @@ struct Prompt {
     prefix: Option<String>,
     /// What the first turn may go on with after `prefix`.
     reply_starts: Vec<Vec<u8>>,
+    /// What holds the reply's tool calls to its tools.
+    calls: Option<Arc<crate::engine::tool_learn::CallGrammar>>,
     /// `disable_parallel_tool_use`: the reply makes at most one client call.
     single_call: bool,
     /// The call syntax read off the chat template, for a model no parser
@@ -1167,6 +1169,27 @@ async fn prepare(
         },
         _ => None,
     };
+    // What holds a call to the tools declared, except beside an output format.
+    let calls = tools
+        .as_ref()
+        .filter(|_| output_schema(&fields).ok().flatten().is_none())
+        .zip(state.engine.chat_template.as_ref())
+        .and_then(|(tools, template)| {
+            let kind = choice.and_then(|c| c.get("type")).and_then(Value::as_str);
+            let start = match (kind, &continue_from) {
+                (Some("any"), None) => crate::engine::tool_learn::CallStart::AtName,
+                (Some("tool"), None) => choice
+                    .and_then(|c| c.get("name"))
+                    .and_then(Value::as_str)
+                    .map_or(
+                        crate::engine::tool_learn::CallStart::Free,
+                        crate::engine::tool_learn::CallStart::AfterName,
+                    ),
+                _ => crate::engine::tool_learn::CallStart::Free,
+            };
+            crate::engine::tool_learn::CallGrammar::build(template, tools, start)
+        })
+        .map(Arc::new);
     // Only the reply's first turn begins with what `prefix` forced.
     let reply_starts = match (
         &prefix,
@@ -1218,6 +1241,7 @@ async fn prepare(
         server,
         prefix,
         reply_starts,
+        calls,
         learned,
         single_call,
         json_schema,
@@ -1690,6 +1714,17 @@ async fn drive_turns(
                 } else {
                     Vec::new()
                 },
+                calls: prepared.prompt.calls.clone().map(|calls| {
+                    if first || calls.initial.is_none() {
+                        calls
+                    } else {
+                        Arc::new(crate::engine::tool_learn::CallGrammar {
+                            trigger: calls.trigger.clone(),
+                            after_trigger: calls.after_trigger.clone(),
+                            initial: None,
+                        })
+                    }
+                }),
                 cache_prompt: prepared.cache_prompt,
                 id_slot: prepared.id_slot,
                 timings_per_token: false,

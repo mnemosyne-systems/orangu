@@ -32,6 +32,8 @@
 use anyhow::Result;
 
 use super::arch::ModelForward;
+use super::kv_cache::KvCache;
+use super::kv_pool::{HostFormats, KvPool, LayerGeometry, Policy, page_tokens};
 
 /// The widest multi-position pass a request may ask for.
 pub const MAX_ROWS: usize = 64;
@@ -51,9 +53,10 @@ pub fn teacher_scored(
     rows: usize,
     top: usize,
     slot_id: usize,
+    formats: Option<HostFormats>,
 ) -> Result<(Vec<TopLogprobs>, Vec<f32>)> {
     let mut scores = Vec::with_capacity(tokens.len().saturating_sub(1));
-    let positions = run(model, tokens, rows, top, slot_id, |at, logits| {
+    let positions = run(model, tokens, rows, top, slot_id, formats, |at, logits| {
         if let Some(&next) = tokens.get(at + 1) {
             scores.push(logprob_of(logits, next));
         }
@@ -71,7 +74,7 @@ pub fn teacher_forced(
     top: usize,
     slot_id: usize,
 ) -> Result<Vec<TopLogprobs>> {
-    run(model, tokens, rows, top, slot_id, |_, _| {})
+    run(model, tokens, rows, top, slot_id, None, |_, _| {})
 }
 
 fn run(
@@ -80,10 +83,14 @@ fn run(
     rows: usize,
     top: usize,
     slot_id: usize,
+    formats: Option<HostFormats>,
     mut each: impl FnMut(usize, &[f32]),
 ) -> Result<Vec<TopLogprobs>> {
     let rows = rows.clamp(1, MAX_ROWS);
     let mut cache = model.new_kv_cache(tokens.len().max(1));
+    if formats.is_some() {
+        cache = in_private_pool(cache, tokens.len().max(1), formats);
+    }
     let mut out = Vec::with_capacity(tokens.len());
     for (i, part) in tokens.chunks(rows).enumerate() {
         let pos = i * rows;
@@ -103,6 +110,23 @@ fn run(
         }
     }
     Ok(out)
+}
+
+/// `cache` over a pool of its own, whose rows are stored as the server's are:
+/// a score measures the arithmetic the server serves with, and no one else's
+/// pages are at stake.
+fn in_private_pool(cache: KvCache, tokens: usize, formats: Option<HostFormats>) -> KvCache {
+    let page_tokens = page_tokens();
+    let pool = KvPool::with_formats(
+        tokens.div_ceil(page_tokens),
+        page_tokens,
+        LayerGeometry::of(&cache),
+        Policy::Lru,
+        formats,
+    );
+    cache
+        .try_into_paged_promising(std::sync::Arc::new(pool), 0, usize::MAX, None)
+        .unwrap_or_else(|cache| cache)
 }
 
 /// `id`'s log-probability over the whole row.

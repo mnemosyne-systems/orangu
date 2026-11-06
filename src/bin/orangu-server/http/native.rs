@@ -822,6 +822,9 @@ pub struct CompletionRequest {
     /// How many of the first tokens a context shift keeps.
     #[serde(default)]
     n_keep: Option<usize>,
+    /// GBNF the reply is held to.
+    #[serde(default)]
+    grammar: Option<String>,
     #[serde(default)]
     temperature: Option<f32>,
     #[serde(default)]
@@ -910,11 +913,16 @@ pub async fn completion(
         },
     );
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
+    let grammar = match super::openai::request_grammar(req.grammar.as_deref()) {
+        Ok(grammar) => grammar,
+        Err(rejection) => return *rejection,
+    };
     serve_generation(
         &state,
         GenerateRequest {
             prompt_tokens: tokens,
             sampling,
+            grammar,
             max_tokens: req.n_predict,
             stop_token_ids,
             cache_prompt: req.cache_prompt,

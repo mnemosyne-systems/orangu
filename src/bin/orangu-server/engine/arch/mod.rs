@@ -2611,6 +2611,14 @@ pub(crate) fn kv_elements_per_token(loaded: &crate::engine::loader::LoadedModel)
     }
 }
 
+/// The `f32` elements one token's rows take in host pages, every layer's.
+pub(crate) fn kv_host_elements_per_token(loaded: &crate::engine::loader::LoadedModel) -> usize {
+    match crate::engine::loader::resolve_arch_family(&loaded.config.architecture) {
+        Ok(crate::engine::loader::ArchFamily::Gemma) => gemma::kv_host_elements_per_token(loaded),
+        _ => kv_elements_per_token(loaded),
+    }
+}
+
 /// The other half of [`kv_elements_per_token`]: what one request's mirror
 /// holds whatever its context — the windowed layers' rings, on a family
 /// that keeps them (`gemma::kv_fixed_elements`); zero elsewhere.
@@ -4246,6 +4254,20 @@ pub trait ModelForward: Send + Sync {
     ) -> Result<(Vec<f32>, Vec<f32>)> {
         let _ = (cache, tokens, start_pos, slot_id);
         anyhow::bail!("this architecture has no multi-token-prediction state to export")
+    }
+
+    /// Whether a verify on a model split across devices can read rows the
+    /// devices are keeping. `false` here: it runs on the host, over the host's
+    /// rows, and a step that lacks them cannot speculate.
+    fn verifies_rows_on_split_devices(&self) -> bool {
+        false
+    }
+
+    /// Whether this architecture reads its cached rows only through
+    /// [`crate::engine::attention::attention`], which is what lets the CPU
+    /// backend keep them in a compact format.
+    fn reads_rows_only_through_attention(&self) -> bool {
+        false
     }
 
     /// Whether a model with recurrent layers verifies a draft on its device,

@@ -94,6 +94,211 @@ fn common_suffix_len(a: &str, b: &str) -> usize {
         .sum()
 }
 
+/// One call the probe makes, for a template to render.
+fn probe_call() -> Value {
+    json!({"id": "probe", "type": "function", "function": {
+        "name": NAME,
+        "arguments": json!({KEY_A: VALUE_A, KEY_B: VALUE_B}).to_string(),
+    }})
+}
+
+/// Renders probe turns through a template, and takes off what comes before a
+/// reply: what comes before says nothing about the call, and can share text
+/// with what ends the turn.
+struct CallProbe<'a> {
+    template: &'a ChatTemplate,
+    tools: Value,
+    user: ChatMessage,
+    head: String,
+    plain: String,
+}
+
+impl<'a> CallProbe<'a> {
+    fn new(template: &'a ChatTemplate) -> Option<Self> {
+        let tools = json!([{"type": "function", "function": {
+            "name": NAME,
+            "parameters": {"type": "object", "properties": {
+                KEY_A: {"type": "string"}, KEY_B: {"type": "string"},
+            }},
+        }}]);
+        let user = ChatMessage::text("user", "probe");
+        let head = template
+            .render_with_tools(
+                std::slice::from_ref(&user),
+                true,
+                "",
+                "",
+                Default::default(),
+                Some(&tools),
+            )
+            .ok()?;
+        let mut probe = Self {
+            template,
+            tools,
+            user,
+            head,
+            plain: String::new(),
+        };
+        probe.plain = probe.reply(probe.render(None)?);
+        Some(probe)
+    }
+
+    fn render(&self, calls: Option<Value>) -> Option<String> {
+        let mut turn = ChatMessage::text("assistant", "");
+        turn.tool_calls = calls;
+        self.template
+            .render_with_tools(
+                &[self.user.clone(), turn],
+                false,
+                "",
+                "",
+                Default::default(),
+                Some(&self.tools),
+            )
+            .ok()
+    }
+
+    fn reply(&self, rendered: String) -> String {
+        match rendered.strip_prefix(self.head.as_str()) {
+            Some(reply) => reply.to_string(),
+            None => rendered,
+        }
+    }
+}
+
+/// Where a reply already stands when a call's grammar takes over.
+#[derive(Clone, Debug, PartialEq)]
+pub enum CallStart<'a> {
+    /// Nowhere: the model chooses whether to call.
+    Free,
+    /// Forced up to where any tool's name goes.
+    AtName,
+    /// Forced through this tool's name.
+    AfterName(&'a str),
+}
+
+/// What holds a tool call to the tools a request declared: once `trigger` has
+/// been written, `after_trigger` says what may follow it, each tool's name
+/// with arguments its schema describes.
+#[derive(Debug)]
+pub struct CallGrammar {
+    pub trigger: String,
+    pub after_trigger: Arc<crate::engine::grammar::Grammar>,
+    /// What a reply forced to begin with a call is held to from its start.
+    pub initial: Option<Arc<crate::engine::grammar::Grammar>>,
+}
+
+impl CallGrammar {
+    /// The grammar for `tools`, in the request's shape, on the call syntax
+    /// `template` renders. `None` where its arguments are not JSON, as a
+    /// grammar over them is not something this can write. A tool whose schema
+    /// cannot be followed takes any object as arguments.
+    pub fn build(template: &ChatTemplate, tools: &Value, start: CallStart<'_>) -> Option<Self> {
+        use crate::engine::schema_text::quoted;
+        let probe = CallProbe::new(template)?;
+        let one = probe.reply(probe.render(Some(json!([probe_call()])))?);
+        let region = call_text(&one, &probe.plain)?.trim();
+        if region.is_empty() || region.len() > MAX_CALL_BYTES {
+            return None;
+        }
+        let (open, close, shape) = read_shape(region)?;
+        let trigger = open.trim().to_string();
+        if trigger.is_empty() {
+            return None;
+        }
+        let closing = match close.trim() {
+            "" => "\"\"".to_string(),
+            close => quoted(close),
+        };
+        let json_key = |key: &str| quoted(&Value::String(key.to_string()).to_string());
+        // Per tool: the rule for what follows its name, and the whole call.
+        let mut rules = crate::engine::json_schema::common_rules();
+        let mut whole = Vec::new();
+        let mut at_name = Vec::new();
+        let mut after_named = None;
+        let declared = tools.as_array()?;
+        for (index, tool) in declared.iter().enumerate() {
+            let function = tool.get("function")?;
+            let name = function.get("name")?.as_str()?;
+            let prefix = format!("t{index}");
+            let parameters = function.get("parameters").unwrap_or(&Value::Null);
+            let args = match crate::engine::json_schema::schema_rules(parameters, &prefix) {
+                Ok((schema_rules, root)) => {
+                    rules.push_str(&schema_rules);
+                    root
+                }
+                Err(_) => "anyobject".to_string(),
+            };
+            let json_name = Value::String(name.to_string()).to_string();
+            let bare_name = &json_name[1..json_name.len() - 1];
+            let after = format!("{prefix}after");
+            let (call, after_body) = match &shape {
+                Shape::JsonObject {
+                    name_field,
+                    args_field,
+                } => {
+                    let name_key = json_key(name_field);
+                    let args_key = json_key(args_field);
+                    if region.find(name_field.as_str()) < region.find(args_field.as_str()) {
+                        (
+                            format!(
+                                "\"{{\" ws {name_key} ws \":\" ws \"\\\"\" {} {after}",
+                                quoted(bare_name)
+                            ),
+                            format!(
+                                "\"\\\"\" ws \",\" ws {args_key} ws \":\" ws {args} ws \"}}\" ws {closing}"
+                            ),
+                        )
+                    } else {
+                        (
+                            format!(
+                                "\"{{\" ws {args_key} ws \":\" ws {args} ws \",\" ws {name_key} ws \":\" ws {} ws \"}}\" ws {closing}",
+                                quoted(&json_name)
+                            ),
+                            String::new(),
+                        )
+                    }
+                }
+                Shape::NameThenJson { gap } => (
+                    format!("{} {after}", quoted(name)),
+                    format!("{} ws {args} ws {closing}", quoted(gap)),
+                ),
+                Shape::Pairs { .. } => return None,
+            };
+            if !after_body.is_empty() {
+                rules.push_str(&format!("{after} ::= {after_body}\n"));
+                at_name.push(format!("{} {after}", quoted(bare_name)));
+                if start == CallStart::AfterName(name) {
+                    after_named = Some(after.clone());
+                }
+            }
+            let rule = format!("{prefix}call");
+            rules.push_str(&format!("{rule} ::= {call}\n"));
+            whole.push(rule);
+        }
+        if whole.is_empty() {
+            return None;
+        }
+        let parse = |root: &str| {
+            crate::engine::grammar::Grammar::parse(&format!("root ::= {root}\n{rules}")).ok()
+        };
+        let any_call = whole.join(" | ");
+        let after_trigger = parse(&format!("ws ({any_call})"))?;
+        let initial = match start {
+            CallStart::Free => None,
+            CallStart::AtName if at_name.len() == whole.len() => parse(&at_name.join(" | ")),
+            // The arguments come first, so the reply is forced only that far.
+            CallStart::AtName => parse(&format!("ws ({any_call})")),
+            CallStart::AfterName(_) => after_named.as_deref().and_then(parse),
+        };
+        Some(Self {
+            trigger,
+            after_trigger,
+            initial,
+        })
+    }
+}
+
 /// The most text one rendered call may be: a real one is a few dozen bytes, and
 /// reading its shape looks at every brace in it.
 const MAX_CALL_BYTES: usize = 16 * 1024;
@@ -193,59 +398,21 @@ impl LearnedCalls {
     /// [`tool_calls`] reads already, when it has none, or when the syntax has
     /// no opening delimiter to anchor on.
     pub fn learn(template: &ChatTemplate) -> Option<Self> {
-        let tools = json!([{"type": "function", "function": {
-            "name": NAME,
-            "parameters": {"type": "object", "properties": {
-                KEY_A: {"type": "string"}, KEY_B: {"type": "string"},
-            }},
-        }}]);
-        let user = ChatMessage::text("user", "probe");
-        let call = || {
-            json!({"id": "probe", "type": "function", "function": {
-                "name": NAME,
-                "arguments": json!({KEY_A: VALUE_A, KEY_B: VALUE_B}).to_string(),
-            }})
-        };
-        let render = |calls: Option<Value>| {
-            let mut turn = ChatMessage::text("assistant", "");
-            turn.tool_calls = calls;
-            template
-                .render_with_tools(
-                    &[user.clone(), turn],
-                    false,
-                    "",
-                    "",
-                    Default::default(),
-                    Some(&tools),
-                )
-                .ok()
-        };
-        // A reply starts where the generation prompt ends: what comes before
-        // it says nothing about the call, and can share text with what ends
-        // the turn.
-        let head = template
-            .render_with_tools(
-                std::slice::from_ref(&user),
-                true,
-                "",
-                "",
-                Default::default(),
-                Some(&tools),
-            )
-            .ok()?;
-        let reply = |rendered: String| match rendered.strip_prefix(head.as_str()) {
-            Some(reply) => reply.to_string(),
-            None => rendered,
-        };
-        let plain = reply(render(None)?);
-        let one = reply(render(Some(json!([call()])))?);
-        let region = call_text(&one, &plain)?.trim();
+        let probe = CallProbe::new(template)?;
+        let one = probe.reply(probe.render(Some(json!([probe_call()])))?);
+        let region = call_text(&one, &probe.plain)?.trim();
         if region.is_empty()
             || region.len() > MAX_CALL_BYTES
             || tool_calls::first_opener(region).is_some()
         {
             return None;
         }
+        let call = probe_call;
+        let (render, reply, plain) = (
+            |calls: Option<Value>| probe.render(calls),
+            |rendered: String| probe.reply(rendered),
+            probe.plain.clone(),
+        );
         let (open, close, shape) = read_shape(region)?;
         let open = open.trim_start().to_string();
         if open.trim().is_empty() {
@@ -467,6 +634,152 @@ impl LearnedReader {
             Some(calls) => LearnedCalls::canonical(&calls),
             None => held,
         }
+    }
+}
+
+#[cfg(test)]
+mod call_grammar_tests {
+    use super::*;
+    use crate::engine::grammar::{Grammar, Matcher};
+
+    const JSON_CALLS: &str = "{% for m in messages %}<{{ m.role }}>{% if m.tool_calls %}{% for c in m.tool_calls %}\
+        <tool_call>\n{\"name\": \"{{ c.function.name }}\", \"arguments\": {{ c.function.arguments | tojson }}}\n</tool_call>\
+        {% endfor %}{% else %}{{ m.content }}{% endif %}</s>{% endfor %}\
+        {% if add_generation_prompt %}<assistant>{% endif %}";
+
+    const NAME_THEN_JSON: &str = "{% for m in messages %}<{{ m.role }}>{% if m.tool_calls %}{% for c in m.tool_calls %}\
+        [CALL]{{ c.function.name }}[ARGS]{{ c.function.arguments | tojson }}\
+        {% endfor %}{% else %}{{ m.content }}{% endif %}</s>{% endfor %}\
+        {% if add_generation_prompt %}<assistant>{% endif %}";
+
+    fn tools() -> Value {
+        json!([
+            {"type": "function", "function": {"name": "read", "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "line": {"type": "integer", "minimum": 1}},
+                "required": ["path"],
+            }}},
+            {"type": "function", "function": {"name": "ping", "parameters": {
+                "type": "object", "not": {"type": "null"},
+            }}},
+        ])
+    }
+
+    fn calls(template: &str, start: CallStart<'_>) -> Option<CallGrammar> {
+        CallGrammar::build(&ChatTemplate::new(template.to_string()), &tools(), start)
+    }
+
+    fn takes(grammar: &Arc<Grammar>, text: &str) -> bool {
+        let mut matcher = Matcher::new(grammar.clone());
+        matcher.push_bytes(text.as_bytes()) && matcher.is_complete()
+    }
+
+    #[test]
+    fn a_call_is_held_to_a_declared_tool_and_its_schema() {
+        let calls = calls(JSON_CALLS, CallStart::Free).unwrap();
+        assert_eq!(calls.trigger, "<tool_call>");
+        assert!(calls.initial.is_none());
+        let g = &calls.after_trigger;
+        let call = |body: &str| format!("\n{body}\n</tool_call>");
+        assert!(takes(
+            g,
+            &call(r#"{"name": "read", "arguments": {"path": "a"}}"#)
+        ));
+        assert!(takes(
+            g,
+            &call(r#"{"name": "read", "arguments": {"path": "a", "line": 3}}"#)
+        ));
+        // A tool nobody declared, a missing argument, a wrong type, a bound.
+        assert!(!takes(
+            g,
+            &call(r#"{"name": "write", "arguments": {"path": "a"}}"#)
+        ));
+        assert!(!takes(g, &call(r#"{"name": "read", "arguments": {}}"#)));
+        assert!(!takes(
+            g,
+            &call(r#"{"name": "read", "arguments": {"path": 1}}"#)
+        ));
+        assert!(!takes(
+            g,
+            &call(r#"{"name": "read", "arguments": {"path": "a", "line": 0}}"#)
+        ));
+        // Nor can it stop before the closer.
+        assert!(!takes(g, r#"{"name": "read", "arguments": {"path": "a"}}"#));
+    }
+
+    /// A schema that cannot be followed does not lose the tool: its name is
+    /// still held, and any object is its arguments.
+    #[test]
+    fn a_schema_it_cannot_follow_leaves_the_tool_any_arguments() {
+        let calls = calls(JSON_CALLS, CallStart::Free).unwrap();
+        let g = &calls.after_trigger;
+        assert!(takes(
+            g,
+            "{\"name\": \"ping\", \"arguments\": {\"x\": [1]}}</tool_call>"
+        ));
+        assert!(!takes(
+            g,
+            "{\"name\": \"ping\", \"arguments\": 1}</tool_call>"
+        ));
+    }
+
+    #[test]
+    fn a_forced_reply_is_held_from_where_the_forcing_ended() {
+        let any = calls(JSON_CALLS, CallStart::AtName).unwrap();
+        let g = any.initial.as_ref().unwrap();
+        assert!(takes(
+            g,
+            "read\", \"arguments\": {\"path\": \"a\"}}</tool_call>"
+        ));
+        assert!(!takes(g, "write\", \"arguments\": {}}</tool_call>"));
+
+        let named = calls(JSON_CALLS, CallStart::AfterName("read")).unwrap();
+        let g = named.initial.as_ref().unwrap();
+        assert!(takes(
+            g,
+            "\", \"arguments\": {\"path\": \"a\"}}</tool_call>"
+        ));
+        assert!(!takes(g, "\", \"arguments\": {}}</tool_call>"));
+    }
+
+    #[test]
+    fn a_name_then_arguments_syntax_is_followed_too() {
+        let calls = calls(NAME_THEN_JSON, CallStart::Free).unwrap();
+        assert_eq!(calls.trigger, "[CALL]");
+        let g = &calls.after_trigger;
+        assert!(takes(g, "read[ARGS]{\"path\": \"a\"}"));
+        assert!(!takes(g, "write[ARGS]{\"path\": \"a\"}"));
+        assert!(!takes(g, "read[ARGS]{}"));
+    }
+
+    /// What building the grammar costs a request: `orangu` sends its tools on
+    /// every turn.
+    #[test]
+    #[ignore = "a timing report"]
+    fn call_grammar_cost() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../orangu-bench/fixtures/coding-session.json"
+        ))
+        .unwrap();
+        let tools = fixture["tools"].clone();
+        let count = tools.as_array().unwrap().len();
+        let template = ChatTemplate::new(JSON_CALLS.to_string());
+        let started = std::time::Instant::now();
+        const N: u32 = 200;
+        for _ in 0..N {
+            std::hint::black_box(CallGrammar::build(&template, &tools, CallStart::Free).unwrap());
+        }
+        println!("{count} tools: {:?} a build", started.elapsed() / N);
+    }
+
+    #[test]
+    fn a_syntax_whose_arguments_are_not_json_has_no_grammar() {
+        let pairs = "{% for m in messages %}<{{ m.role }}>{% if m.tool_calls %}{% for c in m.tool_calls %}\
+            <call name={{ c.function.name }}>\
+            {% for k, v in c.function.arguments | items %}<{{ k }}>{{ v }}</{{ k }}>{% endfor %}</call>\
+            {% endfor %}{% else %}{{ m.content }}{% endif %}</s>{% endfor %}\
+            {% if add_generation_prompt %}<assistant>{% endif %}";
+        assert!(calls(pairs, CallStart::Free).is_none());
     }
 }
 

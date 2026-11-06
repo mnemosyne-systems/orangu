@@ -124,6 +124,19 @@ pub(crate) fn device_rows_to_f32(
     }
 }
 
+/// Rows `from..from + k.len() / kv_dim` as `f32`.
+struct DecodedRows {
+    from: usize,
+    k: Vec<f32>,
+    v: Vec<f32>,
+}
+
+thread_local! {
+    /// The buffers of [`DecodedRows`], kept between layers.
+    static DECODED_SCRATCH: std::cell::Cell<(Vec<f32>, Vec<f32>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+}
+
 pub struct LayerCache {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -153,6 +166,10 @@ pub struct LayerCache {
     /// buffer and hands the page over only when it is full, so the pool never
     /// holds anything that is still changing.
     paged: Option<PagedRows>,
+    /// Sealed rows of a compact pool, decoded for one attention call. Every
+    /// layer's goes back to [`DECODED_SCRATCH`] when its attention is done, so
+    /// a request holds one layer's rows as `f32` at a time.
+    decoded: Option<DecodedRows>,
     /// GPU-resident mirror of `k`/`v`, built lazily on the first call that
     /// needs it (a Vulkan-backed decode step) — `None` for every other
     /// backend/request. See [`Self::sync_gpu`].
@@ -656,6 +673,9 @@ impl Drop for SequencePages {
 /// One layer's view of its sequence's pages.
 struct PagedRows {
     seq: std::sync::Arc<SequencePages>,
+    /// Whether the pool holds sealed rows in a compact format, read once here
+    /// because every row read asks.
+    compact: bool,
     /// Which layer of the pool's geometry this is — pages are shared across
     /// layers, so a page index means "these token positions", and the layer
     /// selects which of its regions to read.
@@ -1163,6 +1183,7 @@ impl LayerCache {
             gpu: None,
             stride,
             paged: None,
+            decoded: None,
             pool_backed: false,
             pending_rows: 0,
             deferred_rows: 0,
@@ -1192,6 +1213,7 @@ impl LayerCache {
             // and only the destination's stride governs how many rows a
             // token count means, so this never needs the original's.
             stride: 1,
+            decoded: None,
             pool_backed: false,
             pending_rows: 0,
             deferred_rows: 0,
@@ -1219,6 +1241,7 @@ impl LayerCache {
             // cache can be in two places at once, and sharing pages between
             // those two would defeat the point of taking it.
             paged: None,
+            decoded: None,
             pool_backed: false,
             pending_rows: 0,
             deferred_rows: 0,
@@ -2034,6 +2057,7 @@ impl LayerCache {
         let mut me = Self::new_strided(capacity, kv_dim, stride);
         let rows_per_page = seq.pool.page_tokens().div_ceil(stride);
         me.paged = Some(PagedRows {
+            compact: seq.pool.host_formats().is_some(),
             seq,
             layer,
             rows_per_page,
@@ -2385,6 +2409,26 @@ impl LayerCache {
             let n = rows * self.kv_dim;
             return (self.k[..n].to_vec(), self.v[..n].to_vec());
         }
+        if let Some(paged) = self.paged.as_ref().filter(|paged| paged.compact) {
+            let dim = self.kv_dim;
+            let mut k = vec![0.0; rows * dim];
+            let mut v = vec![0.0; rows * dim];
+            let sealed = rows.min(paged.full_pages * paged.rows_per_page);
+            for r in 0..sealed {
+                paged.seq.pool.decode_rows(
+                    paged.layer,
+                    paged.pages[r / paged.rows_per_page],
+                    r % paged.rows_per_page,
+                    &mut k[r * dim..(r + 1) * dim],
+                    &mut v[r * dim..(r + 1) * dim],
+                );
+            }
+            for r in sealed..rows {
+                k[r * dim..(r + 1) * dim].copy_from_slice(self.row_k(r));
+                v[r * dim..(r + 1) * dim].copy_from_slice(self.row_v(r));
+            }
+            return (k, v);
+        }
         let mut k = Vec::with_capacity(rows * self.kv_dim);
         let mut v = Vec::with_capacity(rows * self.kv_dim);
         for r in 0..rows {
@@ -2607,10 +2651,19 @@ impl LayerCache {
             let straddling = released[0];
             let mut k = Vec::with_capacity(partial * kv_dim);
             let mut v = Vec::with_capacity(partial * kv_dim);
-            for row in 0..partial {
-                let range = paged.row(straddling, row);
-                k.extend_from_slice(&paged.seq.pool.page_k_all(paged.layer)[range.clone()]);
-                v.extend_from_slice(&paged.seq.pool.page_v_all(paged.layer)[range]);
+            if paged.compact {
+                k.resize(partial * kv_dim, 0.0);
+                v.resize(partial * kv_dim, 0.0);
+                paged
+                    .seq
+                    .pool
+                    .decode_rows(paged.layer, straddling, 0, &mut k, &mut v);
+            } else {
+                for row in 0..partial {
+                    let range = paged.row(straddling, row);
+                    k.extend_from_slice(&paged.seq.pool.page_k_all(paged.layer)[range.clone()]);
+                    v.extend_from_slice(&paged.seq.pool.page_v_all(paged.layer)[range]);
+                }
             }
             self.k = k;
             self.v = v;
@@ -2684,6 +2737,118 @@ impl LayerCache {
         (self.row_k(pos), self.row_v(pos))
     }
 
+    /// What holds row `pos`, which [`Self::decode_sealed_rows`] must have
+    /// covered. A reader that skipped it would otherwise have nothing to read.
+    #[inline]
+    fn decoded_row(&self, pos: usize) -> &DecodedRows {
+        self.decoded
+            .as_ref()
+            .filter(|decoded| {
+                pos >= decoded.from && pos < decoded.from + decoded.k.len() / self.kv_dim
+            })
+            .unwrap_or_else(|| panic!("row {pos} of a compact page was read without decoding it"))
+    }
+
+    #[cold]
+    fn decoded_k(&self, pos: usize) -> &[f32] {
+        let decoded = self.decoded_row(pos);
+        &decoded.k[(pos - decoded.from) * self.kv_dim..][..self.kv_dim]
+    }
+
+    #[cold]
+    fn decoded_v(&self, pos: usize) -> &[f32] {
+        let decoded = self.decoded_row(pos);
+        &decoded.v[(pos - decoded.from) * self.kv_dim..][..self.kv_dim]
+    }
+
+    /// Whether this layer's sealed rows have to be decoded before a read.
+    pub fn has_compact_rows(&self) -> bool {
+        self.paged.as_ref().is_some_and(|paged| paged.compact)
+    }
+
+    /// Decodes this layer's sealed rows within positions `from..to`, for
+    /// [`Self::key_at`] and [`Self::value_at`] until
+    /// [`Self::release_decoded_rows`]. Rows past the seal need no decoding.
+    pub fn decode_sealed_rows(&mut self, from: usize, to: usize) {
+        use rayon::prelude::*;
+        let Some(paged) = self.paged.as_ref().filter(|paged| paged.compact) else {
+            return;
+        };
+        let dim = self.kv_dim;
+        let page_rows = paged.rows_per_page;
+        let to = to.min(paged.full_pages * page_rows);
+        if from >= to {
+            return;
+        }
+        let floats = (to - from) * dim;
+        let (mut k, mut v) = DECODED_SCRATCH.take();
+        k.resize(floats, 0.0);
+        v.resize(floats, 0.0);
+        let mut spans = Vec::with_capacity((to - from) / page_rows + 2);
+        let (mut rest_k, mut rest_v) = (&mut k[..], &mut v[..]);
+        let mut row = from;
+        while row < to {
+            let first = row % page_rows;
+            let rows = (page_rows - first).min(to - row);
+            let (this_k, later_k) = rest_k.split_at_mut(rows * dim);
+            let (this_v, later_v) = rest_v.split_at_mut(rows * dim);
+            spans.push((paged.pages[row / page_rows], first, this_k, this_v));
+            (rest_k, rest_v) = (later_k, later_v);
+            row += rows;
+        }
+        let pool = &paged.seq.pool;
+        let layer = paged.layer;
+        spans.into_par_iter().for_each(|(page, first, k, v)| {
+            pool.decode_rows(layer, page, first, k, v);
+        });
+        self.decoded = Some(DecodedRows { from, k, v });
+    }
+
+    /// Keys and values of K/V head `kv_head` at `rows` positions from `first`,
+    /// as `f32`, from whichever side of the seal each one is on.
+    pub fn read_head_rows(
+        &self,
+        first: usize,
+        rows: usize,
+        kv_head: usize,
+        head_dim: usize,
+        k: &mut [f32],
+        v: &mut [f32],
+    ) {
+        let start = kv_head * head_dim;
+        let paged = self.paged.as_ref();
+        let complete = paged.map_or(0, |paged| paged.full_pages * paged.rows_per_page);
+        for (offset, (k, v)) in k
+            .chunks_exact_mut(head_dim)
+            .zip(v.chunks_exact_mut(head_dim))
+            .take(rows)
+            .enumerate()
+        {
+            let pos = first + offset;
+            match paged.filter(|paged| paged.compact && pos < complete) {
+                Some(paged) => paged.seq.pool.decode_head(
+                    paged.layer,
+                    paged.pages[pos / paged.rows_per_page],
+                    pos % paged.rows_per_page,
+                    start,
+                    k,
+                    v,
+                ),
+                None => {
+                    k.copy_from_slice(&self.row_k(pos)[start..start + head_dim]);
+                    v.copy_from_slice(&self.row_v(pos)[start..start + head_dim]);
+                }
+            }
+        }
+    }
+
+    /// Hands the buffers of [`Self::decode_sealed_rows`] to the next layer.
+    pub fn release_decoded_rows(&mut self) {
+        if let Some(decoded) = self.decoded.take() {
+            DECODED_SCRATCH.set((decoded.k, decoded.v));
+        }
+    }
+
     /// Row `pos`'s keys, from whichever side of the seal it is on.
     ///
     /// The one place the paged indirection lives on the read path. A page's
@@ -2698,7 +2863,12 @@ impl LayerCache {
                 if pos < complete {
                     let (page, row) = (pos / paged.rows_per_page, pos % paged.rows_per_page);
                     let range = paged.row(paged.pages[page], row);
-                    &paged.seq.pool.page_k_all(paged.layer)[range]
+                    // A compact pool has no `f32` pages, so this is also what
+                    // tells the two apart.
+                    match paged.seq.pool.page_k_all(paged.layer).get(range) {
+                        Some(row) => row,
+                        None => self.decoded_k(pos),
+                    }
                 } else {
                     let local = pos - complete;
                     &self.k[local * self.kv_dim..(local + 1) * self.kv_dim]
@@ -2715,7 +2885,12 @@ impl LayerCache {
                 if pos < complete {
                     let (page, row) = (pos / paged.rows_per_page, pos % paged.rows_per_page);
                     let range = paged.row(paged.pages[page], row);
-                    &paged.seq.pool.page_v_all(paged.layer)[range]
+                    // A compact pool has no `f32` pages, so this is also what
+                    // tells the two apart.
+                    match paged.seq.pool.page_v_all(paged.layer).get(range) {
+                        Some(row) => row,
+                        None => self.decoded_v(pos),
+                    }
                 } else {
                     let local = pos - complete;
                     &self.v[local * self.kv_dim..(local + 1) * self.kv_dim]
@@ -3173,6 +3348,7 @@ impl KvCache {
                 layer.mirror_ring_slack = None;
             }
             layer.paged = Some(PagedRows {
+                compact: pool.host_formats().is_some(),
                 seq: seq.clone(),
                 layer: i,
                 rows_per_page: pool.page_tokens().div_ceil(geom.stride.max(1)),
@@ -3967,6 +4143,15 @@ impl KvCache {
         }
         self.truncate_attention(new_len);
         Ok(())
+    }
+
+    /// Whether the host holds every attention layer's first `rows` rows. On a
+    /// model split across devices a decode step leaves its rows on them, and a
+    /// pass that runs on the host, as a verify there does, reads them from here.
+    pub fn host_holds_rows(&self, rows: usize) -> bool {
+        self.layers
+            .iter()
+            .all(|layer| layer.kv_dim == 0 || layer.host_len() >= rows)
     }
 
     /// [`LayerCache::fetch_device_rows`] on every attention layer: `true`
@@ -4991,6 +5176,18 @@ mod tests {
     /// A cache in the state the fused GPU decode path leaves it: a prefill
     /// pushed to the host, then decode steps committed to the device mirror
     /// only.
+    /// What a split model's verify reads: rows the devices kept are not here.
+    #[test]
+    fn the_host_knows_which_rows_it_holds() {
+        let cache = cache_with_gpu_only_tail(8, 4);
+        assert!(cache.host_holds_rows(8));
+        assert!(!cache.host_holds_rows(9));
+        assert_eq!(cache.layers[0].len, 12);
+        // A layer another node holds has no rows here to be missing.
+        let empty = KvCache::new_with_dims(16, &[0, 0]);
+        assert!(empty.host_holds_rows(16));
+    }
+
     fn cache_with_gpu_only_tail(prefilled: usize, decoded: usize) -> KvCache {
         let mut cache = KvCache::new(1, 512, 4);
         for i in 0..prefilled {
@@ -5467,6 +5664,157 @@ mod tests {
     /// the paged cache then holds exactly the source's prefix, sealing the
     /// pages it fills, and one that cannot be filled that way is refused
     /// whole rather than half-filled.
+    /// A pool whose compact format loses nothing, so every reader can be
+    /// held to the plain cache's exact rows.
+    fn exact_compact_pair(
+        rows: usize,
+    ) -> (
+        std::sync::Arc<crate::engine::kv_pool::KvPool>,
+        KvCache,
+        KvCache,
+    ) {
+        use crate::engine::kv_pool::{HostFormats, KvPool, LayerGeometry, Policy};
+        use crate::engine::kv_rows::RowFormat;
+        use std::sync::Arc;
+        const KV: usize = 8;
+        let geom = vec![LayerGeometry {
+            kv_dim: KV,
+            stride: 1,
+            ring: None,
+        }];
+        let pool = Arc::new(KvPool::with_formats(
+            32,
+            4,
+            geom,
+            Policy::Lru,
+            Some(HostFormats {
+                k: RowFormat::F32,
+                v: RowFormat::F32,
+            }),
+        ));
+        let mut plain = KvCache::new_with_strided_dims(64, &[(KV, 1)]);
+        let mut compact = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool.clone(), 0)
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        for r in 0..rows {
+            let k: Vec<f32> = (0..KV).map(|d| (r * KV + d) as f32).collect();
+            let v: Vec<f32> = k.iter().map(|x| -x).collect();
+            plain.layers[0].push(&k, &v);
+            compact.layers[0].push(&k, &v);
+        }
+        (pool, plain, compact)
+    }
+
+    #[test]
+    fn compact_pages_read_back_like_plain_rows() {
+        let (_pool, plain, mut compact) = exact_compact_pair(11);
+        let layer = &mut compact.layers[0];
+        assert!(layer.has_compact_rows());
+        layer.decode_sealed_rows(0, 11);
+        for r in 0..11 {
+            assert_eq!(layer.key_at(r, 0, 8), plain.layers[0].key_at(r, 0, 8));
+            assert_eq!(layer.value_at(r, 0, 8), plain.layers[0].value_at(r, 0, 8));
+        }
+        layer.release_decoded_rows();
+        // A window that starts part of the way through a page.
+        layer.decode_sealed_rows(2, 7);
+        for r in 2..7 {
+            assert_eq!(layer.key_at(r, 0, 8), plain.layers[0].key_at(r, 0, 8));
+        }
+        layer.release_decoded_rows();
+    }
+
+    #[test]
+    #[should_panic(expected = "without decoding it")]
+    fn a_compact_page_read_without_decoding_is_a_panic_not_a_guess() {
+        let (_pool, _plain, compact) = exact_compact_pair(11);
+        let _ = compact.layers[0].key_at(1, 0, 8);
+    }
+
+    #[test]
+    #[should_panic(expected = "without decoding it")]
+    fn a_compact_page_outside_the_decoded_window_is_a_panic() {
+        let (_pool, _plain, mut compact) = exact_compact_pair(11);
+        compact.layers[0].decode_sealed_rows(4, 8);
+        let _ = compact.layers[0].key_at(1, 0, 8);
+    }
+
+    /// The tail needs no decoding, and a rollback into a sealed page brings
+    /// its kept rows back as a tail.
+    #[test]
+    fn a_compact_cache_truncates_saves_and_copies_like_a_plain_one() {
+        let (pool, mut plain, mut compact) = exact_compact_pair(11);
+        assert_eq!(
+            compact.layers[0].key_at(9, 0, 8),
+            plain.layers[0].key_at(9, 0, 8)
+        );
+        assert_eq!(compact.to_bytes(), plain.to_bytes());
+
+        let mut copy = KvCache::new_with_strided_dims(64, &strided_dims(&pool))
+            .try_into_paged(pool.clone(), 0)
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        assert!(copy.push_prefix_from(&compact, 9));
+        let mut want = KvCache::new_with_strided_dims(64, &[(8, 1)]);
+        want.copy_prefix_from(&plain, 9);
+        assert_eq!(copy.to_bytes(), want.to_bytes());
+
+        for keep in [10, 6, 4, 1] {
+            plain.truncate(keep).unwrap();
+            compact.truncate(keep).unwrap();
+            assert_eq!(compact.to_bytes(), plain.to_bytes(), "at {keep}");
+        }
+    }
+
+    #[test]
+    fn a_lossy_compact_page_stays_close_and_takes_less_memory() {
+        use crate::engine::kv_pool::{HostFormats, KvPool, LayerGeometry, Policy};
+        use crate::engine::kv_rows::RowFormat;
+        use std::sync::Arc;
+        const KV: usize = 64;
+        let geom = || {
+            vec![LayerGeometry {
+                kv_dim: KV,
+                stride: 1,
+                ring: None,
+            }]
+        };
+        let plain_pool = KvPool::with_policy(8, 4, geom(), Policy::Lru);
+        let pool = Arc::new(KvPool::with_formats(
+            8,
+            4,
+            geom(),
+            Policy::Lru,
+            Some(HostFormats {
+                k: RowFormat::Q8_0,
+                v: RowFormat::Q4_0,
+            }),
+        ));
+        assert_eq!(
+            pool.host_bytes(),
+            8 * 4 * (RowFormat::Q8_0.row_bytes(KV) + RowFormat::Q4_0.row_bytes(KV))
+        );
+        assert!(pool.host_bytes() * 4 < plain_pool.host_bytes());
+        let mut cache = KvCache::new_with_strided_dims(16, &strided_dims(&pool))
+            .try_into_paged(pool.clone(), 0)
+            .unwrap_or_else(|_| panic!("test pool has room"));
+        let row = |r: usize, d: usize| ((r * KV + d) as f32 * 0.31).sin();
+        for r in 0..6 {
+            let k: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
+            cache.layers[0].push(&k, &k);
+        }
+        let layer = &mut cache.layers[0];
+        layer.decode_sealed_rows(0, 6);
+        for r in 0..6 {
+            for d in 0..KV {
+                assert!((layer.key_at(r, 0, KV)[d] - row(r, d)).abs() < 1.0 / 100.0);
+                assert!((layer.value_at(r, 0, KV)[d] - row(r, d)).abs() < 1.0 / 7.0);
+            }
+        }
+        // Past the seal, rows are as they were pushed.
+        assert_eq!(layer.key_at(5, 0, KV)[3], row(5, 3));
+        layer.release_decoded_rows();
+    }
+
     #[test]
     fn a_paged_cache_takes_a_prefix_by_pushing_its_rows() {
         use crate::engine::kv_pool::{KvPool, LayerGeometry, Policy};

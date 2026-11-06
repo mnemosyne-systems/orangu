@@ -17,13 +17,10 @@
 //! the byte strings that are a prefix of some JSON document the schema
 //! describes, and says when what it has is a whole one.
 //!
-//! It answers the same two questions as [`JsonPrefix`] — "could this still
-//! become valid", for the mask, and "is this already complete", for the stop
-//! condition — with the schema's shape on top of JSON's.
-//!
 //! # The schema it reads
 //!
-//! [`compile`] turns a schema into a small graph of [`Node`]s:
+//! [`compile`] turns a schema into a small graph of [`Node`]s, and the graph
+//! into a [grammar](super::grammar), which is what follows the reply:
 //!
 //! - `type` (one, or a list of them), and the shape each implies:
 //!   `properties`/`required`/`additionalProperties` for an object,
@@ -32,6 +29,12 @@
 //! - `anyOf`/`oneOf` (any branch may match), a one-schema `allOf`, and
 //!   `$ref` into the same document (`#/$defs/…`, `#/definitions/…`, `#`),
 //!   recursion included.
+//! - `minLength`/`maxLength`, `pattern`, and the `format`s
+//!   [`schema_text::format_body`] names, for a string. Any other `format` is an
+//!   annotation.
+//! - `minimum`/`maximum` and their exclusive forms, for a number. A `number`
+//!   bounded this way is written without an exponent, and its bounds must be
+//!   whole.
 //! - `true`, `{}` and a schema with no `type` or shape: any JSON value.
 //!
 //! An object with `properties` is written **in the order they are
@@ -42,27 +45,17 @@
 //! decoder does. An object without `properties` takes any keys, with values
 //! as `additionalProperties` says.
 //!
-//! Annotations and value checks — `description`, `title`, `format`,
-//! `pattern`, `minLength`, `minimum` and the like — do not change what can
-//! be written and are not enforced. Keywords that change the shape in ways
-//! this cannot follow (`not`, `if`, `patternProperties`, a many-schema
-//! `allOf`, …) are refused at compile time rather than silently dropped.
-//!
-//! # How it recognises
-//!
-//! A [`Thread`] is one way of having read the bytes so far: a stack of
-//! [`Frame`]s, one per open value. A union or an `enum` whose members share a
-//! prefix can be read more than one way, so [`SchemaPrefix`] carries every
-//! thread still alive and a byte is allowed while any survives. Each thread
-//! is a few frames, cheap to clone — which is what the sampler does to test
-//! a token — and branches end within a few bytes as the alternatives
-//! diverge.
+//! Annotations such as `description` and `title` do not change what can be
+//! written. A keyword that does and cannot be followed (`not`, `if`,
+//! `patternProperties`, `multipleOf`, a many-schema `allOf`, …) is refused at
+//! compile time rather than silently dropped.
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::engine::constraint::JsonPrefix;
+use super::grammar::{Grammar, Matcher};
+use super::schema_text;
 
 type NodeId = usize;
 
@@ -70,18 +63,11 @@ type NodeId = usize;
 /// server build an arbitrarily large graph.
 const MAX_NODES: usize = 4096;
 
-/// The most parse threads carried at once. Beyond it the newest are dropped:
-/// a schema that ambiguous is one whose later alternatives are not reached.
-const MAX_THREADS: usize = 64;
-
 /// The most whitespace bytes in a row. Whitespace keeps the model free to
 /// lay a document out, but an unbounded run is how a constrained model can
 /// spend its whole budget on newlines.
+#[cfg(test)]
 const MAX_WHITESPACE: u8 = 32;
-
-/// How deep unions and references may nest before a value starts — the
-/// guard against a reference that names only itself.
-const MAX_UNION_DEPTH: usize = 32;
 
 /// The most sub-schemas [`validate`] applies to one value, however they nest.
 const MAX_CHECK_STEPS: usize = 1 << 20;
@@ -107,6 +93,8 @@ enum Node {
     Number {
         integer: bool,
     },
+    /// A value given as grammar text.
+    Text(String),
     /// The compact JSON texts the value may be.
     Literals(Vec<Vec<u8>>),
     /// Any of these.
@@ -124,22 +112,16 @@ struct Prop {
 /// A schema compiled for [`SchemaPrefix`].
 #[derive(Debug)]
 pub struct Schema {
-    nodes: Vec<Node>,
-    root: NodeId,
+    grammar: Arc<Grammar>,
 }
 
 /// Compiles a JSON Schema, or says which part of it cannot be followed.
 pub fn compile(schema: &Value) -> Result<Schema, String> {
-    let mut compiler = Compiler {
-        document: schema,
-        nodes: Vec::new(),
-        refs: HashMap::new(),
-    };
-    let root = compiler.node(schema)?;
-    Ok(Schema {
-        nodes: compiler.nodes,
-        root,
-    })
+    let (rules, root) = schema_rules(schema, "")?;
+    let text = format!("root ::= ws {root}\n{}{rules}", common_rules());
+    let grammar =
+        Grammar::parse(&text).map_err(|error| format!("the schema is too large: {error}"))?;
+    Ok(Schema { grammar })
 }
 
 struct Compiler<'a> {
@@ -164,6 +146,9 @@ const UNSUPPORTED: &[&str] = &[
     "contains",
     "prefixItems",
     "$dynamicRef",
+    "multipleOf",
+    "minProperties",
+    "maxProperties",
 ];
 
 impl Compiler<'_> {
@@ -184,6 +169,12 @@ impl Compiler<'_> {
         };
         if let Some(keyword) = UNSUPPORTED.iter().find(|k| object.contains_key(**k)) {
             return Err(format!("`{keyword}` is not supported in a schema"));
+        }
+        if object
+            .get("uniqueItems")
+            .is_some_and(|unique| unique != false)
+        {
+            return Err("`uniqueItems` is not supported in a schema".into());
         }
         if let Some(reference) = object.get("$ref") {
             let reference = reference
@@ -236,6 +227,23 @@ impl Compiler<'_> {
             Some(_) => Err("`type` must be a string or an array of strings".into()),
             None if object.contains_key("properties") => self.typed(object, "object"),
             None if object.contains_key("items") => self.typed(object, "array"),
+            // A value check says what kind of value it is about.
+            None if ["pattern", "minLength", "maxLength"]
+                .iter()
+                .any(|key| object.contains_key(*key))
+                || object
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .is_some_and(|format| schema_text::format_body(format).is_some()) =>
+            {
+                self.typed(object, "string")
+            }
+            None if ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]
+                .iter()
+                .any(|key| object.contains_key(*key)) =>
+            {
+                self.typed(object, "number")
+            }
             None => self.push(Node::Any),
         }
     }
@@ -294,9 +302,18 @@ impl Compiler<'_> {
                 }
                 self.push(Node::Array { items, min, max })
             }
-            "string" => self.push(Node::String),
-            "number" => self.push(Node::Number { integer: false }),
-            "integer" => self.push(Node::Number { integer: true }),
+            "string" => match string_body(object)? {
+                Some(body) => self.push(Node::Text(body)),
+                None => self.push(Node::String),
+            },
+            "number" => match number_body(object, false)? {
+                Some(body) => self.push(Node::Text(body)),
+                None => self.push(Node::Number { integer: false }),
+            },
+            "integer" => match number_body(object, true)? {
+                Some(body) => self.push(Node::Text(body)),
+                None => self.push(Node::Number { integer: true }),
+            },
             "boolean" => self.push(Node::Literals(vec![b"true".to_vec(), b"false".to_vec()])),
             "null" => self.push(Node::Literals(vec![b"null".to_vec()])),
             other => Err(format!("unknown `type` \"{other}\"")),
@@ -329,474 +346,310 @@ fn literal(value: &Value) -> Vec<u8> {
     serde_json::to_vec(value).unwrap_or_default()
 }
 
-fn is_ws(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Number {
-    Minus,
-    Zero,
-    Int,
-    Dot,
-    Frac,
-    E,
-    ESign,
-    Exp,
-}
-
-impl Number {
-    fn start(b: u8) -> Option<Self> {
-        match b {
-            b'-' => Some(Self::Minus),
-            b'0' => Some(Self::Zero),
-            b'1'..=b'9' => Some(Self::Int),
-            _ => None,
-        }
+/// What a string's checks let between its quotes, as grammar text. `None` for
+/// a string with no checks.
+fn string_body(object: &serde_json::Map<String, Value>) -> Result<Option<String>, String> {
+    let count = |key: &str| object.get(key).and_then(Value::as_u64).map(|n| n as usize);
+    let (min, max) = (count("minLength"), count("maxLength"));
+    if let (Some(min), Some(max)) = (min, max)
+        && max < min
+    {
+        return Err("`maxLength` is smaller than `minLength`".into());
     }
-
-    fn next(self, b: u8, integer: bool) -> Option<Self> {
-        let digit = b.is_ascii_digit();
-        let exponent = matches!(b, b'e' | b'E') && !integer;
-        match self {
-            Self::Minus if b == b'0' => Some(Self::Zero),
-            Self::Minus if digit => Some(Self::Int),
-            Self::Zero | Self::Int if b == b'.' && !integer => Some(Self::Dot),
-            Self::Zero | Self::Int | Self::Frac if exponent => Some(Self::E),
-            Self::Int if digit => Some(Self::Int),
-            Self::Dot | Self::Frac if digit => Some(Self::Frac),
-            Self::E if matches!(b, b'+' | b'-') => Some(Self::ESign),
-            Self::E | Self::ESign | Self::Exp if digit => Some(Self::Exp),
-            _ => None,
-        }
-    }
-
-    fn complete(self) -> bool {
-        matches!(self, Self::Zero | Self::Int | Self::Frac | Self::Exp)
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Escape {
-    None,
-    Backslash,
-    Hex(u8),
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Phase {
-    /// After `{` or `[`: a member, or the close.
-    Open,
-    /// After a key: the `:`. For an object, which property it named.
-    Colon(usize),
-    /// After a member: `,` or the close.
-    AfterValue,
-    /// After `,`: a member.
-    AfterComma,
-}
-
-#[derive(Clone, Debug)]
-enum Frame {
-    /// A value of this node, not yet begun.
-    Value(NodeId),
-    /// An object with declared properties; `next` is the first property not
-    /// yet passed.
-    Object {
-        node: NodeId,
-        next: usize,
-        phase: Phase,
-    },
-    Map {
-        values: Option<NodeId>,
-        phase: Phase,
-    },
-    Array {
-        node: NodeId,
-        count: usize,
-        phase: Phase,
-    },
-    /// A declared key being read: the properties it could still be, and how
-    /// many bytes of their keys have matched.
-    Key {
-        node: NodeId,
-        alive: Vec<usize>,
-        pos: usize,
-    },
-    Str(Escape),
-    Num {
-        integer: bool,
-        state: Number,
-    },
-    Lit {
-        node: NodeId,
-        alive: Vec<usize>,
-        pos: usize,
-    },
-    Any(JsonPrefix),
-}
-
-#[derive(Clone, Debug)]
-struct Thread {
-    stack: Vec<Frame>,
-    whitespace: u8,
-}
-
-impl Thread {
-    /// Takes one more whitespace byte, if the run is not too long already.
-    fn space(mut self, out: &mut Vec<Thread>) {
-        self.whitespace += 1;
-        if self.whitespace <= MAX_WHITESPACE {
-            out.push(self);
-        }
-    }
-}
-
-impl Schema {
-    fn props(&self, node: NodeId) -> &[Prop] {
-        match &self.nodes[node] {
-            Node::Object { props } => props,
-            _ => &[],
-        }
-    }
-
-    fn literals(&self, node: NodeId) -> &[Vec<u8>] {
-        match &self.nodes[node] {
-            Node::Literals(literals) => literals,
-            _ => &[],
-        }
-    }
-
-    /// The properties the next key may name: the first not yet passed, and
-    /// each after it up to and including the first required one.
-    fn next_keys(&self, node: NodeId, next: usize) -> Vec<usize> {
-        let props = self.props(node);
-        let mut keys = Vec::new();
-        for (index, prop) in props.iter().enumerate().skip(next) {
-            keys.push(index);
-            if prop.required {
-                break;
+    let format = object
+        .get("format")
+        .and_then(Value::as_str)
+        .and_then(schema_text::format_body);
+    let pattern = object.get("pattern").map(|pattern| {
+        pattern
+            .as_str()
+            .ok_or_else(|| "`pattern` must be a string".to_string())
+            .and_then(schema_text::pattern_body)
+    });
+    let lengths = min.is_some() || max.is_some();
+    let body = match (pattern, format, lengths) {
+        (None, None, false) => return Ok(None),
+        (Some(pattern), None, false) => pattern?,
+        (None, Some(format), false) => format.to_string(),
+        (None, None, true) => {
+            let min = min.unwrap_or(0);
+            match max {
+                Some(max) => format!("char{{{min},{max}}}"),
+                None => format!("char{{{min},}}"),
             }
         }
-        keys
-    }
+        _ => {
+            return Err(
+                "`pattern`, a checked `format` and a length cannot be enforced together".into(),
+            );
+        }
+    };
+    Ok(Some(format!("\"\\\"\" ({body}) \"\\\"\"")))
+}
 
-    /// Whether the object may close with `next` the first property not yet
-    /// passed: no required property is left.
-    fn may_close(&self, node: NodeId, next: usize) -> bool {
-        !self.props(node).iter().skip(next).any(|p| p.required)
+/// The bounds a number's checks set, as grammar text. `None` for a number with
+/// no bounds.
+fn number_body(
+    object: &serde_json::Map<String, Value>,
+    integer: bool,
+) -> Result<Option<String>, String> {
+    let number = |key: &str| {
+        object
+            .get(key)
+            .filter(|v| !v.is_boolean())
+            .and_then(Value::as_f64)
+    };
+    let flag = |key: &str| object.get(key).and_then(Value::as_bool).unwrap_or(false);
+    // The older form says `exclusiveMinimum: true` beside `minimum`.
+    let low = match (number("minimum"), number("exclusiveMinimum")) {
+        (Some(a), Some(b)) if b >= a => Some((b, true)),
+        (Some(a), _) => Some((a, flag("exclusiveMinimum"))),
+        (None, Some(b)) => Some((b, true)),
+        (None, None) => None,
+    };
+    let high = match (number("maximum"), number("exclusiveMaximum")) {
+        (Some(a), Some(b)) if b <= a => Some((b, true)),
+        (Some(a), _) => Some((a, flag("exclusiveMaximum"))),
+        (None, Some(b)) => Some((b, true)),
+        (None, None) => None,
+    };
+    if low.is_none() && high.is_none() {
+        return Ok(None);
     }
-
-    /// Begins a value of `node` with byte `b`.
-    fn start(&self, t: Thread, node: NodeId, b: u8, depth: usize, out: &mut Vec<Thread>) {
-        self.start_once(t, node, b, depth, out, &mut HashSet::new());
-    }
-
-    /// [`Self::start`], going through each union once. Descending into a union
-    /// changes nothing about the thread, so a second visit starts the same
-    /// threads again, and a union that names itself several times would make
-    /// the visits exponential in the depth allowed.
-    fn start_once(
-        &self,
-        mut t: Thread,
-        node: NodeId,
-        b: u8,
-        depth: usize,
-        out: &mut Vec<Thread>,
-        seen: &mut HashSet<NodeId>,
-    ) {
-        match &self.nodes[node] {
-            Node::Union(branches) => {
-                if depth < MAX_UNION_DEPTH && seen.insert(node) {
-                    for &branch in branches {
-                        self.start_once(t.clone(), branch, b, depth + 1, out, seen);
+    const LIMIT: f64 = 1e30;
+    let whole = |value: f64| {
+        (value.abs() < LIMIT)
+            .then_some(value as i128)
+            .ok_or_else(|| format!("the bound {value} is too large to enforce"))
+    };
+    let body = if integer {
+        // A bound past a whole number is the next whole number inside it.
+        let low = low
+            .map(|(value, strict)| {
+                let ceiling = value.ceil();
+                let shift = i128::from(strict && ceiling == value);
+                whole(ceiling).map(|v| v + shift)
+            })
+            .transpose()?;
+        let high = high
+            .map(|(value, strict)| {
+                let floor = value.floor();
+                let shift = i128::from(strict && floor == value);
+                whole(floor).map(|v| v - shift)
+            })
+            .transpose()?;
+        schema_text::integer_range(low, high)
+    } else {
+        let bound = |bound: Option<(f64, bool)>| {
+            bound
+                .map(|(value, strict)| {
+                    if value.fract() != 0.0 {
+                        return Err(format!(
+                            "the bound {value} cannot be enforced on a `number`: only whole bounds can"
+                        ));
                     }
-                }
-            }
-            Node::Any => {
-                let mut json = JsonPrefix::new();
-                if json.push_bytes(&[b]) {
-                    t.stack.push(Frame::Any(json));
-                    out.push(t);
-                }
-            }
-            Node::Object { .. } if b == b'{' => {
-                t.stack.push(Frame::Object {
-                    node,
-                    next: 0,
-                    phase: Phase::Open,
-                });
-                out.push(t);
-            }
-            Node::Map { values } if b == b'{' => {
-                t.stack.push(Frame::Map {
-                    values: *values,
-                    phase: Phase::Open,
-                });
-                out.push(t);
-            }
-            Node::Array { .. } if b == b'[' => {
-                t.stack.push(Frame::Array {
-                    node,
-                    count: 0,
-                    phase: Phase::Open,
-                });
-                out.push(t);
-            }
-            Node::String if b == b'"' => {
-                t.stack.push(Frame::Str(Escape::None));
-                out.push(t);
-            }
-            Node::Number { integer } => {
-                if let Some(state) = Number::start(b) {
-                    t.stack.push(Frame::Num {
-                        integer: *integer,
-                        state,
-                    });
-                    out.push(t);
-                }
-            }
-            Node::Literals(literals) => {
-                let alive: Vec<usize> = (0..literals.len())
-                    .filter(|&i| literals[i].first() == Some(&b))
-                    .collect();
-                if !alive.is_empty() {
-                    t.stack.push(Frame::Lit {
-                        node,
-                        alive,
-                        pos: 1,
-                    });
-                    out.push(t);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Every way `t` can go on after reading `b`.
-    fn feed(&self, mut t: Thread, b: u8, out: &mut Vec<Thread>) {
-        let Some(top) = t.stack.last_mut() else {
-            // The document is complete; only trailing whitespace may follow.
-            if is_ws(b) {
-                t.space(out);
-            }
-            return;
+                    Ok((whole(value)?, strict))
+                })
+                .transpose()
         };
-        if !is_ws(b) {
-            t.whitespace = 0;
-        }
-        match top {
-            Frame::Value(node) => {
-                let node = *node;
-                if is_ws(b) {
-                    return t.space(out);
-                }
-                t.stack.pop();
-                self.start(t, node, b, 0, out);
-            }
-            Frame::Str(escape) => {
-                *escape = match (*escape, b) {
-                    (Escape::None, b'"') => {
-                        t.stack.pop();
-                        return out.push(t);
-                    }
-                    (Escape::None, b'\\') => Escape::Backslash,
-                    (Escape::None, b) if b < 0x20 => return,
-                    (Escape::None, _) => Escape::None,
-                    (Escape::Backslash, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') => {
-                        Escape::None
-                    }
-                    (Escape::Backslash, b'u') => Escape::Hex(4),
-                    (Escape::Hex(n), b) if b.is_ascii_hexdigit() => {
-                        if n == 1 {
-                            Escape::None
-                        } else {
-                            Escape::Hex(n - 1)
-                        }
-                    }
-                    _ => return,
-                };
-                out.push(t);
-            }
-            Frame::Num { integer, state } => match state.next(b, *integer) {
-                Some(next) => {
-                    *state = next;
-                    out.push(t);
-                }
-                None if state.complete() => {
-                    t.stack.pop();
-                    self.feed(t, b, out);
-                }
-                None => {}
-            },
-            Frame::Lit { node, alive, pos } => {
-                let literals = self.literals(*node);
-                let at = *pos;
-                let complete = alive.iter().any(|&i| literals[i].len() == at);
-                let going_on: Vec<usize> = alive
-                    .iter()
-                    .copied()
-                    .filter(|&i| literals[i].get(at) == Some(&b))
-                    .collect();
-                if !going_on.is_empty() {
-                    let mut next = t.clone();
-                    if let Some(Frame::Lit { alive, pos, .. }) = next.stack.last_mut() {
-                        *alive = going_on;
-                        *pos += 1;
-                    }
-                    out.push(next);
-                }
-                if complete {
-                    t.stack.pop();
-                    self.feed(t, b, out);
-                }
-            }
-            Frame::Any(json) => {
-                if json.is_complete() && (is_ws(b) || !json.allows(&[b])) {
-                    t.stack.pop();
-                    self.feed(t, b, out);
-                } else if json.push_bytes(&[b]) {
-                    out.push(t);
-                }
-            }
-            Frame::Key { node, alive, pos } => {
-                let props = self.props(*node);
-                let at = *pos;
-                alive.retain(|&i| props[i].key.get(at) == Some(&b));
-                *pos += 1;
-                let finished = alive
-                    .iter()
-                    .copied()
-                    .find(|&i| props[i].key.len() == at + 1);
-                match (alive.is_empty(), finished) {
-                    (true, _) => {}
-                    (false, Some(prop)) => {
-                        t.stack.pop();
-                        if let Some(Frame::Object { phase, .. }) = t.stack.last_mut() {
-                            *phase = Phase::Colon(prop);
-                        }
-                        out.push(t);
-                    }
-                    (false, None) => out.push(t),
-                }
-            }
-            Frame::Object { node, next, phase } => {
-                let (node, next_prop) = (*node, *next);
-                match (*phase, b) {
-                    (_, b) if is_ws(b) => t.space(out),
-                    (Phase::Open | Phase::AfterComma, b'"') => {
-                        let alive = self.next_keys(node, next_prop);
-                        if !alive.is_empty() {
-                            t.stack.push(Frame::Key {
-                                node,
-                                alive,
-                                pos: 1,
-                            });
-                            out.push(t);
-                        }
-                    }
-                    (Phase::Open | Phase::AfterValue, b'}') if self.may_close(node, next_prop) => {
-                        t.stack.pop();
-                        out.push(t);
-                    }
-                    (Phase::Colon(prop), b':') => {
-                        *phase = Phase::AfterValue;
-                        *next = prop + 1;
-                        let value = self.props(node)[prop].value;
-                        t.stack.push(Frame::Value(value));
-                        out.push(t);
-                    }
-                    (Phase::AfterValue, b',') if !self.next_keys(node, next_prop).is_empty() => {
-                        *phase = Phase::AfterComma;
-                        out.push(t);
-                    }
-                    _ => {}
-                }
-            }
-            Frame::Map { values, phase } => match (*phase, b, *values) {
-                (_, b, _) if is_ws(b) => t.space(out),
-                (Phase::Open | Phase::AfterComma, b'"', Some(_)) => {
-                    *phase = Phase::Colon(0);
-                    t.stack.push(Frame::Str(Escape::None));
-                    out.push(t);
-                }
-                (Phase::Open | Phase::AfterValue, b'}', _) => {
-                    t.stack.pop();
-                    out.push(t);
-                }
-                (Phase::Colon(_), b':', Some(value)) => {
-                    *phase = Phase::AfterValue;
-                    t.stack.push(Frame::Value(value));
-                    out.push(t);
-                }
-                (Phase::AfterValue, b',', _) => {
-                    *phase = Phase::AfterComma;
-                    out.push(t);
-                }
-                _ => {}
-            },
-            Frame::Array { node, count, phase } => {
-                let Node::Array { items, min, max } = self.nodes[*node] else {
-                    return;
-                };
-                match (*phase, b) {
-                    (_, b) if is_ws(b) => t.space(out),
-                    (Phase::Open, b']') if min == 0 => {
-                        t.stack.pop();
-                        out.push(t);
-                    }
-                    (Phase::AfterValue, b']') if *count >= min => {
-                        t.stack.pop();
-                        out.push(t);
-                    }
-                    (Phase::AfterValue, b',') if max.is_none_or(|max| *count < max) => {
-                        *phase = Phase::AfterComma;
-                        out.push(t);
-                    }
-                    (Phase::Open | Phase::AfterComma, _)
-                        if b != b']' && max.is_none_or(|max| *count < max) =>
-                    {
-                        *phase = Phase::AfterValue;
-                        *count += 1;
-                        t.stack.push(Frame::Value(items));
-                        self.feed(t, b, out);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        schema_text::number_range(bound(low)?, bound(high)?)
+    };
+    body.map(Some)
+        .ok_or_else(|| "no number lies between the schema's bounds".to_string())
+}
+
+/// Writes a compiled graph as grammar text.
+struct Writer<'a> {
+    nodes: &'a [Node],
+    /// What this schema's rule names start with, so that several can share a
+    /// grammar.
+    prefix: &'a str,
+    text: String,
+}
+
+/// What every schema's grammar can call on.
+const COMMON_RULES: &str = "ws ::= [ \\t\\n\\r]{0,32}\n\
+    string ::= \"\\\"\" char* \"\\\"\"\n\
+    number ::= integer (\".\" [0-9]+)? ([eE] [+-]? [0-9]+)?\n\
+    integer ::= \"-\"? (\"0\" | [1-9] [0-9]*)\n\
+    any ::= anyobject | anyarray | string | number | \"true\" | \"false\" | \"null\"\n\
+    anyobject ::= \"{\" ws (member ws (\",\" ws member ws)*)? \"}\"\n\
+    member ::= string ws \":\" ws any\n\
+    anyarray ::= \"[\" ws (any ws (\",\" ws any ws)*)? \"]\"\n";
+
+impl Writer<'_> {
+    fn rule(&mut self, name: &str, body: &str) {
+        self.text.push_str(name);
+        self.text.push_str(" ::= ");
+        self.text.push_str(body);
+        self.text.push('\n');
     }
 
-    /// Whether a thread holds a whole document: nothing open, or only a
-    /// top-level number or literal that nothing has come after to end.
-    fn thread_complete(&self, t: &Thread) -> bool {
-        match t.stack.as_slice() {
-            [] => true,
-            [Frame::Num { state, .. }] => state.complete(),
-            [Frame::Lit { node, alive, pos }] => {
-                alive.iter().any(|&i| self.literals(*node)[i].len() == *pos)
+    /// What a union can be, through unions inside it, each once: a union
+    /// naming itself adds nothing, and a grammar could not hold the call.
+    fn union_members(&self, id: NodeId) -> Vec<NodeId> {
+        let mut members = Vec::new();
+        let mut seen = HashSet::new();
+        let mut work = vec![id];
+        while let Some(id) = work.pop() {
+            if !seen.insert(id) {
+                continue;
             }
-            [Frame::Any(json)] => json.is_complete(),
-            _ => false,
+            match &self.nodes[id] {
+                Node::Union(branches) => work.extend(branches.iter().rev()),
+                _ => members.push(id),
+            }
+        }
+        members
+    }
+
+    fn member(&self, key: &[u8], value: NodeId) -> String {
+        let key = String::from_utf8_lossy(key);
+        let value = self.name(value);
+        format!("{} ws \":\" ws {value} ws", schema_text::quoted(&key))
+    }
+
+    fn name(&self, id: NodeId) -> String {
+        format!("{}n{id}", self.prefix)
+    }
+
+    fn node(&mut self, id: NodeId) {
+        let name = self.name(id);
+        match &self.nodes[id] {
+            Node::Any => self.rule(&name, "any"),
+            Node::String => self.rule(&name, "string"),
+            Node::Number { integer } => {
+                self.rule(&name, if *integer { "integer" } else { "number" });
+            }
+            Node::Text(body) => {
+                let body = body.clone();
+                self.rule(&name, &body);
+            }
+            Node::Literals(values) => {
+                let alternatives: Vec<String> = values
+                    .iter()
+                    .map(|v| schema_text::quoted(&String::from_utf8_lossy(v)))
+                    .collect();
+                self.rule(&name, &alternatives.join(" | "));
+            }
+            Node::Union(_) => {
+                let members: Vec<String> = self
+                    .union_members(id)
+                    .iter()
+                    .map(|m| self.name(*m))
+                    .collect();
+                if members.is_empty() {
+                    // Nothing but itself: there is no such value.
+                    self.rule(&name, "[^\\x00-\\U0010FFFF]");
+                } else {
+                    self.rule(&name, &members.join(" | "));
+                }
+            }
+            Node::Map { values } => match values {
+                None => self.rule(&name, "\"{\" ws \"}\""),
+                Some(values) => {
+                    let member = format!("string ws \":\" ws {} ws", self.name(*values));
+                    let body = format!("\"{{\" ws ({member} (\",\" ws {member})*)? \"}}\"");
+                    self.rule(&name, &body);
+                }
+            },
+            Node::Array { items, min, max } => {
+                let (items, min, max) = (*items, *min, *max);
+                let item = format!("{} ws", self.name(items));
+                let more = format!("\",\" ws {item}");
+                let rest = match max {
+                    Some(max) => format!(
+                        "({more}){{{},{}}}",
+                        min.saturating_sub(1),
+                        max.saturating_sub(1)
+                    ),
+                    None => format!("({more}){{{},}}", min.saturating_sub(1)),
+                };
+                let body = match (min, max) {
+                    (_, Some(0)) => "\"[\" ws \"]\"".to_string(),
+                    (0, _) => format!("\"[\" ws ({item} {rest})? \"]\""),
+                    _ => format!("\"[\" ws {item} {rest} \"]\""),
+                };
+                self.rule(&name, &body);
+            }
+            Node::Object { props } => {
+                // One rule per property, for having written none so far (`s`)
+                // and some (`t`), so that the grammar grows with the properties
+                // however many are optional.
+                let count = props.len();
+                let lines: Vec<(String, String)> = props
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(i, prop)| {
+                        let member = self.member(&prop.key, prop.value);
+                        let first = format!("{member} {name}t{}", i + 1);
+                        let later = format!("\",\" ws {member} {name}t{}", i + 1);
+                        let (first, later) = if prop.required {
+                            (first, later)
+                        } else {
+                            (
+                                format!("{first} | {name}s{}", i + 1),
+                                format!("{later} | {name}t{}", i + 1),
+                            )
+                        };
+                        [
+                            (format!("{name}s{i}"), first),
+                            (format!("{name}t{i}"), later),
+                        ]
+                    })
+                    .collect();
+                for (rule, body) in lines {
+                    self.rule(&rule, &body);
+                }
+                self.rule(&format!("{name}s{count}"), "\"}\"");
+                self.rule(&format!("{name}t{count}"), "\"}\"");
+                self.rule(&name, &format!("\"{{\" ws {name}s0"));
+            }
         }
     }
 }
 
-/// The schema-shaped counterpart of [`JsonPrefix`] — see the module docs.
+/// The rules every schema's grammar can call on.
+pub(crate) fn common_rules() -> String {
+    format!(
+        "{COMMON_RULES}{}{}",
+        schema_text::JSON_CHAR_RULES,
+        schema_text::FORMAT_RULES
+    )
+}
+
+/// `schema` as rules whose names start with `prefix`, for a grammar that also
+/// holds [`common_rules`], and the name of the rule that is the schema.
+pub(crate) fn schema_rules(schema: &Value, prefix: &str) -> Result<(String, String), String> {
+    let mut compiler = Compiler {
+        document: schema,
+        nodes: Vec::new(),
+        refs: HashMap::new(),
+    };
+    let root = compiler.node(schema)?;
+    let mut writer = Writer {
+        nodes: &compiler.nodes,
+        prefix,
+        text: String::new(),
+    };
+    for id in 0..compiler.nodes.len() {
+        writer.node(id);
+    }
+    let name = writer.name(root);
+    Ok((writer.text, name))
+}
+
+/// The schema-shaped counterpart of `JsonPrefix`: what a reply held to a schema
+/// has reached.
 #[derive(Clone, Debug)]
 pub struct SchemaPrefix {
-    schema: Arc<Schema>,
-    threads: Vec<Thread>,
+    matcher: Matcher,
 }
 
 impl SchemaPrefix {
     pub fn new(schema: Arc<Schema>) -> Self {
-        let root = schema.root;
         Self {
-            schema,
-            threads: vec![Thread {
-                stack: vec![Frame::Value(root)],
-                whitespace: 0,
-            }],
+            matcher: Matcher::new(schema.grammar.clone()),
         }
     }
 
@@ -804,33 +657,19 @@ impl SchemaPrefix {
     /// them fits the schema. `self` is only usable afterwards if this
     /// returned `true`.
     pub fn push_bytes(&mut self, bytes: &[u8]) -> bool {
-        for &b in bytes {
-            let mut next = Vec::new();
-            for thread in std::mem::take(&mut self.threads) {
-                self.schema.feed(thread, b, &mut next);
-                if next.len() >= MAX_THREADS {
-                    break;
-                }
-            }
-            next.truncate(MAX_THREADS);
-            self.threads = next;
-            if self.threads.is_empty() {
-                return false;
-            }
-        }
-        true
+        self.matcher.push_bytes(bytes)
     }
 
     /// Whether `bytes` could follow what has been read, without committing
     /// to them.
-    pub fn allows(&self, bytes: &[u8]) -> bool {
-        self.clone().push_bytes(bytes)
+    pub fn allows(&mut self, bytes: &[u8]) -> bool {
+        self.matcher.allows(bytes)
     }
 
     /// Whether what has been read is already a whole document the schema
     /// accepts.
     pub fn is_complete(&self) -> bool {
-        self.threads.iter().any(|t| self.schema.thread_complete(t))
+        self.matcher.is_complete()
     }
 }
 
@@ -1101,6 +940,10 @@ mod tests {
     }
     use serde_json::json;
 
+    fn fixture() -> Vec<Value> {
+        serde_json::from_str(include_str!("fixtures/grammar-vectors.json")).unwrap()
+    }
+
     fn prefix(schema: Value) -> SchemaPrefix {
         SchemaPrefix::new(Arc::new(compile(&schema).unwrap()))
     }
@@ -1248,8 +1091,62 @@ mod tests {
         ] {
             assert!(compile(&schema).is_err(), "{schema}");
         }
-        // Annotations and value checks compile, and are not enforced.
+        // A `format` nothing checks is an annotation.
         assert!(compile(&json!({"type": "string", "format": "email", "minLength": 3})).is_ok());
+    }
+
+    /// The published grammar and schema vectors: strings each must take, and
+    /// strings each must refuse. Where this differs on purpose, the vector is
+    /// named in `DIFFERS`.
+    #[test]
+    fn the_published_vectors_read_as_they_should() {
+        // What this does differently on purpose: integers are not stopped at
+        // fifteen digits, a schema is an object, a key outside `properties` is
+        // not written even where the schema would take it (the document is
+        // still one it accepts), and `uniqueItems` cannot be enforced.
+        const DIFFERS: &[&str] = &[
+            "schema min 0: fail \"100000000000000000000000000000000\"",
+            "schema min 2: fail \"12345678900000000\"",
+            "schema exotic formats (list)",
+            "schema additional properties can't override other properties: pass",
+            "schema object properties, additionalProperties: true: pass",
+            "schema required props: refused",
+        ];
+        let mut wrong = Vec::new();
+        for vector in fixture() {
+            let (kind, name, source) = (
+                vector["kind"].as_str().unwrap(),
+                vector["name"].as_str().unwrap(),
+                vector["source"].as_str().unwrap(),
+            );
+            let grammar = if kind == "grammar" {
+                crate::engine::grammar::Grammar::parse(source).map_err(|e| e.to_string())
+            } else {
+                serde_json::from_str::<Value>(source)
+                    .map_err(|e| e.to_string())
+                    .and_then(|schema| compile(&schema))
+                    .map(|schema| schema.grammar)
+            };
+            let grammar = match grammar {
+                Ok(grammar) => grammar,
+                Err(error) => {
+                    wrong.push(format!("{kind} {name}: refused: {error}"));
+                    continue;
+                }
+            };
+            for (list, want) in [("pass", true), ("fail", false)] {
+                for text in vector[list].as_array().unwrap() {
+                    let text = text.as_str().unwrap();
+                    let mut matcher = crate::engine::grammar::Matcher::new(grammar.clone());
+                    let got = matcher.push_bytes(text.as_bytes()) && matcher.is_complete();
+                    if got != want {
+                        wrong.push(format!("{kind} {name}: {list} {text:?}"));
+                    }
+                }
+            }
+        }
+        wrong.retain(|line| !DIFFERS.iter().any(|known| line.starts_with(known)));
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

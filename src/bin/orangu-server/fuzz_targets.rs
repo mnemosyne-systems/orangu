@@ -406,3 +406,109 @@ fn fuzz_text_stop() {
         },
     );
 }
+
+/// A grammar comes in a request: parsing it and following it are both on the
+/// server's time.
+#[test]
+fn fuzz_grammar() {
+    use crate::engine::grammar::{Grammar, Matcher};
+    let mut seeds: Vec<Vec<u8>> = [
+        "root ::= item (\",\" item)*\nitem ::= \"[\" root? \"]\" | [0-9]+\n",
+        "root ::= ([a-z] | \" \"){1,20} \"é\" [^\\n]* \"\\x41\\u00e9\\U0001F600\"\n",
+        "# comment\nroot ::= ( # inside\n a |\n b )? c*\na ::= \"a\"\nb ::= \"b\"\nc ::= [α-ω]+\n",
+        "root ::= \"a\" root \"b\" | \"a\" root \"c\" | \"\"\n",
+        "root ::= ([x]*)*\n",
+    ]
+    .iter()
+    .map(|s| s.as_bytes().to_vec())
+    .collect();
+    if let Some(dir) = std::env::var_os("ORANGU_FUZZ_GRAMMARS")
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        seeds.extend(
+            entries
+                .flatten()
+                .filter_map(|e| std::fs::read(e.path()).ok()),
+        );
+    }
+    fuzz(
+        "grammar",
+        seeds,
+        &[
+            b"::=",
+            b"root ::= ",
+            b"{1,16000}",
+            b"{16000}",
+            b"(",
+            b")",
+            b"*",
+            b"+",
+            b"?",
+            b"|",
+            b"[^",
+            b"]",
+            b"\\U0010FFFF",
+            b" root ",
+            b"\n",
+        ],
+        1 << 16,
+        |input| {
+            let Ok(grammar) = Grammar::parse(&lossy(input)) else {
+                return;
+            };
+            let mut matcher = Matcher::new(grammar);
+            let _ = matcher.allows(b"a");
+            for chunk in SAMPLE.as_bytes().chunks(3) {
+                let _ = matcher.allows(chunk);
+                if !matcher.push_bytes(chunk) {
+                    break;
+                }
+                let _ = matcher.is_complete();
+            }
+        },
+    );
+}
+
+/// What a request's tools turn into, on whatever a template says a call is.
+#[test]
+fn fuzz_call_grammar() {
+    use crate::engine::tool_learn::{CallGrammar, CallStart};
+    let template = ChatTemplate::new(
+        "{% for m in messages %}{% if m.tool_calls %}{% for c in m.tool_calls %}<tool_call>{\"name\": \"{{ c.function.name }}\", \"arguments\": {{ c.function.arguments | tojson }}}</tool_call>{% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}"
+            .to_string(),
+    );
+    let seeds = vec![
+        br#"[{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"q":{"type":"string","pattern":"^a+$"},"n":{"type":"integer","minimum":1}},"required":["q"]}}}]"#
+            .to_vec(),
+        br##"[{"type":"function","function":{"name":"a\"b","parameters":{"$ref":"#"}}},{"type":"function","function":{"name":"","parameters":true}}]"##
+            .to_vec(),
+    ];
+    fuzz(
+        "call_grammar",
+        seeds,
+        &[
+            b"\"pattern\":\"",
+            b"\"$ref\":\"#\"",
+            b"\"name\":",
+            b"\"minimum\":",
+            b"\\u0000",
+            b"::=",
+        ],
+        1 << 14,
+        |input| {
+            let Ok(tools) = serde_json::from_slice::<Value>(input) else {
+                return;
+            };
+            for start in [
+                CallStart::Free,
+                CallStart::AtName,
+                CallStart::AfterName("read"),
+            ] {
+                if let Some(calls) = CallGrammar::build(&template, &tools, start) {
+                    let mut matcher = crate::engine::grammar::Matcher::new(calls.after_trigger);
+                    let _ = matcher.push_bytes(br#"{"name": "read", "arguments": {"q": "a"}}"#);
+                }
+            }
+        },
+    );
+}

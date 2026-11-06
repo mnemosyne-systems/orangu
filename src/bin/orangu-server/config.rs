@@ -472,6 +472,7 @@ pub fn bundled_configuration(
         // A bundle runs on a machine nobody configured, so it takes the
         // default rather than a lossy format nobody chose.
         kv_cache: KvCache::default(),
+        kv_cache_values: None,
         read_size: DEFAULT_READ_SIZE,
         // A bundle serves whoever runs it; refusing on its owner's behalf is
         // not a decision it can make.
@@ -700,8 +701,10 @@ impl Role {
 /// context — which makes it one of the few knobs that trades *quality* for
 /// *both* memory and speed at once, rather than one for the other.
 ///
-/// Only the Vulkan-family backends (Vulkan, Metal, DX12) have a GPU-side
-/// mirror to store; on CPU, CUDA, OpenCL and ROCm this is inert.
+/// On the Vulkan-family backends (Vulkan, Metal, DX12) this is the device
+/// mirror's storage. On the CPU backend only `q8_0` changes anything, storing
+/// the sealed host pages that way; those are `f32` otherwise. On CUDA, OpenCL
+/// and ROCm this has no effect.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KvCache {
     /// Half precision — the default, and what the reference engines default
@@ -747,13 +750,59 @@ impl KvCache {
         }
     }
 
-    /// Parses one of the three names, or `None` for anything else.
+    /// This value as a format for host pages. `f16` stays `f32` there: it is
+    /// the one format that makes host attention slower.
+    pub fn row_format(self) -> crate::engine::kv_rows::RowFormat {
+        use crate::engine::kv_rows::RowFormat;
+        match self {
+            KvCache::Q8_0 => RowFormat::Q8_0,
+            KvCache::F16 | KvCache::F32 => RowFormat::F32,
+        }
+    }
+
+    /// Parses one of the names, or `None` for anything else.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_lowercase().as_str() {
             "f16" => Some(KvCache::F16),
             "q8_0" | "q8" => Some(KvCache::Q8_0),
             "f32" => Some(KvCache::F32),
             _ => None,
+        }
+    }
+}
+
+/// How the values of sealed CPU-backend KV pages are stored, where that differs
+/// from the keys. Values take 4 bits with little loss. Keys do not, as they
+/// decide which rows attention reads at all, so `q4_0` is only offered here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvValues {
+    F32,
+    Q8_0,
+    /// 4-bit block-quantized. **Lossy**, and more so than `q8_0`.
+    Q4_0,
+}
+
+impl KvValues {
+    /// The accepted spellings, comma-separated.
+    const ACCEPTED: &'static str = "f32, q8_0, q4_0";
+
+    /// Parses one of the names, or `None` for anything else.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_lowercase().as_str() {
+            "f32" => Some(KvValues::F32),
+            "q8_0" | "q8" => Some(KvValues::Q8_0),
+            "q4_0" | "q4" => Some(KvValues::Q4_0),
+            _ => None,
+        }
+    }
+
+    /// This value as a format for host pages.
+    pub fn row_format(self) -> crate::engine::kv_rows::RowFormat {
+        use crate::engine::kv_rows::RowFormat;
+        match self {
+            KvValues::F32 => RowFormat::F32,
+            KvValues::Q8_0 => RowFormat::Q8_0,
+            KvValues::Q4_0 => RowFormat::Q4_0,
         }
     }
 }
@@ -1036,9 +1085,12 @@ pub struct ServerConfiguration {
     /// `0` disables precompiling without turning off
     /// [`Config::npu_precompile`], so blocks already cached still load.
     pub npu_cache_gb: f64,
-    /// How the GPU-side KV mirror is stored — see [`KvCache`]. Overridden by
+    /// How the KV cache is stored — see [`KvCache`]. Overridden by
     /// `ORANGU_KV_CACHE`, so a sweep can vary it without editing the file.
     pub kv_cache: KvCache,
+    /// `[orangu-server].kv_cache_values`: the values' format, where it differs
+    /// from the keys'. CPU backend only.
+    pub kv_cache_values: Option<KvValues>,
     /// `[orangu-server].read_size`: the granule an explicit read of a
     /// model file uses, in KiB.
     ///
@@ -1958,14 +2010,31 @@ pub fn load_server_configuration(
 
     let kv_cache = match section.get("kv_cache") {
         Some(value) => KvCache::parse(value).ok_or_else(|| {
+            let hint = if KvValues::parse(value).is_some() {
+                "; 4 bits only suit values, through kv_cache_values"
+            } else {
+                ""
+            };
             anyhow!(
-                "invalid value for [{SERVER_SECTION}].kv_cache: '{}' (expected {})",
+                "invalid value for [{SERVER_SECTION}].kv_cache: '{}' (expected {}){hint}",
                 value.trim(),
                 KvCache::accepted()
             )
         })?,
         None => KvCache::default(),
     };
+    let kv_cache_values = section
+        .get("kv_cache_values")
+        .map(|value| {
+            KvValues::parse(value).ok_or_else(|| {
+                anyhow!(
+                    "invalid value for [{SERVER_SECTION}].kv_cache_values: '{}' (expected {})",
+                    value.trim(),
+                    KvValues::ACCEPTED
+                )
+            })
+        })
+        .transpose()?;
 
     // Rejected rather than clamped, and page-aligned rather than rounded: a
     // read granule that is not a multiple of the page size cannot satisfy
@@ -2122,6 +2191,7 @@ pub fn load_server_configuration(
         npu_precompile,
         prefill_backend,
         kv_cache,
+        kv_cache_values,
         read_size,
         queue_limit,
         context_shift,
@@ -4342,6 +4412,30 @@ mod tests {
         assert!(text.contains("kv_cache"), "{text}");
         assert!(text.contains("int8"), "{text}");
         assert!(text.contains("q8_0"), "{text}");
+    }
+
+    #[test]
+    fn kv_cache_values_is_its_own_key_and_takes_what_kv_cache_refuses() {
+        let load = |body: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(file, "[orangu-server]\nmodels = /tmp\n{body}").unwrap();
+            load_server_configuration(file.path(), None, false)
+        };
+        let plain = load("").unwrap();
+        assert_eq!(plain.kv_cache_values, None);
+        let both = load("kv_cache = q8_0\nkv_cache_values = q4_0\n").unwrap();
+        assert_eq!(both.kv_cache, KvCache::Q8_0);
+        assert_eq!(both.kv_cache_values, Some(KvValues::Q4_0));
+        assert!(load("kv_cache_values = int8\n").is_err());
+        let split = load(
+            "kv_cache = q8_0
+kv_cache_values = f32
+",
+        )
+        .unwrap();
+        assert_eq!(split.kv_cache_values, Some(KvValues::F32));
+        let keys = load("kv_cache = q4_0\n").unwrap_err().to_string();
+        assert!(keys.contains("kv_cache_values"), "{keys}");
     }
 
     #[test]

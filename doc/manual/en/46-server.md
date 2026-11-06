@@ -1114,6 +1114,11 @@ Only the GGUF tensor tables are read — a few hundred kilobytes at the head
 of each shard — so planning that 434 GiB model costs about as long as `ls`,
 not a thirty-minute load.
 
+A last line prices the KV cache in each storage choice, at the configured
+`context` or otherwise at 8192 tokens, for choosing `kv_cache` and
+`kv_cache_values`. It says so when `backend` names one where `kv_cache` has no
+effect.
+
 `--json` prints the verdict as one line a program can act on — the
 coordinator asks it before every start: `runs`, the `problems` that stop it,
 and the arithmetic behind it. `needs_bytes` is the weights every token
@@ -1123,7 +1128,8 @@ model to price it, and zero when it is unset); `capacity_bytes`
 is the machine's memory (`memory_bytes`) plus its dedicated cards'
 (`device_memory_bytes`, zero under `backend = cpu`). `runs` is false when the
 needs exceed the capacity, and with `--deep` when a shard is missing or the
-architecture unknown.
+architecture unknown. `kv_bytes_per_token` gives one token's
+KV bytes in each storage choice.
 
 The split is the answer, not the file size. **Dense** weights are touched by
 every token, so they must be resident. **Experts** on a mixture-of-experts
@@ -1693,22 +1699,60 @@ https://…` and `TLS Yes`, and a certificate that will not load is a
   with `id_slot` bypass the limit — they are waiting for one specific slot's
   warm cache, not competing for admission. Current depth and the limit are
   both on `/metrics`.
-- `kv_cache` — how the GPU-side KV mirror is stored: `f16` (the default),
-  `q8_0`, or `f32`. The KV cache is re-read in full by every attention
-  dispatch and grows with context, so its storage width multiplies attention's
-  memory traffic directly. `q8_0` is about **44% smaller than `f16`** and cuts
+- `kv_cache` — how the KV cache is stored. On the Vulkan-family backends
+  (Vulkan, Metal, DX12) it is the device mirror: `f16` (the default), `q8_0`,
+  or `f32`. The KV cache is re-read in full by every attention dispatch and
+  grows with context, so its storage width multiplies attention's memory
+  traffic directly. `q8_0` is about **44% smaller than `f16`** and cuts
   attention's read bandwidth at long context — measured −32% attention GPU
   time at ~295 tokens, the saving growing as the cache grows, at a slight cost
-  at short context from the per-write quantize. It is also the only setting
-  here that is **lossy**: it changes generated text, which is why it is not
-  the default and why it is worth choosing deliberately rather than being
-  switched on for you. Set it when memory is the binding constraint — it buys
-  context and concurrent `slots` out of the same VRAM. `f32` is larger and
-  slower than `f16` for no measured quality gain, and exists mainly because
-  it is what an adapter without `f16` support falls back to anyway. Only the
-  Vulkan-family backends (Vulkan, Metal, DX12) have a GPU-side mirror; on
-  CPU, CUDA, OpenCL and ROCm the key has no effect. `ORANGU_KV_CACHE`
-  overrides it for one run.
+  at short context from the per-write quantize. It is the only setting here
+  that is **lossy**: it changes generated text, which is why it is not the
+  default and why it is worth choosing deliberately rather than being switched
+  on for you. Set it when memory is the binding constraint — it buys context
+  and concurrent `slots` out of the same VRAM. `f32` is larger and slower than
+  `f16` for no measured quality gain, and exists mainly because it is what an
+  adapter without `f16` support falls back to anyway.
+
+    On the CPU backend only `q8_0` changes anything: it stores full pages of the
+    cache at 8 bits a value, about 72% smaller than the `f32` used otherwise.
+    `f16` and `f32` both leave the rows as `f32`, because `f16` makes host
+    attention slower. See `kv_cache_values` for what else the CPU backend takes
+    and which models it applies to.
+
+    On CUDA, OpenCL and ROCm the key has no effect. `ORANGU_KV_CACHE` overrides
+    it for one run.
+- `kv_cache_values` — how the **values** of the CPU backend's KV cache are
+  stored, where they should differ from the keys: `f32`, `q8_0` or `q4_0`.
+  Unset, values follow `kv_cache`. Keys and values do not need the same
+  precision: keys decide which rows attention reads, while values are averaged
+  together, so values lose little at 4 bits and keys lose a lot. That is why
+  `q4_0` is offered here and `kv_cache` refuses it. Any GPU backend refuses this
+  key rather than quietly storing something else.
+
+    | `kv_cache` | `kv_cache_values` | KV bytes per element | Quality |
+    | :-- | :-- | :-- | :-- |
+    | *(default)* | *(unset)* | 4 | exact |
+    | `f32` | `q4_0` | 2.31 | small loss |
+    | `q8_0` | `f32` | 2.56 | small loss, larger on some models |
+    | `q8_0` | *(unset)* | 1.13 | small loss, larger on some models |
+    | `q8_0` | `q4_0` | 0.88 | as `q8_0`, slightly more |
+
+    Over 512-token windows of English text, every combination stayed within 0.7%
+    of `f32` in perplexity on gemma-4 E4B, Ministral-3 3B and Qwen3 4B. An older
+    model is more sensitive: Qwen2.5-Coder 0.5B rose 2.2% with `q8_0` keys and
+    `q4_0` values, against 0.1% with `f32` keys. How much a model loses is a property of the model, so measure yours with
+    `orangu-bench --perplexity` before relying on a lossy setting.
+
+    Speed stays close to `f32`, and differences of a few percent either way depend
+    on the model and the depth. Choose these formats for the context they buy, not
+    for speed.
+
+    Only the last, unfinished page of a cache stays `f32`, so the footprint
+    follows the table at any useful context. The compact formats apply to the
+    `llama`, `gemma`, `phi` and `mistral` families. Other architectures log a
+    warning and keep `f32`, and a recurrent model has no pages to compact.
+    `orangu-server plan` prints what each choice takes for the model.
 - `read_size` — the smallest explicit read of a model file, **in KiB**.
   Default `8192`, which is 8 MiB; `4` — one page — disables widening. Must be a
   positive multiple of `4`, because a read has to be a whole number of pages;
@@ -1952,7 +1996,8 @@ shown.
 | `device`                | `auto`                                     | which card: an index, part of a name, or `auto`                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `device_split`          | `off`                                      | spread one model across several devices: `off`, `auto`, `all`, or a ratio list such as `3,1`                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `threads`               | one per logical core                       | CPU worker threads                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `kv_cache`              | `f16`                                      | GPU KV mirror storage: `f16`, `q8_0`, or `f32`                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `kv_cache`              | `f16`                                      | KV cache storage: `f16`, `q8_0`, or `f32` on a Vulkan-family device; on the CPU backend `q8_0` compacts it and the others leave it `f32`                                                                                                                                                                                                                                                                                                                                                             |
+| `kv_cache_values`       | follows `kv_cache`                         | CPU backend only: how KV values are stored, `f32`, `q8_0`, or `q4_0`                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `read_size`             | `8192`                                     | widen an explicit read of a model file to this many **KiB** (8 MiB); `4` disables widening                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `prefill_backend`       | `auto`                                     | where prompt passes run: `auto` (whichever backend a prompt-shaped GEMM timed at load favours), `device`, or `cpu`                                                                                                                                                                                                                                                                                                                                                                                   |
 | `prompt_weights`        | `auto`                                     | how the weights a prompt multiplies on the CPU are held: `auto` (copies for the cores' matrix instructions, kept when they measure at least 10% faster and fit in half the free memory), `copy` (unmeasured), or `file` (no copy). For a video model `auto` means `file`: its encoder reads one prompt a clip                                                                                                                                                                                        |
@@ -3398,6 +3443,15 @@ Two things worth knowing before reaching for `all`:
 - **Layers are handed out in contiguous runs**, never interleaved, so the
   hidden state crosses the bus once per boundary — twice for three devices,
   not once per layer.
+
+A model that fits its card with no room for even 2048 tokens of context could not
+serve a prompt, so with nothing asked for it is treated as one that does not fit:
+layers move to the host until there is room, as `device_split = cpu` does. Setting
+`device_split` or `context` yourself takes that decision over. On a small card this
+can be slower than running on the CPU alone, so compare with `backend = cpu`.
+
+On a split model a verify runs on the host, so speculation skips any step whose rows
+are still on the devices, and that step decodes as usual.
 
 #### Overflowing onto the CPU
 

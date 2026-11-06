@@ -330,6 +330,36 @@ fn size(bytes: u64) -> String {
 /// RAM is the only ceiling that matters.
 pub type PlanDevice<'a> = Option<(&'a str, u64)>;
 
+/// The KV cache `elements` `f32` elements take in each `kv_cache` choice.
+/// Half of them are keys and half values, which is what lets the keys stay
+/// sharper than the values.
+pub fn kv_footprints(elements: u64) -> [(&'static str, u64); 4] {
+    use crate::engine::kv_rows::RowFormat;
+    let bytes = |format: RowFormat| {
+        // A long row's share of one block's bytes; rows short of a block round
+        // up by less than the padding is worth saying here.
+        elements * format.row_bytes(32) as u64 / 32
+    };
+    [
+        ("f32", bytes(RowFormat::F32)),
+        ("f16", elements * 2),
+        ("q8_0", bytes(RowFormat::Q8_0)),
+        (
+            "q8_0 keys, q4_0 values (CPU)",
+            bytes(RowFormat::Q8_0) / 2 + bytes(RowFormat::Q4_0) / 2,
+        ),
+    ]
+}
+
+/// The plan's line for [`kv_footprints`].
+pub fn format_kv_footprints(elements: u64, context: usize) -> String {
+    let choices: Vec<String> = kv_footprints(elements)
+        .iter()
+        .map(|(name, bytes)| format!("{name} {}", size(*bytes)))
+        .collect();
+    format!("KV cache   {context} tokens: {}\n", choices.join(" · "))
+}
+
 /// The plan as a report, with the machine's own memory beside it.
 ///
 /// Deliberately states the *verdict* rather than only the numbers. The numbers
@@ -558,6 +588,18 @@ mod tests {
 
     /// The number that decides whether a streaming model is usable at all,
     /// and the one nobody can work out by looking at a file size.
+    #[test]
+    fn kv_footprints_follow_the_formats() {
+        let got = kv_footprints(1 << 20);
+        assert_eq!(got[0], ("f32", 4 << 20));
+        assert_eq!(got[1], ("f16", 2 << 20));
+        assert_eq!(got[2].1, (1 << 20) * 36 / 32);
+        assert_eq!(got[3].1, (1 << 20) * 28 / 32);
+        let line = format_kv_footprints(1 << 20, 4096);
+        assert!(line.starts_with("KV cache   4096 tokens: f32 4"), "{line}");
+        assert!(line.contains("q8_0 keys, q4_0 values (CPU)"), "{line}");
+    }
+
     #[test]
     fn per_token_expert_bytes_multiply_out_across_layers() {
         let plan = moe_plan();

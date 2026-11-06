@@ -1630,7 +1630,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         );
         Some((context, per_token * context as u64 + fixed))
     });
-    let fits_context = |kv: u64| -> bool {
+    let fits_weights_beside = |kv: u64| -> bool {
         let Some(wgpu) = backend.as_wgpu() else {
             return true;
         };
@@ -1642,8 +1642,9 @@ fn prepare(args: Args) -> Result<Prepared> {
                     .map(|t| (t * 9 / 10, 0))
             })
             .unwrap_or((u64::MAX, 0));
-        weights_device_bytes + kv + kv_pool_scratch_reserve_bytes() <= budget
+        weights_device_bytes + kv <= budget
     };
+    let fits_context = |kv: u64| fits_weights_beside(kv + kv_pool_scratch_reserve_bytes());
     // A picture model's transformer runs every step and its text encoder
     // once a picture, so where both want the selected device the
     // transformer is served first: the encoder is split as though the
@@ -1653,6 +1654,21 @@ fn prepare(args: Args) -> Result<Prepared> {
         .as_ref()
         .filter(|_| backend.as_wgpu().is_some())
         .map(|t| engine::backend::device_resident_split(t.resident_tensor_sizes()).0);
+    // With no context asked for, the least a model has to leave room for. A
+    // model that fills the card would otherwise load, and refuse every prompt.
+    let usable_context_kv = backend.as_wgpu().map(|wgpu| {
+        let context = MIN_USABLE_CONTEXT.min(loaded.config.n_ctx_train.max(1));
+        let per_token = engine::kv_pool::device_bytes_for(
+            engine::arch::kv_elements_per_token(&loaded),
+            wgpu.kv_storage(),
+        );
+        let fixed = engine::kv_pool::device_bytes_for(
+            engine::arch::kv_fixed_elements(&loaded, context),
+            wgpu.kv_storage(),
+        );
+        (context, per_token * context as u64 + fixed)
+    });
+    let mut escalated_for_context = false;
     let split_mode = if partial && requested.is_off() {
         // Whether this node's share fits its device is the plan's question
         // (`workers::plan`), not the whole model's.
@@ -1682,6 +1698,21 @@ fn prepare(args: Args) -> Result<Prepared> {
             orangu::format::format_bytes(kv)
         );
         SplitMode::Cpu
+    } else if requested.is_off()
+        && split_flag.is_none()
+        && conf.device_split.is_off()
+        && context_kv_bytes.is_none()
+        && let Some((context, kv)) = usable_context_kv
+        && !fits_weights_beside(kv)
+    {
+        log::warn!(
+            "orangu-server: the weights leave no room on the selected device for even {context} \
+             tokens of context ({} of KV cache), so no prompt could be served — moving layers \
+             to the host until there is (`device_split = cpu`)",
+            orangu::format::format_bytes(kv)
+        );
+        escalated_for_context = true;
+        SplitMode::Cpu
     } else {
         requested
     };
@@ -1692,7 +1723,9 @@ fn prepare(args: Args) -> Result<Prepared> {
         &per_layer_bytes,
         weights_device_bytes,
         head_reserve(
-            context_kv_bytes.map(|(_, kv)| kv + kv_pool_scratch_reserve_bytes()),
+            context_kv_bytes
+                .or(usable_context_kv.filter(|_| escalated_for_context))
+                .map(|(_, kv)| kv + kv_pool_scratch_reserve_bytes()),
             transformer_reserve_bytes,
         ),
     )?;
@@ -2634,6 +2667,18 @@ fn prepare(args: Args) -> Result<Prepared> {
     // On unless disabled — and not built at all where the selected attention
     // kernels have no paged form, because a paged cache under those would keep
     // the shared pages *and* the per-request mirror.
+    kv_cache_fits_backend(&conf, backend.as_wgpu().is_some())?;
+    let host_formats = host_kv_formats(&conf, backend.is_cpu());
+    let host_formats = host_formats.filter(|_| {
+        let reads = model.reads_rows_only_through_attention();
+        if !reads {
+            log::warn!(
+                "orangu-server: [kv] kv_cache has no effect here: this architecture keeps its \
+                 cached rows as f32"
+            );
+        }
+        reads
+    });
     let paged_supported = backend
         .as_wgpu()
         .is_none_or(engine::backend::vulkan::VulkanBackend::supports_paged_kv);
@@ -2741,22 +2786,35 @@ fn prepare(args: Args) -> Result<Prepared> {
                 engine::backend::vulkan_shaders::KvStorage::F32,
                 |w| w.kv_storage(),
             );
-            let pages = engine::kv_pool::KvPool::pages_within(
-                budget,
-                device_budget,
-                &layers,
-                page_tokens,
-                storage,
-            );
+            let pages = match host_formats {
+                Some(formats) => (budget
+                    / engine::kv_pool::compact_page_bytes(&layers, page_tokens, formats).max(1))
+                    as usize,
+                None => engine::kv_pool::KvPool::pages_within(
+                    budget,
+                    device_budget,
+                    &layers,
+                    page_tokens,
+                    storage,
+                ),
+            };
             if pages == 0 {
                 return None;
             }
-            let mut pool = engine::kv_pool::KvPool::with_policy(
+            let mut pool = engine::kv_pool::KvPool::with_formats(
                 pages,
                 page_tokens,
                 layers,
                 engine::kv_pool::policy_from_env(),
+                host_formats,
             );
+            if let Some(formats) = host_formats {
+                log::info!(
+                    "orangu-server: [kv] sealed pages hold keys as {:?} and values as {:?}",
+                    formats.k,
+                    formats.v
+                );
+            }
             // Device pages, once for the process. This is what makes a shared
             // prefix cost one mirror instead of one per request — the per-slot
             // mirrors it replaces were the reason a four-slot server advertised
@@ -2794,6 +2852,11 @@ fn prepare(args: Args) -> Result<Prepared> {
             Some((Arc::new(pool), Arc::new(index)))
         })
         .flatten();
+    if host_formats.is_some() && paged_kv.is_none() {
+        log::warn!(
+            "orangu-server: [kv] kv_cache has no effect here: only a paged cache has sealed pages"
+        );
+    }
     // What one contiguous request may hold on the device, now that both the
     // weights and the pool's own device pages are placed — see
     // `engine::generate::set_kv_device_token_ceiling`. A request's answer is
@@ -3875,8 +3938,11 @@ fn gate(configured: bool) -> &'static str {
 /// and kept for later starts of this build on this device and file
 /// (`engine::probe_cache`). The integer dot keeps a tie.
 fn choose_integer_dot(model: &Arc<dyn engine::arch::ModelForward>, path: &Path) {
-    /// How much faster one arm's first round must be to settle it.
-    const CLEAR_WIN: f64 = 1.15;
+    /// How close the float kernels must be for the integer dot to keep it: two
+    /// kernels this close are one result, and each rounds differently, so a
+    /// choice that flipped between them would change a build's replies for
+    /// nothing.
+    const TIE: f64 = 1.02;
     let Some(vulkan) = model.vulkan_backend() else {
         return;
     };
@@ -3935,26 +4001,15 @@ fn choose_integer_dot(model: &Arc<dyn engine::arch::ModelForward>, path: &Path) 
             );
             continue;
         }
-        // A second round only when the first is close: a prompt pass on a
-        // slow device takes seconds, and a clear answer needs no second look.
-        let (mut on_s, mut off_s) = (f64::INFINITY, f64::INFINITY);
-        for round in 0..2 {
-            if round == 1 && (on_s.max(off_s) / on_s.min(off_s)) > CLEAR_WIN {
-                break;
-            }
-            for on in [true, false] {
-                set(on);
-                if let Some(s) = time() {
-                    let best = if on { &mut on_s } else { &mut off_s };
-                    *best = best.min(s);
-                }
-            }
-        }
+        let (on_s, off_s) = timed_arms(&mut |on| {
+            set(on);
+            time()
+        });
         if !on_s.is_finite() || !off_s.is_finite() {
             set(true);
             continue;
         }
-        let on = on_s <= off_s;
+        let on = on_s <= off_s * TIE;
         set(on);
         if let Some(k) = key.as_deref() {
             engine::probe_cache::keep_choice(what, k, on, on_s, off_s);
@@ -3974,6 +4029,55 @@ fn choose_integer_dot(model: &Arc<dyn engine::arch::ModelForward>, path: &Path) 
             ),
         );
     }
+}
+
+/// Times the two arms of a start-up choice, `on` and off, and answers the best
+/// of each, in seconds.
+///
+/// **The arms take turns going first.** A device's clock is still rising when a
+/// probe starts, so whichever runs first reads slow: with one fixed order and one
+/// round, the same kernel read 20% faster on nearly every build of one model and
+/// 19% slower on another, and that reading was kept for the life of the build. So
+/// the second round runs the other way about, and rounds that disagree on the
+/// winner get two more.
+///
+/// A second round is skipped only where a first has clearly decided and rounds
+/// are expensive, as a prompt pass on a slow device is.
+fn timed_arms(time: &mut dyn FnMut(bool) -> Option<f64>) -> (f64, f64) {
+    /// A win this large needs no second look, where the look is costly.
+    const CLEAR_WIN: f64 = 1.15;
+    /// What a round may take and still be repeated regardless, in seconds.
+    const CHEAP_ROUND: f64 = 4.0;
+    const MOST_ROUNDS: usize = 4;
+    let (mut on_best, mut off_best) = (f64::INFINITY, f64::INFINITY);
+    let mut winners = Vec::with_capacity(MOST_ROUNDS);
+    for round in 0..MOST_ROUNDS {
+        let (mut on_s, mut off_s) = (f64::INFINITY, f64::INFINITY);
+        let order = if round % 2 == 0 {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        for on in order {
+            if let Some(seconds) = time(on) {
+                *(if on { &mut on_s } else { &mut off_s }) = seconds;
+            }
+        }
+        on_best = on_best.min(on_s);
+        off_best = off_best.min(off_s);
+        if !on_s.is_finite() || !off_s.is_finite() {
+            break;
+        }
+        winners.push(on_s <= off_s);
+        let clear = on_s.max(off_s) / on_s.min(off_s) > CLEAR_WIN;
+        if round == 0 && clear && on_s + off_s > CHEAP_ROUND {
+            break;
+        }
+        if round == 1 && winners[0] == winners[1] {
+            break;
+        }
+    }
+    (on_best, off_best)
 }
 
 /// The short-row `Q4_K` form's rows a slot, `0` for off
@@ -5172,6 +5276,12 @@ fn run_command(
                         "device_memory_bytes": device_memory_bytes,
                         "context": context,
                         "kv_bytes": kv_bytes,
+                        "kv_bytes_per_token": kv_elements_per_token(&path).map(|elements| {
+                            engine::plan::kv_footprints(elements)
+                                .into_iter()
+                                .map(|(name, bytes)| (name.to_string(), bytes))
+                                .collect::<std::collections::BTreeMap<_, _>>()
+                        }),
                         "needs_bytes": needs_bytes,
                         "capacity_bytes": capacity_bytes,
                         "checked": deep,
@@ -5189,6 +5299,21 @@ fn run_command(
                     plan_device(&gpus).as_ref().map(|(n, v)| (n.as_str(), *v)),
                 )
             );
+            if let Some(elements) = kv_elements_per_token(&path) {
+                let context = requested_context(None, conf.context).unwrap_or(PLAN_KV_CONTEXT);
+                print!(
+                    "{}",
+                    engine::plan::format_kv_footprints(elements * context as u64, context)
+                );
+                if matches!(
+                    conf.backend,
+                    config::BackendPreference::Cuda
+                        | config::BackendPreference::OpenCl
+                        | config::BackendPreference::Rocm
+                ) {
+                    println!("           kv_cache has no effect on this backend");
+                }
+            }
             if deep {
                 if problems.is_empty() {
                     println!("Check      {shard_count} shard(s) readable, architecture supported");
@@ -5507,6 +5632,49 @@ fn select_model_for_deletion(models_dir: &Path) -> Result<orangu::model_spec::Mo
     nr.checked_sub(1)
         .and_then(|index| groups.into_iter().nth(index))
         .ok_or_else(|| anyhow!("no model with NR {nr} ({count} model(s) listed)"))
+}
+
+/// The context `plan` prices a KV cache at when none is configured.
+const PLAN_KV_CONTEXT: usize = 8192;
+
+/// The `f32` elements of KV one token takes in host pages for the model at
+/// `path`, or `None` if it has no such cache to price.
+fn kv_elements_per_token(path: &std::path::Path) -> Option<u64> {
+    let loaded = engine::loader::LoadedModel::open(path).ok()?;
+    Some(engine::arch::kv_host_elements_per_token(&loaded) as u64).filter(|&elements| elements > 0)
+}
+
+/// Refuses what this backend cannot honour: a separate value format is for host
+/// pages, and a device would quietly store something else.
+fn kv_cache_fits_backend(conf: &config::ServerConfiguration, on_a_device: bool) -> Result<()> {
+    if !on_a_device {
+        return Ok(());
+    }
+    if conf.kv_cache_values.is_some() {
+        anyhow::bail!("kv_cache_values needs backend = cpu");
+    }
+    Ok(())
+}
+
+/// What sealed host pages should hold, or `None` for `f32`.
+fn host_kv_formats(
+    conf: &config::ServerConfiguration,
+    on_cpu: bool,
+) -> Option<engine::kv_pool::HostFormats> {
+    if !on_cpu {
+        return None;
+    }
+    let keys = engine::backend::tuning_profile::env_var("ORANGU_KV_CACHE")
+        .ok()
+        .and_then(|raw| config::KvCache::parse(&raw))
+        .unwrap_or(conf.kv_cache);
+    let k = keys.row_format();
+    let formats = engine::kv_pool::HostFormats {
+        k,
+        v: conf.kv_cache_values.map_or(k, config::KvValues::row_format),
+    };
+    let plain = engine::kv_rows::RowFormat::F32;
+    (formats.k != plain || formats.v != plain).then_some(formats)
 }
 
 /// Plans a `download` target against this machine **before** fetching it,
@@ -6673,6 +6841,10 @@ fn default_host_kv_pool_bytes(total_ram: u64) -> u64 {
 /// The context one request must fit on the device: `--context`, then
 /// `ORANGU_CONTEXT`, then `[orangu-server].context`; `None` leaves the
 /// placement to the weights alone.
+/// The fewest tokens of context a model on a device must leave room for when
+/// none was asked for: a short conversation's worth.
+const MIN_USABLE_CONTEXT: usize = 2048;
+
 fn requested_context(flag: Option<usize>, configured: Option<usize>) -> Option<usize> {
     flag.or_else(|| {
         std::env::var("ORANGU_CONTEXT")
@@ -7674,6 +7846,76 @@ fn is_x86_feature_detected() -> bool {
     #[cfg(not(target_arch = "x86_64"))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod timed_arms_tests {
+    use super::timed_arms;
+
+    /// A clock that rises through the probe: each timing reads slower the
+    /// earlier it comes, whichever arm it is.
+    fn ramping(on_cost: f64, off_cost: f64) -> (f64, f64, usize) {
+        let mut calls = 0usize;
+        let (on, off) = timed_arms(&mut |on| {
+            let warmth = 1.0 + 0.5 / (1.0 + calls as f64).powi(2);
+            calls += 1;
+            Some(if on { on_cost } else { off_cost } * warmth)
+        });
+        (on, off, calls)
+    }
+
+    /// With the arm first timed on a cold card, a fixed order made the better
+    /// kernel lose. Taking turns gives each arm a warm reading.
+    #[test]
+    fn the_arm_that_goes_first_is_not_held_to_a_cold_clock() {
+        let (on, off, _) = ramping(0.09, 0.10);
+        assert!(on < off, "the faster kernel lost: {on} against {off}");
+        let (on, off, _) = ramping(0.10, 0.09);
+        assert!(off < on, "the faster kernel lost: {on} against {off}");
+    }
+
+    #[test]
+    fn rounds_that_agree_end_at_two_and_rounds_that_disagree_go_on() {
+        let mut calls = 0;
+        timed_arms(&mut |on| {
+            calls += 1;
+            Some(if on { 1.0 } else { 2.0 } * 0.01)
+        });
+        assert_eq!(calls, 4, "two rounds of two arms");
+
+        // A first round read the wrong way, then the truth.
+        let mut calls = 0;
+        let (on, off) = timed_arms(&mut |on| {
+            calls += 1;
+            let wrong = calls <= 2;
+            Some(if on == wrong { 0.02 } else { 0.01 })
+        });
+        assert_eq!(calls, 8, "two more rounds to settle it");
+        assert_eq!((on, off), (0.01, 0.01));
+    }
+
+    /// A prompt pass on a slow device takes seconds: a clear answer stops there.
+    #[test]
+    fn a_clear_answer_stops_early_only_where_rounds_are_costly() {
+        let mut calls = 0;
+        timed_arms(&mut |on| {
+            calls += 1;
+            Some(if on { 5.0 } else { 10.0 })
+        });
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn an_arm_that_cannot_be_timed_ends_the_probe() {
+        let mut calls = 0;
+        let (on, off) = timed_arms(&mut |on| {
+            calls += 1;
+            on.then_some(0.01)
+        });
+        assert_eq!(calls, 2);
+        assert_eq!(on, 0.01);
+        assert!(off.is_infinite());
     }
 }
 

@@ -263,9 +263,20 @@ pub(crate) fn kv_fixed_elements(loaded: &LoadedModel, context: usize) -> usize {
 /// `ring_for == None` prices the per-token layers, `Some(context)` the
 /// ring layers at their rows for that context.
 fn kv_estimate(loaded: &LoadedModel, ring_for: Option<usize>) -> usize {
-    let n_layer = loaded.config.n_layer;
     let n_swa = loaded.metadata_u64("attention.sliding_window").unwrap_or(0) as usize;
     let ringed = n_swa > 0 && !swa_full() && !bidirectional(&loaded.config.architecture);
+    kv_estimate_of(loaded, ring_for, ringed)
+}
+
+/// What every layer's rows take in host pages, per token: a ring is only the
+/// device's way of holding a windowed layer.
+pub(crate) fn kv_host_elements_per_token(loaded: &LoadedModel) -> usize {
+    kv_estimate_of(loaded, None, false)
+}
+
+fn kv_estimate_of(loaded: &LoadedModel, ring_for: Option<usize>, ringed: bool) -> usize {
+    let n_layer = loaded.config.n_layer;
+    let n_swa = loaded.metadata_u64("attention.sliding_window").unwrap_or(0) as usize;
     let ring_rows = |context: usize| {
         (n_swa + crate::engine::generate::prefill_chunk_ceiling())
             .max(1)
@@ -3286,6 +3297,10 @@ impl GemmaModel {
 }
 
 impl ModelForward for GemmaModel {
+    fn reads_rows_only_through_attention(&self) -> bool {
+        true
+    }
+
     fn vulkan_backend(&self) -> Option<&crate::engine::backend::vulkan::VulkanBackend> {
         self.backend.as_wgpu()
     }
@@ -3695,6 +3710,10 @@ impl ModelForward for GemmaModel {
                 .map(|&w| outcomes.by_ref().take(w).collect())
                 .collect(),
         ))
+    }
+
+    fn verifies_rows_on_split_devices(&self) -> bool {
+        true
     }
 
     fn forward_all_logits(

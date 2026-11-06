@@ -117,6 +117,10 @@ enum Grammar {
     Schema(Box<crate::engine::json_schema::SchemaPrefix>),
     /// The start of a reply, held to one of a fixed set of strings.
     OneOf(crate::engine::constraint::OneOfPrefix),
+    /// What a request's `grammar` describes.
+    Text(crate::engine::grammar::Matcher),
+    /// One tool call, after which the constraint lets go.
+    Call(crate::engine::grammar::Matcher),
 }
 
 impl Grammar {
@@ -125,14 +129,25 @@ impl Grammar {
             Self::Json(g) => g.is_complete(),
             Self::Schema(g) => g.is_complete(),
             Self::OneOf(g) => g.is_complete(),
+            Self::Text(g) | Self::Call(g) => g.is_complete(),
         }
     }
 
-    fn allows(&self, bytes: &[u8]) -> bool {
+    /// Whether a reply ends the moment it is complete. A document does; a
+    /// grammar can describe text that goes on, and leaves that to the model.
+    fn ends_when_complete(&self) -> bool {
+        match self {
+            Self::Json(_) | Self::Schema(_) | Self::OneOf(_) | Self::Call(_) => true,
+            Self::Text(g) => !g.can_continue(),
+        }
+    }
+
+    fn allows(&mut self, bytes: &[u8]) -> bool {
         match self {
             Self::Json(g) => g.allows(bytes),
             Self::Schema(g) => g.allows(bytes),
             Self::OneOf(g) => g.allows(bytes),
+            Self::Text(g) | Self::Call(g) => g.allows(bytes),
         }
     }
 
@@ -141,6 +156,7 @@ impl Grammar {
             Self::Json(g) => g.push_bytes(bytes),
             Self::Schema(g) => g.push_bytes(bytes),
             Self::OneOf(g) => g.push_bytes(bytes),
+            Self::Text(g) | Self::Call(g) => g.push_bytes(bytes),
         }
     }
 }
@@ -194,13 +210,43 @@ impl Constraint {
         }
     }
 
+    /// Holds output to what `grammar` describes.
+    pub fn grammar(
+        grammar: std::sync::Arc<crate::engine::grammar::Grammar>,
+        token_bytes: std::sync::Arc<Vec<Vec<u8>>>,
+        stop_ids: Vec<u32>,
+    ) -> Self {
+        Self {
+            grammar: Grammar::Text(crate::engine::grammar::Matcher::new(grammar)),
+            token_bytes,
+            stop_ids,
+        }
+    }
+
+    /// Holds output to one tool call, and lets go at its end.
+    fn call(
+        grammar: std::sync::Arc<crate::engine::grammar::Grammar>,
+        token_bytes: std::sync::Arc<Vec<Vec<u8>>>,
+        stop_ids: Vec<u32>,
+    ) -> Self {
+        Self {
+            grammar: Grammar::Call(crate::engine::grammar::Matcher::new(grammar)),
+            token_bytes,
+            stop_ids,
+        }
+    }
+
     /// Whether this constraint has nothing left to hold.
     fn is_released(&self) -> bool {
-        matches!(&self.grammar, Grammar::OneOf(g) if g.is_finished())
+        match &self.grammar {
+            Grammar::OneOf(g) => g.is_finished(),
+            Grammar::Call(g) => g.is_complete() || !g.can_continue(),
+            _ => false,
+        }
     }
 
     /// Whether this token may be sampled next.
-    fn allows(&self, id: u32) -> bool {
+    fn allows(&mut self, id: u32) -> bool {
         if self.stop_ids.contains(&id) {
             return self.grammar.is_complete();
         }
@@ -221,7 +267,10 @@ impl Constraint {
         // first step and, having committed with nothing planned, closes it
         // again — `{}` where allowing it to pause produced
         // `{"Name": "John Doe", "Age": 32}`.
-        if self.grammar.is_complete() && !self.stop_ids.is_empty() {
+        if self.grammar.is_complete()
+            && self.grammar.ends_when_complete()
+            && !self.stop_ids.is_empty()
+        {
             return false;
         }
         match self.token_bytes.get(id as usize) {
@@ -290,11 +339,24 @@ impl TokenLogprob {
     }
 }
 
+/// A tool-call grammar waiting for a call to open. While it waits, a reply is
+/// ordinary text, on the device's fast paths.
+struct WaitingCall {
+    calls: std::sync::Arc<crate::engine::tool_learn::CallGrammar>,
+    token_bytes: std::sync::Arc<Vec<Vec<u8>>>,
+    stop_ids: Vec<u32>,
+    /// The latest text, as long as the trigger could still be spanning it.
+    tail: Vec<u8>,
+    /// Text inside a reasoning body can mention a call without making one.
+    paused: bool,
+}
+
 pub struct Sampler {
     params: SamplingParams,
     /// `None` for an unconstrained request, which is every request that did
     /// not ask for a `response_format`.
     constraint: Option<Constraint>,
+    waiting_call: Option<WaitingCall>,
     /// The token the next pick is, whatever the logits say — see
     /// [`Self::force`].
     forced: Option<u32>,
@@ -312,6 +374,7 @@ impl Sampler {
         Self {
             params,
             constraint: None,
+            waiting_call: None,
             forced: None,
             logprobs: None,
             recorded: std::collections::VecDeque::new(),
@@ -346,6 +409,47 @@ impl Sampler {
     pub fn with_constraint(mut self, constraint: Constraint) -> Self {
         self.constraint = Some(constraint);
         self
+    }
+
+    /// Holds tool calls to `calls`: from the start where it says what a forced
+    /// call must be, and whenever a call opens after that.
+    pub fn with_calls(
+        mut self,
+        calls: std::sync::Arc<crate::engine::tool_learn::CallGrammar>,
+        token_bytes: std::sync::Arc<Vec<Vec<u8>>>,
+        stop_ids: Vec<u32>,
+    ) -> Self {
+        if let Some(initial) = calls.initial.clone() {
+            self.constraint = Some(Constraint::call(
+                initial,
+                token_bytes.clone(),
+                stop_ids.clone(),
+            ));
+        }
+        self.waiting_call = Some(WaitingCall {
+            calls,
+            token_bytes,
+            stop_ids,
+            tail: Vec::new(),
+            paused: false,
+        });
+        self
+    }
+
+    /// Whether what is being written is reasoning, where a call's opener is
+    /// only a mention of one.
+    pub fn set_reasoning(&mut self, reasoning: bool) {
+        if let Some(waiting) = self.waiting_call.as_mut() {
+            waiting.paused = reasoning;
+            if reasoning {
+                waiting.tail.clear();
+            }
+        }
+    }
+
+    /// A token the device picked, which no pick here saw.
+    pub fn note_device_pick(&mut self, id: u32) {
+        self.accept_into_constraint(id);
     }
 
     /// Whether a pick needs every logit on the host — the decode loop's cue
@@ -408,6 +512,36 @@ impl Sampler {
             if constraint.is_released() {
                 self.constraint = None;
             }
+            return;
+        }
+        let Some(waiting) = self.waiting_call.as_mut().filter(|w| !w.paused) else {
+            return;
+        };
+        let Some(bytes) = waiting.token_bytes.get(id as usize) else {
+            return;
+        };
+        waiting.tail.extend_from_slice(bytes);
+        let trigger = waiting.calls.trigger.as_bytes();
+        let Some(at) = waiting
+            .tail
+            .windows(trigger.len())
+            .position(|w| w == trigger)
+        else {
+            let keep = trigger.len().saturating_sub(1);
+            let drop = waiting.tail.len().saturating_sub(keep);
+            waiting.tail.drain(..drop);
+            return;
+        };
+        // What the token held past the trigger is the call's first text.
+        let rest = waiting.tail.split_off(at + trigger.len());
+        waiting.tail.clear();
+        let mut constraint = Constraint::call(
+            waiting.calls.after_trigger.clone(),
+            waiting.token_bytes.clone(),
+            waiting.stop_ids.clone(),
+        );
+        if constraint.grammar.push_bytes(&rest) && !constraint.is_released() {
+            self.constraint = Some(constraint);
         }
     }
 
@@ -418,7 +552,7 @@ impl Sampler {
         apply_occurrence_penalties(&mut logits, recent_tokens, &self.params);
 
         if self.params.temperature <= 0.0 {
-            return match &self.constraint {
+            return match &mut self.constraint {
                 // Exactly the argmax over allowed tokens, and usually one
                 // check: walking the vocabulary in descending logit order and
                 // stopping at the first token the grammar accepts is the same
@@ -464,7 +598,7 @@ impl Sampler {
         // the field is refilled from the whole vocabulary in descending order
         // rather than failing — a legal token always exists while the document
         // is unfinished, it may simply be an unlikely one.
-        if let Some(c) = &self.constraint {
+        if let Some(c) = &mut self.constraint {
             candidates.retain(|&(id, _)| c.allows(id));
             if candidates.is_empty() {
                 let mut all: Vec<(u32, f32)> = logits
@@ -567,7 +701,7 @@ pub fn position_draw(seed: u64, pos: usize) -> f32 {
 /// happen while a document is unfinished — but a sampler that returned no
 /// token at all would hang the decode loop, and a wrong token is recoverable
 /// where a hang is not.
-fn argmax_allowed(logits: &[f32], constraint: &Constraint) -> u32 {
+fn argmax_allowed(logits: &[f32], constraint: &mut Constraint) -> u32 {
     // The overwhelmingly common case: the model's own preferred token is
     // already legal, so one grammar probe settles it and nothing is sorted.
     // Sorting 262k entries on every generated token to answer a question that
@@ -1059,6 +1193,134 @@ mod constraint_tests {
         assert!(!sampler.needs_host_logits());
     }
 
+    /// A vocabulary of one token per piece of a call, and a sampler for it.
+    fn call_sampler(initial: bool) -> Sampler {
+        use crate::engine::grammar::Grammar;
+        let after = Grammar::parse("root ::= \"x\" \"y\"\n").unwrap();
+        let calls = crate::engine::tool_learn::CallGrammar {
+            trigger: "<c>".to_string(),
+            after_trigger: after.clone(),
+            initial: initial.then(|| Grammar::parse("root ::= \"y\"\n").unwrap()),
+        };
+        let table = Arc::new(vec![
+            b"<c>".to_vec(),
+            b"x".to_vec(),
+            b"y".to_vec(),
+            b"z".to_vec(),
+            b"<c>x".to_vec(),
+            Vec::new(),
+        ]);
+        let params = SamplingParams {
+            temperature: 0.0,
+            repeat_penalty: 1.0,
+            ..Default::default()
+        };
+        Sampler::new(params).with_calls(Arc::new(calls), table, vec![5])
+    }
+
+    fn wanting(id: usize, second: usize) -> Vec<f32> {
+        let mut logits = vec![-50.0_f32; 6];
+        logits[id] = 50.0;
+        logits[second] = 40.0;
+        logits
+    }
+
+    /// Until a call opens the reply is ordinary, and on the fast paths; once it
+    /// opens, only the call can be written, not even a stop; after the call the
+    /// reply is ordinary again.
+    #[test]
+    fn a_call_grammar_waits_for_the_call_and_lets_go_after_it() {
+        let mut sampler = call_sampler(false);
+        assert!(!sampler.needs_host_logits());
+        assert_eq!(sampler.sample(&wanting(3, 1), &[], 0), 3);
+        assert!(!sampler.needs_host_logits());
+        assert_eq!(sampler.sample(&wanting(0, 1), &[], 1), 0);
+        assert!(sampler.needs_host_logits(), "the call has opened");
+        assert_eq!(sampler.sample(&wanting(3, 1), &[], 2), 1);
+        assert_eq!(
+            sampler.sample(&wanting(5, 2), &[], 3),
+            2,
+            "no stopping inside"
+        );
+        assert!(!sampler.needs_host_logits(), "the call has closed");
+        assert_eq!(sampler.sample(&wanting(3, 1), &[], 4), 3);
+        // And the next call is held the same way.
+        assert_eq!(sampler.sample(&wanting(0, 1), &[], 5), 0);
+        assert!(sampler.needs_host_logits());
+    }
+
+    /// The device's pick goes through nothing here, and has to be seen all the
+    /// same, with the text past a trigger in the one token counting as the call.
+    #[test]
+    fn a_call_is_seen_opening_from_a_device_pick_and_within_a_token() {
+        let mut sampler = call_sampler(false);
+        sampler.note_device_pick(0);
+        assert!(sampler.needs_host_logits());
+        let mut sampler = call_sampler(false);
+        sampler.note_device_pick(4);
+        assert!(sampler.needs_host_logits());
+        assert_eq!(sampler.sample(&wanting(3, 2), &[], 0), 2);
+        assert!(!sampler.needs_host_logits());
+    }
+
+    #[test]
+    fn a_call_mentioned_in_reasoning_is_only_a_mention() {
+        let mut sampler = call_sampler(false);
+        sampler.set_reasoning(true);
+        sampler.note_device_pick(0);
+        assert!(!sampler.needs_host_logits());
+        sampler.set_reasoning(false);
+        sampler.note_device_pick(0);
+        assert!(sampler.needs_host_logits());
+    }
+
+    /// A reply forced to begin with a call is held from its first token.
+    #[test]
+    fn a_forced_call_is_held_from_the_start() {
+        let mut sampler = call_sampler(true);
+        assert!(sampler.needs_host_logits());
+        assert_eq!(sampler.sample(&wanting(3, 2), &[], 0), 2);
+        assert!(!sampler.needs_host_logits());
+    }
+
+    /// A grammar that can go on leaves stopping to the model once it may, and
+    /// one that cannot leaves only stopping.
+    #[test]
+    fn a_grammar_says_when_a_reply_may_end() {
+        use crate::engine::grammar::Grammar;
+        let table = Arc::new(vec![b"a".to_vec(), b"b".to_vec(), Vec::new()]);
+        let params = SamplingParams {
+            temperature: 0.0,
+            repeat_penalty: 1.0,
+            ..Default::default()
+        };
+        let open = Grammar::parse("root ::= \"a\"+\n").unwrap();
+        let mut sampler = Sampler::new(params.clone()).with_constraint(Constraint::grammar(
+            open,
+            table.clone(),
+            vec![2],
+        ));
+        let logits = |id: usize, next: usize| {
+            let mut l = vec![-50.0_f32; 3];
+            l[id] = 50.0;
+            l[next] = 40.0;
+            l
+        };
+        assert_eq!(sampler.sample(&logits(2, 0), &[], 0), 0, "not complete yet");
+        assert_eq!(sampler.sample(&logits(0, 2), &[], 1), 0, "it may go on");
+        assert_eq!(sampler.sample(&logits(2, 0), &[], 2), 2, "it may stop");
+
+        let closed = Grammar::parse("root ::= \"a\"\n").unwrap();
+        let mut sampler =
+            Sampler::new(params).with_constraint(Constraint::grammar(closed, table, vec![2]));
+        assert_eq!(sampler.sample(&logits(1, 0), &[], 0), 0);
+        assert_eq!(
+            sampler.sample(&logits(0, 2), &[], 1),
+            2,
+            "only stopping is left"
+        );
+    }
+
     fn json_constraint() -> Constraint {
         Constraint::json(vocab(), vec![EOS])
     }
@@ -1066,7 +1328,7 @@ mod constraint_tests {
     /// The document has to open with `{`, and prose cannot get in.
     #[test]
     fn only_tokens_keeping_the_output_valid_are_allowed() {
-        let c = json_constraint();
+        let mut c = json_constraint();
         assert!(c.allows(0), "`{{` opens the object");
         assert!(c.allows(6), "leading whitespace is legal JSON");
         assert!(!c.allows(5), "`hello` is not a JSON document");

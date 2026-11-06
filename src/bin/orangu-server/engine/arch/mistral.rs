@@ -933,6 +933,10 @@ impl MistralModel {
 }
 
 impl ModelForward for MistralModel {
+    fn reads_rows_only_through_attention(&self) -> bool {
+        true
+    }
+
     /// A greedy decode step that never transfers the logits.
     ///
     /// The default implementation returns `[n_vocab]` logits for the caller to

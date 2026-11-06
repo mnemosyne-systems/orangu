@@ -104,6 +104,8 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use crate::engine::kv_rows::RowFormat;
+
 /// Whether the paged KV path is switched on. **On unless disabled.**
 ///
 /// `ORANGU_PAGED_KV=0` opts out and is a real control arm — the off-list is
@@ -286,6 +288,35 @@ pub fn page_bytes(layers: &[LayerGeometry], page_tokens: usize) -> usize {
         .iter()
         .map(|l| 2 * l.floats_per_page(page_tokens) * std::mem::size_of::<f32>())
         .sum()
+}
+
+/// Host bytes one page costs across `layers` with `formats` as keys and values.
+pub fn compact_page_bytes(
+    layers: &[LayerGeometry],
+    page_tokens: usize,
+    formats: HostFormats,
+) -> u64 {
+    layers
+        .iter()
+        .map(|l| {
+            let rows = page_tokens.div_ceil(l.stride);
+            (rows * (formats.k.row_bytes(l.kv_dim) + formats.v.row_bytes(l.kv_dim))) as u64
+        })
+        .sum()
+}
+
+/// How a pool's sealed pages hold keys and values on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostFormats {
+    pub k: RowFormat,
+    pub v: RowFormat,
+}
+
+/// The pages of a pool that stores anything other than `f32` on the host.
+struct CompactPages {
+    formats: HostFormats,
+    k: Vec<std::cell::UnsafeCell<Vec<u8>>>,
+    v: Vec<std::cell::UnsafeCell<Vec<u8>>>,
 }
 
 /// A page nobody holds, and when it was last released.
@@ -748,6 +779,9 @@ pub struct KvPool {
     /// multiply either way.
     k: Vec<std::cell::UnsafeCell<Vec<f32>>>,
     v: Vec<std::cell::UnsafeCell<Vec<f32>>>,
+    /// Where the pages are when they are not `f32`, which leaves `k` and `v`
+    /// above empty. Such a pool never has a device.
+    compact: Option<CompactPages>,
     /// The same pages on the device, when a device was attached.
     ///
     /// Allocated once, for the whole pool, rather than once per request —
@@ -974,6 +1008,18 @@ impl KvPool {
         layers: Vec<LayerGeometry>,
         policy: Policy,
     ) -> Self {
+        Self::with_formats(num_pages, page_tokens, layers, policy, None)
+    }
+
+    /// [`Self::with_policy`] with sealed pages in `formats`, or as `f32` when
+    /// that is `None`.
+    pub fn with_formats(
+        num_pages: usize,
+        page_tokens: usize,
+        layers: Vec<LayerGeometry>,
+        policy: Policy,
+        formats: Option<HostFormats>,
+    ) -> Self {
         assert!(num_pages > 0, "a KV pool needs at least one page");
         assert!(page_tokens > 0, "a KV page must cover at least one token");
         assert!(
@@ -984,15 +1030,38 @@ impl KvPool {
             layers
                 .iter()
                 .map(|l| {
-                    std::cell::UnsafeCell::new(vec![
-                        0.0;
+                    let floats = if formats.is_some() {
+                        0
+                    } else {
                         num_pages * l.floats_per_page(page_tokens)
-                    ])
+                    };
+                    std::cell::UnsafeCell::new(vec![0.0; floats])
                 })
                 .collect()
         };
         let k = cells();
         let v = cells();
+        let compact = formats.map(|formats| {
+            let side = |format: RowFormat| -> Vec<std::cell::UnsafeCell<Vec<u8>>> {
+                layers
+                    .iter()
+                    .map(|l| {
+                        let rows = page_tokens.div_ceil(l.stride);
+                        std::cell::UnsafeCell::new(vec![
+                            0u8;
+                            num_pages
+                                * rows
+                                * format.row_bytes(l.kv_dim)
+                        ])
+                    })
+                    .collect()
+            };
+            CompactPages {
+                formats,
+                k: side(formats.k),
+                v: side(formats.v),
+            }
+        });
         let device = None;
         Self {
             page_tokens,
@@ -1000,6 +1069,7 @@ impl KvPool {
             layers,
             k,
             v,
+            compact,
             device,
             inner: Mutex::new(PoolInner {
                 refs: vec![0; num_pages],
@@ -1047,6 +1117,10 @@ impl KvPool {
         max_table_entries: usize,
     ) -> bool {
         use crate::engine::backend::vulkan_shaders::KvStorage;
+        assert!(
+            self.compact.is_none(),
+            "device pages are filled from f32 host pages"
+        );
         let elem_bytes = |floats: usize| -> u64 {
             match storage {
                 KvStorage::F32 => (floats * 4) as u64,
@@ -1377,7 +1451,84 @@ impl KvPool {
                 let buf: &Vec<f32> = unsafe { &*b.get() };
                 buf.len() * std::mem::size_of::<f32>()
             })
-            .sum()
+            .sum::<usize>()
+            + self.compact.as_ref().map_or(0, |compact| {
+                compact
+                    .k
+                    .iter()
+                    .chain(compact.v.iter())
+                    // SAFETY: as above.
+                    .map(|b| unsafe { &*b.get() }.len())
+                    .sum()
+            })
+    }
+
+    /// The formats sealed pages are in, when they are not `f32`.
+    pub fn host_formats(&self) -> Option<HostFormats> {
+        self.compact.as_ref().map(|compact| compact.formats)
+    }
+
+    /// Decodes `rows` rows of `layer` from `first_row` of `page` into `k` and
+    /// `v`, whose length says how many. Only for a compact pool.
+    pub fn decode_rows(
+        &self,
+        layer: usize,
+        page: u32,
+        first_row: usize,
+        k: &mut [f32],
+        v: &mut [f32],
+    ) {
+        let compact = self
+            .compact
+            .as_ref()
+            .expect("decoding rows of a pool that holds them as f32");
+        let geometry = self.layers[layer];
+        let dim = geometry.kv_dim;
+        let page_rows = self.page_tokens.div_ceil(geometry.stride);
+        let rows = k.len() / dim;
+        debug_assert_eq!(k.len(), v.len());
+        debug_assert!(first_row + rows <= page_rows);
+        self.debug_assert_readable(page);
+        for (cell, format, out) in [
+            (&compact.k[layer], compact.formats.k, k),
+            (&compact.v[layer], compact.formats.v, v),
+        ] {
+            let width = format.row_bytes(dim);
+            let at = (page as usize * page_rows + first_row) * width;
+            // SAFETY: see the `unsafe impl Sync` on this type.
+            let raw: &Vec<u8> = unsafe { &*cell.get() };
+            format.decode(&raw[at..at + rows * width], dim, out);
+        }
+    }
+
+    /// One row's elements from `start` as `f32`, as many as `k` and `v` hold.
+    pub fn decode_head(
+        &self,
+        layer: usize,
+        page: u32,
+        row: usize,
+        start: usize,
+        k: &mut [f32],
+        v: &mut [f32],
+    ) {
+        let compact = self
+            .compact
+            .as_ref()
+            .expect("decoding rows of a pool that holds them as f32");
+        let geometry = self.layers[layer];
+        let dim = geometry.kv_dim;
+        let page_rows = self.page_tokens.div_ceil(geometry.stride);
+        self.debug_assert_readable(page);
+        for (cell, format, out) in [
+            (&compact.k[layer], compact.formats.k, k),
+            (&compact.v[layer], compact.formats.v, v),
+        ] {
+            let width = format.row_bytes(dim);
+            let at = (page as usize * page_rows + row) * width;
+            // SAFETY: see the `unsafe impl Sync` on this type.
+            let raw: &Vec<u8> = unsafe { &*cell.get() };
+            format.decode_span(&raw[at..at + width], start, out);
+        }
     }
 
     /// How many pages a sequence of `tokens` positions needs.
@@ -1876,6 +2027,21 @@ impl KvPool {
             );
         }
         let base = page as usize * per;
+        if let Some(compact) = &self.compact {
+            let dim = self.layers[layer].kv_dim;
+            let rows = per / dim;
+            for (cell, format, from) in [
+                (&compact.k[layer], compact.formats.k, k_rows),
+                (&compact.v[layer], compact.formats.v, v_rows),
+            ] {
+                let width = format.row_bytes(dim);
+                let at = page as usize * rows * width;
+                // SAFETY: as below.
+                let raw: &mut Vec<u8> = unsafe { &mut *cell.get() };
+                format.encode(from, dim, &mut raw[at..at + rows * width]);
+            }
+            return;
+        }
         // SAFETY: checked above — unsealed and singly held, so this page is in
         // the window described by this type's `unsafe impl Sync`, unreachable
         // to every other caller.

@@ -740,6 +740,9 @@ pub struct ChatCompletionRequest {
     /// the document is complete — see `engine::constraint`.
     #[serde(default)]
     response_format: Option<serde_json::Value>,
+    /// GBNF the reply is held to, in place of a `response_format`.
+    #[serde(default)]
+    grammar: Option<String>,
     /// OpenAI's tool array, handed to the chat template as `tools`. Kept as
     /// raw JSON: what a tool declaration must contain is the template's
     /// business, and every field this server invented an opinion about would
@@ -765,6 +768,18 @@ pub(crate) fn cache_point_of(head: &[u32], tokens: &[u32]) -> Option<usize> {
 
 pub(crate) fn default_cache_prompt() -> bool {
     true
+}
+
+/// A request's `grammar` field, parsed. A `400` names what is wrong with it.
+pub(crate) fn request_grammar(
+    grammar: Option<&str>,
+) -> Result<Option<Arc<crate::engine::grammar::Grammar>>, Box<axum::response::Response>> {
+    grammar
+        .map(|text| {
+            crate::engine::grammar::Grammar::parse(text)
+                .map_err(|error| Box::new(invalid_request(format!("grammar: {error}"))))
+        })
+        .transpose()
 }
 
 /// Whether `response_format` asks for JSON.
@@ -1373,6 +1388,15 @@ pub async fn chat_completions(
             "a reply that must call a tool cannot also be held to a response_format",
         );
     }
+    if req.grammar.is_some() && (requires_call || wants_json(req.response_format.as_ref())) {
+        return invalid_request(
+            "a grammar cannot be combined with a required tool call or a response_format",
+        );
+    }
+    let grammar = match request_grammar(req.grammar.as_deref()) {
+        Ok(grammar) => grammar,
+        Err(rejection) => return *rejection,
+    };
     // A call is required by making the reply begin with one. A template whose
     // call nothing here can read gives no way to do that, and answering as if
     // the requirement had been met would be worse than saying so.
@@ -1409,6 +1433,20 @@ pub async fn chat_completions(
         learned: learned.clone(),
         prefix: prefix.clone(),
     };
+    // What holds any call this reply makes to the tools it declared. Not beside
+    // a grammar or a document, which already say what the reply is.
+    let calls = tools
+        .filter(|_| grammar.is_none() && !wants_json(req.response_format.as_ref()))
+        .zip(state.engine.chat_template.as_ref())
+        .and_then(|(tools, template)| {
+            let start = match &tool_choice {
+                ToolChoice::Required => crate::engine::tool_learn::CallStart::AtName,
+                ToolChoice::Named(name) => crate::engine::tool_learn::CallStart::AfterName(name),
+                _ => crate::engine::tool_learn::CallStart::Free,
+            };
+            crate::engine::tool_learn::CallGrammar::build(template, tools, start)
+        })
+        .map(Arc::new);
     let RenderedChat {
         tokens,
         cache_point,
@@ -1491,6 +1529,8 @@ pub async fn chat_completions(
                     json_output,
                     json_schema: json_schema.clone(),
                     reply_starts: reply_starts.clone(),
+                    grammar: grammar.clone(),
+                    calls: calls.clone(),
                     n_keep: None,
                     context_shift: None,
                     dropped_tokens: 0,
@@ -2129,6 +2169,9 @@ pub struct CompletionsRequest {
     /// are the same engine here, so it does what it does on chat.
     #[serde(default)]
     response_format: Option<serde_json::Value>,
+    /// GBNF the reply is held to, in place of a `response_format`.
+    #[serde(default)]
+    grammar: Option<String>,
     #[serde(default)]
     stream: bool,
     /// Keep generating to `max_tokens` even if the model emits EOS (llama.cpp's
@@ -2210,6 +2253,13 @@ pub async fn completions(
         },
     );
     let max_tokens = req.max_tokens.or(req.n_predict).unwrap_or(256);
+    if req.grammar.is_some() && wants_json(req.response_format.as_ref()) {
+        return invalid_request("a grammar cannot be combined with a response_format");
+    }
+    let grammar = match request_grammar(req.grammar.as_deref()) {
+        Ok(grammar) => grammar,
+        Err(rejection) => return *rejection,
+    };
     let json_schema = match response_schema(req.response_format.as_ref()) {
         Ok(schema) => schema,
         Err(rejection) => return *rejection,
@@ -2245,6 +2295,8 @@ pub async fn completions(
                     json_output,
                     json_schema: json_schema.clone(),
                     reply_starts: Vec::new(),
+                    grammar: grammar.clone(),
+                    calls: None,
                     n_keep: None,
                     context_shift: None,
                     dropped_tokens: 0,
@@ -2670,11 +2722,7 @@ mod tests {
     /// sends one and hears nothing has output it did not ask for.
     #[test]
     fn an_unknown_field_is_refused_by_name() {
-        for (field, value) in [
-            ("grammar", json!("root ::= \"a\"")),
-            ("functions", json!([])),
-            ("mirostat", json!(2)),
-        ] {
+        for (field, value) in [("functions", json!([])), ("mirostat", json!(2))] {
             let message = refusal::<ChatCompletionRequest>(json!({"messages": [], field: value}));
             assert!(message.contains(field), "{message}");
             assert!(message.contains("/v1/chat/completions"), "{message}");
