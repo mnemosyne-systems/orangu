@@ -57,6 +57,7 @@ pub mod session;
 pub mod shell;
 pub mod shell_completions;
 pub mod skills;
+pub mod ssh;
 pub mod subagent_tasks;
 pub mod subagent_worktree;
 pub mod subagents;

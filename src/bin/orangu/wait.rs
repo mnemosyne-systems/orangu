@@ -307,6 +307,36 @@ async fn drive_handle(
                 redraw |= current_stream_metrics != last_rendered_metrics;
                 redraw |= current_tool_running_since.is_some() != last_tool_was_running;
 
+                // An SSH login running in this turn has a question.
+                while let Some(request) = crate::ssh_prompt::next_request() {
+                    let answer = crate::askpass::read_answer_with(
+                        |line| {
+                            let live = live_tab_statuses(parked_tabs, render.tab_bar);
+                            print_screen_fn(
+                                RenderContext { tab_statuses: &live, ..render },
+                                ScreenState {
+                                    transcript: output_state.lines(),
+                                    transcript_epoch: output_state.render_epoch(),
+                                    scroll_offset: output_state.scroll_offset(),
+                                    left_status: None,
+                                    pending_count: pending_commands.len(),
+                                    pending_lines: &[],
+                                    input: line,
+                                    cursor: line.len(),
+                                    ghost_index: 0,
+                                    dropdown: None,
+                                    reverse_search: None,
+                                },
+                            );
+                        },
+                        crate::ssh_prompt::PROMPT_LABEL,
+                        &request.prompt,
+                        || request.abandoned(),
+                    )?;
+                    request.answer(answer);
+                    redraw = true;
+                }
+
                 while event::poll(std::time::Duration::ZERO)? {
                     let event = event::read()?;
                     if let Some(request) = streamed_state

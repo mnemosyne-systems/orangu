@@ -206,6 +206,7 @@ impl OneshotSession {
         .with_mcp(mcp.clone())
         .with_workspace_agents()
         .with_web_search(config.web_search.clone())
+        .with_ssh(orangu::ssh::SshSessions::for_mode(config.ssh, None))
         .with_llms(config.llms.clone())
         .with_subagent_depth(config.subagent_depth);
         let (tools, agent_prompt) = match orangu::agents::custom::main_agent() {

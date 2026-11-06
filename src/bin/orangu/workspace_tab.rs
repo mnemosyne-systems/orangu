@@ -51,6 +51,8 @@ pub(crate) struct TabServerConfig<'a> {
     /// `[orangu].subagent_background`: subagents run in the background by
     /// default.
     pub(crate) subagent_background: bool,
+    /// `[orangu].ssh`: whether `use_ssh` is offered, and who approves hosts.
+    pub(crate) ssh: orangu::config::SshMode,
 }
 
 /// Everything that belongs to one workspace tab. The run loop reads and mutates
@@ -157,6 +159,7 @@ impl WorkspaceTab {
             web_search,
             subagent_depth,
             subagent_background,
+            ssh,
         } = server_config;
         let workspace_created = if !workspace.exists() {
             std::fs::create_dir_all(&workspace)
@@ -216,6 +219,10 @@ impl WorkspaceTab {
         .with_mcp(mcp.clone())
         .with_workspace_agents()
         .with_web_search(web_search.to_vec())
+        .with_ssh(orangu::ssh::SshSessions::for_mode(
+            ssh,
+            Some(crate::ssh_prompt::prompter()),
+        ))
         .with_llms(config_llms.clone())
         .with_subagent_depth(subagent_depth)
         .with_background_default(subagent_background)

@@ -54,6 +54,12 @@ pub struct ToolExecutor {
     /// A browsing subagent's pages: set, it is offered `browse`, and
     /// `web_search` when there are engines.
     browser: Option<Arc<tokio::sync::Mutex<crate::browse::Browser>>>,
+    /// This conversation's SSH sessions: set, the main agent is offered
+    /// `use_ssh`. `None` when `[orangu].ssh` is `deny`.
+    ssh: Option<Arc<crate::ssh::SshSessions>>,
+    /// Whether the login and copy tools themselves are offered: only to the
+    /// subagent `use_ssh` starts, and to custom agents that name them.
+    ssh_tools: bool,
     /// A custom agent's `MEMORY.md`, which `save_memory` rewrites. Outside
     /// the workspace for a user-scope memory, so it has its own tool rather
     /// than the workspace-confined file tools.
@@ -226,6 +232,8 @@ impl ToolExecutor {
             custom_agents: Arc::default(),
             web_engines: Arc::default(),
             browser: None,
+            ssh: None,
+            ssh_tools: false,
             memory_file: None,
             tasks: Arc::default(),
             background_tasks: false,
@@ -627,6 +635,9 @@ impl ToolExecutor {
                             !self.web_engines.is_empty()
                                 || spec.tool != crate::subagents::WEB_RESEARCHER.tool
                         })
+                        .filter(|spec| {
+                            self.ssh.is_some() || spec.tool != crate::subagents::SSH.tool
+                        })
                         .map(|spec| spec.definition()),
                 );
                 defs.push(crate::subagents::document_definition());
@@ -767,6 +778,9 @@ impl ToolExecutor {
                 }),
             ));
         }
+        if self.ssh_tools && !self.read_only {
+            defs.extend(ssh_definitions());
+        }
         let agents = self.custom_agents.current();
         if !self.read_only && self.subagents && !agents.is_empty() {
             defs.push(tool(
@@ -902,6 +916,23 @@ impl ToolExecutor {
     pub fn with_browsing(mut self) -> Self {
         self.browser = Some(Arc::default());
         self
+    }
+
+    /// This conversation's SSH sessions, which offer `use_ssh`.
+    pub fn with_ssh(mut self, ssh: Option<Arc<crate::ssh::SshSessions>>) -> Self {
+        self.ssh = ssh;
+        self
+    }
+
+    /// Offers the login and copy tools, on the parent's SSH sessions.
+    pub fn with_ssh_tools(mut self, ssh: Option<Arc<crate::ssh::SshSessions>>) -> Self {
+        self.ssh_tools = ssh.is_some();
+        self.ssh = ssh;
+        self
+    }
+
+    pub fn ssh(&self) -> Option<Arc<crate::ssh::SshSessions>> {
+        self.ssh.clone()
     }
 
     pub fn web_engines(&self) -> &[crate::web_search::Engine] {
@@ -1093,6 +1124,7 @@ impl ToolExecutor {
                 }
             }
             "use_skill" => self.use_skill(arguments),
+            "ssh_login" | "ssh_copy" | "ssh_logout" => self.ssh_tool(name, arguments).await,
             "list_directory" => self.list_directory(arguments).await,
             "fetch_url" => self.fetch_url(arguments).await,
             "run_shell_command" => self.run_shell_command(arguments).await,
@@ -1362,6 +1394,42 @@ impl ToolExecutor {
             "{}\n(from {engine})\n",
             crate::web_search::format_results(query.trim(), &results).trim_end()
         ))
+    }
+
+    /// `ssh_login`, `ssh_copy` and `ssh_logout`.
+    async fn ssh_tool(&self, name: &str, arguments: &Map<String, Value>) -> Result<String> {
+        let ssh = self
+            .ssh
+            .as_ref()
+            .filter(|_| self.ssh_tools)
+            .ok_or_else(|| anyhow!("{name} is only available to the use_ssh subagent"))?;
+        if self.read_only {
+            return Err(anyhow!("tool not available in read-only mode"));
+        }
+        let text = |key: &str| {
+            arguments
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("missing or invalid '{key}' argument"))
+        };
+        match name {
+            "ssh_login" => ssh.login(text("host")?).await,
+            "ssh_logout" => ssh.logout(text("session")?).await,
+            _ => {
+                ssh.copy(
+                    text("session")?,
+                    text("direction")?.parse()?,
+                    &self.workspace,
+                    text("local")?,
+                    text("remote")?,
+                    arguments
+                        .get("overwrite")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+                .await
+            }
+        }
     }
 
     /// `browse`: a page by URL or by link number, or another part of the
@@ -1916,6 +1984,48 @@ impl ToolExecutor {
     fn resolve_workspace_path(&self, raw_path: &str) -> Result<PathBuf> {
         resolve_workspace_path(&self.workspace, raw_path)
     }
+}
+
+/// The tools of an SSH session. None takes a credential: a login asks the
+/// user for what it needs, so no secret passes through the model.
+fn ssh_definitions() -> Vec<ToolDefinition> {
+    vec![
+        tool(
+            "ssh_login",
+            "Log in to `host`, an ~/.ssh/config alias or [user@]host[:port]; returns the session \
+                 name. Credentials are handled without you. Reuses an open session.",
+            json!({
+                "type": "object",
+                "properties": {"host": {"type": "string"}},
+                "required": ["host"]
+            }),
+        ),
+        tool(
+            "ssh_copy",
+            "Copy one file between workspace path `local` and `remote`; relative remote paths \
+                 start at the remote home. Refuses to replace a file unless `overwrite`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string"},
+                    "direction": {"type": "string", "enum": ["upload", "download"]},
+                    "local": {"type": "string"},
+                    "remote": {"type": "string"},
+                    "overwrite": {"type": "boolean"}
+                },
+                "required": ["session", "direction", "local", "remote"]
+            }),
+        ),
+        tool(
+            "ssh_logout",
+            "Close SSH session `session`.",
+            json!({
+                "type": "object",
+                "properties": {"session": {"type": "string"}},
+                "required": ["session"]
+            }),
+        ),
+    ]
 }
 
 fn tool(name: &str, description: &str, parameters: Value) -> ToolDefinition {
@@ -2901,7 +3011,11 @@ mod file_lifecycle_tool_tests {
         // With web search engines, so `research_web` is offered too.
         let main = tool_names(
             &ToolExecutor::new(workspace.path())
-                .with_web_search(crate::web_search::DEFAULT_ENGINES.to_vec()),
+                .with_web_search(crate::web_search::DEFAULT_ENGINES.to_vec())
+                .with_ssh(crate::ssh::SshSessions::for_mode(
+                    crate::config::SshMode::Prompt,
+                    None,
+                )),
         );
         let read_only = tool_names(&ToolExecutor::new_read_only(workspace.path()));
         for spec in crate::subagents::SUBAGENTS {

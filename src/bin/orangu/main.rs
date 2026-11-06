@@ -41,6 +41,7 @@ mod session_store;
 mod shell;
 mod shell_command;
 mod slash_command;
+mod ssh_prompt;
 mod stats;
 mod terminal;
 mod wait;
@@ -633,6 +634,7 @@ async fn run() -> Result<()> {
             web_search: &config.web_search,
             subagent_depth: config.subagent_depth,
             subagent_background: config.subagent_background,
+            ssh: config.ssh,
             slots: slot_registry.clone(),
         },
     )
@@ -691,6 +693,7 @@ async fn run() -> Result<()> {
                         web_search: &config.web_search,
                         subagent_depth: config.subagent_depth,
                         subagent_background: config.subagent_background,
+                        ssh: config.ssh,
                         slots: slot_registry.clone(),
                     },
                 )
@@ -1043,6 +1046,7 @@ async fn run() -> Result<()> {
                             web_search: &config.web_search,
                             subagent_depth: config.subagent_depth,
                             subagent_background: config.subagent_background,
+                            ssh: config.ssh,
                             slots: slot_registry.clone(),
                         },
                     )
@@ -1508,6 +1512,32 @@ async fn run() -> Result<()> {
                 },
                 forge.name(),
                 &request.prompt,
+                || false,
+            )?;
+            request.answer(answer);
+        }
+
+        // An SSH login in a background subagent has a question.
+        while let Some(request) = ssh_prompt::next_request() {
+            let answer = askpass::read_answer(
+                &mut _terminal_ui_guard,
+                render,
+                &ScreenState {
+                    transcript: output_state.lines(),
+                    transcript_epoch: output_state.render_epoch(),
+                    scroll_offset: output_state.scroll_offset(),
+                    left_status: None,
+                    pending_count: pending_commands.len(),
+                    pending_lines: &[],
+                    input: "",
+                    cursor: 0,
+                    ghost_index: 0,
+                    dropdown: None,
+                    reverse_search: None,
+                },
+                ssh_prompt::PROMPT_LABEL,
+                &request.prompt,
+                || request.abandoned(),
             )?;
             request.answer(answer);
         }
@@ -1834,6 +1864,7 @@ async fn run() -> Result<()> {
                         web_search: &config.web_search,
                         subagent_depth: config.subagent_depth,
                         subagent_background: config.subagent_background,
+                        ssh: config.ssh,
                         slots: slot_registry.clone(),
                     },
                 )
@@ -1901,6 +1932,7 @@ async fn run() -> Result<()> {
                             web_search: &config.web_search,
                             subagent_depth: config.subagent_depth,
                             subagent_background: config.subagent_background,
+                            ssh: config.ssh,
                             slots: slot_registry.clone(),
                         },
                     )

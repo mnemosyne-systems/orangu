@@ -32,6 +32,33 @@ pub enum McpApprovalMode {
     Deny,
 }
 
+/// `[orangu].ssh`: whether a conversation may log in to other machines.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum SshMode {
+    /// The user approves each host, once per conversation; where nobody can
+    /// be asked, logins are refused.
+    #[default]
+    Prompt,
+    /// No approval is asked. Unknown host keys and typed credentials still
+    /// need someone to answer.
+    Auto,
+    /// The `use_ssh` subagent is not offered.
+    Deny,
+}
+
+impl FromStr for SshMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "prompt" => Ok(Self::Prompt),
+            "auto" => Ok(Self::Auto),
+            "deny" => Ok(Self::Deny),
+            other => Err(format!("expected prompt, auto or deny, not '{other}'")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ClientAppConfiguration {
     pub default_server: String,
@@ -78,6 +105,8 @@ pub struct ClientAppConfiguration {
     /// order, local SearXNG instances first (see [`crate::web_search`]).
     /// Unset means the public engines; empty (`off`) leaves web search out.
     pub web_search: Vec<crate::web_search::Engine>,
+    /// `[orangu].ssh`: whether `use_ssh` is offered, and who approves hosts.
+    pub ssh: SshMode,
 }
 
 /// A configured Model Context Protocol server that is already running and
@@ -300,6 +329,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
     let compile_workers = parse_client_field(&client, "compile_workers", default_compile_workers)?;
     let subagent_depth = parse_client_field(&client, "subagent_depth", default_subagent_depth)?;
     let subagent_background = parse_client_field(&client, "subagent_background", || false)?;
+    let ssh = parse_client_field(&client, "ssh", SshMode::default)?;
     if !(1..=MAX_SUBAGENT_DEPTH).contains(&subagent_depth) {
         return Err(anyhow!(
             "invalid value for [{CLIENT_SECTION}].subagent_depth: {subagent_depth} (1 to {MAX_SUBAGENT_DEPTH})"
@@ -373,6 +403,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         word_wrap,
         theme,
         web_search,
+        ssh,
     })
 }
 
@@ -1072,6 +1103,23 @@ mod tests {
         .unwrap();
         let error = load_client_configuration(file.path()).unwrap_err();
         assert!(error.to_string().contains("unknown key [mcp.bad].command"));
+    }
+
+    #[test]
+    fn parses_the_ssh_mode_with_prompt_by_default() {
+        let parse = |line: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu]\nserver = main\n{line}\n\n[main]\nendpoint = http://localhost:8100/v1\nmodel = model\n"
+            )
+            .unwrap();
+            load_client_configuration(file.path()).map(|conf| conf.ssh)
+        };
+        assert_eq!(parse("").unwrap(), SshMode::Prompt);
+        assert_eq!(parse("ssh = auto").unwrap(), SshMode::Auto);
+        assert_eq!(parse("ssh = deny").unwrap(), SshMode::Deny);
+        assert!(parse("ssh = maybe").is_err());
     }
 
     #[test]

@@ -202,32 +202,59 @@ fn prompt_line(forge: &str, prompt: &str, answer: &str) -> String {
 }
 
 /// Show `request` in the input area, prefixed with `forge`, and read the
-/// answer: Enter submits it, Esc or Ctrl+C cancels the prompt.
+/// answer: Enter submits it, Esc or Ctrl+C cancels the prompt. Ends with `None`
+/// as well once `abandoned` says nobody waits any more.
 pub fn read_answer(
     guard: &mut TerminalUiGuard,
     render: RenderContext<'_>,
     screen: &ScreenState<'_>,
     forge: &str,
     prompt: &str,
+    abandoned: impl Fn() -> bool,
+) -> anyhow::Result<Option<String>> {
+    read_answer_with(
+        |line| {
+            guard.print_prompt_screen(
+                render,
+                ScreenState {
+                    left_status: None,
+                    pending_lines: &[],
+                    input: line,
+                    cursor: line.len(),
+                    ghost_index: 0,
+                    dropdown: None,
+                    reverse_search: None,
+                    ..*screen
+                },
+            );
+        },
+        forge,
+        prompt,
+        abandoned,
+    )
+}
+
+/// How often an open prompt checks whether it is still wanted.
+const PROMPT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// [`read_answer`], drawing each state of the input line with `draw`.
+pub fn read_answer_with(
+    mut draw: impl FnMut(&str),
+    forge: &str,
+    prompt: &str,
+    abandoned: impl Fn() -> bool,
 ) -> anyhow::Result<Option<String>> {
     let mut answer = String::new();
     loop {
         let line = prompt_line(forge, prompt, &answer);
-        guard.print_prompt_screen(
-            render,
-            ScreenState {
-                left_status: None,
-                pending_lines: &[],
-                input: &line,
-                cursor: line.len(),
-                ghost_index: 0,
-                dropdown: None,
-                reverse_search: None,
-                ..*screen
-            },
-        );
+        draw(&line);
         std::io::stdout().flush()?;
 
+        while !event::poll(PROMPT_POLL)? {
+            if abandoned() {
+                return Ok(None);
+            }
+        }
         match event::read()? {
             Event::Key(KeyEvent {
                 code,

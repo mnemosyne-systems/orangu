@@ -96,7 +96,13 @@ const ORANGU_TOOLS: &[&str] = &[
     "web_search",
     "browse",
     "use_skill",
+    "ssh_login",
+    "ssh_copy",
+    "ssh_logout",
 ];
+
+/// The SSH tools, which an agent gets only by naming them in `tools`.
+pub const SSH_TOOLS: &[&str] = &["ssh_login", "ssh_copy", "ssh_logout"];
 
 /// The tools that start subagents, which `Agent` (Claude Code's `Task`)
 /// stands for.
@@ -502,6 +508,11 @@ impl CustomAgent {
 
     /// Whether the agent may use orangu tool `tool`.
     pub fn may_use(&self, tool: &str) -> bool {
+        // These reach other machines, so an agent has to name them: having no
+        // `tools` field, which allows everything else, does not grant them.
+        if SSH_TOOLS.contains(&tool) && self.tools.is_none() {
+            return false;
+        }
         !lists_tool(&self.denied_tools(), tool)
             && self
                 .allowed_tools()

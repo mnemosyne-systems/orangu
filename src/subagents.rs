@@ -60,7 +60,8 @@ pub struct SubagentSpec {
     /// Whether the subagent may search the web (`[orangu].web_search`).
     pub web_search: bool,
     /// Whether the subagent follows the `AGENTS.md` rules the main agent does.
-    /// Off only for the explorer, which searches and never changes anything.
+    /// Off for the explorer, which searches and never changes anything, and
+    /// for the SSH subagent, which only copies files.
     pub project_rules: bool,
     pub system_prompt: &'static str,
     /// Opens the user message; the task follows inside `<task>` tags.
@@ -124,8 +125,40 @@ pub const WEB_RESEARCHER: SubagentSpec = SubagentSpec {
     instruction: "Research the following question on the web:",
 };
 
+/// Offered unless `[orangu].ssh` is `deny`.
+pub const SSH: SubagentSpec = SubagentSpec {
+    tool: "use_ssh",
+    description: "Subagent logs in to a host over SSH, copies files to or from the workspace, or \
+                  logs out, for a self-contained `task`. Never put credentials in it.",
+    argument: "task",
+    role: "code",
+    max_tool_rounds: 24,
+    writable: true,
+    web_search: false,
+    project_rules: false,
+    system_prompt: SSH_SYSTEM_PROMPT,
+    instruction: "Do the following over SSH:",
+};
+
+/// The tools the SSH subagent runs with, and nothing else: with a shell it
+/// could reach any machine without the checks `ssh_login` makes.
+const SSH_SUBAGENT_TOOLS: &[&str] = &["ssh_login", "ssh_copy", "ssh_logout", "list_directory"];
+
 /// Every subagent, in the order their tools are offered.
-pub const SUBAGENTS: &[&SubagentSpec] = &[&EXPLORER, &TEST_WRITER, &DOC_WRITER, &WEB_RESEARCHER];
+pub const SUBAGENTS: &[&SubagentSpec] =
+    &[&EXPLORER, &TEST_WRITER, &DOC_WRITER, &WEB_RESEARCHER, &SSH];
+
+const SSH_SYSTEM_PROMPT: &str = r#"You log in to other machines over SSH and copy files between them and the workspace. You cannot run commands on them.
+
+Rules:
+- ssh_login needs only the host. It takes care of credentials itself and may ask the user. If a task contains a password or passphrase, do not use it or repeat it.
+- ssh_login reuses an open session, so call it first in every task. Use the session name it returns.
+- ssh_copy copies one file per call. Copy several files with several calls; find local ones with list_directory.
+- Replace an existing file only if the task says to: pass overwrite only then. If a copy is refused because the file exists, report that.
+- Stay logged in when you finish, unless the task says to log out.
+- A refused host key or login is a decision or a safeguard. Report the exact reason; do not try another host, user or path to get around it.
+
+End with a `<final_answer>` block saying what was copied, from where to where, the sizes, the session left open if any, and anything not done."#;
 
 const WEB_RESEARCHER_SYSTEM_PROMPT: &str = r#"
 You are a research specialist. Your only goal is to answer the question with facts, looking locally before going to the web.
@@ -536,6 +569,9 @@ pub fn run<'a>(
             .and_then(|v| v.as_str())
             .filter(|task| !task.trim().is_empty())
             .with_context(|| format!("missing or invalid '{}' argument", spec.argument))?;
+        if spec.tool == SSH.tool && parent.ssh().is_none() {
+            anyhow::bail!("SSH is off ([orangu].ssh)");
+        }
         let (tools, additions) = spec_tools(spec, parent);
         let system_prompt = format!("{}{additions}", spec.system_prompt);
         launch(
@@ -671,6 +707,12 @@ pub fn run_custom<'a>(
 /// writers) the workspace's skills; read-only executors attach neither.
 fn spec_tools(spec: &SubagentSpec, parent: &ToolExecutor) -> (ToolExecutor, String) {
     let workspace = parent.workspace();
+    if spec.tool == SSH.tool {
+        let tools = ToolExecutor::new_for_subagent(workspace)
+            .with_ssh_tools(parent.ssh())
+            .with_allowed_tools(SSH_SUBAGENT_TOOLS.iter().map(ToString::to_string).collect());
+        return (tools, String::new());
+    }
     let tools = if spec.writable {
         ToolExecutor::new_for_subagent(workspace).with_subagent_mcp(parent.mcp())
     } else {
@@ -705,6 +747,12 @@ async fn custom_tools(
         ));
     }
     prompt.push_str(&restrictions);
+    if crate::agents::custom::SSH_TOOLS
+        .iter()
+        .any(|tool| agent.may_use(tool))
+    {
+        tools = tools.with_ssh_tools(parent.ssh());
+    }
     // `Agent` in its `tools`: it may start subagents itself, as deep as
     // `[orangu].subagent_depth` levels below the main conversation.
     if let Some(startable) = agent.starts_agents() {
@@ -2279,6 +2327,78 @@ mod mention_tests {
             agent_mentions("@agent-security:scan-researcher: look"),
             ["security:scan-researcher"]
         );
+    }
+
+    /// SSH reaches other machines: an agent with no `tools` field, which
+    /// allows everything else, has to ask for it by name.
+    #[tokio::test]
+    async fn a_custom_agent_gets_the_ssh_tools_only_by_naming_them() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join(".orangu/agents");
+        std::fs::create_dir_all(&directory).unwrap();
+        for (file, tools) in [
+            ("anything.md", ""),
+            ("named.md", "tools: Read, ssh_login, ssh_copy\n"),
+            ("planner.md", "tools: ssh_login\npermissionMode: plan\n"),
+        ] {
+            let name = file.trim_end_matches(".md");
+            std::fs::write(
+                directory.join(file),
+                format!("---\nname: {name}\ndescription: x\n{tools}---\nGo.\n"),
+            )
+            .unwrap();
+        }
+        let parent = ToolExecutor::new(workspace.path())
+            .with_workspace_agents()
+            .with_ssh(crate::ssh::SshSessions::for_mode(
+                crate::config::SshMode::Prompt,
+                None,
+            ));
+        let agents = parent.custom_agents();
+        let offered = async |name: &str| -> Vec<String> {
+            let agent = agents.find(name).unwrap();
+            let (tools, _) = custom_tools(agent, &parent, None).await;
+            tools
+                .definitions()
+                .into_iter()
+                .map(|def| def.function.name)
+                .filter(|name| name.contains("ssh"))
+                .collect()
+        };
+        assert!(offered("anything").await.is_empty());
+        assert_eq!(offered("named").await, ["ssh_login", "ssh_copy"]);
+        assert!(offered("planner").await.is_empty());
+    }
+
+    /// The tools of `use_ssh`, and of a task rebuilt after a restart.
+    #[test]
+    fn the_ssh_subagent_has_no_shell_and_no_skills() {
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = ToolExecutor::new(workspace.path()).with_ssh(
+            crate::ssh::SshSessions::for_mode(crate::config::SshMode::Prompt, None),
+        );
+        let (tools, additions) = spec_tools(&SSH, &parent);
+        let mut names: Vec<String> = tools
+            .definitions()
+            .into_iter()
+            .map(|def| def.function.name)
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["list_directory", "ssh_copy", "ssh_login", "ssh_logout"]
+        );
+        assert!(additions.is_empty(), "{additions}");
+    }
+
+    #[tokio::test]
+    async fn use_ssh_says_so_when_ssh_is_off() {
+        let workspace = tempfile::tempdir().unwrap();
+        let parent = ToolExecutor::new(workspace.path());
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("task".into(), json!("copy a"));
+        let error = parent.execute("use_ssh", &arguments).await.unwrap_err();
+        assert!(error.to_string().contains("[orangu].ssh"), "{error}");
     }
 
     #[test]

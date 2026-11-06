@@ -50,6 +50,7 @@ MCP support currently exposes tools only. Resources and prompts are not exposed;
 | `run_agent` | Have a custom subagent do a task, or list matching ones; offered only when agents are installed | `agent`, `task` |
 | `continue_agent` | Give a finished subagent task a follow-up; it keeps its earlier work. Interactive sessions only | `task`, `message`, optional `background` |
 | `research_web` | Have a subagent answer a question from the workspace or the web, with sources; not offered when `[orangu].web_search` is `off` | `question` |
+| `use_ssh` | Have a subagent log in to a host over SSH, copy files between it and the workspace, or log out; not offered when `[orangu].ssh` is `deny`. See **SSH** | `task` |
 
 `semantic_search` uses the same implementation and embeddings server as `/search`.
 It reuses embeddings for unchanged files and refreshes changed or deleted files
@@ -371,7 +372,7 @@ Behavior:
 ## Subagents
 
 `explore_repository`, `write_tests`, `write_docs`, `write_document`,
-`research_web` and `run_agent` hand one task to a subagent and return only its
+`research_web`, `use_ssh` and `run_agent` hand one task to a subagent and return only its
 answer, so the main conversation's context stays small. Each subagent:
 
 - runs in a fresh conversation with its own system prompt. It never sees the
@@ -382,7 +383,8 @@ answer, so the main conversation's context stays small. Each subagent:
   and the coordinator picks the model; otherwise a section with that `role` is
   used (the first by name), falling back to that connection
 - follows the same `AGENTS.md` rules as the main agent (`~/.orangu/AGENTS.md`
-  and the workspace's), except `explore_repository`, which only searches
+  and the workspace's), except `explore_repository`, which only searches, and
+  `use_ssh`, which only copies files
 - runs at the same time as the other subagents the model starts in the same
   turn, up to four at once; their answers come back in the order the model
   asked for them. Other tools in the turn still run one after another, in
@@ -392,8 +394,8 @@ answer, so the main conversation's context stays small. Each subagent:
 - runs silently: no streaming; `/tasks` shows the tool it is on and the
   tokens it has used
 - shares the main agent's MCP tools (`write_tests`, `write_docs` and custom
-  agents, as their `tools` allow; `explore_repository`, `research_web` and
-  `write_document` get none), except the tools that ask for approval
+  agents, as their `tools` allow; `explore_repository`, `research_web`,
+  `use_ssh` and `write_document` get none), except the tools that ask for approval
   (`approval_mode = prompt`, or `writes` for a tool not marked read-only):
   nobody is there to approve them, so they are not offered
 - can load the installed skills with `use_skill` (`write_tests`, `write_docs`
@@ -410,6 +412,7 @@ answer, so the main conversation's context stays small. Each subagent:
 | `write_docs` | `code` | 8 | read and write; changes only documentation |
 | `write_document` | `code` | 8 | read and write; writes one document |
 | `research_web` | `code` | 10 | read-only; `web_search` and `browse` |
+| `use_ssh` | `code` | 24 | `ssh_login`, `ssh_copy`, `ssh_logout` and `list_directory` only |
 | `run_agent` | by its `model` or `role` | 15 by default | as its `tools` allow |
 
 The writers change the same workspace as the main agent. Their answer lists
@@ -553,7 +556,85 @@ Only subagents get `web_search` and `browse`: `research_web`, and custom
 agents whose `tools` include `WebSearch` or `WebFetch` (or that have no
 `tools` field).
 
-### Custom agents
+### SSH
+
+`use_ssh` hands a task such as "copy dist/app.tar.gz to /srv/app on build" to a
+subagent that can log in to other machines, copy files, and log out. It cannot
+run commands on them, and it has no shell.
+
+Its tools:
+
+| Tool | Purpose | Arguments |
+| :-- | :-- | :-- |
+| `ssh_login` | Open a session, or find the one already open | `host`: an alias from `~/.ssh/config`, or `[user@]host[:port]`, with `[address]:port` for IPv6 |
+| `ssh_copy` | Copy one file | `session`, `direction` (`upload` or `download`), `local`, `remote`, optional `overwrite` |
+| `ssh_logout` | Close a session | `session` |
+
+**Logging in.** No tool takes a credential, so a password or passphrase never
+reaches the model, the transcript or the session files. `ssh_login` tries, in
+order, until one works:
+
+1. The keys in your SSH agent (`SSH_AUTH_SOCK`), those matching the host's
+   `IdentityFile` first, at most four. Not on Windows.
+2. The host's `IdentityFile` entries, or `~/.ssh/id_ed25519`, `id_ecdsa` and
+   `id_rsa`. An encrypted key asks for its passphrase.
+3. A password, if the server offers password login.
+
+A second factor and keyboard-interactive login are not supported: the error
+lists what the server accepts.
+
+**What you are asked.** Questions appear in the input area, hidden while you
+type a secret, and also while the subagent works in the background. Esc cancels
+one, and one left unanswered for two minutes counts as cancelled.
+
+| Question | When |
+| :-- | :-- |
+| Allow this conversation to log in to `user@host:port`? | Once per host per conversation, before connecting, unless `[orangu].ssh` is `auto` |
+| Trust this host key and add it to `known_hosts`? | The host is not in `known_hosts`, or is there with another key type. Shows the fingerprint |
+| Passphrase or password | The login needs one |
+
+`[orangu].ssh` sets the first row:
+
+| Value | Meaning |
+| :-- | :-- |
+| `prompt` | The default. Ask, and refuse where nobody can answer: `orangu -p` and workflow loops |
+| `auto` | Do not ask. Questions from the other rows are still asked where someone can answer; elsewhere an unknown host, an encrypted key or a password login fails |
+| `deny` | `use_ssh` is not offered |
+
+**Host keys** are always checked, whatever `StrictHostKeyChecking` says. A key
+that differs from the one in `known_hosts`, or one marked `@revoked`, is refused
+without asking. Host certificates are not supported. `known_hosts` entries may
+be hashed, and `UserKnownHostsFile` is honoured; wildcard entries are not
+matched, so such a host counts as unknown.
+
+**`~/.ssh/config`.** `Host`, `HostName`, `User`, `Port`, `IdentityFile`,
+`UserKnownHostsFile` and settings before the first `Host` are read. `Include`,
+`Match` and the system-wide configuration are not, so a host can resolve
+differently than with `ssh`; the login result says so when the file uses either.
+A host with `ProxyJump` or `ProxyCommand` is refused rather than connected to
+directly.
+
+**Copying.**
+
+- `local` is confined to the workspace, like every file tool. Once you have
+  allowed a host, copies to it are not asked about, so any workspace file can
+  reach it
+- A relative `remote`, or one starting with `~/`, is relative to the remote home
+- Naming a directory, or ending the path in `/`, keeps the file's name
+- A local parent directory is created when missing; a remote one is not
+- An existing file is replaced only with `overwrite`
+- One file per call. Directories are refused
+- A file is written under a temporary name in the same directory, its size is
+  checked, and only then does it take its name. A failed or cancelled copy
+  leaves the target as it was. Replacing a remote file deletes the old one just
+  before the rename
+- The file's mode comes along, without setuid, setgid or sticky bits
+
+**Sessions** belong to the conversation and outlive the subagent, so a later
+task needs no second login. One closes on `ssh_logout`, after 15 minutes with no
+copy, or when orangu exits. Name the host in the next task to log in again.
+
+## Custom agents
 
 orangu reads custom subagents in the format Claude Code uses, so a collection
 such as
@@ -625,6 +706,10 @@ read-only.
 | `Skill` | `use_skill` |
 | `Agent`, `Task` | the subagent tools: `run_agent`, `explore_repository`, `write_tests`, `write_docs`, `write_document`, `research_web` |
 | `Agent(a, b)` | the built-in subagents it names, and `run_agent` for only the custom agents it names |
+
+`ssh_login`, `ssh_copy` and `ssh_logout` have no Claude Code name, and an agent
+gets them only by listing them in `tools`: an agent without a `tools` field
+does not. A login still asks you what it would ask `use_ssh` (see **SSH**).
 
 orangu's own tool names may be listed too, and MCP tools by their names:
 `mcp__<server>__<tool>` for one tool, `mcp__<server>` for all of a server's
