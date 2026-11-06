@@ -21,7 +21,7 @@
 
 use super::pipeline::{BatchItem, Stage};
 #[cfg(test)]
-use super::protocol::read_message;
+use super::protocol::read_frame;
 use super::protocol::{
     ActivationFormat, Activations, ErrorCode, Forward, ForwardResult, Message, Rows, WorkerError,
 };
@@ -57,9 +57,9 @@ pub struct Loopback(pub Arc<SessionStore>);
 #[cfg(test)]
 impl Exchange for Loopback {
     fn exchange(&self, message: &Message) -> Result<Message> {
-        let request = read_message(&mut message.to_frame(0).as_slice())?;
+        let (_, request, _) = read_frame(&mut message.to_frame(0).as_slice())?;
         let reply = self.0.handle(request);
-        read_message(&mut reply.to_frame(0).as_slice())
+        read_frame(&mut reply.to_frame(0).as_slice()).map(|(_, reply, _)| reply)
     }
 
     fn name(&self) -> String {

@@ -287,6 +287,10 @@ A worker is left out, with a warning naming it and the reason, when it:
 
 The tree then forms without it.
 
+Without a `secret`, anyone who reaches a worker's port can take part, so set
+one on any network you do not fully trust. During the handshake a peer can only
+send frames of up to 1 MiB, and is closed if it sends a larger one.
+
 A worker assigned **another model** than the one it serves switches to the
 lead's: it answers that it is switching, restarts itself on that model —
 found under its `models`, or downloaded — and the lead takes it back at its

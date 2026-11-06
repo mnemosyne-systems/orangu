@@ -97,6 +97,14 @@ pub fn feature_names(features: u64) -> Vec<&'static str> {
 /// letting a corrupt length prefix allocate without bound.
 pub const MAX_FRAME: usize = 1 << 30;
 
+/// The largest frame of a handshake, which is all a peer that has proved
+/// nothing can send. Well above what a large tree's reply takes.
+pub const MAX_HANDSHAKE_FRAME: usize = 1 << 20;
+
+/// The room made for a frame before any of it has arrived. Beyond this it
+/// grows with what is received, so a length alone costs nothing.
+const UP_FRONT: usize = 1 << 20;
+
 /// How deep a tree of workers may be. A loop the path check cannot see —
 /// the same node reached under two spellings of its address — still ends
 /// here rather than recursing until something runs out.
@@ -217,16 +225,24 @@ impl Activations {
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.rows as usize * self.width as usize
-    }
-
     pub fn decode(&self) -> Result<Vec<f32>> {
-        let n = self.len();
-        let expected = match self.format {
-            ActivationFormat::F32 => n * 4,
-            ActivationFormat::F16 => n * 2,
-            ActivationFormat::Q8_0 => n.div_ceil(Q8_BLOCK) * Q8_BLOCK_BYTES,
+        // A peer's sizes: the product can be too large to count.
+        let sizes = (self.rows as usize)
+            .checked_mul(self.width as usize)
+            .and_then(|n| {
+                let bytes = match self.format {
+                    ActivationFormat::F32 => n.checked_mul(4),
+                    ActivationFormat::F16 => n.checked_mul(2),
+                    ActivationFormat::Q8_0 => n.div_ceil(Q8_BLOCK).checked_mul(Q8_BLOCK_BYTES),
+                };
+                Some((n, bytes?))
+            });
+        let Some((n, expected)) = sizes else {
+            bail!(
+                "{} rows × {} are too many activations",
+                self.rows,
+                self.width
+            );
         };
         ensure!(
             self.data.len() == expected,
@@ -1256,14 +1272,18 @@ pub fn write_message<W: Write + ?Sized>(out: &mut W, id: u64, message: &Message)
     Ok(frame.len())
 }
 
-/// Reads one frame, dropping its request id: for the handshake, where
-/// there is only ever one request at a time.
+/// Reads one frame of a handshake, up to [`MAX_HANDSHAKE_FRAME`], dropping its
+/// request id: there is only ever one request at a time.
 pub fn read_message<R: Read + ?Sized>(input: &mut R) -> Result<Message> {
-    read_frame(input).map(|(_, message, _)| message)
+    read_up_to(input, MAX_HANDSHAKE_FRAME).map(|(_, message, _)| message)
 }
 
 /// Reads one frame: its request id, its message, and its size in bytes.
 pub fn read_frame<R: Read + ?Sized>(input: &mut R) -> Result<(u64, Message, usize)> {
+    read_up_to(input, MAX_FRAME)
+}
+
+fn read_up_to<R: Read + ?Sized>(input: &mut R, limit: usize) -> Result<(u64, Message, usize)> {
     let mut len = [0u8; 4];
     input.read_exact(&mut len)?;
     let len = u32::from_le_bytes(len) as usize;
@@ -1272,11 +1292,17 @@ pub fn read_frame<R: Read + ?Sized>(input: &mut R) -> Result<(u64, Message, usiz
         "a {len} byte frame is too short to hold a type and an id"
     );
     ensure!(
-        len <= MAX_FRAME,
-        "a {len} byte frame is larger than the {MAX_FRAME} byte limit"
+        len <= limit,
+        "a {len} byte frame is larger than the {limit} byte limit"
     );
-    let mut body = vec![0u8; len];
+    // Doubled as it arrives, so the room never passes twice what was sent.
+    let mut body = vec![0u8; len.min(UP_FRONT)];
     input.read_exact(&mut body)?;
+    while body.len() < len {
+        let filled = body.len();
+        body.resize(len.min(filled * 2), 0);
+        input.read_exact(&mut body[filled..])?;
+    }
     let id = u64::from_le_bytes(body[1..9].try_into()?);
     Ok((id, Message::decode(body[0], &body[9..])?, len + 4))
 }
@@ -1525,6 +1551,206 @@ mod tests {
         assert!(err.to_string().contains("larger than"), "{err:#}");
         let empty = 0u32.to_le_bytes();
         assert!(read_message(&mut empty.as_slice()).is_err());
+    }
+
+    #[test]
+    fn a_frame_too_large_for_a_handshake_is_refused_before_reading_it() {
+        let mut frame = ((MAX_HANDSHAKE_FRAME + 1) as u32).to_le_bytes().to_vec();
+        frame.extend_from_slice(&[0; 64]);
+        let err = read_message(&mut frame.as_slice()).unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err:#}");
+    }
+
+    /// What a parent of a large tree hears has to fit in what it accepts.
+    #[test]
+    fn the_handshake_of_a_large_tree_fits_its_limit() {
+        let name = "a-rather-long-host-name.example.org:8400".to_string();
+        let device = Device {
+            kind: "vulkan".to_string(),
+            name: name.clone(),
+            cores: 12,
+            memory_bytes: 1 << 35,
+            in_use: true,
+        };
+        let setup = NodeSetup {
+            name: name.clone(),
+            devices: vec![device; 8],
+            decode_rate: 1.0,
+            prompt_rate: 1.0,
+            decode_fixed_ms: 1.0,
+            prompt_fixed_ms: 1.0,
+        };
+        let ack = Message::HelloAck(HelloAck {
+            version: PROTOCOL_VERSION,
+            features: FEATURES,
+            nonce: [1; 32],
+            proof: [2; 32],
+            node: name.clone(),
+            subtree: vec![name; 256],
+            capacity: Capacity {
+                setups: vec![setup; 256],
+                ..Capacity::default()
+            },
+            model: Some(identity()),
+        });
+        let frame = ack.to_frame(0);
+        assert!(frame.len() < MAX_HANDSHAKE_FRAME, "{} bytes", frame.len());
+        assert_eq!(read_message(&mut frame.as_slice()).unwrap(), ack);
+    }
+
+    /// Hands over `left` bytes and then ends, noting the widest buffer it was
+    /// given to fill: what the reader had to have in memory at that point.
+    struct Stingy {
+        head: Vec<u8>,
+        left: usize,
+        widest: usize,
+    }
+
+    impl Read for Stingy {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.head.is_empty() {
+                let n = self.head.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.head[..n]);
+                self.head.drain(..n);
+                return Ok(n);
+            }
+            self.widest = self.widest.max(buf.len());
+            let n = self.left.min(buf.len());
+            buf[..n].fill(0);
+            self.left -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_claimed_length_costs_only_what_is_sent() {
+        for sent in [0, 1000, UP_FRONT, 3 * UP_FRONT] {
+            let mut peer = Stingy {
+                head: (MAX_FRAME as u32).to_le_bytes().to_vec(),
+                left: sent,
+                widest: 0,
+            };
+            let err = read_frame(&mut peer).unwrap_err();
+            let io = err.downcast_ref::<std::io::Error>().expect("an I/O error");
+            assert_eq!(io.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert!(
+                peer.widest <= sent.max(UP_FRONT),
+                "{sent} bytes sent, room made for {}",
+                peer.widest
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_arrives_whole_at_any_size() {
+        for len in [
+            0,
+            1,
+            UP_FRONT - 10,
+            UP_FRONT - 9,
+            UP_FRONT - 8,
+            UP_FRONT,
+            2 * UP_FRONT - 9,
+            2 * UP_FRONT,
+            5 * UP_FRONT + 3,
+        ] {
+            let data = (0..len).map(|i| (i % 251) as u8).collect();
+            round_trip(Message::Echo { data });
+        }
+    }
+
+    /// Sizes past `wraps_at` values whose bytes, in `bytes_for`, wrap around to
+    /// a small number that a frame could really hold.
+    fn wrapping_sizes(wraps_at: u64, bytes_for: impl Fn(u64) -> u64) -> (u32, u32, usize) {
+        for rows in wraps_at.isqrt()..=u64::from(u32::MAX) {
+            let width = wraps_at.div_ceil(rows);
+            let wrapped = bytes_for(rows.wrapping_mul(width));
+            if width <= u64::from(u32::MAX) && wrapped < 1 << 16 {
+                return (rows as u32, width as u32, wrapped as usize);
+            }
+        }
+        panic!("no such sizes");
+    }
+
+    #[test]
+    fn sizes_that_wrap_around_are_refused() {
+        let formats: [(ActivationFormat, u64, fn(u64) -> u64); 3] = [
+            (ActivationFormat::F32, 1 << 62, |n| n.wrapping_mul(4)),
+            (ActivationFormat::F16, 1 << 63, |n| n.wrapping_mul(2)),
+            (
+                ActivationFormat::Q8_0,
+                u64::MAX / Q8_BLOCK_BYTES as u64 * Q8_BLOCK as u64,
+                |n| {
+                    n.div_ceil(Q8_BLOCK as u64)
+                        .wrapping_mul(Q8_BLOCK_BYTES as u64)
+                },
+            ),
+        ];
+        for (format, wraps_at, bytes_for) in formats {
+            let (rows, width, len) = wrapping_sizes(wraps_at, bytes_for);
+            let a = Activations {
+                format,
+                rows,
+                width,
+                data: vec![0; len],
+            };
+            let err = a.decode().unwrap_err();
+            assert!(err.to_string().contains("too many"), "{err:#}");
+        }
+    }
+
+    /// Whatever arrives is an error or a message, never a panic.
+    #[test]
+    fn a_damaged_frame_does_not_panic() {
+        let messages = [
+            Message::Hello(Hello {
+                version: PROTOCOL_VERSION,
+                features: FEATURES,
+                nonce: [3; 32],
+                path: vec!["root:8400".to_string()],
+            }),
+            Message::Auth { proof: [1; 32] },
+            Message::Forward(forward()),
+            Message::ForwardBatch(vec![forward(), forward()]),
+            Message::ForwardResult(result()),
+            Message::ForwardBatchResult(vec![Ok(result()), Err(error())]),
+            Message::AssignAck {
+                identity: identity(),
+                plan: vec![PlanEntry {
+                    node: "a".to_string(),
+                    layer_start: 0,
+                    layer_end: 4,
+                }],
+            },
+            Message::LayerRows {
+                kv_dim: 2,
+                len: 1,
+                data: vec![0; 16],
+            },
+            Message::Error(error()),
+        ];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for message in messages {
+            let (tag, payload) = message.encode();
+            for _ in 0..2_000 {
+                let mut damaged = payload.clone();
+                for _ in 0..1 + next() % 4 {
+                    let at = next() % damaged.len();
+                    damaged[at] = [0, 0xff, next() as u8][next() % 3];
+                }
+                damaged.truncate(next() % (damaged.len() + 1));
+                if let Ok(Message::Forward(f)) = Message::decode(tag, &damaged) {
+                    let _ = f.hidden.decode();
+                }
+                let _ = Message::decode(next() as u8, &damaged);
+            }
+        }
     }
 
     /// A corrupt count must fail on the bytes present, not allocate for
