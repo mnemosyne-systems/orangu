@@ -4241,7 +4241,7 @@ mod tests {
                         }
                         if matches!(message, Message::Forward(_) | Message::ForwardBatch(_))
                             && left
-                                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                                     n.checked_sub(1)
                                 })
                                 .is_ok()

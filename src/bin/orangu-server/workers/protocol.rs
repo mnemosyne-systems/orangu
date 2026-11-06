@@ -1674,7 +1674,8 @@ mod tests {
 
     #[test]
     fn sizes_that_wrap_around_are_refused() {
-        let formats: [(ActivationFormat, u64, fn(u64) -> u64); 3] = [
+        type Format = (ActivationFormat, u64, fn(u64) -> u64);
+        let formats: [Format; 3] = [
             (ActivationFormat::F32, 1 << 62, |n| n.wrapping_mul(4)),
             (ActivationFormat::F16, 1 << 63, |n| n.wrapping_mul(2)),
             (
