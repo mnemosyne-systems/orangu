@@ -244,7 +244,12 @@ weak top-level node the model's largest read.
 Once requests have run, a lead plans by the speed each node really showed —
 its layers over its time a token — and plans again between requests when a
 node runs more than 20% off what it was planned at; `/v1/workers` shows
-both (`observed_gb_per_s`, `planned_gb_per_s`).
+both (`observed_gb_per_s`, `planned_gb_per_s`). A new plan has to save more
+than 5% of a decode step or of the slowest stage. Otherwise the plan stays, with
+its conversations, because a worker given other layers has to build and warm
+them, which takes a request behind it about a minute on a board with a large
+model. Workers of about the same speed stay in the order they are in, and start
+in the configured order, so restarting the top-level node does not move layers.
 
 The decisions weigh the links too. A parent times each worker's link when
 it connects — its round trip and bandwidth — so a fast machine on a slow

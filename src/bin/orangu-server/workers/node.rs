@@ -83,6 +83,11 @@ const QUIET: Duration = Duration::from_secs(2);
 /// by the speeds they showed (`Node::calibration_due`).
 const CALIBRATE_TOKENS: usize = 32;
 
+/// The share of a decode step, or of the slowest stage, that moving layers has
+/// to save. A worker given other layers has to build and warm them, a minute on
+/// a board with a large model, and every conversation is rebuilt.
+const WORTH_MOVING: f64 = 0.05;
+
 /// Prompt tokens a request needs before its prompt counts toward the
 /// tree's prompt speed: fewer weigh the fixed costs of a forward too much.
 const SEEN_PROMPT_TOKENS: usize = 64;
@@ -860,7 +865,9 @@ impl Node {
     /// starts at the last cut — so which worker that is depends on the
     /// order. Every order of up to six workers is tried, of more the
     /// configured one and both by speed. The configured order when a worker
-    /// did not measure its speed, or shares follow memory.
+    /// did not measure its speed, or shares follow memory. An order saving
+    /// less than [`WORTH_MOVING`] loses to the plan's, or at the first plan to
+    /// the configured one, so that a restart does not move layers either.
     fn best_order(
         &self,
         range: &Range<usize>,
@@ -890,10 +897,24 @@ impl Node {
                     .map(|(share, i)| bytes(share) / rates[*i])
                     .sum::<f64>()
         };
-        plan::best_order(&rates, &cost)
-            .into_iter()
-            .map(|i| candidates[i].clone())
-            .collect()
+        let best = plan::best_order(&rates, &cost);
+        // The order the plan has, unless another saves enough to pay for moving
+        // layers: two workers of about the same speed stay where they are.
+        let used = self.used.lock().unwrap();
+        let position = |i: &usize| {
+            used.iter()
+                .position(|u| *u == candidates[*i].0.addr)
+                .unwrap_or(usize::MAX)
+        };
+        let mut current: Vec<usize> = (0..candidates.len()).collect();
+        current.sort_by_key(position);
+        drop(used);
+        let order = if cost(&best) < cost(&current) * (1.0 - WORTH_MOVING) {
+            best
+        } else {
+            current
+        };
+        order.into_iter().map(|i| candidates[i].clone()).collect()
     }
 
     /// The speed a share over `setups` — a node, or a worker and every node
@@ -920,6 +941,133 @@ impl Node {
             return 0.0;
         }
         setups.iter().map(rate).sum()
+    }
+
+    /// What this node has for layers. The top-level node also holds the
+    /// embedding and the output head, which no layer range counts: its budget
+    /// for layers is what they leave.
+    fn own_budget(&self, top: bool) -> u64 {
+        if top {
+            self.settings
+                .capacity
+                .budget_bytes
+                .saturating_sub(self.non_layer_bytes)
+        } else {
+            self.settings.capacity.budget_bytes
+        }
+    }
+
+    /// A top-level plan goes by the speeds requests found once every node has
+    /// one — a measurement at start can misjudge a model whose steps read
+    /// different weights each token (a mixture's experts) — and remembers what
+    /// it went by.
+    fn note_rates(&self, candidates: &[(Arc<ChildLink>, ChildInfo)]) {
+        let observed = self.observed.lock().unwrap();
+        let mut names = vec![self.settings.name.clone()];
+        names.extend(
+            candidates
+                .iter()
+                .filter_map(|(_, info)| info.capacity.setups.first().map(|s| s.name.clone())),
+        );
+        *self.observed_now.lock().unwrap() = names
+            .iter()
+            .all(|name| observed.contains_key(name))
+            .then(|| names.iter().map(|n| (n.clone(), observed[n].0)).collect());
+        drop(observed);
+        let mut planned = HashMap::new();
+        planned.insert(
+            self.settings.name.clone(),
+            self.rate(&self.settings.capacity.setups[..1]),
+        );
+        for (_, info) in candidates {
+            if let Some(first) = info.capacity.setups.first() {
+                planned.insert(first.name.clone(), self.rate(&info.capacity.setups));
+            }
+        }
+        *self.planned_rates.lock().unwrap() = planned;
+        self.observed_since_plan.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the plan stands though the speeds requests found differ from
+    /// what it was made by: the plan they call for saves too little of a decode
+    /// step and of the slowest stage to pay for moving layers. Those speeds are
+    /// then the ones it goes by. Plans again whenever a worker it does not use
+    /// is there to take a share, or a standby stands in.
+    fn plan_is_good_enough(&self) -> bool {
+        let _planning = self.planning.lock().unwrap();
+        let used = self.used.lock().unwrap().clone();
+        if used.is_empty() || !self.standing_in.lock().unwrap().is_empty() {
+            return false;
+        }
+        let mut candidates = Vec::new();
+        for link in &self.links {
+            match link.info() {
+                Some(_) if !used.contains(&link.addr) => return false,
+                Some(info) => candidates.push((link.clone(), info)),
+                None if used.contains(&link.addr) => return false,
+                None => {}
+            }
+        }
+        if candidates.len() != used.len() {
+            return false;
+        }
+        candidates.sort_by_key(|(link, _)| used.iter().position(|u| *u == link.addr));
+        let entries = self.plan();
+        let range = 0..self.model.config().n_layer;
+        let own_budget = self.own_budget(true);
+        self.note_rates(&candidates);
+
+        // What a plan costs: a decode step through every stage, and its slowest.
+        let own = self.rate(&self.settings.capacity.setups[..1]);
+        let costs = |local: &Range<usize>,
+                     shares: &[Range<usize>],
+                     nodes: &[(Arc<ChildLink>, ChildInfo)]| {
+            let mut times = vec![plan::bytes_of(local, &self.layer_bytes) as f64 / own];
+            for (share, (_, info)) in shares.iter().zip(nodes) {
+                times.push(
+                    plan::bytes_of(share, &self.layer_bytes) as f64
+                        / self.rate(&info.capacity.setups),
+                );
+            }
+            (
+                times.iter().sum::<f64>(),
+                times.iter().fold(0.0f64, |a, b| a.max(*b)),
+            )
+        };
+        if own <= 0.0
+            || candidates
+                .iter()
+                .any(|(_, info)| self.rate(&info.capacity.setups) <= 0.0)
+        {
+            return false;
+        }
+        let local_now = entries
+            .iter()
+            .find(|e| e.node == self.settings.name)
+            .map_or(0..0, |e| e.layer_start as usize..e.layer_end as usize);
+        let mut shares_now = Vec::new();
+        for (_, info) in &candidates {
+            let below = |e: &&PlanEntry| info.capacity.setups.iter().any(|s| s.name == e.node);
+            let start = entries.iter().filter(below).map(|e| e.layer_start).min();
+            let end = entries.iter().filter(below).map(|e| e.layer_end).max();
+            let (Some(start), Some(end)) = (start, end) else {
+                return false;
+            };
+            shares_now.push(start as usize..end as usize);
+        }
+        let now = costs(&local_now, &shares_now, &candidates);
+
+        let proposed = self.best_order(&range, own_budget, candidates);
+        let (local, shares, _) = self.cut(&range, own_budget, &proposed);
+        if self
+            .not_worth_offloading(&range, &local, &shares, &proposed)
+            .is_some()
+        {
+            return false;
+        }
+        let then = costs(&local, &shares, &proposed);
+        let saves = |now: f64, then: f64| then < now * (1.0 - WORTH_MOVING);
+        !saves(now.0, then.0) && !saves(now.1, then.1)
     }
 
     /// Plans `range` over this node and its workers, reached with `path` (the
@@ -999,47 +1147,10 @@ impl Node {
             }
             false
         });
-        // The top-level node also holds the embedding and the output head,
-        // which no layer range counts: its budget for layers is what they
-        // leave.
         let top = path.len() == 1;
-        let own_budget = if top {
-            self.settings
-                .capacity
-                .budget_bytes
-                .saturating_sub(self.non_layer_bytes)
-        } else {
-            self.settings.capacity.budget_bytes
-        };
-        // A top-level plan goes by the speeds requests found once every
-        // node has one — a measurement at start can misjudge a model whose
-        // steps read different weights each token (a mixture's experts) —
-        // and remembers what it went by.
-        if path.len() == 1 {
-            let observed = self.observed.lock().unwrap();
-            let mut names = vec![self.settings.name.clone()];
-            names.extend(
-                candidates
-                    .iter()
-                    .filter_map(|(_, info)| info.capacity.setups.first().map(|s| s.name.clone())),
-            );
-            *self.observed_now.lock().unwrap() = names
-                .iter()
-                .all(|name| observed.contains_key(name))
-                .then(|| names.iter().map(|n| (n.clone(), observed[n].0)).collect());
-            drop(observed);
-            let mut planned = HashMap::new();
-            planned.insert(
-                self.settings.name.clone(),
-                self.rate(&self.settings.capacity.setups[..1]),
-            );
-            for (_, info) in &candidates {
-                if let Some(first) = info.capacity.setups.first() {
-                    planned.insert(first.name.clone(), self.rate(&info.capacity.setups));
-                }
-            }
-            *self.planned_rates.lock().unwrap() = planned;
-            self.observed_since_plan.store(0, Ordering::Relaxed);
+        let own_budget = self.own_budget(top);
+        if top {
+            self.note_rates(&candidates);
         }
         candidates = self.best_order(&range, own_budget, candidates);
         loop {
@@ -2471,6 +2582,13 @@ impl Node {
             self.observed_since_plan.store(0, Ordering::Relaxed);
             return None;
         }
+        if self.plan_is_good_enough() {
+            log::info!(
+                "orangu-server: workers: keeping the plan, another would save too little: {}",
+                off.join(", ")
+            );
+            return None;
+        }
         Some(off.join(", "))
     }
 
@@ -3321,6 +3439,112 @@ mod tests {
         assert!(top.calibration_due().is_none(), "planned by what was found");
         top.stop();
         a.stop();
+    }
+
+    /// Two workers about as fast as each other, one a little ahead: moving the
+    /// layers over would save almost nothing, and costs a minute on a board.
+    /// The speeds are off from the plan, but it stays and nothing is assigned.
+    #[test]
+    fn a_plan_stays_when_another_would_save_too_little() {
+        let with_rate = |name: &str, workers: Vec<String>, rate: f32| {
+            let mut s = settings(name, workers, None);
+            s.shares = Shares::Decode;
+            s.decode = DecodeOn::Tree;
+            s.capacity.setups = vec![NodeSetup {
+                name: name.to_string(),
+                decode_rate: rate,
+                prompt_rate: rate,
+                ..NodeSetup::default()
+            }];
+            node_with(s, Variant::default())
+        };
+        let a = with_rate("a", vec![], 2.0);
+        let b = with_rate("b", vec![], 1.0);
+        let (at_a, at_b) = (
+            a.local_addr().unwrap().to_string(),
+            b.local_addr().unwrap().to_string(),
+        );
+        let top = with_rate("top", vec![at_a.clone(), at_b.clone()], 1.0);
+        let _model = top.delegating_model().unwrap();
+        let plan = describe(&top.plan());
+        let layers = |n: &str| -> u64 {
+            top.plan()
+                .iter()
+                .filter(|e| e.node == n)
+                .map(|e| u64::from(e.layer_end - e.layer_start))
+                .sum()
+        };
+        assert_eq!((layers("a"), layers("b")), (2, 1), "{plan}");
+        let plans = top.metrics.plans.load(Ordering::Relaxed);
+        let plans_at_a = a.metrics.plans.load(Ordering::Relaxed);
+        let generation = top.top.read().unwrap().1;
+        // Per layer, `b` now runs just ahead of `a`: over twice what it was
+        // planned at, enough for a look, and a hair better placed with more.
+        top.observed_decode(
+            &[
+                (
+                    "top".to_string(),
+                    Duration::from_micros(10_000 * layers("top")),
+                ),
+                (at_a, Duration::from_micros(5_000 * layers("a"))),
+                (at_b, Duration::from_micros(4_900 * layers("b"))),
+            ],
+            40,
+        );
+        assert_eq!(top.calibration_due(), None, "{plan}");
+        assert_eq!(describe(&top.plan()), plan);
+        assert_eq!(top.metrics.plans.load(Ordering::Relaxed), plans);
+        assert_eq!(a.metrics.plans.load(Ordering::Relaxed), plans_at_a);
+        assert_eq!(top.top.read().unwrap().1, generation, "sessions are kept");
+        // It went by what was found, so it does not look again for the same.
+        top.observed_since_plan
+            .store(CALIBRATE_TOKENS, Ordering::Relaxed);
+        assert_eq!(top.calibration_due(), None);
+        // A plan for another reason leaves them in the same order, though `b`
+        // is ahead now and the shares follow the speeds.
+        top.plan_top();
+        let entries = top.plan();
+        let start = |n: &str| entries.iter().find(|e| e.node == n).unwrap().layer_start;
+        assert!(start("a") < start("b"), "{}", describe(&entries));
+        top.stop();
+        a.stop();
+        b.stop();
+    }
+
+    /// Workers as fast as each other stay in the order the plan has them, not
+    /// the configured one: going back to it would move every layer they hold.
+    #[test]
+    fn a_new_plan_leaves_equal_workers_where_they_are() {
+        let with_rate = |name: &str, workers: Vec<String>| {
+            let mut s = settings(name, workers, None);
+            s.shares = Shares::Decode;
+            s.decode = DecodeOn::Tree;
+            s.capacity.setups = vec![NodeSetup {
+                name: name.to_string(),
+                decode_rate: 1.0,
+                prompt_rate: 1.0,
+                ..NodeSetup::default()
+            }];
+            node_with(s, Variant::default())
+        };
+        let a = with_rate("a", vec![]);
+        let b = with_rate("b", vec![]);
+        let (at_a, at_b) = (
+            a.local_addr().unwrap().to_string(),
+            b.local_addr().unwrap().to_string(),
+        );
+        let top = with_rate("top", vec![at_a.clone(), at_b.clone()]);
+        let start = |n: &str| {
+            let plan = top.plan();
+            plan.iter().find(|e| e.node == n).unwrap().layer_start
+        };
+        assert!(start("a") < start("b"), "{}", describe(&top.plan()));
+        *top.used.lock().unwrap() = vec![at_b, at_a];
+        top.plan_top();
+        assert!(start("b") < start("a"), "{}", describe(&top.plan()));
+        top.stop();
+        a.stop();
+        b.stop();
     }
 
     /// A node that holds the model and would run it faster alone serves
