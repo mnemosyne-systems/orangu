@@ -42,8 +42,29 @@ use tokio_rustls::rustls;
 pub struct Split {
     pub reader: Box<dyn Read + Send>,
     pub writer: Box<dyn Write + Send>,
-    /// The socket under both, to shut down.
-    pub tcp: TcpStream,
+    /// The socket under both, to shut down and to set timeouts on.
+    pub tcp: Arc<TcpStream>,
+}
+
+/// One handle on a socket, shared by the threads using it. Never a
+/// [`TcpStream::try_clone`] for reading or writing: on Windows a timeout set on
+/// one handle does not reach a read or write on its duplicate.
+struct Socket(Arc<TcpStream>);
+
+impl Read for Socket {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        (&*self.0).read(buf)
+    }
+}
+
+impl Write for Socket {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        (&*self.0).flush()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -105,13 +126,13 @@ pub fn client(tls: Option<&Tls>, tcp: TcpStream, addr: &str) -> Result<Split> {
     match tls.and_then(|t| t.client.clone()) {
         Some(config) => {
             let mut connection = rustls::ClientConnection::new(config, server_name(addr)?)?;
-            let mut io = tcp.try_clone()?;
+            let mut io = &tcp;
             while connection.is_handshaking() {
                 connection.complete_io(&mut io)?;
             }
-            split_tls(rustls::Connection::Client(connection), tcp)
+            Ok(split_tls(rustls::Connection::Client(connection), tcp))
         }
-        None => split_plain(tcp),
+        None => Ok(split_plain(tcp)),
     }
 }
 
@@ -120,46 +141,48 @@ pub fn server(tls: Option<&Tls>, tcp: TcpStream) -> Result<Split> {
     match tls.and_then(|t| t.server.clone()) {
         Some(config) => {
             let mut connection = rustls::ServerConnection::new(config)?;
-            let mut io = tcp.try_clone()?;
+            let mut io = &tcp;
             while connection.is_handshaking() {
                 connection.complete_io(&mut io)?;
             }
-            split_tls(rustls::Connection::Server(connection), tcp)
+            Ok(split_tls(rustls::Connection::Server(connection), tcp))
         }
-        None => split_plain(tcp),
+        None => Ok(split_plain(tcp)),
     }
 }
 
-fn split_plain(tcp: TcpStream) -> Result<Split> {
-    Ok(Split {
-        reader: Box::new(tcp.try_clone()?),
-        writer: Box::new(tcp.try_clone()?),
+fn split_plain(tcp: TcpStream) -> Split {
+    let tcp = Arc::new(tcp);
+    Split {
+        reader: Box::new(Socket(tcp.clone())),
+        writer: Box::new(Socket(tcp.clone())),
         tcp,
-    })
+    }
 }
 
 /// TLS split in two around one shared session: the reader takes the lock
 /// only to decrypt what it has already read off the socket, never while it
 /// waits for more, so a writer is never held up by a read with nothing to
 /// read.
-fn split_tls(connection: rustls::Connection, tcp: TcpStream) -> Result<Split> {
+fn split_tls(connection: rustls::Connection, tcp: TcpStream) -> Split {
+    let tcp = Arc::new(tcp);
     let session = Arc::new(Mutex::new(connection));
-    let out = Arc::new(Mutex::new(tcp.try_clone()?));
-    Ok(Split {
+    let out = Arc::new(Mutex::new(Socket(tcp.clone())));
+    Split {
         reader: Box::new(TlsReader {
             session: session.clone(),
-            socket: tcp.try_clone()?,
+            socket: Socket(tcp.clone()),
             out: out.clone(),
         }),
         writer: Box::new(TlsWriter { session, out }),
         tcp,
-    })
+    }
 }
 
 /// Sends whatever the session has to send: application data after a
 /// write, and after a read any alert or key update the protocol answers
 /// with.
-fn flush_tls(session: &mut rustls::Connection, out: &Mutex<TcpStream>) -> io::Result<()> {
+fn flush_tls(session: &mut rustls::Connection, out: &Mutex<Socket>) -> io::Result<()> {
     let mut out = out.lock().unwrap();
     while session.wants_write() {
         session.write_tls(&mut *out)?;
@@ -169,8 +192,8 @@ fn flush_tls(session: &mut rustls::Connection, out: &Mutex<TcpStream>) -> io::Re
 
 struct TlsReader {
     session: Arc<Mutex<rustls::Connection>>,
-    socket: TcpStream,
-    out: Arc<Mutex<TcpStream>>,
+    socket: Socket,
+    out: Arc<Mutex<Socket>>,
 }
 
 impl Read for TlsReader {
@@ -204,7 +227,7 @@ impl Read for TlsReader {
 
 struct TlsWriter {
     session: Arc<Mutex<rustls::Connection>>,
-    out: Arc<Mutex<TcpStream>>,
+    out: Arc<Mutex<Socket>>,
 }
 
 /// Plaintext handed to the session at a time: one TLS record's worth. The
@@ -278,6 +301,60 @@ pub(crate) mod fixture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    fn connected() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ours = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (theirs, _) = listener.accept().unwrap();
+        (ours, theirs)
+    }
+
+    /// A worker shortens its read timeout once the handshake is done. Should
+    /// that not reach the reader, this read lasts until the other side closes,
+    /// and ends without an error.
+    #[test]
+    fn a_read_timeout_set_after_the_split_is_shorter_at_the_reader() {
+        let (ours, theirs) = connected();
+        ours.set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut split = split_plain(ours);
+        split
+            .tcp
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(5));
+            drop(theirs);
+        });
+        let error = split.reader.read(&mut [0; 1]).unwrap_err();
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "{error}"
+        );
+    }
+
+    /// A parent lifts its read timeout once the handshake is done, and a
+    /// reply may then take as long as it takes.
+    #[test]
+    fn a_read_timeout_lifted_after_the_split_is_gone_at_the_reader() {
+        let (ours, mut theirs) = connected();
+        ours.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut split = split_plain(ours);
+        split.tcp.set_read_timeout(None).unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            theirs.write_all(&[7]).unwrap();
+        });
+        let mut byte = [0; 1];
+        assert_eq!(split.reader.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, [7]);
+    }
 
     #[test]
     fn the_server_name_is_the_dialed_host() {

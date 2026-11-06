@@ -207,7 +207,7 @@ type Answer = Result<(Message, usize), WorkerError>;
 /// wait in `pending` for the reader thread to hand them their answer.
 struct Connection {
     writer: Mutex<Box<dyn Write + Send>>,
-    tcp: TcpStream,
+    tcp: Arc<TcpStream>,
     pending: Mutex<HashMap<u64, SyncSender<Answer>>>,
     next_id: AtomicU64,
     dead: AtomicBool,

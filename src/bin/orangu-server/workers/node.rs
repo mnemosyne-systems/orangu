@@ -2171,9 +2171,7 @@ impl Node {
         let silence = self.settings.parent_silence;
         let _ = split.tcp.set_read_timeout(Some(silence));
         let _ = split.tcp.set_write_timeout(Some(silence));
-        let Ok(tcp) = split.tcp.try_clone().map(Arc::new) else {
-            return;
-        };
+        let tcp = split.tcp.clone();
         let writer = Arc::new(Mutex::new(writer));
         let answer = |writer: &Mutex<Box<dyn Write + Send>>, id: u64, reply: &Message| {
             let mut writer = writer.lock().unwrap();
