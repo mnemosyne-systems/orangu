@@ -105,6 +105,29 @@ impl Server {
         )
         .unwrap();
 
+        let (child, port) = (0..5)
+            .find_map(|_| Self::listen(root, &host_key))
+            .expect("sshd did not start");
+        let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        let server = Self {
+            child,
+            directory,
+            port,
+            user,
+            workspace: tempfile::tempdir().unwrap(),
+        };
+        server.trust_host_key();
+        Some(server)
+    }
+
+    /// An `sshd` on a free port, heard to answer as one. `None` when it could
+    /// not have the port: nothing holds it between finding it and `sshd`
+    /// binding it, and another test may take it, which would answer a dial.
+    fn listen(root: &Path, host_key: &Path) -> Option<(Child, u16)> {
+        use std::io::Read;
         let port = std::net::TcpListener::bind(("127.0.0.1", 0))
             .unwrap()
             .local_addr()
@@ -124,7 +147,7 @@ impl Server {
             ),
         )
         .unwrap();
-        let child = Command::new(SSHD)
+        let mut child = Command::new(SSHD)
             .arg("-D")
             .arg("-e")
             .arg("-f")
@@ -135,23 +158,24 @@ impl Server {
             .spawn()
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "sshd did not start");
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return None;
+            }
+            if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut banner = [0; 4];
+                if stream.read_exact(&mut banner).is_ok() && &banner == b"SSH-" {
+                    return Some((child, port));
+                }
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
-            .unwrap()
-            .trim()
-            .to_string();
-        let server = Self {
-            child,
-            directory,
-            port,
-            user,
-            workspace: tempfile::tempdir().unwrap(),
-        };
-        server.trust_host_key();
-        Some(server)
+        let _ = child.kill();
+        let _ = child.wait();
+        None
     }
 
     fn keygen(path: &Path, kind: &str, passphrase: &str) {
@@ -909,10 +933,15 @@ async fn the_subagent_logs_in_and_copies() {
     arguments.insert("task".into(), json!("copy a.txt"));
     let report = parent.execute("use_ssh", &arguments).await.unwrap();
     assert!(report.contains("copied a.txt"), "{report}");
-    assert_eq!(std::fs::read(server.remote("a.txt")).unwrap(), b"payload");
+    let requests = served.join().unwrap();
+    assert_eq!(
+        std::fs::read(server.remote("a.txt")).ok().as_deref(),
+        Some(&b"payload"[..]),
+        "what ssh_copy told the model: {}",
+        requests[2]
+    );
     assert!(!server.local("hacked").exists());
 
-    let requests = served.join().unwrap();
     let offered: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
     let mut names: Vec<&str> = offered["tools"]
         .as_array()

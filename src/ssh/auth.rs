@@ -29,6 +29,7 @@ use std::sync::Arc;
 const PROMPT_ATTEMPTS: usize = 3;
 /// How many of an agent's keys are offered: a server cuts a client off after
 /// a few failures (6 by default), and key files and passwords come after.
+#[cfg(unix)]
 const MAX_AGENT_KEYS: usize = 4;
 
 /// What the next method needs to know from the last failure.

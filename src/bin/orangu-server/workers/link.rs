@@ -864,12 +864,16 @@ mod tests {
                 data: vec![1; 1 << 10],
             }
             .to_frame(id);
-            for piece in frame.chunks(frame.len() / 10) {
+            for piece in frame.chunks(frame.len() / 6) {
                 writer.write_all(piece).unwrap();
-                std::thread::sleep(SHORT / 2);
+                std::thread::sleep(SHORT);
             }
         });
-        let link = link_to(addr);
+        let mut link = ChildLink::new(addr, PATIENT, Duration::from_secs(2));
+        // A gap well inside the silence, so a stalled machine does not end the
+        // link, and a frame longer than it.
+        link.silence = 4 * SHORT;
+        link.connect(None, &["top".to_string()]).unwrap();
         assert!(matches!(
             link.request(&truncate()),
             Ok(Message::Echo { .. })

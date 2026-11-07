@@ -179,12 +179,16 @@ async fn upload(
         ));
     }
 
-    let mut attributes = FileAttributes::empty();
     #[cfg(unix)]
-    {
+    let attributes = {
         use std::os::unix::fs::PermissionsExt;
-        attributes.permissions = Some(metadata.permissions().mode() & 0o777);
-    }
+        FileAttributes {
+            permissions: Some(metadata.permissions().mode() & 0o777),
+            ..FileAttributes::empty()
+        }
+    };
+    #[cfg(not(unix))]
+    let attributes = FileAttributes::empty();
     let part_path = match target.rsplit_once('/') {
         Some((directory, _)) => format!("{directory}/{}", part_name()),
         None => part_name(),
