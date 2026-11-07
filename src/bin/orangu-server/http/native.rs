@@ -656,10 +656,14 @@ pub fn render_metrics_text(state: &AppState) -> String {
 /// Serves [`render_metrics_text`] as `/metrics`, behind the API key like
 /// every other route on this router.
 pub async fn metrics(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut body = render_metrics_text(&state);
+
+    body.push_str(&crate::workers::node::discovery_metrics());
+
     (
         StatusCode::OK,
         [("Content-Type", "text/plain; version=0.0.4")],
-        render_metrics_text(&state),
+        body,
     )
 }
 
