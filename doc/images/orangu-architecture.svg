@@ -27,7 +27,7 @@
 
   <!-- arrow orangu -> coordinator -->
   <line x1="450" y1="266" x2="450" y2="316" stroke="#8a7f70" stroke-width="2" marker-end="url(#arrow)"/>
-  <text x="466" y="295" font-size="12.5" fill="#8a7f70" font-style="italic">OpenAI-compatible HTTP</text>
+  <text x="466" y="295" font-size="12.5" fill="#8a7f70" font-style="italic">OpenAI/Anthropic-compatible HTTP</text>
 
   <!-- orangu-coordinator -->
   <rect x="250" y="318" width="400" height="96" rx="14" fill="#eef3fb" stroke="#4a78b5" stroke-width="2"/>
@@ -37,10 +37,12 @@
   <text x="270" y="396" font-size="13.5" fill="#6b6156">server, swapping the model per role (chat, review …).</text>
 
   <!-- arrow coordinator -> server -->
-  <line x1="450" y1="414" x2="450" y2="464" stroke="#8a7f70" stroke-width="2" marker-end="url(#arrow)"/>
-  <text x="466" y="443" font-size="12.5" fill="#8a7f70" font-style="italic">OpenAI-compatible HTTP</text>
+  <line x1="450" y1="414" x2="450" y2="450" stroke="#8a7f70" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="466" y="437" font-size="12.5" fill="#8a7f70" font-style="italic">OpenAI/Anthropic-compatible HTTP</text>
 
-  <!-- orangu-server -->
+  <!-- orangu-server, with two more instances stacked behind it -->
+  <rect x="264" y="452" width="400" height="96" rx="14" fill="#edf7ef" stroke="#3b8c4e" stroke-width="2"/>
+  <rect x="257" y="459" width="400" height="96" rx="14" fill="#edf7ef" stroke="#3b8c4e" stroke-width="2"/>
   <rect x="250" y="466" width="400" height="96" rx="14" fill="#edf7ef" stroke="#3b8c4e" stroke-width="2"/>
   <text x="270" y="498" font-size="21" font-weight="bold" fill="#2c7040" font-family="'DejaVu Sans Mono', monospace">orangu-server</text>
   <text x="270" y="524" font-size="13.5" fill="#6b6156">Native pure-Rust GGUF engine: loading, tokenization,</text>
