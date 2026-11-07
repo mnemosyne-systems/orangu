@@ -2082,30 +2082,54 @@ pub fn format_groups_with_last_used(
     last_used: Option<&[Option<u64>]>,
 ) -> String {
     let order: Vec<usize> = (0..groups.len()).collect();
-    format_groups_with_last_used_in_order(
+    format_groups_in_view(
         groups,
         base,
         latest_updates,
         support,
         dim,
-        last_used,
-        &order,
+        ListView {
+            last_used,
+            ranking: None,
+            order: &order,
+        },
     )
 }
 
-/// [`format_groups_with_last_used`] with an explicit display order. Entries
-/// in `order` are indices into the canonical `groups` slice; the printed `NR`
-/// remains that original index plus one, and aligned metadata is read by that
-/// same index.
-pub fn format_groups_with_last_used_in_order(
+/// The `DATE` and `FIT` cells of one row of a ranked `list`.
+#[derive(Clone, Debug, Default)]
+pub struct RankCells {
+    pub date: String,
+    pub fit: String,
+}
+
+/// Which rows [`format_groups_in_view`] prints, and its optional columns.
+/// Entries in `order` are indices into the canonical `groups` slice; the
+/// printed `NR` remains that original index plus one, and every aligned slice
+/// is read by that same index. `ranking` takes effect beside `last_used` and
+/// a non-empty `support`.
+#[derive(Clone, Copy, Debug)]
+pub struct ListView<'a> {
+    pub last_used: Option<&'a [Option<u64>]>,
+    pub ranking: Option<&'a [RankCells]>,
+    pub order: &'a [usize],
+}
+
+/// [`format_groups_with_last_used`] for an explicit [`ListView`]. Column
+/// widths follow the rows in `order`.
+pub fn format_groups_in_view(
     groups: &[ModelGroup],
     base: &Path,
     latest_updates: &HashMap<String, crate::model_download::RepoUpdateInfo>,
     support: &[ModelSupport],
     dim: Dimming,
-    last_used: Option<&[Option<u64>]>,
-    order: &[usize],
+    view: ListView,
 ) -> String {
+    let ListView {
+        last_used,
+        ranking,
+        order,
+    } = view;
     if groups.is_empty() {
         return format!("No .gguf files found under {}\n", base.display());
     }
@@ -2114,14 +2138,13 @@ pub fn format_groups_with_last_used_in_order(
     let show_last_used = last_used.is_some();
 
     let nr_width = groups.len().to_string().len().max("NR".len());
-    let model_width = groups
-        .iter()
+    let shown = || order.iter().map(|&index| &groups[index]);
+    let model_width = shown()
         .map(|g| g.label.len())
         .max()
         .unwrap_or(0)
         .max("MODEL".len());
-    let quant_width = groups
-        .iter()
+    let quant_width = shown()
         .map(|g| g.quantization.as_deref().unwrap_or("-").len())
         .max()
         .unwrap_or(0)
@@ -2129,8 +2152,7 @@ pub fn format_groups_with_last_used_in_order(
     // SIZE needs a fixed width whenever another column follows it. Error
     // rows carry no size, so they don't factor into the width.
     let size_width = if show_support || show_last_used {
-        groups
-            .iter()
+        shown()
             .filter(|g| g.errors.is_empty())
             .map(|g| format_bytes(g.size_bytes).len())
             .max()
@@ -2140,10 +2162,26 @@ pub fn format_groups_with_last_used_in_order(
         0
     };
 
+    let fit_width = ranking
+        .map(|cells| {
+            order
+                .iter()
+                .map(|&index| cells[index].fit.len())
+                .max()
+                .unwrap_or(0)
+                .max("FIT".len())
+        })
+        .unwrap_or(0);
+    // `~YYYY-MM-DD`: the widest a date cell gets.
+    const DATE_WIDTH: usize = 11;
+    let ranked_header = match ranking {
+        Some(_) => format!("{:<DATE_WIDTH$}  {:<fit_width$}  ", "DATE", "FIT"),
+        None => String::new(),
+    };
     let mut out = String::new();
     if show_support && show_last_used {
         out.push_str(&format!(
-            "{:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {:<16}  SUPPORTED\n",
+            "{:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {:<16}  {ranked_header}SUPPORTED\n",
             "NR", "MODEL", "QUANT", "SIZE", "LAST_USED"
         ));
     } else if show_support {
@@ -2190,9 +2228,16 @@ pub fn format_groups_with_last_used_in_order(
             .and_then(|values| values.get(index).copied().flatten())
             .map(format_last_used)
             .unwrap_or_else(|| "Never".to_string());
+        let ranked = match ranking {
+            Some(cells) => format!(
+                "{:<DATE_WIDTH$}  {:<fit_width$}  ",
+                cells[index].date, cells[index].fit
+            ),
+            None => String::new(),
+        };
         let row = if show_support && show_last_used {
             format!(
-                "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {used:<16}  {}{refresh_suffix}",
+                "{nr:>nr_width$}  {:<model_width$}  {:<quant_width$}  {:<size_width$}  {used:<16}  {ranked}{}{refresh_suffix}",
                 group.label,
                 group.quantization.as_deref().unwrap_or("-"),
                 format_bytes(group.size_bytes),
@@ -3332,14 +3377,17 @@ mod tests {
         write_minimal_gguf(&dir.path().join("b.gguf"), "llama", None);
         let groups = group_models(&scan_models_dir(dir.path()).unwrap());
 
-        let output = format_groups_with_last_used_in_order(
+        let output = format_groups_in_view(
             &groups,
             dir.path(),
             &HashMap::new(),
             &[],
             Dimming::Off,
-            Some(&[None, Some(0)]),
-            &[1, 0],
+            ListView {
+                last_used: Some(&[None, Some(0)]),
+                ranking: None,
+                order: &[1, 0],
+            },
         );
         let rows: Vec<&str> = output.lines().skip(1).collect();
 

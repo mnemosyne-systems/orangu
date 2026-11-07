@@ -10,11 +10,13 @@
 //! Model weights live in the configured models directory, which may be
 //! anywhere on disk. The small pieces of information that cannot be
 //! recovered by scanning those weights live in `~/.orangu/models`: when a
-//! model was downloaded and when it was last successfully loaded.
+//! model was downloaded, when it was last successfully loaded, and when the
+//! Hugging Face repo it came from was created.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, HashMap},
     fs::OpenOptions,
     path::{Path, PathBuf},
     thread,
@@ -29,6 +31,11 @@ struct Registry {
     version: u32,
     #[serde(default)]
     models: Vec<ModelRecord>,
+    /// When each Hugging Face repo was created, in Unix seconds. A repo's
+    /// creation time never changes, so one lookup serves every later run,
+    /// offline ones included.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    repo_created: BTreeMap<String, u64>,
 }
 
 fn current_version() -> u32 {
@@ -103,6 +110,36 @@ pub fn last_used_for<'a>(groups: impl IntoIterator<Item = &'a [PathBuf]>) -> Vec
         .collect()
 }
 
+/// Every repo creation time recorded so far.
+pub fn repo_created_times() -> HashMap<String, u64> {
+    registry_path()
+        .and_then(|path| read_registry(&path).ok())
+        .unwrap_or_default()
+        .repo_created
+        .into_iter()
+        .collect()
+}
+
+/// Records repo creation times looked up on the Hub.
+pub fn record_repo_created(created: &HashMap<String, u64>) -> Result<()> {
+    if created.is_empty() {
+        return Ok(());
+    }
+    let Some(file) = registry_path() else {
+        return Ok(());
+    };
+    record_repo_created_at(&file, created)
+}
+
+fn record_repo_created_at(file: &Path, created: &HashMap<String, u64>) -> Result<()> {
+    let _lock = RegistryLock::acquire(file)?;
+    let mut registry = read_registry(file)?;
+    registry
+        .repo_created
+        .extend(created.iter().map(|(repo, &at)| (repo.clone(), at)));
+    write_registry(file, &registry)
+}
+
 enum Update {
     Downloaded,
     Used,
@@ -166,6 +203,7 @@ fn read_registry(path: &Path) -> Result<Registry> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Registry {
             version: VERSION,
             models: Vec::new(),
+            repo_created: BTreeMap::new(),
         }),
         Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
     }
@@ -263,6 +301,22 @@ mod tests {
         assert_eq!(saved.models[0].path, model.canonicalize().unwrap());
         assert!(saved.models[0].downloaded_at.is_some());
         assert!(saved.models[0].last_used.is_some());
+    }
+
+    #[test]
+    fn repo_creation_times_survive_a_model_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"GGUF").unwrap();
+        let registry = dir.path().join("models");
+
+        let created = HashMap::from([("owner/model".to_string(), 1_700_000_000)]);
+        record_repo_created_at(&registry, &created).unwrap();
+        update_at(&registry, "owner/model", &model, Update::Used).unwrap();
+
+        let saved = read_registry(&registry).unwrap();
+        assert_eq!(saved.repo_created["owner/model"], 1_700_000_000);
+        assert_eq!(saved.models.len(), 1);
     }
 
     #[test]

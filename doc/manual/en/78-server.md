@@ -61,6 +61,8 @@ dependency on any C or C++ inference library.
   `generate::run` rewrites in place, on for a console and off for a file
   or a daemon. Subcommand output and interactive prompts stay on
   `println!`, as does the fatal `error:` line `main` exits on.
+- `best.rs` — `--sort best`: ranks the installed models for `list` and
+  `suggest` by fit, date and the version in their name.
 - `suggest.rs` — `suggest`: a hardware-based model-size estimate built on
   top of `orangu::hardware`'s own detection; see below.
 - `shell.rs` — hand-written bash/zsh/fish/PowerShell completion scripts.
@@ -954,6 +956,31 @@ adds a draft model to the configuration's server section after its last
 setting, leaving every other line as written. `every_entry_is_well_formed`
 checks the list: one `/` per repo, a known role, a drafter that is not the
 model itself, smallest first, no repo twice.
+
+### Ranking installed models (`best.rs`)
+
+`rank_installed` backs `list --sort best` and `suggest --sort best`. `Fit::of`
+places each model from `plan::analyze_shards`, whose summary opens leave the
+vocabulary unread, plus `kv_bytes_at` for the configured context. Its capacity
+is `plan --json`'s (`device_memory_bytes` beside total RAM), so `No` here and
+`runs: false` there are one answer about the weights and the cache.
+
+`rank` sorts by a single key per model, which keeps the order total: the fit
+tier, a ranking date, the version, then placement, `quant_preference` and
+size. `ranking_dates` raises a model's date to the newest of any lower version
+in its family, so comparing that one number also orders a family by version;
+`family_and_version` reads both from the repo id. Models that cannot be served
+raise nothing.
+
+Dates are the Hub's `createdAt`, from `model_download::repo_created_times`.
+They never change, so `model_registry` keeps them under `repo_created` in
+`~/.orangu/models` and only unknown repos cost a request. A failed lookup falls
+back to `file_date`, and the `DATE` cell's `~` says so; nothing is recorded, so
+the next online run corrects it.
+
+`Ranking::top` is `suggest`'s view: models that run, one per repo, at most
+`TOP`. `model_spec::format_groups_in_view` prints both views, with `NR` kept
+canonical so that a ranked row still names its model.
 
 ### Hardware-based model-size suggestion (`suggest.rs`)
 

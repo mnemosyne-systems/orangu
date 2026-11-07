@@ -92,7 +92,7 @@ impl std::fmt::Display for HubEndpoint {
 /// The same fallback preference order llama.cpp's own `find_best_model`
 /// uses when a `download` target names a repo but no `:quant` — asked for
 /// in that order, first match wins.
-const DEFAULT_TAG_PREFERENCE: &[&str] = &["Q4_K_M", "Q8_0"];
+pub const DEFAULT_TAG_PREFERENCE: &[&str] = &["Q4_K_M", "Q8_0"];
 
 /// One file's line of a [`DownloadSnapshot`] — the structured form of the
 /// text [`Slot::line`] renders for a terminal.
@@ -859,6 +859,44 @@ pub fn latest_repo_updates(repos: &[String]) -> std::collections::HashMap<String
             Some((repo.clone(), RepoUpdateInfo { commit, files }))
         })
         .collect()
+}
+
+/// When each of `repos` was created on the Hub, in Unix seconds. A repo that
+/// cannot be looked up is left out: like [`latest_repo_updates`], this runs
+/// under `list` and `suggest`, which must still answer when offline.
+pub fn repo_created_times(repos: &[String]) -> std::collections::HashMap<String, u64> {
+    if repos.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    let client = match build_client(Some(std::time::Duration::from_secs(5))) {
+        Ok(client) => client,
+        Err(_) => return std::collections::HashMap::new(),
+    };
+    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
+
+    repos
+        .par_iter()
+        .filter_map(|repo| {
+            let url = format!("{HUB_ENDPOINT}/api/models/{repo}?expand[]=createdAt");
+            let body: serde_json::Value = authed_get(&client, &url, token.as_deref())
+                .send()
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .json()
+                .ok()?;
+            Some((
+                repo.clone(),
+                parse_hub_time(body.get("createdAt")?.as_str()?)?,
+            ))
+        })
+        .collect()
+}
+
+/// A Hub timestamp (`2026-08-13T08:28:40.000Z`) as Unix seconds.
+fn parse_hub_time(text: &str) -> Option<u64> {
+    let time = chrono::DateTime::parse_from_rfc3339(text).ok()?;
+    u64::try_from(time.timestamp()).ok()
 }
 
 pub fn latest_commits(repos: &[String]) -> std::collections::HashMap<String, String> {
@@ -2784,6 +2822,15 @@ mod tests {
 
     /// A file arrives whole over several connections, every piece in its
     /// place, and leaves neither its `.part` nor its record behind.
+    #[test]
+    fn hub_times_parse_to_unix_seconds() {
+        assert_eq!(
+            parse_hub_time("2025-04-28T07:55:09.000Z"),
+            Some(1_745_826_909)
+        );
+        assert_eq!(parse_hub_time("yesterday"), None);
+    }
+
     #[test]
     fn a_file_downloads_in_pieces() {
         let body = patterned(10_500);

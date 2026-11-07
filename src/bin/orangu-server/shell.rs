@@ -103,7 +103,11 @@ _orangu_server() {
             return 0
             ;;
         --sort)
-            COMPREPLY=( $(compgen -W "size last-used" -- "$cur") )
+            if [[ " ${COMP_WORDS[*]} " == *" suggest "* ]]; then
+                COMPREPLY=( $(compgen -W "best" -- "$cur") )
+            else
+                COMPREPLY=( $(compgen -W "size last-used best" -- "$cur") )
+            fi
             return 0
             ;;
         --device-split)
@@ -203,7 +207,7 @@ _orangu_server() {
         '(-o --output)'{-o,--output}'[Where bundle writes the bundled executable]:output:_files' \
         '--binary[The executable bundle embeds the model into]:binary:_files' \
         '--deep[Also verify plan'"'"'s shards and architecture]' \
-        '--sort[Order list rows while preserving their NR]:field:(size last-used)' \
+        '--sort[Order list or suggest rows while preserving their NR]:field:(size last-used best)' \
         '(-y --yes)'{-y,--yes}'[Skip a confirmation prompt (download/delete/bundle/prune)]' \
         '(-h --help)'{-h,--help}'[Print help]' \
         '(-V --version)'{-V,--version}'[Print version]' \
@@ -299,7 +303,8 @@ complete -c orangu-server      -l audio                   -d 'Text to speech rol
 complete -c orangu-server -s o -l output              -r -d 'Where bundle writes the bundled executable'
 complete -c orangu-server      -l binary              -r -d 'The executable bundle embeds the model into'
 complete -c orangu-server -l deep                         -d 'Also verify plan\'s shards and architecture'
-complete -c orangu-server -n '__fish_seen_subcommand_from list' -l sort -x -a 'size last-used' -d 'Order rows while preserving their NR'
+complete -c orangu-server -n '__fish_seen_subcommand_from list' -l sort -x -a 'size last-used best' -d 'Order rows while preserving their NR'
+complete -c orangu-server -n '__fish_seen_subcommand_from suggest' -l sort -x -a 'best' -d 'Rank the installed models for this machine'
 complete -c orangu-server -s y -l yes                     -d 'Skip a confirmation prompt (download/delete/bundle/prune)'
 complete -c orangu-server -s h -l help                    -d 'Print help'
 complete -c orangu-server -s V -l version                 -d 'Print version'
@@ -350,7 +355,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-server' -ScriptBlock {
         @('-o', '--output', 'Where bundle writes the bundled executable'),
         @('--binary', 'The executable bundle embeds the model into'),
         @('--deep', 'Also verify plan''s shards and architecture'),
-        @('--sort', 'Order list rows while preserving their NR'),
+        @('--sort', 'Order list or suggest rows while preserving their NR'),
         @('-y', '--yes', 'Skip a confirmation prompt (download/delete/bundle/prune)'),
         @('-h', '--help', 'Print help'),
         @('-V', '--version', 'Print version')
@@ -402,7 +407,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-server' -ScriptBlock {
         'prune' { return Offer (Sessions) }
         { $_ -in '-c', '--config', '-o', '--output', '--binary', '-w', '--workspace' } { return }   # a path: PowerShell's own completion takes over
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        '--sort' { return Offer @('size', 'last-used') }
+        '--sort' { return Offer @('size', 'last-used', 'best') }
         '--device-split' { return Offer @('off', 'auto', 'all', 'cpu') }
         { $_ -in '-p', '--port', '--web', '--device', '--context', '--threads', '--metrics' } { return }
     }

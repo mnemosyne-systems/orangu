@@ -974,6 +974,27 @@ that repo's real tensor tables before fetching it — and `plan` does the
 same for a model already on disk. Both give the exact figures this table can
 only approximate.
 
+`--sort best` answers the question for the models already installed. It
+prints the machine's report, then the top 10 installed models that run here,
+one row per repo, using the same ranking as `list --sort best` (below):
+
+```sh
+orangu-server suggest --sort best
+```
+
+```
+Best installed models (top 10)
+  Memory           : 62.19 GiB RAM, 3.98 GiB GPU
+  Context          : 8192
+
+ NR  MODEL                                  QUANT    SIZE       LAST_USED         DATE        FIT      SUPPORTED
+106  unsloth/Qwen3.8-27B-GGUF               Q4_K_M   15.33 GiB  2026-10-27 05:44  2026-08-13  RAM      Yes (qwen35)
+...
+```
+
+Fewer than 10 rows means fewer than 10 installed repos run on this machine.
+Unlike plain `suggest`, this form reads the configured `models` directory.
+
 **`list`** recursively scans the configured `models` directory for `.gguf`
 files and prints one row per model (a multi-shard model collapses into a
 single row, with `SIZE` summed across shards):
@@ -982,6 +1003,7 @@ single row, with `SIZE` summed across shards):
 orangu-server list
 orangu-server list --sort size       # largest first
 orangu-server list --sort last-used  # most recently used first; Never last
+orangu-server list --sort best       # fits this machine first, then newest
 ```
 
 ```
@@ -998,6 +1020,32 @@ By default, `NR` numbers models alphabetically by `MODEL`, starting from 1 — a
 shorthand for `show` so you don't have to retype a long `MODEL` string.
 `--sort size` and `--sort last-used` reorder the rows but retain those default
 numbers; ties stay alphabetical and models never used sort after dated rows.
+
+`--sort best` ranks every installed model for this machine and adds two
+columns. Models group by whether they run here, and within each group newer
+comes first:
+
+- `FIT` weighs the file's real tensor tables, plus the KV cache for the
+  configured `context` (8192 tokens when none is set), against total memory.
+  `GPU` means what a backend uploads fits on the largest dedicated card, `RAM`
+  that all of it fits in system RAM, and `GPU+RAM` that it fits only across
+  both. These rank first. `Streams` follows: the dense part fits and the
+  experts are read from disk as they are routed, so the model runs slowly.
+  Then come `No`, a model too large to run, and `-`, a file this build cannot
+  serve (including companions).
+- `DATE` is when the model's Hugging Face repo was created, which is looked up
+  once and kept in `~/.orangu/models`. A date with a `~` is the file's own
+  modification date, used when there is no repo or no answer from the Hub.
+  A repo's date is that of the upload, so a recent re-upload of an old model
+  counts as new.
+
+The version in a model's name refines the date. Inside one family a higher
+version always ranks above a lower one: `Qwen3.8` above `Qwen3.5`, whatever
+order their repos were created in. A family is the name before its first number
+(`qwen`, `gemma`, `deepseek-v`), and a size such as `27B` is not a version.
+Rows of the same repo rank the card first, then the quantizations `download`
+prefers (`Q4_K_M`, `Q8_0`), then other quantizations before plain floats, and
+larger before smaller.
 When a file was downloaded by `-hf`/`--hf-repo`, `MODEL` is the repo id to
 hand back to `-hf`: `<user>/<model>`. The `:quant` tag is left off — `QUANT`
 shows it in the next column — so two quantizations of one repo print the same
@@ -1564,9 +1612,9 @@ port = 8300
 - `models` — the base directory a model spec resolves into: what `list`/
   `show` scan (recursively) for `.gguf` files, `download` fetches into, and
   the serving path resolves the CLI's positional `model` argument against.
-  Required by every subcommand except `system` and `suggest` (pure hardware
-  inventory, no models directory involved) and a `show` given a direct
-  path. `-i`/`--init` prompts for it with TAB-completion over real
+  Required by every subcommand except `system` and a plain `suggest` (pure
+  hardware inventory, no models directory involved) and a `show` given a
+  direct path. `-i`/`--init` prompts for it with TAB-completion over real
   filesystem paths and an inline grey ghost suggestion of the directory
   being typed, so pointing at one is a prefix and a keypress rather than a
   full path typed out.

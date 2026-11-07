@@ -30,6 +30,7 @@
 // remedy and costs nothing but a deeper proof search.
 #![recursion_limit = "256"]
 
+mod best;
 mod bundle;
 mod config;
 mod daemon;
@@ -353,11 +354,15 @@ enum Command {
     System,
     /// Suggest a GGUF model size (not yet a specific model) likely to run
     /// comfortably on this machine's detected hardware.
-    Suggest,
+    Suggest {
+        /// Rank the installed models for this machine and print the top 10.
+        #[arg(long, value_enum, value_name = "FIELD")]
+        sort: Option<SuggestSort>,
+    },
     /// List every .gguf file found under the configured models directory.
     List {
-        /// Order rows by size (largest first) or last use (most recent first).
-        /// NR remains the model's number in the default alphabetical listing.
+        /// Order rows by size (largest first), last use (most recent first)
+        /// or best for this machine (fits first, then newest). NR remains the model's number in the default alphabetical listing.
         #[arg(long, value_enum, value_name = "FIELD")]
         sort: Option<ListSort>,
     },
@@ -592,6 +597,12 @@ enum Command {
 enum ListSort {
     Size,
     LastUsed,
+    Best,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SuggestSort {
+    Best,
 }
 
 impl Command {
@@ -601,7 +612,7 @@ impl Command {
     fn mode(&self) -> &'static str {
         match self {
             Command::System => "system",
-            Command::Suggest => "suggest",
+            Command::Suggest { .. } => "suggest",
             Command::List { .. } => "list",
             Command::Plan { .. } => "plan",
             Command::Show { .. } => "show",
@@ -5141,7 +5152,26 @@ fn run_command(
             );
             Ok(())
         }
-        Command::Suggest => {
+        Command::Suggest {
+            sort: Some(SuggestSort::Best),
+        } => {
+            let conf = load_config(config_arg, None, false)?;
+            let mut os = orangu::os::detect();
+            os.models = orangu::os::detect_model_storage(&conf.models);
+            let models = orangu::model_spec::scan_models_dir(&conf.models)?;
+            let groups = orangu::model_spec::group_models(&models);
+            let support = model_support(&groups);
+            let cpu = orangu::hardware::detect_cpu();
+            let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
+            let npu = orangu::npu::detect_npu_inventory();
+            let ranking = best::rank_installed(&groups, &support, &conf, &cpu, &gpus);
+            print!(
+                "{}",
+                best::format_top(&os, &cpu, &gpus, npu.as_ref(), &groups, &support, &ranking)
+            );
+            Ok(())
+        }
+        Command::Suggest { sort: None } => {
             let mut os = orangu::os::detect();
             // Same best-effort load as `system`, and for the same reason:
             // a machine with no config file still gets a suggestion, and
@@ -5169,17 +5199,28 @@ fn run_command(
             let last_used = orangu::model_registry::last_used_for(
                 groups.iter().map(|group| group.paths.as_slice()),
             );
-            let order = list_order(&groups, &last_used, sort);
+            let ranking = (sort == Some(ListSort::Best)).then(|| {
+                let cpu = orangu::hardware::detect_cpu();
+                let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
+                best::rank_installed(&groups, &support, &conf, &cpu, &gpus)
+            });
+            let order = match &ranking {
+                Some(ranking) => ranking.order.clone(),
+                None => list_order(&groups, &last_used, sort),
+            };
             print!(
                 "{}",
-                orangu::model_spec::format_groups_with_last_used_in_order(
+                orangu::model_spec::format_groups_in_view(
                     &groups,
                     &conf.models,
                     &latest_commits,
                     &support,
                     dimming(orangu::model_spec::Dimming::Unsupported),
-                    Some(&last_used),
-                    &order,
+                    orangu::model_spec::ListView {
+                        last_used: Some(&last_used),
+                        ranking: ranking.as_ref().map(|ranking| ranking.cells.as_slice()),
+                        order: &order,
+                    },
                 )
             );
             Ok(())
@@ -5224,23 +5265,9 @@ fn run_command(
                 let context = requested_context(None, conf.context);
                 let kv_bytes = context
                     .filter(|_| deep)
-                    .and_then(|context| {
-                        let loaded = engine::loader::LoadedModel::open(&path).ok()?;
-                        let elements = engine::arch::kv_elements_per_token(&loaded) as u64
-                            * context as u64
-                            + engine::arch::kv_fixed_elements(&loaded, context) as u64;
-                        Some(elements * 2)
-                    })
+                    .and_then(|context| kv_bytes_at(&path, context))
                     .unwrap_or(0);
-                let device_memory_bytes: u64 =
-                    if matches!(conf.backend, config::BackendPreference::Cpu) {
-                        0
-                    } else {
-                        gpus.iter()
-                            .filter(|g| g.memory_kind == orangu::hardware::MemoryKind::Dedicated)
-                            .filter_map(|g| g.vram_total_bytes)
-                            .sum()
-                    };
+                let device_memory_bytes = device_memory_bytes(&conf, &gpus);
                 let needs_bytes = plan.dense_bytes + kv_bytes;
                 let capacity_bytes = cpu.total_memory_bytes + device_memory_bytes;
                 let runs = problems.is_empty() && needs_bytes <= capacity_bytes;
@@ -5509,7 +5536,8 @@ fn list_order(
 ) -> Vec<usize> {
     let mut order: Vec<usize> = (0..groups.len()).collect();
     match sort {
-        None => {}
+        // `Best` weighs the machine as well; `best::rank_installed` orders it.
+        None | Some(ListSort::Best) => {}
         Some(ListSort::Size) => {
             order.sort_by_key(|&index| std::cmp::Reverse(groups[index].size_bytes));
         }
@@ -5642,6 +5670,30 @@ const PLAN_KV_CONTEXT: usize = 8192;
 fn kv_elements_per_token(path: &std::path::Path) -> Option<u64> {
     let loaded = engine::loader::LoadedModel::open(path).ok()?;
     Some(engine::arch::kv_host_elements_per_token(&loaded) as u64).filter(|&elements| elements > 0)
+}
+
+/// The KV cache of the model at `path` for `context` tokens, at two bytes an
+/// element, the least any storage takes.
+fn kv_bytes_at(path: &std::path::Path, context: usize) -> Option<u64> {
+    let loaded = engine::loader::LoadedModel::open(path).ok()?;
+    let elements = engine::arch::kv_elements_per_token(&loaded) as u64 * context as u64
+        + engine::arch::kv_fixed_elements(&loaded, context) as u64;
+    Some(elements * 2)
+}
+
+/// The dedicated cards' memory a model can use beside the machine's own: none
+/// on the CPU backend.
+fn device_memory_bytes(
+    conf: &config::ServerConfiguration,
+    gpus: &[orangu::hardware::GpuInfo],
+) -> u64 {
+    if matches!(conf.backend, config::BackendPreference::Cpu) {
+        return 0;
+    }
+    gpus.iter()
+        .filter(|g| g.memory_kind == orangu::hardware::MemoryKind::Dedicated)
+        .filter_map(|g| g.vram_total_bytes)
+        .sum()
 }
 
 /// Refuses what this backend cannot honour: a separate value format is for host
@@ -7922,7 +7974,8 @@ mod timed_arms_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ListSort, dominant_tensor_types, kv_pages_from_budget, list_order, slots_that_fit,
+        ListSort, SuggestSort, dominant_tensor_types, kv_pages_from_budget, list_order,
+        slots_that_fit,
     };
     use crate::engine::quant::{GGML_TYPE_BF16, GGML_TYPE_F32, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K};
     use clap::Parser;
@@ -7995,8 +8048,24 @@ mod tests {
     }
 
     #[test]
-    fn clap_accepts_both_list_sort_fields() {
-        for (value, expected) in [("size", ListSort::Size), ("last-used", ListSort::LastUsed)] {
+    fn clap_accepts_suggest_sort_best_only() {
+        let args = Args::try_parse_from(["orangu-server", "suggest", "--sort", "best"]).unwrap();
+        assert!(matches!(
+            args.command,
+            Some(Command::Suggest {
+                sort: Some(SuggestSort::Best)
+            })
+        ));
+        assert!(Args::try_parse_from(["orangu-server", "suggest", "--sort", "size"]).is_err());
+    }
+
+    #[test]
+    fn clap_accepts_every_list_sort_field() {
+        for (value, expected) in [
+            ("size", ListSort::Size),
+            ("last-used", ListSort::LastUsed),
+            ("best", ListSort::Best),
+        ] {
             let args = Args::try_parse_from(["orangu-server", "list", "--sort", value]).unwrap();
             assert!(matches!(
                 args.command,
@@ -8185,7 +8254,7 @@ mod tests {
 
         let modes = [
             Command::System.mode(),
-            Command::Suggest.mode(),
+            Command::Suggest { sort: None }.mode(),
             Command::List { sort: None }.mode(),
             Command::Plan {
                 file: None,
