@@ -32,10 +32,9 @@ fn render_tool_result(result: Result<String>) -> String {
     }
 }
 
-/// Runs subagent `calls` concurrently, at most [`MAX_PARALLEL_SUBAGENTS`] at
-/// a time, and returns their results in call order. Each runs on its own
-/// clone of `tools` (clones share their state), and is aborted if the turn
-/// is.
+/// Runs `calls` concurrently, at most [`MAX_PARALLEL_SUBAGENTS`] at a time,
+/// and returns their results in call order. Each runs on its own clone of
+/// `tools` (clones share their state), and is aborted if the turn is.
 async fn execute_concurrently(tools: &ToolExecutor, calls: &[crate::llm::ToolCall]) -> Vec<String> {
     let calls = calls
         .iter()
@@ -52,6 +51,61 @@ async fn execute_concurrently(tools: &ToolExecutor, calls: &[crate::llm::ToolCal
         async move { tools.execute(&name, &arguments).await }
     })
     .await
+}
+
+/// What a run of calls that may overlap has in common.
+///
+/// A run is homogeneous: subagent starts overlap with subagent starts, and
+/// read-only calls with read-only calls, but never across the two. A read
+/// beside a writer would otherwise see a workspace the model had not asked it
+/// to see yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatchKind {
+    Subagents,
+    ReadsOnly,
+}
+
+/// The end (exclusive) of the run starting at `start`, and what the run is,
+/// or `None` when that call must run alone.
+fn parallel_run(
+    tools: &ToolExecutor,
+    calls: &[crate::llm::ToolCall],
+    start: usize,
+) -> Option<(usize, BatchKind)> {
+    let kind = match calls[start].function.name.as_str() {
+        name if tools.runs_subagent(name) => BatchKind::Subagents,
+        name if tools.parallel_safe(name) && !tools.has_agent_hooks() => BatchKind::ReadsOnly,
+        _ => return None,
+    };
+
+    let mut continued_tasks: Vec<&str> = Vec::new();
+    let mut end = start;
+    while end < calls.len() {
+        let call = &calls[end];
+        let same_kind = match kind {
+            BatchKind::Subagents => tools.runs_subagent(&call.function.name),
+            BatchKind::ReadsOnly => tools.parallel_safe(&call.function.name),
+        };
+        if !same_kind {
+            break;
+        }
+        // Two continuations of one task are not independent: the first
+        // restart wins and the second finds it running. Keep them in order.
+        if call.function.name == "continue_agent" {
+            let task = call
+                .function
+                .arguments
+                .get("task")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            if continued_tasks.contains(&task) {
+                break;
+            }
+            continued_tasks.push(task);
+        }
+        end += 1;
+    }
+    Some((end, kind))
 }
 
 /// Runs `run` on every call, at most `limit` at a time, each as its own
@@ -619,13 +673,13 @@ impl ChatSession {
                         on_tool_running(true);
                         let mut index = 0;
                         while index < tool_calls.len() {
-                            // Consecutive subagent calls are independent of
-                            // each other: run them together. Everything else
+                            // Consecutive calls of one kind are independent
+                            // of each other: subagent starts, or read-only
+                            // tools. Run those together; everything else
                             // runs in order, as the model asked.
-                            let run_end = (index..tool_calls.len())
-                                .find(|&i| !tools.runs_subagent(&tool_calls[i].function.name))
-                                .unwrap_or(tool_calls.len());
-                            if run_end - index >= 2 {
+                            if let Some((run_end, _)) = parallel_run(tools, &tool_calls, index)
+                                && run_end - index >= 2
+                            {
                                 let batch = &tool_calls[index..run_end];
                                 for tool_call in batch {
                                     on_tool_call(tool_call);
@@ -719,7 +773,7 @@ impl std::error::Error for RoundsExhausted {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ChatSession, run_concurrently, strip_stale_fragment};
+    use super::{BatchKind, ChatSession, parallel_run, run_concurrently, strip_stale_fragment};
     use crate::config::LlmConfiguration;
     use crate::context::fragments::ContextualFragment;
     use crate::test_support::serve_chat_responses;
@@ -1266,6 +1320,106 @@ data: [DONE]
         // The executor learned the connection, for subagents to follow.
         assert_eq!(tools.active_profile().unwrap().endpoint, endpoint);
         assert_eq!(server.join().expect("server").len(), 2);
+    }
+
+    fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> crate::llm::ToolCall {
+        crate::llm::ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: crate::llm::ToolCallFunction {
+                name: name.to_string(),
+                arguments: arguments
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            },
+        }
+    }
+
+    /// Read-only calls are independent, so a turn that asks for several files
+    /// runs them together. Anything that writes keeps the order the model
+    /// asked for.
+    #[test]
+    fn read_only_calls_overlap_but_writes_do_not() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = crate::tools::ToolExecutor::new(workspace.path());
+
+        let reads = vec![
+            tool_call("a", "show_file", serde_json::json!({"path": "a.rs"})),
+            tool_call("b", "list_directory", serde_json::json!({})),
+        ];
+        assert_eq!(
+            parallel_run(&tools, &reads, 0),
+            Some((2, BatchKind::ReadsOnly))
+        );
+
+        let mixed = vec![
+            tool_call("a", "show_file", serde_json::json!({"path": "a.rs"})),
+            tool_call("b", "create_file", serde_json::json!({"path": "b.rs"})),
+        ];
+        assert_eq!(
+            parallel_run(&tools, &mixed, 0),
+            Some((1, BatchKind::ReadsOnly))
+        );
+    }
+
+    /// A read and a subagent in one turn are not overlapped: the subagent may
+    /// write, and the read has to see what the model asked it to see.
+    #[test]
+    fn a_read_and_a_subagent_do_not_overlap() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = crate::tools::ToolExecutor::new(workspace.path());
+        let calls = vec![
+            tool_call("a", "show_file", serde_json::json!({"path": "a.rs"})),
+            tool_call("b", "explore_repository", serde_json::json!({"query": "x"})),
+        ];
+        assert_eq!(
+            parallel_run(&tools, &calls, 0),
+            Some((1, BatchKind::ReadsOnly))
+        );
+    }
+
+    /// Two continuations of one task are one task's work, not two: the second
+    /// has to wait for the first. Different tasks may overlap.
+    #[test]
+    fn continuations_of_one_task_stay_in_order() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = crate::tools::ToolExecutor::new(workspace.path());
+        let same = vec![
+            tool_call(
+                "a",
+                "continue_agent",
+                serde_json::json!({"task": "t1", "message": "one"}),
+            ),
+            tool_call(
+                "b",
+                "continue_agent",
+                serde_json::json!({"task": "t1", "message": "two"}),
+            ),
+        ];
+        assert_eq!(
+            parallel_run(&tools, &same, 0),
+            Some((1, BatchKind::Subagents))
+        );
+
+        let different = vec![
+            tool_call(
+                "a",
+                "continue_agent",
+                serde_json::json!({"task": "t1", "message": "one"}),
+            ),
+            tool_call(
+                "b",
+                "continue_agent",
+                serde_json::json!({"task": "t2", "message": "two"}),
+            ),
+        ];
+        assert_eq!(
+            parallel_run(&tools, &different, 0),
+            Some((2, BatchKind::Subagents))
+        );
     }
 
     /// Running out of rounds is a typed error. By default the turn is rolled
