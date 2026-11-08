@@ -65,6 +65,19 @@ enum BatchKind {
     ReadsOnly,
 }
 
+/// Whether `call` is local and read-only, so it may overlap another such
+/// call. `run_agent` counts only when it lists agents.
+fn is_read_only(tools: &ToolExecutor, call: &crate::llm::ToolCall) -> bool {
+    tools.parallel_safe(&call.function.name)
+        || tools.lists_agents(&call.function.name, &call.function.arguments)
+}
+
+/// Whether `call` starts a subagent, as opposed to only listing agents.
+fn starts_subagent(tools: &ToolExecutor, call: &crate::llm::ToolCall) -> bool {
+    tools.runs_subagent(&call.function.name)
+        && !tools.lists_agents(&call.function.name, &call.function.arguments)
+}
+
 /// The end (exclusive) of the run starting at `start`, and what the run is,
 /// or `None` when that call must run alone.
 fn parallel_run(
@@ -72,10 +85,13 @@ fn parallel_run(
     calls: &[crate::llm::ToolCall],
     start: usize,
 ) -> Option<(usize, BatchKind)> {
-    let kind = match calls[start].function.name.as_str() {
-        name if tools.runs_subagent(name) => BatchKind::Subagents,
-        name if tools.parallel_safe(name) && !tools.has_agent_hooks() => BatchKind::ReadsOnly,
-        _ => return None,
+    let first = &calls[start];
+    let kind = if starts_subagent(tools, first) {
+        BatchKind::Subagents
+    } else if is_read_only(tools, first) && !tools.has_agent_hooks() {
+        BatchKind::ReadsOnly
+    } else {
+        return None;
     };
 
     let mut continued_tasks: Vec<&str> = Vec::new();
@@ -83,8 +99,8 @@ fn parallel_run(
     while end < calls.len() {
         let call = &calls[end];
         let same_kind = match kind {
-            BatchKind::Subagents => tools.runs_subagent(&call.function.name),
-            BatchKind::ReadsOnly => tools.parallel_safe(&call.function.name),
+            BatchKind::Subagents => starts_subagent(tools, call),
+            BatchKind::ReadsOnly => is_read_only(tools, call),
         };
         if !same_kind {
             break;
@@ -1419,6 +1435,72 @@ data: [DONE]
         assert_eq!(
             parallel_run(&tools, &different, 0),
             Some((2, BatchKind::Subagents))
+        );
+    }
+
+    /// `run_agent` with `agent: "list"` only searches the registry, so it
+    /// batches with other reads. Starting an agent still does not.
+    #[test]
+    fn listing_agents_is_read_only_but_starting_one_is_not() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = crate::tools::ToolExecutor::new(workspace.path());
+
+        let listings = vec![
+            tool_call(
+                "a",
+                "run_agent",
+                serde_json::json!({"agent": "list", "task": "review"}),
+            ),
+            tool_call("b", "show_file", serde_json::json!({"path": "a.rs"})),
+        ];
+        assert_eq!(
+            parallel_run(&tools, &listings, 0),
+            Some((2, BatchKind::ReadsOnly))
+        );
+
+        // Case and surrounding spaces do not change what the call is.
+        let upper = vec![
+            tool_call(
+                "a",
+                "run_agent",
+                serde_json::json!({"agent": " LIST ", "task": "review"}),
+            ),
+            tool_call("b", "list_directory", serde_json::json!({})),
+        ];
+        assert_eq!(
+            parallel_run(&tools, &upper, 0),
+            Some((2, BatchKind::ReadsOnly))
+        );
+
+        let starting = vec![
+            tool_call(
+                "a",
+                "run_agent",
+                serde_json::json!({"agent": "reviewer", "task": "review"}),
+            ),
+            tool_call("b", "show_file", serde_json::json!({"path": "a.rs"})),
+        ];
+        assert_eq!(
+            parallel_run(&tools, &starting, 0),
+            Some((1, BatchKind::Subagents))
+        );
+
+        // A listing and a start are different kinds, so they stay ordered.
+        let mixed = vec![
+            tool_call(
+                "a",
+                "run_agent",
+                serde_json::json!({"agent": "list", "task": "review"}),
+            ),
+            tool_call(
+                "b",
+                "run_agent",
+                serde_json::json!({"agent": "reviewer", "task": "review"}),
+            ),
+        ];
+        assert_eq!(
+            parallel_run(&tools, &mixed, 0),
+            Some((1, BatchKind::ReadsOnly))
         );
     }
 

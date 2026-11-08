@@ -964,12 +964,12 @@ impl ToolExecutor {
     /// Whether `name` is a read-only tool that may share one turn with
     /// another such call.
     ///
-    /// A name-level allowlist on purpose: a tool whose safety depends on its
-    /// arguments (e.g. `run_agent` listing agents vs starting one) stays out.
-    /// `browse` is stateful (link numbers refer to the page it last showed),
-    /// the graph tools may build or refresh a cache, and MCP tools have
-    /// unknown side effects, so none of those qualify either. Subagent
-    /// starters are [`Self::runs_subagent`]'s business, not this list's.
+    /// A name-level allowlist: a tool whose safety depends on its arguments
+    /// has its own test (see [`Self::lists_agents`]). `browse` is stateful
+    /// (link numbers refer to the page it last showed), the graph tools may
+    /// build or refresh a cache, and MCP tools have unknown side effects, so
+    /// none of those qualify. Subagent starters are [`Self::runs_subagent`]'s
+    /// business, not this list's.
     pub fn parallel_safe(&self, name: &str) -> bool {
         matches!(
             name,
@@ -981,6 +981,21 @@ impl ToolExecutor {
                 | "web_search"
                 | "use_skill"
         )
+    }
+
+    /// Whether this call asks `run_agent` to list matching agents. That is a
+    /// local search, not a subagent start, so it may share a turn with other
+    /// read-only calls.
+    pub fn lists_agents(
+        &self,
+        name: &str,
+        arguments: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> bool {
+        name == "run_agent"
+            && arguments
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|agent| agent.trim().eq_ignore_ascii_case("list"))
     }
 
     /// Whether a hook runs around every tool call in this executor. Hooks can
