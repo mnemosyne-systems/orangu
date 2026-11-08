@@ -4328,7 +4328,10 @@ arrived in: a JPEG stays a JPEG, a PNG a PNG, a GIF a GIF (one frame, 256
 colours), a WebP a lossless WebP, an SVG an SVG — drawn first, and the
 picture comes back as an SVG document carrying it as PNG, there being no
 pixels-to-vector. An animated GIF or WebP is read as its first frame. The attachment itself shows as a thumbnail under
-your message.
+your message. One picture can be attached; attaching several is
+currently rejected (the limits are described under
+*POST /v1/images/generations* in the _HTTP endpoints_ chapter, and
+support for models with reference conditioning follows).
 
 Attaching a picture to a _language_ model's chat sends it to the model when
 the model reads pictures (see **Pictures in a chat**); otherwise the model is
@@ -4341,13 +4344,16 @@ contents.
 `size`, `output_format` (`png`, `jpeg`, `gif` or `webp`), `response_format: "b64_json"`
 — plus the knobs above per request (`steps`, `cfg_scale`,
 `negative_prompt`, `seed`) and, in place of OpenAI's multipart
-`/v1/images/edits`, an `image` (a `data:` URL or bare base64 of a PNG,
-JPEG, GIF, WebP or SVG) with a `strength` to start from. `stream: true` reports a
-step at a time. `POST /v1/chat/completions` on an image server answers the
-last user message with the picture as a markdown image over a `data:` URL
-— which any chat client that renders markdown shows inline — and takes a
-picture from an `image_url` content part. Both are documented field by
-field in the _HTTP endpoints_ chapter.
+`/v1/images/edits`, an `image` or an `images` list (a `data:` URL or
+bare base64 of a PNG, JPEG, GIF, WebP or SVG; see the _HTTP endpoints_
+chapter for limits; more than one is currently rejected) with a
+`strength` to start from. `stream: true` reports a step at a time.
+`POST /v1/chat/completions` on an image server answers the last user
+message with the picture as a markdown image over a `data:` URL —
+which any chat client that renders markdown shows inline — and collects
+all `image_url` content parts in order (more than one is currently
+rejected). Both are documented field by field in the _HTTP endpoints_
+chapter.
 
 ## Video generation
 

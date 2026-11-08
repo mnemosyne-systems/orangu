@@ -19,7 +19,7 @@
 //! `response_format`) plus what a local diffusion model has knobs for and
 //! OpenAI's schema has no word for: `steps`, `cfg_scale`, `negative_prompt`,
 //! `seed`, and — in place of the separate multipart `/v1/images/edits` —
-//! an `image` (a data URL or bare base64 of a PNG, JPEG, GIF, WebP or SVG) with a
+//! an `image` or an `images` list (data URLs or bare base64 of PNG, JPEG, GIF, WebP or SVG) with a
 //! `strength`, which starts the picture from that one. The answer is
 //! OpenAI's `{"created", "data": [{"b64_json"}]}`; there is no `url` form,
 //! since this server keeps nothing to link to.
@@ -58,6 +58,15 @@ pub const MAX_IMAGE_BYTES: usize = 50 * 1024 * 1024;
 /// the JSON around it.
 pub const IMAGE_BODY_LIMIT: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4 + 1024 * 1024;
 
+/// The maximum number of initial/reference images allowed per request.
+pub const MAX_INIT_IMAGES: usize = 4;
+
+/// The aggregate byte cap for all decoded initial/reference images in one request (100 MB).
+pub const MAX_AGGREGATE_IMAGE_BYTES: usize = 100 * 1024 * 1024;
+
+/// The aggregate pixel cap across all initial/reference images in one request (32 MP).
+pub const MAX_AGGREGATE_PIXELS: usize = 32 * 1024 * 1024;
+
 #[derive(Deserialize, Default)]
 pub struct ImageGenerationRequest {
     #[serde(default)]
@@ -84,6 +93,9 @@ pub struct ImageGenerationRequest {
     /// A picture to start from: a `data:` URL or bare base64.
     #[serde(default)]
     image: Option<String>,
+    /// Pictures to start from: an ordered list of `data:` URLs or bare base64 strings.
+    #[serde(default)]
+    images: Option<Vec<String>>,
     #[serde(default)]
     strength: Option<f32>,
     #[serde(default)]
@@ -237,7 +249,16 @@ pub struct ImageParams<'a> {
     pub cfg_scale: Option<f32>,
     /// A picture to start from, already decoded from its transport.
     pub init: Option<(String, Vec<u8>)>,
+    /// Pictures to start from, already decoded from their transport.
+    pub inits: Vec<(String, Vec<u8>)>,
     pub strength: Option<f32>,
+    /// Whether the pipeline supports multiple reference images.
+    pub supports_multi_reference: bool,
+}
+
+/// Whether a pipeline supports multiple reference images.
+pub fn supports_multi_reference(pipeline: &Pipeline) -> bool {
+    pipeline.supports_multi_reference()
 }
 
 /// One data URL (`data:image/png;base64,...`) or bare base64 string to its
@@ -282,6 +303,96 @@ pub fn decode_image_payload(payload: &str) -> Result<(String, Vec<u8>), String> 
     Ok((mime, bytes))
 }
 
+/// Validates decoded initial/reference images against count, individual and aggregate
+/// size and pixel caps, and decodability.
+/// Errors name the image index where applicable.
+pub fn validate_init_images(images: &[(String, Vec<u8>)]) -> Result<(), String> {
+    if images.len() > MAX_INIT_IMAGES {
+        return Err(format!(
+            "at most {MAX_INIT_IMAGES} images are supported, but {} were provided",
+            images.len()
+        ));
+    }
+    if images.len() <= 1 {
+        if let Some((_, bytes)) = images.first()
+            && bytes.len() > MAX_IMAGE_BYTES
+        {
+            return Err(format!(
+                "image is larger than the {} MB this server takes",
+                MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
+        }
+        return Ok(());
+    }
+
+    let mut total_bytes = 0usize;
+    let mut total_pixels = 0usize;
+    for (i, (_, bytes)) in images.iter().enumerate() {
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(format!(
+                "image at index {i} is larger than the {} MB this server takes",
+                MAX_IMAGE_BYTES / (1024 * 1024)
+            ));
+        }
+        let (w, h) = codec::dimensions(bytes)
+            .map_err(|err| format!("image at index {i}: invalid image dimensions: {err}"))?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        total_pixels = total_pixels.saturating_add(w.saturating_mul(h));
+    }
+    if total_bytes > MAX_AGGREGATE_IMAGE_BYTES {
+        return Err(format!(
+            "total image bytes ({total_bytes}) exceed the cap of {} MB",
+            MAX_AGGREGATE_IMAGE_BYTES / (1024 * 1024)
+        ));
+    }
+    if total_pixels > MAX_AGGREGATE_PIXELS {
+        return Err(format!(
+            "total image pixels ({total_pixels}) exceed the cap of {MAX_AGGREGATE_PIXELS}"
+        ));
+    }
+    Ok(())
+}
+
+/// Validates that both `image` and `images` are not simultaneously supplied.
+pub fn check_request_image_conflict(
+    image: Option<&str>,
+    images: Option<&[String]>,
+) -> Result<(), &'static str> {
+    if image.is_some() && images.is_some() {
+        return Err(
+            "cannot provide both 'image' and 'images'; use 'images' for multiple pictures or 'image' for a single picture",
+        );
+    }
+    Ok(())
+}
+
+/// Decodes and validates image payloads (data URLs or bare base64).
+/// Reuses [`decode_image_payload`] and [`validate_init_images`], naming the image index on error.
+pub fn validate_and_decode_image_payloads<S: AsRef<str>>(
+    payloads: &[S],
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    if payloads.len() > MAX_INIT_IMAGES {
+        return Err(format!(
+            "at most {MAX_INIT_IMAGES} images are supported, but {} were provided",
+            payloads.len()
+        ));
+    }
+    let multiple = payloads.len() > 1;
+    let mut decoded = Vec::with_capacity(payloads.len());
+    for (i, payload) in payloads.iter().enumerate() {
+        let item = decode_image_payload(payload.as_ref()).map_err(|err| {
+            if multiple {
+                format!("image at index {i}: {err}")
+            } else {
+                err
+            }
+        })?;
+        decoded.push(item);
+    }
+    validate_init_images(&decoded)?;
+    Ok(decoded)
+}
+
 /// Resolves the parameters into a request, or the reason they cannot be.
 /// `unit` is the pixels a side must be a multiple of — the pipeline's
 /// [`Pipeline::size_unit`].
@@ -293,21 +404,37 @@ pub fn build_request(
     if params.prompt.trim().is_empty() {
         return Err("prompt is required".to_string());
     }
+    let raw_inits: Vec<(String, Vec<u8>)> = if !params.inits.is_empty() {
+        params.inits.clone()
+    } else if let Some(init) = &params.init {
+        vec![init.clone()]
+    } else {
+        Vec::new()
+    };
+    validate_init_images(&raw_inits)?;
+    if raw_inits.len() > 1 && !params.supports_multi_reference {
+        return Err(format!(
+            "{} images were sent, but this model does not support multiple reference images yet; send one image",
+            raw_inits.len()
+        ));
+    }
+    let inits: Vec<InitImage> = raw_inits
+        .into_iter()
+        .map(|(_, bytes)| InitImage {
+            bytes,
+            strength: params.strength.unwrap_or(defaults.strength),
+        })
+        .collect();
+    let init = inits.first().cloned();
     let format = match params.output_format {
         Some(name) => ImageFormat::parse(name)
             .ok_or_else(|| format!("output_format '{name}' is not png, jpeg, gif or webp"))?,
         None => params
-            .init
-            .as_ref()
+            .inits
+            .first()
+            .or(params.init.as_ref())
             .and_then(|(mime, _)| ImageFormat::from_mime(mime))
             .unwrap_or(defaults.format),
-    };
-    let init = match &params.init {
-        Some((_, bytes)) => Some(InitImage {
-            bytes: bytes.clone(),
-            strength: params.strength.unwrap_or(defaults.strength),
-        }),
-        None => None,
     };
     if let Some(strength) = params.strength
         && !(0.0..=1.0).contains(&strength)
@@ -322,7 +449,7 @@ pub fn build_request(
                     format!("size '{size}' is not WIDTHxHEIGHT in multiples of {unit}")
                 })?
         }
-        _ => match &init {
+        _ => match inits.last() {
             // A picture to start from sets the proportions; the server's
             // configured size bounds the longer side.
             Some(init) => codec::dimensions(&init.bytes)
@@ -351,6 +478,7 @@ pub fn build_request(
         seed: params.seed,
         format,
         init,
+        inits,
     })
 }
 
@@ -440,12 +568,19 @@ pub async fn generations(
     if n == 0 || n > 10 {
         return (StatusCode::BAD_REQUEST, "n must be between 1 and 10").into_response();
     }
-    let init = match req.image.as_deref() {
-        Some(payload) => match decode_image_payload(payload) {
-            Ok(init) => Some(init),
-            Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
-        },
-        None => None,
+    if let Err(err) = check_request_image_conflict(req.image.as_deref(), req.images.as_deref()) {
+        return (StatusCode::BAD_REQUEST, err).into_response();
+    }
+    let payloads: Vec<&str> = if let Some(images) = &req.images {
+        images.iter().map(String::as_str).collect()
+    } else if let Some(image) = &req.image {
+        vec![image.as_str()]
+    } else {
+        Vec::new()
+    };
+    let inits = match validate_and_decode_image_payloads(&payloads) {
+        Ok(inits) => inits,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
     let request = match build_request(
         &pipeline.defaults(),
@@ -458,8 +593,10 @@ pub async fn generations(
             seed: req.seed,
             steps: req.steps,
             cfg_scale: req.cfg_scale,
-            init,
+            init: inits.first().cloned(),
+            inits,
             strength: req.strength,
+            supports_multi_reference: supports_multi_reference(&pipeline),
         },
     ) {
         Ok(request) => request,
@@ -605,7 +742,9 @@ mod tests {
             steps: None,
             cfg_scale: None,
             init: None,
+            inits: Vec::new(),
             strength: None,
+            supports_multi_reference: false,
         }
     }
 
@@ -712,5 +851,200 @@ mod tests {
             markdown_image(&image, "a [cat]\nhere"),
             "![a  cat  here](data:image/png;base64,AQID)"
         );
+    }
+
+    #[test]
+    fn single_image_behavior_is_identical() {
+        let defaults = ImageDefaults {
+            width: 512,
+            height: 512,
+            ..ImageDefaults::default()
+        };
+        let feature =
+            crate::engine::image::vae::Feature::new(200, 400, 3, vec![0.0; 200 * 400 * 3]);
+        let jpeg = codec::encode(&feature, ImageFormat::Jpeg).unwrap();
+
+        // Single image passed via `init`
+        let mut p1 = params("brighter");
+        p1.init = Some(("image/jpeg".into(), jpeg.clone()));
+        let r1 = build_request(&defaults, 16, p1).unwrap();
+        assert_eq!(r1.format, ImageFormat::Jpeg);
+        assert_eq!((r1.width, r1.height), (400, 208));
+        assert!(r1.init.is_some());
+        assert_eq!(r1.inits.len(), 1);
+        assert_eq!(r1.init.as_ref().unwrap().strength, defaults.strength);
+        assert_eq!(r1.inits[0].strength, defaults.strength);
+
+        // Single image passed via `inits`
+        let mut p2 = params("brighter");
+        p2.inits = vec![("image/jpeg".into(), jpeg)];
+        let r2 = build_request(&defaults, 16, p2).unwrap();
+        assert_eq!(r2.format, ImageFormat::Jpeg);
+        assert_eq!((r2.width, r2.height), (400, 208));
+        assert!(r2.init.is_some());
+        assert_eq!(r2.inits.len(), 1);
+        assert_eq!(r1.width, r2.width);
+        assert_eq!(r1.height, r2.height);
+    }
+
+    #[test]
+    fn both_image_fields_set_is_rejected() {
+        let err = check_request_image_conflict(
+            Some("data:image/png;base64,AQID"),
+            Some(&["data:image/png;base64,AQID".into()]),
+        )
+        .unwrap_err();
+        assert!(err.contains("cannot provide both 'image' and 'images'"));
+
+        assert!(check_request_image_conflict(Some("a"), None).is_ok());
+        assert!(check_request_image_conflict(None, Some(&["b".into()])).is_ok());
+        assert!(check_request_image_conflict(None, None).is_ok());
+    }
+
+    #[test]
+    fn more_than_four_images_is_rejected() {
+        let feature = crate::engine::image::vae::Feature::new(16, 16, 3, vec![0.0; 16 * 16 * 3]);
+        let png = codec::encode(&feature, ImageFormat::Png).unwrap();
+        let images: Vec<(String, Vec<u8>)> = (0..5)
+            .map(|_| ("image/png".to_string(), png.clone()))
+            .collect();
+        let err = validate_init_images(&images).unwrap_err();
+        assert!(err.contains("at most 4 images"));
+
+        let base64_png = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+        let payloads: Vec<String> = (0..5).map(|_| base64_png.clone()).collect();
+        let err2 = validate_and_decode_image_payloads(&payloads).unwrap_err();
+        assert!(err2.contains("at most 4 images"));
+    }
+
+    #[test]
+    fn bad_image_at_index_n_names_index() {
+        let feature = crate::engine::image::vae::Feature::new(16, 16, 3, vec![0.0; 16 * 16 * 3]);
+        let png = codec::encode(&feature, ImageFormat::Png).unwrap();
+        let valid_payload = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&png)
+        );
+
+        // Bad base64 at index 2
+        let payloads = vec![
+            valid_payload.clone(),
+            valid_payload.clone(),
+            "data:image/png;base64,!!!not-base64".to_string(),
+        ];
+        let err = validate_and_decode_image_payloads(&payloads).unwrap_err();
+        assert!(err.contains("image at index 2"), "{err}");
+
+        // Bad dimensions/corrupt bytes at index 1 in validate_init_images
+        let images = vec![
+            ("image/png".to_string(), png),
+            ("image/png".to_string(), vec![0u8; 32]), // invalid png header
+        ];
+        let err2 = validate_init_images(&images).unwrap_err();
+        assert!(err2.contains("image at index 1"), "{err2}");
+
+        // Single payload error does not name an index (identical to main)
+        let single_err =
+            validate_and_decode_image_payloads(&["data:image/png;base64,!!!not-base64"])
+                .unwrap_err();
+        assert!(!single_err.contains("image at index"), "{single_err}");
+    }
+
+    #[test]
+    fn single_image_over_32mp_with_explicit_size_is_accepted() {
+        let defaults = ImageDefaults {
+            width: 512,
+            height: 512,
+            ..ImageDefaults::default()
+        };
+        // A single SVG header declaring 7000x5000 = 35 MP (> 32 MP cap)
+        let svg_35mp =
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"7000\" height=\"5000\"></svg>"
+                .to_vec();
+        let mut p = params("landscape");
+        p.init = Some(("image/svg+xml".into(), svg_35mp));
+        p.size = Some("256x256");
+
+        let req = build_request(&defaults, 16, p)
+            .expect("single image with explicit size must not be rejected by pixel cap");
+        assert_eq!((req.width, req.height), (256, 256));
+    }
+
+    #[test]
+    fn two_images_exceeding_pixel_cap_are_rejected() {
+        // Two 5000x4000 (20 MP each) images total 40 MP, exceeding the 32 MP aggregate cap
+        let svg_20mp =
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"5000\" height=\"4000\"></svg>"
+                .to_vec();
+        let images = vec![
+            ("image/svg+xml".to_string(), svg_20mp.clone()),
+            ("image/svg+xml".to_string(), svg_20mp),
+        ];
+        let err = validate_init_images(&images).unwrap_err();
+        assert!(err.contains("total image pixels"), "{err}");
+        assert!(err.contains("exceed the cap"), "{err}");
+    }
+
+    #[test]
+    fn multiple_images_rejected_when_unsupported() {
+        let defaults = ImageDefaults::default();
+        let feature = crate::engine::image::vae::Feature::new(32, 32, 3, vec![0.0; 32 * 32 * 3]);
+        let png = codec::encode(&feature, ImageFormat::Png).unwrap();
+
+        let mut p = params("two images");
+        p.inits = vec![("image/png".into(), png.clone()), ("image/png".into(), png)];
+        p.supports_multi_reference = false;
+
+        let err = build_request(&defaults, 16, p).unwrap_err();
+        assert!(
+            err.contains("does not support multiple reference images"),
+            "{err}"
+        );
+        assert!(err.contains("2 images were sent"), "{err}");
+    }
+
+    #[test]
+    fn image_order_preserved_and_last_sets_auto_size() {
+        let defaults = ImageDefaults {
+            width: 512,
+            height: 512,
+            ..ImageDefaults::default()
+        };
+        // Image A: 100 wide x 200 high
+        let feat_a = crate::engine::image::vae::Feature::new(200, 100, 3, vec![0.0; 200 * 100 * 3]);
+        let png_a = codec::encode(&feat_a, ImageFormat::Png).unwrap();
+
+        // Image B: 400 wide x 200 high
+        let feat_b = crate::engine::image::vae::Feature::new(200, 400, 3, vec![0.0; 200 * 400 * 3]);
+        let png_b = codec::encode(&feat_b, ImageFormat::Png).unwrap();
+
+        let mut p = params("compare");
+        p.inits = vec![
+            ("image/png".into(), png_a.clone()),
+            ("image/png".into(), png_b.clone()),
+        ];
+        // Allow multi-reference to test order and size resolution
+        p.supports_multi_reference = true;
+
+        let req = build_request(&defaults, 16, p).unwrap();
+        // Order preserved:
+        assert_eq!(req.inits.len(), 2);
+        assert_eq!(req.inits[0].bytes, png_a);
+        assert_eq!(req.inits[1].bytes, png_b);
+
+        // Auto size derived from last image (Image B: 400x200 -> wider than tall)
+        assert_eq!((req.width, req.height), (400, 208));
+
+        // Explicit size overrides last image proportions
+        let mut p_override = params("compare");
+        p_override.inits = vec![("image/png".into(), png_a), ("image/png".into(), png_b)];
+        p_override.supports_multi_reference = true;
+        p_override.size = Some("256x256");
+
+        let req_override = build_request(&defaults, 16, p_override).unwrap();
+        assert_eq!((req_override.width, req_override.height), (256, 256));
     }
 }

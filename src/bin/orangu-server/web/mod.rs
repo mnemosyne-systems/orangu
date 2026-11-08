@@ -872,9 +872,9 @@ async fn send_message(
     }
 
     // Pictures go to disk beside the transcript now, so the turn persisted
-    // below — and every later visit — can show them; the bytes of the last
-    // one are also what an image model starts from.
-    let mut init_picture: Option<(String, Vec<u8>)> = None;
+    // below — and every later visit — can show them; their bytes in order
+    // are also what an image model starts from.
+    let mut init_pictures: Vec<(String, Vec<u8>)> = Vec::new();
     for att in extracted.iter_mut() {
         if let Some(bytes) = att.image_bytes.take() {
             let extension = match att.mime.as_str() {
@@ -889,12 +889,12 @@ async fn send_message(
                     return (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")).into_response();
                 }
             }
-            init_picture = Some((att.mime.clone(), bytes));
+            init_pictures.push((att.mime.clone(), bytes));
         }
     }
 
     if state.engine.image.is_some() {
-        return send_image_message(state, session, req.content, extracted, init_picture).await;
+        return send_image_message(state, session, req.content, extracted, init_pictures).await;
     }
     if state.engine.video.is_some() {
         return send_video_message(state, session, req.content, extracted).await;
@@ -1080,8 +1080,8 @@ async fn send_message(
     axum::response::sse::Sse::new(stream).into_response()
 }
 
-/// A chat turn on a `qwen_image` server: the message is the prompt, an
-/// attached picture is what the picture starts from, and the answer is the
+/// A chat turn on a `qwen_image` server: the message is the prompt, attached
+/// pictures in order are what the picture starts from, and the answer is the
 /// picture — kept as a file beside the transcript and written into the
 /// assistant's message as a markdown image, so a reload renders it the same
 /// way the live turn did.
@@ -1096,7 +1096,7 @@ async fn send_image_message(
     mut session: Session,
     user_message: String,
     user_attachments: Vec<Attachment>,
-    init_picture: Option<(String, Vec<u8>)>,
+    init_pictures: Vec<(String, Vec<u8>)>,
 ) -> axum::response::Response {
     let Some(pipeline) = state.engine.image.clone() else {
         return (StatusCode::NOT_IMPLEMENTED, "not an image model").into_response();
@@ -1112,8 +1112,10 @@ async fn send_image_message(
             seed: None,
             steps: None,
             cfg_scale: None,
-            init: init_picture,
+            init: init_pictures.first().cloned(),
+            inits: init_pictures,
             strength: None,
+            supports_multi_reference: pipeline.supports_multi_reference(),
         },
     ) {
         Ok(request) => request,

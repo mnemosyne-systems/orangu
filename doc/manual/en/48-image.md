@@ -396,7 +396,10 @@ the prompt edits it — see **Editing a picture** above. With Qwen-Image
 attachment rather than from noise, running *Strength* of the schedule — a
 rough sketch redrawn as a painting, or a photograph in another style.
 Either way the picture keeps the attachment's proportions and comes back
-in its format.
+in its format. One picture can be attached; attaching several is
+currently rejected (the limits are described under
+*POST /v1/images/generations* in the *HTTP endpoints* chapter, and
+support for models with reference conditioning follows).
 
 A long picture can be stopped with the console's Stop button, or by
 closing the tab: the work ends within seconds, at the next transformer
@@ -416,12 +419,15 @@ Everything the console does, a client can:
 
 - `POST /v1/images/generations` is OpenAI's Images API with the local
   model's knobs added (`size`, `steps`, `cfg_scale`, `negative_prompt`,
-  `seed`, `output_format`, and an `image` with `strength` to start
-  from). `stream: true` sends a progress event per step, the first one
-  — step 0 — carrying the estimate before any work.
+  `seed`, `output_format`, and an `image` or `images` list with
+  `strength` to start from; see the *HTTP endpoints* chapter for limits;
+  more than one is currently rejected). `stream: true` sends a progress
+  event per step, the first one — step 0 — carrying the estimate before
+  any work.
 - `POST /v1/chat/completions` on the same server treats the last user
-  message as the prompt, and its last `image_url` part as the picture to
-  start from; the answer is the picture as a markdown image.
+  message as the prompt, and collects all `image_url` parts in order as
+  pictures to start from (the same limits apply; more than one is
+  currently rejected); the answer is the picture as a markdown image.
 - `GET /props` reports the companions, the adapter, the defaults, the
   measured rate and what a picture costs at it; `POST /props` sets the
   defaults — it is what the Image pane's Save calls.

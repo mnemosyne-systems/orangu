@@ -681,6 +681,9 @@ pub struct ImageRequest {
     pub format: ImageFormat,
     /// A picture to start from, for image-to-image.
     pub init: Option<InitImage>,
+    /// Pictures to start from, for image-to-image and multi-reference editing.
+    #[allow(dead_code)]
+    pub inits: Vec<InitImage>,
 }
 
 #[derive(Debug, Clone)]
@@ -1481,6 +1484,12 @@ impl Pipeline {
     /// drawn over from a noised copy of it (`strength`).
     pub fn edits(&self) -> bool {
         self.vision.is_some()
+    }
+
+    /// Whether this pipeline supports multiple reference images.
+    /// In PR 1 this returns false on all models; PR 2 will wire this to `self.edits()`.
+    pub fn supports_multi_reference(&self) -> bool {
+        false
     }
 
     /// An attached picture prepared for editing a `(width, height)`
@@ -2518,6 +2527,7 @@ mod tests {
                     seed: Some(1),
                     format: ImageFormat::Png,
                     init: None,
+                    inits: Vec::new(),
                 },
                 &mut |p| {
                     steps_seen = p.step;
