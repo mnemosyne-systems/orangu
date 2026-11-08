@@ -126,20 +126,8 @@ pub(crate) struct TerminalUiGuard {
 
 impl TerminalUiGuard {
     pub(crate) fn new(mouse_capture: bool) -> Result<Self> {
-        enable_raw_mode()?;
-        if mouse_capture {
-            execute!(
-                std::io::stdout(),
-                crossterm::event::EnableMouseCapture,
-                EnterAlternateScreen
-            )?;
-        } else {
-            execute!(std::io::stdout(), EnterAlternateScreen)?;
-        }
-        let _ = execute!(
-            std::io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        );
+        MOUSE_CAPTURE.store(mouse_capture, Ordering::Relaxed);
+        enter_ui_modes()?;
         let backend = CrosstermBackend::new(std::io::stdout());
         let terminal = Terminal::new(backend)?;
         Ok(Self {
@@ -155,6 +143,16 @@ impl TerminalUiGuard {
         &mut self,
         render: impl FnOnce(&mut ratatui::Frame),
     ) -> std::io::Result<ratatui::CompletedFrame<'_>> {
+        // Something else had the screen (the external editor): a blank frame
+        // first, so the real one paints every cell rather than the difference
+        // from the frame before the editor.
+        if REPAINT.swap(false, Ordering::Relaxed) {
+            execute!(
+                std::io::stdout(),
+                crossterm::terminal::Clear(crossterm::terminal::ClearType::All)
+            )?;
+            self.terminal.draw(|_| {})?;
+        }
         self.terminal.draw(|frame| {
             render(frame);
             orangu::tui::selection::finish_frame(frame.buffer_mut());
@@ -249,23 +247,147 @@ impl Drop for TerminalUiGuard {
         use std::io::Write;
         print!("\x1b]111\x07\x1b]110\x07\x1b]112\x07");
         let _ = std::io::stdout().flush();
-
-        if self.mouse_capture {
-            let _ = execute!(
-                std::io::stdout(),
-                crossterm::event::DisableMouseCapture,
-                PopKeyboardEnhancementFlags,
-                LeaveAlternateScreen
-            );
-        } else {
-            let _ = execute!(
-                std::io::stdout(),
-                PopKeyboardEnhancementFlags,
-                LeaveAlternateScreen
-            );
-        }
-        let _ = disable_raw_mode();
+        debug_assert_eq!(self.mouse_capture, MOUSE_CAPTURE.load(Ordering::Relaxed));
+        leave_ui_modes();
     }
+}
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Whether the full-screen UI captures the mouse, for leaving and re-entering
+/// its terminal modes around the external editor.
+static MOUSE_CAPTURE: AtomicBool = AtomicBool::new(false);
+/// The next frame repaints the whole screen.
+static REPAINT: AtomicBool = AtomicBool::new(false);
+
+/// Raw mode, the alternate screen, bracketed paste, disambiguated keys and,
+/// when configured, mouse capture.
+fn enter_ui_modes() -> Result<()> {
+    enable_raw_mode()?;
+    if MOUSE_CAPTURE.load(Ordering::Relaxed) {
+        execute!(
+            std::io::stdout(),
+            crossterm::event::EnableMouseCapture,
+            EnterAlternateScreen
+        )?;
+    } else {
+        execute!(std::io::stdout(), EnterAlternateScreen)?;
+    }
+    let _ = execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    Ok(())
+}
+
+fn leave_ui_modes() {
+    if MOUSE_CAPTURE.load(Ordering::Relaxed) {
+        let _ = execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    }
+    let _ = execute!(
+        std::io::stdout(),
+        crossterm::event::DisableBracketedPaste,
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen
+    );
+    let _ = disable_raw_mode();
+}
+
+/// Open `text` in `$VISUAL`, `$EDITOR` or `vi` on this terminal, as bash's
+/// Ctrl+X Ctrl+E does, and return what was saved without its trailing line
+/// breaks. `None` when the editor fails or the saved text is blank.
+pub(crate) fn edit_text_externally(text: &str) -> Result<Option<String>> {
+    let editor = ["VISUAL", "EDITOR"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "vi".to_string());
+    let words = crate::commands::shell_words(&editor)?;
+    let (program, args) = words
+        .split_first()
+        .ok_or_else(|| anyhow!("the editor command is empty"))?;
+
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let path =
+        std::env::temp_dir().join(format!("orangu-prompt-{}-{stamp}.md", std::process::id()));
+    std::fs::write(&path, text).with_context(|| format!("failed to write {}", path.display()))?;
+
+    leave_ui_modes();
+    let status = std::process::Command::new(program)
+        .args(args)
+        .arg(&path)
+        .status();
+    let restored = enter_ui_modes();
+    REPAINT.store(true, Ordering::Relaxed);
+
+    let saved = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    restored?;
+    let status = status.with_context(|| format!("failed to run the editor '{program}'"))?;
+    if !status.success() {
+        return Ok(None);
+    }
+    let saved = saved.with_context(|| format!("failed to read {}", path.display()))?;
+    let saved = saved.trim_end_matches(['\n', '\r']);
+    Ok((!saved.trim().is_empty()).then(|| saved.to_string()))
+}
+
+/// Events typed out from a bracketed paste, waiting to be read.
+static TYPED_PASTE: std::sync::Mutex<std::collections::VecDeque<Event>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// `crossterm::event::poll` that also sees a paste still being typed out.
+pub(crate) fn poll_typed_event(timeout: std::time::Duration) -> std::io::Result<bool> {
+    let queued = TYPED_PASTE.lock().is_ok_and(|queue| !queue.is_empty());
+    if queued {
+        return Ok(true);
+    }
+    crossterm::event::poll(timeout)
+}
+
+/// Read the next event for a screen that takes keys only: a bracketed paste is
+/// typed out one key at a time, each line break as Enter.
+pub(crate) fn read_typed_event() -> std::io::Result<Event> {
+    if let Some(event) = TYPED_PASTE
+        .lock()
+        .ok()
+        .and_then(|mut queue| queue.pop_front())
+    {
+        return Ok(event);
+    }
+    match crossterm::event::read()? {
+        Event::Paste(text) => {
+            let mut keys = paste_as_keys(&text);
+            let first = keys.pop_front();
+            if let Ok(mut queue) = TYPED_PASTE.lock() {
+                queue.extend(keys);
+            }
+            match first {
+                Some(event) => Ok(event),
+                None => read_typed_event(),
+            }
+        }
+        event => Ok(event),
+    }
+}
+
+fn paste_as_keys(text: &str) -> std::collections::VecDeque<Event> {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    crate::input::pasted_text(text)
+        .chars()
+        .map(|ch| {
+            let code = match ch {
+                '\n' => KeyCode::Enter,
+                '\t' => KeyCode::Tab,
+                ch => KeyCode::Char(ch),
+            };
+            Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+        })
+        .collect()
 }
 
 // Currently unused; kept for callers that need to drop out of raw mode

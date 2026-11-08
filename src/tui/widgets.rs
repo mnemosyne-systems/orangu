@@ -190,10 +190,24 @@ pub struct PromptFrameWidget<'a> {
 
 impl<'a> PromptFrameWidget<'a> {
     /// The input rows themselves — identical in both frames, apart from how
-    /// many columns the surrounding chrome leaves for them.
-    fn input_lines(&self, content_width: usize, ghost_color: Color) -> Vec<Line<'static>> {
+    /// many columns the surrounding chrome leaves for them. At most `visible`
+    /// rows are drawn, scrolled to keep the cursor in view.
+    fn input_lines(
+        &self,
+        content_width: usize,
+        visible: usize,
+        ghost_color: Color,
+    ) -> Vec<Line<'static>> {
         let input_lines_wrapped =
             crate::tui::screen::wrapped_input_lines(self.input, content_width, self.prompt_prefix);
+        let (cursor_row, _) = crate::tui::screen::cursor_position(
+            self.input,
+            self.cursor,
+            content_width,
+            self.prompt_prefix,
+        );
+        let first_shown =
+            crate::tui::screen::input_scroll_row(cursor_row, input_lines_wrapped.len(), visible);
         let prompt_width = self.prompt_prefix.chars().count();
         let cmd_len = self.valid_command_len;
         let last_input_index = input_lines_wrapped.len().saturating_sub(1);
@@ -228,6 +242,9 @@ impl<'a> PromptFrameWidget<'a> {
                 spans.push(Span::raw(content.clone()));
             }
             char_offset += used_width;
+            if index < first_shown || index >= first_shown + visible.max(1) {
+                continue;
+            }
 
             let used = used_width + prompt_width;
 
@@ -254,7 +271,8 @@ impl<'a> PromptFrameWidget<'a> {
         let separator = "\u{2501}".repeat(width);
 
         let mut lines = vec![Line::from(separator.clone())];
-        lines.extend(self.input_lines(width, GHOST_TEXT));
+        let visible = usize::from(area.height.saturating_sub(3));
+        lines.extend(self.input_lines(width, visible, GHOST_TEXT));
         lines.push(Line::from(separator));
         lines.push(status_line(
             width,
@@ -274,7 +292,8 @@ impl<'a> PromptFrameWidget<'a> {
     /// the branch, which this frame keeps out of the prompt prefix.
     fn render_modern(self, area: Rect, buf: &mut Buffer, theme: &Theme) {
         let width = area.width as usize;
-        let lines = self.input_lines(width.saturating_sub(4), Color::DarkGray);
+        let visible = usize::from(area.height.saturating_sub(3));
+        let lines = self.input_lines(width.saturating_sub(4), visible, Color::DarkGray);
 
         // The box takes everything but the last row, which the status line gets
         // to itself — the same split the classic frame makes below its second

@@ -442,8 +442,16 @@ impl OutputState {
         );
     }
 
+    /// Echo a submitted prompt; the lines after the first of a multi-line
+    /// prompt line up under its text, past the `> ` marker.
     pub fn push_input(&mut self, text: &str) {
-        self.push_lines(std::iter::once(TranscriptLine::UserInput(text.to_owned())));
+        let mut lines = text.split('\n');
+        let first = lines.next().unwrap_or_default();
+        let indent = if first.starts_with("> ") { "  " } else { "" };
+        self.push_lines(
+            std::iter::once(TranscriptLine::UserInput(first.to_owned()))
+                .chain(lines.map(|line| TranscriptLine::UserInput(format!("{indent}{line}")))),
+        );
     }
 
     pub fn push_lines<I>(&mut self, lines: I)
@@ -726,6 +734,8 @@ pub struct InputState {
     pub dropdown: Option<DropdownState>,
     pub reverse_search: Option<ReverseSearchState>,
     pub last_mouse_click: Option<(std::time::Instant, u16, u16)>,
+    /// Ctrl+X was pressed and waits for the second key of its chord.
+    pub ctrl_x: bool,
 }
 
 impl InputState {
@@ -746,6 +756,7 @@ impl InputState {
         self.history_draft.clear();
         self.dropdown = None;
         self.reverse_search = None;
+        self.ctrl_x = false;
     }
 
     pub fn set_buffer(&mut self, buffer: String) {
@@ -803,29 +814,57 @@ impl InputState {
         }
     }
 
+    /// Move to the start of the line the cursor is on.
     pub fn move_home(&mut self) {
-        self.cursor = 0;
+        self.cursor = line_start(&self.buffer, self.cursor);
         self.completion = None;
         self.ghost_index = 0;
     }
 
+    /// Move to the end of the line the cursor is on.
     pub fn move_end(&mut self) {
-        self.cursor = self.buffer.len();
+        self.cursor = line_end(&self.buffer, self.cursor);
         self.completion = None;
         self.ghost_index = 0;
     }
 
+    /// Delete from the cursor to the end of its line.
     pub fn kill_to_end(&mut self) {
-        self.buffer.truncate(self.cursor);
+        let end = line_end(&self.buffer, self.cursor);
+        self.buffer.drain(self.cursor..end);
         self.completion = None;
         self.ghost_index = 0;
     }
 
+    /// Delete from the start of the cursor's line to the cursor.
     pub fn kill_to_start(&mut self) {
-        self.buffer.drain(..self.cursor);
-        self.cursor = 0;
+        let start = line_start(&self.buffer, self.cursor);
+        self.buffer.drain(start..self.cursor);
+        self.cursor = start;
         self.completion = None;
         self.ghost_index = 0;
+    }
+
+    /// Insert a line break at the cursor.
+    pub fn insert_newline(&mut self) {
+        self.insert_char('\n');
+        self.dropdown = None;
+    }
+
+    /// Move to the same column on the previous line; `false` on the first line.
+    pub fn move_line_up(&mut self) -> bool {
+        let moved = cursor_line_up(&self.buffer, self.cursor);
+        let changed = moved != self.cursor;
+        self.cursor = moved;
+        changed
+    }
+
+    /// Move to the same column on the next line; `false` on the last line.
+    pub fn move_line_down(&mut self) -> bool {
+        let moved = cursor_line_down(&self.buffer, self.cursor);
+        let changed = moved != self.cursor;
+        self.cursor = moved;
+        changed
     }
 
     pub fn delete_prev_word(&mut self) {
@@ -1087,7 +1126,8 @@ pub fn handle_input_event_with_status(
         Event::Paste(text) => {
             interrupt_state.reset();
             output_state.reset_scroll();
-            input_state.insert_str(&text);
+            input_state.ctrl_x = false;
+            input_state.insert_str(&pasted_text(&text));
             reverse_search_requery(input_state, input_context.history);
             redraw = true;
         }
@@ -1111,6 +1151,23 @@ pub fn handle_input_event_with_status(
                     // below, which now holds an accepted match or what was typed.
                     ReverseSearchKey::Passthrough => {}
                 }
+            }
+
+            // Ctrl+X opens a chord: Ctrl+X Ctrl+E edits the prompt in the
+            // external editor; any other second key drops the chord and acts
+            // on its own.
+            let ctrl_only = modifiers == KeyModifiers::CONTROL;
+            if std::mem::take(&mut input_state.ctrl_x) {
+                if ctrl_only && code == KeyCode::Char('e') {
+                    interrupt_state.reset();
+                    return edit_prompt_externally(input_state, output_state);
+                }
+            } else if ctrl_only && code == KeyCode::Char('x') {
+                input_state.ctrl_x = true;
+                return InputEventResult {
+                    redraw: false,
+                    outcome: None,
+                };
             }
 
             match (code, modifiers) {
@@ -1204,6 +1261,23 @@ pub fn handle_input_event_with_status(
                         redraw: false,
                         outcome: Some(InputResult::Quit),
                     };
+                }
+                // Alt+Enter, Shift+Enter (where the terminal reports it) and
+                // Ctrl+J break the line; Enter alone submits.
+                (KeyCode::Enter, modifiers)
+                    if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT)
+                        && !modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    interrupt_state.reset();
+                    output_state.reset_scroll();
+                    input_state.insert_newline();
+                    redraw = true;
+                }
+                (KeyCode::Char('j'), KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    output_state.reset_scroll();
+                    input_state.insert_newline();
+                    redraw = true;
                 }
                 (KeyCode::Enter, KeyModifiers::NONE) => {
                     interrupt_state.reset();
@@ -1338,25 +1412,25 @@ pub fn handle_input_event_with_status(
                     output_state.line_down();
                     redraw = true;
                 }
+                // On a prompt of several lines, Up and Down move between
+                // them and reach the history only from the first or last.
                 (KeyCode::Up, _) => {
                     interrupt_state.reset();
                     if let Some(dropdown) = &mut input_state.dropdown {
                         dropdown.select_previous();
-                        redraw = true;
-                    } else {
+                    } else if !input_state.move_line_up() {
                         history_previous(input_state, input_context.history);
-                        redraw = true;
                     }
+                    redraw = true;
                 }
                 (KeyCode::Down, _) => {
                     interrupt_state.reset();
                     if let Some(dropdown) = &mut input_state.dropdown {
                         dropdown.select_next();
-                        redraw = true;
-                    } else {
+                    } else if !input_state.move_line_down() {
                         history_next(input_state, input_context.history);
-                        redraw = true;
                     }
+                    redraw = true;
                 }
                 (KeyCode::Tab, _) => {
                     interrupt_state.reset();
@@ -1529,6 +1603,40 @@ pub fn handle_input_event_with_status(
     InputEventResult {
         redraw,
         outcome: None,
+    }
+}
+
+/// A bracketed paste as prompt text: the terminal's carriage returns become
+/// line breaks, so a pasted block keeps its lines and never submits.
+pub(crate) fn pasted_text(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+/// Ctrl+X Ctrl+E: hand the prompt to the external editor and submit what it
+/// saves, as bash does. A failed or empty edit leaves the prompt as it was.
+fn edit_prompt_externally(
+    input_state: &mut InputState,
+    output_state: &mut OutputState,
+) -> InputEventResult {
+    match crate::terminal::edit_text_externally(input_state.as_str()) {
+        Ok(Some(text)) => {
+            input_state.clear();
+            InputEventResult {
+                redraw: true,
+                outcome: Some(InputResult::Submitted(text)),
+            }
+        }
+        Ok(None) => InputEventResult {
+            redraw: true,
+            outcome: None,
+        },
+        Err(err) => {
+            output_state.push_text(&format!("Could not edit the prompt: {err:#}"));
+            InputEventResult {
+                redraw: true,
+                outcome: None,
+            }
+        }
     }
 }
 
@@ -1940,6 +2048,58 @@ fn readline_word_end(buffer: &str, cursor: usize) -> usize {
     pos
 }
 
+/// Byte index of the start of the line containing `cursor`.
+pub(crate) fn line_start(text: &str, cursor: usize) -> usize {
+    text[..cursor.min(text.len())]
+        .rfind('\n')
+        .map(|index| index + 1)
+        .unwrap_or(0)
+}
+
+/// Byte index of the end of the line containing `cursor` (just before its
+/// `\n`, or the end of the text).
+pub(crate) fn line_end(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text[cursor..]
+        .find('\n')
+        .map(|index| cursor + index)
+        .unwrap_or(text.len())
+}
+
+/// The byte index `column` characters into `line`, or its end when shorter.
+fn column_index(line: &str, column: usize) -> usize {
+    line.char_indices()
+        .nth(column)
+        .map(|(index, _)| index)
+        .unwrap_or(line.len())
+}
+
+/// Move a byte cursor to the same column on the previous line (or its end
+/// when that line is shorter); the first line keeps the cursor put.
+pub(crate) fn cursor_line_up(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    let start = line_start(text, cursor);
+    if start == 0 {
+        return cursor;
+    }
+    let column = text[start..cursor].chars().count();
+    let previous_start = line_start(text, start - 1);
+    previous_start + column_index(&text[previous_start..start - 1], column)
+}
+
+/// Move a byte cursor to the same column on the next line (or its end when
+/// that line is shorter); the last line keeps the cursor put.
+pub(crate) fn cursor_line_down(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    let column = text[line_start(text, cursor)..cursor].chars().count();
+    let end = line_end(text, cursor);
+    if end == text.len() {
+        return cursor;
+    }
+    let next_start = end + 1;
+    next_start + column_index(&text[next_start..line_end(text, next_start)], column)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1948,6 +2108,23 @@ mod tests {
     use orangu::workspaces::WorkspacePlacement;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
+
+    #[test]
+    fn cursor_moves_between_lines_by_column() {
+        let text = "alpha\nbé\ngamma";
+        // Down from column 4 of "alpha" clamps to the end of the shorter "bé".
+        assert_eq!(cursor_line_down(text, 4), 6 + "bé".len());
+        // Up from "gamma" lands at the same column of "bé"; columns are
+        // characters, not bytes.
+        let gamma_start = text.find("gamma").unwrap();
+        assert_eq!(cursor_line_up(text, gamma_start + 1), 6 + 'b'.len_utf8());
+        // The first and last lines keep the cursor put.
+        assert_eq!(cursor_line_up(text, 2), 2);
+        assert_eq!(cursor_line_down(text, gamma_start + 1), gamma_start + 1);
+        // Line home/end stay within the line.
+        assert_eq!(line_start(text, 7), 6);
+        assert_eq!(line_end(text, 7), 6 + "bé".len());
+    }
 
     #[test]
     fn output_state_keeps_last_ten_thousand_lines() {
@@ -2593,6 +2770,111 @@ mod tests {
             matches!(result.outcome, Some(InputResult::Submitted(ref line)) if line == "/tasks"),
             "a complete command runs on the first Enter"
         );
+    }
+
+    #[test]
+    fn alt_enter_and_ctrl_j_break_the_line_and_enter_submits_it() {
+        let mut input_state = InputState::default();
+        input_state.set_buffer("first".to_string());
+        let result = press_with_history(&mut input_state, &[], KeyCode::Enter, KeyModifiers::ALT);
+        assert!(result.outcome.is_none());
+        input_state.insert_str("second");
+        let result = press_with_history(
+            &mut input_state,
+            &[],
+            KeyCode::Char('j'),
+            KeyModifiers::CONTROL,
+        );
+        assert!(result.outcome.is_none());
+        input_state.insert_str("third");
+        assert_eq!(input_state.as_str(), "first\nsecond\nthird");
+
+        let result = press_with_history(&mut input_state, &[], KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(result.outcome, Some(InputResult::Submitted(ref line)) if line == "first\nsecond\nthird")
+        );
+    }
+
+    #[test]
+    fn a_paste_keeps_its_line_breaks_and_does_not_submit() {
+        let workspace = tempdir().expect("workspace");
+        let mut input_state = InputState::default();
+        let result = handle_input_event(
+            Event::Paste("one\r\ntwo\rthree".to_string()),
+            &mut input_state,
+            &mut InterruptState::default(),
+            &mut OutputState::default(),
+            &mut ViewportState::new(80, 80, 24),
+            test_input_context(workspace.path()),
+        );
+        assert!(result.outcome.is_none());
+        assert_eq!(input_state.as_str(), "one\ntwo\nthree");
+    }
+
+    #[test]
+    fn up_and_down_walk_the_lines_before_the_history() {
+        let entries = history(&["older"]);
+        let mut input_state = InputState::default();
+        input_state.set_buffer("ab\ncd".to_string());
+
+        press_with_history(&mut input_state, &entries, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            input_state.as_str(),
+            "ab\ncd",
+            "Up first moves to the line above"
+        );
+        assert_eq!(input_state.cursor(), 2);
+        press_with_history(
+            &mut input_state,
+            &entries,
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        );
+        assert_eq!(input_state.cursor(), 5);
+        press_with_history(&mut input_state, &entries, KeyCode::Up, KeyModifiers::NONE);
+        press_with_history(&mut input_state, &entries, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(
+            input_state.as_str(),
+            "older",
+            "Up on the first line recalls history"
+        );
+    }
+
+    #[test]
+    fn home_end_and_kills_act_on_the_cursor_line() {
+        let mut input_state = InputState::default();
+        input_state.set_buffer("ab\ncd\nef".to_string());
+        input_state.cursor = 4; // between c and d
+        input_state.move_home();
+        assert_eq!(input_state.cursor(), 3);
+        input_state.move_end();
+        assert_eq!(input_state.cursor(), 5);
+        input_state.cursor = 4;
+        input_state.kill_to_end();
+        assert_eq!(input_state.as_str(), "ab\nc\nef");
+        input_state.kill_to_start();
+        assert_eq!(input_state.as_str(), "ab\n\nef");
+    }
+
+    #[test]
+    fn ctrl_x_then_another_key_drops_the_chord() {
+        let mut input_state = InputState::default();
+        let result = press_with_history(
+            &mut input_state,
+            &[],
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+        );
+        assert!(result.outcome.is_none());
+        assert!(input_state.ctrl_x);
+        press_with_history(
+            &mut input_state,
+            &[],
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        );
+        assert!(!input_state.ctrl_x);
+        assert_eq!(input_state.as_str(), "a", "the second key still types");
     }
 
     #[test]

@@ -911,7 +911,7 @@ pub(crate) fn run_review_mode(
         );
         std::io::stdout().flush()?;
 
-        let event = event::read()?;
+        let event = crate::terminal::read_typed_event()?;
         if crate::terminal::mouse_selection(&event).consumed() {
             continue;
         }
@@ -1206,8 +1206,8 @@ pub(crate) async fn run_review_request(
         tokio::select! {
             result = &mut future => return Ok(ReviewRequestOutcome::Completed(result)),
             _ = interval.tick() => {
-                while event::poll(std::time::Duration::ZERO)? {
-                    let event = event::read()?;
+                while crate::terminal::poll_typed_event(std::time::Duration::ZERO)? {
+                    let event = crate::terminal::read_typed_event()?;
                     if crate::terminal::mouse_selection(&event).consumed() {
                         continue;
                     }

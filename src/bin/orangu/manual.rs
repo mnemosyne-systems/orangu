@@ -25,7 +25,7 @@
 //! Enter jumps to the next match, Esc closes it.
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orangu::tui::{
     StatusFragment, Theme, prompt_prefix, review_pane_body_height,
     text::{clip_line, clip_ratatui_line},
@@ -590,7 +590,7 @@ pub fn run_manual_mode(
             draw_manual_screen(f, &state, viewport, chrome, &theme);
         })?;
 
-        let event = event::read()?;
+        let event = crate::terminal::read_typed_event()?;
         if crate::terminal::mouse_selection(&event).consumed() {
             continue;
         }

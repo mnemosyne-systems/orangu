@@ -375,7 +375,7 @@ pub fn main_screen_layout(
     let prompt_prefix = prompt_prefix();
     let input_lines =
         wrapped_input_lines(input, input_wrap_width(actual_width.max(1)), &prompt_prefix);
-    let prompt_frame_height = (input_lines.len() + 3) as u16;
+    let prompt_frame_height = (input_lines.len().min(max_input_rows(actual_height)) + 3) as u16;
     // The classic frame packs the screen edge to edge — banner at the top, the
     // prompt separator directly under the output; the modern frame breathes
     // with a blank row above the content and above the input box.
@@ -780,12 +780,15 @@ pub fn draw_screen(frame: &mut ratatui::Frame, args: ScreenRenderArgs<'_>) {
     // Set cursor position using Ratatui. Both frames start the input on the
     // row below their top edge (the classic separator, the modern border); only
     // the modern frame costs a column for its left border.
-    let (cr_offset, cc_offset) = cursor_position(
-        args.input,
-        args.cursor,
-        input_wrap_width(layout.padded_prompt_area.width as usize),
-        &prompt_prefix,
-    );
+    let wrap_width = input_wrap_width(layout.padded_prompt_area.width as usize);
+    let (cr_offset, cc_offset) =
+        cursor_position(args.input, args.cursor, wrap_width, &prompt_prefix);
+    let cr_offset = cr_offset
+        - input_scroll_row(
+            cr_offset,
+            wrapped_input_lines(args.input, wrap_width, &prompt_prefix).len(),
+            usize::from(layout.padded_prompt_area.height.saturating_sub(3)),
+        );
     let pf_input_start = layout.padded_prompt_area.y + 1;
     let pf_prompt_width = prompt_prefix.chars().count();
     let cr = pf_input_start as usize + cr_offset;
@@ -1328,8 +1331,38 @@ pub(crate) fn cursor_position(
     prompt_prefix: &str,
 ) -> (usize, usize) {
     let input_width = width.saturating_sub(prompt_prefix.chars().count()).max(1);
-    let prefix_chars = input[..cursor.min(input.len())].chars().count();
-    (prefix_chars / input_width, prefix_chars % input_width)
+    let cursor = cursor.min(input.len());
+    let line_start = input[..cursor].rfind('\n').map_or(0, |index| index + 1);
+    // Each earlier line takes the rows `wrapped_input_lines` gives it.
+    let rows_above: usize = match line_start {
+        0 => 0,
+        start => input[..start - 1]
+            .split('\n')
+            .map(|line| line.chars().count().div_ceil(input_width).max(1))
+            .sum(),
+    };
+    let prefix_chars = input[line_start..cursor].chars().count();
+    (
+        rows_above + prefix_chars / input_width,
+        prefix_chars % input_width,
+    )
+}
+
+/// The most rows the main prompt's input window takes on a screen `height`
+/// rows tall; a longer prompt scrolls inside it.
+pub fn max_input_rows(height: usize) -> usize {
+    (height / 2).max(3)
+}
+
+/// The first wrapped input row shown when `total` rows share `visible` rows,
+/// keeping the cursor's row in view.
+pub fn input_scroll_row(cursor_row: usize, total: usize, visible: usize) -> usize {
+    if visible == 0 || total <= visible {
+        return 0;
+    }
+    (cursor_row + 1)
+        .saturating_sub(visible)
+        .min(total - visible)
 }
 
 /// The input-window prompt marker, the same in every theme. The branch is no
@@ -1676,6 +1709,25 @@ mod tests {
         assert_eq!(input_left_inset(), 2);
 
         crate::tui::Theme::apply_named("classic").expect("restore classic");
+    }
+
+    #[test]
+    fn cursor_position_counts_the_rows_of_earlier_lines() {
+        // Width 6 leaves 4 columns after "> ": "abcdef" takes two rows.
+        assert_eq!(cursor_position("abcdef\nxy", 9, 6, "> "), (2, 2));
+        assert_eq!(cursor_position("a\n\nb", 3, 6, "> "), (2, 0));
+        assert_eq!(
+            wrapped_input_lines("abcdef\nxy", 6, "> ").len(),
+            cursor_position("abcdef\nxy", 9, 6, "> ").0 + 1
+        );
+    }
+
+    #[test]
+    fn input_scroll_keeps_the_cursor_row_in_view() {
+        assert_eq!(input_scroll_row(0, 3, 5), 0);
+        assert_eq!(input_scroll_row(9, 10, 4), 6);
+        assert_eq!(input_scroll_row(2, 10, 4), 0);
+        assert_eq!(input_scroll_row(5, 10, 4), 2);
     }
 
     #[test]

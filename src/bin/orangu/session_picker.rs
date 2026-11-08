@@ -24,7 +24,7 @@
 //! opens on.
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use orangu::tui::{Theme, text::clip_line};
 use ratatui::{
     layout::Rect,
@@ -283,7 +283,7 @@ fn pick_from(guard: &mut TerminalUiGuard, mut state: PickerState) -> Result<Opti
         state.clamp(rows);
         guard.draw(|frame| draw_picker(frame, &state, &theme))?;
 
-        let event = event::read()?;
+        let event = crate::terminal::read_typed_event()?;
         if mouse_selection(&event).consumed() {
             continue;
         }

@@ -3005,13 +3005,17 @@ fn resolve_existing_dir_arg(arg: &str) -> Option<PathBuf> {
     normalized.is_dir().then_some(normalized)
 }
 
+/// Stands for a line break inside a history entry, which the history file
+/// keeps one entry to a line.
+const HISTORY_LINE_BREAK: char = '\u{1e}';
+
 fn load_history(path: &Path) -> Result<Vec<String>> {
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(content
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
+            .map(|line| line.replace(HISTORY_LINE_BREAK, "\n"))
             .collect()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => {
@@ -3031,6 +3035,7 @@ fn append_history_entry(path: &Path, entry: &str) -> Result<()> {
         .append(true)
         .open(path)
         .with_context(|| format!("failed to open history file {}", path.display()))?;
+    let entry = entry.replace('\n', &HISTORY_LINE_BREAK.to_string());
     writeln!(file, "{entry}")
         .with_context(|| format!("failed to write history file {}", path.display()))
 }
@@ -3091,6 +3096,23 @@ mod tests {
 
     fn args(argv: &[&str]) -> Args {
         Args::parse_from(std::iter::once("orangu").chain(argv.iter().copied()))
+    }
+
+    #[test]
+    fn a_multi_line_prompt_is_one_history_entry() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("history");
+        super::append_history_entry(&path, "one line").unwrap();
+        super::append_history_entry(&path, "first\nsecond").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().lines().count(),
+            2,
+            "each entry keeps one line of the file"
+        );
+        assert_eq!(
+            super::load_history(&path).unwrap(),
+            vec!["one line".to_string(), "first\nsecond".to_string()]
+        );
     }
 
     #[test]

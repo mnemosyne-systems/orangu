@@ -266,13 +266,24 @@ Setting it for the **left** Option key alone is the usual choice: the
 bindings work, and the right Option key still types accented characters.
 The bindings that need it are the ones on this page and in the interactive
 tools — the manual viewer's `Alt+S`/`Alt+J`/`Alt+K`/`Alt+X`, the review
-screens' `Alt+X`, the prompt's `Alt+Backspace`/`Alt+D`, and the scrolling
+screens' `Alt+X`, the prompt's `Alt+Backspace`/`Alt+D`/`Alt+Enter`, and the scrolling
 and panning keys. `Ctrl+…` bindings are unaffected.
 
 ### Prompt editing
 
-- `Ctrl+A` or `Home` moves the cursor to the start of the input line
-- `Ctrl+E` or `End` moves the cursor to the end of the input line
+The prompt can hold several lines. `Enter` submits all of them; the keys below
+break the line instead:
+
+- `Alt+Enter` or `Ctrl+J` inserts a line break at the cursor; `Ctrl+J` works in every terminal without configuration
+- `Shift+Enter` inserts a line break in terminals that report it as a key of its own (kitty, WezTerm, foot, Ghostty)
+- `Ctrl+X Ctrl+E` opens the prompt in `$VISUAL`, or `$EDITOR`, or `vi`, on this terminal, as in bash. Saving and quitting submits what was saved; quitting without saving, or saving an empty file, leaves the prompt as it was
+- Pasted text is inserted at the cursor as it is, line breaks included, and never submits the prompt
+
+The input window grows with the prompt up to half the screen and then scrolls
+to keep the cursor in view. A multi-line prompt is one entry in the history.
+
+- `Ctrl+A` or `Home` moves the cursor to the start of the current line
+- `Ctrl+E` or `End` moves the cursor to the end of the current line
 - `Left` moves the cursor one character left
 - `Right` moves the cursor one character right
 - `Ctrl+Left` moves one word left using bash-style word boundaries
@@ -286,12 +297,11 @@ and panning keys. `Ctrl+…` bindings are unaffected.
 - `Ctrl+R` searches backward through the command history (see below)
 - `Alt+Backspace` deletes backward using bash-style word boundaries
 - `Alt+D` deletes forward using bash-style word boundaries
-- Pasted text is inserted at the current cursor position
 
 ### History and completion
 
-- `<ARROW_UP>` moves backward through command history
-- `<ARROW_DOWN>` moves forward through command history
+- `<ARROW_UP>` moves backward through command history; on a prompt of several lines it first moves the cursor up a line, and reaches the history from the first line
+- `<ARROW_DOWN>` moves forward through command history; on a prompt of several lines it first moves the cursor down a line, and reaches the history from the last line
 - History navigation preserves the current unfinished line as a draft and restores it when you move back out of history
 - `Ctrl+R` searches the command history backward, like the bash key of the same name, and does nothing when the history is empty:
   - The last command starting with the letters entered is previewed as grey ghost text after them, and `Tab` completes it into the line — the same key that accepts a command hint
@@ -429,7 +439,7 @@ With `word_wrap = on`, LLM, tool, and `/show_file` output wraps to the visible t
 - `Ctrl+B` while a subagent runs in the foreground moves it to the background: the request goes on without waiting for it, and its report arrives later (see **Background subagents and tasks** in the Tools chapter)
 - `Ctrl+C` once arms quit mode, shows a warning in the transcript, and clears the current input line
 - `Ctrl+C` again within 2 seconds exits the client
-- `Enter` submits the current input line
+- `Enter` submits the prompt, every line of it
 
 ## Built-in manual
 

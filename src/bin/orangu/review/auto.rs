@@ -2710,7 +2710,7 @@ pub(crate) fn run_auto_review_prestart(
         );
         std::io::stdout().flush()?;
 
-        let event = event::read()?;
+        let event = crate::terminal::read_typed_event()?;
         if crate::terminal::mouse_selection(&event).consumed() {
             continue;
         }
@@ -2985,8 +2985,8 @@ pub(crate) async fn run_auto_review_request(
                     "",
                     viewport.actual_width,
                 );
-                while event::poll(std::time::Duration::ZERO)? {
-                    let event = event::read()?;
+                while crate::terminal::poll_typed_event(std::time::Duration::ZERO)? {
+                    let event = crate::terminal::read_typed_event()?;
                     if crate::terminal::mouse_selection(&event).consumed() {
                         continue;
                     }
@@ -3109,63 +3109,6 @@ pub(crate) async fn run_auto_review_request(
     }
 }
 
-/// Byte index of the start of the logical line containing `cursor`.
-pub(crate) fn multiline_line_start(text: &str, cursor: usize) -> usize {
-    text[..cursor.min(text.len())]
-        .rfind('\n')
-        .map(|index| index + 1)
-        .unwrap_or(0)
-}
-
-/// Byte index of the end of the logical line containing `cursor` (just
-/// before its `\n`, or the end of the text).
-pub(crate) fn multiline_line_end(text: &str, cursor: usize) -> usize {
-    let cursor = cursor.min(text.len());
-    text[cursor..]
-        .find('\n')
-        .map(|index| cursor + index)
-        .unwrap_or(text.len())
-}
-
-/// Move a byte cursor to the same column on the previous logical line (or
-/// its end when that line is shorter); the first line keeps the cursor put.
-pub(crate) fn multiline_cursor_up(text: &str, cursor: usize) -> usize {
-    let cursor = cursor.min(text.len());
-    let line_start = multiline_line_start(text, cursor);
-    if line_start == 0 {
-        return cursor;
-    }
-    let column = text[line_start..cursor].chars().count();
-    let prev_start = multiline_line_start(text, line_start - 1);
-    let prev_line = &text[prev_start..line_start - 1];
-    prev_start
-        + prev_line
-            .char_indices()
-            .nth(column)
-            .map(|(index, _)| index)
-            .unwrap_or(prev_line.len())
-}
-
-/// Move a byte cursor to the same column on the next logical line (or its
-/// end when that line is shorter); the last line keeps the cursor put.
-pub(crate) fn multiline_cursor_down(text: &str, cursor: usize) -> usize {
-    let cursor = cursor.min(text.len());
-    let line_start = multiline_line_start(text, cursor);
-    let column = text[line_start..cursor].chars().count();
-    let line_end = multiline_line_end(text, cursor);
-    if line_end == text.len() {
-        return cursor;
-    }
-    let next_start = line_end + 1;
-    let next_line = &text[next_start..multiline_line_end(text, next_start)];
-    next_start
-        + next_line
-            .char_indices()
-            .nth(column)
-            .map(|(index, _)| index)
-            .unwrap_or(next_line.len())
-}
-
 /// Run the post-run auto review event loop — browsing the report — until the
 /// user exits with Alt+x or Esc Esc. Alt+j/Alt+k move through the files;
 /// Alt+a approves the highlighted file (dropping its findings from the
@@ -3237,7 +3180,7 @@ pub(crate) fn run_auto_review_browse(
         );
         std::io::stdout().flush()?;
 
-        let event = event::read()?;
+        let event = crate::terminal::read_typed_event()?;
         if crate::terminal::mouse_selection(&event).consumed() {
             continue;
         }
@@ -3363,18 +3306,13 @@ pub(crate) fn run_auto_review_browse(
                             (KeyCode::Left, _) => editor.move_left(),
                             (KeyCode::Right, _) => editor.move_right(),
                             (KeyCode::Up, _) => {
-                                editor.cursor = multiline_cursor_up(&editor.buffer, editor.cursor);
+                                editor.move_line_up();
                             }
                             (KeyCode::Down, _) => {
-                                editor.cursor =
-                                    multiline_cursor_down(&editor.buffer, editor.cursor);
+                                editor.move_line_down();
                             }
-                            (KeyCode::Home, _) => {
-                                editor.cursor = multiline_line_start(&editor.buffer, editor.cursor);
-                            }
-                            (KeyCode::End, _) => {
-                                editor.cursor = multiline_line_end(&editor.buffer, editor.cursor);
-                            }
+                            (KeyCode::Home, _) => editor.move_home(),
+                            (KeyCode::End, _) => editor.move_end(),
                             (KeyCode::Char(ch), false) if !alt => editor.insert_char(ch),
                             _ => {}
                         }
@@ -4238,33 +4176,6 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("see the spec")));
         assert!(lines.iter().all(|line| !line.contains('\n')));
-    }
-
-    #[test]
-    fn multiline_cursor_moves_between_logical_lines() {
-        use crate::review::{
-            multiline_cursor_down, multiline_cursor_up, multiline_line_end, multiline_line_start,
-        };
-
-        let text = "alpha\nbé\ngamma";
-        // Down from column 4 of "alpha" clamps to the end of the shorter "bé".
-        assert_eq!(multiline_cursor_down(text, 4), 6 + "bé".len());
-        // Up from "gamma" lands at the same column of "bé"; columns are
-        // characters, not bytes.
-        let gamma_start = text.find("gamma").unwrap();
-        assert_eq!(
-            multiline_cursor_up(text, gamma_start + 1),
-            6 + 'b'.len_utf8()
-        );
-        // The first and last lines keep the cursor put.
-        assert_eq!(multiline_cursor_up(text, 2), 2);
-        assert_eq!(
-            multiline_cursor_down(text, gamma_start + 1),
-            gamma_start + 1
-        );
-        // Line home/end stay within the logical line.
-        assert_eq!(multiline_line_start(text, 7), 6);
-        assert_eq!(multiline_line_end(text, 7), 6 + "bé".len());
     }
 
     #[test]
