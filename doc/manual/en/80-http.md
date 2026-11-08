@@ -788,8 +788,17 @@ curl -s localhost:8100/v1/images/generations -H 'Content-Type: application/json'
 | `steps` | `image_steps` | denoising steps |
 | `cfg_scale` | `image_cfg_scale` | classifier-free guidance; `1` runs the prompt alone, half the work |
 | `image` | — | a picture to start from — a `data:image/…;base64,…` URL or bare base64 of a PNG, JPEG, GIF, WebP or SVG. Resized to `size`. On a `qwen_image_2_1` server with a vision projector (`/props`' `image.vision`), the picture is **edited** by the prompt instead: read by the text encoder and kept wherever the prompt does not ask for a change |
+| `images` | — | an array of pictures, in order; use it instead of `image`; supplying both is an error |
 | `strength` | `image_strength` | with `image`: how much of the schedule to run, `0` (unchanged) to `1` (the picture's content is ignored). Not read for an edit |
 | `stream` | `false` | server-sent events instead of one body |
+
+A request takes at most 4 pictures (as `image` or in `images`). When more
+than one is provided, their combined size is capped at 100 MB and 32
+megapixels, and errors name the image (for example `image at index 2`).
+With `size` omitted or `auto`, the last image sets the proportions; an
+explicit size overrides. More than one image is currently rejected on
+every model; support for models with reference conditioning follows, and
+a single image is unaffected.
 
 The reply is OpenAI's: `{"created", "model", "data": [{"b64_json", …}]}`,
 with each picture also carrying `output_format`, `size`, `seed`, `steps`,
@@ -820,16 +829,18 @@ as `token_passes_per_second` (at the defaults' size) and
 and the rate model itself — see **`GET /props`** below.
 
 `POST /v1/chat/completions` on the same server draws from the last user
-message: its text is the prompt, and the last `image_url` part of an
+message: its text is the prompt, and all `image_url` parts of an
 array-shaped `content` (`{"type": "image_url", "image_url": {"url":
-"data:image/png;base64,…"}}`) is the picture to start from. Every knob is
-the server's `image_*` default except `seed`. The assistant's `content` is
-the picture as a markdown image over a `data:` URL, which a markdown-rendering
-chat client shows inline; `message.images` carries the same picture as
-`b64_json` with `mime`, `size`, `seed`, `steps` and `generation_ms` for a
-client that wants the bytes. Streamed, the chunks carry an empty `delta` and
-an `image_progress` object (`step`, `steps`, `eta_seconds`) until the final
-chunk delivers the content with `finish_reason: "stop"`.
+"data:image/png;base64,…"}}`) are collected in order as pictures to
+start from (the same limits apply; more than one is currently rejected).
+Every knob is the server's `image_*` default except `seed`. The
+assistant's `content` is the picture as a markdown image over a `data:`
+URL, which a markdown-rendering chat client shows inline;
+`message.images` carries the same picture as `b64_json` with `mime`,
+`size`, `seed`, `steps` and `generation_ms` for a client that wants the
+bytes. Streamed, the chunks carry an empty `delta` and an `image_progress`
+object (`step`, `steps`, `eta_seconds`) until the final chunk delivers
+the content with `finish_reason: "stop"`.
 
 #### `POST /v1/videos`
 
