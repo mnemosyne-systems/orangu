@@ -625,6 +625,18 @@ pub fn run_manual_mode(
         // Any key press clears the search notice from the status bar.
         state.notice = None;
 
+        // Outside the search window every key is a binding, so an Option
+        // character on a Mac is the Alt key it meant.
+        let (code, modifiers) = crate::option_keys::as_binding(
+            code,
+            modifiers,
+            crate::option_keys::ACTIVE,
+            state.search.is_none(),
+        );
+        if let Some(hint) = crate::option_keys::take_hint() {
+            state.notice = Some(hint);
+        }
+
         let alt =
             modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL);
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
@@ -672,15 +684,21 @@ pub fn run_manual_mode(
         }
         escape_cancel.reset();
 
+        // Each Alt binding has a Ctrl twin for terminals where Alt is hard
+        // to send.
+        let bound = alt || ctrl;
         match (code, alt) {
             (KeyCode::Char('x'), true) => return Ok(()),
             (KeyCode::Char('j'), true) => state.select_next(),
             (KeyCode::Char('k'), true) => state.select_prev(),
             (KeyCode::Char('s'), true) => state.search = Some(InputState::default()),
+            (KeyCode::Char('n'), false) if ctrl => state.select_next(),
+            (KeyCode::Char('p'), false) if ctrl => state.select_prev(),
+            (KeyCode::Char('f'), false) if ctrl => state.search = Some(InputState::default()),
             // Left-pane scrolling (Alt+arrows / PageUp/Down), mirroring
             // review mode.
-            (KeyCode::Up, true) => state.scroll = state.scroll.saturating_sub(1),
-            (KeyCode::Down, true) => state.scroll = state.scroll.saturating_add(1),
+            (KeyCode::Up, _) if bound => state.scroll = state.scroll.saturating_sub(1),
+            (KeyCode::Down, _) if bound => state.scroll = state.scroll.saturating_add(1),
             (KeyCode::PageUp, _) => state.scroll = state.scroll.saturating_sub(text_height),
             (KeyCode::PageDown, _) => state.scroll = state.scroll.saturating_add(text_height),
             // Move the highlighted line through the text, view following.

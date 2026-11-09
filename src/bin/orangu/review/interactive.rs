@@ -969,6 +969,16 @@ pub(crate) fn run_review_mode(
             _ => continue,
         };
 
+        // With nothing typed and no window open, a key is a binding, so an
+        // Option character on a Mac is the Alt key it meant.
+        let (code, modifiers) = crate::option_keys::as_binding(
+            code,
+            modifiers,
+            crate::option_keys::ACTIVE,
+            state.feedback.is_none()
+                && state.comment_editor.is_none()
+                && input_state.as_str().is_empty(),
+        );
         let alt =
             modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL);
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
@@ -1078,8 +1088,12 @@ pub(crate) fn run_review_mode(
 
         match (code, alt, ctrl) {
             (KeyCode::Char('x'), true, _) => return Ok(ReviewSignal::Exit),
-            (KeyCode::Char('j'), true, _) => state.select_next(),
-            (KeyCode::Char('k'), true, _) => state.select_prev(),
+            (KeyCode::Char('j'), true, _) | (KeyCode::Char('n'), false, true) => {
+                state.select_next()
+            }
+            (KeyCode::Char('k'), true, _) | (KeyCode::Char('p'), false, true) => {
+                state.select_prev()
+            }
             (KeyCode::Char('a'), true, _) => state.set_status(ReviewStatus::Approved),
             (KeyCode::Char('r'), true, _) => state.set_status(ReviewStatus::Rejected),
             (KeyCode::Char('c'), true, _) => state.open_comment_editor(body_height),
@@ -1223,6 +1237,12 @@ pub(crate) async fn run_review_request(
                         }
                         _ => continue,
                     };
+                    let (code, modifiers) = crate::option_keys::as_binding(
+                        code,
+                        modifiers,
+                        crate::option_keys::ACTIVE,
+                        true,
+                    );
                     let alt = modifiers.contains(KeyModifiers::ALT)
                         && !modifiers.contains(KeyModifiers::CONTROL);
                     if code == KeyCode::Char('x') && alt {

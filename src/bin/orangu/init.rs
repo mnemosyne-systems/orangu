@@ -233,6 +233,9 @@ pub async fn run_init() -> Result<()> {
     );
 
     report_optional_tools(&platform);
+    if crate::option_keys::ACTIVE {
+        println!("\n{}", option_key_advice());
+    }
 
     println!("\nConfiguration to write:\n");
     println!("{contents}");
@@ -281,6 +284,14 @@ pub async fn run_init() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// On a Mac, the terminal setting the `Alt+…` keys need.
+fn option_key_advice() -> &'static str {
+    "On a Mac, orangu's Alt+… keys are pressed with Option, and the terminal must send \
+     Option as Meta for them to work: in Terminal.app, Settings → Profiles → Keyboard → \
+     \"Use Option as Meta key\"; in iTerm2, Settings → Profiles → Keys → General → Left \
+     Option key → \"Esc+\". Other terminals are listed under \"Alt on macOS\" in /manual."
 }
 
 /// Print whether each optional external tool documented under "Optional

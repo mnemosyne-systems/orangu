@@ -258,15 +258,17 @@ pub fn help_text() -> &'static str {
 
 Natural-language forms such as `open README.md`, `list models`, `show information`, `list files`, `pull 58`, `log`, `git show abc1234`, `fetch`, `fetch upstream`, `add repository Jubilee101`, `add repository Jubilee101 muse`, `status`, `rebase`, `rebase origin/main`, `squash`, `merge feature/foo`, `grep <pattern>`, `find <pattern>`, `branch`, `list branches`, `checkout main`, `switch to main`, `create branch feature/x`, `rename to new-name`, `delete feature/foo`, `restore README.md`, `add README.md`, `remove README.md`, `move old.rs new.rs`, `cherry pick abc1234`, `commit "[#42] My feature"`, `amend "[#42] My feature"`, `push`, `force push`, `add comment on 51 "My comment"`, `comment on 48 with review`, `comment on 48 with auto review`, `comment on all merged.md`, `get comments for issue 51`, `get comments for pull request 58`, `review`, `auto review`, `create patch`, `fix review findings`, `find duplicates`, `export console`, `export review`, `export auto review`, `export duplicates`, `export statistics`, `show statistics`, `show schedule`, `license`, `use license MIT`, `create pull request`, `create issue Crash on startup`, `new issue Crash on startup`, `stash`, `stash pop`, `stash list`, `stash drop`, `bisect start`, `mark good`, `mark bad`, `bisect reset`, `init repo`, `prune session <uuid>`, `prune all`, `prune sessions older than <days>`, `prune sessions in <path>`, `restart`, `pending`, `workspace`, `workspace 1`, `switch workspace ~/project`, `create workspace ~/project`, `delete workspace`, `show manual`, and `show help` are also handled locally.
 
-The prompt uses standard Unix shell keys, including Ctrl+Left, Ctrl+Right, Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W, Alt+Backspace, Alt+D, and Tab completion.
+The prompt uses standard Unix shell keys, including Ctrl+Left, Ctrl+Right, Ctrl+A, Ctrl+E, Ctrl+K, Ctrl+U, Ctrl+W (or Alt+Backspace), Ctrl+Delete (or Alt+D), Alt+Enter or Ctrl+J for a line break, and Tab completion. Ctrl+PageUp / Ctrl+PageDown (or Alt+, / Alt+.) switch workspace tabs.
 
 Ctrl+R searches the command history backward like bash: the last command starting with the letters entered is previewed as grey ghost text, Tab completes it, typing narrows the search and Backspace widens it, Ctrl+R again steps to the next older match, Enter submits it, and Esc leaves the search.
 
 As you type, a grey inline hint previews the matching command (e.g. `q` suggests `quit`). Press Tab to accept it. When several commands match, Shift+Tab cycles the hint through them; Tab then accepts the one shown.
 
-Shift+PageUp / Shift+PageDown scrolls the output window by a full page. Alt+Up / Alt+Down scrolls one line at a time.
+Shift+PageUp / Shift+PageDown scrolls the output window by a full page. Ctrl+Up / Ctrl+Down (or Alt+Up / Alt+Down) scrolls one line at a time.
 
-/manual opens the built-in manual in a full-screen viewer: the text on the left, the table of contents on the right. Alt+J/Alt+K switch sections, Up/Down move the highlighted line, Alt+S opens a search window over the entire manual (Enter jumps to the next match, Esc closes it), Alt+Up/Alt+Down scroll, PageUp/PageDown page, Left/Right pan, and Alt+X (or Esc Esc) exits."#
+/manual opens the built-in manual in a full-screen viewer: the text on the left, the table of contents on the right. Alt+J/Alt+K (or Ctrl+N/Ctrl+P) switch sections, Up/Down move the highlighted line, Alt+S (or Ctrl+F) opens a search window over the entire manual (Enter jumps to the next match, Esc closes it), Alt+Up/Alt+Down (or Ctrl+Up/Ctrl+Down) scroll, PageUp/PageDown page, Left/Right pan, and Alt+X (or Esc Esc) exits.
+
+On a Mac, Alt is the Option key, and the terminal must send it as Meta; until it does, the Ctrl keys above work, and orangu reads the character Option types (ß for Option+S) as the Alt key where a key is expected rather than text. See "Alt on macOS" in /manual."#
 }
 
 pub(crate) fn indicator(status: ConnStatus) -> String {

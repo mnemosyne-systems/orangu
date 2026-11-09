@@ -1254,6 +1254,15 @@ pub fn handle_input_event_with_status(
                 };
             }
 
+            // On an empty prompt, `≤` and `≥` are a Mac's Option+, and
+            // Option+. (switch workspace tab), not text.
+            let (code, modifiers) = crate::option_keys::as_binding(
+                code,
+                modifiers,
+                crate::option_keys::ACTIVE,
+                input_state.as_str().is_empty() && matches!(code, KeyCode::Char('≤' | '≥')),
+            );
+
             match (code, modifiers) {
                 (KeyCode::Left, modifiers)
                     if modifiers.contains(KeyModifiers::CONTROL)
@@ -1389,6 +1398,23 @@ pub fn handle_input_event_with_status(
                     input_state.backspace();
                     redraw = true;
                 }
+                (KeyCode::Delete, KeyModifiers::CONTROL) => {
+                    interrupt_state.reset();
+                    input_state.delete_forward_readline_word();
+                    redraw = true;
+                }
+                (KeyCode::PageUp, KeyModifiers::CONTROL) => {
+                    return InputEventResult {
+                        redraw: false,
+                        outcome: Some(InputResult::WorkspacePrevious),
+                    };
+                }
+                (KeyCode::PageDown, KeyModifiers::CONTROL) => {
+                    return InputEventResult {
+                        redraw: false,
+                        outcome: Some(InputResult::WorkspaceNext),
+                    };
+                }
                 (KeyCode::Delete, _) | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                     interrupt_state.reset();
                     input_state.delete();
@@ -1481,12 +1507,16 @@ pub fn handle_input_event_with_status(
                         redraw = true;
                     }
                 }
-                (KeyCode::Up, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
+                (KeyCode::Up, modifiers)
+                    if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                {
                     interrupt_state.reset();
                     output_state.line_up();
                     redraw = true;
                 }
-                (KeyCode::Down, modifiers) if modifiers.contains(KeyModifiers::ALT) => {
+                (KeyCode::Down, modifiers)
+                    if modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+                {
                     interrupt_state.reset();
                     output_state.line_down();
                     redraw = true;

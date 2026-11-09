@@ -2760,8 +2760,13 @@ pub(crate) fn run_auto_review_prestart(
             }) if kind == KeyEventKind::Press || kind == KeyEventKind::Repeat => (code, modifiers),
             _ => continue,
         };
+        // Every key here is a binding: an Option character on a Mac is the
+        // Alt key it meant.
+        let (code, modifiers) =
+            crate::option_keys::as_binding(code, modifiers, crate::option_keys::ACTIVE, true);
         let alt =
             modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL);
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
         // A second Esc within the timeout leaves; the first arms it.
         if code == KeyCode::Esc {
@@ -2777,6 +2782,8 @@ pub(crate) fn run_auto_review_prestart(
             (KeyCode::Char('x'), true) => return Ok(PreStartOutcome::Exit),
             (KeyCode::Char('j'), true) => state.select_next(),
             (KeyCode::Char('k'), true) => state.select_prev(),
+            (KeyCode::Char('n'), false) if ctrl => state.select_next(),
+            (KeyCode::Char('p'), false) if ctrl => state.select_prev(),
             (KeyCode::Char('m'), true) => state.cycle_mode_selected(),
             // Alt+e opens the selected file's diff in `$EDITOR`, like `/diff`.
             (KeyCode::Char('e'), true) => {
@@ -3020,6 +3027,12 @@ pub(crate) async fn run_auto_review_request(
                         }
                         _ => continue,
                     };
+                    let (code, modifiers) = crate::option_keys::as_binding(
+                        code,
+                        modifiers,
+                        crate::option_keys::ACTIVE,
+                        true,
+                    );
                     let alt = modifiers.contains(KeyModifiers::ALT)
                         && !modifiers.contains(KeyModifiers::CONTROL);
                     if code == KeyCode::Esc {
@@ -3234,6 +3247,14 @@ pub(crate) fn run_auto_review_browse(
             }) if kind == KeyEventKind::Press || kind == KeyEventKind::Repeat => (code, modifiers),
             _ => continue,
         };
+        // With nothing typed and no window open, a key is a binding, so an
+        // Option character on a Mac is the Alt key it meant.
+        let (code, modifiers) = crate::option_keys::as_binding(
+            code,
+            modifiers,
+            crate::option_keys::ACTIVE,
+            state.diff_view.is_none() && state.reject.is_none() && input_state.as_str().is_empty(),
+        );
         let alt =
             modifiers.contains(KeyModifiers::ALT) && !modifiers.contains(KeyModifiers::CONTROL);
         let ctrl = modifiers.contains(KeyModifiers::CONTROL);
@@ -3333,8 +3354,12 @@ pub(crate) fn run_auto_review_browse(
 
         match (code, alt, ctrl) {
             (KeyCode::Char('x'), true, _) => return Ok(()),
-            (KeyCode::Char('j'), true, _) => state.select_next(),
-            (KeyCode::Char('k'), true, _) => state.select_prev(),
+            (KeyCode::Char('j'), true, _) | (KeyCode::Char('n'), false, true) => {
+                state.select_next()
+            }
+            (KeyCode::Char('k'), true, _) | (KeyCode::Char('p'), false, true) => {
+                state.select_prev()
+            }
             (KeyCode::Char('a'), true, _) => state.approve_selected(),
             (KeyCode::Char('r'), true, _) => state.open_reject(),
             (KeyCode::Char('e'), true, _) => {

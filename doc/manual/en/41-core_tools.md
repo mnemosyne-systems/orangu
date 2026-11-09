@@ -1192,8 +1192,8 @@ for these to work — see "Alt on macOS" in the Terminal section.
 
 | Key | Action |
 | --- | --- |
-| `Alt+j` | Select the next file (shows its diff in the left pane) |
-| `Alt+k` | Select the previous file (shows its diff in the left pane) |
+| `Alt+j` or `Ctrl+N` | Select the next file (shows its diff in the left pane) |
+| `Alt+k` or `Ctrl+P` | Select the previous file (shows its diff in the left pane) |
 | `Alt+a` | Mark the selected file approved (green dot) |
 | `Alt+r` | Mark the selected file rejected (red dot) |
 | `Alt+c` | Comment on the highlighted line — pick a category (`Tab` to focus it, `Up`/`Down` to move), `Enter` saves, `Esc` discards |
@@ -1290,7 +1290,7 @@ Unless you passed `immediate`, the view opens in a **pre-start phase**: the pane
 
 Before starting, you can prepare the run:
 
-- **`Alt+j`/`Alt+k`** move the highlight through the file list (like `/review`).
+- **`Alt+j`/`Alt+k`** (or `Ctrl+N`/`Ctrl+P`) move the highlight through the file list (like `/review`).
 - **`Alt+m`** (Mode) cycles the highlighted file through three modes, in order — **Normal → Deep → Ignore → Normal** — described in full below.
 - **`Alt+e`** (Diff) opens the highlighted file's diff in `$EDITOR`, like `/diff` for one file — orangu writes the file's unified diff to a temporary file and opens it in a separate window, so you can read what changed before deciding which mode to give it.
 
@@ -1373,7 +1373,7 @@ for these to work — see "Alt on macOS" in the Terminal section.
 | `Esc` `Esc` | Cancel the auto review (the collected report stays open) |
 | `Alt+x` | Exit auto review mode; the report is copied to the clipboard |
 | `Esc` `Esc` (after the run) | Exit auto review mode, like `Alt+x` |
-| `Alt+j` / `Alt+k` | Move the highlight through the file list (after the run) |
+| `Alt+j` / `Alt+k` or `Ctrl+N` / `Ctrl+P` | Move the highlight through the file list (after the run) |
 | `Alt+a` | Approve the highlighted file and drop its findings from the report |
 | `Alt+r` | Reject the highlighted file: pick a category, write a Markdown comment |
 | `Alt+e` | Open the highlighted file in your configured editor |

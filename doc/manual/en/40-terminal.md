@@ -344,8 +344,33 @@ Setting it for the **left** Option key alone is the usual choice: the
 bindings work, and the right Option key still types accented characters.
 The bindings that need it are the ones on this page and in the interactive
 tools — the manual viewer's `Alt+S`/`Alt+J`/`Alt+K`/`Alt+X`, the review
-screens' `Alt+X`, the prompt's `Alt+Backspace`/`Alt+D`/`Alt+Enter`, and the scrolling
+screens' `Alt+…` keys, the prompt's `Alt+Backspace`/`Alt+D`/`Alt+Enter`, and the scrolling
 and panning keys. `Ctrl+…` bindings are unaffected.
+
+Until the setting is changed, orangu helps in two ways:
+
+- The keys used most have a `Ctrl` twin that needs no setting:
+
+  | Alt key | Ctrl twin | where |
+  | :-- | :-- | :-- |
+  | `Alt+Enter` | `Ctrl+J` | prompt: line break |
+  | `Alt+Backspace` | `Ctrl+W` | prompt: delete the word before the cursor |
+  | `Alt+D` | `Ctrl+Delete` | prompt: delete the word after the cursor |
+  | `Alt+,` / `Alt+.` | `Ctrl+PageUp` / `Ctrl+PageDown` | prompt: previous / next workspace tab |
+  | `Alt+Up` / `Alt+Down` | `Ctrl+Up` / `Ctrl+Down` | prompt and manual: scroll one line |
+  | `Alt+J` / `Alt+K` | `Ctrl+N` / `Ctrl+P` | manual: next / previous section; review screens: next / previous file |
+  | `Alt+S` | `Ctrl+F` | manual: search |
+  | `Alt+X` | `Esc` `Esc` | manual and review screens: leave |
+
+- Where a screen expects a key rather than text, the character Option types is
+  read as the `Alt` key it came from: `ß` as `Alt+S`, `∆` as `Alt+J`, `≈` as
+  `Alt+X`, and so on for the US layout's letters, `≤` as `Alt+,` and `≥` as
+  `Alt+.`. That is everywhere in the manual viewer outside its search window,
+  in the review screens while nothing is typed in the input line and no
+  window is open, and for `≤`/`≥` on an empty prompt. The first time it
+  happens, the output window names the setting for the terminal in use.
+
+`orangu --init` mentions the setting when it runs on a Mac.
 
 ### Prompt editing
 
@@ -373,8 +398,8 @@ to keep the cursor in view. A multi-line prompt is one entry in the history.
 - `Ctrl+U` deletes from the start of the line to the cursor
 - `Ctrl+W` deletes from the cursor to the previous whitespace
 - `Ctrl+R` searches backward through the command history (see below)
-- `Alt+Backspace` deletes backward using bash-style word boundaries
-- `Alt+D` deletes forward using bash-style word boundaries
+- `Alt+Backspace` or `Ctrl+W` deletes backward using bash-style word boundaries
+- `Alt+D` or `Ctrl+Delete` deletes forward using bash-style word boundaries
 
 ### History and completion
 
@@ -479,8 +504,8 @@ Path-completion details:
 
 - `Shift+PageUp` scrolls backward through the output window by a full page
 - `Shift+PageDown` scrolls forward through the output window by a full page
-- `Alt+Up` scrolls backward one line at a time
-- `Alt+Down` scrolls forward one line at a time
+- `Alt+Up` or `Ctrl+Up` scrolls backward one line at a time
+- `Alt+Down` or `Ctrl+Down` scrolls forward one line at a time
 - `Ctrl+Home` jumps to the start of the output; `Ctrl+End` jumps back to the end, where new output appears
 - A scrollbar runs down the right edge of the output window whenever there is more output than fits; its thumb shows where the visible rows sit in the whole
 - The output scrollback buffer keeps the most recent 10,000 lines
@@ -547,11 +572,11 @@ Press `Esc` to close the search window; the highlighted line stays on the last m
 
 | Key | Action |
 | --- | --- |
-| `Alt+J` | Select the next section (shows its text in the left pane) |
-| `Alt+K` | Select the previous section |
-| `Alt+S` | Open the search window (`Enter` next match, `Esc` close) |
+| `Alt+J` or `Ctrl+N` | Select the next section (shows its text in the left pane) |
+| `Alt+K` or `Ctrl+P` | Select the previous section |
+| `Alt+S` or `Ctrl+F` | Open the search window (`Enter` next match, `Esc` close) |
 | `Up` / `Down` | Move the highlighted line through the text, view following |
-| `Alt+Up` / `Alt+Down` | Scroll the text one line at a time |
+| `Alt+Up` / `Alt+Down` or `Ctrl+Up` / `Ctrl+Down` | Scroll the text one line at a time |
 | `PageUp` / `PageDown` | Scroll the text by a full page |
 | `Left` / `Right` | Pan long lines horizontally |
 | `Alt+X` or `Esc` `Esc` | Leave the manual and return to the prompt |

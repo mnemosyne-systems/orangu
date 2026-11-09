@@ -77,8 +77,8 @@ At the prompt, the workspace tabs are driven by these keys:
 
 | Key | Action |
 | :-- | :-- |
-| `Alt+,` | Switch to the previous tab (to the left), wrapping |
-| `Alt+.` | Switch to the next tab (to the right), wrapping |
+| `Alt+,` or `Ctrl+PageUp` | Switch to the previous tab (to the left), wrapping |
+| `Alt+.` or `Ctrl+PageDown` | Switch to the next tab (to the right), wrapping |
 | `Alt+Insert` | Open a new workspace tab (re-point it with `/workspace`) |
 | `Alt+Delete` | Close the active tab |
 

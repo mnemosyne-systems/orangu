@@ -34,6 +34,7 @@ mod mentions;
 mod mode;
 mod models;
 mod oneshot;
+mod option_keys;
 mod quotes;
 mod render;
 mod review;
@@ -1622,6 +1623,11 @@ async fn run() -> Result<()> {
                 notification.status.name()
             ));
             pending_commands.push_back(PendingCommand::notification(notification.message()));
+        }
+
+        // An Option character read as an Alt key: say once how to fix Option.
+        if let Some(hint) = crate::option_keys::take_hint() {
+            output_state.push_text(&hint);
         }
 
         // Set when this iteration's command came from the scheduler: its `&&`
