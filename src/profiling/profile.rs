@@ -571,6 +571,316 @@ impl SystemRecorder {
     }
 }
 
+/// A capture of a command from its first instruction: `perf record -- cmd`.
+///
+/// [`Recorder`] attaches to a process that is already running, and so sees
+/// nothing of how it got there — a server's start-up, which is where a model
+/// load spends its time, has finished before there is a pid to attach to. Run
+/// under `perf`, every thread the command ever creates is sampled from birth.
+///
+/// Samples are stamped on `CLOCK_MONOTONIC` (`perf record -k`), the clock
+/// [`monotonic_seconds`] reads, so the caller can cut the capture into
+/// windows at moments it observed itself — when a log line arrived, when the
+/// server first answered — and get one profile per window from
+/// [`LaunchRecorder::finish`].
+pub struct LaunchRecorder {
+    perf: Child,
+    data: PathBuf,
+    stderr_log: PathBuf,
+    freq: u32,
+    call_graph: String,
+    png: bool,
+    keep_data: bool,
+}
+
+/// One stretch of a [`LaunchRecorder`] capture, in [`monotonic_seconds`].
+pub struct Window {
+    pub svg: PathBuf,
+    pub title: String,
+    pub from: f64,
+    pub to: f64,
+}
+
+impl LaunchRecorder {
+    /// Start `command` (a shell command line) under `perf record`. Its stdout
+    /// and stderr, merged, are handed back for the caller to read: `perf`'s
+    /// own messages go to a log beside `data` instead.
+    pub fn start(
+        command_line: &str,
+        data: &Path,
+        freq: u32,
+        call_graph: &str,
+        png: bool,
+        keep_data: bool,
+    ) -> anyhow::Result<(Self, std::process::ChildStdout)> {
+        if let Some(parent) = data.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let stderr_log = data.with_extension("log");
+        let log = std::fs::File::create(&stderr_log)?;
+        let mut command = Command::new("perf");
+        command
+            .args(["record", "-k", "CLOCK_MONOTONIC", "-F"])
+            .arg(freq.to_string())
+            .arg("-g")
+            .arg("--call-graph")
+            .arg(call_graph)
+            .arg("-o")
+            .arg(data)
+            .args(["--", "sh", "-c"])
+            // The workload inherits perf's stdout; its stderr is folded into
+            // it so one pipe carries every line it prints, in order.
+            .arg(format!("exec 2>&1; exec {command_line}"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::from(log));
+        #[cfg(target_os = "linux")]
+        crate::child::die_with_parent(&mut command, libc::SIGINT);
+        let mut perf = command
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("could not run `perf record`: {e}"))?;
+        let stdout = perf
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("`perf record` has no stdout"))?;
+        Ok((
+            Self {
+                perf,
+                data: data.to_path_buf(),
+                stderr_log,
+                freq,
+                call_graph: call_graph.to_string(),
+                png,
+                keep_data,
+            },
+            stdout,
+        ))
+    }
+
+    /// The command's own pid: `perf`'s child, once `sh` has exec'd it.
+    pub fn workload_pid(&self) -> Option<u32> {
+        child_pids(self.perf.id()).first().copied()
+    }
+
+    /// Whether the command (and so `perf`) has exited.
+    pub fn exited(&mut self) -> bool {
+        matches!(self.perf.try_wait(), Ok(Some(_)))
+    }
+
+    /// Stop the command, let `perf` write its data, and render one profile
+    /// per window.
+    ///
+    /// The command is sent `SIGTERM` and `perf`, which exits with its
+    /// workload, writes a complete file. A command that ignores it is killed
+    /// after `grace`.
+    pub fn finish(
+        mut self,
+        windows: &[Window],
+        grace: std::time::Duration,
+    ) -> anyhow::Result<Vec<Summary>> {
+        if !self.exited() {
+            let children = child_pids(self.perf.id());
+            for pid in &children {
+                signal(*pid, "-TERM");
+            }
+            let deadline = Instant::now() + grace;
+            while !self.exited() && Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if !self.exited() {
+                for pid in &children {
+                    signal(*pid, "-KILL");
+                }
+                signal(self.perf.id(), "-INT");
+            }
+        }
+        self.perf.wait()?;
+        if !self.data.exists() {
+            let why = std::fs::read_to_string(&self.stderr_log).unwrap_or_default();
+            anyhow::bail!("`perf record` failed: {}", why.trim().replace('\n', " "));
+        }
+        // No `cpu`: a recording of one command has no CPU attribute, and
+        // `perf script` refuses the whole field list for it.
+        let script = perf_script(
+            &self.data,
+            &[
+                "--no-inline",
+                "-F",
+                "comm,pid,tid,time,period,event,ip,sym,dso",
+            ],
+        )?;
+        let text = String::from_utf8_lossy(&script);
+        let own = std::cell::OnceCell::new();
+        let mut out = Vec::with_capacity(windows.len());
+        for window in windows {
+            let script = samples_between(&text, window.from, window.to);
+            let mut totals = flamegraph::collapse(&script);
+            if totals
+                .keys()
+                .any(|s| s.split(';').nth(1) == Some(flamegraph::LOST_STACK))
+            {
+                let own = match own.get() {
+                    Some(own) => own,
+                    None => {
+                        let g = perf_script(&self.data, &["-G", "-F", "comm,tid,time,ip,sym,dso"])?;
+                        own.get_or_init(|| flamegraph::own_frames(&String::from_utf8_lossy(&g)))
+                    }
+                };
+                totals = flamegraph::collapse_with(&script, own);
+            }
+            let folded = flamegraph::to_folded(&totals);
+            let seconds = (window.to - window.from).max(1e-3);
+            let opts = Options {
+                svg: window.svg.clone(),
+                pid: 0,
+                freq: self.freq,
+                call_graph: self.call_graph.clone(),
+                png: self.png,
+                title: window.title.clone(),
+                keep_data: self.keep_data,
+            };
+            let folded_path = sibling(&opts.svg, "folded");
+            std::fs::write(&folded_path, &folded)?;
+            let samples = attribution_samples(&folded);
+            let svg = render(&folded, &opts, seconds, samples)?;
+            let png = if self.png && samples > 0 {
+                render_png(&svg)?
+            } else {
+                None
+            };
+            let attribution = summarize(&folded);
+            let cores_busy = attribution.samples as f64 / (f64::from(self.freq) * seconds);
+            out.push(Summary {
+                svg,
+                folded: folded_path,
+                png,
+                data: self.keep_data.then(|| self.data.clone()),
+                samples: attribution.samples,
+                seconds,
+                cores_busy,
+                cores_from_proc: None,
+                gpu_wait: attribution.gpu_wait,
+                pool_idle: attribution.pool_idle,
+                buckets: attribution.buckets,
+                leaves: attribution.leaves,
+                lost_stacks: attribution.lost_stacks,
+            });
+        }
+        if !self.keep_data {
+            let _ = std::fs::remove_file(&self.data);
+            let _ = std::fs::remove_file(&self.stderr_log);
+        }
+        Ok(out)
+    }
+}
+
+/// `CLOCK_MONOTONIC` in seconds — the clock [`LaunchRecorder`] stamps its
+/// samples with.
+#[cfg(unix)]
+pub fn monotonic_seconds() -> f64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec for the duration of the call.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as f64 + ts.tv_nsec as f64 * 1e-9
+}
+
+/// No `clock_gettime` and no `perf` off Unix: the launch capture never runs.
+#[cfg(not(unix))]
+pub fn monotonic_seconds() -> f64 {
+    0.0
+}
+
+/// Bytes `pid` has caused to be fetched from storage, every thread included —
+/// `read_bytes` in `/proc/<pid>/io`, which counts page-fault reads of a mapped
+/// file as well as `read(2)`, and nothing the page cache already held.
+pub fn proc_read_bytes(pid: u32) -> Option<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/io"))
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("read_bytes:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Drop `path` — a file, or every file under a directory — from the page
+/// cache, so the next reader fetches it from storage. Returns the bytes
+/// covered. Only clean pages go; a file being written keeps its dirty ones.
+#[cfg(unix)]
+pub fn evict_from_page_cache(path: &Path) -> std::io::Result<u64> {
+    use std::os::unix::io::AsRawFd as _;
+    let meta = std::fs::metadata(path)?;
+    if meta.is_dir() {
+        let mut total = 0;
+        for entry in std::fs::read_dir(path)? {
+            total += evict_from_page_cache(&entry?.path()).unwrap_or(0);
+        }
+        return Ok(total);
+    }
+    let file = std::fs::File::open(path)?;
+    // SAFETY: a valid descriptor for the call's duration; offset 0, length 0
+    // means the whole file.
+    let rc = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc));
+    }
+    Ok(meta.len())
+}
+
+/// No `posix_fadvise` off Unix.
+#[cfg(not(unix))]
+pub fn evict_from_page_cache(_path: &Path) -> std::io::Result<u64> {
+    Err(std::io::Error::other(
+        "page-cache eviction needs posix_fadvise",
+    ))
+}
+
+/// The direct children of `pid`, from `/proc/<pid>/task/*/children`.
+fn child_pids(pid: u32) -> Vec<u32> {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return Vec::new();
+    };
+    tasks
+        .flatten()
+        .filter_map(|t| std::fs::read_to_string(t.path().join("children")).ok())
+        .flat_map(|s| {
+            s.split_whitespace()
+                .filter_map(|p| p.parse().ok())
+                .collect::<Vec<u32>>()
+        })
+        .collect()
+}
+
+fn signal(pid: u32, sig: &str) {
+    let _ = Command::new("kill")
+        .arg(sig)
+        .arg(pid.to_string())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// The samples of a `perf script` stream whose timestamp lies in
+/// `[from, to)`, each kept verbatim with its frames and trailing blank line.
+fn samples_between(script: &str, from: f64, to: f64) -> String {
+    let mut out = String::new();
+    let mut keep = false;
+    for line in script.lines() {
+        if !line.starts_with([' ', '\t']) && !line.trim().is_empty() {
+            keep = flamegraph::sample_time(line).is_some_and(|t| t >= from && t < to);
+        }
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// `(comm, pid)` from a `perf script` sample header of the form
 /// `comm pid/tid [cpu] time: …` — the comm may contain spaces, so it is
 /// everything before the first field that looks like a pid.
@@ -1218,6 +1528,26 @@ pub fn pid_listening_on(port: u16) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    /// A start-up phase is the samples stamped inside it, each kept whole
+    /// with its frames, and nothing from either side.
+    #[test]
+    fn samples_between_keeps_whole_samples_inside_the_window() {
+        let script = "orangu-server 10/10 1.000000: 1 cycles:P:\n\
+                      \t    1 early (/bin/x)\n\
+                      \n\
+                      orangu-server 10/11 2.500000: 1 cycles:P:\n\
+                      \t    2 inside (/bin/x)\n\
+                      \t    3 caller (/bin/x)\n\
+                      \n\
+                      orangu-server 10/10 4.000000: 1 cycles:P:\n\
+                      \t    4 late (/bin/x)\n";
+        let kept = super::samples_between(script, 2.0, 4.0);
+        assert!(kept.contains("inside") && kept.contains("caller"), "{kept}");
+        assert!(!kept.contains("early") && !kept.contains("late"), "{kept}");
+        let folded = crate::profiling::flamegraph::collapse(&kept);
+        assert_eq!(folded.get("orangu-server;caller;inside"), Some(&1));
+    }
+
     /// A kept recording (`ORANGU_PERF_DATA`, from `--flamegraph-keep-data`)
     /// collapsed the way the recorder collapses it: the share of samples
     /// whose stack did not unwind, and the heaviest leaf frames — what a

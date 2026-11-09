@@ -30,6 +30,7 @@ use rayon::prelude::*;
 
 pub const GGML_TYPE_F32: u32 = 0;
 pub const GGML_TYPE_F16: u32 = 1;
+pub const GGML_TYPE_Q8_0: u32 = 8;
 pub const GGML_TYPE_Q2_K: u32 = 10;
 pub const GGML_TYPE_Q3_K: u32 = 11;
 pub const GGML_TYPE_Q4_K: u32 = 12;
@@ -74,7 +75,7 @@ pub fn block_size(ggml_type: u32) -> usize {
         | GGML_TYPE_Q8_K | GGML_TYPE_IQ2_XXS | GGML_TYPE_IQ2_XS | GGML_TYPE_IQ2_S
         | GGML_TYPE_IQ3_XXS | GGML_TYPE_IQ3_S | GGML_TYPE_IQ1_S | GGML_TYPE_IQ1_M
         | GGML_TYPE_IQ4_XS => QK_K,
-        GGML_TYPE_IQ4_NL => QK,
+        GGML_TYPE_IQ4_NL | GGML_TYPE_Q8_0 => QK,
         _ => 1,
     }
 }
@@ -91,6 +92,7 @@ pub fn type_name(ggml_type: u32) -> &'static str {
         GGML_TYPE_I16 => "I16",
         GGML_TYPE_I32 => "I32",
         GGML_TYPE_I64 => "I64",
+        GGML_TYPE_Q8_0 => "Q8_0",
         GGML_TYPE_Q2_K => "Q2_K",
         GGML_TYPE_Q3_K => "Q3_K",
         GGML_TYPE_Q4_K => "Q4_K",
@@ -123,6 +125,7 @@ pub fn row_bytes(ggml_type: u32, ncols: usize) -> usize {
         GGML_TYPE_Q5_K => ncols / QK_K * (2 + 2 + 12 + QK_K / 8 + QK_K / 2),
         GGML_TYPE_Q6_K => ncols / QK_K * (QK_K / 2 + QK_K / 4 + QK_K / 16 + 2),
         GGML_TYPE_IQ4_NL => ncols / QK * (2 + QK / 2),
+        GGML_TYPE_Q8_0 => ncols / QK * (2 + QK),
         GGML_TYPE_IQ4_XS => ncols / QK_K * (2 + 2 + QK_K / 64 + QK_K / 2),
         _ => 0,
     }
@@ -164,6 +167,7 @@ pub fn encode_chunk(ggml_type: u32, values: &[f32]) -> Vec<u8> {
         GGML_TYPE_Q5_K => blocks(values, QK_K, quantize_q5_k),
         GGML_TYPE_Q6_K => blocks(values, QK_K, quantize_q6_k),
         GGML_TYPE_IQ4_NL => blocks(values, QK, quantize_iq4_nl),
+        GGML_TYPE_Q8_0 => blocks(values, QK, quantize_q8_0),
         GGML_TYPE_IQ4_XS => blocks(values, QK_K, quantize_iq4_xs),
         _ => {
             debug_assert!(false, "no encoder for ggml type {ggml_type}");
@@ -938,6 +942,19 @@ fn fit_codebook_scale(x: &[f32], levels: &mut [u8], tries: i32) -> f32 {
 /// 32 values, one `f16` scale, and 4-bit indices into the non-linear
 /// codebook. The only 32-wide type here, and so the one a row that does not
 /// divide 256 falls back to.
+/// `Q8_0`: an `f16` scale, the block's largest magnitude over 127, then the
+/// 32 values divided by it and rounded to `i8`.
+fn quantize_q8_0(block: &[f32], out: &mut Vec<u8>) {
+    let mut values = [0.0f32; QK];
+    let n = block.len().min(QK);
+    values[..n].copy_from_slice(&block[..n]);
+    let amax = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let d = amax / 127.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    out.extend_from_slice(&f16::from_f32(d).to_le_bytes());
+    out.extend(values.iter().map(|v| (v * id).round() as i8 as u8));
+}
+
 fn quantize_iq4_nl(block: &[f32], out: &mut Vec<u8>) {
     let mut values = [0.0f32; QK];
     let n = block.len().min(QK);
@@ -1070,4 +1087,30 @@ fn fit_signed_scale(x: &[f32], nmax: i32, quants: &mut [i8]) -> f32 {
     }
 
     if suml2 > 0.0 { sumlx / suml2 } else { 0.0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `Q8_0` block is the scale as `f16`, then each value over it,
+    /// rounded: the largest magnitude lands on ±127 and the row's bytes are
+    /// what `row_bytes` says.
+    #[test]
+    fn q8_0_scales_the_largest_value_to_127() {
+        let values: Vec<f32> = (0..64).map(|i| i as f32 - 31.0).collect();
+        let bytes = encode(GGML_TYPE_Q8_0, &values, 64);
+        assert_eq!(bytes.len(), row_bytes(GGML_TYPE_Q8_0, 64));
+        let d = f16::from_le_bytes([bytes[0], bytes[1]]).to_f32();
+        assert!((d - 31.0 / 127.0).abs() < 1e-3, "{d}");
+        assert_eq!(bytes[2] as i8, -127);
+        assert_eq!(bytes[2 + 31] as i8, 0);
+        // The second block runs 1..=32: its largest value is 32.
+        let q = &bytes[34 + 2..];
+        assert_eq!(q[31] as i8, 127);
+        for (i, &b) in q.iter().enumerate() {
+            let back = (b as i8) as f32 * (32.0 / 127.0);
+            assert!((back - (i as f32 + 1.0)).abs() <= 0.5 * 32.0 / 127.0 + 1e-2);
+        }
+    }
 }

@@ -56,7 +56,7 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--streams-depth|--interference|--chat|--chat-fixture|--kl|--kl-rows|--kl-top|--kl-tokens|--kl-text|--perplexity|--ppl-ctx|--ppl-chunks|--hellaswag|--winogrande|--score-tasks|--score-rows|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--streams-depth|--interference|--chat|--chat-fixture|--kl|--kl-rows|--kl-top|--kl-tokens|--kl-text|--perplexity|--ppl-ctx|--ppl-chunks|--hellaswag|--winogrande|--score-tasks|--score-rows|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--startup|--startup-gap|--startup-evict|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
             return 0
             ;;
     esac
@@ -69,6 +69,7 @@ _orangu_bench() {
              --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels --chart-grid --chart-overlay \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png --flamegraph-keep-data \
              --flamegraph-layers --flamegraph-duration --flamegraph-watch \
+             --startup --startup-gap --startup-evict \
              --compare-profiles --bundle --read-bundle --sweep --sweep-cmd --sweep-env --sweep-start-timeout \
              --render-profile --report --web --host --port --delay --temperature --workers -s --shell-completions -h --help -V --version" -- "$cur") )
         return 0
@@ -169,6 +170,9 @@ _orangu_bench() {
         '--flamegraph-layers[Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR]:dir:_files -/' \
         '--flamegraph-duration[Seconds to keep sampling under --flamegraph-layers or --flamegraph-watch]:seconds:' \
         '--flamegraph-watch[With --flamegraph, profile the server while something else drives it]' \
+        '--startup[Start CMD under perf and profile it until --url answers]:command:' \
+        '--startup-gap[Shortest silence between two --startup log lines that gets its own flamegraph]:seconds:' \
+        '--startup-evict[Files or directories to drop from the page cache before --startup]:paths:_files' \
         '--compare-profiles[Compare already-collapsed .folded profiles side by side; measure nothing]:list:_files' \
         '--bundle[Write the whole run — measurements, configuration, host — to one JSON file]:path:_files' \
         '--read-bundle[Read bundles and report them side by side; measure nothing]:list:_files' \
@@ -280,6 +284,9 @@ complete -c orangu-bench -l flamegraph-keep-data      -d 'Keep the raw perf.data
 complete -c orangu-bench -l flamegraph-layers      -r -d 'Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR'
 complete -c orangu-bench -l flamegraph-duration    -x -d 'Seconds to keep sampling under --flamegraph-layers or --flamegraph-watch'
 complete -c orangu-bench -l flamegraph-watch          -d 'With --flamegraph, profile the server while something else drives it'
+complete -c orangu-bench -l startup                -x -d 'Start CMD under perf and profile it until --url answers'
+complete -c orangu-bench -l startup-gap            -x -d 'Shortest silence between two --startup log lines that gets its own flamegraph'
+complete -c orangu-bench -l startup-evict          -r -d 'Files or directories to drop from the page cache before --startup'
 complete -c orangu-bench -l compare-profiles       -r -d 'Compare already-collapsed .folded profiles side by side; measure nothing'
 complete -c orangu-bench -l bundle                 -r -d 'Write the whole run — measurements, configuration, host — to one JSON file'
 complete -c orangu-bench -l read-bundle            -r -d 'Read bundles and report them side by side; measure nothing'
@@ -400,6 +407,9 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--flamegraph-layers', 'Profile every running orangu, orangu-coordinator and orangu-server while you drive the workload; one flamegraph per process in DIR'),
         @('--flamegraph-duration', 'Seconds to keep sampling under --flamegraph-layers or --flamegraph-watch'),
         @('--flamegraph-watch', 'With --flamegraph, profile the server while something else drives it'),
+        @('--startup', 'Start CMD under perf and profile it until --url answers'),
+        @('--startup-gap', 'Shortest silence between two --startup log lines that gets its own flamegraph'),
+        @('--startup-evict', 'Files or directories to drop from the page cache before --startup'),
         @('--compare-profiles', 'Compare already-collapsed .folded profiles side by side; measure nothing'),
         @('--bundle', 'Write the whole run - measurements, configuration, host - to one JSON file'),
         @('--read-bundle', 'Read bundles and report them side by side; measure nothing'),
@@ -433,7 +443,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         { $_ -in '--history', '--chart', '--table', '--storage-file', '--download-dir', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--streams-depth', '--interference', '--chat', '--chat-fixture', '--kl', '--kl-rows', '--kl-top', '--kl-tokens', '--kl-text', '--perplexity', '--ppl-ctx', '--ppl-chunks', '--hellaswag', '--winogrande', '--score-tasks', '--score-rows', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--streams-depth', '--interference', '--chat', '--chat-fixture', '--kl', '--kl-rows', '--kl-top', '--kl-tokens', '--kl-text', '--perplexity', '--ppl-ctx', '--ppl-chunks', '--hellaswag', '--winogrande', '--score-tasks', '--score-rows', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--startup', '--startup-gap', '--startup-evict', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

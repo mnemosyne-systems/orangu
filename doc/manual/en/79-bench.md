@@ -1434,6 +1434,9 @@ Options:
       --flamegraph-layers <DIR>        Profile every running orangu, orangu-coordinator and orangu-server for `--flamegraph-duration` while you drive the workload; one flamegraph per process in DIR. Measures nothing itself.
       --flamegraph-duration <SECONDS>  Seconds to keep sampling under `--flamegraph-layers` or `--flamegraph-watch` [default: 60]
       --flamegraph-watch               With `--flamegraph PATH`: profile the server for `--flamegraph-duration` while something else drives it. Measures nothing itself.
+      --startup <CMD>                  Start CMD under perf and profile it until --url answers; one flamegraph per silence in its log
+      --startup-gap <SECONDS>          Shortest silence between two `--startup` log lines that gets its own flamegraph [default: 2]
+      --startup-evict <LIST>           Files or directories to drop from the page cache before `--startup`, for a cold start
       --compare-profiles <LIST>        Compare already-collapsed `.folded` profiles side by side; measure nothing
       --bundle <PATH>                  Write the whole run — measurements, configuration, host — to one JSON file
       --read-bundle <LIST>             Read bundles and report them side by side; measure nothing
@@ -1734,6 +1737,52 @@ orangu -p "Hello, who are you ?"
 It attaches to one process (`perf record -p`), so it works under
 `kernel.perf_event_paranoid = 2`, where `--flamegraph-layers` — which samples
 the whole machine to catch processes started mid-window — is refused.
+
+### Profiling a server's start-up (`--startup`)
+
+`--flamegraph` and `--flamegraph-watch` attach to a server that is already
+answering, so neither sees how it got there. `--startup CMD` starts the server
+itself, under `perf record`, so every thread it creates is sampled from its
+first instruction. The capture ends when `--url` first answers `/health`; the
+server is then stopped.
+
+A load is a sequence of phases, and the server prints a line as each one ends.
+Every line is stamped on the clock the samples carry, and each silence of
+`--startup-gap` seconds or more becomes a phase with its own flamegraph
+(`NAME-phaseN.svg`), beside one of the whole start-up (`NAME.svg`). The
+timeline the phases are cut from is written to `NAME.log`.
+
+```sh
+orangu-bench --startup "orangu-server --image qwen-image-2.1-turbo-Q4_K_M.gguf --web 0" \
+    --flamegraph startup.svg --flamegraph-freq 299
+```
+
+```
+  answers http://127.0.0.1:8100/health after 75.6s — timeline in startup.log
+  5 silences of 2s or more cover 69.7s (92%):
+  read 9637 MiB from storage (127 MiB/s), 144.2 CPU seconds (1.91 cores) — per /proc
+     #     from       to     secs  cores   read MiB   MiB/s  until
+     3      9.8     18.5      8.7   5.04        648      75  [image] VAE placement: …
+     5     33.7     75.5     41.8   0.43       7245     173  [kv] paged cache — …
+```
+
+A flamegraph shows only time on a CPU. The other columns cover the rest: `cores`
+is the phase's samples over its length, and `read MiB` is what the server
+fetched from storage during the phase, according to `/proc/<pid>/io`. That count
+includes page faults on a mapped file and excludes anything the page cache
+already held. A phase with few cores and a high read rate is waiting on the
+disk. A phase with many cores is computing, and its flamegraph says what.
+
+How long a start-up takes depends on how much of the model is in the page
+cache. `--startup-evict` drops the listed files, or every file under the listed
+directories, from the cache before the launch, so a cold start can be measured
+on purpose. It takes the companion files too: the text encoder, the VAE, the
+vision projector.
+
+`auto` call graphs are `dwarf` here, because there is no running server to ask
+how it was built. Sampling at the default 999 Hz writes several hundred MB of
+`perf.data` for a minute-long load, so a lower `--flamegraph-freq` is the
+usual choice.
 
 ### Profiling the whole chain (`--flamegraph-layers`)
 

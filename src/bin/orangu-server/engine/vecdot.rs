@@ -4874,6 +4874,51 @@ pub struct RowI8 {
 }
 
 impl RowI8 {
+    /// The matrix as bytes, for [`RowI8::from_bytes`]: `in_dim` and
+    /// `out_dim` as little-endian `u64`, then the quantized values, then
+    /// the scales.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(16 + self.q.len() + self.scale.len() * 4);
+        out.extend_from_slice(&(self.in_dim as u64).to_le_bytes());
+        out.extend_from_slice(&(self.out_dim as u64).to_le_bytes());
+        out.extend_from_slice(bytemuck::cast_slice(&self.q));
+        for s in &self.scale {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        out
+    }
+
+    /// A matrix [`RowI8::to_bytes`] wrote, or `None` when the bytes are not
+    /// one — the wrong length for the shape they declare, or a shape no
+    /// [`RowI8::quantize`] makes.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let in_dim = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?) as usize;
+        let out_dim = u64::from_le_bytes(bytes.get(8..16)?.try_into().ok()?) as usize;
+        if in_dim == 0 || out_dim == 0 || !in_dim.is_multiple_of(SUPER_BLOCK) {
+            return None;
+        }
+        let groups = out_dim.div_ceil(ROW_OCT);
+        let q_len = groups.checked_mul(in_dim / 32 * ROW_OCT * 32)?;
+        let scale_len = groups * ROW_OCT;
+        if bytes.len() != 16 + q_len + scale_len * 4 {
+            return None;
+        }
+        let q = bytemuck::cast_slice::<u8, i8>(&bytes[16..16 + q_len]).to_vec();
+        let scale = bytes[16 + q_len..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        Some(Self {
+            in_dim,
+            out_dim,
+            groups,
+            q,
+            scale,
+        })
+    }
+
     /// `out_dim` rows of `in_dim` (a multiple of [`SUPER_BLOCK`]), row `o`
     /// produced by `row(o)` in `f32`.
     pub fn quantize(out_dim: usize, in_dim: usize, row: impl Fn(usize) -> Vec<f32> + Sync) -> Self {

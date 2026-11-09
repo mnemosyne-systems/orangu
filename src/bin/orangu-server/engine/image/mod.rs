@@ -77,6 +77,7 @@
 //! guidance 3.
 
 pub mod codec;
+pub mod encoded_cache;
 pub mod flux2;
 pub mod lora;
 pub mod moss;
@@ -541,6 +542,51 @@ fn calibration_tensor(transformer: &LoadedModel) -> &'static str {
 /// The token count [`calibrate`] runs — a 256×256 picture's worth, the
 /// smallest size worth generating.
 const CALIBRATION_TOKENS: usize = 256;
+
+/// One of the text encoder's own linears, timed at a prompt's width on
+/// `device` and on the CPU: `(device, cpu)`, each the second of two runs.
+/// What a split asks of every device before giving it encoder layers — a
+/// device slower than the cores at this shape only makes every prompt
+/// slower. `None` when the encoder has none of the tensors looked for.
+pub fn time_encoder_linear(
+    encoder: &LoadedModel,
+    device: &dyn Backend,
+    n_tokens: usize,
+) -> Option<(std::time::Duration, std::time::Duration)> {
+    let w = [
+        "blk.0.ffn_up.weight",
+        "blk.0.ffn_gate.weight",
+        "blk.0.attn_q.weight",
+    ]
+    .iter()
+    .find_map(|name| encoder.matrix(name).ok())?;
+    let x: Vec<f32> = (0..n_tokens * w.in_dim)
+        .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.031)
+        .collect();
+    let time = |backend: &dyn Backend| {
+        let op = crate::engine::backend::MatmulOp {
+            x: &x,
+            n_tokens,
+            w: &w,
+        };
+        let _ = backend.matmul_batch(std::slice::from_ref(&op));
+        let started = Instant::now();
+        let _ = backend.matmul_batch(std::slice::from_ref(&op));
+        started.elapsed()
+    };
+    Some((time(device), time(&crate::engine::backend::CpuBackend)))
+}
+
+impl Variant {
+    /// About how many tokens one prompt puts through the text encoder: the
+    /// width [`time_encoder_linear`] measures at.
+    pub fn encoder_tokens(self) -> usize {
+        match self {
+            Self::Flux2Klein => FLUX2_PROMPT_TOKENS,
+            Self::QwenImage | Self::QwenImage21 | Self::MossImage => 64,
+        }
+    }
+}
 
 /// Times [`CALIBRATION_TENSOR`] through `device` (when one is offered) and
 /// through the CPU at [`CALIBRATION_TOKENS`] tokens, on synthetic
@@ -1322,6 +1368,28 @@ impl Pipeline {
             .defaults
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = defaults;
+    }
+
+    /// Runs one short prompt through the text encoder, the way a picture
+    /// does, so its weights are on their device before the first request.
+    /// They are placed on first use, and from a cold disk that is most of a
+    /// start-up; done here, after the server answers, it overlaps the idle
+    /// time instead. Holds the picture lock, so a request that arrives
+    /// meanwhile waits for it rather than racing it.
+    pub fn warm_encoder(&self) -> Result<()> {
+        let _turn = self
+            .busy
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        const PROMPT: &str = "a cat";
+        match &self.model {
+            Model::QwenImage { .. } => self.encode_prompt(PROMPT).map(drop),
+            Model::QwenImage21 { .. } => self.encode_prompt21(PROMPT).map(drop),
+            Model::MossImage { .. } => self.encode_prompt_moss(PROMPT).map(drop),
+            Model::Flux2Klein { text, .. } => self
+                .encode_prompt_flux2(text, PROMPT, &AtomicBool::new(false))
+                .map(drop),
+        }
     }
 
     /// A prompt's conditioning: the text encoder's final hidden states for

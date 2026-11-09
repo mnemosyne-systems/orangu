@@ -724,11 +724,17 @@ pub(crate) fn row_matrix(
     }
     let padded =
         cols.div_ceil(crate::engine::vecdot::SUPER_BLOCK) * crate::engine::vecdot::SUPER_BLOCK;
-    Some(crate::engine::vecdot::RowI8::quantize(cout, padded, |o| {
-        let mut row = vec![0f32; padded];
-        row[..cols].copy_from_slice(&rows[o * cols..(o + 1) * cols]);
-        row
-    }))
+    Some(super::encoded_cache::row_i8(
+        rows,
+        &[cols, cout, padded],
+        || {
+            crate::engine::vecdot::RowI8::quantize(cout, padded, |o| {
+                let mut row = vec![0f32; padded];
+                row[..cols].copy_from_slice(&rows[o * cols..(o + 1) * cols]);
+                row
+            })
+        },
+    ))
 }
 
 /// The matrix a convolution runs as: `rows` is `[cout][cols]` in `f32`.
@@ -745,12 +751,19 @@ pub(crate) fn conv_matrix(
         VaePrecision::Int8 => {
             const BLOCK: usize = 256;
             let padded = cols.div_ceil(BLOCK) * BLOCK;
-            let mut wide = vec![0.0f32; cout * padded];
-            for (o, row) in rows.chunks_exact(cols).enumerate() {
-                wide[o * padded..o * padded + cols].copy_from_slice(row);
-            }
             let ggml_type = crate::engine::quant::GGML_TYPE_Q6_K;
-            let bytes = orangu::quantize::encode(ggml_type, &wide, padded);
+            let bytes = super::encoded_cache::q6_k(
+                &rows,
+                &[cols, cout, padded],
+                orangu::quantize::row_bytes(ggml_type, padded) * cout,
+                || {
+                    let mut wide = vec![0.0f32; cout * padded];
+                    for (o, row) in rows.chunks_exact(cols).enumerate() {
+                        wide[o * padded..o * padded + cols].copy_from_slice(row);
+                    }
+                    orangu::quantize::encode(ggml_type, &wide, padded)
+                },
+            );
             QuantMatrix::from_encoded_rows(bytes, ggml_type, padded, cout, None)
         }
     }

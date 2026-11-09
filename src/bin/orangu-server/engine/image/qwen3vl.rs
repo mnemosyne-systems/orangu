@@ -179,7 +179,10 @@ impl VisionTower {
             if !int8 {
                 return Ok(w);
             }
-            let rows: Vec<f32> = (0..w.out_dim).flat_map(|o| w.row(o)).collect();
+            let mut rows = vec![0f32; w.out_dim * w.in_dim];
+            rows.par_chunks_mut(w.in_dim)
+                .enumerate()
+                .for_each(|(o, row)| row.copy_from_slice(&w.row(o)));
             let fast = row_matrix(&rows, w.in_dim, w.out_dim, VaePrecision::Int8);
             let q = conv_matrix(rows, w.in_dim, w.out_dim, VaePrecision::Int8);
             if let Some(fast) = fast {

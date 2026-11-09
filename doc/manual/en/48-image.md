@@ -135,6 +135,33 @@ once a call rather than being read from host memory by every kernel
 surprise: the startup log says what a picture at the defaults costs on
 this machine, and the console counts it down.
 
+The server answers before the text encoder's weights are on their device.
+They are placed on first use, and reading them from a cold disk can take a
+minute, so the server encodes one short prompt in the background as soon as
+it is listening (`[image] text encoder ready in …`). A picture asked for in
+the meantime waits for that to finish. The encoder only reads prompts into
+hidden states: it has no paged KV cache and no prompt lookup, and its output
+head is never used.
+
+When the encoder has to be split (`device_split = cpu`, which the server
+chooses itself when the transformer fills the selected card), each device is
+first timed on one of the encoder's own linears at a prompt's width, and so is
+the CPU. A device slower than the CPU gets no layers; the CPU runs them
+instead (`[image] text encoder linear x 64 tokens: … — no layers there, the
+CPU takes them`). An integrated GPU often loses this comparison: on the
+machine this was measured on, a prompt took 6.6 s with the encoder on the
+integrated GPU and 1.3 s on the CPU. An explicit `device_split` ratio is used
+as given, without timing.
+
+A VAE published as `bf16`, and a `BF16` vision projector, are converted at
+load to the formats the kernels read. The first start writes the results to
+`~/.orangu/cache/encoded/`, and later starts read them back
+(`[image] re-encoded weights: 396 read back (1.60 GiB), 0 encoded and kept`).
+An entry is named by a hash of the weights it was made from and of the
+server build, so a changed model or a new build makes new entries rather than
+reusing old ones. The directories of all but the two most recently started
+builds are deleted. `ORANGU_IMAGE_ENCODED_CACHE=0` turns the cache off.
+
 ### Transparent pictures
 
 Qwen-Image 2.1 draws with an alpha channel, and decides from the prompt

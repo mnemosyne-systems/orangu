@@ -150,6 +150,12 @@ pub fn own_frames(perf_script_g: &str) -> HashMap<SampleKey, String> {
         .collect()
 }
 
+/// A sample header's timestamp in seconds, on whatever clock `perf record`
+/// stamped it with.
+pub fn sample_time(header: &str) -> Option<f64> {
+    sample_key(header).and_then(|((_, time), _)| time.parse().ok())
+}
+
 /// A sample header's thread and timestamp, and what follows the timestamp.
 /// The thread is the field [`sample_comm`] stops at (`tid`, or the `tid`
 /// of `pid/tid`); the timestamp is the next field, the one ending in `:`.

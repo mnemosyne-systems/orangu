@@ -439,6 +439,18 @@ struct Args {
     #[arg(long, default_value_t = false)]
     flamegraph_watch: bool,
 
+    /// Start CMD under perf and profile it until --url answers; one flamegraph per silence in its log.
+    #[arg(long, value_name = "CMD")]
+    startup: Option<String>,
+
+    /// Shortest silence between two `--startup` log lines that gets its own flamegraph.
+    #[arg(long, default_value_t = 2.0, value_name = "SECONDS")]
+    startup_gap: f64,
+
+    /// Files or directories to drop from the page cache before `--startup`, for a cold start.
+    #[arg(long, value_delimiter = ',', value_name = "LIST")]
+    startup_evict: Vec<String>,
+
     /// Compare already-collapsed `.folded` profiles side by side; measure nothing.
     #[arg(long, value_delimiter = ',', value_name = "LIST")]
     compare_profiles: Vec<String>,
@@ -1392,6 +1404,9 @@ fn run(args: &Args) -> anyhow::Result<()> {
     }
     if args.flamegraph_watch {
         return profile_watch(args);
+    }
+    if let Some(command) = &args.startup {
+        return profile_startup(args, command);
     }
 
     // Starts its own servers, so it comes before the client below is pointed
@@ -4296,6 +4311,285 @@ fn profile_watch(args: &Args) -> anyhow::Result<()> {
     std::thread::sleep(std::time::Duration::from_secs(args.flamegraph_duration));
     let summary = recorder.finish()?;
     report_profile(&summary, args);
+    Ok(())
+}
+
+/// `--startup CMD`: where a server's start-up goes.
+///
+/// The command runs under `perf record` from its first instruction, every
+/// line it prints is stamped on the clock the samples carry, and the capture
+/// ends when `--url` first answers `/health`. A load is a sequence of phases,
+/// and the server says when each one ends; the silences between its lines are
+/// where the time went, so each silence of `--startup-gap` seconds or more
+/// gets a flamegraph of its own, beside one of the whole start-up. A phase's
+/// `cores` below 1 is waiting — on the disk, on the device — rather than
+/// computing, which a flamegraph (on-CPU time only) cannot show by itself.
+fn profile_startup(args: &Args, command: &str) -> anyhow::Result<()> {
+    use std::io::BufRead as _;
+    let Some(svg) = &args.flamegraph else {
+        anyhow::bail!("--startup needs --flamegraph <PATH> for the pictures");
+    };
+    let svg = std::path::PathBuf::from(svg);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    let health = format!("{}/health", args.url);
+    let answers = || {
+        client
+            .get(&health)
+            .send()
+            .is_ok_and(|r| r.status().is_success())
+    };
+    if answers() {
+        anyhow::bail!(
+            "{} already answers before the command started — stop that server first",
+            args.url
+        );
+    }
+    let call_graph = if args.flamegraph_call_graph == "auto" {
+        "dwarf".to_string()
+    } else {
+        args.flamegraph_call_graph.clone()
+    };
+    let stem = svg
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "startup".to_string());
+    let beside = |suffix: &str| svg.with_file_name(format!("{stem}{suffix}"));
+
+    if !args.startup_evict.is_empty() {
+        let mut evicted = 0u64;
+        for path in &args.startup_evict {
+            evicted += profile::evict_from_page_cache(std::path::Path::new(path))
+                .map_err(|e| anyhow::anyhow!("could not evict {path} from the page cache: {e}"))?;
+        }
+        if !args.json {
+            println!(
+                "  evicted {:.2} GiB from the page cache",
+                evicted as f64 / (1u64 << 30) as f64
+            );
+        }
+    }
+    let launched = profile::monotonic_seconds();
+    let (mut recorder, stdout) = profile::LaunchRecorder::start(
+        command,
+        &beside(".perf.data"),
+        args.flamegraph_freq,
+        &call_graph,
+        args.flamegraph_png,
+        args.flamegraph_keep_data,
+    )?;
+    if !args.json {
+        println!(
+            "  starting under perf at {} Hz (--call-graph {call_graph}): {command}",
+            args.flamegraph_freq
+        );
+    }
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(f64, String)>::new()));
+    let sink = std::sync::Arc::clone(&lines);
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let at = profile::monotonic_seconds();
+            if let Ok(mut lines) = sink.lock() {
+                lines.push((at, line));
+            }
+        }
+    });
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(args.sweep_start_timeout);
+    // What the kernel says the server did, sampled beside the health poll:
+    // `(time, bytes read from storage, CPU seconds)`. Per phase, the first
+    // says whether it waited on the disk and the second whether it computed —
+    // the part of a phase the flamegraph, which sees only on-CPU time, cannot.
+    let mut counters: Vec<(f64, u64, f64)> = vec![(launched, 0, 0.0)];
+    let mut workload = None;
+    let ready = loop {
+        workload = workload.or_else(|| recorder.workload_pid());
+        if let Some(pid) = workload
+            && let (Some(read), Some(cpu)) = (
+                profile::proc_read_bytes(pid),
+                profile::proc_cpu_seconds(pid),
+            )
+        {
+            counters.push((profile::monotonic_seconds(), read, cpu));
+        }
+        if answers() {
+            break profile::monotonic_seconds();
+        }
+        if recorder.exited() || std::time::Instant::now() > deadline {
+            let tail: Vec<String> = lines
+                .lock()
+                .map(|l| {
+                    l.iter()
+                        .rev()
+                        .take(10)
+                        .rev()
+                        .map(|(_, s)| s.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let why = if recorder.exited() {
+                "exited before it answered"
+            } else {
+                "did not answer within --sweep-start-timeout"
+            };
+            let _ = recorder.finish(&[], std::time::Duration::from_secs(10));
+            anyhow::bail!("{command} {why} {health}:\n{}", tail.join("\n"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let lines: Vec<(f64, String)> = lines
+        .lock()
+        .map(|l| l.iter().filter(|(t, _)| *t < ready).cloned().collect())
+        .unwrap_or_default();
+
+    // The timeline, beside the graphs: what the server said, and when.
+    let log_path = beside(".log");
+    let mut log = String::new();
+    for (at, line) in &lines {
+        log.push_str(&format!("{:9.3}  {line}\n", at - launched));
+    }
+    log.push_str(&format!("{:9.3}  [answers {health}]\n", ready - launched));
+    std::fs::write(&log_path, log)?;
+
+    // Phase boundaries: launch, every line, ready. A phase is named by the
+    // line that closes it — the server reports a step once it is done.
+    let short = |s: &str| -> String {
+        let s = s.trim_start_matches("orangu-server: ").trim();
+        let mut out: String = s.chars().take(70).collect();
+        if s.chars().count() > 70 {
+            out.push('…');
+        }
+        out
+    };
+    let mut marks: Vec<(f64, String)> = vec![(launched, "launch".to_string())];
+    marks.extend(lines.iter().map(|(t, s)| (*t, short(s))));
+    marks.push((ready, "answers /health".to_string()));
+    let mut phases = Vec::new();
+    for pair in marks.windows(2) {
+        let ((from, opened), (to, closed)) = (&pair[0], &pair[1]);
+        if to - from >= args.startup_gap {
+            phases.push((*from, *to, opened.clone(), closed.clone()));
+        }
+    }
+    let mut windows = vec![profile::Window {
+        svg: svg.clone(),
+        title: format!("start-up · {command}"),
+        from: launched,
+        to: ready,
+    }];
+    for (n, (from, to, _, closed)) in phases.iter().enumerate() {
+        windows.push(profile::Window {
+            svg: beside(&format!("-phase{}.svg", n + 1)),
+            title: format!(
+                "start-up {:.1}–{:.1}s · until: {closed}",
+                from - launched,
+                to - launched
+            ),
+            from: *from,
+            to: *to,
+        });
+    }
+    let summaries = recorder.finish(&windows, std::time::Duration::from_secs(30))?;
+
+    // The counters at a moment: the last reading taken at or before it.
+    let at = |t: f64| {
+        counters
+            .iter()
+            .rev()
+            .find(|(when, _, _)| *when <= t)
+            .copied()
+            .unwrap_or((launched, 0, 0.0))
+    };
+    let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "type": "startup",
+                "command": command,
+                "ready_seconds": ready - launched,
+                "read_bytes": at(ready).1,
+                "cpu_seconds": at(ready).2,
+                "log": log_path,
+                "phases": phases.iter().zip(summaries.iter().skip(1)).map(|((from, to, opened, closed), s)| serde_json::json!({
+                    "read_bytes": at(*to).1.saturating_sub(at(*from).1),
+                    "from": from - launched,
+                    "to": to - launched,
+                    "after": opened,
+                    "until": closed,
+                    "cores_busy": s.cores_busy,
+                    "svg": s.svg,
+                    "leaves": s.leaves.iter().take(5).map(|(k, v)| serde_json::json!({"frame": k, "pct": v})).collect::<Vec<_>>(),
+                })).collect::<Vec<_>>(),
+            })
+        );
+        if let Some(whole) = summaries.first() {
+            report_profile(whole, args);
+        }
+        return Ok(());
+    }
+    println!(
+        "  answers {health} after {:.1}s — timeline in {}",
+        ready - launched,
+        log_path.display()
+    );
+    let covered: f64 = phases.iter().map(|(from, to, _, _)| to - from).sum();
+    println!(
+        "  {} silence{} of {:.0}s or more cover {:.1}s ({:.0}%):",
+        phases.len(),
+        if phases.len() == 1 { "" } else { "s" },
+        args.startup_gap,
+        covered,
+        100.0 * covered / (ready - launched).max(1e-3)
+    );
+    let (_, read_total, cpu_total) = at(ready);
+    println!(
+        "  read {:.0} MiB from storage ({:.0} MiB/s), {:.1} CPU seconds ({:.2} cores) — per /proc",
+        mib(read_total),
+        mib(read_total) / (ready - launched).max(1e-3),
+        cpu_total,
+        cpu_total / (ready - launched).max(1e-3)
+    );
+    println!("     #     from       to     secs  cores   read MiB   MiB/s  until");
+    for (n, ((from, to, _, closed), s)) in phases.iter().zip(summaries.iter().skip(1)).enumerate() {
+        let read = at(*to).1.saturating_sub(at(*from).1);
+        println!(
+            "   {:>3} {:>8.1} {:>8.1} {:>8.1} {:>6.2} {:>10.0} {:>7.0}  {closed}",
+            n + 1,
+            from - launched,
+            to - launched,
+            to - from,
+            s.cores_busy,
+            mib(read),
+            mib(read) / (to - from).max(1e-3),
+        );
+    }
+    if let Some(whole) = summaries.first() {
+        println!("\n=== whole start-up");
+        report_profile(whole, args);
+    }
+    for (n, ((_, _, opened, closed), s)) in phases.iter().zip(summaries.iter().skip(1)).enumerate()
+    {
+        println!("\n=== phase {} — after: {opened}", n + 1);
+        println!("              until: {closed}");
+        println!(
+            "  profile  {} ({} samples over {:.1}s — {:.2} cores busy)",
+            s.svg.display(),
+            s.samples,
+            s.seconds,
+            s.cores_busy
+        );
+        for (frame, pct) in s.leaves.iter().take(6) {
+            println!(
+                "           {pct:5.1}%  {}",
+                frame.chars().take(100).collect::<String>()
+            );
+        }
+    }
     Ok(())
 }
 

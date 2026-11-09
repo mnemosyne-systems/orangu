@@ -1727,6 +1727,40 @@ fn prepare(args: Args) -> Result<Prepared> {
     } else {
         requested
     };
+    // A picture model's text encoder reads one prompt a picture, at a width
+    // where a slow device — an integrated GPU, typically — can lose to the
+    // cores outright. Under `device_split = cpu` each device is timed on one
+    // of the encoder's own linears first, and one slower than the CPU gets
+    // no layers: they run on the host instead. A separate mapping of the
+    // file, so the model's own tensors are not stamped by the probe.
+    let encoder_probe = match (&image_companions, image_variant) {
+        (Some(companions), Some(variant)) => LoadedModel::open(&companions.text_encoder)
+            .ok()
+            .map(|weights| (weights, variant.encoder_tokens())),
+        _ => None,
+    };
+    let encoder_worth_layers = encoder_probe.as_ref().map(|(weights, n_tokens)| {
+        move |name: &str, device: &dyn Backend| -> bool {
+            let Some((on_device, on_cpu)) =
+                engine::image::time_encoder_linear(weights, device, *n_tokens)
+            else {
+                return true;
+            };
+            let worth = on_device < on_cpu;
+            log::info!(
+                "orangu-server: [image] text encoder linear x {n_tokens} tokens: {name} {:.1} ms, \
+                 cpu {:.1} ms — {}",
+                on_device.as_secs_f64() * 1e3,
+                on_cpu.as_secs_f64() * 1e3,
+                if worth {
+                    "layers may go there"
+                } else {
+                    "no layers there, the CPU takes them"
+                }
+            );
+            worth
+        }
+    });
     let (backend, backend_label, split) = apply_device_split(
         backend,
         backend_label,
@@ -1739,6 +1773,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                 .map(|(_, kv)| kv + kv_pool_scratch_reserve_bytes()),
             transformer_reserve_bytes,
         ),
+        encoder_worth_layers.as_ref().map(|f| f as &WorthLayers<'_>),
     )?;
     // A model with layers on the host is never prefilled narrower than the
     // width at which those layers stream to the card — see `CHUNK_FLOOR`.
@@ -1887,6 +1922,10 @@ fn prepare(args: Args) -> Result<Prepared> {
     // loads (where prompts run), and keeps it under this model's key.
     engine::probe_cache::set_model(&path);
     let model = build_model(&loaded, &backend)?;
+    // Behind a picture or video pipeline the model is a text encoder: it
+    // reads one prompt to hidden states on a cache of its own and never
+    // decodes, so nothing that exists for generated text applies to it.
+    let encoder_only = image_variant.is_some() || video_companions.is_some();
     if !ranged && image_variant.is_none() && role.allows_generation() {
         choose_integer_dot(&model, &path);
         choose_q4k_short_rows(&model, &path);
@@ -2341,6 +2380,14 @@ fn prepare(args: Args) -> Result<Prepared> {
             )?;
             pipeline.adapter = lora_path.clone();
             pipeline.turbo = turbo;
+            let (read, encoded, read_bytes) = engine::image::encoded_cache::take_counts();
+            if read + encoded > 0 {
+                log::info!(
+                    "orangu-server: [image] re-encoded weights: {read} read back ({}), {encoded} \
+                     encoded and kept",
+                    orangu::format::format_bytes(read_bytes)
+                );
+            }
             // What the defaults cost on this machine, said once, up front —
             // with the knobs that bring it down, when it is long enough
             // that somebody would otherwise conclude the server hung.
@@ -2565,6 +2612,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     // model without one drafts nothing rather than failing its first
     // request that finds a match. A recurrent model is decided per request.
     if draft.is_none()
+        && !encoder_only
         && engine::generate::speculation_enabled()
         && !model.new_kv_cache(1).has_recurrent()
         && let Err(err) = supports_multi_position(model.as_ref(), &architecture)
@@ -2693,7 +2741,13 @@ fn prepare(args: Args) -> Result<Prepared> {
     let paged_supported = backend
         .as_wgpu()
         .is_none_or(engine::backend::vulkan::VulkanBackend::supports_paged_kv);
-    let paged_kv = (engine::kv_pool::paged_kv_enabled() && paged_supported)
+    if encoder_only && engine::kv_pool::paged_kv_enabled() {
+        log::info!(
+            "orangu-server: [kv] no paged cache — the text encoder reads each prompt on a \
+             cache of its own"
+        );
+    }
+    let paged_kv = (engine::kv_pool::paged_kv_enabled() && paged_supported && !encoder_only)
         .then(|| {
             let page_tokens = engine::kv_pool::page_tokens();
             let probe = model.new_kv_cache(1);
@@ -2927,7 +2981,7 @@ fn prepare(args: Args) -> Result<Prepared> {
             "orangu-server: [kv] paged cache off — this device's attention \
              kernels (GQA or flash split) have no paged form yet"
         );
-    } else if engine::kv_pool::paged_kv_enabled() && paged_kv.is_none() {
+    } else if engine::kv_pool::paged_kv_enabled() && paged_kv.is_none() && !encoder_only {
         // Said out loud rather than silently falling back: an operator who
         // asked for the pool and did not get one should learn it here, not
         // from a hit rate that never moves.
@@ -3261,6 +3315,26 @@ fn prepare(args: Args) -> Result<Prepared> {
             "orangu-server: reading the model files ahead ({}) while idle",
             orangu::format::format_bytes(bytes)
         );
+    }
+    // The text encoder's weights reach their device on first use. Placed
+    // here, once the server answers, a cold disk's minute of reading is idle
+    // time rather than start-up; a picture asked for meanwhile waits for it.
+    if let Some(image) = engine.image.clone() {
+        std::thread::Builder::new()
+            .name("encoder-warm".to_string())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                match image.warm_encoder() {
+                    Ok(()) => log::info!(
+                        "orangu-server: [image] text encoder ready in {:.1}s",
+                        started.elapsed().as_secs_f64()
+                    ),
+                    Err(err) => {
+                        log::warn!("orangu-server: [image] text encoder warm-up failed: {err:#}")
+                    }
+                }
+            })
+            .context("starting the text encoder warm-up")?;
     }
 
     Ok(Prepared {
@@ -7047,6 +7121,9 @@ fn choose_image_device(
     Ok(choice)
 }
 
+/// Whether a device, by name, should be given layers at all.
+type WorthLayers<'a> = dyn Fn(&str, &dyn Backend) -> bool + 'a;
+
 fn apply_device_split(
     backend: Arc<dyn Backend>,
     label: String,
@@ -7054,6 +7131,7 @@ fn apply_device_split(
     per_layer_bytes: &[u64],
     weights_bytes: u64,
     head_reserve_bytes: Option<(u64, &'static str)>,
+    worth_layers: Option<&WorthLayers<'_>>,
 ) -> Result<(Arc<dyn Backend>, String, Option<SplitReport>)> {
     /// The share of a device's memory a fill-in-order placement will put
     /// weights into, leaving the rest for the KV cache and the transient
@@ -7162,6 +7240,39 @@ fn apply_device_split(
         device_classes.push(DeviceClass::Software);
     }
 
+    // Every device but the head is brought up here, before the plan, when
+    // a device has to earn its layers: it can only be timed once it is up.
+    // A device the plan gives no layers to is still brought up: the wrapper
+    // indexes by position, and skipping one would shift every later
+    // device's weights onto the wrong card.
+    let bring_up = |position: usize, index: usize| -> Result<VulkanBackend> {
+        init_gpu_with_retry(|| VulkanBackend::try_init_selected(backends_bit, &[index])).ok_or_else(
+            || {
+                anyhow!(
+                    "device_split = {mode}, but device {index} ({}) could not be brought up \
+                     (device or pipeline creation failed)",
+                    names[position]
+                )
+            },
+        )
+    };
+    let mut early: Vec<VulkanBackend> = Vec::new();
+    // Only where the host takes what the devices do not: a device left out
+    // there hands its layers to the CPU, which this check found faster. An
+    // explicit ratio is honoured as given.
+    if let Some(worth) = worth_layers.filter(|_| overflow_to_cpu) {
+        if !worth(&names[0], backend.as_ref()) {
+            capacities[0] = Some(0);
+        }
+        for (position, &index) in indices.iter().enumerate().skip(1) {
+            let extra = bring_up(position, index)?;
+            if !worth(&names[position], &extra) {
+                capacities[position] = Some(0);
+            }
+            early.push(extra);
+        }
+    }
+
     let Some(plan) = placement::plan(mode, per_layer_bytes, &capacities, weights_bytes) else {
         return Ok((backend, label, None));
     };
@@ -7173,22 +7284,14 @@ fn apply_device_split(
     // KV cache — which is what turns a layer count into a byte figure.
     let mut kv_storage: Vec<Option<KvStorage>> = vec![Some(wgpu.kv_storage())];
     devices.push(backend);
+    let mut early = early.into_iter();
     for (position, &index) in indices.iter().enumerate().skip(1) {
         // `indices` holds only the wgpu devices; the host entry appended to
         // `capacities`/`names` above has no adapter to bring up.
-
-        // A device the plan gave no layers to is still brought up: the
-        // wrapper indexes by position, and skipping one would shift every
-        // later device's weights onto the wrong card.
-        let extra =
-            init_gpu_with_retry(|| VulkanBackend::try_init_selected(backends_bit, &[index]))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "device_split = {mode}, but device {index} ({}) could not be brought up \
-                     (device or pipeline creation failed)",
-                        names[position]
-                    )
-                })?;
+        let extra = match early.next() {
+            Some(extra) => extra,
+            None => bring_up(position, index)?,
+        };
         kv_storage.push(Some(extra.kv_storage()));
         devices.push(Arc::new(extra));
     }
