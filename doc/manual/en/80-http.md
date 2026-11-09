@@ -3099,6 +3099,7 @@ Chat sessions:
 | `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
 | `POST /api/sessions/{id}/messages` | sends one chat turn against that session; SSE reply |
 | `POST /api/sessions/{id}/versions/{n}` | shows version `n` (from 0) of the last turn and answers with the session as `GET` does |
+| `PUT /api/sessions/{id}/settings` | sets the chat's own settings, answering with them |
 | `GET /api/sessions/{id}/files/{name}` | a file kept beside the session: a picture attached to a message (PNG, JPEG, GIF, WebP, SVG), one a `qwen_image` model made, a clip an `ltxv` model made (`video/mp4`, with `Range`), or speech a `qwen3tts` model made (`audio/wav` or `audio/flac`, with `Range`) |
 | `DELETE /api/sessions/{id}` | deletes one chat session, directory and all — History's per-row cross |
 | `DELETE /api/sessions` | deletes every chat session — History's **Clear all** footer |
@@ -3111,7 +3112,17 @@ ignored); either of the last two is a `400` when the session has no answered
 question. An edit or a regeneration is saved as another version of the last
 turn: `GET /api/sessions/{id}` reports `versions` (0 until the last turn has
 been edited or regenerated) and `active_version`, and a new turn keeps the
-version shown and drops the others. Attachments ride along as base64 in the JSON, which is why this port
+version shown and drops the others.
+
+`PUT /api/sessions/{id}/settings` takes `{"system_prompt": "…",
+"temperature": 0.2, "top_p": 0.9, "min_p": 0.05, "max_tokens": 1024}`, every
+field optional; it replaces the chat's settings, so a field left out goes back
+to the server's default. The system prompt is sent ahead of the conversation
+on every later turn, and the rest set the sampling and the answer's length.
+Temperature is from 0 to 2, `top_p` and `min_p` from 0 to 1, and `max_tokens`
+from 1 to 32768; anything else is a `400`. `GET /api/sessions/{id}` reports
+them as `settings`, and the console's `GET /api/props` gives the defaults an
+unset field takes as `chat`. Attachments ride along as base64 in the JSON, which is why this port
 raises its body cap to 64 MB. Its SSE events are typed rather than
 OpenAI-shaped, because the browser is being handed rendered HTML rather than
 raw tokens: an `attachments` event first (what each upload turned into, sent

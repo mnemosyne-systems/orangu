@@ -118,6 +118,59 @@ pub struct Session {
     /// the last turn rather than a new turn.
     #[serde(skip)]
     pub replacing_last_turn: bool,
+    /// This chat's own system prompt and sampling settings.
+    #[serde(default, skip_serializing_if = "ChatSettings::is_default")]
+    pub settings: ChatSettings,
+}
+
+/// A chat's own generation settings. An empty system prompt sends none, and
+/// each unset value takes the server's default.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ChatSettings {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub system_prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_p: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+}
+
+impl ChatSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Why these settings cannot be used, when they cannot: `limit` is the
+    /// most tokens one answer may have.
+    pub fn check(&self, limit: usize) -> Result<(), String> {
+        let within = |value: Option<f64>, low: f64, high: f64, name: &str| match value {
+            Some(v) if !(low..=high).contains(&v) => {
+                Err(format!("{name} must be between {low} and {high}"))
+            }
+            _ => Ok(()),
+        };
+        within(self.temperature, 0.0, 2.0, "temperature")?;
+        within(self.top_p, 0.0, 1.0, "top_p")?;
+        within(self.min_p, 0.0, 1.0, "min_p")?;
+        match self.max_tokens {
+            Some(n) if n == 0 || n > limit => {
+                Err(format!("max_tokens must be between 1 and {limit}"))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Stores `settings` as the chat `id`'s own.
+pub fn set_settings(id: &str, settings: ChatSettings) -> Result<Session> {
+    let mut session = load_session(id)?;
+    session.settings = settings;
+    save_session(&session)?;
+    Ok(session)
 }
 
 /// One version of the last turn.
@@ -177,6 +230,7 @@ pub fn create_session() -> Result<Session> {
         turn_versions: Vec::new(),
         active_version: 0,
         replacing_last_turn: false,
+        settings: ChatSettings::default(),
     };
     save_session(&session)?;
     Ok(session)
@@ -625,6 +679,10 @@ pub fn append_turn(
         session.active_version = 0;
     }
     session.updated_at = unix_now();
+    // Settings changed while the answer was being written are kept.
+    if let Ok(on_disk) = load_session(&session.id) {
+        session.settings = on_disk.settings;
+    }
     save_session(session)
 }
 
@@ -740,6 +798,66 @@ mod tests {
             assert_eq!(session.title, "What is Rust?");
             assert_eq!(session.messages.len(), 4);
         });
+    }
+
+    #[test]
+    fn chat_settings_are_kept_with_the_chat() {
+        with_temp_home(|| {
+            let mut session = create_session().unwrap();
+            let settings = ChatSettings {
+                system_prompt: "Answer in French.".into(),
+                temperature: Some(0.2),
+                max_tokens: Some(512),
+                ..ChatSettings::default()
+            };
+            set_settings(&session.id, settings.clone()).unwrap();
+            // A turn that was answering while the settings changed keeps them.
+            append_turn(&mut session, "Hi?", Vec::new(), "Salut.", "", None).unwrap();
+            let reloaded = load_session(&session.id).unwrap();
+            assert_eq!(reloaded.settings, settings);
+            assert_eq!(reloaded.messages.len(), 2);
+
+            // Unset settings are not written at all.
+            set_settings(&session.id, ChatSettings::default()).unwrap();
+            let chat = fs::read_to_string(
+                session_chat_path(&Uuid::parse_str(&session.id).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert!(!chat.contains("settings"), "{chat}");
+        });
+    }
+
+    #[test]
+    fn chat_settings_out_of_range_are_refused() {
+        let ok = ChatSettings {
+            temperature: Some(2.0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+            max_tokens: Some(100),
+            ..ChatSettings::default()
+        };
+        assert_eq!(ok.check(100), Ok(()));
+        let hot = ChatSettings {
+            temperature: Some(2.5),
+            ..ChatSettings::default()
+        };
+        assert_eq!(
+            hot.check(100),
+            Err("temperature must be between 0 and 2".to_string())
+        );
+        let long = ChatSettings {
+            max_tokens: Some(101),
+            ..ChatSettings::default()
+        };
+        assert_eq!(
+            long.check(100),
+            Err("max_tokens must be between 1 and 100".to_string())
+        );
+        let none = ChatSettings {
+            max_tokens: Some(0),
+            ..ChatSettings::default()
+        };
+        assert!(none.check(100).is_err());
     }
 
     #[test]
@@ -907,6 +1025,7 @@ mod tests {
                 turn_versions: Vec::new(),
                 active_version: 0,
                 replacing_last_turn: false,
+                settings: ChatSettings::default(),
             };
             let dir = session_dir(&id).unwrap();
             fs::create_dir_all(&dir).unwrap();

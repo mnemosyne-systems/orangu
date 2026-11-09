@@ -3969,6 +3969,28 @@ follows on from. Sending a new question keeps the version on screen and drops
 the others — only the last turn has versions. Stopping an edit or a
 regeneration before it finishes leaves the turn as it was.
 
+### Chat settings
+
+The sliders button in the top bar opens this chat's own settings, used from
+its next message on:
+
+- **System prompt** — sent ahead of the conversation on every turn of the chat
+- **Temperature**, **Top P**, **Min P** — how the answer is sampled
+- **Max tokens** — the longest an answer may be
+
+An empty field takes the server's default, shown in it in grey. **Apply**
+keeps the settings with the chat, so they are still there after a reload or
+when the chat is reopened from **History**; a new chat starts from the
+defaults, and **Reset** empties the fields. The button is coloured while the
+chat has settings of its own. They apply to a language model; picture, clip
+and speech models keep their own settings under **Settings**.
+
+**Preset** fills the sampling fields: **Precise** (temperature 0.2) and
+**Creative** (temperature 1.1) are built in, and **Save as…** keeps the
+fields as a named preset of your own (the system prompt is not part of a
+preset). Your presets are kept in this browser; **Delete** forgets the
+selected one.
+
 Chat sessions persist as one directory per session at
 `~/.orangu/server/sessions/<uuid>/chat.json`, so **History** survives a
 restart.

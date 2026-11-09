@@ -831,6 +831,7 @@
     state.sessionId = session.id;
     localStorage.setItem("orangu-session-id", session.id);
     transcript.innerHTML = "";
+    applyChatSettings(session.settings);
   }
 
   async function newChat() {
@@ -880,6 +881,7 @@
     state.versions = session.versions || 0;
     state.activeVersion = session.active_version || 0;
     decorateLastTurn();
+    applyChatSettings(session.settings);
   }
 
   // The last question and its answer.
@@ -1107,6 +1109,7 @@
   }
 
   function showHistory() {
+    hideChatSettings();
     refreshHistory().catch((err) => console.error(err));
     historyPanel.hidden = false;
     historyBtn.setAttribute("aria-expanded", "true");
@@ -3409,6 +3412,190 @@
       cancelSettings();
     }
   });
+
+  // ------------------------------------------------------- chat settings
+
+  // This chat's own system prompt and sampling settings (web/sessions.rs,
+  // `ChatSettings`). An empty field is unset: the server's default, shown
+  // as the placeholder, applies.
+  const chatSettingsBtn = document.getElementById("chat-settings-btn");
+  const chatSettingsPanel = document.getElementById("chat-settings-panel");
+  const chatPreset = document.getElementById("chat-preset");
+  const chatPresetSave = document.getElementById("chat-preset-save");
+  const chatPresetDelete = document.getElementById("chat-preset-delete");
+  const chatStatus = document.getElementById("chat-settings-status");
+  const chatFields = {
+    system_prompt: document.getElementById("chat-system-prompt"),
+    temperature: document.getElementById("chat-temperature"),
+    top_p: document.getElementById("chat-top-p"),
+    min_p: document.getElementById("chat-min-p"),
+    max_tokens: document.getElementById("chat-max-tokens"),
+  };
+  const NUMBER_FIELDS = ["temperature", "top_p", "min_p", "max_tokens"];
+  const BUILT_IN_PRESETS = {
+    Precise: { temperature: 0.2, top_p: 0.9, min_p: 0.05 },
+    Creative: { temperature: 1.1, top_p: 0.98, min_p: 0.02 },
+  };
+  const PRESETS_KEY = "orangu-chat-presets";
+  let chatSettings = {};
+
+  function userPresets() {
+    try {
+      return JSON.parse(localStorage.getItem(PRESETS_KEY) || "{}") || {};
+    } catch {
+      return {};
+    }
+  }
+
+  function storeUserPresets(presets) {
+    try {
+      localStorage.setItem(PRESETS_KEY, JSON.stringify(presets));
+    } catch {
+      // Storage unavailable: the preset lasts until the page is closed.
+    }
+  }
+
+  function allPresets() {
+    return { ...BUILT_IN_PRESETS, ...userPresets() };
+  }
+
+  function renderPresets(selected = "") {
+    chatPreset.innerHTML = "";
+    const none = document.createElement("option");
+    none.value = "";
+    none.textContent = "—";
+    chatPreset.appendChild(none);
+    for (const name of Object.keys(allPresets())) {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      chatPreset.appendChild(option);
+    }
+    chatPreset.value = selected;
+    chatPresetDelete.disabled = !(selected in userPresets());
+  }
+
+  async function loadChatDefaults() {
+    try {
+      const res = await fetch("/api/props");
+      if (!res.ok) return;
+      const defaults = (await res.json()).chat || {};
+      for (const name of NUMBER_FIELDS) {
+        if (defaults[name] !== undefined) chatFields[name].placeholder = String(defaults[name]);
+      }
+      if (defaults.max_tokens) chatFields.max_tokens.max = String(defaults.max_tokens);
+    } catch {
+      // The placeholders stay empty; the server still applies its defaults.
+    }
+  }
+
+  function fillChatSettings(settings) {
+    chatFields.system_prompt.value = settings.system_prompt || "";
+    for (const name of NUMBER_FIELDS) {
+      chatFields[name].value = settings[name] ?? "";
+    }
+  }
+
+  function chatSettingsFromForm() {
+    const settings = {};
+    const prompt = chatFields.system_prompt.value.trim();
+    if (prompt) settings.system_prompt = prompt;
+    for (const name of NUMBER_FIELDS) {
+      const raw = chatFields[name].value.trim();
+      if (raw !== "") settings[name] = Number(raw);
+    }
+    return settings;
+  }
+
+  // Called whenever another chat is shown.
+  function applyChatSettings(settings) {
+    chatSettings = settings || {};
+    chatSettingsBtn.classList.toggle("has-settings", Object.keys(chatSettings).length > 0);
+    fillChatSettings(chatSettings);
+    renderPresets();
+    chatStatus.textContent = "";
+  }
+
+  async function saveChatSettings(settings) {
+    if (!state.sessionId) return;
+    const res = await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(settings),
+    });
+    if (!res.ok) {
+      chatStatus.textContent = (await res.text()) || `failed (${res.status})`;
+      return;
+    }
+    const preset = chatPreset.value;
+    applyChatSettings(await res.json());
+    renderPresets(preset);
+    chatStatus.textContent = "Applied to this chat's next message.";
+  }
+
+  function showChatSettings() {
+    hideHistory();
+    fillChatSettings(chatSettings);
+    chatStatus.textContent = "";
+    chatSettingsPanel.hidden = false;
+    chatSettingsBtn.setAttribute("aria-expanded", "true");
+  }
+
+  function hideChatSettings() {
+    chatSettingsPanel.hidden = true;
+    chatSettingsBtn.setAttribute("aria-expanded", "false");
+  }
+
+  chatSettingsBtn.addEventListener("click", () => {
+    if (chatSettingsPanel.hidden) showChatSettings();
+    else hideChatSettings();
+  });
+  chatPreset.addEventListener("change", () => {
+    const preset = allPresets()[chatPreset.value];
+    if (preset) fillChatSettings({ ...chatSettingsFromForm(), ...preset });
+    chatPresetDelete.disabled = !(chatPreset.value in userPresets());
+  });
+  chatPresetSave.addEventListener("click", () => {
+    const name = (window.prompt("Name for this preset") || "").trim();
+    if (!name) return;
+    const settings = chatSettingsFromForm();
+    delete settings.system_prompt;
+    const presets = userPresets();
+    presets[name] = settings;
+    storeUserPresets(presets);
+    renderPresets(name);
+  });
+  chatPresetDelete.addEventListener("click", () => {
+    const presets = userPresets();
+    delete presets[chatPreset.value];
+    storeUserPresets(presets);
+    renderPresets();
+  });
+  document.getElementById("chat-settings-reset").addEventListener("click", () => {
+    fillChatSettings({});
+    renderPresets();
+  });
+  chatSettingsPanel.addEventListener("submit", (event) => {
+    event.preventDefault();
+    saveChatSettings(chatSettingsFromForm()).catch((err) => {
+      chatStatus.textContent = String(err);
+      console.error(err);
+    });
+  });
+  document.addEventListener("click", (event) => {
+    if (
+      !chatSettingsPanel.hidden &&
+      !chatSettingsPanel.contains(event.target) &&
+      !chatSettingsBtn.contains(event.target)
+    ) {
+      hideChatSettings();
+    }
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !chatSettingsPanel.hidden) hideChatSettings();
+  });
+  loadChatDefaults();
+  renderPresets();
 
   (async function init() {
     const savedId = localStorage.getItem("orangu-session-id");

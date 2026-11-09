@@ -38,7 +38,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{Html, IntoResponse},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -310,6 +310,7 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         )
         .route("/api/sessions/{id}/messages", post(send_message))
         .route("/api/sessions/{id}/versions/{index}", post(show_version))
+        .route("/api/sessions/{id}/settings", put(set_session_settings))
         .route("/api/sessions/{id}/files/{name}", get(session_file))
         .merge(mcp::router())
         // The monitoring pane: live CPU/GPU/NPU inventory.
@@ -492,6 +493,21 @@ fn props_view(state: &WebState) -> serde_json::Value {
         "image": state.engine.image.as_deref().map(crate::http::images::props_json),
         "video": state.engine.video.as_deref().map(crate::http::videos::props_json),
         "audio": state.engine.audio.as_deref().map(crate::http::audio::props_json),
+        // What a chat's own settings fall back to.
+        "chat": chat_defaults(),
+    })
+}
+
+/// The server's defaults for a chat's settings.
+fn chat_defaults() -> serde_json::Value {
+    let sampling = SamplingParams::default();
+    // As typed, not as the nearest f32: 0.8, not 0.800000011920929.
+    let shown = |value: f32| (f64::from(value) * 1e4).round() / 1e4;
+    json!({
+        "temperature": shown(sampling.temperature),
+        "top_p": shown(sampling.top_p),
+        "min_p": shown(sampling.min_p),
+        "max_tokens": MAX_TOKENS,
     })
 }
 
@@ -791,6 +807,23 @@ struct SessionView {
     /// regenerated), and which one `messages` ends with.
     versions: usize,
     active_version: usize,
+    /// The chat's own system prompt and sampling settings.
+    settings: sessions::ChatSettings,
+}
+
+/// `PUT /api/sessions/{id}/settings`: the chat's own system prompt and
+/// sampling settings, used from its next message on. Answers with them.
+async fn set_session_settings(
+    Path(id): Path<String>,
+    Json(settings): Json<sessions::ChatSettings>,
+) -> axum::response::Response {
+    if let Err(err) = settings.check(MAX_TOKENS) {
+        return (StatusCode::BAD_REQUEST, err).into_response();
+    }
+    match sessions::set_settings(&id, settings) {
+        Ok(session) => Json(session.settings).into_response(),
+        Err(err) => (StatusCode::NOT_FOUND, err.to_string()).into_response(),
+    }
 }
 
 async fn get_session(
@@ -829,6 +862,7 @@ fn session_view(state: &WebState, session: Session) -> SessionView {
         title: session.title,
         versions,
         active_version,
+        settings: session.settings.clone(),
         messages: session
             .messages
             .into_iter()
@@ -1045,6 +1079,18 @@ async fn send_message(
         None => None,
     };
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
+    // The chat's own settings over the server's defaults.
+    let defaults = SamplingParams::default();
+    let sampling = SamplingParams {
+        temperature: session
+            .settings
+            .temperature
+            .map_or(defaults.temperature, |v| v as f32),
+        top_p: session.settings.top_p.map_or(defaults.top_p, |v| v as f32),
+        min_p: session.settings.min_p.map_or(defaults.min_p, |v| v as f32),
+        ..defaults
+    };
+    let max_tokens = session.settings.max_tokens.unwrap_or(MAX_TOKENS);
 
     let mut rx = state
         .engine
@@ -1053,8 +1099,8 @@ async fn send_message(
             json_output: false,
             json_schema: None,
             prompt_tokens: tokens,
-            sampling: SamplingParams::default(),
-            max_tokens: MAX_TOKENS,
+            sampling,
+            max_tokens,
             stop_token_ids,
             // The console is served by this process and has no coordinator
             // in front of it, so it is this server's own role.
@@ -1577,6 +1623,11 @@ fn render_prompt(
             )
         })
         .collect();
+    // The chat's own system prompt comes first.
+    let system_prompt = session.settings.system_prompt.trim();
+    if !system_prompt.is_empty() {
+        messages.insert(0, ChatMessage::text("system", system_prompt));
+    }
     messages.push(ChatMessage::text(
         "user",
         &attachments::compose_content(new_message, new_attachments, seen.then_some(&mut pictures)),

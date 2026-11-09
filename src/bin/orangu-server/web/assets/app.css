@@ -220,6 +220,119 @@ button:disabled {
   display: none;
 }
 
+/* Chat settings: a dropdown under the topbar like History, holding this
+   chat's own system prompt and sampling settings. */
+#chat-settings-panel {
+  position: absolute;
+  top: 54px;
+  right: 16px;
+  width: min(380px, calc(100vw - 32px));
+  max-height: 75vh;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 10;
+}
+
+#chat-settings-panel[hidden] {
+  display: none;
+}
+
+#chat-settings-panel h2 {
+  margin: 0 0 4px;
+  font-size: 1em;
+}
+
+.chat-settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.9em;
+}
+
+.chat-settings-wide {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.chat-settings-inline {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+#chat-settings-panel input,
+#chat-settings-panel select,
+#chat-settings-panel textarea {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 7px;
+  font: inherit;
+}
+
+#chat-settings-panel input[type="number"] {
+  width: 8em;
+}
+
+#chat-settings-panel select {
+  min-width: 0;
+  max-width: 9em;
+}
+
+#chat-settings-panel textarea {
+  resize: vertical;
+  margin-top: 4px;
+}
+
+#chat-settings-panel button {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font: inherit;
+  cursor: pointer;
+}
+
+#chat-settings-panel button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#chat-settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+#chat-settings-apply {
+  background: var(--accent) !important;
+  color: var(--accent-text) !important;
+  border-color: var(--accent) !important;
+}
+
+#chat-settings-status {
+  flex: 1;
+  min-width: 0;
+  white-space: normal;
+  overflow: visible;
+}
+
+/* A chat with settings of its own marks the button. */
+#chat-settings-btn.has-settings {
+  color: var(--accent);
+}
+
 #history-list {
   overflow-y: auto;
 }
