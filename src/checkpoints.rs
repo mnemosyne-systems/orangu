@@ -311,10 +311,7 @@ impl State {
     }
 
     fn relative(&self, path: &Path) -> String {
-        path.strip_prefix(&self.workspace)
-            .unwrap_or(path)
-            .display()
-            .to_string()
+        crate::files::to_slash(path.strip_prefix(&self.workspace).unwrap_or(path))
     }
 
     fn summary(&self, manifest: &Manifest) -> TurnSummary {
@@ -370,15 +367,14 @@ impl State {
         self.git_root.clone().flatten()
     }
 
-    /// `path` relative to the repository's top level.
+    /// `path` relative to the repository's top level, `/`-separated as git
+    /// lists it. Both sides are canonicalized: git prints its top level in
+    /// its own form, which on Windows shares no prefix with a canonical path.
     fn repo_relative(&mut self, path: &Path) -> Option<String> {
-        let root = self.git_root()?;
+        let root = self.git_root()?.canonicalize().ok()?;
         let workspace = self.workspace.canonicalize().ok()?;
         let inside = workspace.join(path.strip_prefix(&self.workspace).ok()?);
-        inside
-            .strip_prefix(&root)
-            .ok()
-            .map(|rel| rel.to_string_lossy().into_owned())
+        inside.strip_prefix(&root).ok().map(crate::files::to_slash)
     }
 
     /// The index entries (`<mode> <object>`) of `paths`, by path.
