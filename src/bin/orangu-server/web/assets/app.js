@@ -3830,6 +3830,124 @@
   loadChatDefaults();
   renderPresets();
 
+  // ------------------------------------------------------ keyboard shortcuts
+
+  // Cmd on a Mac, Ctrl elsewhere; none of these is a key the browser keeps
+  // for itself (new tab, new window, close tab, reload).
+  const IS_MAC = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+  const MOD = IS_MAC ? "⌘" : "Ctrl";
+  const SHORTCUTS = [
+    { keys: `${MOD}+Shift+O`, what: "New chat", button: newChatBtn },
+    { keys: `${MOD}+K`, what: "Search chats" },
+    { keys: `${MOD}+B`, what: "Show or hide History", button: historyBtn },
+    { keys: `${MOD}+.`, what: "Chat settings", button: chatSettingsBtn },
+    { keys: "/", what: "Type a message" },
+    { keys: "↑", what: "Edit the last question (in an empty message box)" },
+    { keys: "Esc", what: "Stop the answer being written, or close what is open" },
+    { keys: "?", what: "This list" },
+  ];
+  const shortcutsOverlay = document.getElementById("shortcuts-overlay");
+  const shortcutsTable = document.getElementById("shortcuts-table");
+
+  for (const { keys, what } of SHORTCUTS) {
+    const row = shortcutsTable.insertRow();
+    const key = row.insertCell();
+    for (const [index, part] of keys.split("+").entries()) {
+      if (index > 0) key.append("+");
+      const kbd = document.createElement("kbd");
+      kbd.textContent = part;
+      key.appendChild(kbd);
+    }
+    row.insertCell().textContent = what;
+  }
+  // The buttons say their shortcut in their tooltip.
+  for (const { keys, button } of SHORTCUTS) {
+    if (button) button.title = `${button.getAttribute("aria-label")} (${keys})`;
+  }
+
+  function showShortcuts() {
+    shortcutsOverlay.hidden = false;
+    document.getElementById("shortcuts-close").focus();
+  }
+
+  function hideShortcuts() {
+    shortcutsOverlay.hidden = true;
+  }
+
+  document.getElementById("shortcuts-close").addEventListener("click", hideShortcuts);
+  shortcutsOverlay.addEventListener("click", (event) => {
+    if (event.target === shortcutsOverlay) hideShortcuts();
+  });
+
+  function typingInField(target) {
+    return (
+      target instanceof HTMLElement &&
+      (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))
+    );
+  }
+
+  function somethingOpen() {
+    return (
+      !shortcutsOverlay.hidden ||
+      !settingsOverlay.hidden ||
+      !historyPanel.hidden ||
+      !chatSettingsPanel.hidden ||
+      !attachMenu.hidden ||
+      Boolean(transcript.querySelector(".editing"))
+    );
+  }
+
+  // In the capture phase, so it sees what is open before the panels' own
+  // Escape handlers close it.
+  document.addEventListener(
+    "keydown",
+    (event) => {
+      const mod = IS_MAC ? event.metaKey : event.ctrlKey;
+      const key = event.key.toLowerCase();
+      if (mod && event.shiftKey && key === "o") {
+        event.preventDefault();
+        if (!state.busy) newChat().catch((err) => console.error(err));
+      } else if (mod && !event.shiftKey && key === "k") {
+        event.preventDefault();
+        if (historyPanel.hidden) showHistory();
+        historySearch.focus();
+        historySearch.select();
+      } else if (mod && !event.shiftKey && key === "b") {
+        event.preventDefault();
+        historyBtn.click();
+      } else if (mod && !event.shiftKey && key === ".") {
+        event.preventDefault();
+        chatSettingsBtn.click();
+      } else if (event.key === "Escape" && !shortcutsOverlay.hidden) {
+        event.preventDefault();
+        hideShortcuts();
+      } else if (event.key === "Escape" && state.busy && !somethingOpen()) {
+        event.preventDefault();
+        stopGeneration();
+      } else if (!mod && !event.altKey && !typingInField(event.target) && !somethingOpen()) {
+        if (event.key === "/") {
+          event.preventDefault();
+          input.focus();
+        } else if (event.key === "?") {
+          event.preventDefault();
+          showShortcuts();
+        }
+      } else if (
+        event.key === "ArrowUp" &&
+        event.target === input &&
+        input.value === "" &&
+        !state.busy
+      ) {
+        const turn = lastTurnElements();
+        if (turn) {
+          event.preventDefault();
+          editQuestion(turn.question);
+        }
+      }
+    },
+    true,
+  );
+
   (async function init() {
     const savedId = localStorage.getItem("orangu-session-id");
     if (savedId) {

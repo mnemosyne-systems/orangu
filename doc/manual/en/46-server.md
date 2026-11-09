@@ -3951,6 +3951,24 @@ streamed in stays on screen, marked as stopped, but since the turn never
 reached completion it isn't saved — a stopped reply won't reappear if you
 reload or revisit it from **History**.
 
+### Keyboard shortcuts
+
+`?` (outside a text box) lists them. On a Mac they use `⌘` where others use
+`Ctrl`, and none of them is a key the browser keeps for itself:
+
+| Key | Action |
+| :-- | :-- |
+| `Ctrl+Shift+O` | New chat |
+| `Ctrl+K` | Search chats: opens History with the cursor in its search box |
+| `Ctrl+B` | Show or hide History |
+| `Ctrl+.` | Chat settings |
+| `/` | Put the cursor in the message box |
+| `↑` | In an empty message box: edit the last question |
+| `Esc` | Stop the answer being written; with a window or dropdown open, close it instead |
+| `?` | The list of shortcuts |
+
+The buttons with a shortcut name it in their tooltip.
+
 ### On a phone
 
 The console works on a phone's browser, for example to chat with the model on
