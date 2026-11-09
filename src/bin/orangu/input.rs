@@ -222,12 +222,7 @@ pub struct StreamRenderState {
     pub metrics: StreamMetrics,
     pub tool_running_since: Option<std::time::Instant>,
     pub native_tool_calls: Vec<orangu::llm::ToolCall>,
-    pub pending_mcp_approval: Option<McpApprovalRequest>,
-}
-
-#[derive(Clone)]
-pub struct McpApprovalRequest {
-    pub decision: std::sync::mpsc::Sender<bool>,
+    pub pending_mcp_approval: Option<crate::approval::McpApprovalRequest>,
 }
 
 #[derive(Debug, Default)]

@@ -543,7 +543,7 @@ async fn run_persisted_inner(
                 |_metrics: StreamMetrics| {},
                 |_running| {},
                 |tool_call| note(*quiet, &format!("[tool] {}", tool_call.function.name)),
-                |_| false,
+                |_| orangu::session::ToolApproval::Deny(None),
             )
             .await
             .context("work phase failed")?;

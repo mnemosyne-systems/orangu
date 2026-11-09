@@ -14,6 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 mod activity_log;
+mod approval;
 mod askpass;
 mod build;
 mod commands;

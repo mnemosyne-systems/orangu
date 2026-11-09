@@ -250,6 +250,7 @@ pub fn help_text() -> &'static str {
 /license [<spdx> [<holder>]]                    Set the licence generated files carry (`auto` follows the project, `none` writes no header)
 /clear                                          Clear the current conversation
 /compact                                        Drop old tool output from the conversation
+/permissions [revoke <name>|clear]              List or revoke the MCP tools allowed for this session
 /copy                                           Copy the latest assistant response as Markdown
 /quit                                           Exit the client
 

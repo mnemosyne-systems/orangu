@@ -129,6 +129,15 @@ impl McpManager {
             .is_ok_and(|state| state.routes.contains_key(name))
     }
 
+    /// The server and the server's own name for the exposed tool `name`.
+    pub fn route_names(&self, name: &str) -> Option<(String, String)> {
+        self.state
+            .read()
+            .ok()
+            .and_then(|state| state.routes.get(name).cloned())
+            .map(|route| (route.server_name, route.tool_name))
+    }
+
     pub fn requires_approval(&self, name: &str) -> bool {
         self.state
             .read()

@@ -1528,7 +1528,7 @@ async fn take_turn_in_place(
             move |call: &crate::llm::ToolCall| {
                 counter.count_tool_call(&counted, &call.function.name)
             },
-            |_| false,
+            |_| crate::session::ToolApproval::Deny(None),
         )
         .await;
 
@@ -2160,6 +2160,45 @@ mod mcp_tests {
             .with_allowed_tools(["mcp__other".to_string()].into());
         assert!(names(&limited).is_empty());
         assert!(limited.mcp_instructions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_grants_stop_the_prompt_for_the_main_conversation_only() {
+        let endpoint = serve_mcp(vec![("lookup", false), ("drop_table", false)]).await;
+        let configurations =
+            HashMap::from([("db".to_string(), server(endpoint, McpApprovalMode::Prompt))]);
+        let workspace = tempfile::tempdir().unwrap();
+        let (mcp, _) = crate::mcp::McpManager::connect_all(&configurations, workspace.path())
+            .await
+            .unwrap();
+        let tools = ToolExecutor::new(workspace.path()).with_mcp(mcp);
+        assert_eq!(
+            tools.mcp_route("mcp__db__lookup"),
+            Some(("db".to_string(), "lookup".to_string()))
+        );
+        assert!(tools.requires_mcp_approval("mcp__db__lookup"));
+
+        tools.grant_mcp_tool("mcp__db__lookup");
+        assert!(!tools.requires_mcp_approval("mcp__db__lookup"));
+        assert!(tools.requires_mcp_approval("mcp__db__drop_table"));
+
+        tools.grant_mcp_server("db");
+        assert!(!tools.requires_mcp_approval("mcp__db__drop_table"));
+        assert_eq!(
+            tools.mcp_grants(),
+            (vec!["mcp__db__lookup".to_string()], vec!["db".to_string()])
+        );
+
+        // A subagent still cannot run what needs approval: nobody is there
+        // to have granted it.
+        let child = ToolExecutor::new_for_subagent(workspace.path()).with_subagent_mcp(tools.mcp());
+        assert!(names(&child).is_empty());
+
+        assert!(tools.revoke_mcp_grant("db"));
+        assert!(!tools.revoke_mcp_grant("db"));
+        assert!(tools.requires_mcp_approval("mcp__db__drop_table"));
+        assert_eq!(tools.clear_mcp_grants(), 1);
+        assert!(tools.requires_mcp_approval("mcp__db__lookup"));
     }
 
     #[tokio::test]

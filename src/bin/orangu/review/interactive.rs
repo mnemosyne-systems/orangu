@@ -1196,7 +1196,7 @@ pub(crate) async fn run_review_request(
         |_| {},
         |_| {},
         |_| {},
-        |_| false,
+        |_| orangu::session::ToolApproval::Deny(None),
     ));
     let mut interval = tokio::time::interval(WAIT_LOOP_POLL_INTERVAL);
     let started = std::time::Instant::now();

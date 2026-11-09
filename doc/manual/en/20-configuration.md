@@ -371,8 +371,11 @@ the `mcp = on` shortcut — is a startup error.
 `approval_mode` controls MCP execution: `auto` runs tools directly, `prompt`
 asks for each call, `writes` asks unless the MCP tool declares `readOnlyHint`,
 and `deny` disables the service. In the interactive terminal,
-answer an approval with `y` or `n`; noninteractive and review runs deny calls
-that require confirmation.
+an approval opens a panel with the call's arguments and, for a call that writes
+a workspace file, its diff: allow it once, allow the tool or the whole server for
+the rest of the session, deny it, or deny it with a reason for the model (see
+**Tool approvals** in the Terminal chapter, and `/permissions`). Noninteractive
+and review runs deny calls that require confirmation.
 
 orangu connects to configured MCP services; it does not launch or manage MCP
 processes. A failed service is disabled with a warning while the rest of the

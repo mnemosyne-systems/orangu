@@ -268,7 +268,9 @@ pub async fn probe_context_size(
     endpoint: &str,
     api_key: Option<&str>,
 ) -> Option<u64> {
-    let mut builder = client.get(format!("{endpoint}/props"));
+    let mut builder = client
+        .get(format!("{endpoint}/props"))
+        .timeout(std::time::Duration::from_secs(5));
     if let Some(api_key) = api_key {
         builder = builder.bearer_auth(api_key);
     }

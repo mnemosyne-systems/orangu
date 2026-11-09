@@ -29,6 +29,13 @@ use std::{
 use tokio::{process::Command, time::Duration};
 use walkdir::WalkDir;
 
+/// MCP tools and servers allowed for the rest of a session.
+#[derive(Default)]
+struct McpGrants {
+    tools: std::collections::BTreeSet<String>,
+    servers: std::collections::BTreeSet<String>,
+}
+
 #[derive(Clone)]
 pub struct ToolExecutor {
     workspace: PathBuf,
@@ -106,6 +113,9 @@ pub struct ToolExecutor {
     /// Whether nobody can approve a tool call here (a subagent): MCP tools
     /// that ask for approval are then not offered at all.
     mcp_unattended: bool,
+    /// MCP tools and servers the user allowed for the rest of the session
+    /// at an approval prompt: their calls no longer ask.
+    mcp_grants: Arc<Mutex<McpGrants>>,
     /// How many subagents deep this executor runs: 0 for the main
     /// conversation.
     depth: usize,
@@ -258,6 +268,7 @@ impl ToolExecutor {
             mcp: None,
             agent_mcp: None,
             mcp_unattended: false,
+            mcp_grants: Arc::default(),
             agent_hooks: None,
             skills: None,
             depth: 0,
@@ -1045,8 +1056,72 @@ impl ToolExecutor {
     }
 
     pub fn requires_mcp_approval(&self, name: &str) -> bool {
-        self.mcp_for(name)
-            .is_some_and(|mcp| mcp.requires_approval(name))
+        self.mcp_for(name).is_some_and(|mcp| {
+            mcp.requires_approval(name)
+                && !self.mcp_grants.lock().is_ok_and(|grants| {
+                    grants.tools.contains(name)
+                        || mcp
+                            .route_names(name)
+                            .is_some_and(|(server, _)| grants.servers.contains(&server))
+                })
+        })
+    }
+
+    /// The MCP server behind the exposed tool `name`, and the server's own
+    /// name for the tool.
+    pub fn mcp_route(&self, name: &str) -> Option<(String, String)> {
+        self.mcp_for(name).and_then(|mcp| mcp.route_names(name))
+    }
+
+    /// Lets every later call of the MCP tool `name` run without asking.
+    pub fn grant_mcp_tool(&self, name: &str) {
+        if let Ok(mut grants) = self.mcp_grants.lock() {
+            grants.tools.insert(name.to_string());
+        }
+    }
+
+    /// Lets every later call of the MCP server `server`'s tools run without
+    /// asking.
+    pub fn grant_mcp_server(&self, server: &str) {
+        if let Ok(mut grants) = self.mcp_grants.lock() {
+            grants.servers.insert(server.to_string());
+        }
+    }
+
+    /// The tools and the servers granted for this session, each sorted.
+    pub fn mcp_grants(&self) -> (Vec<String>, Vec<String>) {
+        self.mcp_grants
+            .lock()
+            .map(|grants| {
+                (
+                    grants.tools.iter().cloned().collect(),
+                    grants.servers.iter().cloned().collect(),
+                )
+            })
+            .unwrap_or_default()
+    }
+
+    /// Withdraws the grant for a tool or a server named `name`; `false` when
+    /// there was none.
+    pub fn revoke_mcp_grant(&self, name: &str) -> bool {
+        self.mcp_grants.lock().is_ok_and(|mut grants| {
+            let tool = grants.tools.remove(name);
+            let server = grants.servers.remove(name);
+            tool || server
+        })
+    }
+
+    /// Withdraws every grant; returns how many there were.
+    pub fn clear_mcp_grants(&self) -> usize {
+        self.mcp_grants
+            .lock()
+            .map(|mut grants| {
+                let count = grants.tools.len() + grants.servers.len();
+                grants.tools.clear();
+                grants.servers.clear();
+                count
+            })
+            .unwrap_or_default()
     }
 
     /// Expose the session-local file context cache for persistence across runs.

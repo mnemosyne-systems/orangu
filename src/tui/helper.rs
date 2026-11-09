@@ -75,6 +75,7 @@ impl OranguHelper {
                 "/squash".to_string(),
                 "/clear".to_string(),
                 "/compact".to_string(),
+                "/permissions".to_string(),
                 "/quit".to_string(),
             ],
             models,

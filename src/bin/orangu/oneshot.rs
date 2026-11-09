@@ -336,7 +336,7 @@ impl OneshotSession {
                 |tool_call| {
                     console.note(&format!("[tool] {}", tool_call.function.name));
                 },
-                |_| false,
+                |_| orangu::session::ToolApproval::Deny(None),
             )
             .await;
 

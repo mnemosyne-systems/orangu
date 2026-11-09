@@ -267,6 +267,26 @@ show local tools
 
 \newpage
 
+## /permissions
+
+Lists the MCP tools and servers allowed for this session at an approval prompt
+(`t` and `s`; see **Tool approvals** in the Terminal chapter), whose calls run
+without asking.
+
+`/permissions revoke <name>` takes back the grant for one tool or server, so its
+calls ask again; `/permissions clear` takes back all of them.
+
+**Examples**
+
+```text
+/permissions
+/permissions revoke mcp__fs__write_file
+/permissions revoke fs
+/permissions clear
+```
+
+\newpage
+
 ## /model
 
 Selects the model used for requests on the active server.

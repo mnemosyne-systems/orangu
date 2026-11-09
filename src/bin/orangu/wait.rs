@@ -37,6 +37,8 @@ pub(crate) async fn wait_for_response(
 
     // Move `session` into the background task so the future can outlive this
     // stack frame if the user switches tabs mid-stream.
+    // Known before the turn, so the gauge has its limit while the turn runs.
+    session.learn_context_size(profile).await;
     // The stand-in keeps the context gauge's state, for the status line while
     // the turn runs and for a cancelled turn's rebuilt session.
     let mut stand_in = ChatSession::new("");
@@ -53,6 +55,7 @@ pub(crate) async fn wait_for_response(
     let stc = Arc::clone(&streamed_state);
     let sta = Arc::clone(&streamed_state);
     let su = Arc::clone(&streamed_state);
+    let approval_tools = tools.clone();
 
     let handle = tokio::spawn(async move {
         let mut s = real_session;
@@ -86,16 +89,39 @@ pub(crate) async fn wait_for_response(
                     }
                 },
                 move |tool_call| {
+                    use crate::approval::{ApprovalChoice, McpApprovalRequest};
+                    use orangu::session::ToolApproval;
+
+                    let name = &tool_call.function.name;
+                    let server = approval_tools.mcp_route(name).map(|(server, _)| server);
                     let (decision, receiver) = std::sync::mpsc::channel();
+                    let request = McpApprovalRequest::new(
+                        decision,
+                        tool_call,
+                        server.clone(),
+                        approval_tools.workspace(),
+                    );
                     if let Ok(mut state) = sta.lock() {
-                        state.pending_mcp_approval =
-                            Some(crate::input::McpApprovalRequest { decision });
-                        state.output.push_str(&format!(
-                            "\n\n[MCP approval required: {}. Press y to approve or n to deny.]",
-                            tool_call.function.name
-                        ));
+                        state.pending_mcp_approval = Some(request);
                     }
-                    receiver.recv().unwrap_or(false)
+                    let choice = receiver.recv().unwrap_or(ApprovalChoice::Deny(None));
+                    if let Ok(mut state) = sta.lock() {
+                        state.pending_mcp_approval = None;
+                    }
+                    match choice {
+                        ApprovalChoice::Once => ToolApproval::Allow,
+                        ApprovalChoice::Tool => {
+                            approval_tools.grant_mcp_tool(name);
+                            ToolApproval::Allow
+                        }
+                        ApprovalChoice::Server => {
+                            if let Some(server) = &server {
+                                approval_tools.grant_mcp_server(server);
+                            }
+                            ToolApproval::Allow
+                        }
+                        ApprovalChoice::Deny(reason) => ToolApproval::Deny(reason),
+                    }
                 },
             )
             .await;
@@ -182,6 +208,7 @@ async fn drive_handle(
     let mut last_rendered_output = String::new();
     let mut last_rendered_metrics = StreamMetrics::default();
     let mut last_tool_was_running = false;
+    let mut last_approval_view = None;
     let mut rendered_native_tool_calls = 0usize;
     let mut escape_cancel_state = EscapeCancelState::default();
     let initial_status = Some(render_thinking_status(
@@ -302,6 +329,7 @@ async fn drive_handle(
                 let current_stream_metrics = current_state.metrics;
                 let current_tool_running_since = current_state.tool_running_since;
                 let current_native_tool_calls = current_state.native_tool_calls;
+                let current_approval = current_state.pending_mcp_approval;
 
                 if current_native_tool_calls.len() > rendered_native_tool_calls {
                     for tc in &current_native_tool_calls[rendered_native_tool_calls..] {
@@ -324,6 +352,8 @@ async fn drive_handle(
                     orangu::tui::context_gauge::show(Some(session.context_gauge_for(usage)));
                 }
                 redraw |= current_tool_running_since.is_some() != last_tool_was_running;
+                redraw |= current_approval.as_ref().map(crate::approval::McpApprovalRequest::view)
+                    != last_approval_view;
 
                 // An SSH login running in this turn has a question.
                 while let Some(request) = crate::ssh_prompt::next_request() {
@@ -357,18 +387,22 @@ async fn drive_handle(
 
                 while event::poll(std::time::Duration::ZERO)? {
                     let event = event::read()?;
-                    if let Some(request) = streamed_state
-                        .lock()
-                        .ok()
-                        .and_then(|state| state.pending_mcp_approval.clone())
-                        && let Event::Key(KeyEvent { code: KeyCode::Char(choice), .. }) = event
-                        && matches!(choice, 'y' | 'Y' | 'n' | 'N')
-                    {
-                        let approved = matches!(choice, 'y' | 'Y');
-                        let _ = request.decision.send(approved);
-                        if let Ok(mut state) = streamed_state.lock() {
-                            state.pending_mcp_approval = None;
+                    // An MCP call waiting for approval takes its keys first.
+                    let approval_key = streamed_state.lock().ok().and_then(|mut state| {
+                        let request = state.pending_mcp_approval.as_mut()?;
+                        match request.key(&event) {
+                            crate::approval::ApprovalKey::Ignored => None,
+                            crate::approval::ApprovalKey::Changed => Some(()),
+                            crate::approval::ApprovalKey::Decided(choice) => {
+                                output_state.push_text(
+                                    &choice.record(&request.tool, request.server.as_deref()),
+                                );
+                                let _ = request.decision.send(choice);
+                                Some(())
+                            }
                         }
+                    });
+                    if approval_key.is_some() {
                         redraw = true;
                         continue;
                     }
@@ -505,6 +539,14 @@ async fn drive_handle(
                     last_rendered_output = current_streamed_output;
                     last_rendered_metrics = current_stream_metrics;
                     last_tool_was_running = current_tool_running_since.is_some();
+                    // Read again: a key handled since the top of this tick
+                    // may have changed or answered it.
+                    let approval = streamed_state
+                        .lock()
+                        .ok()
+                        .and_then(|state| state.pending_mcp_approval.clone());
+                    last_approval_view =
+                        approval.as_ref().map(crate::approval::McpApprovalRequest::view);
                     let left_status = render_left_status(
                         &last_rendered_output,
                         &last_rendered_metrics,
@@ -519,6 +561,9 @@ async fn drive_handle(
                         }
                     } else {
                         parsed_state.push_parsed(&last_rendered_output, true);
+                    }
+                    if let Some(approval) = &approval {
+                        parsed_state.push_parsed(&format!("\n\n{}", approval.panel()), false);
                     }
                     let pending_lines = parsed_state.lines();
 

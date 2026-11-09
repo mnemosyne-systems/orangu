@@ -94,6 +94,7 @@ pub enum SlashCommand {
     Graph,
     Clear,
     Compact,
+    Permissions,
     Copy,
     Theme,
     License,
@@ -191,6 +192,7 @@ impl SlashCommand {
             }
             SlashCommand::Clear => "Clears the terminal screen",
             SlashCommand::Compact => "Drops old tool output from the conversation",
+            SlashCommand::Permissions => "Lists and revokes the MCP tools allowed for this session",
             SlashCommand::Copy => "Copies the latest assistant response as Markdown",
             SlashCommand::Theme => "Switches the active TUI theme",
             SlashCommand::License => "Chooses the licence generated code is written under",

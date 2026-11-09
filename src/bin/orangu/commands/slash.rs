@@ -132,6 +132,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/schedule" => Some(LocalCommand::Schedule),
         "/clear" => Some(LocalCommand::Clear),
         "/compact" => Some(LocalCommand::Compact),
+        "/permissions" => Some(LocalCommand::Permissions(PermissionsSubcommand::List)),
         "/copy" => Some(LocalCommand::Copy),
         "/quit" => Some(LocalCommand::Quit),
         "/pending" => Some(LocalCommand::PendingList),
@@ -167,6 +168,19 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     }
                     _ => None,
                 };
+            }
+            if let Some(args) = input.strip_prefix("/permissions ") {
+                let mut words = args.split_whitespace();
+                return Some(LocalCommand::Permissions(
+                    match (words.next(), words.next(), words.next()) {
+                        (None, ..) => PermissionsSubcommand::List,
+                        (Some("clear"), None, _) => PermissionsSubcommand::Clear,
+                        (Some("revoke"), Some(name), None) => {
+                            PermissionsSubcommand::Revoke(Cow::Borrowed(name))
+                        }
+                        _ => PermissionsSubcommand::Usage,
+                    },
+                ));
             }
             if let Some(args) = input.strip_prefix("/mcp ") {
                 let args = args.trim();

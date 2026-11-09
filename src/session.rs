@@ -20,6 +20,24 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 
+/// The user's answer to an MCP tool call that asks for approval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolApproval {
+    Allow,
+    /// Refused, with the user's reason for the model when they gave one.
+    Deny(Option<String>),
+}
+
+impl ToolApproval {
+    /// The tool result a refused call returns to the model.
+    fn denial(reason: Option<&str>) -> String {
+        match reason.map(str::trim).filter(|reason| !reason.is_empty()) {
+            Some(reason) => format!("error: the user denied this MCP tool call: {reason}"),
+            None => "error: MCP tool call denied by user".to_string(),
+        }
+    }
+}
+
 /// How many subagents of one turn run at the same time. Local inference
 /// shares one machine between them, so more would mostly queue.
 pub const MAX_PARALLEL_SUBAGENTS: usize = 4;
@@ -676,7 +694,7 @@ impl ChatSession {
         G: FnMut(StreamMetrics),
         H: FnMut(bool),
         I: FnMut(&crate::llm::ToolCall),
-        J: FnMut(&crate::llm::ToolCall) -> bool,
+        J: FnMut(&crate::llm::ToolCall) -> ToolApproval,
     {
         self.compact_transcript();
         // Subagents this turn starts talk to the same connection.
@@ -759,10 +777,14 @@ impl ChatSession {
                             let tool_call = &tool_calls[index];
                             index += 1;
                             on_tool_call(tool_call);
-                            let rendered = if tools.requires_mcp_approval(&tool_call.function.name)
-                                && !on_mcp_approval(tool_call)
+                            let approval = if tools.requires_mcp_approval(&tool_call.function.name)
                             {
-                                "error: MCP tool call denied by user".to_string()
+                                on_mcp_approval(tool_call)
+                            } else {
+                                ToolApproval::Allow
+                            };
+                            let rendered = if let ToolApproval::Deny(reason) = &approval {
+                                ToolApproval::denial(reason.as_deref())
                             } else {
                                 render_tool_result(
                                     tools
@@ -1430,7 +1452,7 @@ data: [DONE]
                 |_| {},
                 |_| {},
                 |call| announced.push(call.id.clone()),
-                |_| false,
+                |_| crate::session::ToolApproval::Deny(None),
             )
             .await
             .expect("turn completes");
@@ -1482,7 +1504,7 @@ data: [DONE]
                     |_| {},
                     |_| {},
                     |_| {},
-                    |_| false,
+                    |_| crate::session::ToolApproval::Deny(None),
                 )
                 .await
                 .expect_err("out of rounds");

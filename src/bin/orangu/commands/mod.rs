@@ -682,6 +682,7 @@ pub enum LocalCommand<'a> {
     /// `/compact`: drop stale working-tree snapshots and old tool output
     /// from the conversation now.
     Compact,
+    Permissions(PermissionsSubcommand<'a>),
     /// `/copy`: copy the latest assistant response as raw Markdown.
     Copy,
     Quit,
@@ -722,6 +723,15 @@ pub enum McpSubcommand<'a> {
         name: Cow<'a, str>,
         endpoint: Cow<'a, str>,
     },
+    Usage,
+}
+
+/// `/permissions`: the MCP tools and servers allowed for this session at an
+/// approval prompt.
+pub enum PermissionsSubcommand<'a> {
+    List,
+    Revoke(Cow<'a, str>),
+    Clear,
     Usage,
 }
 

@@ -236,6 +236,41 @@ main                         Graph: ●                 ctx 18k/32k   gemma-4-E2
 Each workspace tab has its own conversation and its own gauge. A resumed
 session shows its gauge after its first answer.
 
+## Tool approvals
+
+An MCP tool call that asks for approval (`approval_mode = prompt`, or `writes`
+for a tool not marked read-only; see the Configuration chapter) stops the turn
+and opens a panel under the answer:
+
+```text
+MCP tool call needs approval: mcp__fs__write_file on server fs
+{
+  "path": "notes.txt",
+  "content": "one\nthree\n"
+}
+--- a/notes.txt
++++ b/notes.txt
+@@ -1,2 +1,2 @@
+ one
+-two
++three
+y allow once · t always this tool · s always this server · n deny · r deny with a reason
+```
+
+- The arguments are shown as formatted JSON. Past 12 lines they are folded; `e` shows them in full and folds them again
+- A call that writes a workspace file — a path with the whole new content, a path with old and new text, or a path with a list of such edits — also shows what it would change, as a diff against the file as it is now
+- `y` runs this call
+- `t` runs it, and every later call of this tool in this session without asking
+- `s` runs it, and every later call of any tool of this server in this session without asking
+- `n` refuses it; the model is told the user denied the call
+- `r` asks for a reason: type it and press `Enter` to refuse the call with it, so the model reads why; `Esc` goes back to the choices
+- The choice is recorded in the output window, for example `[MCP mcp__fs__write_file: allowed for this session]`
+
+What `t` and `s` allowed lasts until the client exits; `/permissions` lists it
+and takes it back. Subagents never run a tool that asks for approval, whatever
+was allowed. Other keys keep going to the input line, where commands can be
+queued as usual.
+
 ## History and navigation
 
 Command history is stored per session in:

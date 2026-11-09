@@ -2668,3 +2668,27 @@ fn parses_fork_commands() {
         Some(LocalCommand::Fork(Some(task))) if task == "check the other branch too"
     ));
 }
+
+#[test]
+fn parses_permissions_forms() {
+    assert!(matches!(
+        parse_local_command("/permissions"),
+        Some(LocalCommand::Permissions(PermissionsSubcommand::List))
+    ));
+    assert!(matches!(
+        parse_local_command("/permissions clear"),
+        Some(LocalCommand::Permissions(PermissionsSubcommand::Clear))
+    ));
+    assert!(matches!(
+        parse_local_command("/permissions revoke db"),
+        Some(LocalCommand::Permissions(PermissionsSubcommand::Revoke(name))) if name == "db"
+    ));
+    assert!(matches!(
+        parse_local_command("/permissions revoke"),
+        Some(LocalCommand::Permissions(PermissionsSubcommand::Usage))
+    ));
+    assert!(matches!(
+        parse_local_command("compact"),
+        Some(LocalCommand::Compact)
+    ));
+}

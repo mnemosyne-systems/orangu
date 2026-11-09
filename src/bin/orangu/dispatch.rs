@@ -13,6 +13,7 @@
 // You should have received a copy of the GNU General Public License
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+use crate::commands::PermissionsSubcommand;
 use crate::commands::revert_usage_message;
 use crate::commands::{AfterTurn, GitOperation, build_workspace_system_prompt};
 use crate::git::{abort_output, discover_git_dir, git_current_branch, revert_output};
@@ -156,6 +157,23 @@ fn licence_phrase(project: &orangu::license::Project) -> String {
 
 /// What `/license` reports when asked with no argument: the licence in force
 /// and, as much as it can, where it came from.
+/// `/permissions`: what an approval prompt allowed for the rest of the session.
+fn permissions_list(tools: &ToolExecutor) -> String {
+    let (granted_tools, servers) = tools.mcp_grants();
+    if granted_tools.is_empty() && servers.is_empty() {
+        return "No MCP tools or servers are allowed for this session; calls that need \
+                approval ask each time."
+            .to_string();
+    }
+    let mut lines = vec!["Allowed for this session without asking:".to_string()];
+    lines.extend(granted_tools.iter().map(|tool| format!("  tool    {tool}")));
+    lines.extend(servers.iter().map(|server| format!("  server  {server}")));
+    lines.push(
+        "Revoke one with /permissions revoke <name>, all with /permissions clear.".to_string(),
+    );
+    lines.join("\n")
+}
+
 fn license_status(tools: &ToolExecutor, workspace: &std::path::Path) -> String {
     use orangu::license::{Choice, DEFAULT_LICENCE, Project};
 
@@ -2651,6 +2669,28 @@ pub(crate) fn handle_command(
             session.clear(&prompt);
             Ok(CommandOutcome::Cleared)
         }
+        LocalCommand::Permissions(command) => Ok(match command {
+            PermissionsSubcommand::List => CommandOutcome::Output(permissions_list(tools)),
+            PermissionsSubcommand::Revoke(name) => {
+                CommandOutcome::Output(if tools.revoke_mcp_grant(&name) {
+                    format!("Revoked '{name}': its calls ask for approval again.")
+                } else {
+                    format!("Nothing allowed under '{name}'. /permissions lists what is.")
+                })
+            }
+            PermissionsSubcommand::Clear => {
+                CommandOutcome::Output(match tools.clear_mcp_grants() {
+                    0 => "No MCP tools or servers were allowed for this session.".to_string(),
+                    count => format!(
+                        "Revoked {count}: every MCP call that asks for approval asks again."
+                    ),
+                })
+            }
+            PermissionsSubcommand::Usage => CommandOutcome::OutputError(
+                "Usage: /permissions, /permissions revoke <tool|server>, /permissions clear"
+                    .to_string(),
+            ),
+        }),
         LocalCommand::Compact => {
             let (before, after) = session.compact_now();
             orangu::tui::context_gauge::show(session.context_gauge());
