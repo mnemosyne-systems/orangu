@@ -106,6 +106,25 @@ pub struct Session {
     /// as "New chat" by the UI) until then.
     pub title: String,
     pub messages: Vec<SessionMessage>,
+    /// Every version of the last turn — its question and its answer — once
+    /// it has been edited or regenerated; empty until then, and emptied
+    /// again by the next new turn. The last two `messages` are always
+    /// `turn_versions[active_version]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turn_versions: Vec<TurnVersion>,
+    #[serde(default)]
+    pub active_version: usize,
+    /// Set by [`take_last_turn`]: the next [`append_turn`] adds a version of
+    /// the last turn rather than a new turn.
+    #[serde(skip)]
+    pub replacing_last_turn: bool,
+}
+
+/// One version of the last turn.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TurnVersion {
+    pub user: SessionMessage,
+    pub assistant: SessionMessage,
 }
 
 #[derive(Serialize, Clone)]
@@ -155,9 +174,62 @@ pub fn create_session() -> Result<Session> {
         updated_at: now,
         title: String::new(),
         messages: Vec::new(),
+        turn_versions: Vec::new(),
+        active_version: 0,
+        replacing_last_turn: false,
     };
     save_session(&session)?;
     Ok(session)
+}
+
+/// Takes the last question and its answer off `session`, so the next
+/// [`append_turn`] adds another version of that turn: an edited question or
+/// a regenerated answer. Returns the question taken off. Nothing is saved:
+/// a turn that never completes leaves the session on disk as it was.
+pub fn take_last_turn(session: &mut Session) -> Result<SessionMessage> {
+    let count = session.messages.len();
+    let answered = count >= 2
+        && session.messages[count - 2].role == "user"
+        && session.messages[count - 1].role == "assistant";
+    if !answered {
+        return Err(anyhow!(
+            "the conversation has no answered question to change"
+        ));
+    }
+    let assistant = session.messages.pop().expect("checked above");
+    let user = session.messages.pop().expect("checked above");
+    if session.turn_versions.is_empty() {
+        session.turn_versions.push(TurnVersion {
+            user: user.clone(),
+            assistant,
+        });
+        session.active_version = 0;
+    }
+    // A first question rewritten gets its title from the new wording.
+    if session.messages.is_empty() {
+        session.title.clear();
+    }
+    session.replacing_last_turn = true;
+    Ok(user)
+}
+
+/// Shows version `index` of the last turn, and saves the session.
+pub fn show_version(session: &mut Session, index: usize) -> Result<()> {
+    let version = session
+        .turn_versions
+        .get(index)
+        .cloned()
+        .ok_or_else(|| anyhow!("the last turn has no version {}", index + 1))?;
+    let count = session.messages.len();
+    if count < 2 {
+        return Err(anyhow!("the conversation has no last turn"));
+    }
+    session.messages.truncate(count - 2);
+    session.messages.push(version.user);
+    session.messages.push(version.assistant);
+    session.active_version = index;
+    session.updated_at = unix_now();
+    save_session(session)
 }
 
 pub fn save_session(session: &Session) -> Result<()> {
@@ -539,6 +611,19 @@ pub fn append_turn(
         attachments: Vec::new(),
         reasoning: assistant_reasoning.to_string(),
     });
+    if std::mem::take(&mut session.replacing_last_turn) {
+        let count = session.messages.len();
+        session.turn_versions.push(TurnVersion {
+            user: session.messages[count - 2].clone(),
+            assistant: session.messages[count - 1].clone(),
+        });
+        session.active_version = session.turn_versions.len() - 1;
+    } else {
+        // A new turn keeps the version shown of the one before and drops
+        // the others: only the last turn has versions.
+        session.turn_versions.clear();
+        session.active_version = 0;
+    }
     session.updated_at = unix_now();
     save_session(session)
 }
@@ -658,6 +743,77 @@ mod tests {
     }
 
     #[test]
+    fn edits_and_regenerations_are_versions_of_the_last_turn() {
+        with_temp_home(|| {
+            let mut session = create_session().unwrap();
+            append_turn(&mut session, "First?", Vec::new(), "One.", "", None).unwrap();
+            append_turn(&mut session, "Second?", Vec::new(), "Two.", "", None).unwrap();
+            assert!(session.turn_versions.is_empty());
+
+            // Regenerate: the same question, a new answer.
+            let question = take_last_turn(&mut session).unwrap();
+            assert_eq!(question.content, "Second?");
+            assert_eq!(session.messages.len(), 2);
+            append_turn(
+                &mut session,
+                &question.content,
+                Vec::new(),
+                "Deux.",
+                "",
+                None,
+            )
+            .unwrap();
+            // Edit: a new question.
+            take_last_turn(&mut session).unwrap();
+            append_turn(
+                &mut session,
+                "Second, again?",
+                Vec::new(),
+                "Zwei.",
+                "",
+                None,
+            )
+            .unwrap();
+
+            let saved = load_session(&session.id).unwrap();
+            assert_eq!(saved.turn_versions.len(), 3);
+            assert_eq!(saved.active_version, 2);
+            assert_eq!(saved.messages.len(), 4);
+            assert_eq!(saved.messages[3].content, "Zwei.");
+
+            let mut saved = saved;
+            show_version(&mut saved, 0).unwrap();
+            let shown = load_session(&session.id).unwrap();
+            assert_eq!(shown.messages[2].content, "Second?");
+            assert_eq!(shown.messages[3].content, "Two.");
+            assert_eq!(shown.active_version, 0);
+            assert!(show_version(&mut saved, 3).is_err());
+
+            // The next new turn keeps the version shown and drops the rest.
+            let mut shown = shown;
+            append_turn(&mut shown, "Third?", Vec::new(), "Three.", "", None).unwrap();
+            assert!(shown.turn_versions.is_empty());
+            assert_eq!(shown.messages[3].content, "Two.");
+        });
+    }
+
+    #[test]
+    fn only_an_answered_question_can_be_changed() {
+        with_temp_home(|| {
+            let mut session = create_session().unwrap();
+            assert!(take_last_turn(&mut session).is_err());
+            append_turn(&mut session, "Only?", Vec::new(), "Yes.", "", None).unwrap();
+            take_last_turn(&mut session).unwrap();
+            assert!(
+                session.title.is_empty(),
+                "a rewritten first question retitles"
+            );
+            append_turn(&mut session, "Rewritten?", Vec::new(), "Yes.", "", None).unwrap();
+            assert_eq!(session.title, "Rewritten?");
+        });
+    }
+
+    #[test]
     fn list_sessions_sorts_by_most_recently_updated() {
         with_temp_home(|| {
             let mut a = create_session().unwrap();
@@ -748,6 +904,9 @@ mod tests {
                 updated_at: 0,
                 title: String::new(),
                 messages: Vec::new(),
+                turn_versions: Vec::new(),
+                active_version: 0,
+                replacing_last_turn: false,
             };
             let dir = session_dir(&id).unwrap();
             fs::create_dir_all(&dir).unwrap();

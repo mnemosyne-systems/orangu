@@ -3951,6 +3951,24 @@ streamed in stays on screen, marked as stopped, but since the turn never
 reached completion it isn't saved — a stopped reply won't reappear if you
 reload or revisit it from **History**.
 
+### Editing a question and regenerating an answer
+
+The last question and its answer carry two small buttons:
+
+- **Edit** (the pencil under the question) turns it into a text box with its
+  wording. **Send** (or `Enter`; `Shift+Enter` for a new line) answers the new
+  wording in place of the old; **Cancel** (or `Esc`) leaves it as it was. Files
+  attached to the question stay attached
+- **Regenerate** (the circular arrow under the answer) answers the same
+  question again
+
+Neither throws the earlier version away. Once the last turn has more than one
+version, its answer shows `‹ 2/3 ›`: the arrows switch between them, question
+and answer together, and the version shown is the one the next question
+follows on from. Sending a new question keeps the version on screen and drops
+the others — only the last turn has versions. Stopping an edit or a
+regeneration before it finishes leaves the turn as it was.
+
 Chat sessions persist as one directory per session at
 `~/.orangu/server/sessions/<uuid>/chat.json`, so **History** survives a
 restart.

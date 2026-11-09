@@ -351,6 +351,90 @@ button:disabled {
   background: var(--user-bubble);
 }
 
+/* Edit under the last question; Regenerate and the version switcher under
+   its answer. Dim like the answer footer until pointed at. */
+.turn-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 6px;
+  margin-top: 0.4em;
+  color: var(--text-dim);
+  font-size: 0.72em;
+}
+
+.turn-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 4px;
+  border: none;
+  background: none;
+  color: inherit;
+  line-height: 1;
+  opacity: 0.65;
+}
+
+.turn-btn:hover:not(:disabled),
+.turn-btn:focus-visible {
+  color: var(--text);
+  opacity: 1;
+}
+
+.turn-btn:disabled {
+  opacity: 0.25;
+}
+
+.turn-btn svg {
+  width: 12px;
+  height: 12px;
+}
+
+.version-switch {
+  display: inline-flex;
+  align-items: center;
+  margin-right: auto;
+  font-size: 1.1em;
+}
+
+.version-label {
+  font-variant-numeric: tabular-nums;
+  font-size: 0.9em;
+}
+
+.message.user.editing {
+  width: 100%;
+  max-width: min(80%, 720px);
+}
+
+.edit-box {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius) - 4px);
+  padding: 6px 8px;
+}
+
+.edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.edit-actions .primary {
+  background: var(--brand-bg);
+  color: #ffffff;
+  border-color: var(--brand-bg);
+}
+
 .message.assistant {
   align-self: flex-start;
   background: var(--assistant-bubble);

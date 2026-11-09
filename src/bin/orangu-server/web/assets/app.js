@@ -22,7 +22,9 @@
     file: document.getElementById("attach-input-file"),
   };
 
-  const state = { sessionId: null, busy: false, abortController: null };
+  // `versions`/`activeVersion`: how many versions the last turn has (0
+  // until it is edited or regenerated) and which one is shown.
+  const state = { sessionId: null, busy: false, abortController: null, versions: 0, activeVersion: 0 };
 
   // Files staged for the next message. Each entry is
   // {name, mime, size, data} where `data` is base64 of the raw bytes — the
@@ -39,6 +41,8 @@
   // The primary action saves the raw Markdown; its adjacent menu offers
   // plain text and the browser's PDF print flow.
   const SAVE_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
+  const EDIT_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>`;
+  const REGENERATE_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>`;
   const SAVE_MENU_ICON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>`;
   let openSaveMenu = null;
 
@@ -83,6 +87,9 @@
     const el = document.createElement("div");
     el.className = `message ${role}`;
     el.textContent = text;
+    // Kept for Edit, which shows the question again with its files.
+    el.messageText = text;
+    el.messageAttachments = attachments || [];
     appendAttachmentChips(el, attachments);
     transcript.appendChild(el);
     transcript.scrollTop = transcript.scrollHeight;
@@ -834,7 +841,24 @@
   async function loadSession(id) {
     const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`);
     if (!res.ok) throw new Error(`failed to load session (${res.status})`);
-    const session = await res.json();
+    renderSession(await res.json());
+    hideHistory();
+  }
+
+  // Shows another version of the last turn.
+  async function showVersion(index) {
+    if (state.busy || !state.sessionId) return;
+    const res = await fetch(
+      `/api/sessions/${encodeURIComponent(state.sessionId)}/versions/${index}`,
+      { method: "POST" },
+    );
+    if (!res.ok) throw new Error(`failed to switch version (${res.status})`);
+    const scroll = transcript.scrollTop;
+    renderSession(await res.json());
+    transcript.scrollTop = scroll;
+  }
+
+  function renderSession(session) {
     state.sessionId = session.id;
     localStorage.setItem("orangu-session-id", session.id);
     transcript.innerHTML = "";
@@ -853,7 +877,129 @@
         pendingTurnDiagrams = message.attachments || [];
       }
     }
-    hideHistory();
+    state.versions = session.versions || 0;
+    state.activeVersion = session.active_version || 0;
+    decorateLastTurn();
+  }
+
+  // The last question and its answer.
+  function lastTurnElements() {
+    const answer = transcript.lastElementChild;
+    if (!answer || !answer.classList.contains("assistant")) return null;
+    const question = answer.previousElementSibling;
+    if (!question || !question.classList.contains("user")) return null;
+    return { question, answer };
+  }
+
+  function clearTurnControls() {
+    for (const el of transcript.querySelectorAll(".turn-actions")) el.remove();
+  }
+
+  function turnButton(icon, label, onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "turn-btn";
+    button.innerHTML = icon;
+    button.setAttribute("aria-label", label);
+    button.setAttribute("title", label);
+    button.addEventListener("click", () => {
+      if (!state.busy) onClick();
+    });
+    return button;
+  }
+
+  // Edit under the last question, Regenerate and the version switcher under
+  // its answer. Only the last turn has them.
+  function decorateLastTurn() {
+    clearTurnControls();
+    const turn = lastTurnElements();
+    if (!turn || turn.answer.classList.contains("error")) return;
+
+    const questionActions = document.createElement("div");
+    questionActions.className = "turn-actions";
+    questionActions.appendChild(turnButton(EDIT_ICON, "Edit question", () => editQuestion(turn.question)));
+    turn.question.appendChild(questionActions);
+
+    const answerActions = document.createElement("div");
+    answerActions.className = "turn-actions";
+    if (state.versions > 1) {
+      const switcher = document.createElement("span");
+      switcher.className = "version-switch";
+      const previous = turnButton("‹", "Previous version", () =>
+        showVersion(state.activeVersion - 1).catch((err) => console.error(err)),
+      );
+      previous.disabled = state.activeVersion === 0;
+      const label = document.createElement("span");
+      label.className = "version-label";
+      label.textContent = `${state.activeVersion + 1}/${state.versions}`;
+      const next = turnButton("›", "Next version", () =>
+        showVersion(state.activeVersion + 1).catch((err) => console.error(err)),
+      );
+      next.disabled = state.activeVersion >= state.versions - 1;
+      switcher.append(previous, label, next);
+      answerActions.appendChild(switcher);
+    }
+    answerActions.appendChild(
+      turnButton(REGENERATE_ICON, "Regenerate answer", () => {
+        sendMessage(turn.question.messageText ?? "", [], "regenerate", turn.question.messageAttachments)
+          .catch((err) => console.error(err));
+      }),
+    );
+    turn.answer.appendChild(answerActions);
+  }
+
+  // Turns the last question into a text box; saving answers the new wording
+  // as another version of the turn.
+  function editQuestion(questionEl) {
+    clearTurnControls();
+    const original = questionEl.messageText ?? "";
+    const attachments = questionEl.messageAttachments || [];
+    questionEl.classList.add("editing");
+    questionEl.textContent = "";
+    const box = document.createElement("textarea");
+    box.className = "edit-box";
+    box.value = original;
+    box.rows = Math.min(12, Math.max(2, original.split("\n").length));
+    const actions = document.createElement("div");
+    actions.className = "edit-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.textContent = "Cancel";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "primary";
+    save.textContent = "Send";
+    actions.append(cancel, save);
+    questionEl.append(box, actions);
+    box.focus();
+    box.setSelectionRange(box.value.length, box.value.length);
+
+    const restore = () => {
+      questionEl.classList.remove("editing");
+      questionEl.textContent = original;
+      appendAttachmentChips(questionEl, attachments);
+      decorateLastTurn();
+    };
+    const submit = () => {
+      const text = box.value.trim();
+      if (!text && attachments.length === 0) return;
+      if (text === original.trim()) {
+        restore();
+        return;
+      }
+      sendMessage(text, [], "edit", attachments).catch((err) => console.error(err));
+    };
+    cancel.addEventListener("click", restore);
+    save.addEventListener("click", submit);
+    box.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        submit();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        restore();
+      }
+    });
   }
 
   function formatDate(unixSeconds) {
@@ -1054,15 +1200,26 @@
     return `${rest}s`;
   }
 
-  async function sendMessage(text, attachments) {
+  // `mode` is "send" for a new turn, or "edit"/"regenerate" for another
+  // version of the last one, which replaces it on screen; `shownAttachments`
+  // are that question's files, which the server keeps.
+  async function sendMessage(text, attachments, mode = "send", shownAttachments = null) {
     attachments = attachments || [];
     if (!state.sessionId) {
       await newChat();
     }
+    clearTurnControls();
+    if (mode !== "send") {
+      const turn = lastTurnElements();
+      if (turn) {
+        turn.answer.remove();
+        turn.question.remove();
+      }
+    }
     // Kept so the "attachments" event below can hang diagrams off the user's
     // own message once the server has drawn them (the browser only has the
     // raw file bytes; extraction and rendering are server-side).
-    const userEl = addMessage("user", text, attachments);
+    const userEl = addMessage("user", text, shownAttachments || attachments);
     const assistantEl = addMessage("assistant", "🤖");
     assistantEl.classList.add("pending");
     setBusy(true);
@@ -1086,6 +1243,9 @@
     // The server's view of this turn's uploads, as sent by the "attachments"
     // event — kept so the finished answer can carry their diagrams.
     let turnAttachments = [];
+    // Set once the server has saved the turn: only then does it get the
+    // last turn's controls.
+    let turnFinished = false;
     const tpsText = () => {
       if (!tpsStarted || tpsCount === 0) return null;
       const elapsed = (performance.now() - tpsStartMs) / 1000;
@@ -1099,6 +1259,7 @@
         body: JSON.stringify({
           content: text,
           attachments: attachments.map((a) => ({ name: a.name, mime: a.mime, data: a.data })),
+          mode,
         }),
         signal: controller.signal,
       });
@@ -1206,6 +1367,9 @@
                 assistantEl.appendChild(notice);
               }
               addTimingFooter(assistantEl, payload.generation_ms, payload.content, tpsText());
+              state.versions = payload.versions || 0;
+              state.activeVersion = payload.active_version || 0;
+              turnFinished = true;
             }
             transcript.scrollTop = transcript.scrollHeight;
           } else if (payload.type === "error") {
@@ -1235,6 +1399,14 @@
     } finally {
       setBusy(false);
       state.abortController = null;
+      // A turn that did not finish was not saved. An edit or regeneration
+      // stopped by hand shows the turn as the server still has it; otherwise
+      // nothing on screen offers to change a turn the server does not have.
+      if (turnFinished) {
+        decorateLastTurn();
+      } else if (mode !== "send" && controller.signal.aborted) {
+        await loadSession(state.sessionId).catch((err) => console.error(err));
+      }
     }
   }
 

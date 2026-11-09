@@ -309,6 +309,7 @@ pub fn build_router(state: Arc<WebState>) -> Router {
             get(get_session).delete(delete_session),
         )
         .route("/api/sessions/{id}/messages", post(send_message))
+        .route("/api/sessions/{id}/versions/{index}", post(show_version))
         .route("/api/sessions/{id}/files/{name}", get(session_file))
         .merge(mcp::router())
         // The monitoring pane: live CPU/GPU/NPU inventory.
@@ -786,6 +787,10 @@ struct SessionView {
     updated_at: u64,
     title: String,
     messages: Vec<SessionMessageView>,
+    /// How many versions the last turn has (0 until it is edited or
+    /// regenerated), and which one `messages` ends with.
+    versions: usize,
+    active_version: usize,
 }
 
 async fn get_session(
@@ -793,37 +798,60 @@ async fn get_session(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match sessions::load_session(&id) {
-        Ok(session) => Json(SessionView {
-            id: session.id.clone(),
-            created_at: session.created_at,
-            updated_at: session.updated_at,
-            title: session.title,
-            messages: session
-                .messages
-                .into_iter()
-                .map(|m| {
-                    let html = (m.role == "assistant").then(|| {
-                        render::render_markdown_to_html(&m.content, state.project_licence.as_ref())
-                    });
-                    let reasoning_html = (!m.reasoning.is_empty())
-                        .then(|| render::render_reasoning_to_html(&m.reasoning));
-                    SessionMessageView {
-                        role: m.role,
-                        content: m.content,
-                        html,
-                        generation_ms: m.generation_ms,
-                        attachments: m
-                            .attachments
-                            .into_iter()
-                            .map(|a| attachment_view(&session.id, a))
-                            .collect(),
-                        reasoning_html,
-                    }
-                })
-                .collect(),
-        })
-        .into_response(),
+        Ok(session) => Json(session_view(&state, session)).into_response(),
         Err(err) => (StatusCode::NOT_FOUND, err.to_string()).into_response(),
+    }
+}
+
+/// `POST /api/sessions/{id}/versions/{index}`: show another version of the
+/// last turn. Answers with the session as `GET` does.
+async fn show_version(
+    State(state): State<Arc<WebState>>,
+    Path((id, index)): Path<(String, usize)>,
+) -> impl IntoResponse {
+    let mut session = match sessions::load_session(&id) {
+        Ok(session) => session,
+        Err(err) => return (StatusCode::NOT_FOUND, err.to_string()).into_response(),
+    };
+    match sessions::show_version(&mut session, index) {
+        Ok(()) => Json(session_view(&state, session)).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+    }
+}
+
+fn session_view(state: &WebState, session: Session) -> SessionView {
+    let versions = session.turn_versions.len();
+    let active_version = session.active_version;
+    SessionView {
+        id: session.id.clone(),
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+        title: session.title,
+        versions,
+        active_version,
+        messages: session
+            .messages
+            .into_iter()
+            .map(|m| {
+                let html = (m.role == "assistant").then(|| {
+                    render::render_markdown_to_html(&m.content, state.project_licence.as_ref())
+                });
+                let reasoning_html = (!m.reasoning.is_empty())
+                    .then(|| render::render_reasoning_to_html(&m.reasoning));
+                SessionMessageView {
+                    role: m.role,
+                    content: m.content,
+                    html,
+                    generation_ms: m.generation_ms,
+                    attachments: m
+                        .attachments
+                        .into_iter()
+                        .map(|a| attachment_view(&session.id, a))
+                        .collect(),
+                    reasoning_html,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -832,6 +860,22 @@ struct SendMessageRequest {
     content: String,
     #[serde(default)]
     attachments: Vec<attachments::IncomingAttachment>,
+    #[serde(default)]
+    mode: SendMode,
+}
+
+/// What a message does to the conversation.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum SendMode {
+    /// A new turn.
+    #[default]
+    Send,
+    /// A new wording of the last question, answered again: another version
+    /// of the last turn, keeping that question's attachments.
+    Edit,
+    /// The last question answered again.
+    Regenerate,
 }
 
 async fn send_message(
@@ -842,6 +886,28 @@ async fn send_message(
     let mut session = match sessions::load_session(&id) {
         Ok(session) => session,
         Err(err) => return (StatusCode::NOT_FOUND, err.to_string()).into_response(),
+    };
+
+    // An edit or a regeneration answers the last question again: it comes
+    // off the conversation, and its attachments — already read and stored —
+    // go with the question being answered.
+    let mut content = req.content;
+    let mut previous_attachments = None;
+    if req.mode != SendMode::Send {
+        match sessions::take_last_turn(&mut session) {
+            Ok(question) => {
+                if req.mode == SendMode::Regenerate {
+                    content = question.content;
+                }
+                previous_attachments = Some(question.attachments);
+            }
+            Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+        }
+    }
+    let req = SendMessageRequest {
+        content,
+        attachments: req.attachments,
+        mode: req.mode,
     };
 
     // Decode + extract text from every attachment up front, so the prompt
@@ -867,6 +933,21 @@ async fn send_message(
         }
     };
 
+    // The pictures among them are files already: an image model starts
+    // from the last one again.
+    let mut previous_picture: Option<(String, Vec<u8>)> = None;
+    if let Some(previous) = previous_attachments {
+        for att in &previous {
+            if let Some(name) = &att.image
+                && let Ok(bytes) =
+                    sessions::file_path(&id, name).and_then(|path| Ok(std::fs::read(path)?))
+            {
+                previous_picture = Some((att.mime.clone(), bytes));
+            }
+        }
+        extracted.extend(previous);
+    }
+
     if req.content.trim().is_empty() && extracted.is_empty() {
         return (StatusCode::BAD_REQUEST, "message is empty").into_response();
     }
@@ -874,7 +955,7 @@ async fn send_message(
     // Pictures go to disk beside the transcript now, so the turn persisted
     // below — and every later visit — can show them; the bytes of the last
     // one are also what an image model starts from.
-    let mut init_picture: Option<(String, Vec<u8>)> = None;
+    let mut init_picture = previous_picture;
     for att in extracted.iter_mut() {
         if let Some(bytes) = att.image_bytes.take() {
             let extension = match att.mime.as_str() {
@@ -1061,7 +1142,7 @@ async fn send_message(
                     }
                     let truncated = finish_reason == FinishReason::Length;
                     yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "done", "html": html, "reasoning_html": reasoning_html, "content": full, "reasoning": reasoning, "truncated": truncated, "generation_ms": generation_ms}).to_string()));
+                        .data(json!({"type": "done", "html": html, "reasoning_html": reasoning_html, "content": full, "reasoning": reasoning, "truncated": truncated, "generation_ms": generation_ms, "versions": session.turn_versions.len(), "active_version": session.active_version}).to_string()));
                     break;
                 }
                 StreamEvent::Overloaded => {
@@ -1167,7 +1248,7 @@ async fn send_image_message(
                         break;
                     }
                     yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "done", "html": html, "reasoning_html": "", "content": content, "reasoning": "", "truncated": false, "generation_ms": generation_ms, "image": true}).to_string()));
+                        .data(json!({"type": "done", "html": html, "reasoning_html": "", "content": content, "reasoning": "", "truncated": false, "generation_ms": generation_ms, "image": true, "versions": session.turn_versions.len(), "active_version": session.active_version}).to_string()));
                     break;
                 }
                 ImageEvent::Error(err) => {
@@ -1261,7 +1342,7 @@ async fn send_video_message(
                         break;
                     }
                     yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "done", "html": html, "reasoning_html": "", "content": content, "reasoning": "", "truncated": false, "generation_ms": generation_ms, "video": true}).to_string()));
+                        .data(json!({"type": "done", "html": html, "reasoning_html": "", "content": content, "reasoning": "", "truncated": false, "generation_ms": generation_ms, "video": true, "versions": session.turn_versions.len(), "active_version": session.active_version}).to_string()));
                     break;
                 }
                 crate::engine::video::VideoEvent::Error(err) => {
@@ -1373,7 +1454,7 @@ async fn send_audio_message(
                         break;
                     }
                     yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "done", "html": html, "reasoning_html": "", "content": content, "reasoning": "", "truncated": false, "generation_ms": generation_ms, "audio": true}).to_string()));
+                        .data(json!({"type": "done", "html": html, "reasoning_html": "", "content": content, "reasoning": "", "truncated": false, "generation_ms": generation_ms, "audio": true, "versions": session.turn_versions.len(), "active_version": session.active_version}).to_string()));
                     break;
                 }
                 crate::engine::audio::SpeechEvent::Error(err) => {

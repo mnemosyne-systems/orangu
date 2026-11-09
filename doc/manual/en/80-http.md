@@ -3098,19 +3098,28 @@ Chat sessions:
 | `GET /api/sessions` | lists every non-empty session, newest-updated first |
 | `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
 | `POST /api/sessions/{id}/messages` | sends one chat turn against that session; SSE reply |
+| `POST /api/sessions/{id}/versions/{n}` | shows version `n` (from 0) of the last turn and answers with the session as `GET` does |
 | `GET /api/sessions/{id}/files/{name}` | a file kept beside the session: a picture attached to a message (PNG, JPEG, GIF, WebP, SVG), one a `qwen_image` model made, a clip an `ltxv` model made (`video/mp4`, with `Range`), or speech a `qwen3tts` model made (`audio/wav` or `audio/flac`, with `Range`) |
 | `DELETE /api/sessions/{id}` | deletes one chat session, directory and all — History's per-row cross |
 | `DELETE /api/sessions` | deletes every chat session — History's **Clear all** footer |
 
 `POST /api/sessions/{id}/messages` takes `{"content": "…", "attachments":
-[…]}`; attachments ride along as base64 in the JSON, which is why this port
+[…], "mode": "send"}`. `mode` is `send` (the default) for a new turn, `edit`
+to answer `content` in place of the last question, keeping that question's
+attachments, or `regenerate` to answer the last question again (`content` is
+ignored); either of the last two is a `400` when the session has no answered
+question. An edit or a regeneration is saved as another version of the last
+turn: `GET /api/sessions/{id}` reports `versions` (0 until the last turn has
+been edited or regenerated) and `active_version`, and a new turn keeps the
+version shown and drops the others. Attachments ride along as base64 in the JSON, which is why this port
 raises its body cap to 64 MB. Its SSE events are typed rather than
 OpenAI-shaped, because the browser is being handed rendered HTML rather than
 raw tokens: an `attachments` event first (what each upload turned into, sent
 before the first token so the user's own message can show it while the reply
 generates), then a `token` event per token carrying the whole answer
 re-rendered to HTML, then one `done` event with the final HTML, the raw
-`content`, `truncated`, and `generation_ms`. Errors arrive as an `error`
+`content`, `truncated`, `generation_ms`, and the session's `versions` and
+`active_version` after the turn. Errors arrive as an `error`
 event. An empty message with no attachments is a `400`, and a model with no
 chat template makes the whole endpoint a `501`.
 
