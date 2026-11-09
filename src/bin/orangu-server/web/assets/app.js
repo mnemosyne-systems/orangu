@@ -708,10 +708,54 @@
   // `assistantEl.innerHTML = payload.html` reassignments during streaming
   // and never gets treated as message content (copy/paste, markdown
   // re-render, ...).
-  function addTimingFooter(assistantEl, ms, rawContent, tpsText) {
+  // A token count in a few characters: 950, 1.2k, 18k.
+  function shortCount(count) {
+    if (count < 1000) return String(count);
+    if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+    if (count < 1000000) return `${Math.floor(count / 1000)}k`;
+    return `${(count / 1000000).toFixed(1)}M`;
+  }
+
+  // A short wait to a tenth of a second; anything longer as the footer
+  // shows it.
+  function preciseDuration(ms) {
+    return ms < 10000 ? `${(ms / 1000).toFixed(1)}s` : formatDuration(ms);
+  }
+
+  // What answering took (web/sessions.rs, `AnswerStats`): the tokens
+  // written, folded open for the prompt, the wait and the rate.
+  // Returns the toggle for the footer and the line it opens, which goes
+  // under the footer.
+  function statsDetails(stats, ms) {
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "gen-stats";
+    toggle.textContent = `${stats.output_tokens} tokens`;
+    toggle.title = "Show what this answer took";
+    toggle.setAttribute("aria-expanded", "false");
+    const body = document.createElement("div");
+    body.className = "gen-stats-body";
+    body.hidden = true;
+    toggle.addEventListener("click", () => {
+      body.hidden = !body.hidden;
+      toggle.setAttribute("aria-expanded", String(!body.hidden));
+    });
+    const parts = [];
+    const cached = stats.cached_tokens ? `, ${shortCount(stats.cached_tokens)} cached` : "";
+    parts.push(`prompt ${shortCount(stats.prompt_tokens)} tokens${cached}`);
+    parts.push(`first token after ${preciseDuration(stats.prompt_ms)}`);
+    if (ms > 0) parts.push(`${(stats.output_tokens / (ms / 1000)).toFixed(1)} t/s`);
+    parts.push(`${preciseDuration(stats.prompt_ms + ms)} in all`);
+    body.textContent = parts.join(" · ");
+    return { toggle, body };
+  }
+
+  function addTimingFooter(assistantEl, ms, rawContent, tpsText, stats) {
     if (ms == null) return;
     const footer = document.createElement("div");
     footer.className = "gen-time";
+    // The server's own count beats the live estimate.
+    if (stats && ms > 0) tpsText = `${(stats.output_tokens / (ms / 1000)).toFixed(1)} t/s`;
 
     // Left-aligned tokens-per-second, kept from the live readout so the
     // final footer shows the same figure the counter settled on (only
@@ -723,6 +767,9 @@
       footer.appendChild(rate);
     }
 
+    const details = stats ? statsDetails(stats, ms) : null;
+    if (details) footer.appendChild(details.toggle);
+
     const time = document.createElement("span");
     time.className = "gen-duration";
     time.textContent = formatDuration(ms);
@@ -731,6 +778,7 @@
     footer.appendChild(createAnswerSaveControl(assistantEl, rawContent));
 
     assistantEl.appendChild(footer);
+    if (details) assistantEl.appendChild(details.body);
   }
 
   // While a code block is still filling up during streaming, keep it
@@ -832,6 +880,7 @@
     localStorage.setItem("orangu-session-id", session.id);
     transcript.innerHTML = "";
     applyChatSettings(session.settings);
+    showContextGauge(null);
   }
 
   async function newChat() {
@@ -863,6 +912,7 @@
     state.sessionId = session.id;
     localStorage.setItem("orangu-session-id", session.id);
     transcript.innerHTML = "";
+    let lastStats = null;
     // Diagrams from the attachments on the turn being answered, so a
     // reloaded answer carries the same picture a live one did.
     let pendingTurnDiagrams = [];
@@ -871,7 +921,8 @@
         const el = addRenderedMessage("assistant", message.html || escapeHtml(message.content), message.reasoning_html);
         renderMathIn(el);
         appendAttachedDiagramsToAnswer(el, pendingTurnDiagrams);
-        addTimingFooter(el, message.generation_ms, message.content);
+        addTimingFooter(el, message.generation_ms, message.content, null, message.stats);
+        lastStats = message.stats || null;
         pendingTurnDiagrams = [];
       } else {
         addMessage(message.role, message.content, message.attachments);
@@ -882,6 +933,7 @@
     state.activeVersion = session.active_version || 0;
     decorateLastTurn();
     applyChatSettings(session.settings);
+    showContextGauge(lastStats);
   }
 
   // The last question and its answer.
@@ -1369,7 +1421,8 @@
                 notice.textContent = "⚠️ Response was cut off at the token limit.";
                 assistantEl.appendChild(notice);
               }
-              addTimingFooter(assistantEl, payload.generation_ms, payload.content, tpsText());
+              addTimingFooter(assistantEl, payload.generation_ms, payload.content, tpsText(), payload.stats);
+              if (payload.stats) showContextGauge(payload.stats);
               state.versions = payload.versions || 0;
               state.activeVersion = payload.active_version || 0;
               turnFinished = true;
@@ -3413,6 +3466,35 @@
     }
   });
 
+  // --------------------------------------------------------- context gauge
+
+  // How much of the model's context the chat fills: the last answer's
+  // prompt and output against the context one request gets. Hidden until
+  // an answer has been counted.
+  const contextGauge = document.getElementById("context-gauge");
+  const CONTEXT_WARN = 0.8;
+  let contextLimit = null;
+  let gaugeStats = null;
+
+  function showContextGauge(stats) {
+    gaugeStats = stats;
+    composer.classList.toggle("has-gauge", Boolean(stats));
+    if (!stats) {
+      contextGauge.hidden = true;
+      return;
+    }
+    const used = stats.prompt_tokens + stats.output_tokens;
+    contextGauge.textContent = contextLimit
+      ? `ctx ${shortCount(used)}/${shortCount(contextLimit)}`
+      : `ctx ${shortCount(used)}`;
+    const high = contextLimit && used / contextLimit >= CONTEXT_WARN;
+    contextGauge.classList.toggle("high", Boolean(high));
+    contextGauge.title = high
+      ? "This chat fills most of the model's context; start a new chat before it runs out"
+      : "How much of the model's context this chat fills";
+    contextGauge.hidden = false;
+  }
+
   // ------------------------------------------------------- chat settings
 
   // This chat's own system prompt and sampling settings (web/sessions.rs,
@@ -3479,7 +3561,10 @@
     try {
       const res = await fetch("/api/props");
       if (!res.ok) return;
-      const defaults = (await res.json()).chat || {};
+      const props = await res.json();
+      contextLimit = props.context || null;
+      showContextGauge(gaugeStats);
+      const defaults = props.chat || {};
       for (const name of NUMBER_FIELDS) {
         if (defaults[name] !== undefined) chatFields[name].placeholder = String(defaults[name]);
       }

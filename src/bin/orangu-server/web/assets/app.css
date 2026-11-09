@@ -653,6 +653,53 @@ button:disabled {
   opacity: 0.65;
 }
 
+/* Per-answer statistics: the token count in the footer opens a line
+   under it with the prompt, the wait and the rate. */
+.gen-stats {
+  padding: 0;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  opacity: 0.65;
+}
+
+.gen-stats:hover,
+.gen-stats[aria-expanded="true"] {
+  opacity: 1;
+}
+
+.gen-stats-body {
+  margin-top: 2px;
+  text-align: right;
+  color: var(--text-dim);
+  font-size: 0.72em;
+}
+
+/* The context gauge sits in the input's bottom-right corner. */
+#composer-main {
+  position: relative;
+}
+
+#context-gauge {
+  position: absolute;
+  right: 10px;
+  bottom: 6px;
+  font-size: 0.72em;
+  color: var(--text-dim);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+#composer.has-gauge #input {
+  padding-right: 96px;
+}
+
+#context-gauge.high {
+  color: var(--error);
+}
+
 .gen-tps {
   margin-right: auto;
   font-variant-numeric: tabular-nums;

@@ -53,6 +53,9 @@ pub struct SessionMessage {
     /// deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_ms: Option<u64>,
+    /// What answering took, for an assistant message the model wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats: Option<AnswerStats>,
     /// Files the user attached to this message. Kept (with their extracted
     /// text) so a later turn still has the document in context, and shown
     /// as chips under the message in the web UI. `#[serde(default)]` for
@@ -121,6 +124,19 @@ pub struct Session {
     /// This chat's own system prompt and sampling settings.
     #[serde(default, skip_serializing_if = "ChatSettings::is_default")]
     pub settings: ChatSettings,
+}
+
+/// What one answer took.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AnswerStats {
+    /// Tokens of the conversation read for it.
+    pub prompt_tokens: usize,
+    /// Of those, the ones a cache already held.
+    pub cached_tokens: usize,
+    /// Tokens written, thinking included.
+    pub output_tokens: usize,
+    /// Milliseconds spent reading the prompt: the wait for the first token.
+    pub prompt_ms: u64,
 }
 
 /// A chat's own generation settings. An empty system prompt sends none, and
@@ -637,6 +653,7 @@ pub fn append_turn(
     assistant_message: &str,
     assistant_reasoning: &str,
     generation_ms: Option<u64>,
+    stats: Option<AnswerStats>,
 ) -> Result<()> {
     if session.title.is_empty() {
         // A file-only message (no typed text) still deserves a title —
@@ -655,6 +672,7 @@ pub fn append_turn(
         role: "user".to_string(),
         content: user_message.to_string(),
         generation_ms: None,
+        stats: None,
         attachments: user_attachments,
         reasoning: String::new(),
     });
@@ -662,6 +680,7 @@ pub fn append_turn(
         role: "assistant".to_string(),
         content: assistant_message.to_string(),
         generation_ms,
+        stats,
         attachments: Vec::new(),
         reasoning: assistant_reasoning.to_string(),
     });
@@ -783,6 +802,7 @@ mod tests {
                 "A systems language.",
                 "",
                 Some(123),
+                None,
             )
             .unwrap();
             assert_eq!(session.title, "What is Rust?");
@@ -793,6 +813,7 @@ mod tests {
                 "Also a systems-ish language.",
                 "",
                 Some(456),
+                None,
             )
             .unwrap();
             assert_eq!(session.title, "What is Rust?");
@@ -812,9 +833,26 @@ mod tests {
             };
             set_settings(&session.id, settings.clone()).unwrap();
             // A turn that was answering while the settings changed keeps them.
-            append_turn(&mut session, "Hi?", Vec::new(), "Salut.", "", None).unwrap();
+            let stats = AnswerStats {
+                prompt_tokens: 30,
+                cached_tokens: 10,
+                output_tokens: 4,
+                prompt_ms: 12,
+            };
+            append_turn(
+                &mut session,
+                "Hi?",
+                Vec::new(),
+                "Salut.",
+                "",
+                Some(5),
+                Some(stats),
+            )
+            .unwrap();
             let reloaded = load_session(&session.id).unwrap();
             assert_eq!(reloaded.settings, settings);
+            assert_eq!(reloaded.messages[1].stats, Some(stats));
+            assert_eq!(reloaded.messages[0].stats, None);
             assert_eq!(reloaded.messages.len(), 2);
 
             // Unset settings are not written at all.
@@ -864,8 +902,8 @@ mod tests {
     fn edits_and_regenerations_are_versions_of_the_last_turn() {
         with_temp_home(|| {
             let mut session = create_session().unwrap();
-            append_turn(&mut session, "First?", Vec::new(), "One.", "", None).unwrap();
-            append_turn(&mut session, "Second?", Vec::new(), "Two.", "", None).unwrap();
+            append_turn(&mut session, "First?", Vec::new(), "One.", "", None, None).unwrap();
+            append_turn(&mut session, "Second?", Vec::new(), "Two.", "", None, None).unwrap();
             assert!(session.turn_versions.is_empty());
 
             // Regenerate: the same question, a new answer.
@@ -879,6 +917,7 @@ mod tests {
                 "Deux.",
                 "",
                 None,
+                None,
             )
             .unwrap();
             // Edit: a new question.
@@ -889,6 +928,7 @@ mod tests {
                 Vec::new(),
                 "Zwei.",
                 "",
+                None,
                 None,
             )
             .unwrap();
@@ -909,7 +949,7 @@ mod tests {
 
             // The next new turn keeps the version shown and drops the rest.
             let mut shown = shown;
-            append_turn(&mut shown, "Third?", Vec::new(), "Three.", "", None).unwrap();
+            append_turn(&mut shown, "Third?", Vec::new(), "Three.", "", None, None).unwrap();
             assert!(shown.turn_versions.is_empty());
             assert_eq!(shown.messages[3].content, "Two.");
         });
@@ -920,13 +960,22 @@ mod tests {
         with_temp_home(|| {
             let mut session = create_session().unwrap();
             assert!(take_last_turn(&mut session).is_err());
-            append_turn(&mut session, "Only?", Vec::new(), "Yes.", "", None).unwrap();
+            append_turn(&mut session, "Only?", Vec::new(), "Yes.", "", None, None).unwrap();
             take_last_turn(&mut session).unwrap();
             assert!(
                 session.title.is_empty(),
                 "a rewritten first question retitles"
             );
-            append_turn(&mut session, "Rewritten?", Vec::new(), "Yes.", "", None).unwrap();
+            append_turn(
+                &mut session,
+                "Rewritten?",
+                Vec::new(),
+                "Yes.",
+                "",
+                None,
+                None,
+            )
+            .unwrap();
             assert_eq!(session.title, "Rewritten?");
         });
     }
@@ -940,6 +989,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 generation_ms: None,
+                stats: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -947,6 +997,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 generation_ms: None,
+                stats: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -971,6 +1022,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 generation_ms: None,
+                stats: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -1092,6 +1144,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 generation_ms: None,
+                stats: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -1132,6 +1185,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 generation_ms: None,
+                stats: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -1168,6 +1222,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "hi".to_string(),
                 generation_ms: None,
+                stats: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });

@@ -3129,8 +3129,12 @@ raw tokens: an `attachments` event first (what each upload turned into, sent
 before the first token so the user's own message can show it while the reply
 generates), then a `token` event per token carrying the whole answer
 re-rendered to HTML, then one `done` event with the final HTML, the raw
-`content`, `truncated`, `generation_ms`, and the session's `versions` and
-`active_version` after the turn. Errors arrive as an `error`
+`content`, `truncated`, `generation_ms`, `stats` (`prompt_tokens`,
+`cached_tokens`, `output_tokens` and `prompt_ms`, the wait for the first
+token), and the session's `versions` and `active_version` after the turn.
+`GET /api/sessions/{id}` reports the same `stats` on each assistant message
+that has them, and the console's `GET /api/props` gives the context one
+request gets as `context`. Errors arrive as an `error`
 event. An empty message with no attachments is a `400`, and a model with no
 chat template makes the whole endpoint a `501`.
 

@@ -495,6 +495,8 @@ fn props_view(state: &WebState) -> serde_json::Value {
         "audio": state.engine.audio.as_deref().map(crate::http::audio::props_json),
         // What a chat's own settings fall back to.
         "chat": chat_defaults(),
+        // The context one request gets, for the console's context gauge.
+        "context": crate::http::native::served_context(&state.engine),
     })
 }
 
@@ -785,6 +787,8 @@ struct SessionMessageView {
     html: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<sessions::AnswerStats>,
     // Name/type/size for the chip, plus any diagrams drawn out of the file.
     // The extracted text itself stays server-side.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -877,6 +881,7 @@ fn session_view(state: &WebState, session: Session) -> SessionView {
                     content: m.content,
                     html,
                     generation_ms: m.generation_ms,
+                    stats: m.stats,
                     attachments: m
                         .attachments
                         .into_iter()
@@ -1181,14 +1186,20 @@ async fn send_message(
                     let html = render::render_markdown_to_html(&full, state.project_licence.as_ref());
                     let reasoning_html = render::render_reasoning_to_html(&reasoning);
                     let generation_ms = stats.generate_time.as_millis() as u64;
-                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &full, &reasoning, Some(generation_ms)) {
+                    let answer_stats = sessions::AnswerStats {
+                        prompt_tokens: stats.prompt_tokens,
+                        cached_tokens: stats.cached_tokens,
+                        output_tokens: stats.generated_tokens,
+                        prompt_ms: stats.prompt_time.as_millis() as u64,
+                    };
+                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &full, &reasoning, Some(generation_ms), Some(answer_stats)) {
                         yield Ok(axum::response::sse::Event::default()
                             .data(json!({"type": "error", "message": err.to_string()}).to_string()));
                         break;
                     }
                     let truncated = finish_reason == FinishReason::Length;
                     yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "done", "html": html, "reasoning_html": reasoning_html, "content": full, "reasoning": reasoning, "truncated": truncated, "generation_ms": generation_ms, "versions": session.turn_versions.len(), "active_version": session.active_version}).to_string()));
+                        .data(json!({"type": "done", "html": html, "reasoning_html": reasoning_html, "content": full, "reasoning": reasoning, "truncated": truncated, "generation_ms": generation_ms, "stats": answer_stats, "versions": session.turn_versions.len(), "active_version": session.active_version}).to_string()));
                     break;
                 }
                 StreamEvent::Overloaded => {
@@ -1288,7 +1299,7 @@ async fn send_image_message(
                     );
                     let html = render::render_markdown_to_html(&content, state.project_licence.as_ref());
                     let generation_ms = image.elapsed.as_millis() as u64;
-                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms)) {
+                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms), None) {
                         yield Ok(axum::response::sse::Event::default()
                             .data(json!({"type": "error", "message": err.to_string()}).to_string()));
                         break;
@@ -1382,7 +1393,7 @@ async fn send_video_message(
                     );
                     let html = render::render_markdown_to_html(&content, state.project_licence.as_ref());
                     let generation_ms = video.elapsed.as_millis() as u64;
-                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms)) {
+                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms), None) {
                         yield Ok(axum::response::sse::Event::default()
                             .data(json!({"type": "error", "message": err.to_string()}).to_string()));
                         break;
@@ -1494,7 +1505,7 @@ async fn send_audio_message(
                     );
                     let html = render::render_markdown_to_html(&content, state.project_licence.as_ref());
                     let generation_ms = started.elapsed().as_millis() as u64;
-                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms)) {
+                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms), None) {
                         yield Ok(axum::response::sse::Event::default()
                             .data(json!({"type": "error", "message": err.to_string()}).to_string()));
                         break;

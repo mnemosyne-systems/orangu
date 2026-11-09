@@ -3951,6 +3951,21 @@ streamed in stays on screen, marked as stopped, but since the turn never
 reached completion it isn't saved — a stopped reply won't reappear if you
 reload or revisit it from **History**.
 
+### Answer statistics and the context gauge
+
+Under each answer, its footer gives the rate it was written at, how many
+tokens it took and how long. Clicking the token count opens a line under the
+footer with the rest: how many tokens of the conversation were read for it
+(and how many of those a cache already held), how long until the first token,
+the rate, and the time in all. The figures are kept with the chat, so a
+reloaded or reopened chat shows them too.
+
+Once the chat has an answer, the input's lower right corner shows how much of
+the model's context the conversation fills, for example `ctx 2.3k/131k`: the
+last answer's prompt and output against the context one request gets. From
+80% it turns red, as a sign to start a new chat before the model runs out of
+room.
+
 ### Editing a question and regenerating an answer
 
 The last question and its answer carry two small buttons:
