@@ -683,6 +683,13 @@ pub enum LocalCommand<'a> {
     /// from the conversation now.
     Compact,
     Permissions(PermissionsSubcommand<'a>),
+    /// `/undo [force]`: put back the files the last turn with changes wrote.
+    Undo {
+        force: bool,
+    },
+    /// `/rewind [<turn> [force]]`: list the turns with changes, or put the
+    /// files back as they were before one.
+    Rewind(RewindSubcommand),
     /// `/copy`: copy the latest assistant response as raw Markdown.
     Copy,
     Quit,
@@ -732,6 +739,13 @@ pub enum PermissionsSubcommand<'a> {
     List,
     Revoke(Cow<'a, str>),
     Clear,
+    Usage,
+}
+
+/// `/rewind`'s forms.
+pub enum RewindSubcommand {
+    List,
+    To { turn: u64, force: bool },
     Usage,
 }
 

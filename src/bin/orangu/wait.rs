@@ -125,6 +125,7 @@ pub(crate) async fn wait_for_response(
                 },
             )
             .await;
+        tools_clone.checkpoints().finish_turn();
         // The turn's last response is what the conversation now holds.
         let usage = su.lock().ok().and_then(|state| state.metrics.usage);
         if let Some(usage) = usage {

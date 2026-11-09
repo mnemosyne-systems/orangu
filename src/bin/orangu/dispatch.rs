@@ -14,6 +14,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 use crate::commands::PermissionsSubcommand;
+use crate::commands::RewindSubcommand;
 use crate::commands::revert_usage_message;
 use crate::commands::{AfterTurn, GitOperation, build_workspace_system_prompt};
 use crate::git::{abort_output, discover_git_dir, git_current_branch, revert_output};
@@ -158,6 +159,107 @@ fn licence_phrase(project: &orangu::license::Project) -> String {
 /// What `/license` reports when asked with no argument: the licence in force
 /// and, as much as it can, where it came from.
 /// `/permissions`: what an approval prompt allowed for the rest of the session.
+/// `/undo` and `/rewind`'s report; `force` is the command that overwrites
+/// files changed since.
+fn restore_outcome(
+    result: Result<orangu::checkpoints::Restored, orangu::checkpoints::RestoreError>,
+    force: &str,
+) -> CommandOutcome {
+    use orangu::checkpoints::RestoreError;
+    let restored = match result {
+        Ok(restored) => restored,
+        Err(RestoreError::Nothing) => {
+            return CommandOutcome::Output(
+                "Nothing to undo: the agent has changed no files in this session.".to_string(),
+            );
+        }
+        Err(RestoreError::NoSuchTurn(turn)) => {
+            return CommandOutcome::OutputError(format!(
+                "No turn {turn} with file changes. /rewind lists them."
+            ));
+        }
+        Err(RestoreError::Changed(paths)) => {
+            return CommandOutcome::OutputError(format!(
+                "Nothing restored: {} changed after the agent wrote {}. `{force}` overwrites {}.",
+                paths.join(", "),
+                if paths.len() == 1 { "it" } else { "them" },
+                if paths.len() == 1 { "it" } else { "them" },
+            ));
+        }
+        Err(RestoreError::Failed(message)) => {
+            return CommandOutcome::OutputError(format!("Restoring failed: {message}"));
+        }
+    };
+    let turns: Vec<String> = restored
+        .turns
+        .iter()
+        .map(|turn| format!("{} (\"{}\")", turn.id, turn.prompt))
+        .collect();
+    let mut lines = vec![format!(
+        "Undid turn{} {}.",
+        if turns.len() == 1 { "" } else { "s" },
+        turns.join(", ")
+    )];
+    if !restored.written.is_empty() {
+        lines.push(format!("Restored: {}", restored.written.join(", ")));
+    }
+    if !restored.removed.is_empty() {
+        lines.push(format!("Removed: {}", restored.removed.join(", ")));
+    }
+    if !restored.overwritten.is_empty() {
+        lines.push(format!(
+            "Overwrote later changes to: {}",
+            restored.overwritten.join(", ")
+        ));
+    }
+    if !restored.not_saved.is_empty() {
+        lines.push(format!(
+            "Too large to have been saved, left as they are: {}",
+            restored.not_saved.join(", ")
+        ));
+    }
+    CommandOutcome::Output(lines.join("\n"))
+}
+
+/// `/rewind`'s list of the turns that changed files.
+fn rewind_list(turns: &[orangu::checkpoints::TurnSummary], now: u64) -> String {
+    if turns.is_empty() {
+        return "No turns to rewind: the agent has changed no files in this session.".to_string();
+    }
+    let mut lines = vec!["Turns that changed files, newest last:".to_string()];
+    for turn in turns {
+        let shown: Vec<&str> = turn.files.iter().take(4).map(String::as_str).collect();
+        let more = turn.files.len().saturating_sub(shown.len());
+        lines.push(format!(
+            "  {:>3}  {:>8}  \"{}\"  {}{}",
+            turn.id,
+            age(now.saturating_sub(turn.started_at)),
+            turn.prompt,
+            shown.join(", "),
+            if more > 0 {
+                format!(" and {more} more")
+            } else {
+                String::new()
+            }
+        ));
+    }
+    lines.push(
+        "/rewind <turn> puts the files back as they were before that turn; /undo undoes the last."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+/// `seconds` as a short age: `just now`, `5 min ago`, `3 h ago`, `2 d ago`.
+fn age(seconds: u64) -> String {
+    match seconds {
+        0..60 => "just now".to_string(),
+        60..3_600 => format!("{} min ago", seconds / 60),
+        3_600..86_400 => format!("{} h ago", seconds / 3_600),
+        _ => format!("{} d ago", seconds / 86_400),
+    }
+}
+
 fn permissions_list(tools: &ToolExecutor) -> String {
     let (granted_tools, servers) = tools.mcp_grants();
     if granted_tools.is_empty() && servers.is_empty() {
@@ -2669,6 +2771,21 @@ pub(crate) fn handle_command(
             session.clear(&prompt);
             Ok(CommandOutcome::Cleared)
         }
+        LocalCommand::Undo { force } => Ok(restore_outcome(
+            tools.checkpoints().undo(force),
+            "/undo force",
+        )),
+        LocalCommand::Rewind(RewindSubcommand::List) => Ok(CommandOutcome::Output(rewind_list(
+            &tools.checkpoints().list(),
+            crate::session_store::current_unix_timestamp(),
+        ))),
+        LocalCommand::Rewind(RewindSubcommand::To { turn, force }) => Ok(restore_outcome(
+            tools.checkpoints().rewind(turn, force),
+            &format!("/rewind {turn} force"),
+        )),
+        LocalCommand::Rewind(RewindSubcommand::Usage) => Ok(CommandOutcome::OutputError(
+            "Usage: /rewind, /rewind <turn>, /rewind <turn> force".to_string(),
+        )),
         LocalCommand::Permissions(command) => Ok(match command {
             PermissionsSubcommand::List => CommandOutcome::Output(permissions_list(tools)),
             PermissionsSubcommand::Revoke(name) => {
@@ -2904,6 +3021,41 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn rewind_lists_turns_with_their_age_and_files() {
+        let turns = vec![orangu::checkpoints::TurnSummary {
+            id: 2,
+            prompt: "fix the parser".into(),
+            started_at: 1_000,
+            files: (1..=6).map(|n| format!("f{n}.rs")).collect(),
+            not_saved: vec![],
+        }];
+        let list = rewind_list(&turns, 1_000 + 300);
+        assert!(list.contains(
+            "    2  5 min ago  \"fix the parser\"  f1.rs, f2.rs, f3.rs, f4.rs and 2 more"
+        ));
+        assert!(rewind_list(&[], 0).starts_with("No turns to rewind"));
+        assert_eq!(age(30), "just now");
+        assert_eq!(age(7_200), "2 h ago");
+        assert_eq!(age(200_000), "2 d ago");
+    }
+
+    #[test]
+    fn a_refused_undo_names_the_changed_files_and_the_force_form() {
+        let outcome = restore_outcome(
+            Err(orangu::checkpoints::RestoreError::Changed(vec![
+                "a.rs".into(),
+            ])),
+            "/undo force",
+        );
+        let CommandOutcome::OutputError(text) = outcome else {
+            panic!("expected an error");
+        };
+        assert!(
+            text.contains("a.rs changed after the agent wrote it. `/undo force` overwrites it.")
+        );
+    }
 
     #[tokio::test]
     async fn tasks_command_lists_shows_and_stops() {

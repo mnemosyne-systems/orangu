@@ -133,6 +133,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/clear" => Some(LocalCommand::Clear),
         "/compact" => Some(LocalCommand::Compact),
         "/permissions" => Some(LocalCommand::Permissions(PermissionsSubcommand::List)),
+        "/undo" => Some(LocalCommand::Undo { force: false }),
+        "/undo force" => Some(LocalCommand::Undo { force: true }),
+        "/rewind" => Some(LocalCommand::Rewind(RewindSubcommand::List)),
         "/copy" => Some(LocalCommand::Copy),
         "/quit" => Some(LocalCommand::Quit),
         "/pending" => Some(LocalCommand::PendingList),
@@ -168,6 +171,23 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     }
                     _ => None,
                 };
+            }
+            if let Some(args) = input.strip_prefix("/rewind ") {
+                let mut words = args.split_whitespace();
+                return Some(LocalCommand::Rewind(
+                    match (
+                        words.next().map(str::parse::<u64>),
+                        words.next(),
+                        words.next(),
+                    ) {
+                        (None, ..) => RewindSubcommand::List,
+                        (Some(Ok(turn)), None, _) => RewindSubcommand::To { turn, force: false },
+                        (Some(Ok(turn)), Some("force"), None) => {
+                            RewindSubcommand::To { turn, force: true }
+                        }
+                        _ => RewindSubcommand::Usage,
+                    },
+                ));
             }
             if let Some(args) = input.strip_prefix("/permissions ") {
                 let mut words = args.split_whitespace();

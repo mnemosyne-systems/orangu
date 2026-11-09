@@ -198,9 +198,10 @@ Sessions that had no LLM interaction (zero tokens generated) and are on `main`, 
 Session data is stored under `~/.orangu/sessions/<uuid>/`:
 
 ```text
-history    per-session command history (readline)
-messages   full conversation turn history (JSON array of role/content objects)
-metadata   session metadata (JSON)
+history      per-session command history (readline)
+messages     full conversation turn history (JSON array of role/content objects)
+metadata     session metadata (JSON)
+checkpoints  copies of the files each agent turn changed, for /undo and /rewind
 ```
 
 The `messages` file preserves the complete conversation so that resuming restores the exact context the model had when the session was last active.

@@ -248,6 +248,8 @@ Then start with:
 /usage
 /clear
 /compact
+/undo
+/rewind
 /copy
 /quit
 ```

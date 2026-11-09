@@ -116,6 +116,8 @@ pub struct ToolExecutor {
     /// MCP tools and servers the user allowed for the rest of the session
     /// at an approval prompt: their calls no longer ask.
     mcp_grants: Arc<Mutex<McpGrants>>,
+    /// The files the agent's turns changed, for `/undo` and `/rewind`.
+    checkpoints: crate::checkpoints::Checkpoints,
     /// How many subagents deep this executor runs: 0 for the main
     /// conversation.
     depth: usize,
@@ -230,6 +232,10 @@ impl ToolExecutor {
         diff_file_cap: usize,
         session_dir: Option<PathBuf>,
     ) -> Self {
+        let checkpoints = crate::checkpoints::Checkpoints::new(
+            workspace,
+            session_dir.as_ref().map(|dir| dir.join("checkpoints")),
+        );
         Self {
             workspace: workspace.to_path_buf(),
             http_client: Client::new(),
@@ -269,6 +275,7 @@ impl ToolExecutor {
             agent_mcp: None,
             mcp_unattended: false,
             mcp_grants: Arc::default(),
+            checkpoints,
             agent_hooks: None,
             skills: None,
             depth: 0,
@@ -1124,6 +1131,18 @@ impl ToolExecutor {
             .unwrap_or_default()
     }
 
+    /// The checkpoints of the files this session's turns changed.
+    pub fn checkpoints(&self) -> &crate::checkpoints::Checkpoints {
+        &self.checkpoints
+    }
+
+    /// Records a subagent's writes in its parent's checkpoints, so `/undo`
+    /// covers them too.
+    pub fn with_checkpoints(mut self, checkpoints: crate::checkpoints::Checkpoints) -> Self {
+        self.checkpoints = checkpoints;
+        self
+    }
+
     /// Expose the session-local file context cache for persistence across runs.
     pub fn context_cache(&self) -> &std::sync::Mutex<crate::context::ContextCache> {
         &self.context_cache
@@ -1149,19 +1168,23 @@ impl ToolExecutor {
         let start = std::time::Instant::now();
         let result = match name {
             "show_file" => self.show_file(arguments).await,
-            "modify_file" => self.mutating(|| self.modify_file(arguments)),
-            "create_file" => self.mutating(|| self.create_file(arguments)),
-            "move_file" => self.mutating(|| self.file_operation(crate::files::move_, arguments)),
-            "delete_file" => self.mutating(|| self.file_operation(crate::files::delete, arguments)),
-            "create_directory" => {
-                self.mutating(|| self.file_operation(crate::files::create_dir, arguments))
-            }
-            "move_directory" => {
-                self.mutating(|| self.file_operation(crate::files::move_dir, arguments))
-            }
-            "delete_directory" => {
-                self.mutating(|| self.file_operation(crate::files::delete_dir, arguments))
-            }
+            "modify_file" => self.mutating(arguments, || self.modify_file(arguments)),
+            "create_file" => self.mutating(arguments, || self.create_file(arguments)),
+            "move_file" => self.mutating(arguments, || {
+                self.file_operation(crate::files::move_, arguments)
+            }),
+            "delete_file" => self.mutating(arguments, || {
+                self.file_operation(crate::files::delete, arguments)
+            }),
+            "create_directory" => self.mutating(arguments, || {
+                self.file_operation(crate::files::create_dir, arguments)
+            }),
+            "move_directory" => self.mutating(arguments, || {
+                self.file_operation(crate::files::move_dir, arguments)
+            }),
+            "delete_directory" => self.mutating(arguments, || {
+                self.file_operation(crate::files::delete_dir, arguments)
+            }),
             _ if name == crate::subagents::DOCUMENT_TOOL
                 || crate::subagents::find(name).is_some() =>
             {
@@ -1425,11 +1448,34 @@ impl ToolExecutor {
     /// Guard for every tool that changes the workspace: refused outright in
     /// read-only mode (`/review`, the explorer subagent), the same rule the
     /// old `edit_file` had before these tools replaced it.
-    fn mutating<T>(&self, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    fn mutating<T>(
+        &self,
+        arguments: &Map<String, Value>,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
         if self.read_only {
             return Err(anyhow!("tool not available in read-only mode"));
         }
+        self.checkpoint(arguments);
         operation()
+    }
+
+    /// Saves what a file tool called with `arguments` is about to change:
+    /// its `path` or `target`, or both ends of a `from`/`to` move.
+    fn checkpoint(&self, arguments: &Map<String, Value>) {
+        let resolve = |key: &str| {
+            arguments
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(|path| self.resolve_workspace_path(path).ok())
+        };
+        if let (Some(from), Some(to)) = (resolve("from"), resolve("to")) {
+            self.checkpoints.record_move(&from, &to);
+        }
+        let paths: Vec<PathBuf> = ["path", "target"].into_iter().filter_map(resolve).collect();
+        if !paths.is_empty() {
+            self.checkpoints.record(&paths);
+        }
     }
 
     /// Run one [`crate::files`] operation: the same function, request shape
@@ -1674,6 +1720,7 @@ impl ToolExecutor {
         if self.read_only {
             return Err(anyhow!("tool not available in read-only mode"));
         }
+        self.checkpoint(arguments);
         let request: crate::office::ConvertRequest =
             serde_json::from_value(Value::Object(arguments.clone()))
                 .map_err(|err| anyhow!("{err}"))?;
@@ -3612,6 +3659,61 @@ mod file_lifecycle_tool_tests {
 
     /// The whole life cycle through the tool interface, on the same library
     /// functions `orangu-server` serves.
+    #[tokio::test]
+    async fn undo_puts_back_what_the_file_tools_wrote() {
+        let workspace = tempfile::tempdir().unwrap();
+        let session = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("keep.txt"), "original\n").unwrap();
+        let executor = ToolExecutor::with_config(
+            workspace.path(),
+            false,
+            300,
+            20,
+            Some(session.path().to_path_buf()),
+        );
+        executor.checkpoints().begin_turn("rework the files");
+        executor
+            .execute(
+                "modify_file",
+                &args(&[
+                    ("path", json!("keep.txt")),
+                    ("old_text", json!("original")),
+                    ("new_text", json!("changed")),
+                ]),
+            )
+            .await
+            .expect("modify_file");
+        executor
+            .execute(
+                "create_file",
+                &args(&[
+                    ("path", json!("made/new.txt")),
+                    ("content", json!("new\n")),
+                    ("parents", json!(true)),
+                ]),
+            )
+            .await
+            .expect("create_file");
+        executor
+            .execute(
+                "move_file",
+                &args(&[("from", json!("keep.txt")), ("to", json!("moved.txt"))]),
+            )
+            .await
+            .expect("move_file");
+        executor.checkpoints().finish_turn();
+
+        let restored = executor.checkpoints().undo(false).expect("undo");
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("keep.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(!workspace.path().join("moved.txt").exists());
+        assert!(!workspace.path().join("made").exists());
+        assert_eq!(restored.written, vec!["keep.txt"]);
+        assert_eq!(restored.removed, vec!["made/new.txt", "moved.txt"]);
+    }
+
     #[tokio::test]
     async fn a_file_can_be_created_shown_moved_and_deleted_through_the_tools() {
         let workspace = tempfile::tempdir().unwrap();

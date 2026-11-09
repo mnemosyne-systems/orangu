@@ -251,6 +251,8 @@ pub fn help_text() -> &'static str {
 /clear                                          Clear the current conversation
 /compact                                        Drop old tool output from the conversation
 /permissions [revoke <name>|clear]              List or revoke the MCP tools allowed for this session
+/undo [force]                                   Put back the files the agent's last turn changed
+/rewind [<turn> [force]]                        List the agent's turns, or put the files back as they were before one
 /copy                                           Copy the latest assistant response as Markdown
 /quit                                           Exit the client
 

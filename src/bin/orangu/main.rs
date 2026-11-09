@@ -2764,6 +2764,11 @@ async fn run() -> Result<()> {
             active_model_id.clone()
         };
 
+        // What the agent writes from here on belongs to this turn for `/undo`.
+        tools.checkpoints().begin_turn(&next_input);
+        if let Some(notice) = tools.checkpoints().take_notice() {
+            prompt_input = format!("{notice}\n\n{prompt_input}");
+        }
         if let Some((hash, diff)) = orangu::context::world_state::get_current_workspace_diff(
             &workspace,
             config.diff_file_cap,

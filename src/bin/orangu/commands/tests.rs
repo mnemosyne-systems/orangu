@@ -2692,3 +2692,37 @@ fn parses_permissions_forms() {
         Some(LocalCommand::Compact)
     ));
 }
+
+#[test]
+fn parses_undo_and_rewind_forms() {
+    assert!(matches!(
+        parse_local_command("/undo"),
+        Some(LocalCommand::Undo { force: false })
+    ));
+    assert!(matches!(
+        parse_local_command("/undo force"),
+        Some(LocalCommand::Undo { force: true })
+    ));
+    assert!(matches!(
+        parse_local_command("/rewind"),
+        Some(LocalCommand::Rewind(RewindSubcommand::List))
+    ));
+    assert!(matches!(
+        parse_local_command("/rewind 3"),
+        Some(LocalCommand::Rewind(RewindSubcommand::To {
+            turn: 3,
+            force: false
+        }))
+    ));
+    assert!(matches!(
+        parse_local_command("/rewind 3 force"),
+        Some(LocalCommand::Rewind(RewindSubcommand::To {
+            turn: 3,
+            force: true
+        }))
+    ));
+    assert!(matches!(
+        parse_local_command("/rewind latest"),
+        Some(LocalCommand::Rewind(RewindSubcommand::Usage))
+    ));
+}

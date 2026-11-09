@@ -714,7 +714,9 @@ fn spec_tools(spec: &SubagentSpec, parent: &ToolExecutor) -> (ToolExecutor, Stri
         return (tools, String::new());
     }
     let tools = if spec.writable {
-        ToolExecutor::new_for_subagent(workspace).with_subagent_mcp(parent.mcp())
+        ToolExecutor::new_for_subagent(workspace)
+            .with_subagent_mcp(parent.mcp())
+            .with_checkpoints(parent.checkpoints().clone())
     } else {
         ToolExecutor::new_read_only(workspace)
     };
@@ -737,8 +739,11 @@ async fn custom_tools(
     let workspace = parent.workspace();
     let mut prompt = String::new();
     let root = worktree.map_or_else(|| workspace.to_path_buf(), |worktree| worktree.workspace());
-    let (mut tools, restrictions) =
-        restrict_to_agent(agent, ToolExecutor::new_for_subagent(&root), workspace);
+    let mut executor = ToolExecutor::new_for_subagent(&root);
+    if worktree.is_none() {
+        executor = executor.with_checkpoints(parent.checkpoints().clone());
+    }
+    let (mut tools, restrictions) = restrict_to_agent(agent, executor, workspace);
     if worktree.is_some() {
         prompt.push_str(&format!(
             "\n\nYou work in an isolated git worktree at {} on a branch of your own: \
@@ -784,7 +789,9 @@ async fn custom_tools(
 /// A fork's tools: a writer's, with the parent's MCP services and the
 /// workspace's skills.
 fn fork_tools(parent: &ToolExecutor) -> ToolExecutor {
-    let tools = ToolExecutor::new_for_subagent(parent.workspace()).with_subagent_mcp(parent.mcp());
+    let tools = ToolExecutor::new_for_subagent(parent.workspace())
+        .with_subagent_mcp(parent.mcp())
+        .with_checkpoints(parent.checkpoints().clone());
     attach_skills(tools, &[]).0
 }
 /// Gives `tools` the workspace's skills (read at each launch, so new ones

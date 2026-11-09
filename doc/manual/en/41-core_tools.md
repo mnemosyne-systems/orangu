@@ -287,6 +287,61 @@ calls ask again; `/permissions clear` takes back all of them.
 
 \newpage
 
+## /undo
+
+Puts back the files the agent changed in its last turn that changed any:
+files it edited get their earlier content, permissions and Git index entry
+back, and files and directories it created are removed. Your own commits, the
+rest of the index and files the agent did not touch are left alone.
+
+Before a file tool (`create_file`, `modify_file`, `move_file`, `delete_file`,
+the directory tools and `convert_document`) first changes a path in a turn,
+orangu saves a copy of it, so this works with or without Git and does not
+depend on what was committed. Writers among the subagents share the turn's
+copies; agents in a worktree of their own do not, since their work never
+reaches the workspace until it is merged. Commands run through
+`run_shell_command` and MCP tools are not covered: what they change is not
+known in advance.
+
+If a file changed again after the agent wrote it (you edited it, say), `/undo`
+restores nothing and names the file; `/undo force` restores anyway and
+discards that change.
+
+The copies are kept in the session's directory (see **Session storage** in the
+Terminal chapter), so they survive a restart and `/session` resume, and they
+are removed with the session by `/prune`. A session keeps the last 100 turns
+that changed files and up to 64 MiB of copies per turn; a file past that is
+reported as not saved and left as it is by `/undo`.
+
+After an undo, your next prompt tells the model which files went back, so it
+does not assume its changes are still there.
+
+**Examples**
+
+```text
+/undo
+/undo force
+```
+
+\newpage
+
+## /rewind
+
+Lists the agent's turns that changed files, numbered, with their age, the
+first line of the prompt and the files each changed. `/rewind <turn>` puts the
+files back as they were before that turn, undoing it and every later one, the
+same way `/undo` does; `/rewind <turn> force` overwrites changes made since.
+
+**Examples**
+
+```text
+/rewind
+/rewind 3
+/rewind 3 force
+```
+
+\newpage
+
 ## /model
 
 Selects the model used for requests on the active server.

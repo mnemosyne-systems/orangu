@@ -76,6 +76,8 @@ impl OranguHelper {
                 "/clear".to_string(),
                 "/compact".to_string(),
                 "/permissions".to_string(),
+                "/undo".to_string(),
+                "/rewind".to_string(),
                 "/quit".to_string(),
             ],
             models,

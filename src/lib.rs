@@ -16,6 +16,7 @@
 pub mod agents;
 pub mod browse;
 pub mod build_info;
+pub mod checkpoints;
 pub mod child;
 pub mod compression;
 pub mod compression_cache;
