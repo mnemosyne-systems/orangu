@@ -30,6 +30,7 @@ mod init;
 mod input;
 mod r#loop;
 mod manual;
+mod mentions;
 mod mode;
 mod models;
 mod oneshot;
@@ -2768,6 +2769,12 @@ async fn run() -> Result<()> {
         tools.checkpoints().begin_turn(&next_input);
         if let Some(notice) = tools.checkpoints().take_notice() {
             prompt_input = format!("{notice}\n\n{prompt_input}");
+        }
+        // `@path` and `@Symbol` attach what they name.
+        let (with_mentions, attached) = crate::mentions::attach(&prompt_input, &workspace, &tools);
+        if !attached.is_empty() {
+            output_state.push_text(&crate::mentions::summary(&attached));
+            prompt_input = with_mentions;
         }
         if let Some((hash, diff)) = orangu::context::world_state::get_current_workspace_diff(
             &workspace,

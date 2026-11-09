@@ -938,9 +938,53 @@ impl InputState {
         }
     }
 
-    pub fn update_dropdown(&mut self, skills: &orangu::skills::SkillRegistry, enabled: bool) {
+    /// Puts the dropdown's selected candidate in place of what it completes.
+    /// A folder (`@src/`) stays open for the next part of the path; anything
+    /// else gets a space after it. `false` when nothing was selected.
+    pub fn accept_dropdown(&mut self) -> bool {
+        let Some(dropdown) = self.dropdown.take() else {
+            return false;
+        };
+        let Some((candidate, _)) = dropdown.candidates.get(dropdown.selected_index) else {
+            return false;
+        };
+        self.buffer.truncate(dropdown.replacement_start);
+        self.buffer.push_str(candidate);
+        if !(candidate.starts_with('@') && candidate.ends_with('/')) {
+            self.buffer.push(' ');
+        }
+        self.cursor = self.buffer.len();
+        true
+    }
+
+    pub fn update_dropdown(
+        &mut self,
+        skills: &orangu::skills::SkillRegistry,
+        workspace: &Path,
+        enabled: bool,
+    ) {
         if !enabled {
             self.dropdown = None;
+            return;
+        }
+
+        // `@` at the start of the word being typed: the workspace's files.
+        if let Some((start, candidates)) = self.mention_candidates(workspace) {
+            if candidates.is_empty() {
+                self.dropdown = None;
+            } else {
+                let selected_index = self
+                    .dropdown
+                    .as_ref()
+                    .and_then(|old| old.candidates.get(old.selected_index))
+                    .and_then(|(old, _)| candidates.iter().position(|(c, _)| c == old))
+                    .unwrap_or(0);
+                self.dropdown = Some(DropdownState {
+                    candidates,
+                    selected_index,
+                    replacement_start: start,
+                });
+            }
             return;
         }
 
@@ -988,6 +1032,51 @@ impl InputState {
         }
     }
 }
+
+impl InputState {
+    /// The `@` completions for the word ending at the cursor, as the word's
+    /// start and `(candidate, description)` pairs: the workspace's files and
+    /// folders, each with its size. `None` unless the cursor ends the line
+    /// and that word starts with `@` (and is not `@agent-…`).
+    fn mention_candidates(&self, workspace: &Path) -> Option<(usize, Vec<(String, String)>)> {
+        if self.cursor != self.buffer.len() || self.buffer.starts_with('/') {
+            return None;
+        }
+        let start = self
+            .buffer
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map_or(0, |(index, ch)| index + ch.len_utf8());
+        let typed = self.buffer[start..].strip_prefix('@')?;
+        if typed.starts_with("agent-") {
+            return None;
+        }
+        let candidates = super::completion::file_completion_candidates(typed, workspace)
+            .into_iter()
+            .take(MENTION_CANDIDATES)
+            .map(|path| {
+                let description = if path.ends_with('/') {
+                    "folder".to_string()
+                } else {
+                    std::fs::metadata(workspace.join(&path))
+                        .map(|meta| {
+                            format!(
+                                "~{} tokens",
+                                orangu::tui::context_gauge::short_count(meta.len().div_ceil(4))
+                            )
+                        })
+                        .unwrap_or_default()
+                };
+                (format!("@{path}"), description)
+            })
+            .collect();
+        Some((start, candidates))
+    }
+}
+
+/// The most files the `@` dropdown lists at once.
+const MENTION_CANDIDATES: usize = 50;
 
 pub fn idle_status_refresh_timeout(refresh_deadline: Instant, now: Instant) -> Duration {
     refresh_deadline
@@ -1284,12 +1373,7 @@ pub fn handle_input_event_with_status(
                         && input_state.buffer.get(dropdown.replacement_start..)
                             != Some(dropdown.candidates[dropdown.selected_index].0.as_str())
                     {
-                        let cmd = &dropdown.candidates[dropdown.selected_index].0;
-                        input_state.buffer.truncate(dropdown.replacement_start);
-                        input_state.buffer.push_str(cmd);
-                        input_state.buffer.push(' ');
-                        input_state.cursor = input_state.buffer.len();
-                        input_state.dropdown = None;
+                        input_state.accept_dropdown();
                         redraw = true;
                     } else {
                         let input = input_state.buffer.clone();
@@ -1429,16 +1513,8 @@ pub fn handle_input_event_with_status(
                 }
                 (KeyCode::Tab, _) => {
                     interrupt_state.reset();
-                    if let Some(dropdown) = &input_state.dropdown {
-                        if dropdown.selected_index < dropdown.candidates.len() {
-                            let cmd = &dropdown.candidates[dropdown.selected_index].0;
-                            input_state.buffer.truncate(dropdown.replacement_start);
-                            input_state.buffer.push_str(cmd);
-                            input_state.buffer.push(' ');
-                            input_state.cursor = input_state.buffer.len();
-                            input_state.dropdown = None;
-                            redraw = true;
-                        }
+                    if input_state.dropdown.is_some() {
+                        redraw = input_state.accept_dropdown();
                     } else {
                         apply_completion(
                             input_state,
@@ -1590,7 +1666,11 @@ pub fn handle_input_event_with_status(
         if input_state.reverse_search.is_some() {
             input_state.dropdown = None;
         } else {
-            input_state.update_dropdown(input_context.skills, input_context.render.drop_down);
+            input_state.update_dropdown(
+                input_context.skills,
+                input_context.workspace,
+                input_context.render.drop_down,
+            );
             sync_theme_preview(input_state);
         }
     }
@@ -2700,6 +2780,43 @@ mod tests {
     }
 
     #[test]
+    fn an_at_sign_opens_the_workspace_files_and_a_folder_stays_open() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        std::fs::write(workspace.path().join("src/main.rs"), "x".repeat(4_000)).unwrap();
+        let context = test_input_context(workspace.path());
+        let mut input_state = InputState::default();
+
+        input_state.set_buffer("explain @s".to_string());
+        input_state.update_dropdown(context.skills, workspace.path(), true);
+        let dropdown = input_state.dropdown.as_ref().expect("file dropdown");
+        assert_eq!(dropdown.replacement_start, "explain ".len());
+        assert_eq!(
+            dropdown.candidates,
+            vec![("@src/".to_string(), "folder".to_string())]
+        );
+        assert!(input_state.accept_dropdown());
+        assert_eq!(input_state.as_str(), "explain @src/");
+
+        input_state.update_dropdown(context.skills, workspace.path(), true);
+        let dropdown = input_state.dropdown.as_ref().expect("folder contents");
+        assert_eq!(
+            dropdown.candidates,
+            vec![("@src/main.rs".to_string(), "~1.0k tokens".to_string())]
+        );
+        assert!(input_state.accept_dropdown());
+        assert_eq!(input_state.as_str(), "explain @src/main.rs ");
+
+        // Not for an e-mail address, nor for `@agent-`.
+        input_state.set_buffer("mail me@s".to_string());
+        input_state.update_dropdown(context.skills, workspace.path(), true);
+        assert!(input_state.dropdown.is_none());
+        input_state.set_buffer("@agent-".to_string());
+        input_state.update_dropdown(context.skills, workspace.path(), true);
+        assert!(input_state.dropdown.is_none());
+    }
+
+    #[test]
     fn dropdown_selection_wraps_around() {
         let mut dropdown = DropdownState {
             candidates: vec![
@@ -2738,7 +2855,11 @@ mod tests {
         let mut viewport = ViewportState::new(80, 80, 24);
 
         input_state.set_buffer("/task".to_string());
-        input_state.update_dropdown(test_input_context(workspace.path()).skills, true);
+        input_state.update_dropdown(
+            test_input_context(workspace.path()).skills,
+            workspace.path(),
+            true,
+        );
         let result = handle_input_event(
             enter(),
             &mut input_state,
@@ -2751,7 +2872,11 @@ mod tests {
         assert_eq!(input_state.as_str(), "/tasks ");
 
         input_state.set_buffer("/tasks".to_string());
-        input_state.update_dropdown(test_input_context(workspace.path()).skills, true);
+        input_state.update_dropdown(
+            test_input_context(workspace.path()).skills,
+            workspace.path(),
+            true,
+        );
         assert!(input_state.dropdown.is_some());
         let result = handle_input_event(
             enter(),
@@ -2885,7 +3010,7 @@ mod tests {
         let context = test_input_context(workspace.path());
 
         // Seed dropdown (set_buffer clears it).
-        input_state.update_dropdown(context.skills, true);
+        input_state.update_dropdown(context.skills, workspace.path(), true);
         sync_theme_preview(&input_state);
         let dropdown = input_state.dropdown.as_ref().expect("theme dropdown");
         let count = dropdown.candidates.len();

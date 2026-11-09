@@ -93,6 +93,14 @@ pub fn completion_candidates(
         candidates.dedup();
         return Some((start, cursor, candidates));
     }
+    // `@<path>`: a workspace file or folder to attach.
+    if let Some(typed) = token.strip_prefix('@') {
+        let candidates = file_completion_candidates(typed, workspace)
+            .into_iter()
+            .map(|path| format!("@{path}"))
+            .collect();
+        return Some((start, cursor, candidates));
+    }
     // While the first word is being typed — the empty prompt included — the
     // merge flow's next steps come before the workspace files, so Tab reaches
     // for `switch to main` / `merge <branch>` / ... ahead of a same-prefixed

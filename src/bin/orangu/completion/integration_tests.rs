@@ -1552,3 +1552,17 @@ fn completes_agent_mentions() {
             .expect("mention completion");
     assert_eq!(candidates, ["@agent-explore_repository"]);
 }
+
+#[test]
+fn completes_file_mentions() {
+    let workspace = tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("src");
+    fs::write(workspace.path().join("src/lib.rs"), "").expect("file");
+    let skills = orangu::skills::SkillRegistry::discover(std::path::Path::new("/"));
+    let input = "read @src/l";
+    let (start, _, candidates) =
+        completion_candidates(input, input.len(), workspace.path(), &[], &[], &skills)
+            .expect("mention completion");
+    assert_eq!(start, "read ".len());
+    assert_eq!(candidates, ["@src/lib.rs"]);
+}

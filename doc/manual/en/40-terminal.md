@@ -97,6 +97,29 @@ The prompt area stays at the bottom of the terminal window.
 
 All slash commands are handled locally and are never sent to the model, so they continue to work even when the model is unavailable. Free-form prompts, by contrast, are blocked when the server or model status in the header is red.
 
+## Mentioning files with @
+
+A word in a prompt that starts with `@` attaches what it names, so the model has
+it without searching for it:
+
+- `@src/main.rs` attaches the file's content (up to 256 KiB; a longer file is
+  cut and the model is told to read the rest itself)
+- `@src/` attaches a listing of the folder, three levels deep, without what Git
+  ignores
+- `@ChatSession` attaches the definition of a symbol the Knowledge Graph knows
+  by exactly that name, once the graph has been built
+
+Typing `@` at the start of a word opens a list of the workspace's files and
+folders, each file with its approximate size in tokens; `Tab` or `Enter`
+takes the highlighted one, and a folder stays open so you can go on into it.
+After the prompt is sent, the output window names what was attached and its
+approximate size, for example `Attached src/main.rs (~1.2k tokens), src/
+(listing, ~300 tokens)`, which you can weigh against the context gauge.
+
+A mention that names no file, folder or symbol stays plain text, as do e-mail
+addresses (`me@example.com`) and `@agent-<name>`, which asks for a subagent
+instead.
+
 ## Waiting state
 
 While the model is generating a response, the left side of the footer shows a rolling:
