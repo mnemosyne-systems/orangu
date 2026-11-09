@@ -89,6 +89,9 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  /* The visible height: on a phone, what the browser bars and the
+     on-screen keyboard leave, so the input stays above the keyboard. */
+  height: 100dvh;
 }
 
 #topbar {
@@ -2247,4 +2250,140 @@ button:disabled {
 @keyframes monitor-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
+}
+
+/* ------------------------------------------------------------ phones
+   Below 700 pixels the console is one column: the dropdowns (History,
+   Chat settings) and Settings take the whole screen under the top bar,
+   answers take the full width, and tables become stacked cards. */
+@media (max-width: 700px) {
+  #topbar {
+    padding-left: max(10px, env(safe-area-inset-left));
+    padding-right: max(10px, env(safe-area-inset-right));
+    gap: 8px;
+  }
+
+  /* Settings › Models names the model; the bar keeps its buttons. */
+  #model-name {
+    display: none;
+  }
+
+  #brand {
+    margin-right: auto;
+  }
+
+  #topbar-actions {
+    gap: 4px;
+  }
+
+  #history-panel,
+  #chat-settings-panel {
+    position: fixed;
+    top: 54px;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: auto;
+    max-height: none;
+    border-radius: 0;
+    border-left: none;
+    border-right: none;
+  }
+
+  .message {
+    max-width: 100%;
+  }
+
+  #composer {
+    padding-left: max(8px, env(safe-area-inset-left));
+    padding-right: max(8px, env(safe-area-inset-right));
+    padding-bottom: max(8px, env(safe-area-inset-bottom));
+  }
+
+  #footer {
+    display: none;
+  }
+
+  #settings-panel {
+    width: 100vw;
+    height: 100dvh;
+    max-width: none;
+    max-height: none;
+    border-radius: 0;
+  }
+
+  #settings-body {
+    flex-direction: column;
+  }
+
+  #settings-overlay {
+    padding: 0;
+  }
+
+  #settings-nav {
+    flex: 0 0 auto;
+    flex-direction: row;
+    overflow-x: auto;
+    width: auto;
+    padding: 6px;
+    gap: 4px;
+    border-right: none;
+    border-bottom: 1px solid var(--brand-border);
+  }
+
+  #settings-nav h2 {
+    display: none;
+  }
+
+  #settings-nav .settings-tab {
+    flex: 0 0 auto;
+    width: auto;
+    white-space: nowrap;
+  }
+
+  table.stackable,
+  table.stackable tbody,
+  table.stackable tr,
+  table.stackable td {
+    display: block;
+    width: auto;
+  }
+
+  table.stackable thead {
+    display: none;
+  }
+
+  table.stackable tr {
+    margin: 0 0 10px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+
+  table.stackable td {
+    padding: 3px 0 !important;
+    border: none !important;
+    text-align: left !important;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  table.stackable td[data-label]::before {
+    content: attr(data-label) ": ";
+    color: var(--text-dim);
+    font-size: 0.85em;
+  }
+}
+
+/* Touch screens: every control at least 44 pixels across. */
+@media (pointer: coarse) {
+  .icon-btn,
+  .history-delete,
+  .settings-tab,
+  .mcps-action,
+  .turn-btn,
+  #chat-settings-panel button {
+    min-width: 44px;
+    min-height: 44px;
+  }
 }

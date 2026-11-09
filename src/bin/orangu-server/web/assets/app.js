@@ -2014,7 +2014,7 @@
       body.appendChild(row);
     }
     table.appendChild(body);
-    modelsTableEl.appendChild(table);
+    modelsTableEl.appendChild(stackable(table));
   }
 
   // How a row is named in a confirmation dialog and above its metadata:
@@ -2340,7 +2340,7 @@
       body.appendChild(row);
     });
     table.appendChild(body);
-    mcpsTable.replaceChildren(table);
+    mcpsTable.replaceChildren(stackable(table));
   }
 
   // The form, for a new server (`name` empty) or the named one's values.
@@ -2466,6 +2466,19 @@
     openWorkers().catch((err) => { workersSummary.textContent = err.message; });
   });
 
+  // Gives each cell its column's heading, so a narrow screen can show a
+  // row as a card of labelled lines (app.css, `table.stackable`).
+  function stackable(table) {
+    const headings = [...table.querySelectorAll("thead th")].map((th) => th.textContent.trim());
+    for (const row of table.querySelectorAll("tbody tr")) {
+      [...row.children].forEach((cell, index) => {
+        if (headings[index]) cell.dataset.label = headings[index];
+      });
+    }
+    table.classList.add("stackable");
+    return table;
+  }
+
   function workersTable(headings, rows) {
     const table = document.createElement("table");
     const head = document.createElement("tr");
@@ -2480,7 +2493,7 @@
       const row = body.insertRow();
       for (const value of values) row.insertCell().textContent = value;
     }
-    return table;
+    return stackable(table);
   }
 
   function layerSpan(layers) {

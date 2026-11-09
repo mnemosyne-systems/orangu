@@ -3951,6 +3951,21 @@ streamed in stays on screen, marked as stopped, but since the turn never
 reached completion it isn't saved — a stopped reply won't reappear if you
 reload or revisit it from **History**.
 
+### On a phone
+
+The console works on a phone's browser, for example to chat with the model on
+a home machine from elsewhere in the house. Below 700 pixels wide it becomes a
+single column: answers take the full width, **History** and **Chat settings**
+fill the screen under the top bar, **Settings** takes the whole screen with
+its sections as a row of tabs, and the Models, MCP and Workers tables show
+each row as a card. On a touch screen every button is at least 44 pixels
+across, and the input stays above the on-screen keyboard.
+
+The console can be installed as an app: the browser's **Add to Home Screen**
+(or **Install**) puts it on the home screen with its own icon, opening without
+the browser's bars. It is the same page, so the server has to be reachable,
+as for the browser.
+
 ### Answer statistics and the context gauge
 
 Under each answer, its footer gives the rate it was written at, how many

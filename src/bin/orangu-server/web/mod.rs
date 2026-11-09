@@ -59,6 +59,11 @@ use sessions::{Attachment, Session, SessionMessage};
 const INDEX_HTML: &str = include_str!("assets/index.html");
 const APP_CSS: &str = include_str!("assets/app.css");
 const APP_JS: &str = include_str!("assets/app.js");
+/// What lets a phone or desktop install the console as an app.
+const MANIFEST: &str = include_str!("assets/manifest.webmanifest");
+const ICON_SVG: &str = include_str!("assets/icon.svg");
+const ICON_192: &[u8] = include_bytes!("assets/icon-192.png");
+const ICON_512: &[u8] = include_bytes!("assets/icon-512.png");
 
 /// KaTeX (MIT, `assets/katex/LICENSE`) — vendored rather than pulled from a
 /// CDN, matching this whole web UI's "no build step, no network
@@ -279,6 +284,10 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         .route("/", get(index))
         .route("/static/app.css", get(app_css))
         .route("/static/app.js", get(app_js))
+        .route("/manifest.webmanifest", get(manifest))
+        .route("/static/icon.svg", get(icon_svg))
+        .route("/static/icon-192.png", get(|| icon_png(ICON_192)))
+        .route("/static/icon-512.png", get(|| icon_png(ICON_512)))
         .route("/static/katex/katex.min.css", get(katex_css))
         .route("/static/katex/katex.min.js", get(katex_js))
         .route("/static/katex/fonts/{name}", get(katex_font))
@@ -568,6 +577,36 @@ async fn app_css() -> impl IntoResponse {
             ("Cache-Control", "no-cache"),
         ],
         APP_CSS,
+    )
+}
+
+async fn manifest() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [("Content-Type", "application/manifest+json")],
+        MANIFEST,
+    )
+}
+
+async fn icon_svg() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            ("Content-Type", "image/svg+xml"),
+            ("Cache-Control", "max-age=86400"),
+        ],
+        ICON_SVG,
+    )
+}
+
+async fn icon_png(bytes: &'static [u8]) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [
+            ("Content-Type", "image/png"),
+            ("Cache-Control", "max-age=86400"),
+        ],
+        bytes,
     )
 }
 

@@ -3085,6 +3085,7 @@ The page itself and its assets:
 | :-- | :-- |
 | `GET /` | the console page |
 | `GET /static/app.css`, `GET /static/app.js` | its stylesheet and script |
+| `GET /manifest.webmanifest`, `GET /static/icon.svg`, `GET /static/icon-192.png`, `GET /static/icon-512.png` | the web app manifest and icons, so the console can be installed on a home screen |
 | `GET /static/katex/…` | the vendored math renderer and its fonts, served from an allowlist rather than from disk |
 | `GET /api/diagrams/{key}/{name}` | one rendered diagram, kept off the streamed message payload — a PNG's base64 form would grow every event by about a third |
 | `GET /api/asset-version` | the served page's own asset fingerprint, which powers the Reload prompt shown when a newer build is running behind an already-open tab |
