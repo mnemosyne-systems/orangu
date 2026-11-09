@@ -488,7 +488,7 @@ pub fn git_show_file_content(workspace: &Path, file_path: &Path, rev: &str) -> R
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("git show is only available inside a Git repository"))?;
     let relative = file_path.strip_prefix(&repo_root).unwrap_or(file_path);
-    let spec = format!("{rev}:{}", relative.display());
+    let spec = format!("{rev}:{}", relative.to_string_lossy().replace('\\', "/"));
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(&repo_root)

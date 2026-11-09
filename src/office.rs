@@ -267,8 +267,8 @@ pub fn convert_file(
         target: target
             .strip_prefix(workspace)
             .unwrap_or(target)
-            .display()
-            .to_string(),
+            .to_string_lossy()
+            .replace('\\', "/"),
         format: to,
         bytes_written: bytes.len(),
         overwritten: existed,

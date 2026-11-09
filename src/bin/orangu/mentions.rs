@@ -235,7 +235,7 @@ fn relative_to(path: &Path, workspace: &Path) -> String {
     path.strip_prefix(workspace)
         .unwrap_or(path)
         .to_string_lossy()
-        .into_owned()
+        .replace('\\', "/")
 }
 
 #[cfg(test)]

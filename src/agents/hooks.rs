@@ -305,7 +305,7 @@ fn scan_workspace(workspace: &Path, cache_path: &Path) -> WorkspaceScanResult {
                         .strip_prefix(workspace)
                         .unwrap_or(path)
                         .to_string_lossy()
-                        .to_string();
+                        .replace('\\', "/");
 
                     let content = match std::fs::read_to_string(path) {
                         Ok(c) => c,
@@ -412,7 +412,7 @@ fn source_path_keys(workspace: &Path, files: &[PathBuf]) -> HashSet<String> {
             path.strip_prefix(workspace)
                 .unwrap_or(path)
                 .to_string_lossy()
-                .into_owned()
+                .replace('\\', "/")
         })
         .collect()
 }
@@ -444,7 +444,7 @@ pub fn rescan_changed_files(
                         .strip_prefix(workspace)
                         .unwrap_or(path)
                         .to_string_lossy()
-                        .to_string();
+                        .replace('\\', "/");
 
                     let content = match std::fs::read_to_string(path) {
                         Ok(c) => c,

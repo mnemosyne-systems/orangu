@@ -248,7 +248,7 @@ impl EmbeddingIndex {
                 .strip_prefix(workspace)
                 .unwrap_or(&path)
                 .to_string_lossy()
-                .to_string();
+                .replace('\\', "/");
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
