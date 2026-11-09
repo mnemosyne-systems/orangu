@@ -811,7 +811,7 @@ pub fn proc_read_bytes(pid: u32) -> Option<u64> {
 /// Drop `path` — a file, or every file under a directory — from the page
 /// cache, so the next reader fetches it from storage. Returns the bytes
 /// covered. Only clean pages go; a file being written keeps its dirty ones.
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn evict_from_page_cache(path: &Path) -> std::io::Result<u64> {
     use std::os::unix::io::AsRawFd as _;
     let meta = std::fs::metadata(path)?;
@@ -832,11 +832,12 @@ pub fn evict_from_page_cache(path: &Path) -> std::io::Result<u64> {
     Ok(meta.len())
 }
 
-/// No `posix_fadvise` off Unix.
-#[cfg(not(unix))]
+/// Elsewhere — macOS among them — there is no `posix_fadvise` to drop a
+/// file's cached pages with.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub fn evict_from_page_cache(_path: &Path) -> std::io::Result<u64> {
     Err(std::io::Error::other(
-        "page-cache eviction needs posix_fadvise",
+        "page-cache eviction needs Linux's posix_fadvise",
     ))
 }
 
