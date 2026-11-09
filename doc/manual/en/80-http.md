@@ -3096,7 +3096,10 @@ Chat sessions:
 | Endpoint | |
 | :-- | :-- |
 | `POST /api/sessions` | creates a new, empty chat session, returning its id |
-| `GET /api/sessions` | lists every non-empty session, newest-updated first |
+| `GET /api/sessions` | lists every non-empty session, newest-updated first; `?q=…` lists those whose title or messages contain it, each found by its messages with a `snippet` |
+| `PATCH /api/sessions/{id}` | renames the chat to `{"title": "…"}` |
+| `GET /api/sessions/{id}/export?format=markdown` | the chat as a Markdown download; `format=json` gives it with its files (base64) as `{"format": "orangu-chat", "version": 1, "session": …, "files": …}` |
+| `POST /api/sessions/import` | adds a chat from such a JSON export as a new chat, answering with its `id` and `title` |
 | `GET /api/sessions/{id}` | one session's full message history, each assistant reply already rendered to HTML |
 | `POST /api/sessions/{id}/messages` | sends one chat turn against that session; SSE reply |
 | `POST /api/sessions/{id}/versions/{n}` | shows version `n` (from 0) of the last turn and answers with the session as `GET` does |

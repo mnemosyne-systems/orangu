@@ -84,9 +84,14 @@
   </form>
 
   <nav id="history-panel" hidden>
+    <div id="history-search-row">
+      <input id="history-search" type="search" placeholder="Search chats" aria-label="Search chats" autocomplete="off">
+    </div>
     <div id="history-list"></div>
-    <div id="history-footer" hidden>
-      <button id="history-clear-btn" type="button">Clear all</button>
+    <div id="history-footer">
+      <button id="history-import-btn" type="button" title="Add a chat exported as JSON">Import…</button>
+      <input id="history-import-input" type="file" accept=".json,application/json" hidden>
+      <button id="history-clear-btn" type="button" hidden>Clear all</button>
     </div>
   </nav>
 

@@ -315,8 +315,12 @@ pub fn build_router(state: Arc<WebState>) -> Router {
         )
         .route(
             "/api/sessions/{id}",
-            get(get_session).delete(delete_session),
+            get(get_session)
+                .delete(delete_session)
+                .patch(rename_session),
         )
+        .route("/api/sessions/{id}/export", get(export_session))
+        .route("/api/sessions/import", post(import_session))
         .route("/api/sessions/{id}/messages", post(send_message))
         .route("/api/sessions/{id}/versions/{index}", post(show_version))
         .route("/api/sessions/{id}/settings", put(set_session_settings))
@@ -675,10 +679,107 @@ async fn create_session() -> impl IntoResponse {
     }
 }
 
-async fn list_sessions() -> impl IntoResponse {
-    match sessions::list_sessions() {
+#[derive(Deserialize)]
+struct SessionQuery {
+    #[serde(default)]
+    q: String,
+}
+
+/// `GET /api/sessions[?q=…]`: every chat, or those whose title or messages
+/// contain `q`.
+async fn list_sessions(
+    axum::extract::Query(query): axum::extract::Query<SessionQuery>,
+) -> impl IntoResponse {
+    match sessions::search_sessions(&query.q) {
         Ok(list) => Json(list).into_response(),
         Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct RenameRequest {
+    title: String,
+}
+
+/// `PATCH /api/sessions/{id}` with `{"title": "…"}`: renames the chat.
+async fn rename_session(
+    Path(id): Path<String>,
+    Json(req): Json<RenameRequest>,
+) -> axum::response::Response {
+    match sessions::rename_session(&id, &req.title) {
+        Ok(session) => Json(json!({"id": session.id, "title": session.title})).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    #[serde(default)]
+    format: String,
+}
+
+/// `GET /api/sessions/{id}/export?format=markdown|json`: the chat as a
+/// download, Markdown to read, or JSON (with its files) to import again.
+async fn export_session(
+    Path(id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ExportQuery>,
+) -> axum::response::Response {
+    let export = match sessions::export_session(&id) {
+        Ok(export) => export,
+        Err(err) => return (StatusCode::NOT_FOUND, format!("{err:#}")).into_response(),
+    };
+    let stem: String = export
+        .session
+        .title
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .take(8)
+        .collect::<Vec<_>>()
+        .join("-");
+    let stem = if stem.is_empty() {
+        "chat".to_string()
+    } else {
+        stem
+    };
+    let (body, mime, extension) = match query.format.as_str() {
+        "json" => match serde_json::to_string_pretty(&export) {
+            Ok(body) => (body, "application/json", "json"),
+            Err(err) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response();
+            }
+        },
+        "markdown" | "md" | "" => (
+            sessions::export_markdown(&export.session),
+            "text/markdown; charset=utf-8",
+            "md",
+        ),
+        other => {
+            return (StatusCode::BAD_REQUEST, format!("unknown format '{other}'")).into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        [
+            ("Content-Type", mime.to_string()),
+            (
+                "Content-Disposition",
+                format!("attachment; filename=\"{stem}.{extension}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// `POST /api/sessions/import`: a new chat from an exported one. Answers
+/// with its id and title.
+async fn import_session(Json(export): Json<sessions::SessionExport>) -> axum::response::Response {
+    match sessions::import_session(export) {
+        Ok(session) => Json(json!({"id": session.id, "title": session.title})).into_response(),
+        Err(err) => (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
     }
 }
 

@@ -124,6 +124,10 @@ pub struct Session {
     /// This chat's own system prompt and sampling settings.
     #[serde(default, skip_serializing_if = "ChatSettings::is_default")]
     pub settings: ChatSettings,
+    /// The user gave `title`, so it is no longer derived from the first
+    /// question.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub title_given: bool,
 }
 
 /// What one answer took.
@@ -202,6 +206,9 @@ pub struct SessionSummary {
     pub title: String,
     pub created_at: u64,
     pub updated_at: u64,
+    /// Where a search matched the chat's messages, rather than its title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 fn unix_now() -> u64 {
@@ -247,6 +254,7 @@ pub fn create_session() -> Result<Session> {
         active_version: 0,
         replacing_last_turn: false,
         settings: ChatSettings::default(),
+        title_given: false,
     };
     save_session(&session)?;
     Ok(session)
@@ -275,8 +283,9 @@ pub fn take_last_turn(session: &mut Session) -> Result<SessionMessage> {
         });
         session.active_version = 0;
     }
-    // A first question rewritten gets its title from the new wording.
-    if session.messages.is_empty() {
+    // A first question rewritten gets its title from the new wording,
+    // unless the user gave the chat one.
+    if session.messages.is_empty() && !session.title_given {
         session.title.clear();
     }
     session.replacing_last_turn = true;
@@ -449,7 +458,15 @@ pub fn load_session(id: &str) -> Result<Session> {
     serde_json::from_str(&contents).with_context(|| format!("session '{id}' is corrupt"))
 }
 
+#[cfg(test)]
 pub fn list_sessions() -> Result<Vec<SessionSummary>> {
+    search_sessions("")
+}
+
+/// The chats whose title or messages contain `query` (ignoring case), as
+/// [`list_sessions`] lists them; an empty query lists them all.
+pub fn search_sessions(query: &str) -> Result<Vec<SessionSummary>> {
+    let needle = query.trim().to_lowercase();
     let dir = sessions_dir()?;
     let mut summaries = Vec::new();
     for entry in fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))? {
@@ -469,15 +486,182 @@ pub fn list_sessions() -> Result<Vec<SessionSummary>> {
         if session.messages.is_empty() {
             continue;
         }
+        let mut snippet = None;
+        if !needle.is_empty() && !session.title.to_lowercase().contains(&needle) {
+            snippet = session
+                .messages
+                .iter()
+                .find_map(|message| snippet_of(&message.content, &needle));
+            if snippet.is_none() {
+                continue;
+            }
+        }
         summaries.push(SessionSummary {
             id: session.id,
             title: session.title,
             created_at: session.created_at,
             updated_at: session.updated_at,
+            snippet,
         });
     }
     summaries.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     Ok(summaries)
+}
+
+/// A few words either side of where `needle` (lowercase) is in `text`.
+fn snippet_of(text: &str, needle: &str) -> Option<String> {
+    const AROUND: usize = 40;
+    let lower = text.to_lowercase();
+    let at = lower.find(needle)?;
+    // Lowercasing can change byte lengths; map back by characters.
+    let start_chars = lower[..at].chars().count();
+    let chars: Vec<char> = text.chars().collect();
+    let from = start_chars.saturating_sub(AROUND);
+    let to = (start_chars + needle.chars().count() + AROUND).min(chars.len());
+    let mut words: Vec<String> = chars[from..to]
+        .iter()
+        .collect::<String>()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    // Whole words only: drop the ones the window cut through.
+    if from > 0 && words.len() > 1 {
+        words.remove(0);
+    }
+    if to < chars.len() && words.len() > 1 {
+        words.pop();
+    }
+    let mut snippet = words.join(" ");
+    if from > 0 {
+        snippet.insert(0, '…');
+    }
+    if to < chars.len() {
+        snippet.push('…');
+    }
+    Some(snippet)
+}
+
+/// Gives the chat `id` the title `title`.
+pub fn rename_session(id: &str, title: &str) -> Result<Session> {
+    let title: String = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        anyhow::bail!("a title cannot be empty");
+    }
+    let mut session = load_session(id)?;
+    session.title = title.chars().take(200).collect();
+    session.title_given = true;
+    save_session(&session)?;
+    Ok(session)
+}
+
+/// A chat as a Markdown document: its title, then each message under the
+/// name of who wrote it.
+pub fn export_markdown(session: &Session) -> String {
+    let title = if session.title.is_empty() {
+        "Chat"
+    } else {
+        &session.title
+    };
+    let mut out = format!("# {title}\n");
+    for message in &session.messages {
+        let who = if message.role == "assistant" {
+            "orangu"
+        } else {
+            "You"
+        };
+        out.push_str(&format!("\n## {who}\n\n{}\n", message.content.trim_end()));
+        let names: Vec<&str> = message
+            .attachments
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
+        if !names.is_empty() {
+            out.push_str(&format!("\n*Attached: {}*\n", names.join(", ")));
+        }
+    }
+    out
+}
+
+/// A chat with the files kept beside it, as one JSON document that
+/// [`import_session`] reads back.
+#[derive(Serialize, Deserialize)]
+pub struct SessionExport {
+    pub format: String,
+    pub version: u32,
+    pub session: Session,
+    /// Each kept file's bytes, base64, by name.
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
+}
+
+/// What [`SessionExport::format`] says.
+pub const EXPORT_FORMAT: &str = "orangu-chat";
+
+/// The chat `id` and its files as a [`SessionExport`].
+pub fn export_session(id: &str) -> Result<SessionExport> {
+    use base64::Engine as _;
+    let session = load_session(id)?;
+    let mut files = std::collections::BTreeMap::new();
+    let dir = session_dir(&Uuid::parse_str(id)?)?.join("files");
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if file_path(id, &name).is_ok()
+                && let Ok(bytes) = fs::read(entry.path())
+            {
+                files.insert(
+                    name,
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                );
+            }
+        }
+    }
+    Ok(SessionExport {
+        format: EXPORT_FORMAT.to_string(),
+        version: 1,
+        session,
+        files,
+    })
+}
+
+/// A new chat made from an exported one, with its files; links to them in
+/// the messages are pointed at the new chat.
+pub fn import_session(export: SessionExport) -> Result<Session> {
+    use base64::Engine as _;
+    if export.format != EXPORT_FORMAT {
+        anyhow::bail!("not an exported orangu chat");
+    }
+    let mut session = export.session;
+    let old_id = session.id.clone();
+    let new_id = Uuid::new_v4().to_string();
+    let rewrite = |text: &str| {
+        text.replace(
+            &format!("/api/sessions/{old_id}/files/"),
+            &format!("/api/sessions/{new_id}/files/"),
+        )
+    };
+    for message in &mut session.messages {
+        message.content = rewrite(&message.content);
+    }
+    for version in &mut session.turn_versions {
+        version.user.content = rewrite(&version.user.content);
+        version.assistant.content = rewrite(&version.assistant.content);
+    }
+    session.id = new_id.clone();
+    session.replacing_last_turn = false;
+    if session.active_version >= session.turn_versions.len() {
+        session.active_version = 0;
+    }
+    save_session(&session)?;
+    for (name, data) in export.files {
+        let path = file_path(&new_id, &name)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .with_context(|| format!("file {name} is not base64"))?;
+        fs::create_dir_all(path.parent().expect("files/ has a parent"))?;
+        fs::write(&path, bytes)?;
+    }
+    Ok(session)
 }
 
 /// One row of `orangu-server prune`'s listing — unlike [`SessionSummary`]/
@@ -698,9 +882,14 @@ pub fn append_turn(
         session.active_version = 0;
     }
     session.updated_at = unix_now();
-    // Settings changed while the answer was being written are kept.
+    // Settings changed, or a title given, while the answer was being
+    // written are kept.
     if let Ok(on_disk) = load_session(&session.id) {
         session.settings = on_disk.settings;
+        if on_disk.title_given {
+            session.title = on_disk.title;
+            session.title_given = true;
+        }
     }
     save_session(session)
 }
@@ -862,6 +1051,76 @@ mod tests {
             )
             .unwrap();
             assert!(!chat.contains("settings"), "{chat}");
+        });
+    }
+
+    #[test]
+    fn history_search_rename_and_export_round_trip() {
+        with_temp_home(|| {
+            let mut session = create_session().unwrap();
+            append_turn(
+                &mut session,
+                "Tell me about otters",
+                Vec::new(),
+                "Otters hold hands while they sleep in kelp forests.",
+                "",
+                None,
+                None,
+            )
+            .unwrap();
+            let mut other = create_session().unwrap();
+            append_turn(&mut other, "Weather?", Vec::new(), "Rain.", "", None, None).unwrap();
+
+            // By title, and by message text with a snippet.
+            let by_title = search_sessions("OTTERS").unwrap();
+            assert_eq!(by_title.len(), 1);
+            assert_eq!(by_title[0].snippet, None);
+            let by_text = search_sessions("kelp").unwrap();
+            assert_eq!(by_text.len(), 1);
+            assert!(
+                by_text[0]
+                    .snippet
+                    .as_deref()
+                    .unwrap()
+                    .contains("kelp forests")
+            );
+            assert_eq!(search_sessions("").unwrap().len(), 2);
+            assert!(search_sessions("zebra").unwrap().is_empty());
+
+            rename_session(&session.id, "  Otter   notes ").unwrap();
+            assert!(rename_session(&session.id, "   ").is_err());
+            // An answer finishing after the rename keeps the new title.
+            append_turn(&mut session, "More?", Vec::new(), "Yes.", "", None, None).unwrap();
+            assert_eq!(load_session(&session.id).unwrap().title, "Otter notes");
+
+            let markdown = export_markdown(&load_session(&session.id).unwrap());
+            assert!(markdown.starts_with(
+                "# Otter notes\n\n## You\n\nTell me about otters\n\n## orangu\n\nOtters hold hands"
+            ));
+
+            let picture = store_file(&session.id, "png", b"png bytes").unwrap();
+            let mut stored = load_session(&session.id).unwrap();
+            stored.messages[1].content =
+                format!("![p](/api/sessions/{}/files/{picture})", session.id);
+            save_session(&stored).unwrap();
+            let export = export_session(&session.id).unwrap();
+            let json = serde_json::to_string(&export).unwrap();
+            let imported = import_session(serde_json::from_str(&json).unwrap()).unwrap();
+            assert_ne!(imported.id, session.id);
+            assert_eq!(imported.title, "Otter notes");
+            assert_eq!(imported.messages.len(), 4);
+            assert_eq!(
+                imported.messages[1].content,
+                format!("![p](/api/sessions/{}/files/{picture})", imported.id)
+            );
+            assert_eq!(
+                fs::read(file_path(&imported.id, &picture).unwrap()).unwrap(),
+                b"png bytes"
+            );
+
+            let mut wrong = export_session(&session.id).unwrap();
+            wrong.format = "something".into();
+            assert!(import_session(wrong).is_err());
         });
     }
 
@@ -1078,6 +1337,7 @@ mod tests {
                 active_version: 0,
                 replacing_last_turn: false,
                 settings: ChatSettings::default(),
+                title_given: false,
             };
             let dir = session_dir(&id).unwrap();
             fs::create_dir_all(&dir).unwrap();

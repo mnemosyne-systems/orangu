@@ -4025,6 +4025,17 @@ Chat sessions persist as one directory per session at
 `~/.orangu/server/sessions/<uuid>/chat.json`, so **History** survives a
 restart.
 
+History finds, renames and moves chats as well:
+
+- The box at the top searches the chats' titles and messages as you type; a
+  chat found by its messages shows the words around the match
+- The pencil on a row renames the chat: `Enter` (or clicking elsewhere) keeps
+  the new title, `Esc` the old one. A renamed chat keeps its title from then on
+- The download arrow on a row exports the chat as **Markdown**, to read or
+  share, or as **JSON**, which includes its pictures and can be brought back
+- **Import…** in the footer adds a chat exported as JSON, on this server or
+  another, as a new chat
+
 History can clean them up too: each row carries a **cross** that deletes
 that one chat, and the dropdown's footer a small **Clear all** that deletes
 every one. Both confirm first, and neither is gated by `[web].delete` —

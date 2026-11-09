@@ -10,8 +10,10 @@
   const historyBtn = document.getElementById("history-btn");
   const historyPanel = document.getElementById("history-panel");
   const historyList = document.getElementById("history-list");
-  const historyFooter = document.getElementById("history-footer");
   const historyClearBtn = document.getElementById("history-clear-btn");
+  const historySearch = document.getElementById("history-search");
+  const historyImportBtn = document.getElementById("history-import-btn");
+  const historyImportInput = document.getElementById("history-import-input");
   const themeToggleBtn = document.getElementById("theme-toggle-btn");
   const attachBtn = document.getElementById("attach-btn");
   const attachMenu = document.getElementById("attach-menu");
@@ -1065,17 +1067,21 @@
   }
 
   async function refreshHistory() {
-    const res = await fetch("/api/sessions");
+    const query = historySearch.value.trim();
+    const res = await fetch(query ? `/api/sessions?q=${encodeURIComponent(query)}` : "/api/sessions");
     if (!res.ok) return;
     const sessions = await res.json();
-    // Nothing to clear is the only reason the footer ever hides — deleting
+    // A search can come back after the box changed again: show only the
+    // answer to what it holds now.
+    if (query !== historySearch.value.trim()) return;
+    // Nothing to clear is the only reason Clear all ever hides — deleting
     // sessions is unconditional, unlike the model manager's own Delete.
-    historyFooter.hidden = sessions.length === 0;
+    if (!query) historyClearBtn.hidden = sessions.length === 0;
     historyList.innerHTML = "";
     if (sessions.length === 0) {
       const empty = document.createElement("div");
       empty.className = "history-empty";
-      empty.textContent = "No previous chats yet.";
+      empty.textContent = query ? "No chat matches." : "No previous chats yet.";
       historyList.appendChild(empty);
       return;
     }
@@ -1091,11 +1097,25 @@
       date.className = "history-date";
       date.textContent = formatDate(session.updated_at);
       text.appendChild(title);
+      if (session.snippet) {
+        const snippet = document.createElement("div");
+        snippet.className = "history-snippet";
+        snippet.textContent = session.snippet;
+        text.appendChild(snippet);
+      }
       text.appendChild(date);
       item.appendChild(text);
       item.addEventListener("click", () => {
+        if (item.classList.contains("renaming")) return;
         loadSession(session.id).catch((err) => console.error(err));
       });
+      item.appendChild(historyAction(EDIT_ICON, `Rename "${historyTitle(session)}"`, () => {
+        renameInPlace(item, title, session);
+      }));
+      const exportBtn = historyAction(SAVE_ICON, `Export "${historyTitle(session)}"`, () => {
+        toggleExportMenu(exportBtn, session);
+      });
+      item.appendChild(exportBtn);
       const remove = document.createElement("button");
       remove.type = "button";
       remove.className = "history-delete";
@@ -1111,6 +1131,109 @@
       item.appendChild(remove);
       historyList.appendChild(item);
     }
+  }
+
+  function historyAction(icon, label, onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "history-delete history-action";
+    button.innerHTML = icon;
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      onClick();
+    });
+    return button;
+  }
+
+  // The title turns into a text box: Enter or leaving it saves, Esc keeps
+  // the old title.
+  function renameInPlace(item, titleEl, session) {
+    if (item.classList.contains("renaming")) return;
+    item.classList.add("renaming");
+    const box = document.createElement("input");
+    box.type = "text";
+    box.className = "history-rename";
+    box.value = session.title;
+    box.setAttribute("aria-label", "New title");
+    titleEl.replaceWith(box);
+    box.focus();
+    box.select();
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      const title = box.value.trim();
+      if (save && title && title !== session.title) {
+        const res = await fetch(`/api/sessions/${encodeURIComponent(session.id)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title }),
+        });
+        if (!res.ok) console.error("failed to rename session", await res.text());
+      }
+      await refreshHistory();
+    };
+    box.addEventListener("click", (event) => event.stopPropagation());
+    box.addEventListener("keydown", (event) => {
+      event.stopPropagation();
+      if (event.key === "Enter") finish(true).catch((err) => console.error(err));
+      if (event.key === "Escape") finish(false).catch((err) => console.error(err));
+    });
+    box.addEventListener("blur", () => finish(true).catch((err) => console.error(err)));
+  }
+
+  let openExportMenu = null;
+
+  function closeExportMenu() {
+    if (openExportMenu) openExportMenu.remove();
+    openExportMenu = null;
+  }
+
+  // Markdown to read or share, JSON (with the chat's pictures) to import.
+  function toggleExportMenu(anchor, session) {
+    const wasFor = openExportMenu && openExportMenu.dataset.session;
+    closeExportMenu();
+    if (wasFor === session.id) return;
+    const menu = document.createElement("div");
+    menu.className = "history-export-menu";
+    menu.dataset.session = session.id;
+    for (const [label, format] of [["Markdown", "markdown"], ["JSON", "json"]]) {
+      const link = document.createElement("a");
+      link.href = `/api/sessions/${encodeURIComponent(session.id)}/export?format=${format}`;
+      link.textContent = label;
+      link.setAttribute("download", "");
+      link.addEventListener("click", (event) => {
+        event.stopPropagation();
+        closeExportMenu();
+      });
+      menu.appendChild(link);
+    }
+    anchor.closest(".history-item").after(menu);
+    openExportMenu = menu;
+  }
+
+  async function importHistory(file) {
+    let body;
+    try {
+      body = JSON.parse(await file.text());
+    } catch {
+      window.alert(`${file.name} is not a JSON file.`);
+      return;
+    }
+    const res = await fetch("/api/sessions/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      window.alert(`Could not import ${file.name}: ${await res.text()}`);
+      return;
+    }
+    const imported = await res.json();
+    historySearch.value = "";
+    await loadSession(imported.id);
   }
 
   // Deleting the session a reply is still streaming into would otherwise
@@ -1576,6 +1699,18 @@
 
   historyClearBtn.addEventListener("click", () => {
     clearHistory().catch((err) => console.error(err));
+  });
+
+  let historySearchTimer = null;
+  historySearch.addEventListener("input", () => {
+    clearTimeout(historySearchTimer);
+    historySearchTimer = setTimeout(() => refreshHistory().catch((err) => console.error(err)), 200);
+  });
+  historyImportBtn.addEventListener("click", () => historyImportInput.click());
+  historyImportInput.addEventListener("change", () => {
+    const [file] = historyImportInput.files;
+    historyImportInput.value = "";
+    if (file) importHistory(file).catch((err) => console.error(err));
   });
 
   // ---------------------------------------------------------------- models
