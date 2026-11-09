@@ -50,10 +50,11 @@ use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 
 use super::transformer::{
-    StageClock, Stages, TIMESTEP_FREQUENCIES, TransformerConfig, concat_rows, gated_add,
-    head_rms_norm, layer_norm_into, modulate_inplace, silu_inplace, step_attention,
-    timestep_embedding,
+    StageClock, Stages, TIMESTEP_FREQUENCIES, TransformerConfig, concat_rows,
+    device_head_attention, gated_add, head_rms_norm, layer_norm_into, modulate_inplace,
+    silu_inplace, step_attention, step_attention_heads, timestep_embedding,
 };
+use std::time::{Duration, Instant};
 
 /// The rotary base, diffusers' `rope_theta`.
 const ROPE_THETA: f64 = 2000.0;
@@ -119,6 +120,19 @@ pub struct Flux2Transformer {
     single: Vec<SingleBlock>,
     stages: Mutex<Stages>,
     modulation: Mutex<Option<Modulation>>,
+    /// How many heads (the last ones) each block's attention runs on the
+    /// card, beside the host's.
+    head_split: Mutex<HeadSplit>,
+    /// The device heads' gathered keys and values, one a pass in flight.
+    head_caches: Mutex<Vec<Option<crate::engine::kv_cache::KvCache>>>,
+}
+
+/// One pass's attention time by side: the host's heads and the card's,
+/// which run at the same time.
+#[derive(Default)]
+struct HeadTimes {
+    host: Duration,
+    card: Duration,
 }
 
 /// What one forward pass is given.
@@ -227,6 +241,8 @@ impl Flux2Transformer {
             single,
             stages: Mutex::new(Stages::default()),
             modulation: Mutex::new(None),
+            head_split: Mutex::new(HeadSplit { heads: None }),
+            head_caches: Mutex::new(Vec::new()),
         };
         model.check_shapes()?;
         Ok(model)
@@ -277,6 +293,122 @@ impl Flux2Transformer {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
+    }
+
+    /// Whether the linears run on a device — what lets a guided step's two
+    /// passes overlap, one pass's host attention beside the other's device
+    /// calls.
+    pub fn on_device(&self) -> bool {
+        !self.backend.is_cpu()
+    }
+
+    /// Drops the device heads' key and value copies and the card's
+    /// attention buffers — before the VAE takes the card.
+    pub fn release_pass_scratch(&self) {
+        self.head_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let devices = self.double.iter().map(|b| b.img_qkv.device());
+        let devices = devices.chain(self.single.iter().map(|b| b.linear1.device()));
+        let mut seen = Vec::new();
+        for device in devices {
+            if !seen.contains(&device) {
+                seen.push(device);
+                if let Some(vulkan) = self.backend.as_wgpu_on(device) {
+                    vulkan.release_prefill_attention_scratch();
+                }
+            }
+        }
+    }
+
+    /// How many heads the card takes this pass: `ORANGU_FLUX2_DEVICE_HEADS`
+    /// when a count, else [`HeadSplit`]'s.
+    fn device_heads(&self) -> usize {
+        let n_head = self.config.n_head;
+        fixed_device_heads()
+            .unwrap_or_else(|| {
+                self.head_split
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .heads(n_head)
+            })
+            .min(n_head)
+    }
+
+    /// The joint attention of a block whose linears live where `w` does:
+    /// the last `heads` heads on that device's card (when it is one) while
+    /// the host computes the others, each side's time added to `times`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention(
+        &self,
+        w: &QuantMatrix,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        n: usize,
+        heads: usize,
+        scale: f32,
+        times: &mut HeadTimes,
+    ) -> Vec<f32> {
+        let c = &self.config;
+        let vulkan = if heads > 0 {
+            self.backend.as_wgpu_on(w.device())
+        } else {
+            None
+        };
+        let Some(vulkan) = vulkan else {
+            return step_attention(q, n, k, v, n, c.n_head, c.head_dim, scale, None);
+        };
+        let split = c.n_head - heads;
+        let mut cache = self
+            .head_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop()
+            .flatten();
+        let held = &mut cache;
+        let (mut out, card_out, host, card) = std::thread::scope(|scope| {
+            // On the lane's own threads: the gather and the upload's
+            // conversion queued on the global pool would wait behind the
+            // host's heads.
+            let lane = scope.spawn(move || {
+                super::transformer21::lane_pool().install(|| {
+                    let ran = Instant::now();
+                    let out = device_head_attention(
+                        vulkan,
+                        held,
+                        q,
+                        k,
+                        v,
+                        (n, n),
+                        (c.dim, c.head_dim),
+                        split..c.n_head,
+                        scale,
+                    );
+                    (out, ran.elapsed())
+                })
+            });
+            let ran = Instant::now();
+            let out = step_attention_heads(q, n, k, v, n, c.n_head, c.head_dim, scale, 0..split);
+            let host = ran.elapsed();
+            let (card_out, card) = lane
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            (out, card_out, host, card)
+        });
+        self.head_caches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(cache);
+        let (column, width) = (split * c.head_dim, heads * c.head_dim);
+        out.par_chunks_mut(c.dim)
+            .zip(card_out.par_chunks(width))
+            .with_min_len(64)
+            .for_each(|(row, dev)| row[column..column + width].copy_from_slice(dev));
+        times.host += host;
+        times.card += card;
+        out
     }
 
     fn linear(&self, x: &[f32], n: usize, w: &QuantMatrix) -> Vec<f32> {
@@ -348,6 +480,8 @@ impl Flux2Transformer {
         let rope = rope_table(c.head_dim, (rows, cols), n_txt);
         let scale = 1.0 / (c.head_dim as f32).sqrt();
         let mut normed = Vec::new();
+        let heads = self.device_heads();
+        let mut times = HeadTimes::default();
         clock.lap(|s| &mut s.other);
 
         for block in &self.double {
@@ -376,7 +510,7 @@ impl Flux2Transformer {
             drop((iq, ik, iv, tq, tk, tv));
             apply_rope(&mut q, d, c.head_dim, &rope);
             apply_rope(&mut k, d, c.head_dim, &rope);
-            let attn = step_attention(&q, n, &k, &v, n, c.n_head, c.head_dim, scale, None);
+            let attn = self.attention(&block.img_qkv, &q, &k, &v, n, heads, scale, &mut times);
             drop((q, k, v));
             clock.lap(|s| &mut s.attention);
             let txt_attn = self.linear(&attn[..n_txt * d], n_txt, &block.txt_proj);
@@ -420,7 +554,7 @@ impl Flux2Transformer {
             head_rms_norm(&mut k, &block.k_norm, c.head_dim, EPS);
             apply_rope(&mut q, d, c.head_dim, &rope);
             apply_rope(&mut k, d, c.head_dim, &rope);
-            let attn = step_attention(&q, n, &k, &v, n, c.n_head, c.head_dim, scale, None);
+            let attn = self.attention(&block.linear1, &q, &k, &v, n, heads, scale, &mut times);
             drop((q, k, v));
             clock.lap(|s| &mut s.attention);
             // `[attention | silu(a) * b]` for `linear2`.
@@ -453,6 +587,23 @@ impl Flux2Transformer {
             .modulation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(modulation);
+        if fixed_device_heads().is_none() && times.card > Duration::ZERO {
+            let mut split = self
+                .head_split
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            split.observe(heads, c.n_head, &times);
+            if crate::engine::env::flag_on("ORANGU_IMAGE_HEADS_TRACE") {
+                eprintln!(
+                    "orangu-server: [image] pass with {heads} of {} heads on the device: host \
+                     {:.2}s, card {:.2}s, next pass {}",
+                    c.n_head,
+                    times.host.as_secs_f64(),
+                    times.card.as_secs_f64(),
+                    split.heads(c.n_head)
+                );
+            }
+        }
         self.stages
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -463,6 +614,46 @@ impl Flux2Transformer {
 
 /// `q`, `k` and `v` out of rows of `stride` values whose first `3 * dim`
 /// are `q | k | v` — a fused `qkv` projection, or `linear1`'s leading part.
+/// `ORANGU_FLUX2_DEVICE_HEADS`, read once: a fixed count of heads for the
+/// card (`0` keeps attention on the host), or `None` — unset or `auto` —
+/// for [`HeadSplit`] to balance.
+fn fixed_device_heads() -> Option<usize> {
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("ORANGU_FLUX2_DEVICE_HEADS") {
+        Ok(v) if v.trim().eq_ignore_ascii_case("auto") => None,
+        Ok(v) => Some(v.trim().parse().unwrap_or(0)),
+        Err(_) => None,
+    })
+}
+
+/// Splits a block's heads between the host and the card so both sides of
+/// the attention end together: from a pass's time per host head `a` and
+/// per card head `c`, the next pass gives the card `n · a / (a + c)` heads
+/// — at least one, so the card's time stays measured, and at least one
+/// left to the host. The first pass gives it a quarter.
+struct HeadSplit {
+    heads: Option<usize>,
+}
+
+impl HeadSplit {
+    fn heads(&self, n_head: usize) -> usize {
+        self.heads.unwrap_or(n_head / 4)
+    }
+
+    fn observe(&mut self, used: usize, n_head: usize, times: &HeadTimes) {
+        if used == 0 || used >= n_head {
+            return;
+        }
+        let a = times.host.as_secs_f64() / (n_head - used) as f64;
+        let c = times.card.as_secs_f64() / used as f64;
+        if a <= 0.0 || c <= 0.0 {
+            return;
+        }
+        let target = n_head as f64 * a / (a + c);
+        self.heads = Some((target.round() as usize).clamp(1, n_head.saturating_sub(1).max(1)));
+    }
+}
+
 fn split_qkv(rows: &[f32], n: usize, dim: usize, stride: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     debug_assert_eq!(rows.len(), n * stride);
     let mut q = vec![0.0f32; n * dim];
@@ -574,6 +765,27 @@ mod tests {
         apply_rope(&mut x, 4, 4, &[(a.cos(), a.sin()), (a.cos(), a.sin())]);
         assert!((x[0] - a.cos()).abs() < 1e-6 && (x[1] - a.sin()).abs() < 1e-6);
         assert!((x[2] + a.sin()).abs() < 1e-6 && (x[3] - a.cos()).abs() < 1e-6);
+    }
+
+    #[test]
+    fn head_split_ends_both_sides_together() {
+        let mut split = HeadSplit { heads: None };
+        assert_eq!(split.heads(24), 6);
+        // 18 host heads in 9 s (0.5 s each), 6 card heads in 1.5 s (0.25 s
+        // each): the card takes two thirds.
+        let times = HeadTimes {
+            host: Duration::from_secs(9),
+            card: Duration::from_millis(1500),
+        };
+        split.observe(6, 24, &times);
+        assert_eq!(split.heads(24), 16);
+        // A slow card still keeps one head.
+        let slow = HeadTimes {
+            host: Duration::from_millis(10),
+            card: Duration::from_secs(100),
+        };
+        split.observe(16, 24, &slow);
+        assert_eq!(split.heads(24), 1);
     }
 
     #[test]

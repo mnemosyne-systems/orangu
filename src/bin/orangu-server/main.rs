@@ -1659,12 +1659,16 @@ fn prepare(args: Args) -> Result<Prepared> {
     // A picture model's transformer runs every step and its text encoder
     // once a picture, so where both want the selected device the
     // transformer is served first: the encoder is split as though the
-    // transformer's weights were already on it, and plans against the
-    // rest. `None` when the pictures run on the CPU (no device in hand).
+    // transformer's weights and its working regions were already on it,
+    // and plans against the rest. `None` when the pictures run on the CPU
+    // (no device in hand).
     let transformer_reserve_bytes: Option<u64> = transformer_opened
         .as_ref()
         .filter(|_| backend.as_wgpu().is_some())
-        .map(|t| engine::backend::device_resident_split(t.resident_tensor_sizes()).0);
+        .map(|t| {
+            engine::backend::device_resident_split(t.resident_tensor_sizes()).0
+                + engine::image::transformer21::STREAM_MARGIN_BYTES
+        });
     // With no context asked for, the least a model has to leave room for. A
     // model that fills the card would otherwise load, and refuse every prompt.
     let usable_context_kv = backend.as_wgpu().map(|wgpu| {
@@ -2369,6 +2373,13 @@ fn prepare(args: Args) -> Result<Prepared> {
                 &transformer,
                 companions.clone(),
                 model.clone(),
+                engine::image::EncoderPlacement {
+                    backend: backend.clone(),
+                    layer_devices: split
+                        .as_ref()
+                        .map(|s| s.plan.layer_device.clone())
+                        .unwrap_or_default(),
+                },
                 tokenizer.clone(),
                 image_backend,
                 image_defaults.clone(),

@@ -265,6 +265,14 @@ blank negative prompt is the empty one FLUX.2 is guided against. Every
 prompt is read as 512 tokens — padded or cut — so a long prompt costs no
 more than a short one, and words past the 512th are not read.
 
+With the transformer on a graphics card, a guided step's two passes run
+side by side (`ORANGU_IMAGE_PASS_OVERLAP=0` runs them one after the other),
+and each block's attention is split by heads: the card takes a share
+while the CPU computes the rest, the share measured each pass so both
+sides finish together. `ORANGU_FLUX2_DEVICE_HEADS` fixes the card's
+count instead (`0` keeps attention on the CPU); `ORANGU_IMAGE_HEADS_TRACE=1`
+prints each pass's split.
+
 [klein] does not draw transparency, and an attached picture is a
 starting point rather than an edit (see **Strength** below). There is no
 adapter for it: `image_lora` stays `auto` (nothing) or `none`.

@@ -328,6 +328,30 @@ pub const TEXT_ENCODER_DEFAULT_TAG: &str = orangu::model_download::QWEN_IMAGE_TE
 pub const VAE_REPO: &str = orangu::model_download::QWEN_IMAGE_VAE_REPO;
 pub const VAE_FILE: &str = orangu::model_download::QWEN_IMAGE_VAE_FILE;
 
+/// Where the server put the text encoder's layers: its backend and the split
+/// plan's device per layer (empty when it is not split). A pipeline that
+/// opens the encoder's file a second time — FLUX.2 [klein]'s masked encoder,
+/// Qwen-Image 2.1's vision path — places that copy the same way. Unplaced,
+/// every layer would go to the first device and push the transformer, which
+/// runs every step, out of the card's memory.
+#[derive(Clone)]
+pub struct EncoderPlacement {
+    pub backend: Arc<dyn Backend>,
+    pub layer_devices: Vec<usize>,
+}
+
+impl EncoderPlacement {
+    /// Maps the encoder's file with this placement's layer plan, ready for
+    /// a model to be built from it on [`Self::backend`].
+    fn open(&self, path: &Path) -> Result<LoadedModel> {
+        let mut weights = LoadedModel::open(path)?;
+        if !self.layer_devices.is_empty() {
+            weights.set_layer_devices(self.layer_devices.clone());
+        }
+        Ok(weights)
+    }
+}
+
 /// The two files a picture model cannot generate without — and, for
 /// Qwen-Image 2.1, the one that lets it edit a picture.
 #[derive(Debug, Clone)]
@@ -1108,6 +1132,7 @@ impl Pipeline {
         transformer: &LoadedModel,
         companions: Companions,
         encoder: Arc<dyn ModelForward>,
+        encoder_placement: EncoderPlacement,
         tokenizer: Arc<Tokenizer>,
         backend: Arc<dyn Backend>,
         defaults: ImageDefaults,
@@ -1174,9 +1199,10 @@ impl Pipeline {
                     ""
                 }
             );
-            let weights =
-                LoadedModel::open(&companions.text_encoder).context("mapping the text encoder")?;
-            let text = qwen3vl::TextModel::load(&weights, backend.clone())?;
+            let weights = encoder_placement
+                .open(&companions.text_encoder)
+                .context("mapping the text encoder")?;
+            let text = qwen3vl::TextModel::load(&weights, encoder_placement.backend.clone())?;
             ensure!(
                 FLUX2_TEXT_LAYERS
                     .iter()
@@ -1228,9 +1254,10 @@ impl Pipeline {
                          text encoder",
                         tower.out_width
                     );
-                    let weights = LoadedModel::open(&companions.text_encoder)
+                    let weights = encoder_placement
+                        .open(&companions.text_encoder)
                         .context("mapping the text encoder for the vision path")?;
-                    let text = qwen3vl::TextModel::load(&weights, backend)?;
+                    let text = qwen3vl::TextModel::load(&weights, encoder_placement.backend)?;
                     Some(Vision { tower, text })
                 }
                 None => None,
@@ -1743,6 +1770,19 @@ impl Pipeline {
         }
     }
 
+    /// Whether a guided step runs its two passes side by side: FLUX.2
+    /// [klein] with its linears on a device, where one pass's host attention
+    /// and element-wise work fill the time the other waits on the device.
+    /// The others keep one pass at a time (Qwen-Image 2.1 overlaps inside
+    /// its pass already). `ORANGU_IMAGE_PASS_OVERLAP=0` turns it off.
+    fn passes_overlap(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            crate::engine::env::flag_on_unless_disabled("ORANGU_IMAGE_PASS_OVERLAP")
+        });
+        on && matches!(&self.model, Model::Flux2Klein { transformer, .. } if transformer.on_device())
+    }
+
     /// Classifier-free guidance of `positive` by `negative`: Qwen-Image's
     /// with its norm rescale ([`guide`]), the others' plain.
     fn guide(&self, positive: &mut [f32], negative: &[f32], scale: f32, token_width: usize) {
@@ -1850,6 +1890,9 @@ impl Pipeline {
                 vae.decode_unless(&Feature::new(h16, w16, vae21::Z_DIM, z), Some(cancel))
             }
             Model::Flux2Klein { vae, .. } | Model::MossImage { vae, .. } => {
+                if let Model::Flux2Klein { transformer, .. } = &self.model {
+                    transformer.release_pass_scratch();
+                }
                 let (h8, w8) = (
                     height / vae_flux2::SPATIAL_COMPRESSION,
                     width / vae_flux2::SPATIAL_COMPRESSION,
@@ -2020,12 +2063,34 @@ impl Pipeline {
             let velocity = match reused {
                 Some(velocity) => velocity,
                 None => {
-                    let mut velocity =
-                        self.velocity(&latents, grid, &positive, sigma, false, cancel)?;
-                    if let Some(negative) = &negative {
-                        let unguided =
-                            self.velocity(&latents, grid, negative, sigma, true, cancel)?;
-                        self.guide(&mut velocity, &unguided, request.cfg_scale, token_width);
+                    let (velocity, unguided) = match &negative {
+                        Some(negative) if self.passes_overlap() => std::thread::scope(|scope| {
+                            let unguided = scope.spawn(|| {
+                                self.velocity(&latents, grid, negative, sigma, true, cancel)
+                            });
+                            let velocity =
+                                self.velocity(&latents, grid, &positive, sigma, false, cancel);
+                            let unguided = unguided
+                                .join()
+                                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                            (velocity, Some(unguided))
+                        }),
+                        Some(negative) => {
+                            let velocity =
+                                self.velocity(&latents, grid, &positive, sigma, false, cancel);
+                            let unguided = velocity.is_ok().then(|| {
+                                self.velocity(&latents, grid, negative, sigma, true, cancel)
+                            });
+                            (velocity, unguided)
+                        }
+                        None => (
+                            self.velocity(&latents, grid, &positive, sigma, false, cancel),
+                            None,
+                        ),
+                    };
+                    let mut velocity = velocity?;
+                    if let Some(unguided) = unguided {
+                        self.guide(&mut velocity, &unguided?, request.cfg_scale, token_width);
                     }
                     if let Some(cache) = cache.as_mut() {
                         cache.record(done, &latents, &velocity);
@@ -2557,6 +2622,10 @@ mod tests {
             &transformer,
             companions,
             encoder,
+            EncoderPlacement {
+                backend: backend.clone(),
+                layer_devices: Vec::new(),
+            },
             tokenizer,
             backend,
             ImageDefaults::default(),

@@ -55,8 +55,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::transformer::{
-    StageClock, Stages, TIMESTEP_FREQUENCIES, TransformerConfig, head_rms_norm, layer_norm_into,
-    silu_inplace, step_attention, step_attention_heads, timestep_embedding,
+    StageClock, Stages, TIMESTEP_FREQUENCIES, TransformerConfig, device_head_attention,
+    head_rms_norm, layer_norm_into, silu_inplace, step_attention, step_attention_heads,
+    timestep_embedding,
 };
 
 /// The feed-forward's two input projections: ComfyUI's checkpoints fuse
@@ -659,68 +660,25 @@ impl QwenImage21Transformer {
         heads: std::ops::Range<usize>,
         scale: f32,
     ) -> Vec<f32> {
-        let c = &self.config;
         let vulkan = self
             .backend
             .as_wgpu_on(block.to_q.device())
             .expect("device_heads saw the card");
-        let (first, width) = (heads.start * c.head_dim, heads.len() * c.head_dim);
-        // `ORANGU_IMAGE_HEADS_TRACE=1`: a line a block — the gather of the
-        // queries' columns, the cache fill (straight from the keys' and
-        // values' columns), the device's call.
-        let trace = crate::engine::env::flag_on("ORANGU_IMAGE_HEADS_TRACE").then(Instant::now);
-        let mut q_sub = vec![0.0f32; n_q * width];
-        q_sub
-            .par_chunks_mut(width)
-            .zip(q.par_chunks(c.dim))
-            .with_min_len(64)
-            .for_each(|(sub, row)| sub.copy_from_slice(&row[first..first + width]));
-        let gathered = trace.map(|t| t.elapsed());
         let mut held = self
             .head_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let cache = match held.as_mut() {
-            Some(cache)
-                if cache.layers[0].capacity() > n_kv && cache.layers[0].kv_dim() == width =>
-            {
-                cache.layers[0].truncate(0);
-                cache
-            }
-            _ => held.insert(crate::engine::kv_cache::KvCache::new(1, n_kv + 1, width)),
-        };
-        for (k, v) in keys.chunks(c.dim).zip(values.chunks(c.dim)) {
-            cache.layers[0].push(&k[first..first + width], &v[first..first + width]);
-        }
-        let filled = trace.map(|t| t.elapsed());
-        if trace.is_some() {
-            vulkan.sync_kv_mirror(&mut cache.layers[0], heads.len());
-        }
-        let synced = trace.map(|t| t.elapsed());
-        let out = vulkan.gpu_attention_prefill(
-            &q_sub,
-            &mut cache.layers[0],
-            n_kv - n_q,
-            n_q,
-            heads.len(),
-            heads.len(),
-            c.head_dim,
-            0,
-            false,
+        device_head_attention(
+            vulkan,
+            &mut held,
+            q,
+            keys,
+            values,
+            (n_q, n_kv),
+            (self.config.dim, self.config.head_dim),
+            heads,
             scale,
-        );
-        if let (Some(t), Some(g), Some(f), Some(y)) = (trace, gathered, filled, synced) {
-            eprintln!(
-                "orangu-server: [image] {} heads on the device: gather {:.1} ms, cache {:.1} ms, \
-                 kv upload {:.1} ms, device {:.1} ms",
-                heads.len(),
-                g.as_secs_f64() * 1e3,
-                (f - g).as_secs_f64() * 1e3,
-                (y - f).as_secs_f64() * 1e3,
-                (t.elapsed() - y).as_secs_f64() * 1e3
-            );
-        }
-        out
+        )
     }
 
     /// [`Self::mlp`] on the card that holds the block, as one submission
@@ -1155,9 +1113,10 @@ fn tapered_chunks(n: usize) -> Vec<usize> {
 /// a chunk cost more than the overlap saves.
 const OVERLAP_MIN_CHUNK: usize = 1024;
 
-/// What a streamed transformer leaves free on its card beyond the region:
-/// the activations, the calls' input and output regions, their scratch.
-const STREAM_MARGIN_BYTES: u64 = 512 << 20;
+/// What a transformer leaves free on its card beyond its weights (and,
+/// streamed, beyond the region): the activations, the calls' input and
+/// output regions, their scratch.
+pub const STREAM_MARGIN_BYTES: u64 = 512 << 20;
 
 /// The tensors a block's device calls read: q, k, v, the output
 /// projection, the feed-forward's gate and up (row views of a fused
@@ -1246,7 +1205,7 @@ struct Gates<'a> {
 /// The threads the device lane's host work runs on (the residual adds, the
 /// norm, the MLP's activation, the device calls' staging and copies) while
 /// the attention holds the global pool: a quarter of it, at most four.
-fn lane_pool() -> &'static rayon::ThreadPool {
+pub(super) fn lane_pool() -> &'static rayon::ThreadPool {
     static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         rayon::ThreadPoolBuilder::new()

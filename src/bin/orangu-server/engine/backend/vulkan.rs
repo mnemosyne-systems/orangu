@@ -20289,6 +20289,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         self.prefill_fused_attn
     }
 
+    /// Frees [`Self::gpu_attention_prefill`]'s held query and output buffers
+    /// — for a caller handing the card to other work, which the next call
+    /// regrows them after.
+    pub fn release_prefill_attention_scratch(&self) {
+        *self
+            .prefill_attn_scratch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
     /// Brings home the rows only `cache`'s device mirrors hold — see
     /// [`crate::engine::kv_cache::LayerCache::fetch_device_rows`].
     pub fn fetch_kv_rows(&self, cache: &mut crate::engine::kv_cache::KvCache) -> bool {

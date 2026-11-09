@@ -920,6 +920,77 @@ pub(crate) fn step_attention_heads(
     )
 }
 
+/// The non-causal attention of the heads `heads` on `vulkan`
+/// (`VulkanBackend::gpu_attention_prefill`): their columns of the queries,
+/// keys and values gathered, `[n_q][heads · head_dim]` back. The queries are
+/// the last `n_q` of the `n_kv` keys. `cache` holds the gathered keys and
+/// values (and their device mirror) from one call to the next and is
+/// rebuilt when too short or of another width.
+///
+/// `ORANGU_IMAGE_HEADS_TRACE=1`: a line a call — the gather of the queries'
+/// columns, the cache fill, the mirror's upload, the device's call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn device_head_attention(
+    vulkan: &crate::engine::backend::VulkanBackend,
+    cache: &mut Option<crate::engine::kv_cache::KvCache>,
+    q: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    (n_q, n_kv): (usize, usize),
+    (dim, head_dim): (usize, usize),
+    heads: std::ops::Range<usize>,
+    scale: f32,
+) -> Vec<f32> {
+    let (first, width) = (heads.start * head_dim, heads.len() * head_dim);
+    let trace = crate::engine::env::flag_on("ORANGU_IMAGE_HEADS_TRACE").then(Instant::now);
+    let mut q_sub = vec![0.0f32; n_q * width];
+    q_sub
+        .par_chunks_mut(width)
+        .zip(q.par_chunks(dim))
+        .with_min_len(64)
+        .for_each(|(sub, row)| sub.copy_from_slice(&row[first..first + width]));
+    let gathered = trace.map(|t| t.elapsed());
+    let cache = match cache {
+        Some(held) if held.layers[0].capacity() > n_kv && held.layers[0].kv_dim() == width => {
+            held.layers[0].truncate(0);
+            held
+        }
+        _ => cache.insert(crate::engine::kv_cache::KvCache::new(1, n_kv + 1, width)),
+    };
+    for (k, v) in keys.chunks(dim).zip(values.chunks(dim)) {
+        cache.layers[0].push(&k[first..first + width], &v[first..first + width]);
+    }
+    let filled = trace.map(|t| t.elapsed());
+    if trace.is_some() {
+        vulkan.sync_kv_mirror(&mut cache.layers[0], heads.len());
+    }
+    let synced = trace.map(|t| t.elapsed());
+    let out = vulkan.gpu_attention_prefill(
+        &q_sub,
+        &mut cache.layers[0],
+        n_kv - n_q,
+        n_q,
+        heads.len(),
+        heads.len(),
+        head_dim,
+        0,
+        false,
+        scale,
+    );
+    if let (Some(t), Some(g), Some(f), Some(y)) = (trace, gathered, filled, synced) {
+        eprintln!(
+            "orangu-server: [image] {} heads on the device: gather {:.1} ms, cache {:.1} ms, \
+             kv upload {:.1} ms, device {:.1} ms",
+            heads.len(),
+            g.as_secs_f64() * 1e3,
+            (f - g).as_secs_f64() * 1e3,
+            (y - f).as_secs_f64() * 1e3,
+            (t.elapsed() - y).as_secs_f64() * 1e3
+        );
+    }
+    out
+}
+
 /// [`attention`] for a denoising step's picture tokens, where attention is
 /// the part of a pass that grows with the square of the picture (39% of a
 /// Qwen-Image 2.1 step at 1024 x 1024, against 14% at 512): the scores
