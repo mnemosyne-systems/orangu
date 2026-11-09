@@ -185,6 +185,12 @@ struct Args {
     /// console and exit.
     #[arg(short = 'p', long = "prompt")]
     prompt: Option<String>,
+    /// Chat in plain lines, without the full-screen interface.
+    #[arg(
+        long = "plain",
+        conflicts_with_all = ["prompt", "list", "init", "shell_completions", "workflow", "dry_run", "all", "resume"]
+    )]
+    plain: bool,
     /// Run the conversation as the custom agent NAME: its prompt joins the
     /// system prompt and its `tools` limit the tools.
     #[arg(long = "agent", value_name = "NAME")]
@@ -518,6 +524,16 @@ async fn run() -> Result<()> {
         )
         .await;
     }
+    if args.plain {
+        return oneshot::run_plain(oneshot::OneshotContext {
+            workspace: resolve_workspace_root(args.workspace)?,
+            config,
+            config_path,
+            role: None,
+            quiet: false,
+        })
+        .await;
+    }
     // Only from here on is there an interface to name: the modes above print to
     // stdout and exit, and a terminal-title escape sequence in that output is
     // something a script or a pipe has to strip.
@@ -527,7 +543,20 @@ async fn run() -> Result<()> {
     // `/committer` and `/developer` do, and only the interface reads it.
     mode::set(startup_mode);
     let cli_theme_override = args.theme.clone();
-    let requested_theme = cli_theme_override.as_deref().unwrap_or(&config.theme);
+    // NO_COLOR wins over the configured and session themes; `-t` wins
+    // over NO_COLOR.
+    let no_color = cli_theme_override.is_none() && orangu::tui::theme::no_color_requested();
+    orangu::tui::theme::set_no_color(no_color);
+    // The terminal backend leaves colour out under NO_COLOR by itself; a
+    // theme named on the command line brings it back.
+    if cli_theme_override.is_some() {
+        crossterm::style::force_color_output(true);
+    }
+    let requested_theme = if no_color {
+        "monochrome"
+    } else {
+        cli_theme_override.as_deref().unwrap_or(&config.theme)
+    };
     if let Some(cli_theme) = cli_theme_override.as_deref() {
         orangu::tui::theme::Theme::apply_cli_override(cli_theme)
             .with_context(|| format!("failed to apply --theme {}", cli_theme))?;
@@ -770,7 +799,7 @@ async fn run() -> Result<()> {
     active_model_id = initial_active_model_id;
     current_endpoint = initial_current_endpoint;
     let apply_session_theme = |session_theme_override: &Option<String>| {
-        if cli_theme_override.is_some() {
+        if cli_theme_override.is_some() || orangu::tui::theme::no_color() {
             return;
         }
         let theme_name = session_theme_override.as_deref().unwrap_or(&config.theme);

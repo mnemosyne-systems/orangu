@@ -1,0 +1,18 @@
+# No colour at all: the terminal's own foreground and background, with bold,
+# underlined and reversed text where the other themes use colour. orangu
+# picks it when the NO_COLOR environment variable is set.
+chrome = classic
+success = bold
+error = bold underlined
+ignore = italic
+deep = bold italic
+muted = fg:default
+cursor_line_bg = reversed
+selected_file = reversed bold
+comment_bg = underlined
+code_block_bg = bg:default
+highlight = bold
+warning = bold
+user_input = bold
+bg_base = default
+text_primary = default

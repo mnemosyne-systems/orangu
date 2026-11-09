@@ -24,6 +24,7 @@ The sync runs in the background so it never delays startup. Its progress and res
 |       | `--committer` | Open the prompt in committer mode, on the merge flow — what `/committer` does. The two are mutually exclusive. |
 | `-t`  | `--theme`     | Apply a theme to the terminal interface for this run. Built-in names and paths to `.theme` files are accepted. |
 | `-p`  | `--prompt`    | Run a single prompt or command and exit — no terminal UI and no session on disk. See One-shot mode below. |
+|       | `--plain`     | Chat in plain lines, one prompt after another, without the full-screen interface. See Accessibility below. |
 |       | `--agent NAME` | Run the conversation as the custom agent NAME: its prompt joins the system prompt and its `tools` limit the tools. See Custom agents in the Tools chapter. |
 |       | `--agents JSON` | Define custom agents for this run, as JSON. See Custom agents in the Tools chapter. |
 |       | `--workflow FILE` | Validate and execute every job in a YAML workflow. |
@@ -32,6 +33,31 @@ The sync runs in the background so it never delays startup. Its progress and res
 | `-l`  | `--list`      | List all stored sessions as a `SESSION WORKSPACE BRANCH DATE` table and exit. |
 | `-i`  | `--init`      | Interactively create `~/.orangu/orangu.conf` and exit (see the Configuration chapter). |
 | `-s`  | `--shell-completions` | Print the shell completion script for the detected shell (`$SHELL`; bash, zsh, or fish) and exit. |
+
+### Accessibility
+
+- **`NO_COLOR`.** When the `NO_COLOR` environment variable is set to anything
+  but an empty string, orangu writes no colour: it uses the `monochrome` theme,
+  which marks with bold, underlined and reversed text what other themes mark
+  with colour, over the configured and session themes. A theme named with `-t`
+  overrides `NO_COLOR` and brings colour back
+- **Status without colour.** Every status mark has its own shape as well as its
+  colour: in the header and the status line `●` is up, `✗` is down and `○` is
+  still being checked; a workspace tab whose branch is gone shows `✗`; an
+  auto-reviewed file that was rejected shows `✗` where an approved one shows `●`
+- **High contrast.** The `high_contrast` theme is white on black, with bright
+  colours, bold marks and nothing dimmed: `-t high_contrast`, `/theme
+  high_contrast`, or `theme = high_contrast` in the configuration
+- **Plain mode.** `orangu --plain` is the conversation as plain lines, for a
+  screen reader or a terminal that redraws poorly. It prints `> `, reads a
+  prompt, streams the answer to stdout and asks again; a line ending in `\`
+  goes on to the next line, and `/quit`, `exit` or `Ctrl+D` leaves. Notes (the
+  server, each tool call, the timings) go to stderr. The conversation is kept
+  for the whole run, the tools are the same as in the full-screen interface,
+  and an MCP call that needs approval asks on the terminal: `y` once, `t` for
+  that tool from then on, `n` to refuse, with any words after it given to the
+  model as the reason. Commands that need the full-screen interface are not
+  available, as in one-shot mode
 
 ### One-shot mode
 

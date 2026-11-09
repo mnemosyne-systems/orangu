@@ -228,11 +228,41 @@ const BUILT_IN_THEMES: &[BuiltInTheme] = &[
         aliases: &["tokyo-night", "tokyo"],
     },
     BuiltInTheme {
+        name: "high_contrast",
+        source: include_str!("../../contrib/themes/high_contrast.theme"),
+        aliases: &["high-contrast", "contrast"],
+    },
+    BuiltInTheme {
+        name: "monochrome",
+        source: include_str!("../../contrib/themes/monochrome.theme"),
+        aliases: &["mono", "no-color", "no_color"],
+    },
+    BuiltInTheme {
         name: "rosepine-moon",
         source: include_str!("../../contrib/themes/rosepine-moon.theme"),
         aliases: &["rosepine", "rose-pine", "rose-pine-moon"],
     },
 ];
+
+/// Set while the `NO_COLOR` convention applies: the terminal backend
+/// writes no colour, and the monochrome theme marks with bold, underlined
+/// and reversed text what colour would have.
+static NO_COLOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the environment asks for no colour: `NO_COLOR` set to anything
+/// but the empty string.
+pub fn no_color_requested() -> bool {
+    std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+}
+
+/// Records whether the `NO_COLOR` convention applies.
+pub fn set_no_color(on: bool) {
+    NO_COLOR.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn no_color() -> bool {
+    NO_COLOR.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 fn theme_state() -> &'static RwLock<ThemeState> {
     static STATE: OnceLock<RwLock<ThemeState>> = OnceLock::new();
@@ -863,6 +893,33 @@ mod tests {
         assert!(matches!(theme.text_primary, Color::Rgb(50, 51, 52)));
         // An omitted `chrome` key keeps the original frame.
         assert_eq!(theme.chrome, Chrome::Classic);
+    }
+
+    #[test]
+    fn the_accessibility_themes_load_and_mark_without_colour() {
+        let (_, contrast) = load_theme_by_name("high_contrast").expect("high_contrast");
+        assert_eq!(contrast.bg_base, Color::Rgb(0, 0, 0));
+        assert!(contrast.success.add_modifier.contains(Modifier::BOLD));
+        let (_, mono) = load_theme_by_name("monochrome").expect("monochrome");
+        assert_eq!(mono.text_primary, Color::Reset);
+        assert!(
+            mono.cursor_line_bg
+                .add_modifier
+                .contains(Modifier::REVERSED)
+        );
+        assert_eq!(mono.cursor_line_bg.bg, None);
+        assert!(load_theme_by_name("no-color").is_ok());
+    }
+
+    #[test]
+    fn status_marks_differ_in_shape() {
+        use crate::tui::header::ConnStatus;
+        let glyphs = [
+            ConnStatus::Pending.glyph(),
+            ConnStatus::Ok.glyph(),
+            ConnStatus::Failed.glyph(),
+        ];
+        assert_eq!(glyphs, ["○", "●", "✗"]);
     }
 
     #[test]

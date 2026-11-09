@@ -68,7 +68,7 @@ _orangu() {
             return 0
             ;;
         -t|--theme)
-            COMPREPLY=( $(compgen -W "classic modern_dark modern_light oranguday tokyonight rosepine-moon random" -- "$cur") $(compgen -f -- "$cur") )
+            COMPREPLY=( $(compgen -W "classic modern_dark modern_light oranguday tokyonight rosepine-moon high_contrast monochrome random" -- "$cur") $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
             ;;
@@ -76,7 +76,7 @@ _orangu() {
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-c --config -t --theme -w --workspace -r --resume -a --all --developer --committer -p --prompt --agent --agents --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help -V --version" -- "$cur") )
+            "-c --config -t --theme -w --workspace -r --resume -a --all --developer --committer -p --prompt --plain --agent --agents --workflow --dry-run -q --quiet -l --list -i --init -s --shell-completions -h --help -V --version" -- "$cur") )
         return 0
     fi
     COMPREPLY=( $(compgen -W "status pause resume clear" -- "$cur") )
@@ -116,7 +116,7 @@ _orangu_workspaces() {
 
 _orangu_themes() {
     local -a themes
-    themes=(classic modern_dark modern_light oranguday tokyonight rosepine-moon random)
+    themes=(classic modern_dark modern_light oranguday tokyonight rosepine-moon high_contrast monochrome random)
     compadd -a themes
     _files -g '*.theme'
 }
@@ -131,6 +131,7 @@ _orangu() {
         '(--developer --committer)--developer[Open the prompt in developer mode (the default)]' \
         '(--developer --committer)--committer[Open the prompt in committer mode]' \
         '(-p --prompt)'{-p,--prompt}'[Run one prompt or command, print the result and exit]:prompt:' \
+        '--plain[Chat in plain lines, without the full-screen interface]' \
         '--agent[Run the conversation as a custom agent]:agent name:' \
         '--agents[Define custom agents for this run, as JSON]:agents JSON:' \
         '--workflow[Validate and execute every job in a YAML workflow]:workflow file:_files' \
@@ -171,7 +172,7 @@ function __orangu_workspaces
 end
 
 complete -c orangu -s c -l config           -r                          -d 'Path to the configuration file (orangu.conf)'
-complete -c orangu -s t -l theme             -r -a 'classic modern_dark modern_light oranguday tokyonight rosepine-moon random' -d 'Override the TUI theme with a name or .theme file'
+complete -c orangu -s t -l theme             -r -a 'classic modern_dark modern_light oranguday tokyonight rosepine-moon high_contrast monochrome random' -d 'Override the TUI theme with a name or .theme file'
 complete -c orangu -s t -l theme             -r -a '(__fish_complete_path)' -d 'Theme file'
 complete -c orangu -s w -l workspace         -x -a '(__orangu_workspaces)' -d 'Workspace root for local tools'
 complete -c orangu -s r -l resume            -x -a '(__orangu_sessions)'   -d 'Resume a session by UUID, or pick one from a list'
@@ -179,6 +180,7 @@ complete -c orangu -s a -l all                                            -d 'Re
 complete -c orangu      -l developer                                      -d 'Open the prompt in developer mode (the default)'
 complete -c orangu      -l committer                                      -d 'Open the prompt in committer mode'
 complete -c orangu -s p -l prompt            -x                           -d 'Run one prompt or command, print the result and exit'
+complete -c orangu      -l plain                                          -d 'Chat in plain lines, without the full-screen interface'
 complete -c orangu      -l agent           -x                           -d 'Run the conversation as a custom agent'
 complete -c orangu      -l agents          -x                           -d 'Define custom agents for this run, as JSON'
 complete -c orangu      -l workflow        -r -a '(__fish_complete_path)' -d 'Validate and execute every job in a YAML workflow'
@@ -221,6 +223,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu' -ScriptBlock {
         @('--developer', 'Open the prompt in developer mode (the default)'),
         @('--committer', 'Open the prompt in committer mode'),
         @('-p', '--prompt', 'Run one prompt or command, print the result and exit'),
+        @('--plain', 'Chat in plain lines, without the full-screen interface'),
         @('--agent', 'Run the conversation as a custom agent'),
         @('--agents', 'Define custom agents for this run, as JSON'),
         @('--workflow', 'Validate and execute every job in a YAML workflow'),
@@ -273,7 +276,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu' -ScriptBlock {
         { $_ -in '-c', '--config', '--workflow' } { return }   # a file: PowerShell's own completion takes over
         { $_ -in '-w', '--workspace' } { return Offer (Workspaces) }
         { $_ -in '-r', '--resume' } { return Offer (Sessions) }
-        { $_ -in '-t', '--theme' } { return Offer @('classic', 'modern_dark', 'modern_light', 'oranguday', 'tokyonight', 'rosepine-moon', 'random') }
+        { $_ -in '-t', '--theme' } { return Offer @('classic', 'modern_dark', 'modern_light', 'oranguday', 'tokyonight', 'rosepine-moon', 'high_contrast', 'monochrome', 'random') }
         { $_ -in '-p', '--prompt' } { return }
         { $_ -in '--agent', '--agents' } { return }
     }

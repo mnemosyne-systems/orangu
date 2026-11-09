@@ -125,7 +125,7 @@ theme = classic
 | `quotes` | No | Quote set shown while the model is thinking. Defaults to `none`. Options: `none`, `star_trek`, `star_wars`, `marco_pierre_white`, `gordon_ramsay`, `calvin_and_hobbes`, `sun_tzu_mandarin`, `sun_tzu_english`, `attila_the_hun`, `all` |
 | `width` | No | Virtual terminal width in characters. Controls the layout canvas for `/show_file` output. Defaults to `512` |
 | `banner` | No | Horizontal placement of the banner. Defaults to `left`. Options: `left`, `center`, `right` |
-| `theme` | No | Global default UI theme. Defaults to `classic`. Built-ins are `classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, and `rosepine-moon`; `random` draws one of the available themes at each launch. User themes are loaded from `~/.orangu/themes/*.theme` |
+| `theme` | No | Global default UI theme. Defaults to `classic`. Built-ins are `classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, `rosepine-moon`, `high_contrast` and `monochrome`; `random` draws one of the available themes at each launch. User themes are loaded from `~/.orangu/themes/*.theme` |
 | `drop_down` | No | Enable the autocomplete dropdown for slash commands. Defaults to `on`. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `word_wrap` | No | Wrap long lines in the main TUI, `/show_file`, `/review`, and `/auto_review` windows. Defaults to `off`; set it to `on` to wrap at the visible width. Options: `on`, `true`, `1`, `off`, `false`, `0` |
 | `mouse` | No | Enable mouse capture in the terminal. When `true` (the default), the TUI handles the mouse itself: the wheel scrolls, a drag selects text and copies it to the clipboard on release, and a double-click copies the word under the pointer or folds a collapsible section. Hold **Shift** while clicking/dragging to use the terminal's own selection instead. Set to `false` to disable all mouse handling and leave the mouse to the terminal. See the Terminal chapter |
@@ -228,8 +228,10 @@ theme = classic
 ```
 
 Built-in themes are shipped inside the binary: `classic`, `modern_dark`,
-`modern_light`, `oranguday`, `tokyonight`, and `rosepine-moon`. `modern` is
-accepted as a short name for `modern_dark`.
+`modern_light`, `oranguday`, `tokyonight`, `rosepine-moon`, `high_contrast`
+and `monochrome`. `modern` is accepted as a short name for `modern_dark`.
+`monochrome` is what orangu uses when the `NO_COLOR` environment variable is
+set (see **Accessibility** in the Terminal chapter).
 
 `random` is not a palette of its own: it draws one of the available themes —
 the shipped ones plus anything in `~/.orangu/themes` — when it is applied, and

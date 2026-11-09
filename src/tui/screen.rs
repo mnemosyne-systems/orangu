@@ -218,7 +218,7 @@ pub struct PromptFrameArgs<'a> {
 fn tab_dot(status: TabStatus, theme: &crate::tui::Theme) -> ratatui::text::Span<'static> {
     match status {
         TabStatus::Valid => ratatui::text::Span::styled("●", theme.success),
-        TabStatus::BranchGone => ratatui::text::Span::styled("●", theme.error),
+        TabStatus::BranchGone => ratatui::text::Span::styled("✗", theme.error),
         TabStatus::Working => ratatui::text::Span::styled(
             "●",
             ratatui::style::Style::default()

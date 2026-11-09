@@ -428,7 +428,7 @@ select server local-llama
 
 Selects the UI theme for the current session.
 
-Built-in themes are shipped inside the binary: `classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, and `rosepine-moon` (`modern` is a short name for `modern_dark`). The `random` selector draws one of the available themes when applied and holds it for the rest of the run.
+Built-in themes are shipped inside the binary: `classic`, `modern_dark`, `modern_light`, `oranguday`, `tokyonight`, `rosepine-moon`, `high_contrast` (white on black, bright colours, bold marks, nothing dimmed) and `monochrome` (no colour: bold, underlined and reversed text instead) (`modern` is a short name for `modern_dark`). The `random` selector draws one of the available themes when applied and holds it for the rest of the run.
 
 Custom themes can be placed in:
 

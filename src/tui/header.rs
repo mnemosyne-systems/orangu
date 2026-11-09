@@ -57,6 +57,16 @@ pub enum ConnStatus {
 }
 
 impl ConnStatus {
+    /// The status as a shape as well as a colour, so it reads without
+    /// colour: `●` up, `✗` down, `○` still being checked.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Self::Pending => "○",
+            Self::Ok => "●",
+            Self::Failed => "✗",
+        }
+    }
+
     pub fn from_bool(ok: bool) -> Self {
         if ok { Self::Ok } else { Self::Failed }
     }
@@ -273,9 +283,9 @@ On a Mac, Alt is the Option key, and the terminal must send it as Meta; until it
 
 pub(crate) fn indicator(status: ConnStatus) -> String {
     match status {
-        ConnStatus::Pending => format!("{STATUS_WHITE}●{ANSI_RESET}"),
-        ConnStatus::Ok => format!("{STATUS_GREEN}●{ANSI_RESET}"),
-        ConnStatus::Failed => format!("{STATUS_RED}●{ANSI_RESET}"),
+        ConnStatus::Pending => format!("{STATUS_WHITE}{}{ANSI_RESET}", status.glyph()),
+        ConnStatus::Ok => format!("{STATUS_GREEN}{}{ANSI_RESET}", status.glyph()),
+        ConnStatus::Failed => format!("{STATUS_RED}{}{ANSI_RESET}", status.glyph()),
     }
 }
 

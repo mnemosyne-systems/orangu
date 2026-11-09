@@ -1,0 +1,18 @@
+# High contrast: white text on black, with the few colours the interface
+# needs at full strength, and bold or reversed text wherever a colour alone
+# would carry the meaning. Nothing is dimmed.
+chrome = classic
+success = fg:#00ff00 bold
+error = fg:#ff5f5f bold
+ignore = fg:#5fd7ff bold
+deep = fg:#ff87ff bold
+muted = fg:#d0d0d0
+cursor_line_bg = fg:#000000 bg:#ffffff
+selected_file = fg:#000000 bg:#ffff00 bold
+comment_bg = bg:#000000 underlined
+code_block_bg = bg:#000000
+highlight = fg:#ffff00 bold
+warning = fg:#ffff00 bold
+user_input = fg:#ffffff bg:#000000 bold
+bg_base = #000000
+text_primary = #ffffff

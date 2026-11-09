@@ -83,6 +83,9 @@ pub(crate) struct OneshotSession {
     tools: ToolExecutor,
     skills: SkillRegistry,
     session: ChatSession,
+    /// `--plain`: someone is at the keyboard, so an MCP call that needs
+    /// approval asks rather than being refused.
+    ask_approval: bool,
 }
 
 /// What the `-p` text turned out to be.
@@ -147,6 +150,109 @@ impl Console {
 pub(crate) async fn run_prompt(prompt: &str, context: OneshotContext) -> Result<()> {
     let mut session = OneshotSession::new(context).await?;
     session.run(prompt).await
+}
+
+/// `--plain`: the conversation as plain lines, one prompt after another,
+/// with no full-screen interface — for screen readers, and for terminals
+/// that redraw poorly. Each answer streams to stdout as it is written;
+/// notes go to stderr. A line ending in `\` goes on to the next one.
+/// `/quit`, `exit` or end of input leaves.
+pub(crate) async fn run_plain(context: OneshotContext) -> Result<()> {
+    let mut session = OneshotSession::new(context).await?;
+    session.ask_approval = true;
+    eprintln!(
+        "orangu, plain mode. Type a prompt and press Enter; end a line with \\ to go on to \
+         the next. /quit or Ctrl+D leaves."
+    );
+    loop {
+        let Some(input) = read_plain_prompt().await? else {
+            break;
+        };
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+        if matches!(input, "/quit" | "quit" | "exit") {
+            break;
+        }
+        if let Err(err) = session.run(input).await {
+            eprintln!("Error: {err:#}");
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// One prompt from stdin, `> ` first; continuation lines (after a line
+/// ending in `\`) are joined with line breaks. `None` at end of input.
+async fn read_plain_prompt() -> Result<Option<String>> {
+    tokio::task::spawn_blocking(|| -> Result<Option<String>> {
+        let stdin = std::io::stdin();
+        let mut prompt = String::new();
+        let mut marker = "> ";
+        loop {
+            print!("{marker}");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            if stdin.read_line(&mut line)? == 0 {
+                return Ok((!prompt.is_empty()).then_some(prompt));
+            }
+            let line = line.trim_end_matches(['\n', '\r']);
+            match line.strip_suffix('\\') {
+                Some(head) => {
+                    prompt.push_str(head);
+                    prompt.push('\n');
+                    marker = "… ";
+                }
+                None => {
+                    prompt.push_str(line);
+                    return Ok(Some(prompt));
+                }
+            }
+        }
+    })
+    .await?
+}
+
+/// `--plain`'s question before an MCP call that needs approval: the tool,
+/// its server and arguments, then y (once), t (this tool from now on), or
+/// n (no; anything after it is the reason the model is given).
+fn ask_tool_approval(
+    tool_call: &orangu::llm::ToolCall,
+    tools: &ToolExecutor,
+) -> orangu::session::ToolApproval {
+    use orangu::session::ToolApproval;
+    let name = &tool_call.function.name;
+    let server = tools
+        .mcp_route(name)
+        .map(|(server, _)| format!(" on server {server}"))
+        .unwrap_or_default();
+    eprintln!("\nThe model asks to run the MCP tool {name}{server} with:");
+    let arguments = serde_json::to_string_pretty(&tool_call.function.arguments)
+        .unwrap_or_else(|_| format!("{:?}", tool_call.function.arguments));
+    eprintln!("{arguments}");
+    eprint!("Allow it? y = yes, t = always this tool, n [reason] = no: ");
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return ToolApproval::Deny(None);
+    }
+    let answer = answer.trim();
+    match answer.chars().next().map(|c| c.to_ascii_lowercase()) {
+        Some('y') => ToolApproval::Allow,
+        Some('t') => {
+            tools.grant_mcp_tool(name);
+            ToolApproval::Allow
+        }
+        _ => {
+            let reason = answer
+                .strip_prefix(['n', 'N'])
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(str::to_string);
+            ToolApproval::Deny(reason)
+        }
+    }
 }
 
 impl OneshotSession {
@@ -255,6 +361,7 @@ impl OneshotSession {
             tools,
             skills,
             session: ChatSession::new(&system),
+            ask_approval: false,
         })
     }
 
@@ -310,6 +417,8 @@ impl OneshotSession {
             self.config.semantic_budget_tokens,
         )?;
 
+        let ask_approval = self.ask_approval;
+        let tools_for_approval = &self.tools.clone();
         let metrics = Arc::new(Mutex::new(StreamMetrics::default()));
         let collected = Arc::clone(&metrics);
         let started = Instant::now();
@@ -336,7 +445,13 @@ impl OneshotSession {
                 |tool_call| {
                     console.note(&format!("[tool] {}", tool_call.function.name));
                 },
-                |_| orangu::session::ToolApproval::Deny(None),
+                |tool_call| {
+                    if ask_approval {
+                        ask_tool_approval(tool_call, tools_for_approval)
+                    } else {
+                        orangu::session::ToolApproval::Deny(None)
+                    }
+                },
             )
             .await;
 

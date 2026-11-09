@@ -73,9 +73,9 @@ fn header_status_lines(
     theme: &Theme,
 ) -> Vec<(Line<'static>, usize)> {
     let dot = |conn: ConnStatus| match conn {
-        ConnStatus::Pending => Span::styled("●", Style::default().fg(STATUS_PENDING)),
-        ConnStatus::Ok => Span::styled("●", theme.success),
-        ConnStatus::Failed => Span::styled("●", theme.error),
+        ConnStatus::Pending => Span::styled(conn.glyph(), Style::default().fg(STATUS_PENDING)),
+        ConnStatus::Ok => Span::styled(conn.glyph(), theme.success),
+        ConnStatus::Failed => Span::styled(conn.glyph(), theme.error),
     };
     let row = |text: String, conn: Option<ConnStatus>| {
         let width = text.chars().count() + if conn.is_some() { 2 } else { 0 };
@@ -430,7 +430,7 @@ fn status_line(
             if let Some(status) = graph_status {
                 spans.push(Span::raw("Graph: "));
                 spans.push(Span::styled(
-                    "\u{25cf}",
+                    status.glyph(),
                     match status {
                         ConnStatus::Pending => Style::default().fg(STATUS_PENDING),
                         ConnStatus::Ok => theme.success,

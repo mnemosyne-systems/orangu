@@ -47,7 +47,7 @@ fn review_status_span(status: ReviewStatus, theme: &Theme) -> Span<'static> {
     match status {
         ReviewStatus::Unreviewed => Span::raw(" "),
         ReviewStatus::Approved => Span::styled("●", theme.success),
-        ReviewStatus::Rejected => Span::styled("●", theme.error),
+        ReviewStatus::Rejected => Span::styled("✗", theme.error),
     }
 }
 
