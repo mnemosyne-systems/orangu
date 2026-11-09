@@ -2091,7 +2091,8 @@ Model and server metadata — the closest thing the server exposes over HTTP to
 | `model`, `architecture` | which model, and which architecture family reads it |
 | `backend`, `gpu` | the backend and device it runs on, every other device that backend saw, `gpu.footprint` for what this model costs on it, and `gpu.kernels` for which kernel each quantization resolved to. `null` on a backend with no kernel selection to report |
 | `version`, `commit` | which build answered |
-| `n_ctx`, `n_vocab`, `n_embd` | context length, vocabulary size, embedding width |
+| `n_ctx`, `n_vocab`, `n_embd` | the model's trained context length, vocabulary size, embedding width |
+| `default_generation_settings.n_ctx` | the context one request gets here: `n_ctx`, or less when the device has room for fewer tokens. The orangu client's context gauge reads it |
 | `total_slots` | how many concurrent requests, and the range `id_slot` may name |
 | `chat_template` | the template source, or `null` when the model carries none |
 | `workspace` | the root the file-lifecycle endpoints resolve against |

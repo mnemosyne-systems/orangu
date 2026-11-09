@@ -262,6 +262,16 @@ async fn switch_workers(state: &Arc<AppState>, enabled: bool) -> Result<(), Stri
     result
 }
 
+/// The longest conversation a request can carry: the model's trained length,
+/// capped by the device's room for tokens unless a context shift cuts
+/// longer prompts to fit.
+fn served_context(state: &AppState, n_ctx_train: usize) -> usize {
+    match crate::engine::generate::kv_device_token_ceiling() {
+        Some(ceiling) if state.engine.context_shift.is_none() => n_ctx_train.min(ceiling),
+        _ => n_ctx_train,
+    }
+}
+
 fn props_json(state: &AppState) -> serde_json::Value {
     let cfg = state.engine.model.config();
     serde_json::json!({
@@ -327,6 +337,10 @@ fn props_json(state: &AppState) -> serde_json::Value {
         // the profile it was about to start one for.
         "role": state.engine.role.label(),
         "n_ctx": cfg.n_ctx_train,
+        // The context one request gets here, under llama.cpp's name for it:
+        // the model's own length, or less when the device has room for
+        // fewer tokens. A client's context gauge reads it.
+        "default_generation_settings": { "n_ctx": served_context(state, cfg.n_ctx_train) },
         "n_vocab": state.engine.tokenizer.vocab_size(),
         "n_embd": cfg.n_embd,
         "total_slots": state.engine.slots.total(),

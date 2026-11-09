@@ -88,6 +88,7 @@ The prompt area stays at the bottom of the terminal window.
 
 - The input window carries a bare `> ` prompt; the branch is not part of it
 - Below it, the status line shows the current branch on the left, `Graph:` and `Pending:` centered, and the active model flush right
+- In front of the model, the context gauge shows how much of the model's context the conversation fills, for example `ctx 18k/32k` (see **Context gauge** below)
 - Long input wraps upward
 - Submitted input moves directly into the output area
 - The banner and prompt stay fixed while the output window scrolls independently
@@ -216,6 +217,24 @@ The `metadata` file records when the session was created, last used, which works
 ```
 
 `branch` is an empty string for sessions started outside a Git repository or in a detached HEAD state. Timestamps are Unix seconds (UTC).
+
+## Context gauge
+
+After the first answer of a conversation the status line shows how full the
+model's context is, in front of the model name:
+
+```text
+main                         Graph: ●                 ctx 18k/32k   gemma-4-E2B-it
+```
+
+- The first number is what the conversation holds: the tokens the last answer's request read and wrote, as the server counted them. During a turn that uses tools it follows each round
+- The second is the context one request gets on the server, from its `/props`. A server without `/props` gives no limit, and the gauge shows the count alone, for example `ctx 18k`
+- From 80% the gauge turns the theme's warning colour, and the output window says once that the context is filling up, suggesting `/compact` (drop old tool output) or `/clear` (start a new conversation). The notice comes back only after the conversation has dropped below 80% and filled up again
+- After `/compact` the count is scaled to what was removed and shown with a `~`, for example `ctx ~9.0k/32k`, until the next answer counts it again
+- `compact_at` in the `[orangu]` section compacts the conversation by itself after a turn that leaves it at least that full. See the Configuration chapter
+
+Each workspace tab has its own conversation and its own gauge. A resumed
+session shows its gauge after its first answer.
 
 ## History and navigation
 

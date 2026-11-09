@@ -98,6 +98,9 @@ pub struct ClientAppConfiguration {
     pub semantic_budget_tokens: usize,
     /// How many levels of subagents may run below the main conversation.
     pub subagent_depth: usize,
+    /// `[orangu].compact_at` — compact the conversation after a turn that
+    /// leaves it this percent full of the context; `0` (the default) never.
+    pub compact_at: u8,
     /// Whether subagents run in the background unless a call says otherwise.
     pub subagent_background: bool,
     pub theme: String,
@@ -330,6 +333,12 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
     let subagent_depth = parse_client_field(&client, "subagent_depth", default_subagent_depth)?;
     let subagent_background = parse_client_field(&client, "subagent_background", || false)?;
     let ssh = parse_client_field(&client, "ssh", SshMode::default)?;
+    let compact_at = parse_client_field(&client, "compact_at", || 0u8)?;
+    if compact_at > 100 {
+        return Err(anyhow!(
+            "invalid value for [{CLIENT_SECTION}].compact_at: {compact_at} (0 to 100)"
+        ));
+    }
     if !(1..=MAX_SUBAGENT_DEPTH).contains(&subagent_depth) {
         return Err(anyhow!(
             "invalid value for [{CLIENT_SECTION}].subagent_depth: {subagent_depth} (1 to {MAX_SUBAGENT_DEPTH})"
@@ -393,6 +402,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         ),
         semantic_budget_tokens,
         subagent_depth,
+        compact_at,
         subagent_background,
         compile_workers,
         terminal: client.get("terminal").cloned().unwrap_or_default(),
@@ -1051,6 +1061,23 @@ mod tests {
         assert_eq!(conf.platform, "github");
         // Absent theme keeps the original orangu UI as the named classic theme.
         assert_eq!(conf.theme, "classic");
+    }
+
+    #[test]
+    fn compact_at_defaults_to_off_and_is_a_percentage() {
+        let load = |extra: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu]\nserver = main\n{extra}\n[main]\nendpoint = http://localhost:8100/v1\nmodel = model\n"
+            )
+            .unwrap();
+            load_client_configuration(file.path())
+        };
+        assert_eq!(load("").unwrap().compact_at, 0);
+        assert_eq!(load("compact_at = 85").unwrap().compact_at, 85);
+        assert!(load("compact_at = 101").is_err());
+        assert!(load("compact_at = high").is_err());
     }
 
     #[test]

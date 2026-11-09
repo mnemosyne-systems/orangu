@@ -1211,6 +1211,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     ) {
         return Some(LocalCommand::Clear);
     }
+    if matches_ci(input, &["compact", "compact conversation"]) {
+        return Some(LocalCommand::Compact);
+    }
     if matches_ci(input, &["quit", "exit"]) {
         return Some(LocalCommand::Quit);
     }

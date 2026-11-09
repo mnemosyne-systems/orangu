@@ -15,6 +15,7 @@
 
 mod auto_review;
 pub mod auto_review_native;
+pub mod context_gauge;
 pub mod header;
 mod helper;
 pub mod renderer;

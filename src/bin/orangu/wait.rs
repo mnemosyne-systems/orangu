@@ -37,7 +37,11 @@ pub(crate) async fn wait_for_response(
 
     // Move `session` into the background task so the future can outlive this
     // stack frame if the user switches tabs mid-stream.
-    let real_session = std::mem::replace(session, ChatSession::new(""));
+    // The stand-in keeps the context gauge's state, for the status line while
+    // the turn runs and for a cancelled turn's rebuilt session.
+    let mut stand_in = ChatSession::new("");
+    stand_in.keep_context_of(session);
+    let real_session = std::mem::replace(session, stand_in);
     // `@agent-<name>` asks for that agent: the model is told to delegate.
     let user_input_owned = orangu::subagents::with_agent_mentions(user_input, tools);
     let profile_owned = profile.clone();
@@ -48,6 +52,7 @@ pub(crate) async fn wait_for_response(
     let st = Arc::clone(&streamed_state);
     let stc = Arc::clone(&streamed_state);
     let sta = Arc::clone(&streamed_state);
+    let su = Arc::clone(&streamed_state);
 
     let handle = tokio::spawn(async move {
         let mut s = real_session;
@@ -94,6 +99,12 @@ pub(crate) async fn wait_for_response(
                 },
             )
             .await;
+        // The turn's last response is what the conversation now holds.
+        let usage = su.lock().ok().and_then(|state| state.metrics.usage);
+        if let Some(usage) = usage {
+            s.note_usage(usage);
+        }
+        s.learn_context_size(&profile_owned).await;
         (s, result)
     });
 
@@ -305,6 +316,13 @@ async fn drive_handle(
 
                 redraw |= current_streamed_output != last_rendered_output;
                 redraw |= current_stream_metrics != last_rendered_metrics;
+                // Each round of a tool-using turn reports what the context
+                // holds so far: the gauge follows it while the turn runs.
+                if current_stream_metrics.usage != last_rendered_metrics.usage
+                    && let Some(usage) = current_stream_metrics.usage
+                {
+                    orangu::tui::context_gauge::show(Some(session.context_gauge_for(usage)));
+                }
                 redraw |= current_tool_running_since.is_some() != last_tool_was_running;
 
                 // An SSH login running in this turn has a question.
@@ -375,6 +393,7 @@ async fn drive_handle(
                             handle.abort();
                             let mut restored = ChatSession::new("");
                             restored.restore(saved_messages);
+                            restored.keep_context_of(session);
                             *session = restored;
                             return Ok(WaitResult::Cancelled(partial_output));
                         }

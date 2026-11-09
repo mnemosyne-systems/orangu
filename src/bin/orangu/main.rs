@@ -1355,6 +1355,7 @@ async fn run() -> Result<()> {
                     if let Some(step) = after_turn {
                         push_after_turn(&mut output_state, step, tools.workspace(), &answer);
                     }
+                    watch_context(&mut session, &mut output_state, config.compact_at);
                     if config.feedback {
                         output_state.push_text(FEEDBACK_OK);
                     }
@@ -1608,6 +1609,7 @@ async fn run() -> Result<()> {
 
         // The status line counts this tab's running background subagents.
         orangu::subagent_tasks::show_in_status_line(tools.tasks());
+        orangu::tui::context_gauge::show(session.context_gauge());
         // Finished background subagents: each report becomes a turn of the
         // model's own, through the same queue.
         for notification in tools.tasks().take_notifications() {
@@ -2865,6 +2867,7 @@ async fn run() -> Result<()> {
                 if let Some(step) = after_turn {
                     push_after_turn(&mut output_state, step, tools.workspace(), &answer);
                 }
+                watch_context(&mut session, &mut output_state, config.compact_at);
                 if config.feedback {
                     output_state.push_text(FEEDBACK_OK);
                 }
@@ -3003,6 +3006,38 @@ fn resolve_existing_dir_arg(arg: &str) -> Option<PathBuf> {
     };
     let normalized = normalize_path(&absolute);
     normalized.is_dir().then_some(normalized)
+}
+
+/// After a turn: compact the conversation once it fills `compact_at` percent
+/// of the context (`0` never does), or else say once that it is getting full.
+fn watch_context(session: &mut ChatSession, output_state: &mut OutputState, compact_at: u8) {
+    // Shown now, so the frame that draws the answer carries it.
+    orangu::tui::context_gauge::show(session.context_gauge());
+    let Some(gauge) = session.context_gauge() else {
+        return;
+    };
+    if compact_at > 0 && gauge.at_least(u64::from(compact_at)) {
+        let (before, after) = session.compact_now();
+        if after < before
+            && let Some(compacted) = session.context_gauge()
+        {
+            output_state.push_text(&format!(
+                "Context {}% full: compacted the conversation from {} to {} tokens.",
+                gauge.percent().unwrap_or_default(),
+                orangu::tui::context_gauge::short_count(gauge.used),
+                orangu::tui::context_gauge::short_count(compacted.used)
+            ));
+            orangu::tui::context_gauge::show(Some(compacted));
+            return;
+        }
+    }
+    if session.take_context_warning() {
+        output_state.push_text(&format!(
+            "Context {}% full ({}). /compact drops old tool output; /clear starts a new conversation.",
+            gauge.percent().unwrap_or_default(),
+            gauge.label()
+        ));
+    }
 }
 
 /// Stands for a line break inside a history entry, which the history file

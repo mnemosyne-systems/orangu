@@ -247,6 +247,7 @@ Then start with:
 /status
 /usage
 /clear
+/compact
 /copy
 /quit
 ```

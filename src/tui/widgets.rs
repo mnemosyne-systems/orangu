@@ -391,7 +391,12 @@ fn status_line(
     }
 
     let right_space = width.saturating_sub(left_visible_width);
-    let model_width = current_model.chars().count();
+    // The context gauge sits in front of the model, and only fits with it.
+    let gauge = crate::tui::context_gauge::shown()
+        .map(|gauge| (format!("{}   ", gauge.label()), gauge.is_high()))
+        .filter(|(label, _)| label.chars().count() + current_model.chars().count() <= right_space);
+    let gauge_width = gauge.as_ref().map_or(0, |(label, _)| label.chars().count());
+    let model_width = current_model.chars().count() + gauge_width;
     let show_model = right_space >= model_width;
     let gap = if show_model {
         right_space.saturating_sub(model_width)
@@ -445,6 +450,12 @@ fn status_line(
     }
 
     if show_model {
+        if let Some((label, high)) = gauge {
+            spans.push(Span::styled(
+                label,
+                if high { theme.warning } else { theme.muted },
+            ));
+        }
         spans.push(Span::raw(current_model.to_string()));
     }
 

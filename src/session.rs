@@ -174,6 +174,23 @@ pub struct ChatSession {
 
     /// See [`Self::keep_turn_when_rounds_run_out`].
     keep_exhausted_turn: bool,
+
+    /// What the context gauge knows: see [`Self::context_gauge`].
+    context: ContextState,
+}
+
+/// How full this conversation's context is, as far as the server has said.
+#[derive(Clone, Default)]
+struct ContextState {
+    /// Tokens the last response read and wrote.
+    used: Option<u64>,
+    /// `used` was scaled after a compaction rather than counted.
+    estimated: bool,
+    /// The endpoint `limit` was asked of, and what it answered.
+    limit: Option<(String, Option<u64>)>,
+    /// The "context is filling up" notice was shown, and is not shown again
+    /// until the conversation drops below the warning level.
+    warned: bool,
 }
 
 /// The subset of [`LlmConfiguration`] that the [`OpenAiClient`] is built from.
@@ -211,7 +228,95 @@ impl ChatSession {
 
             model_verbosity_override: None,
             keep_exhausted_turn: false,
+            context: ContextState::default(),
         }
+    }
+
+    /// How full the context is: the last response's tokens against the
+    /// server's context size. `None` before the first response.
+    pub fn context_gauge(&self) -> Option<crate::tui::context_gauge::ContextGauge> {
+        let used = self.context.used?;
+        Some(crate::tui::context_gauge::ContextGauge {
+            used,
+            limit: self.context.limit.as_ref().and_then(|(_, limit)| *limit),
+            estimated: self.context.estimated,
+        })
+    }
+
+    /// The gauge for a response that read and wrote `usage`, against what
+    /// this session knows of the context size.
+    pub fn context_gauge_for(
+        &self,
+        usage: crate::llm::TokenUsage,
+    ) -> crate::tui::context_gauge::ContextGauge {
+        crate::tui::context_gauge::ContextGauge {
+            used: usage.prompt.saturating_add(usage.completion),
+            limit: self.context.limit.as_ref().and_then(|(_, limit)| *limit),
+            estimated: false,
+        }
+    }
+
+    /// Records what a finished turn's last response read and wrote, which is
+    /// what the conversation now holds.
+    pub fn note_usage(&mut self, usage: crate::llm::TokenUsage) {
+        self.context.used = Some(usage.prompt.saturating_add(usage.completion));
+        self.context.estimated = false;
+        self.rearm_context_warning();
+    }
+
+    /// Asks `profile`'s server for its context size once per endpoint, from
+    /// `GET /props`. A server without it leaves the gauge without a limit.
+    pub async fn learn_context_size(&mut self, profile: &LlmConfiguration) {
+        if self
+            .context
+            .limit
+            .as_ref()
+            .is_some_and(|(endpoint, _)| *endpoint == profile.endpoint)
+        {
+            return;
+        }
+        let limit = crate::llm::probe_context_size(
+            &self.probe_client,
+            &profile.endpoint,
+            profile.api_key.as_deref(),
+        )
+        .await;
+        self.context.limit = Some((profile.endpoint.clone(), limit));
+    }
+
+    /// Whether the "context is filling up" notice is due: the gauge is at its
+    /// warning level and the notice has not been shown since it got there.
+    pub fn take_context_warning(&mut self) -> bool {
+        let due = !self.context.warned && self.context_gauge().is_some_and(|gauge| gauge.is_high());
+        self.context.warned |= due;
+        due
+    }
+
+    fn rearm_context_warning(&mut self) {
+        if !self.context_gauge().is_some_and(|gauge| gauge.is_high()) {
+            self.context.warned = false;
+        }
+    }
+
+    /// Drops what compaction can drop — stale working-tree snapshots and old
+    /// tool output — now, whatever it reclaims. Returns the transcript's
+    /// bytes before and after; the gauge scales its count to match until the
+    /// next response counts it again.
+    pub fn compact_now(&mut self) -> (usize, usize) {
+        let bytes = |messages: &[ChatMessage]| -> usize {
+            messages.iter().map(|message| message.content.len()).sum()
+        };
+        let before = bytes(&self.messages);
+        self.apply_compaction();
+        let after = bytes(&self.messages);
+        if after < before
+            && let Some(used) = self.context.used
+        {
+            self.context.used = Some((used as u128 * after as u128 / before as u128) as u64);
+            self.context.estimated = true;
+            self.rearm_context_warning();
+        }
+        (before, after)
     }
 
     /// Keeps a turn that runs out of `max_tool_rounds` in the transcript
@@ -352,6 +457,10 @@ impl ChatSession {
     pub fn clear(&mut self, system_prompt: &str) {
         self.messages.clear();
         self.messages.push(ChatMessage::system(system_prompt));
+        self.context = ContextState {
+            limit: self.context.limit.take(),
+            ..ContextState::default()
+        };
     }
 
     pub fn push_user(&mut self, content: &str) {
@@ -364,6 +473,14 @@ impl ChatSession {
 
     pub fn restore(&mut self, messages: Vec<ChatMessage>) {
         self.messages = messages;
+        self.context.used = None;
+        self.context.warned = false;
+    }
+
+    /// Carries another session's context state over, for a session rebuilt
+    /// from its messages after a cancelled turn.
+    pub fn keep_context_of(&mut self, other: &ChatSession) {
+        self.context = other.context.clone();
     }
 
     pub fn checkpoint(&self) -> usize {
@@ -734,6 +851,76 @@ mod tests {
     /// The ordering here is the one [`ChatSession::prompt`] uses: compact the
     /// transcript, *then* append this turn. That is what makes "every
     /// fragment still in the history is stale" true.
+    fn usage(prompt: u64, completion: u64) -> crate::llm::TokenUsage {
+        crate::llm::TokenUsage { prompt, completion }
+    }
+
+    #[test]
+    fn the_gauge_counts_the_last_response_and_warns_once() {
+        let mut session = ChatSession::new("system");
+        assert_eq!(
+            session.context_gauge(),
+            None,
+            "nothing known before a reply"
+        );
+        session.context.limit = Some(("http://server".to_string(), Some(1_000)));
+
+        session.note_usage(usage(500, 100));
+        let gauge = session.context_gauge().unwrap();
+        assert_eq!((gauge.used, gauge.limit), (600, Some(1_000)));
+        assert!(!session.take_context_warning(), "60% is below the warning");
+
+        session.note_usage(usage(800, 50));
+        assert!(session.take_context_warning(), "85% warns");
+        session.note_usage(usage(820, 50));
+        assert!(!session.take_context_warning(), "and only once");
+
+        // Dropping below the warning level and climbing back warns again.
+        session.note_usage(usage(300, 0));
+        session.note_usage(usage(900, 0));
+        assert!(session.take_context_warning());
+
+        session.clear("system");
+        assert_eq!(session.context_gauge(), None);
+        assert!(
+            session.context.limit.is_some(),
+            "clear keeps the context size"
+        );
+    }
+
+    #[test]
+    fn compacting_now_scales_the_count_until_the_next_reply() {
+        let mut session = ChatSession::new("system");
+        session.push_user("old question");
+        session.messages.push(crate::llm::ChatMessage::tool_result(
+            "call",
+            &"x".repeat(10_000),
+        ));
+        for turn in 0..4 {
+            session.push_user(&format!("question {turn}"));
+            session
+                .messages
+                .push(crate::llm::ChatMessage::assistant("answer"));
+        }
+        session.note_usage(usage(4_000, 0));
+
+        let (before, after) = session.compact_now();
+        assert!(after < before / 4, "the old tool output was dropped");
+        let gauge = session.context_gauge().unwrap();
+        assert!(gauge.estimated);
+        assert!(
+            gauge.used < 1_000,
+            "scaled with the transcript: {}",
+            gauge.used
+        );
+
+        let (again_before, again_after) = session.compact_now();
+        assert_eq!(again_before, again_after, "nothing left to drop");
+
+        session.note_usage(usage(700, 10));
+        assert!(!session.context_gauge().unwrap().estimated);
+    }
+
     #[test]
     fn an_earlier_turns_world_state_fragment_is_dropped_on_the_next_turn() {
         let fragment = ContextualFragment::new("world_state_changes", &"x".repeat(100_000));

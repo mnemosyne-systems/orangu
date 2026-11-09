@@ -2651,6 +2651,25 @@ pub(crate) fn handle_command(
             session.clear(&prompt);
             Ok(CommandOutcome::Cleared)
         }
+        LocalCommand::Compact => {
+            let (before, after) = session.compact_now();
+            orangu::tui::context_gauge::show(session.context_gauge());
+            Ok(CommandOutcome::Output(if after < before {
+                match session.context_gauge() {
+                    Some(gauge) => format!(
+                        "Compacted the conversation: about {} tokens now ({}).",
+                        orangu::tui::context_gauge::short_count(gauge.used),
+                        gauge.label()
+                    ),
+                    None => format!(
+                        "Compacted the conversation from {} to {} characters.",
+                        before, after
+                    ),
+                }
+            } else {
+                "Nothing to compact: the conversation holds no stale tool output.".to_string()
+            }))
+        }
         LocalCommand::Copy => Ok(CommandOutcome::CopyLastResponse),
         LocalCommand::Quit => Ok(CommandOutcome::Quit),
         LocalCommand::PendingList => Ok(CommandOutcome::PendingList),

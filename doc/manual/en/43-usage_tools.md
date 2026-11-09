@@ -86,6 +86,34 @@ reset conversation
 
 \newpage
 
+## /compact
+
+Drops old tool output from the conversation now.
+
+Tool output longer than 500 characters from more than three prompts back is
+replaced with a short stub, and working-tree snapshots from earlier prompts are
+removed: the same pass the Compression chapter describes, run now whatever it
+reclaims. The rest of the conversation stays. The context gauge on the status
+line shows the new size with a `~` until the next answer counts it.
+
+The server has to read the rewritten conversation again on the next prompt, so
+that prompt starts more slowly.
+
+**Examples**
+
+```text
+/compact
+```
+
+Natural-language forms:
+
+```text
+compact
+compact conversation
+```
+
+\newpage
+
 ## /copy
 
 Copies the latest assistant response to the system clipboard as its original

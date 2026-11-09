@@ -157,6 +157,10 @@ compacting does not.
 
 Nothing about *what* gets compacted changed; only when.
 
+`/compact` runs the same pass at once, whatever it reclaims, and `compact_at`
+in the `[orangu]` section runs it after any turn that leaves the conversation
+that full of the context. See **Context gauge** in the Terminal chapter.
+
 ### Metrics & `/usage`
 
 You can monitor the effectiveness of the compression layer by running the `/usage`

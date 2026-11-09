@@ -260,6 +260,29 @@ impl SlotRegistry {
     }
 }
 
+/// The context size one request gets on `endpoint`: `/props`'s
+/// `default_generation_settings.n_ctx`, or its top-level `n_ctx` where that
+/// is all it reports. `None` from a server without `/props`.
+pub async fn probe_context_size(
+    client: &Client,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> Option<u64> {
+    let mut builder = client.get(format!("{endpoint}/props"));
+    if let Some(api_key) = api_key {
+        builder = builder.bearer_auth(api_key);
+    }
+    let response = builder.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body: Value = response.json().await.ok()?;
+    ["/default_generation_settings/n_ctx", "/n_ctx"]
+        .iter()
+        .find_map(|pointer| body.pointer(pointer).and_then(Value::as_u64))
+        .filter(|&n_ctx| n_ctx > 0)
+}
+
 async fn probe_total_slots(client: &Client, endpoint: &str, api_key: Option<&str>) -> Option<u32> {
     let mut builder = client.get(format!("{endpoint}/props"));
     if let Some(api_key) = api_key {
@@ -294,6 +317,34 @@ mod tests {
 
         let slots: Vec<Option<u32>> = futures_sequential(&registry, &client, &endpoint, 4).await;
         assert_eq!(slots, vec![Some(0), Some(1), Some(0), Some(1)]);
+    }
+
+    #[tokio::test]
+    async fn the_context_size_prefers_the_per_request_n_ctx() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let bodies = [
+                r#"{"n_ctx":131072,"default_generation_settings":{"n_ctx":16384}}"#,
+                r#"{"n_ctx":8192}"#,
+                r#"{"total_slots":2}"#,
+            ];
+            for body in bodies {
+                let (mut stream, _) = listener.accept().expect("accept");
+                serve_ok_response(&mut stream, body);
+            }
+        });
+        let endpoint = format!("http://{addr}");
+        let client = Client::new();
+        assert_eq!(
+            probe_context_size(&client, &endpoint, None).await,
+            Some(16_384)
+        );
+        assert_eq!(
+            probe_context_size(&client, &endpoint, None).await,
+            Some(8_192)
+        );
+        assert_eq!(probe_context_size(&client, &endpoint, None).await, None);
     }
 
     #[tokio::test]

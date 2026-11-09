@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 pub use coordinator::{probe_coordinator, probe_coordinator_roles};
 pub use openai::{OpenAiClient, normalized_openai_endpoint};
-pub use slots::{SaveRestoreOutcome, SlotRegistry};
+pub use slots::{SaveRestoreOutcome, SlotRegistry, probe_context_size};
 
 /// What every surface says when a turn ended with
 /// [`StreamMetrics::truncated`].

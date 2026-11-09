@@ -679,6 +679,9 @@ pub enum LocalCommand<'a> {
     /// output. `None` is a usage error (the command line is required).
     Shell(Option<Cow<'a, str>>),
     Clear,
+    /// `/compact`: drop stale working-tree snapshots and old tool output
+    /// from the conversation now.
+    Compact,
     /// `/copy`: copy the latest assistant response as raw Markdown.
     Copy,
     Quit,
