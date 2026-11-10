@@ -1284,7 +1284,6 @@
   }
 
   function showHistory() {
-    hideChatSettings();
     refreshHistory().catch((err) => console.error(err));
     historyPanel.hidden = false;
     historyBtn.setAttribute("aria-expanded", "true");
@@ -1722,8 +1721,9 @@
   // icon button whose label lives in its `title`/`aria-label`, matching the
   // rest of this UI's chrome.
 
-  // Settings: one dialog, three panes — MCP servers, the model manager,
-  // the picture settings — picked from the brand-brown column on its left.
+  // Settings: one dialog of panes — this chat's settings, MCP servers, the
+  // model manager, the picture, clip and speech settings, the workers —
+  // picked from the brand-brown column on its left.
   // The overlay is shared; each pane keeps its own state below, and the
   // model manager's polling runs only while its pane is the one shown.
   const settingsBtn = document.getElementById("settings-btn");
@@ -1733,6 +1733,7 @@
   const settingsCancelBtn = document.getElementById("settings-cancel-btn");
   const settingsTabs = Array.from(document.querySelectorAll("#settings-nav .settings-tab"));
   const settingsPanes = {
+    chat: document.getElementById("chat-panel"),
     mcps: document.getElementById("mcps-panel"),
     models: document.getElementById("models-panel"),
     monitor: document.getElementById("monitor-panel"),
@@ -3463,6 +3464,7 @@
     }
     if (name === "models") openModels();
     if (name === "monitor") openMonitor();
+    if (name === "chat" && !keepForm) showChatPane();
     // A draft with edits survives a look at another pane; a clean one is
     // re-read, in case the file changed.
     if (name === "mcps" && !keepForm && !mcpsDirty()) {
@@ -3490,14 +3492,16 @@
     }
   }
 
-  function openSettings() {
+  // `pane`: the one to show first, else the one shown last.
+  function openSettings(pane = null) {
     settingsOverlay.hidden = false;
     settingsBtn.setAttribute("aria-expanded", "true");
-    let pane = null;
-    try {
-      pane = localStorage.getItem("orangu-settings-pane");
-    } catch {
-      // As above.
+    if (!pane) {
+      try {
+        pane = localStorage.getItem("orangu-settings-pane");
+      } catch {
+        // As above.
+      }
     }
     if (!settingsPanes[pane]) pane = "models";
     showSettingsPane(pane);
@@ -3523,11 +3527,20 @@
   }
 
   // Save: every pane's pending edits go to the server, then the dialog
-  // closes. Only the Image pane holds any — the model manager acts as it
-  // goes and the MCP pane is read-only — so this is the picture form when
-  // it differs from what the server holds; a refused value keeps the
-  // dialog open with the reason under the form.
+  // closes — the chat's settings, the picture, clip and speech forms when
+  // they differ from what the server holds, and the MCP list; the model
+  // manager acts as it goes. A refused value keeps the dialog open with
+  // the reason under the form.
   async function saveSettings() {
+    if (chatFormDirty()) {
+      try {
+        await saveChatSettings(chatSettingsFromForm());
+      } catch (err) {
+        showSettingsPane("chat", true);
+        chatStatus.textContent = err.message;
+        return;
+      }
+    }
     if (imageFormDirty()) {
       try {
         await postImageProps(imageFormSettings());
@@ -3646,10 +3659,10 @@
   // ------------------------------------------------------- chat settings
 
   // This chat's own system prompt and sampling settings (web/sessions.rs,
-  // `ChatSettings`). An empty field is unset: the server's default, shown
-  // as the placeholder, applies.
-  const chatSettingsBtn = document.getElementById("chat-settings-btn");
-  const chatSettingsPanel = document.getElementById("chat-settings-panel");
+  // `ChatSettings`), the Settings dialog's Chat pane. An empty field is
+  // unset: the server's default, shown as the placeholder, applies.
+  const chatTab = settingsTabs.find((tab) => tab.dataset.pane === "chat");
+  const chatSettingsForm = document.getElementById("chat-settings-form");
   const chatPreset = document.getElementById("chat-preset");
   const chatPresetSave = document.getElementById("chat-preset-save");
   const chatPresetDelete = document.getElementById("chat-preset-delete");
@@ -3740,15 +3753,24 @@
     return settings;
   }
 
-  // Called whenever another chat is shown.
+  // Whether the form differs from what the chat holds — what Save sends.
+  function chatFormDirty() {
+    const form = chatSettingsFromForm();
+    const keys = new Set([...Object.keys(form), ...Object.keys(chatSettings)]);
+    return [...keys].some((key) => form[key] !== chatSettings[key]);
+  }
+
+  // Called whenever another chat is shown. The Chat tab is coloured while
+  // the chat has settings of its own.
   function applyChatSettings(settings) {
     chatSettings = settings || {};
-    chatSettingsBtn.classList.toggle("has-settings", Object.keys(chatSettings).length > 0);
+    chatTab.classList.toggle("has-settings", Object.keys(chatSettings).length > 0);
     fillChatSettings(chatSettings);
     renderPresets();
     chatStatus.textContent = "";
   }
 
+  // Throws with the server's reason when it refuses them.
   async function saveChatSettings(settings) {
     if (!state.sessionId) return;
     const res = await fetch(`/api/sessions/${encodeURIComponent(state.sessionId)}/settings`, {
@@ -3757,32 +3779,17 @@
       body: JSON.stringify(settings),
     });
     if (!res.ok) {
-      chatStatus.textContent = (await res.text()) || `failed (${res.status})`;
-      return;
+      throw new Error((await res.text()) || `failed (${res.status})`);
     }
-    const preset = chatPreset.value;
     applyChatSettings(await res.json());
-    renderPresets(preset);
-    chatStatus.textContent = "Applied to this chat's next message.";
   }
 
-  function showChatSettings() {
-    hideHistory();
+  // The pane opened: the form shows what the chat holds.
+  function showChatPane() {
     fillChatSettings(chatSettings);
+    renderPresets();
     chatStatus.textContent = "";
-    chatSettingsPanel.hidden = false;
-    chatSettingsBtn.setAttribute("aria-expanded", "true");
   }
-
-  function hideChatSettings() {
-    chatSettingsPanel.hidden = true;
-    chatSettingsBtn.setAttribute("aria-expanded", "false");
-  }
-
-  chatSettingsBtn.addEventListener("click", () => {
-    if (chatSettingsPanel.hidden) showChatSettings();
-    else hideChatSettings();
-  });
   chatPreset.addEventListener("change", () => {
     const preset = allPresets()[chatPreset.value];
     if (preset) fillChatSettings({ ...chatSettingsFromForm(), ...preset });
@@ -3808,24 +3815,10 @@
     fillChatSettings({});
     renderPresets();
   });
-  chatSettingsPanel.addEventListener("submit", (event) => {
+  // Enter in a field saves, as the dialog's Save does.
+  chatSettingsForm.addEventListener("submit", (event) => {
     event.preventDefault();
-    saveChatSettings(chatSettingsFromForm()).catch((err) => {
-      chatStatus.textContent = String(err);
-      console.error(err);
-    });
-  });
-  document.addEventListener("click", (event) => {
-    if (
-      !chatSettingsPanel.hidden &&
-      !chatSettingsPanel.contains(event.target) &&
-      !chatSettingsBtn.contains(event.target)
-    ) {
-      hideChatSettings();
-    }
-  });
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !chatSettingsPanel.hidden) hideChatSettings();
+    saveSettings().catch((err) => console.error(err));
   });
   loadChatDefaults();
   renderPresets();
@@ -3840,7 +3833,7 @@
     { keys: `${MOD}+Shift+O`, what: "New chat", button: newChatBtn },
     { keys: `${MOD}+K`, what: "Search chats" },
     { keys: `${MOD}+B`, what: "Show or hide History", button: historyBtn },
-    { keys: `${MOD}+.`, what: "Chat settings", button: chatSettingsBtn },
+    { keys: `${MOD}+.`, what: "This chat's settings" },
     { keys: "/", what: "Type a message" },
     { keys: "↑", what: "Edit the last question (in an empty message box)" },
     { keys: "Esc", what: "Stop the answer being written, or close what is open" },
@@ -3891,7 +3884,6 @@
       !shortcutsOverlay.hidden ||
       !settingsOverlay.hidden ||
       !historyPanel.hidden ||
-      !chatSettingsPanel.hidden ||
       !attachMenu.hidden ||
       Boolean(transcript.querySelector(".editing"))
     );
@@ -3917,7 +3909,9 @@
         historyBtn.click();
       } else if (mod && !event.shiftKey && key === ".") {
         event.preventDefault();
-        chatSettingsBtn.click();
+        if (settingsOverlay.hidden) openSettings("chat");
+        else if (settingsPane === "chat") cancelSettings();
+        else showSettingsPane("chat");
       } else if (event.key === "Escape" && !shortcutsOverlay.hidden) {
         event.preventDefault();
         hideShortcuts();

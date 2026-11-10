@@ -38,9 +38,6 @@
       <button id="new-chat-btn" class="icon-btn" type="button" aria-label="New chat" title="New chat">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
       </button>
-      <button id="chat-settings-btn" class="icon-btn" type="button" aria-expanded="false" aria-controls="chat-settings-panel" aria-label="Chat settings" title="Chat settings">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
-      </button>
       <button id="history-btn" class="icon-btn" type="button" aria-expanded="false" aria-controls="history-panel" aria-label="History" title="History">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 16 14"/></svg>
       </button>
@@ -55,34 +52,6 @@
        stays put, so Clear all is reachable without scrolling to the oldest
        chat first. It starts hidden only because an empty history has
        nothing to clear — app.js shows it as soon as there is a row. -->
-  <!-- This chat's own system prompt and sampling settings, kept with the
-       chat on the server. Empty fields take the server's defaults, shown
-       as their placeholders. Presets are kept in this browser. -->
-  <form id="chat-settings-panel" hidden>
-    <h2>Chat settings</h2>
-    <label class="chat-settings-row">
-      <span>Preset</span>
-      <span class="chat-settings-inline">
-        <select id="chat-preset"></select>
-        <button id="chat-preset-save" type="button" title="Keep these settings as a preset in this browser">Save as…</button>
-        <button id="chat-preset-delete" type="button" title="Forget the selected preset">Delete</button>
-      </span>
-    </label>
-    <label class="chat-settings-row chat-settings-wide">
-      <span>System prompt</span>
-      <textarea id="chat-system-prompt" rows="4" placeholder="none"></textarea>
-    </label>
-    <label class="chat-settings-row"><span>Temperature</span><input id="chat-temperature" type="number" min="0" max="2" step="0.05"></label>
-    <label class="chat-settings-row"><span>Top P</span><input id="chat-top-p" type="number" min="0" max="1" step="0.01"></label>
-    <label class="chat-settings-row"><span>Min P</span><input id="chat-min-p" type="number" min="0" max="1" step="0.01"></label>
-    <label class="chat-settings-row"><span>Max tokens</span><input id="chat-max-tokens" type="number" min="1" step="1"></label>
-    <div id="chat-settings-actions">
-      <button id="chat-settings-reset" type="button" title="Back to the server's defaults">Reset</button>
-      <button id="chat-settings-apply" type="submit">Apply</button>
-      <span id="chat-settings-status" class="models-subtle"></span>
-    </div>
-  </form>
-
   <nav id="history-panel" hidden>
     <div id="history-search-row">
       <input id="history-search" type="search" placeholder="Search chats" aria-label="Search chats" autocomplete="off">
@@ -99,14 +68,18 @@
        one of its panes owns an irreversible action (delete) and a
        long-running one (download), so it deliberately takes over the screen
        instead of closing on the next outside click. The brand-brown column
-       on the left picks the pane — MCP servers, the model manager, the
-       picture settings — and the panes are the sections beside it, one
+       on the left picks the pane — this chat's settings, MCP servers, the
+       model manager, the picture settings — and the panes are the sections beside it, one
        shown at a time (app.js, `openSettings`). -->
   <div id="settings-overlay" hidden>
     <section id="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settings-title">
       <div id="settings-body">
       <nav id="settings-nav" aria-label="Settings sections">
         <h2 id="settings-title">Settings</h2>
+        <button class="settings-tab" type="button" data-pane="chat" aria-controls="chat-panel" aria-pressed="false">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+          <span>Chat</span>
+        </button>
         <button class="settings-tab" type="button" data-pane="mcps" aria-controls="mcps-panel" aria-pressed="false">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
           <span>MCP</span>
@@ -140,6 +113,39 @@
         <button id="settings-close-btn" class="icon-btn subtle-btn" type="button" aria-label="Close settings" title="Close settings">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
+
+    <!-- This chat's own system prompt and sampling settings, kept with the
+         chat on the server and sent by the dialog's Save. Empty fields take
+         the server's defaults, shown as their placeholders. Presets are
+         kept in this browser. -->
+    <section id="chat-panel" class="settings-pane" aria-labelledby="chat-title" hidden>
+      <header id="chat-header"><h2 id="chat-title">Chat</h2><span class="models-subtle">This chat, from its next message</span></header>
+      <form id="chat-settings-form">
+        <label class="image-field">
+          <span>Preset</span>
+          <span class="image-controls">
+            <select id="chat-preset"></select>
+            <button id="chat-preset-save" type="button" title="Keep these settings as a preset in this browser">Save as…</button>
+            <button id="chat-preset-delete" type="button" title="Forget the selected preset">Delete</button>
+          </span>
+        </label>
+        <label class="image-field chat-settings-wide">
+          <span>System prompt</span>
+          <textarea id="chat-system-prompt" rows="6" placeholder="none"></textarea>
+        </label>
+        <label class="image-field"><span>Temperature</span><span class="image-controls"><input id="chat-temperature" type="number" min="0" max="2" step="0.05"></span></label>
+        <label class="image-field"><span>Top P</span><span class="image-controls"><input id="chat-top-p" type="number" min="0" max="1" step="0.01"></span></label>
+        <label class="image-field"><span>Min P</span><span class="image-controls"><input id="chat-min-p" type="number" min="0" max="1" step="0.01"></span></label>
+        <label class="image-field"><span>Max tokens</span><span class="image-controls"><input id="chat-max-tokens" type="number" min="1" step="1"></span></label>
+        <div id="chat-settings-actions">
+          <button id="chat-settings-reset" type="button" title="Empty every field, so the server's defaults apply; Save makes it so">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+            Reset
+          </button>
+          <span id="chat-settings-status" class="models-subtle"></span>
+        </div>
+      </form>
+    </section>
 
     <!-- The model manager. The table is built by app.js from /api/models —
          `orangu-server list`, column for column; the markup here is only

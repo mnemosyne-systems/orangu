@@ -3961,7 +3961,7 @@ reload or revisit it from **History**.
 | `Ctrl+Shift+O` | New chat |
 | `Ctrl+K` | Search chats: opens History with the cursor in its search box |
 | `Ctrl+B` | Show or hide History |
-| `Ctrl+.` | Chat settings |
+| `Ctrl+.` | This chat's settings (the **Chat** tab of **Settings**) |
 | `/` | Put the cursor in the message box |
 | `↑` | In an empty message box: edit the last question |
 | `Esc` | Stop the answer being written; with a window or dropdown open, close it instead |
@@ -3973,8 +3973,8 @@ The buttons with a shortcut name it in their tooltip.
 
 The console works on a phone's browser, for example to chat with the model on
 a home machine from elsewhere in the house. Below 700 pixels wide it becomes a
-single column: answers take the full width, **History** and **Chat settings**
-fill the screen under the top bar, **Settings** takes the whole screen with
+single column: answers take the full width, **History** fills the screen
+under the top bar, **Settings** takes the whole screen with
 its sections as a row of tabs, and the Models, MCP and Workers tables show
 each row as a card. On a touch screen every button is at least 44 pixels
 across, and the input stays above the on-screen keyboard.
@@ -4019,19 +4019,20 @@ regeneration before it finishes leaves the turn as it was.
 
 ### Chat settings
 
-The sliders button in the top bar opens this chat's own settings, used from
-its next message on:
+The **Chat** tab of **Settings** (or `Ctrl+.`) holds this chat's own
+settings, used from its next message on:
 
 - **System prompt** — sent ahead of the conversation on every turn of the chat
 - **Temperature**, **Top P**, **Min P** — how the answer is sampled
 - **Max tokens** — the longest an answer may be
 
-An empty field takes the server's default, shown in it in grey. **Apply**
-keeps the settings with the chat, so they are still there after a reload or
-when the chat is reopened from **History**; a new chat starts from the
-defaults, and **Reset** empties the fields. The button is coloured while the
-chat has settings of its own. They apply to a language model; picture, clip
-and speech models keep their own settings under **Settings**.
+An empty field takes the server's default, shown in it in grey. The
+dialog's **Save** keeps the settings with the chat, so they are still there
+after a reload or when the chat is reopened from **History**; a new chat
+starts from the defaults, and **Reset** empties the fields. The tab's icon is
+coloured while the chat has settings of its own. They apply to a language
+model; picture, clip and speech models keep their own settings in the
+**Image**, **Video** and **Audio** tabs.
 
 **Preset** fills the sampling fields: **Precise** (temperature 0.2) and
 **Creative** (temperature 1.1) are built in, and **Save as…** keeps the
