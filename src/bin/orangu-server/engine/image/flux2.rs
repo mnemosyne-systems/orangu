@@ -50,9 +50,9 @@ use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 
 use super::transformer::{
-    StageClock, Stages, TIMESTEP_FREQUENCIES, TransformerConfig, concat_rows,
-    device_head_attention, gated_add, head_rms_norm, layer_norm_into, modulate_inplace,
-    silu_inplace, step_attention, step_attention_heads, timestep_embedding,
+    StageClock, Stages, TIMESTEP_FREQUENCIES, TransformerConfig, device_head_attention, gated_add,
+    head_rms_norm, layer_norm_into, modulate_inplace, silu_inplace, step_attention,
+    step_attention_heads, timestep_embedding,
 };
 use std::time::{Duration, Instant};
 
@@ -245,6 +245,10 @@ impl Flux2Transformer {
             head_caches: Mutex::new(Vec::new()),
         };
         model.check_shapes()?;
+        let device = model.double.first().map_or(0, |b| b.img_qkv.device());
+        if let Some(vulkan) = model.backend.as_wgpu_on(device) {
+            vulkan.hold_results_up_to(result_pool_bytes());
+        }
         Ok(model)
     }
 
@@ -358,7 +362,9 @@ impl Flux2Transformer {
             None
         };
         let Some(vulkan) = vulkan else {
-            return step_attention(q, n, k, v, n, c.n_head, c.head_dim, scale, None);
+            return on_attention_pool(self.on_device(), || {
+                step_attention(q, n, k, v, n, c.n_head, c.head_dim, scale, None)
+            });
         };
         let split = c.n_head - heads;
         let mut cache = self
@@ -390,7 +396,9 @@ impl Flux2Transformer {
                 })
             });
             let ran = Instant::now();
-            let out = step_attention_heads(q, n, k, v, n, c.n_head, c.head_dim, scale, 0..split);
+            let out = on_attention_pool(true, || {
+                step_attention_heads(q, n, k, v, n, c.n_head, c.head_dim, scale, 0..split)
+            });
             let host = ran.elapsed();
             let (card_out, card) = lane
                 .join()
@@ -406,8 +414,32 @@ impl Flux2Transformer {
             .zip(card_out.par_chunks(width))
             .with_min_len(64)
             .for_each(|(row, dev)| row[column..column + width].copy_from_slice(dev));
+        self.give(card_out);
         times.host += host;
         times.card += card;
+        out
+    }
+
+    /// `len` zeros, in memory a finished buffer handed back — the wide
+    /// buffers of a pass are hundreds of megabytes, and fresh ones are
+    /// mappings the kernel faults in and zeroes page by page.
+    fn take(&self, len: usize) -> Vec<f32> {
+        let mut v = self.backend.take_scratch(len);
+        v.resize(len, 0.0);
+        v
+    }
+
+    /// Hands a finished wide buffer back for [`Self::take`] and the next
+    /// device result (`Backend::recycle`).
+    fn give(&self, v: Vec<f32>) {
+        self.backend.recycle(v);
+    }
+
+    /// `[a | b]` as rows, in a recycled buffer.
+    fn concat(&self, a: &[f32], b: &[f32]) -> Vec<f32> {
+        let mut out = self.backend.take_scratch(a.len() + b.len());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
         out
     }
 
@@ -497,48 +529,66 @@ impl Flux2Transformer {
             clock.lap(|s| &mut s.other);
             let txt_qkv = self.linear(&normed, n_txt, &block.txt_qkv);
             clock.lap(|s| &mut s.qkv);
-            let (mut iq, mut ik, iv) = split_qkv(&img_qkv, n_img, d, 3 * d);
-            let (mut tq, mut tk, tv) = split_qkv(&txt_qkv, n_txt, d, 3 * d);
-            drop((img_qkv, txt_qkv));
+            let take = |len| self.take(len);
+            let (mut iq, mut ik, iv) = split_qkv(&img_qkv, n_img, d, 3 * d, &take);
+            let (mut tq, mut tk, tv) = split_qkv(&txt_qkv, n_txt, d, 3 * d, &take);
+            self.give(img_qkv);
+            self.give(txt_qkv);
             head_rms_norm(&mut iq, &block.img_q_norm, c.head_dim, EPS);
             head_rms_norm(&mut ik, &block.img_k_norm, c.head_dim, EPS);
             head_rms_norm(&mut tq, &block.txt_q_norm, c.head_dim, EPS);
             head_rms_norm(&mut tk, &block.txt_k_norm, c.head_dim, EPS);
-            let mut q = concat_rows(&tq, &iq);
-            let mut k = concat_rows(&tk, &ik);
-            let v = concat_rows(&tv, &iv);
-            drop((iq, ik, iv, tq, tk, tv));
+            let mut q = self.concat(&tq, &iq);
+            let mut k = self.concat(&tk, &ik);
+            let v = self.concat(&tv, &iv);
+            for buffer in [iq, ik, iv, tq, tk, tv] {
+                self.give(buffer);
+            }
             apply_rope(&mut q, d, c.head_dim, &rope);
             apply_rope(&mut k, d, c.head_dim, &rope);
             let attn = self.attention(&block.img_qkv, &q, &k, &v, n, heads, scale, &mut times);
-            drop((q, k, v));
+            for buffer in [q, k, v] {
+                self.give(buffer);
+            }
             clock.lap(|s| &mut s.attention);
             let txt_attn = self.linear(&attn[..n_txt * d], n_txt, &block.txt_proj);
             let img_attn = self.linear(&attn[n_txt * d..], n_img, &block.img_proj);
-            drop(attn);
+            self.give(attn);
             clock.lap(|s| &mut s.out);
             gated_add(&mut x, &img_attn, &im[2], d);
             gated_add(&mut t, &txt_attn, &tm[2], d);
+            self.give(img_attn);
+            self.give(txt_attn);
 
             layer_norm_into(&mut normed, &x, d, EPS);
             modulate_inplace(&mut normed, &im[3], &im[4], d);
             clock.lap(|s| &mut s.other);
-            let h = swiglu(&self.linear(&normed, n_img, &block.img_mlp_in), m);
+            let gate_up = self.linear(&normed, n_img, &block.img_mlp_in);
+            let h = swiglu(&gate_up, m, &take);
+            self.give(gate_up);
             let mlp = self.linear(&h, n_img, &block.img_mlp_out);
+            self.give(h);
             clock.lap(|s| &mut s.mlp);
             gated_add(&mut x, &mlp, &im[5], d);
+            self.give(mlp);
             layer_norm_into(&mut normed, &t, d, EPS);
             modulate_inplace(&mut normed, &tm[3], &tm[4], d);
             clock.lap(|s| &mut s.other);
-            let h = swiglu(&self.linear(&normed, n_txt, &block.txt_mlp_in), m);
+            let gate_up = self.linear(&normed, n_txt, &block.txt_mlp_in);
+            let h = swiglu(&gate_up, m, &take);
+            self.give(gate_up);
             let mlp = self.linear(&h, n_txt, &block.txt_mlp_out);
+            self.give(h);
             clock.lap(|s| &mut s.mlp);
             gated_add(&mut t, &mlp, &tm[5], d);
+            self.give(mlp);
         }
 
         // One stream from here on: `[text | image]`.
-        let mut x = concat_rows(&t, &x);
-        drop(t);
+        let joint = self.concat(&t, &x);
+        self.give(t);
+        self.give(x);
+        let mut x = joint;
         let wide = 3 * d + 2 * m;
         for block in &self.single {
             if super::cancelled(input.cancel) {
@@ -549,16 +599,18 @@ impl Flux2Transformer {
             clock.lap(|s| &mut s.other);
             let h = self.linear(&normed, n, &block.linear1);
             clock.lap(|s| &mut s.qkv);
-            let (mut q, mut k, v) = split_qkv(&h, n, d, wide);
+            let (mut q, mut k, v) = split_qkv(&h, n, d, wide, &|len| self.take(len));
             head_rms_norm(&mut q, &block.q_norm, c.head_dim, EPS);
             head_rms_norm(&mut k, &block.k_norm, c.head_dim, EPS);
             apply_rope(&mut q, d, c.head_dim, &rope);
             apply_rope(&mut k, d, c.head_dim, &rope);
             let attn = self.attention(&block.linear1, &q, &k, &v, n, heads, scale, &mut times);
-            drop((q, k, v));
+            for buffer in [q, k, v] {
+                self.give(buffer);
+            }
             clock.lap(|s| &mut s.attention);
             // `[attention | silu(a) * b]` for `linear2`.
-            let mut joined = vec![0.0f32; n * (d + m)];
+            let mut joined = self.take(n * (d + m));
             joined
                 .par_chunks_mut(d + m)
                 .zip(attn.par_chunks(d))
@@ -570,11 +622,14 @@ impl Flux2Transformer {
                         *o = crate::engine::tensor::silu(*g) * u;
                     }
                 });
-            drop((attn, h));
+            self.give(attn);
+            self.give(h);
             clock.lap(|s| &mut s.other);
             let out = self.linear(&joined, n, &block.linear2);
+            self.give(joined);
             clock.lap(|s| &mut s.mlp);
             gated_add(&mut x, &out, &sm[2], d);
+            self.give(out);
         }
 
         // `LastLayer`: `shift, scale = chunk(2)` over the image rows.
@@ -582,6 +637,7 @@ impl Flux2Transformer {
         layer_norm_into(&mut normed, &x[n_txt * d..], d, EPS);
         modulate_inplace(&mut normed, shift, scale_v, d);
         let out = self.linear(&normed, n_img, &self.final_linear);
+        self.give(x);
         clock.lap(|s| &mut s.other);
         *self
             .modulation
@@ -614,6 +670,54 @@ impl Flux2Transformer {
 
 /// `q`, `k` and `v` out of rows of `stride` values whose first `3 * dim`
 /// are `q | k | v` — a fused `qkv` projection, or `linear1`'s leading part.
+/// Runs `f` — a pass's host attention — on a pool of its own, as wide as
+/// the global one, when the transformer is on a device: a guided step's
+/// other pass meanwhile runs its norms, adds and device calls' staging on
+/// the global pool, where they would otherwise queue behind this
+/// attention's tasks; the threads of the two share the cores instead.
+/// `ORANGU_FLUX2_ATTENTION_POOL=0` runs it on the caller's pool.
+fn on_attention_pool<T: Send>(on_device: bool, f: impl FnOnce() -> T + Send) -> T {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    if !on_device
+        || !*ON.get_or_init(|| {
+            crate::engine::env::flag_on_unless_disabled("ORANGU_FLUX2_ATTENTION_POOL")
+        })
+    {
+        return f();
+    }
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(rayon::current_num_threads())
+            .thread_name(|i| format!("image-attention-{i}"))
+            .build()
+            .expect("the image attention's thread pool")
+    })
+    .install(f)
+}
+
+/// What the device results' recycle pool may keep while this transformer
+/// is served: a pass's wide buffers, two passes in flight — 4 GiB, or an
+/// eighth of the machine's memory where that is less.
+fn result_pool_bytes() -> usize {
+    const MOST: usize = 4 << 30;
+    #[cfg(unix)]
+    {
+        // Safety: `sysconf` reads a system constant and has no
+        // preconditions.
+        let (pages, page) = unsafe {
+            (
+                libc::sysconf(libc::_SC_PHYS_PAGES),
+                libc::sysconf(libc::_SC_PAGESIZE),
+            )
+        };
+        if pages > 0 && page > 0 {
+            return (pages as usize).saturating_mul(page as usize).min(8 * MOST) / 8;
+        }
+    }
+    MOST / 4
+}
+
 /// `ORANGU_FLUX2_DEVICE_HEADS`, read once: a fixed count of heads for the
 /// card (`0` keeps attention on the host), or `None` — unset or `auto` —
 /// for [`HeadSplit`] to balance.
@@ -654,11 +758,19 @@ impl HeadSplit {
     }
 }
 
-fn split_qkv(rows: &[f32], n: usize, dim: usize, stride: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+/// The first three `dim`-wide columns of rows `stride` wide, as three
+/// `[n, dim]` buffers from `take` (`len` zeros).
+fn split_qkv(
+    rows: &[f32],
+    n: usize,
+    dim: usize,
+    stride: usize,
+    take: &dyn Fn(usize) -> Vec<f32>,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     debug_assert_eq!(rows.len(), n * stride);
-    let mut q = vec![0.0f32; n * dim];
-    let mut k = vec![0.0f32; n * dim];
-    let mut v = vec![0.0f32; n * dim];
+    let mut q = take(n * dim);
+    let mut k = take(n * dim);
+    let mut v = take(n * dim);
     q.par_chunks_mut(dim)
         .zip(k.par_chunks_mut(dim))
         .zip(v.par_chunks_mut(dim))
@@ -672,9 +784,9 @@ fn split_qkv(rows: &[f32], n: usize, dim: usize, stride: usize) -> (Vec<f32>, Ve
 }
 
 /// The gated-SiLU activation over rows of `2 * hidden`: `silu(a) * b`
-/// for the two halves.
-fn swiglu(rows: &[f32], hidden: usize) -> Vec<f32> {
-    let mut out = vec![0.0f32; rows.len() / 2];
+/// for the two halves, into a buffer from `take`.
+fn swiglu(rows: &[f32], hidden: usize, take: &dyn Fn(usize) -> Vec<f32>) -> Vec<f32> {
+    let mut out = take(rows.len() / 2);
     out.par_chunks_mut(hidden)
         .zip(rows.par_chunks(2 * hidden))
         .for_each(|(o, row)| {
@@ -790,7 +902,7 @@ mod tests {
 
     #[test]
     fn swiglu_gates_the_second_half_by_the_first() {
-        let out = swiglu(&[0.0, 2.0, 5.0, 7.0], 2);
+        let out = swiglu(&[0.0, 2.0, 5.0, 7.0], 2, &|len| vec![0.0; len]);
         assert_eq!(out[0], 0.0);
         assert!((out[1] - crate::engine::tensor::silu(2.0) * 7.0).abs() < 1e-6);
     }
@@ -798,7 +910,7 @@ mod tests {
     #[test]
     fn qkv_rows_split_into_thirds_past_a_wider_stride() {
         let rows: Vec<f32> = (0..2 * 8).map(|v| v as f32).collect();
-        let (q, k, v) = split_qkv(&rows, 2, 2, 8);
+        let (q, k, v) = split_qkv(&rows, 2, 2, 8, &|len| vec![0.0; len]);
         assert_eq!(q, vec![0.0, 1.0, 8.0, 9.0]);
         assert_eq!(k, vec![2.0, 3.0, 10.0, 11.0]);
         assert_eq!(v, vec![4.0, 5.0, 12.0, 13.0]);

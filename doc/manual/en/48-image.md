@@ -271,7 +271,9 @@ and each block's attention is split by heads: the card takes a share
 while the CPU computes the rest, the share measured each pass so both
 sides finish together. `ORANGU_FLUX2_DEVICE_HEADS` fixes the card's
 count instead (`0` keeps attention on the CPU); `ORANGU_IMAGE_HEADS_TRACE=1`
-prints each pass's split.
+prints each pass's split. The CPU's share of the attention runs on a
+thread pool of its own, so the other pass's lighter work is not held up
+behind it (`ORANGU_FLUX2_ATTENTION_POOL=0` turns that off).
 
 [klein] does not draw transparency, and an attached picture is a
 starting point rather than an edit (see **Strength** below). There is no

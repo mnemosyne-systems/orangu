@@ -3359,8 +3359,13 @@ const HOST_POOL_BYTES: u64 = 1 << 30;
 /// for the other's next one.
 static RESULT_POOL: std::sync::Mutex<Vec<Vec<f32>>> = std::sync::Mutex::new(Vec::new());
 
-/// The most memory [`RESULT_POOL`] keeps.
+/// The most memory [`RESULT_POOL`] keeps unless a caller raises it
+/// ([`VulkanBackend::hold_results_up_to`]).
 const RESULT_POOL_BYTES: usize = 1 << 30;
+
+/// The most memory [`RESULT_POOL`] keeps now.
+static RESULT_POOL_CAP: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(RESULT_POOL_BYTES);
 
 /// Keeps `buffer` for the next caller of `byte_len`: at most four per size,
 /// the concurrency one device sees, and none past [`HOST_POOL_BYTES`] in
@@ -7869,7 +7874,8 @@ impl Backend for VulkanBackend {
     fn recycle(&self, buffer: Vec<f32>) {
         if let Ok(mut pool) = RESULT_POOL.lock() {
             let held: usize = pool.iter().map(|v| v.capacity() * 4).sum();
-            if held + buffer.capacity() * 4 <= RESULT_POOL_BYTES {
+            let cap = RESULT_POOL_CAP.load(std::sync::atomic::Ordering::Relaxed);
+            if held + buffer.capacity() * 4 <= cap {
                 pool.push(buffer);
             }
         }
@@ -20287,6 +20293,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// `prefill_fused_attn`.
     pub fn prefill_fused_attention_enabled(&self) -> bool {
         self.prefill_fused_attn
+    }
+
+    /// Lets the process's pool of recycled results (`Backend::recycle`) keep
+    /// up to `bytes` — for a model whose passes churn more wide buffers than
+    /// the default keeps. Never lowers it.
+    pub fn hold_results_up_to(&self, bytes: usize) {
+        RESULT_POOL_CAP.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Frees [`Self::gpu_attention_prefill`]'s held query and output buffers
