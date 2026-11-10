@@ -266,7 +266,10 @@ async fn switch_workers(state: &Arc<AppState>, enabled: bool) -> Result<(), Stri
 /// capped by the device's room for tokens unless a context shift cuts
 /// longer prompts to fit.
 pub(crate) fn served_context(engine: &crate::Engine) -> usize {
-    let n_ctx_train = engine.model.config().n_ctx_train;
+    let n_ctx_train = match crate::engine::generate::context_tier() {
+        Some((_, served)) => engine.model.config().n_ctx_train.min(served),
+        None => engine.model.config().n_ctx_train,
+    };
     match crate::engine::generate::kv_device_token_ceiling() {
         Some(ceiling) if engine.context_shift.is_none() => n_ctx_train.min(ceiling),
         _ => n_ctx_train,
@@ -342,6 +345,11 @@ fn props_json(state: &AppState) -> serde_json::Value {
         // the model's own length, or less when the device has room for
         // fewer tokens. A client's context gauge reads it.
         "default_generation_settings": { "n_ctx": served_context(&state.engine) },
+        // The context tier served in place of a configured context the device
+        // could not hold beside the weights, and the context asked for.
+        "context_tier": crate::engine::generate::context_tier().map(|(asked, served)| {
+            serde_json::json!({ "asked": asked, "served": served })
+        }),
         "n_vocab": state.engine.tokenizer.vocab_size(),
         "n_embd": cfg.n_embd,
         "total_slots": state.engine.slots.total(),
@@ -624,6 +632,75 @@ pub async fn slot_action(
             format!("unknown slot action {other:?} (expected \"save\" or \"restore\")\n"),
         )
             .into_response(),
+    }
+}
+
+/// The most row bytes `POST /slots/pool?action=save` writes:
+/// `ORANGU_POOL_SAVE_MIB`, 1024 unless set.
+fn pool_save_cap_bytes() -> u64 {
+    crate::engine::backend::env_tuning_value(
+        "ORANGU_POOL_SAVE_MIB",
+        1024u64,
+        "a whole number of MiB",
+        |_| true,
+    ) << 20
+}
+
+/// `POST /slots/pool?action=save|restore` with a JSON body naming the file:
+/// the paged pool's published pages — every conversation it still holds, the
+/// slots' and everyone else's — written to, or read back from,
+/// `~/.orangu/server/<fingerprint>/slots/<filename>`. What a coordinator
+/// saves before it swaps this model out and the next start restores, so the
+/// conversations survive the swap whichever slot ran them.
+pub async fn pool_action(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SlotActionQuery>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let (Some(store), Some((pool, index))) = (
+        state.engine.slot_store.clone(),
+        state.engine.paged_kv.clone(),
+    ) else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "This server keeps no paged pool to save\n".to_string(),
+        )
+            .into_response();
+    };
+    let filename = match serde_json::from_slice::<SlotActionBody>(&body) {
+        Ok(b) if !b.filename.is_empty() => b.filename,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "request body must be a JSON object with a non-empty \"filename\" field\n"
+                    .to_string(),
+            )
+                .into_response();
+        }
+    };
+    let action = query.action.clone();
+    let name = filename.clone();
+    let outcome = tokio::task::spawn_blocking(move || match action.as_str() {
+        "save" => store
+            .save_pool(&pool, &index, &name, pool_save_cap_bytes())
+            .map(|n| ("n_saved", n)),
+        "restore" => store
+            .restore_pool(&pool, &index, &name)
+            .map(|n| ("n_restored", n)),
+        other => Err(anyhow::anyhow!(
+            "unknown pool action {other:?} (expected \"save\" or \"restore\")"
+        )),
+    })
+    .await;
+    match outcome {
+        Ok(Ok((key, pages))) => Json(serde_json::json!({
+            "filename": filename,
+            key: pages,
+            "page_tokens": state.engine.paged_kv.as_ref().map(|(p, _)| p.page_tokens()),
+        }))
+        .into_response(),
+        Ok(Err(err)) => (StatusCode::BAD_REQUEST, format!("{err}\n")).into_response(),
+        Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err}\n")).into_response(),
     }
 }
 

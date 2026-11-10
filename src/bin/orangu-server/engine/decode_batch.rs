@@ -72,6 +72,9 @@ struct Inner {
     registered: usize,
     pending: Vec<Pending>,
     results: HashMap<u64, Result<Answer>>,
+    /// How long each answered ticket's batch took to compute, its wait for
+    /// the other rows left out — see [`DecodeBatcher::take_last_compute`].
+    computed: HashMap<u64, std::time::Duration>,
     running: bool,
     next_ticket: u64,
 }
@@ -147,6 +150,12 @@ impl Default for DecodeBatcher {
     }
 }
 
+thread_local! {
+    /// The compute time of the batch that last answered this thread's step.
+    static LAST_COMPUTE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl DecodeBatcher {
     /// On unless `ORANGU_DECODE_BATCH=0` — see the module doc.
     pub fn new() -> Self {
@@ -159,6 +168,14 @@ impl DecodeBatcher {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// How long the last batch this thread's step was answered by took to
+    /// compute, without the time the step waited for the other rows — `None`
+    /// when the step ran alone. Read once: a later step that runs alone
+    /// leaves nothing behind.
+    pub fn take_last_compute(&self) -> Option<std::time::Duration> {
+        LAST_COMPUTE.with(std::cell::Cell::take)
     }
 
     /// How many slots a decode step is shared by: those registered, or one
@@ -286,6 +303,8 @@ impl DecodeBatcher {
         let mut inner = self.lock();
         loop {
             if let Some(result) = inner.results.remove(&ticket) {
+                let took = inner.computed.remove(&ticket);
+                LAST_COMPUTE.with(|last| last.set(took));
                 return Some(result);
             }
             let complete = !inner.running
@@ -295,8 +314,13 @@ impl DecodeBatcher {
                 inner.running = true;
                 let batch = std::mem::take(&mut inner.pending);
                 drop(inner);
+                let started = std::time::Instant::now();
                 let results = Self::run_batch(model, batch);
+                let took = started.elapsed();
                 inner = self.lock();
+                for (ticket, _) in &results {
+                    inner.computed.insert(*ticket, took);
+                }
                 inner.results.extend(results);
                 inner.running = false;
                 self.joined.notify_all();

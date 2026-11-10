@@ -302,7 +302,9 @@ fn unmap_pages(mapping: &Mmap) {
 pub fn prefetch_registered() -> Option<u64> {
     // `ORANGU_PREFETCH=0` turns it off (an A/B, a fast disk, a machine whose
     // memory is better left to something else).
-    if std::env::var("ORANGU_PREFETCH").is_ok_and(|v| v.trim() == "0") {
+    if crate::engine::backend::tuning_profile::env_var("ORANGU_PREFETCH")
+        .is_ok_and(|v| v.trim() == "0")
+    {
         return None;
     }
     // Once a process: a second call would only start a second reader.

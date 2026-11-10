@@ -45,12 +45,115 @@ use crate::{Args, Stats, history};
 const BUILTIN: &str = include_str!("fixtures/coding-session.json");
 
 /// A conversation to replay.
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, serde::Serialize)]
 pub struct Fixture {
     pub system: String,
     #[serde(default)]
     pub tools: Option<serde_json::Value>,
     pub turns: Vec<String>,
+    /// What followed each turn's user message in a recorded session: the
+    /// assistant's messages, tool calls and tool results, in order.
+    /// `--chat-fixed` sends these instead of the model's own replies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replies: Option<Vec<Vec<serde_json::Value>>>,
+}
+
+/// How many tool rounds one turn may take while recording: the model's calls
+/// answered and sent back, until it answers in prose.
+const RECORD_ROUNDS: usize = 6;
+
+/// The most of one tool result kept, in bytes.
+const TOOL_RESULT_CAP: usize = 24 * 1024;
+
+/// What is wrong with a tool call, given the declared `tools`: an unknown
+/// name, arguments that are not a JSON object, or a required argument
+/// missing. `None` for a valid call.
+pub fn call_problem(call: &serde_json::Value, tools: Option<&serde_json::Value>) -> Option<String> {
+    let name = call["function"]["name"].as_str().unwrap_or("");
+    let declared = tools
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.iter().find(|t| t["function"]["name"] == name));
+    let Some(declared) = declared else {
+        return Some(format!("`{name}` is not a declared tool"));
+    };
+    let arguments = match &call["function"]["arguments"] {
+        serde_json::Value::String(text) => match serde_json::from_str(text) {
+            Ok(value) => value,
+            Err(_) => return Some(format!("`{name}`'s arguments are not JSON: {text:?}")),
+        },
+        other => other.clone(),
+    };
+    let Some(arguments) = arguments.as_object() else {
+        return Some(format!("`{name}`'s arguments are not an object"));
+    };
+    let required = declared["function"]["parameters"]["required"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_str());
+    for key in required {
+        if !arguments.contains_key(key) {
+            return Some(format!("`{name}` is missing `{key}`"));
+        }
+    }
+    None
+}
+
+/// What a recording answers `call` with: a file's contents and a search's
+/// matches from `workspace`, a plain acknowledgement for what would change
+/// something.
+fn run_tool(call: &serde_json::Value, workspace: Option<&Path>) -> String {
+    let name = call["function"]["name"].as_str().unwrap_or("");
+    let arguments: serde_json::Value = match &call["function"]["arguments"] {
+        serde_json::Value::String(text) => serde_json::from_str(text).unwrap_or_default(),
+        other => other.clone(),
+    };
+    let arg = |key: &str| arguments[key].as_str().unwrap_or("").to_string();
+    let cap = |mut text: String| {
+        if text.len() > TOOL_RESULT_CAP {
+            let mut at = TOOL_RESULT_CAP;
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            text.truncate(at);
+            text.push_str("\n… (truncated)");
+        }
+        text
+    };
+    let Some(workspace) = workspace else {
+        return "(no output: this is a benchmark replay)".to_string();
+    };
+    match name {
+        "read_file" => {
+            let path = workspace.join(arg("path"));
+            match std::fs::read_to_string(&path) {
+                Ok(text) => cap(text),
+                Err(e) => format!("error: {}: {e}", arg("path")),
+            }
+        }
+        "search" => {
+            let mut command = std::process::Command::new("grep");
+            command.args(["-rnI", "-m", "5", "-E", &arg("pattern")]);
+            let glob = arg("glob");
+            if !glob.is_empty() {
+                command.arg(format!("--include={glob}"));
+            }
+            command.arg(".").current_dir(workspace);
+            match command.output() {
+                Ok(out) => {
+                    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+                    if text.is_empty() {
+                        "no matches".to_string()
+                    } else {
+                        cap(text)
+                    }
+                }
+                Err(e) => format!("error: {e}"),
+            }
+        }
+        "write_file" => format!("wrote {} ({} bytes)", arg("path"), arg("content").len()),
+        _ => "(not run while recording)".to_string(),
+    }
 }
 
 impl Fixture {
@@ -166,7 +269,9 @@ pub fn send_turn(
         }
         sample.content.push_str(content);
         if let Some(calls) = calls {
-            sample.tool_calls.extend(calls.iter().cloned());
+            for call in calls {
+                merge_call_delta(&mut sample.tool_calls, call);
+            }
         }
         if let Some(t) = v.get("timings") {
             let u = |k: &str| t[k].as_u64().map(|n| n as u32);
@@ -185,9 +290,52 @@ pub fn send_turn(
     Ok(sample)
 }
 
+/// Folds one streamed tool-call delta into `calls`. A call arrives in pieces
+/// that share an `index` — its id and name first, then its arguments a
+/// fragment at a time — and a client sends back one call per index, its
+/// argument fragments joined. Kept as they came, the pieces became calls of
+/// their own, and the ones with no name broke any chat template that reads
+/// it.
+fn merge_call_delta(calls: &mut Vec<serde_json::Value>, delta: &serde_json::Value) {
+    let index = delta["index"].as_u64().map_or(calls.len(), |i| i as usize);
+    while calls.len() <= index {
+        calls.push(
+            serde_json::json!({"type": "function", "function": {"name": "", "arguments": ""}}),
+        );
+    }
+    let call = &mut calls[index];
+    if let Some(id) = delta["id"].as_str() {
+        call["id"] = serde_json::json!(id);
+    }
+    if let Some(kind) = delta["type"].as_str() {
+        call["type"] = serde_json::json!(kind);
+    }
+    let function = &delta["function"];
+    if let Some(name) = function["name"].as_str() {
+        let joined = format!("{}{name}", call["function"]["name"].as_str().unwrap_or(""));
+        call["function"]["name"] = serde_json::json!(joined);
+    }
+    match &function["arguments"] {
+        serde_json::Value::String(part) => {
+            let joined = format!(
+                "{}{part}",
+                call["function"]["arguments"].as_str().unwrap_or("")
+            );
+            call["function"]["arguments"] = serde_json::json!(joined);
+        }
+        serde_json::Value::Null => {}
+        whole => call["function"]["arguments"] = whole.clone(),
+    }
+}
+
 /// The assistant message a client sends back for `sample`, and the tool
 /// answers its calls need before the next user message.
 fn reply_messages(sample: &TurnSample) -> Vec<serde_json::Value> {
+    reply_messages_in(sample, None)
+}
+
+/// [`reply_messages`], with tool answers from `workspace` when it is given.
+fn reply_messages_in(sample: &TurnSample, workspace: Option<&Path>) -> Vec<serde_json::Value> {
     if sample.tool_calls.is_empty() {
         return vec![serde_json::json!({"role": "assistant", "content": sample.content})];
     }
@@ -203,7 +351,7 @@ fn reply_messages(sample: &TurnSample) -> Vec<serde_json::Value> {
         out.push(serde_json::json!({
             "role": "tool",
             "tool_call_id": id,
-            "content": "(no output: this is a benchmark replay)",
+            "content": run_tool(call, workspace),
         }));
     }
     out
@@ -223,6 +371,15 @@ pub fn run_chat(
             fixture.turns.len()
         );
     }
+    let fixed = match (args.chat_fixed, fixture.replies.as_ref()) {
+        (false, _) => None,
+        (true, Some(replies)) if replies.len() >= turns => Some(replies),
+        (true, _) => anyhow::bail!(
+            "--chat-fixed sends recorded replies, and this fixture has none for {turns} turns \
+             — record one with --chat-record"
+        ),
+    };
+    let mut invalid = 0usize;
     let mut per_turn: Vec<Vec<TurnSample>> = (0..turns).map(|_| Vec::new()).collect();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -235,11 +392,53 @@ pub fn run_chat(
             "role": "system",
             "content": format!("Session {stamp}-{rep}.\n\n{}", fixture.system),
         })];
+        let mut recorded: Vec<Vec<serde_json::Value>> = Vec::new();
         for (turn, text) in fixture.turns.iter().take(turns).enumerate() {
             messages.push(serde_json::json!({"role": "user", "content": text}));
             let sample = send_turn(client, args, &messages, fixture.tools.as_ref())?;
-            messages.extend(reply_messages(&sample));
+            invalid += sample
+                .tool_calls
+                .iter()
+                .filter_map(|call| call_problem(call, fixture.tools.as_ref()))
+                .inspect(|problem| {
+                    if !args.json {
+                        eprintln!("turn {}: invalid tool call: {problem}", turn + 1);
+                    }
+                })
+                .count();
+            if let Some(replies) = fixed {
+                messages.extend(replies[turn].iter().cloned());
+            } else if args.chat_record.is_some() {
+                // A recording runs the turn's tool rounds to the end, so the
+                // fixture holds what an agent's session would.
+                let start = messages.len();
+                let mut reply = reply_messages_in(&sample, args.chat_workspace.as_deref());
+                let mut rounds = 1;
+                while reply.len() > 1 && rounds < RECORD_ROUNDS {
+                    messages.extend(reply);
+                    let next = send_turn(client, args, &messages, fixture.tools.as_ref())?;
+                    reply = reply_messages_in(&next, args.chat_workspace.as_deref());
+                    rounds += 1;
+                }
+                messages.extend(reply);
+                recorded.push(messages[start..].to_vec());
+            } else {
+                messages.extend(reply_messages(&sample));
+            }
             per_turn[turn].push(sample);
+        }
+        if let (Some(path), 0) = (&args.chat_record, rep) {
+            let session = Fixture {
+                system: fixture.system.clone(),
+                tools: fixture.tools.clone(),
+                turns: fixture.turns.iter().take(turns).cloned().collect(),
+                replies: Some(recorded),
+            };
+            std::fs::write(path, serde_json::to_string_pretty(&session)? + "\n")
+                .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+            if !args.json {
+                println!("recorded the session to {}", path.display());
+            }
         }
     }
 
@@ -339,7 +538,8 @@ pub fn run_chat(
         let cached: u64 = all.iter().map(|s| u64::from(s.cached_tokens)).sum();
         let calls: usize = all.iter().map(|s| s.tool_calls.len()).sum();
         println!(
-            "cache: {cached} of {prompt} prompt tokens ({:.1}%) · {calls} tool call(s)",
+            "cache: {cached} of {prompt} prompt tokens ({:.1}%) · {calls} tool call(s), \
+             {invalid} invalid",
             if prompt > 0 {
                 100.0 * cached as f64 / prompt as f64
             } else {
@@ -347,6 +547,19 @@ pub fn run_chat(
             }
         );
     }
+    // Calls the model got wrong, for the whole run: a decode change that
+    // keeps its speed and loses its tool calls is a regression too.
+    records.push(history::Record {
+        date: history::today(),
+        label: label.to_string(),
+        mode: "chat-invalid-calls".to_string(),
+        n: turns as u32,
+        best: invalid as f64,
+        mean: invalid as f64,
+        sd: 0.0,
+        sd_sample: None,
+        device: None,
+    });
     Ok(records)
 }
 
@@ -382,5 +595,93 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert_eq!(out[1]["tool_call_id"], "a");
         assert_eq!(out[2]["tool_call_id"], "call_1");
+    }
+
+    /// A call streamed in pieces is sent back as one call with its name and
+    /// its arguments joined, and two calls stay two.
+    #[test]
+    fn streamed_call_pieces_join_into_one_call() {
+        let mut calls = Vec::new();
+        for delta in [
+            serde_json::json!({"index": 0, "id": "c0", "type": "function", "function": {"name": "read_file", "arguments": ""}}),
+            serde_json::json!({"index": 0, "function": {"arguments": "{\"path\":"}}),
+            serde_json::json!({"index": 0, "function": {"arguments": "\"a.rs\"}"}}),
+            serde_json::json!({"index": 1, "id": "c1", "function": {"name": "ls", "arguments": "{}"}}),
+        ] {
+            super::merge_call_delta(&mut calls, &delta);
+        }
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "c0");
+        assert_eq!(calls[0]["function"]["name"], "read_file");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
+        assert_eq!(calls[1]["function"]["name"], "ls");
+    }
+
+    /// A call is valid when it names a declared tool with an object of
+    /// arguments that has every required key.
+    #[test]
+    fn a_tool_call_is_checked_against_the_declared_tools() {
+        let tools = Fixture::load(None).unwrap().tools;
+        let call = |name: &str, args: serde_json::Value| serde_json::json!({"function": {"name": name, "arguments": args}});
+        assert_eq!(
+            call_problem(
+                &call("read_file", serde_json::json!("{\"path\":\"a\"}")),
+                tools.as_ref()
+            ),
+            None
+        );
+        assert_eq!(
+            call_problem(
+                &call("read_file", serde_json::json!({"path": "a"})),
+                tools.as_ref()
+            ),
+            None
+        );
+        assert!(
+            call_problem(
+                &call("delete_everything", serde_json::json!("{}")),
+                tools.as_ref()
+            )
+            .unwrap()
+            .contains("not a declared tool")
+        );
+        assert!(
+            call_problem(
+                &call("read_file", serde_json::json!("{\"path\":")),
+                tools.as_ref()
+            )
+            .unwrap()
+            .contains("not JSON")
+        );
+        assert!(
+            call_problem(&call("read_file", serde_json::json!("{}")), tools.as_ref())
+                .unwrap()
+                .contains("missing `path`")
+        );
+    }
+
+    /// A recording answers reads and searches from the checkout and keeps
+    /// the session's fixture shape, replies included.
+    #[test]
+    fn a_recording_answers_from_the_workspace_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let read = serde_json::json!({"function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}});
+        assert_eq!(run_tool(&read, Some(dir.path())), "fn main() {}\n");
+        let search =
+            serde_json::json!({"function": {"name": "search", "arguments": {"pattern": "main"}}});
+        assert!(run_tool(&search, Some(dir.path())).contains("a.rs:1:"));
+        assert!(run_tool(&read, None).contains("no output"));
+        let fixture = Fixture {
+            system: "s".into(),
+            tools: None,
+            turns: vec!["t".into()],
+            replies: Some(vec![vec![
+                serde_json::json!({"role": "assistant", "content": "ok"}),
+            ]]),
+        };
+        let back: Fixture =
+            serde_json::from_str(&serde_json::to_string(&fixture).unwrap()).unwrap();
+        assert_eq!(back.replies.unwrap()[0][0]["content"], "ok");
     }
 }

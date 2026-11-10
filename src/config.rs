@@ -59,6 +59,11 @@ impl FromStr for SshMode {
     }
 }
 
+/// `[orangu].compact_at` when unset: compact once a turn leaves the
+/// conversation 85% full, which leaves room for the next turn's tool output
+/// and for the summarising pass's own answer.
+pub const DEFAULT_COMPACT_AT: u8 = 85;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct ClientAppConfiguration {
     pub default_server: String,
@@ -99,7 +104,8 @@ pub struct ClientAppConfiguration {
     /// How many levels of subagents may run below the main conversation.
     pub subagent_depth: usize,
     /// `[orangu].compact_at` — compact the conversation after a turn that
-    /// leaves it this percent full of the context; `0` (the default) never.
+    /// leaves it this percent full of the context (85 unless set); `0`
+    /// never.
     pub compact_at: u8,
     /// Whether subagents run in the background unless a call says otherwise.
     pub subagent_background: bool,
@@ -333,7 +339,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
     let subagent_depth = parse_client_field(&client, "subagent_depth", default_subagent_depth)?;
     let subagent_background = parse_client_field(&client, "subagent_background", || false)?;
     let ssh = parse_client_field(&client, "ssh", SshMode::default)?;
-    let compact_at = parse_client_field(&client, "compact_at", || 0u8)?;
+    let compact_at = parse_client_field(&client, "compact_at", || DEFAULT_COMPACT_AT)?;
     if compact_at > 100 {
         return Err(anyhow!(
             "invalid value for [{CLIENT_SECTION}].compact_at: {compact_at} (0 to 100)"
@@ -1064,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_at_defaults_to_off_and_is_a_percentage() {
+    fn compact_at_defaults_to_85_and_is_a_percentage() {
         let load = |extra: &str| {
             let mut file = tempfile::NamedTempFile::new().unwrap();
             writeln!(
@@ -1074,8 +1080,9 @@ mod tests {
             .unwrap();
             load_client_configuration(file.path())
         };
-        assert_eq!(load("").unwrap().compact_at, 0);
-        assert_eq!(load("compact_at = 85").unwrap().compact_at, 85);
+        assert_eq!(load("").unwrap().compact_at, 85);
+        assert_eq!(load("compact_at = 0").unwrap().compact_at, 0);
+        assert_eq!(load("compact_at = 70").unwrap().compact_at, 70);
         assert!(load("compact_at = 101").is_err());
         assert!(load("compact_at = high").is_err());
     }

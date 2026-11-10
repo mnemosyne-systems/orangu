@@ -932,8 +932,9 @@ Suggested model size (Dedicated)
   ...
 
   Catalogue models that fit, with the context that fits:
-    unsloth/gemma-4-E2B-it-GGUF:Q4_K_M            3.1 GB    8K  all,code,review  MTP head
-    unsloth/Qwen3-4B-GGUF:Q4_K_M                  2.5 GB   16K  all,code  draft_model unsloth/Qwen3-0.6B-GGUF:Q4_K_M
+    (decode estimate: weights read at <rate> GB/s on <card>, measured here)
+    unsloth/gemma-4-E2B-it-GGUF:Q4_K_M            3.1 GB    8K  ~<n> tok/s  all,code,review
+    unsloth/Qwen3-4B-GGUF:Q4_K_M                  2.5 GB   16K  ~<n> tok/s  all,code  draft_model unsloth/Qwen3-0.6B-GGUF:Q4_K_M
     ...
 ```
 
@@ -943,6 +944,21 @@ fetches for it, with its file's size, the largest context up to the one it
 is sized for whose memory fits beside the file, the roles it suits, and the
 drafter that pairs with it where there is one. A model listed at a shorter
 context than another of its size has a larger cache per token.
+
+**The decode estimate is measured on this machine.** A decode step reads
+every weight a token touches once, so its rate is close to how fast the
+decode kernel reads weights, divided by the bytes a token touches. The first
+is measured: `suggest` runs the server's own one-token `Q4_K` kernel over
+256 MiB of weights on the card the server would choose, and on the cores,
+for a second and a half each, and keeps the result per device and driver in
+`~/.orangu/server/tuning/speed-<key>.json`, so only the first run pays for
+it. The second comes from the catalogue: the file, or for a mixture of
+experts (`…-A3B`) the share its active parameters are, and for a gemma-4 `E`
+model (`…-E2B`) its effective ones. The `Dedicated` table prices its models
+at the card's rate, the `Total` table at the rate of the pool it names. It
+is a best case — the weights alone, at depth zero, one stream — and attention
+at depth, layers moved to the host and a busy machine are slower. Delete the
+file to measure again.
 
 Both budgets are a **largest single pool**, never a sum of pools: a model
 is loaded onto one device and runs on one backend, with no tensor split
@@ -1169,14 +1185,22 @@ effect.
 
 `--json` prints the verdict as one line a program can act on — the
 coordinator asks it before every start: `runs`, the `problems` that stop it,
-and the arithmetic behind it. `needs_bytes` is the weights every token
-touches (`dense_bytes`) plus `kv_bytes`, the KV cache for the configured
-`[orangu-server].context` (`context`; counted with `--deep`, which opens the
-model to price it, and zero when it is unset); `capacity_bytes`
-is the machine's memory (`memory_bytes`) plus its dedicated cards'
-(`device_memory_bytes`, zero under `backend = cpu`). `runs` is false when the
-needs exceed the capacity, and with `--deep` when a shard is missing or the
-architecture unknown. `kv_bytes_per_token` gives one token's
+and the arithmetic behind it. The model is placed card by card. The weights a
+device backend uploads, with their KV cache, fill each dedicated card in turn;
+`devices` lists each card's `memory_bytes` and `placed_bytes`. What the cards
+cannot hold runs from the machine's memory, beside the weights no card takes
+and the host KV pool. The KV cache is counted for every slot (`slots`) at the
+configured `[orangu-server].context` (`context`; with `--deep`, which opens the
+model to price it, and zero when it is unset): `kv_device_bytes` at two bytes
+an element on the cards, and `kv_host_bytes` as the pool's `f32` rows, up to
+the pool's size. `device_needs_bytes` is what wants a card, `host_needs_bytes`
+what only the machine's memory holds, and `memory_needs_bytes` the machine's
+memory needed in all, against `memory_bytes`. `runs` is false when that is more
+than the machine has, and with `--deep` when a shard is missing or the
+architecture unknown. `needs_bytes` and `capacity_bytes` give the two
+together: everything the model needs, against the machine's memory plus its
+dedicated cards' (`device_memory_bytes`, zero under `backend = cpu`).
+`kv_bytes_per_token` gives one token's
 KV bytes in each storage choice.
 
 The split is the answer, not the file size. **Dense** weights are touched by
@@ -2032,7 +2056,7 @@ shown.
 | `context_keep`          | `0`                                        | first tokens a context shift always keeps; at least the first token, at most half the window |
 | `context_shift_drop`    | `0.5`                                      | share of the tokens after those that one step of a context shift drops, above `0`, up to `1` |
 | `queue_limit`           | `16`                                       | requests allowed to wait for a slot before `503`; `0` is unbounded                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `context`               | —                                          | tokens one request must fit on the device; set, layers move to the host until the card has room for that much KV cache                                                                                                                                                                                                                                                                                                                                                                               |
+| `context`               | —                                          | tokens one request must fit on the device; when the card cannot hold that much KV cache beside the weights, the largest context tier below it that fits is served instead, with every layer on the card, and `/props` reports it under `context_tier`                                                                                                                                                                                                                                                |
 | `api_key`               | —                                          | bearer token every request must carry; unset leaves the server open                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `tls_cert` / `tls_key`  | —                                          | PEM paths for serving HTTPS; both or neither                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `reasoning_effort`      | — (the template decides)                   | how hard a reasoning model is asked to think, in its own template's words; see **Roles** below                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -2228,7 +2252,10 @@ loses the start of a too-long review rather than a file's surrounding context.
 what stays again before writing the next token. The reply pauses for that read,
 and otherwise continues as if nothing happened: stop strings, `logprobs`, a
 required tool call's name and a JSON constraint all carry on from where they
-were. `max_tokens` still ends the reply. The read covers every family, recurrent
+were. Speculation carries on too: a verify never picks a token past the window,
+so nothing it picked is left for the shift to take back. A sampled reply draws
+each token by its place in the whole conversation, the dropped tokens counted,
+so the positions the window counts again after a shift draw afresh. `max_tokens` still ends the reply. The read covers every family, recurrent
 and hybrid models too, because the state is computed from the kept tokens rather
 than patched, so the tokens after a shift are the ones a fresh request for that
 shorter conversation produces. A model whose layers other nodes hold (see
@@ -2285,8 +2312,13 @@ failure stops the server with a message naming what is wrong.
 accepted only when it equals what the request's own sampler picks at that
 position, and the sampler's random draw for a position depends on the seed and
 the position alone — not on how many draws came before — so the verifier picks
-at every drafted position what plain decoding would have picked there, and the
-output is identical. Under a `response_format` constraint the verifier picks
+at every drafted position what plain decoding would have picked from the same
+logits. The verify computes those logits for several tokens in one pass. Its
+`Q4_K` and `Q6_K` multi-token kernels give each token bit for bit what the
+one-token kernels give it; the short-row `Q4_K` form, the prompt GEMM's tiles
+and the other weight types sum in a different order. So the output is plain
+decoding's up to that rounding: where two tokens score within rounding of each
+other, a reply with a draft can take the other one. Under a `response_format` constraint the verifier picks
 each position in order and the grammar advances once per pick, so at every
 position it has seen exactly the tokens accepted before it; a drafted token the
 grammar forbids differs from the pick and ends the accepted run. A hybrid model — `qwen35`, `qwen35moe`,
@@ -2305,9 +2337,11 @@ speculate only with `ORANGU_SPEC_RECURRENT=1`: the state is saved before
 each verify (on the device, where it lives there), and when part of a draft
 is rejected it goes back to that copy and the accepted tokens run again.
 `ORANGU_SPEC_RECURRENT=0` turns it off everywhere. Either way the output is
-what plain decoding emits. A draft
-model that is itself hybrid is not built, and neither is an MTP head on a
-hybrid model, nor any drafter for a model split across nodes of a tree.
+what plain decoding emits, up to the same rounding. A draft
+model that is itself hybrid is not used — its state cannot be cut back to an
+accepted prefix — and prompt lookup drafts in its place; an MTP head on a
+hybrid model is not built either, nor any drafter for a model split across
+nodes of a tree.
 
 **Whether it pays is a question about your hardware, not about the models.**
 Measured here on a 4 GiB card with a target that does not fit on it
@@ -3156,10 +3190,7 @@ Five GPU backends are available, chosen via `backend` in the config (or
   driver with no AMD-specific code needed, and reaches NVIDIA/Intel GPUs
   the same way, wherever a working Vulkan driver is installed — no Vulkan
   SDK is needed to _build_ `orangu-server`, only a Vulkan driver to _run_
-  it on a GPU. Verified end-to-end against real AMD hardware. Still
-  meaningfully behind the reference implementation's tuned Vulkan backend on
-  the same model and hardware — a real, ongoing, and openly tracked performance
-  gap, not a hidden one.
+  it on a GPU. Verified end-to-end against real AMD hardware.
 - **Metal** (`backend = metal`, Apple GPUs; the default on macOS) — the
   Vulkan backend's engine and its kernels, running on Apple hardware. Not
   a separate, smaller implementation: the compute shaders, the cached
@@ -5037,6 +5068,15 @@ and the request fields that shape a turn (`stop`, `n`, `logprobs`, `logit_bias`,
 `cache_prompt`, `id_slot`, `timings_per_token`, `return_progress`,
 `response_format`, `tools`, `tool_choice`), are documented in the _HTTP
 endpoints_ chapter, which is the one place each is described.
+
+A chat request's prompt is turned into tokens once per part, not once per
+request. The server keeps the tokens of the sixteen most recent chat prompts,
+each up to its last special token, and a prompt that begins with one of them
+encodes only what follows it. A conversation's next turn repeats the last one
+and adds to it, so a long session spends its tokenizer time on the new turn
+alone, and a client running several subagents finds each conversation's own.
+The tokens are the same as encoding the whole prompt; where the encoder could
+join text across the boundary, the prompt is encoded in full.
 
 ## Endpoint reference
 

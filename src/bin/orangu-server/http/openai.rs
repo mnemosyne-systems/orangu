@@ -982,6 +982,9 @@ pub(crate) fn request_role(state: &AppState, headers: &HeaderMap) -> crate::conf
 pub(crate) struct RenderedChat {
     pub(crate) tokens: Vec<u32>,
     pub(crate) cache_point: Option<usize>,
+    /// Where the conversation's leading system messages end — see
+    /// `GenerateRequest::shared_point`.
+    pub(crate) shared_point: Option<usize>,
 }
 
 /// How [`render_chat`] departs from rendering a conversation for the role's
@@ -1119,9 +1122,52 @@ pub(crate) async fn render_chat(
         })
         .flatten()
         .filter(|head| prompt.starts_with(head.as_str()) && head.len() < prompt.len());
+    // And where the leading system messages end, with the tools: the part
+    // another conversation repeats — see `GenerateRequest::shared_point`. A
+    // template may refuse a conversation without a user message, so the
+    // system part is what two renderings agree on whose next message
+    // differs, cut back to a line's end.
+    let n_system = messages.iter().take_while(|m| m.role == "system").count();
+    let shared = (head.is_some() && n_system > 0 && n_system < messages.len())
+        .then(|| {
+            let with = |content: &str| {
+                let mut probe = messages[..=n_system].to_vec();
+                probe[n_system].content = content.to_string();
+                probe[n_system].images.clear();
+                probe[n_system].image_at.clear();
+                probe[n_system].tool_calls = None;
+                template
+                    .render_with_tools(&probe, false, bos, eos, reasoning, tools)
+                    .ok()
+            };
+            let (a, b) = (with("a")?, with("b")?);
+            let common = a
+                .char_indices()
+                .zip(b.chars())
+                .find(|((_, x), y)| x != y)
+                .map_or(a.len().min(b.len()), |((i, _), _)| i);
+            let end = a[..common].rfind('\n')? + 1;
+            Some(a[..end].to_string())
+        })
+        .flatten()
+        .filter(|shared| prompt.starts_with(shared.as_str()) && shared.len() < prompt.len());
     if let Some(suffix) = options.suffix {
         prompt.push_str(suffix);
     }
+    // The head first: the prompt extends it, so encoding the prompt next
+    // reuses the head's tokens and encodes only the generation prompt.
+    let head = match head {
+        Some(head) => {
+            Some(crate::http::encode_prompt_off_runtime(&state.engine.tokenizer, head).await)
+        }
+        None => None,
+    };
+    let shared = match shared {
+        Some(shared) => {
+            Some(crate::http::encode_prompt_off_runtime(&state.engine.tokenizer, shared).await)
+        }
+        None => None,
+    };
     let tokens = match vision {
         Some(vision) => {
             let pictures: Vec<String> = pictures.iter().map(|p| p.to_string()).collect();
@@ -1133,18 +1179,16 @@ pub(crate) async fn render_chat(
             .map_err(|err| bad_request(anyhow::anyhow!("reading the pictures: {err}")))?
             .map_err(bad_request)?
         }
-        None => crate::http::encode_off_runtime(&state.engine.tokenizer, prompt, false).await,
+        None => crate::http::encode_prompt_off_runtime(&state.engine.tokenizer, prompt).await,
     };
-    let cache_point = match head {
-        Some(head) => {
-            let head = crate::http::encode_off_runtime(&state.engine.tokenizer, head, false).await;
-            cache_point_of(&head, &tokens)
-        }
-        None => None,
-    };
+    let cache_point = head.and_then(|head| cache_point_of(&head, &tokens));
+    let shared_point = shared
+        .and_then(|shared| cache_point_of(&shared, &tokens))
+        .filter(|&at| cache_point.is_some_and(|c| at < c));
     Ok(RenderedChat {
         tokens,
         cache_point,
+        shared_point,
     })
 }
 
@@ -1450,6 +1494,7 @@ pub async fn chat_completions(
     let RenderedChat {
         tokens,
         cache_point,
+        shared_point,
     } = match render_chat(
         &state,
         role,
@@ -1539,6 +1584,7 @@ pub async fn chat_completions(
                     timings_per_token: req.stream && req.timings_per_token,
                     role: Some(role),
                     cache_point,
+                    shared_point,
                     background: false,
                     reasoning_budget: None,
                     stop: stop.clone(),
@@ -2305,6 +2351,7 @@ pub async fn completions(
                     timings_per_token: false,
                     role: Some(role),
                     cache_point: None,
+                    shared_point: None,
                     background: false,
                     reasoning_budget: None,
                     stop: stop.clone(),

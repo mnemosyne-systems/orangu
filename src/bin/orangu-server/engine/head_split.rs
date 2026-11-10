@@ -112,7 +112,7 @@ pub fn enabled() -> bool {
 }
 
 fn forced_share() -> Option<f64> {
-    std::env::var("ORANGU_HEAD_SPLIT_SHARE")
+    crate::engine::backend::tuning_profile::env_var("ORANGU_HEAD_SPLIT_SHARE")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|s| (0.0..1.0).contains(s))

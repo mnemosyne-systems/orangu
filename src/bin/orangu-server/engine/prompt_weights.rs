@@ -260,7 +260,7 @@ fn best_of(f: &mut dyn FnMut()) -> f64 {
 /// Decides, and builds the copies when the answer is yes. Called by `main`
 /// once the model is built and where its prompts run is settled.
 pub fn prepare(loaded: &LoadedModel, choice: PromptWeights) {
-    let choice = std::env::var("ORANGU_PROMPT_WEIGHTS")
+    let choice = crate::engine::backend::tuning_profile::env_var("ORANGU_PROMPT_WEIGHTS")
         .ok()
         .and_then(|v| PromptWeights::parse(&v))
         .unwrap_or(choice);
@@ -406,7 +406,7 @@ impl Decision {
 /// ([`build_for_layers`]). Whether the copies fit is asked there, of the
 /// layers the node runs.
 pub fn decide(loaded: &LoadedModel, choice: PromptWeights) -> Decision {
-    let choice = std::env::var("ORANGU_PROMPT_WEIGHTS")
+    let choice = crate::engine::backend::tuning_profile::env_var("ORANGU_PROMPT_WEIGHTS")
         .ok()
         .and_then(|v| PromptWeights::parse(&v))
         .unwrap_or(choice);

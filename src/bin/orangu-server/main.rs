@@ -52,6 +52,7 @@ mod prune;
 mod reexec;
 mod refresh;
 mod shell;
+mod speed;
 mod suggest;
 mod tls;
 mod web;
@@ -1656,6 +1657,67 @@ fn prepare(args: Args) -> Result<Prepared> {
         weights_device_bytes + kv <= budget
     };
     let fits_context = |kv: u64| fits_weights_beside(kv + kv_pool_scratch_reserve_bytes());
+    // A requested context that does not fit beside the weights is served at
+    // the largest tier below it that does, with every layer still on the
+    // card, rather than moving layers to the host for room — see
+    // `context_tiers_below`. `ORANGU_CONTEXT_TIERS=0` keeps the context and
+    // moves the layers.
+    let context_kv_bytes = match context_kv_bytes {
+        Some((context, kv))
+            if !fits_context(kv)
+                && engine::env::flag_on_unless_disabled("ORANGU_CONTEXT_TIERS") =>
+        {
+            let kv_at = |tokens: usize| {
+                let wgpu = backend.as_wgpu()?;
+                Some(
+                    engine::kv_pool::device_bytes_for(
+                        engine::arch::kv_elements_per_token(&loaded),
+                        wgpu.kv_storage(),
+                    ) * tokens as u64
+                        + engine::kv_pool::device_bytes_for(
+                            engine::arch::kv_fixed_elements(&loaded, tokens),
+                            wgpu.kv_storage(),
+                        ),
+                )
+            };
+            match context_tiers_below(context).find_map(|tier| {
+                kv_at(tier)
+                    .filter(|&kv| fits_context(kv))
+                    .map(|kv| (tier, kv))
+            }) {
+                Some((tier, tier_kv)) => {
+                    log::warn!(
+                        "orangu-server: [kv] a context of {context} tokens needs {} of KV cache \
+                         beside the weights, more than the selected device has — serving a \
+                         {tier}-token context tier with every layer on the device \
+                         (`ORANGU_CONTEXT_TIERS=0` keeps the context and moves layers to the host)",
+                        orangu::format::format_bytes(kv)
+                    );
+                    engine::generate::set_context_tier(Some((context, tier)));
+                    Some((tier, tier_kv))
+                }
+                // Not even the least usable context fits beside every layer:
+                // layers move to the host, but only until that context fits,
+                // not the one asked for, whose cache could take most of the
+                // model off the card.
+                None => match kv_at(MIN_USABLE_CONTEXT) {
+                    Some(least) if MIN_USABLE_CONTEXT < context => {
+                        log::warn!(
+                            "orangu-server: [kv] a context of {context} tokens needs {} of KV \
+                             cache, and not even {MIN_USABLE_CONTEXT} tokens fit beside the \
+                             weights — serving a {MIN_USABLE_CONTEXT}-token context tier, with \
+                             layers moved to the host until it fits",
+                            orangu::format::format_bytes(kv)
+                        );
+                        engine::generate::set_context_tier(Some((context, MIN_USABLE_CONTEXT)));
+                        Some((MIN_USABLE_CONTEXT, least))
+                    }
+                    _ => Some((context, kv)),
+                },
+            }
+        }
+        other => other,
+    };
     // A picture model's transformer runs every step and its text encoder
     // once a picture, so where both want the selected device the
     // transformer is served first: the encoder is split as though the
@@ -2615,7 +2677,20 @@ fn prepare(args: Args) -> Result<Prepared> {
             // reports a draft on its banner, and then fails every generation.
             supports_multi_position(model.as_ref(), &architecture)?;
             supports_multi_position(draft.model.as_ref(), &draft.label)?;
-            (Some(Arc::new(draft)), footprint)
+            // A draft's cache follows the served model's by truncating it,
+            // which a recurrent state cannot; such a draft would only take
+            // memory. Prompt lookup drafts instead.
+            if draft.model.new_kv_cache(1).has_recurrent() {
+                log::warn!(
+                    "orangu-server: [speculative] draft model {} has recurrent layers, whose \
+                     state a rejected draft cannot be cut back from; not used — prompt lookup \
+                     drafts instead",
+                    draft.label
+                );
+                (None, None)
+            } else {
+                (Some(Arc::new(draft)), footprint)
+            }
         }
         None => (None, None),
     };
@@ -2904,9 +2979,10 @@ fn prepare(args: Args) -> Result<Prepared> {
             // stays until the request ends. A sequence the table has no room
             // for is declined from the pool and runs on a cache of its own.
             if let Some(wgpu) = backend.as_wgpu() {
-                let (device, _) = wgpu.device_and_queue();
+                let (device, queue) = wgpu.device_and_queue();
                 let entries = pool.num_pages() * conf.slots * 2;
                 if pool.attach_device(device, wgpu.kv_storage(), entries) {
+                    pool.keep_queue(queue);
                     log::info!(
                         "orangu-server: [kv] device pages — {:.2} GiB across {} layers",
                         pool.device_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -2925,7 +3001,9 @@ fn prepare(args: Args) -> Result<Prepared> {
                 wgpu.report_device_memory("vulkan");
             }
             let index = engine::prefix_index::PrefixIndex::new(page_tokens);
-            Some((Arc::new(pool), Arc::new(index)))
+            let pool = Arc::new(pool);
+            release_idle_device_pages(&pool);
+            Some((pool, Arc::new(index)))
         })
         .flatten();
     if host_formats.is_some() && paged_kv.is_none() {
@@ -3238,6 +3316,17 @@ fn prepare(args: Args) -> Result<Prepared> {
         && let Some(store) = &slot_store
     {
         let restored = store.restore_all(&prefix);
+        if let Some((pool, index)) = &paged_kv {
+            match store.restore_pool(pool, index, &format!("{prefix}-pool.bin")) {
+                Ok(0) => {}
+                Ok(pages) => engine::adapt::note(
+                    "pool restore",
+                    format!("{pages} page(s) of {} tokens", pool.page_tokens()),
+                    format!("from the {prefix}-pool.bin file a swap saved"),
+                ),
+                Err(err) => log::warn!("orangu-server: the pool was not restored: {err}"),
+            }
+        }
         let tokens: usize = restored.iter().sum();
         if tokens > 0 {
             engine::adapt::note(
@@ -3259,6 +3348,9 @@ fn prepare(args: Args) -> Result<Prepared> {
         &tokenizer,
         &backend,
     )?;
+    // Start-up's reads are done: later ones are not recorded as reads made
+    // before a tuning profile was installed.
+    engine::backend::tuning_profile::settled();
     let engine = Arc::new(Engine {
         paged_kv: paged_kv.clone(),
         metrics: Arc::new(engine::metrics::ServerMetrics::new()),
@@ -3479,6 +3571,9 @@ fn prepare_audio(start: AudioStart<'_>) -> Result<Prepared> {
         loaded.config.clone(),
     ));
     drop(loaded);
+    // Start-up's reads are done: later ones are not recorded as reads made
+    // before a tuning profile was installed.
+    engine::backend::tuning_profile::settled();
     let engine = Arc::new(Engine {
         paged_kv: None,
         metrics: Arc::new(engine::metrics::ServerMetrics::new()),
@@ -5300,9 +5395,11 @@ fn run_command(
             let cpu = orangu::hardware::detect_cpu();
             let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
             let npu = orangu::npu::detect_npu_inventory();
+            // This machine's own kernels, measured once per device and kept.
+            let rates = speed::rates();
             print!(
                 "{}",
-                suggest::format_suggestion(&os, &cpu, &gpus, npu.as_ref())
+                suggest::format_suggestion(&os, &cpu, &gpus, npu.as_ref(), &rates)
             );
             Ok(())
         }
@@ -5374,37 +5471,68 @@ fn run_command(
                 // Against the machine's *total* memory, not what is free: the
                 // caller is typically about to stop another model to make
                 // room, and what it needs to know is whether any amount of
-                // room would do. A dedicated card's memory counts beside the
-                // machine's — weights on the card need no room in RAM — and
-                // a configured context's KV cache counts beside the weights,
-                // at two bytes an element, the least any storage takes.
+                // room would do. Each card is checked on its own — see
+                // `fit_plan` — and the KV cache is counted for every slot.
                 let context = requested_context(None, conf.context);
-                let kv_bytes = context
+                let kv_elements = context
                     .filter(|_| deep)
-                    .and_then(|context| kv_bytes_at(&path, context))
+                    .and_then(|context| kv_elements_at(&path, context))
                     .unwrap_or(0);
-                let device_memory_bytes = device_memory_bytes(&conf, &gpus);
-                let needs_bytes = plan.dense_bytes + kv_bytes;
+                let on_device = !matches!(conf.backend, config::BackendPreference::Cpu);
+                let cards: Vec<(String, u64)> = gpus
+                    .iter()
+                    .filter(|_| on_device)
+                    .filter(|g| g.memory_kind == orangu::hardware::MemoryKind::Dedicated)
+                    .filter_map(|g| Some((g.name.clone(), g.vram_total_bytes?)))
+                    .collect();
+                let fit = fit_plan(&FitInputs {
+                    dense: plan.dense_bytes,
+                    device_weights: plan.device_bytes.min(plan.dense_bytes),
+                    kv_elements,
+                    slots: conf.slots as u64,
+                    host_pool: engine::backend::env_tuning_value(
+                        "ORANGU_KV_POOL_BYTES",
+                        default_host_kv_pool_bytes(cpu.total_memory_bytes),
+                        "a positive byte count",
+                        |v: u64| v > 0,
+                    ),
+                    cards: &cards,
+                });
+                let kv_bytes = fit.kv_device + fit.kv_host;
+                let device_memory_bytes: u64 = cards.iter().map(|(_, b)| b).sum();
+                // The card this profile's server lands on: the one its
+                // `device` names, else the largest.
+                let card_bytes = match &conf.device {
+                    engine::backend::device::DeviceRequest::Name(name) => {
+                        let name = name.to_lowercase();
+                        cards
+                            .iter()
+                            .find(|(card, _)| card.to_lowercase().contains(&name))
+                            .map(|(_, b)| *b)
+                    }
+                    _ => cards.iter().map(|(_, b)| *b).max(),
+                };
+                let needs_bytes = fit.device_needs + fit.host_needs;
                 let capacity_bytes = cpu.total_memory_bytes + device_memory_bytes;
-                let runs = problems.is_empty() && needs_bytes <= capacity_bytes;
-                if needs_bytes > capacity_bytes {
+                let runs = problems.is_empty() && fit.memory_needs <= cpu.total_memory_bytes;
+                if fit.memory_needs > cpu.total_memory_bytes {
                     problems.push(format!(
-                        "the weights every token touches ({}){} are more than this machine's \
-                         memory{} ({})",
-                        orangu::format::format_bytes(plan.dense_bytes),
-                        context
-                            .filter(|_| kv_bytes > 0)
-                            .map(|c| format!(
-                                " and the KV cache for {c} tokens of context ({})",
-                                orangu::format::format_bytes(kv_bytes)
-                            ))
-                            .unwrap_or_default(),
-                        if device_memory_bytes > 0 {
-                            " and its cards'"
+                        "it needs {} of this machine's memory ({}) — the weights the cards \
+                         cannot hold{}, and the KV cache for {} slot(s){}",
+                        orangu::format::format_bytes(fit.memory_needs),
+                        orangu::format::format_bytes(cpu.total_memory_bytes),
+                        if fit.overflow > 0 {
+                            format!(
+                                " ({} past the cards)",
+                                orangu::format::format_bytes(fit.overflow)
+                            )
                         } else {
-                            ""
+                            String::new()
                         },
-                        orangu::format::format_bytes(capacity_bytes)
+                        conf.slots,
+                        context
+                            .map(|c| format!(" at {c} tokens of context"))
+                            .unwrap_or_default(),
                     ));
                 }
                 println!(
@@ -5417,14 +5545,26 @@ fn run_command(
                         "device_bytes": plan.device_bytes,
                         "memory_bytes": cpu.total_memory_bytes,
                         "device_memory_bytes": device_memory_bytes,
+                        "card_bytes": card_bytes,
                         "context": context,
+                        "slots": conf.slots,
                         "kv_bytes": kv_bytes,
+                        "kv_device_bytes": fit.kv_device,
+                        "kv_host_bytes": fit.kv_host,
                         "kv_bytes_per_token": kv_elements_per_token(&path).map(|elements| {
                             engine::plan::kv_footprints(elements)
                                 .into_iter()
                                 .map(|(name, bytes)| (name.to_string(), bytes))
                                 .collect::<std::collections::BTreeMap<_, _>>()
                         }),
+                        "devices": fit.placed.iter().map(|(name, memory, placed)| serde_json::json!({
+                            "name": name,
+                            "memory_bytes": memory,
+                            "placed_bytes": placed,
+                        })).collect::<Vec<_>>(),
+                        "device_needs_bytes": fit.device_needs,
+                        "host_needs_bytes": fit.host_needs,
+                        "memory_needs_bytes": fit.memory_needs,
                         "needs_bytes": needs_bytes,
                         "capacity_bytes": capacity_bytes,
                         "checked": deep,
@@ -5564,7 +5704,7 @@ fn run_command(
             let path = orangu::model_download::download_model(&conf.models, &repo)?;
             println!("Downloaded to {}", path.display());
             if with_drafter {
-                download_catalogue_drafter(&conf.models, &repo, config_path.as_deref())?;
+                download_catalogue_drafter(&conf.models, &repo, &path, config_path.as_deref())?;
             }
             Ok(())
         }
@@ -5790,11 +5930,53 @@ fn kv_elements_per_token(path: &std::path::Path) -> Option<u64> {
 
 /// The KV cache of the model at `path` for `context` tokens, at two bytes an
 /// element, the least any storage takes.
-fn kv_bytes_at(path: &std::path::Path, context: usize) -> Option<u64> {
+/// KV elements one sequence of `context` tokens holds.
+fn kv_elements_at(path: &std::path::Path, context: usize) -> Option<u64> {
     let loaded = engine::loader::LoadedModel::open(path).ok()?;
-    let elements = engine::arch::kv_elements_per_token(&loaded) as u64 * context as u64
-        + engine::arch::kv_fixed_elements(&loaded, context) as u64;
-    Some(elements * 2)
+    Some(
+        engine::arch::kv_elements_per_token(&loaded) as u64 * context as u64
+            + engine::arch::kv_fixed_elements(&loaded, context) as u64,
+    )
+}
+
+/// Gives the KV pool's device pages back to the driver after the server has
+/// sat idle for `ORANGU_KV_DEVICE_IDLE_S` seconds (300 unless set; `0`
+/// never), checked every few seconds on a thread of its own that ends with
+/// the pool. The pages are built again on the next request
+/// (`KvPool::device_pages`).
+fn release_idle_device_pages(pool: &Arc<engine::kv_pool::KvPool>) {
+    let seconds = engine::backend::env_tuning_value(
+        "ORANGU_KV_DEVICE_IDLE_S",
+        300u64,
+        "a whole number of seconds",
+        |_| true,
+    );
+    if seconds == 0 || pool.device_bytes() == 0 {
+        return;
+    }
+    let idle = std::time::Duration::from_secs(seconds);
+    let pool = Arc::downgrade(pool);
+    let _ = std::thread::Builder::new()
+        .name("kv-idle".to_string())
+        .spawn(move || {
+            let tick = (idle / 10).clamp(
+                std::time::Duration::from_secs(1),
+                std::time::Duration::from_secs(30),
+            );
+            loop {
+                std::thread::sleep(tick);
+                let Some(pool) = pool.upgrade() else {
+                    return;
+                };
+                pool.release_idle_device(idle);
+            }
+        });
+}
+
+/// One sequence's KV cache at `context`, at two bytes an element — the least
+/// any storage takes.
+fn kv_bytes_at(path: &std::path::Path, context: usize) -> Option<u64> {
+    kv_elements_at(path, context).map(|elements| elements * 2)
 }
 
 /// The dedicated cards' memory a model can use beside the machine's own: none
@@ -5810,6 +5992,81 @@ fn device_memory_bytes(
         .filter(|g| g.memory_kind == orangu::hardware::MemoryKind::Dedicated)
         .filter_map(|g| g.vram_total_bytes)
         .sum()
+}
+
+/// What `plan --json` weighs a model's fit from.
+struct FitInputs<'a> {
+    /// Weights every token touches.
+    dense: u64,
+    /// Of those, the ones a device backend uploads.
+    device_weights: u64,
+    /// KV elements of one sequence at the configured context.
+    kv_elements: u64,
+    slots: u64,
+    /// The host KV pool's budget.
+    host_pool: u64,
+    /// The dedicated cards a device backend places on, and their memory;
+    /// empty on the CPU backend.
+    cards: &'a [(String, u64)],
+}
+
+/// Where a model's bytes go, device by device.
+#[derive(Debug, PartialEq)]
+struct FitPlan {
+    /// KV on the cards: every slot's full context at two bytes an element.
+    kv_device: u64,
+    /// KV in host memory: the pool's `f32` rows for every slot's full
+    /// context, up to the pool's budget.
+    kv_host: u64,
+    /// What wants a card: its weights and its KV.
+    device_needs: u64,
+    /// What lives in host memory whatever the cards hold.
+    host_needs: u64,
+    /// Each card: its name, memory and what is placed on it.
+    placed: Vec<(String, u64, u64)>,
+    /// What wanted a card and found none with room: it runs from host
+    /// memory, as a model that overflows its card does.
+    overflow: u64,
+    /// Host memory needed in all.
+    memory_needs: u64,
+}
+
+/// Places a model card by card rather than against one pooled number: the
+/// weights a device backend uploads and their KV fill each card in turn, what
+/// is left over runs from host memory beside the weights no card takes and
+/// the host pool, and only host memory decides whether it runs. A pooled sum
+/// let a card's free bytes stand in for host memory a host-only tensor needed.
+fn fit_plan(inputs: &FitInputs<'_>) -> FitPlan {
+    let on_device = !inputs.cards.is_empty();
+    let all_slots = inputs.kv_elements.saturating_mul(inputs.slots);
+    let kv_device = if on_device {
+        all_slots.saturating_mul(2)
+    } else {
+        0
+    };
+    let kv_host = all_slots.saturating_mul(4).min(inputs.host_pool);
+    let device_weights = if on_device { inputs.device_weights } else { 0 };
+    let device_needs = device_weights + kv_device;
+    let host_needs = inputs.dense.saturating_sub(device_weights) + kv_host;
+    let mut left = device_needs;
+    let placed = inputs
+        .cards
+        .iter()
+        .map(|(name, memory)| {
+            let here = left.min(*memory);
+            left -= here;
+            (name.clone(), *memory, here)
+        })
+        .collect();
+    FitPlan {
+        kv_device,
+        kv_host,
+        device_needs,
+        host_needs,
+        placed,
+        overflow: left,
+        memory_needs: host_needs + left,
+    }
 }
 
 /// Refuses what this backend cannot honour: a separate value format is for host
@@ -6825,11 +7082,18 @@ fn expert_tier_projection(
 /// MTP head from the model's own repo. A draft model is also written into
 /// the configuration at `config` as `draft_model`, when that configuration
 /// serves this repo and names no draft model yet; otherwise the line to add
-/// is printed. A model the catalogue does not pair says so and fetches
-/// nothing.
+/// is printed.
+///
+/// A repo the catalogue does not list may be a fine-tune of one it does: the
+/// file names its base (`general.base_model.*`), and when that base is a
+/// catalogue entry with a draft model, the drafter is reused — but only once
+/// the fine-tune's vocabulary is the base's and a sample of its weights
+/// still agrees with the base's ([`fine_tune_of`]). A model the catalogue
+/// cannot pair says so and fetches nothing.
 fn download_catalogue_drafter(
     models: &std::path::Path,
     spec: &str,
+    local: &std::path::Path,
     config: Option<&std::path::Path>,
 ) -> Result<()> {
     use orangu::model_catalogue::Drafter;
@@ -6845,11 +7109,188 @@ fn download_catalogue_drafter(
             println!("Downloaded the MTP head to {}", path.display());
             println!("The server attaches it from beside the model.");
         }
-        None => {
-            println!("The catalogue pairs no drafter with {repo}; prompt lookup drafts for it.")
-        }
+        None => match fine_tune_of(local)? {
+            FineTune::Of(base, Drafter::Model(draft)) => {
+                println!(
+                    "{repo} is a fine-tune of {} (its weights still agree with the base's); \
+                     reusing that model's drafter.",
+                    base.repo
+                );
+                let path = orangu::model_download::download_model(models, draft)?;
+                println!("Downloaded the drafter to {}", path.display());
+                configure_draft_model(config, repo, draft)?;
+            }
+            FineTune::Of(base, Drafter::MtpHead(_)) => println!(
+                "{repo} is a fine-tune of {}, whose drafter is a head trained on the base's \
+                 own states and not reused; prompt lookup drafts for it.",
+                base.repo
+            ),
+            FineTune::Diverged(base, why) => println!(
+                "{repo} names {} as its base, but {why}; its drafter is not reused, and \
+                 prompt lookup drafts for it.",
+                base.repo
+            ),
+            FineTune::NoBase => {
+                println!("The catalogue pairs no drafter with {repo}; prompt lookup drafts for it.")
+            }
+        },
     }
     Ok(())
+}
+
+/// What [`fine_tune_of`] found.
+enum FineTune {
+    /// A fine-tune of this catalogue entry, which drafts with this.
+    Of(
+        &'static orangu::model_catalogue::CatalogueEntry,
+        orangu::model_catalogue::Drafter,
+    ),
+    /// It names this entry as its base, and the reason not to trust that.
+    Diverged(&'static orangu::model_catalogue::CatalogueEntry, String),
+    /// It names no catalogue entry with a drafter as its base.
+    NoBase,
+}
+
+/// How closely a fine-tune's weight sample has to follow its base's for the
+/// base's drafter to be reused: the Pearson correlation of the two. The same
+/// weights at two quantizations sit near 1, a fine-tune a little lower, and
+/// an unrelated model of the same shape near 0.
+const FINE_TUNE_AGREEMENT: f64 = 0.9;
+
+/// Elements of the sampled tensor compared — a multiple of every block size.
+const FINE_TUNE_SAMPLE: u64 = 8192;
+
+/// Whether the model at `local` is a fine-tune of a catalogue entry whose
+/// drafter it can reuse: its `general.base_model.*` names the entry, its
+/// vocabulary is the entry's, and the first elements of a middle layer's
+/// query projection correlate with the entry's file on the Hub at
+/// [`FINE_TUNE_AGREEMENT`]. A drafter predicts the base's next token; a
+/// model whose weights moved far from the base predicts other ones, and a
+/// renamed model of the same shape is not a fine-tune at all.
+fn fine_tune_of(local: &std::path::Path) -> Result<FineTune> {
+    let gguf = GgufFile::open(local)?;
+    let Some(base) = catalogue_base(&gguf) else {
+        return Ok(FineTune::NoBase);
+    };
+    let Some(drafter) = base.drafter else {
+        return Ok(FineTune::NoBase);
+    };
+    let diverged = |why: String| Ok(FineTune::Diverged(base, why));
+    let arch = gguf
+        .metadata
+        .iter()
+        .find(|(k, _)| k == "general.architecture")
+        .and_then(|(_, v)| match v {
+            orangu::gguf::GgufValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let layers = gguf
+        .metadata
+        .iter()
+        .find(|(k, _)| *k == format!("{arch}.block_count"))
+        .and_then(|(_, v)| v.as_u64())
+        .unwrap_or(0);
+    let name = format!("blk.{}.attn_q.weight", layers / 2);
+    let Some(mine) = gguf.tensors.iter().find(|t| t.name == name) else {
+        return diverged(format!("it has no {name} to compare"));
+    };
+    let remote = orangu::model_download::resolve_remote_model(&base.spec())?;
+    // As many bytes as the widest type takes, so any type's sample fits.
+    let want = engine::quant::tensor_byte_size(engine::quant::GGML_TYPE_F32, FINE_TUNE_SAMPLE)?;
+    let Some((header, theirs, bytes)) = remote.tensor_prefix(&name, want)? else {
+        return diverged(format!("the base has no {name}"));
+    };
+    if theirs.dims != mine.dims {
+        return diverged(format!(
+            "{name} is {:?} here and {:?} in the base",
+            mine.dims, theirs.dims
+        ));
+    }
+    let base_tokenizer = Tokenizer::from_gguf(&header).context("the base's tokenizer")?;
+    let own_tokenizer = Tokenizer::from_gguf(&gguf).context("the fine-tune's tokenizer")?;
+    if let Some(mismatch) = vocabulary_mismatch(&base_tokenizer, &own_tokenizer) {
+        return diverged(format!("its vocabulary differs ({mismatch})"));
+    }
+    let count = FINE_TUNE_SAMPLE.min(mine.element_count());
+    let theirs = engine::quant::dequantize(
+        theirs.ggml_type,
+        &bytes[..engine::quant::tensor_byte_size(theirs.ggml_type, count)? as usize],
+        count as usize,
+    )?;
+    let mut own = vec![0u8; engine::quant::tensor_byte_size(mine.ggml_type, count)? as usize];
+    {
+        use std::io::{Read, Seek};
+        let mut file = std::fs::File::open(local)?;
+        file.seek(std::io::SeekFrom::Start(gguf.data_offset + mine.offset))?;
+        file.read_exact(&mut own)?;
+    }
+    let own = engine::quant::dequantize(mine.ggml_type, &own, count as usize)?;
+    let agreement = correlation(&own, &theirs);
+    if agreement < FINE_TUNE_AGREEMENT {
+        return diverged(format!(
+            "a sample of its {name} correlates {agreement:.2} with the base's (under \
+             {FINE_TUNE_AGREEMENT})"
+        ));
+    }
+    Ok(FineTune::Of(base, drafter))
+}
+
+/// The catalogue entry a file's `general.base_model.*` names, matched on the
+/// model's name — the base is usually the original repo, and the catalogue
+/// lists a quantizer's copy of it (`Qwen/Qwen3-4B` → `unsloth/Qwen3-4B-GGUF`).
+fn catalogue_base(gguf: &GgufFile) -> Option<&'static orangu::model_catalogue::CatalogueEntry> {
+    let named: Vec<String> = gguf
+        .metadata
+        .iter()
+        .filter(|(k, _)| {
+            k.starts_with("general.base_model.")
+                && (k.ends_with(".repo_url") || k.ends_with(".name"))
+        })
+        .filter_map(|(_, v)| match v {
+            orangu::gguf::GgufValue::String(s) => Some(model_stem(s)),
+            _ => None,
+        })
+        .collect();
+    orangu::model_catalogue::CATALOGUE
+        .iter()
+        .find(|e| named.iter().any(|n| *n == model_stem(e.repo)))
+}
+
+/// A model's name with its owner, a `-GGUF` suffix and case taken off:
+/// `https://huggingface.co/Qwen/Qwen3-4B` and `unsloth/Qwen3-4B-GGUF` are
+/// both `qwen3-4b`.
+fn model_stem(name: &str) -> String {
+    let last = name
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(name);
+    let lower = last.trim().to_ascii_lowercase();
+    lower.strip_suffix("-gguf").unwrap_or(&lower).to_string()
+}
+
+/// The Pearson correlation of two equally long samples; 0 where either is
+/// flat.
+fn correlation(a: &[f32], b: &[f32]) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let mean = |x: &[f32]| x[..n].iter().map(|&v| f64::from(v)).sum::<f64>() / n as f64;
+    let (ma, mb) = (mean(a), mean(b));
+    let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+    for (&x, &y) in a[..n].iter().zip(&b[..n]) {
+        let (x, y) = (f64::from(x) - ma, f64::from(y) - mb);
+        ab += x * y;
+        aa += x * x;
+        bb += y * y;
+    }
+    if aa == 0.0 || bb == 0.0 {
+        0.0
+    } else {
+        ab / (aa * bb).sqrt()
+    }
 }
 
 /// Writes `draft_model = draft` into the configuration at `config` when it
@@ -7009,6 +7450,24 @@ fn default_host_kv_pool_bytes(total_ram: u64) -> u64 {
 /// The context one request must fit on the device: `--context`, then
 /// `ORANGU_CONTEXT`, then `[orangu-server].context`; `None` leaves the
 /// placement to the weights alone.
+/// The context tiers below `requested`, largest first, down to
+/// [`MIN_USABLE_CONTEXT`]: powers of two and the halfway steps between them
+/// (2048, 3072, 4096, 6144, 8192, 12288, …), so a tier lost to a small card
+/// costs at most a third of the context rather than half.
+fn context_tiers_below(requested: usize) -> impl Iterator<Item = usize> {
+    let mut tiers = Vec::new();
+    let mut power = MIN_USABLE_CONTEXT;
+    while power < requested {
+        tiers.push(power);
+        let half_step = power + power / 2;
+        if half_step < requested {
+            tiers.push(half_step);
+        }
+        power *= 2;
+    }
+    tiers.into_iter().rev()
+}
+
 /// The fewest tokens of context a model on a device must leave room for when
 /// none was asked for: a short conversation's worth.
 const MIN_USABLE_CONTEXT: usize = 2048;
@@ -8126,6 +8585,138 @@ mod tests {
     use clap::Parser;
     use orangu::model_spec::ModelGroup;
     use std::path::PathBuf;
+
+    /// The server's own drafter vocabulary check on real files, for choosing
+    /// catalogue pairings: `ORANGU_TEST_PAIRS="target.gguf=draft.gguf;…"`.
+    #[test]
+    #[ignore]
+    fn catalogue_pairings_share_a_vocabulary() {
+        let pairs = std::env::var("ORANGU_TEST_PAIRS").unwrap_or_default();
+        for pair in pairs.split(';').filter(|p| !p.is_empty()) {
+            let (target, draft) = pair.split_once('=').expect("target=draft");
+            let open = |p: &str| {
+                let gguf = orangu::gguf::GgufFile::open(std::path::Path::new(p)).unwrap();
+                crate::engine::tokenizer::Tokenizer::from_gguf(&gguf).unwrap()
+            };
+            let verdict = super::vocabulary_mismatch(&open(target), &open(draft));
+            eprintln!(
+                "{target}\n  {draft}\n  -> {}",
+                verdict.as_deref().unwrap_or("same vocabulary")
+            );
+        }
+    }
+
+    /// A card is filled before anything spills to host memory; what no card
+    /// takes stays in host memory however much card room is free; and the
+    /// KV cache is every slot's.
+    #[test]
+    fn a_fit_places_card_by_card_and_counts_every_slot() {
+        const GB: u64 = 1 << 30;
+        let card = [("card".to_string(), 4 * GB)];
+        let inputs = super::FitInputs {
+            dense: 6 * GB,
+            device_weights: 5 * GB,
+            kv_elements: GB / 8,
+            slots: 4,
+            host_pool: GB,
+            cards: &card,
+        };
+        let fit = super::fit_plan(&inputs);
+        assert_eq!(fit.kv_device, GB, "4 slots × 1/8 G elements × 2 bytes");
+        assert_eq!(fit.kv_host, GB, "capped at the pool's budget");
+        assert_eq!(fit.device_needs, 6 * GB);
+        assert_eq!(
+            fit.host_needs,
+            2 * GB,
+            "1 G of host-only weights and the pool"
+        );
+        assert_eq!(fit.placed, [("card".to_string(), 4 * GB, 4 * GB)]);
+        assert_eq!(fit.overflow, 2 * GB);
+        assert_eq!(fit.memory_needs, 4 * GB);
+        // The CPU backend: no card, everything in host memory.
+        let cpu = super::fit_plan(&super::FitInputs {
+            cards: &[],
+            ..inputs
+        });
+        assert_eq!((cpu.kv_device, cpu.device_needs, cpu.overflow), (0, 0, 0));
+        assert_eq!(cpu.memory_needs, 6 * GB + GB);
+        // Two cards share what one could not hold.
+        let two = [("a".to_string(), 4 * GB), ("b".to_string(), 4 * GB)];
+        let split = super::fit_plan(&super::FitInputs {
+            cards: &two,
+            ..inputs
+        });
+        assert_eq!(split.overflow, 0);
+        assert_eq!(split.placed[1].2, 2 * GB);
+        assert_eq!(split.memory_needs, 2 * GB);
+    }
+
+    /// The tiers below a context step down by halves and the halfway points
+    /// between them, and stop at the least usable context.
+    #[test]
+    fn context_tiers_step_down_to_the_least_usable() {
+        let tiers: Vec<usize> = super::context_tiers_below(32768).collect();
+        assert_eq!(tiers, [24576, 16384, 12288, 8192, 6144, 4096, 3072, 2048]);
+        let odd: Vec<usize> = super::context_tiers_below(20000).collect();
+        assert_eq!(odd[..3], [16384, 12288, 8192]);
+        assert!(super::context_tiers_below(2048).next().is_none());
+        assert!(super::context_tiers_below(1000).next().is_none());
+    }
+
+    /// A fine-tune names its base by the original repo; the catalogue lists
+    /// a quantizer's copy of it. Both come down to the model's own name.
+    #[test]
+    fn a_fine_tune_finds_its_catalogue_base_by_name() {
+        assert_eq!(
+            super::model_stem("https://huggingface.co/Qwen/Qwen3-4B"),
+            "qwen3-4b"
+        );
+        assert_eq!(super::model_stem("unsloth/Qwen3-4B-GGUF"), "qwen3-4b");
+        assert_eq!(super::model_stem("Qwen3 4B"), "qwen3 4b");
+        let gguf = |key: &str, value: &str| orangu::gguf::GgufFile {
+            version: 3,
+            metadata: vec![(
+                key.to_string(),
+                orangu::gguf::GgufValue::String(value.to_string()),
+            )],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        };
+        let base = super::catalogue_base(&gguf(
+            "general.base_model.0.repo_url",
+            "https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct",
+        ));
+        assert_eq!(
+            base.map(|e| e.repo),
+            Some("bartowski/Llama-3.2-3B-Instruct-GGUF")
+        );
+        assert!(super::catalogue_base(&gguf("general.base_model.0.name", "Unknown-7B")).is_none());
+        assert!(super::catalogue_base(&gguf("general.name", "Qwen3-4B")).is_none());
+    }
+
+    /// The weight sample's measure: the same weights quantized coarsely
+    /// still agree, a model that moved a little still agrees, and an
+    /// unrelated one does not.
+    #[test]
+    fn a_weight_sample_agrees_only_with_its_own_weights() {
+        let base: Vec<f32> = (0..8192)
+            .map(|i| ((i * 7919) % 1000) as f32 / 500.0 - 1.0)
+            .collect();
+        let coarse: Vec<f32> = base.iter().map(|v| (v * 8.0).round() / 8.0).collect();
+        let tuned: Vec<f32> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + 0.15 * (((i * 31) % 17) as f32 / 8.0 - 1.0))
+            .collect();
+        let other: Vec<f32> = (0..8192)
+            .map(|i| ((i * 104_729) % 997) as f32 / 498.5 - 1.0)
+            .collect();
+        assert!(super::correlation(&base, &coarse) > 0.99);
+        assert!(super::correlation(&base, &tuned) > super::FINE_TUNE_AGREEMENT);
+        assert!(super::correlation(&base, &other).abs() < 0.2);
+        assert_eq!(super::correlation(&base, &[0.0; 8192]), 0.0);
+    }
 
     /// The KV pages come out the same whether the start-up probes ran — the
     /// weights placed and the prefill's scratch held — or the pool is sized

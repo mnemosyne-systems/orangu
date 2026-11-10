@@ -1438,8 +1438,9 @@ impl ModelForward for PhiModel {
     /// (`record_decode_run`, as the multi-device split decode does) and a
     /// prompt chunk runs it on the device-resident stream
     /// (`run_range_resident`); everything else takes the host step path
-    /// (`run_layer_range`). Like `arch::llama`'s: the chains share
-    /// [`super::RANGE_SLOT`] and take turns ([`super::RANGE_CHAINS`]).
+    /// (`run_layer_range`). Like `arch::llama`'s: a chain holds a range slot
+    /// of its own ([`super::range_turn`]) and prompt chunks take turns
+    /// ([`super::RANGE_PREFILL`]).
     fn forward_layers(
         &self,
         cache: &mut KvCache,
@@ -1452,22 +1453,28 @@ impl ModelForward for PhiModel {
             && super::range_chains()
             && let Some(vulkan) = self.backend.as_wgpu()
         {
-            let _turn = super::RANGE_CHAINS
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            if tokens.len() == 1
-                && let Some((encoder, buf, offset)) = self.record_decode_run(
+            if tokens.len() == 1 {
+                let turn = super::range_turn(cache);
+                if let Some((encoder, buf, offset)) = self.record_decode_run(
                     vulkan,
                     cache,
                     layers.clone(),
                     &hidden,
                     start_pos,
-                    super::RANGE_SLOT,
+                    turn.slot,
                     false,
-                )
-            {
-                return Ok(vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd));
+                ) {
+                    return Ok(vulkan.submit_and_read_at(
+                        encoder,
+                        &buf,
+                        offset,
+                        self.config.n_embd,
+                    ));
+                }
             }
+            let _turn = super::RANGE_PREFILL
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             if self.resident_prefill_serves(tokens.len())
                 && let Some(x) = self.run_range_resident(
                     cache,

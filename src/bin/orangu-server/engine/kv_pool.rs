@@ -144,7 +144,9 @@ pub fn paged_kv_enabled() -> bool {
 /// against, and they are indistinguishable from each other: across four
 /// comparisons the winner alternates and every margin is inside the noise.
 pub fn policy_from_env() -> Policy {
-    policy_from_str(&std::env::var("ORANGU_KV_POLICY").unwrap_or_default())
+    policy_from_str(
+        &crate::engine::backend::tuning_profile::env_var("ORANGU_KV_POLICY").unwrap_or_default(),
+    )
 }
 
 /// The parse behind [`policy_from_env`], split out so it can be tested without
@@ -788,7 +790,12 @@ pub struct KvPool {
     /// which is the point. Two sequences sharing a prefix currently mirror it
     /// twice, because the mirror is per request; sharing on the device means
     /// sharing *this*.
-    device: Option<DevicePages>,
+    device: std::sync::RwLock<Option<std::sync::Arc<DevicePages>>>,
+    /// What [`Self::attach_device`] was given, kept so pages released while
+    /// the pool sat idle can be built again ([`Self::release_idle_device`]).
+    device_spec: Mutex<Option<DeviceSpec>>,
+    /// When a sequence last took or gave back pages, as [`Instant`]s go.
+    last_active: Mutex<std::time::Instant>,
     inner: Mutex<PoolInner>,
     /// How many times a sequence has given its pages back to an older one
     /// ([`Occupant::yielded`]), for the operator and the tests.
@@ -796,6 +803,14 @@ pub struct KvPool {
     /// `PoolInner::waiting`'s length, read without the lock by the
     /// question every decode step asks ([`Occupant::yield_due`]).
     waiters: std::sync::atomic::AtomicUsize,
+}
+
+/// How the device pages were built, to build them again.
+struct DeviceSpec {
+    device: wgpu::Device,
+    queue: Option<wgpu::Queue>,
+    storage: crate::engine::backend::vulkan_shaders::KvStorage,
+    table_entries: usize,
 }
 
 /// The pool's device-side pages: one buffer per layer, plus the block tables
@@ -1062,7 +1077,6 @@ impl KvPool {
                 v: side(formats.v),
             }
         });
-        let device = None;
         Self {
             page_tokens,
             num_pages,
@@ -1070,7 +1084,9 @@ impl KvPool {
             k,
             v,
             compact,
-            device,
+            device: std::sync::RwLock::new(None),
+            device_spec: Mutex::new(None),
+            last_active: Mutex::new(std::time::Instant::now()),
             inner: Mutex::new(PoolInner {
                 refs: vec![0; num_pages],
                 never_used: (0..num_pages as u32).rev().collect(),
@@ -1116,11 +1132,37 @@ impl KvPool {
         storage: crate::engine::backend::vulkan_shaders::KvStorage,
         max_table_entries: usize,
     ) -> bool {
-        use crate::engine::backend::vulkan_shaders::KvStorage;
         assert!(
             self.compact.is_none(),
             "device pages are filled from f32 host pages"
         );
+        let pages = self.build_device(device, storage, max_table_entries);
+        *self.device.write().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::new(pages));
+        *self.device_spec.lock().expect("kv pool poisoned") = Some(DeviceSpec {
+            device: device.clone(),
+            queue: None,
+            storage,
+            table_entries: max_table_entries,
+        });
+        true
+    }
+
+    /// The queue device pages built again are refilled through — see
+    /// [`Self::release_idle_device`]. Without one, pages are released only
+    /// when none holds data.
+    pub fn keep_queue(&self, queue: &wgpu::Queue) {
+        if let Some(spec) = self.device_spec.lock().expect("kv pool poisoned").as_mut() {
+            spec.queue = Some(queue.clone());
+        }
+    }
+
+    fn build_device(
+        &self,
+        device: &wgpu::Device,
+        storage: crate::engine::backend::vulkan_shaders::KvStorage,
+        max_table_entries: usize,
+    ) -> DevicePages {
+        use crate::engine::backend::vulkan_shaders::KvStorage;
         let elem_bytes = |floats: usize| -> u64 {
             match storage {
                 KvStorage::F32 => (floats * 4) as u64,
@@ -1159,24 +1201,115 @@ impl KvPool {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        self.device = Some(DevicePages {
+        DevicePages {
             layers,
             table,
             table_len: max_table_entries.max(1),
             storage,
-        });
-        true
+        }
     }
 
-    /// The device pages, if a device was attached.
-    pub fn device_pages(&self) -> Option<&DevicePages> {
-        self.device.as_ref()
+    /// Marks the pool in use — a sequence took or gave back pages.
+    pub fn touch(&self) {
+        *self.last_active.lock().expect("kv pool poisoned") = std::time::Instant::now();
+    }
+
+    /// Gives the device pages back to the driver when no sequence has held a
+    /// page for `idle`: an idle server holds the card's memory for nothing,
+    /// and another model on the same card could be using it. Returns whether
+    /// it released them.
+    ///
+    /// Nothing is lost. Every page that holds data is sealed and kept on the
+    /// host, and [`Self::device_pages`] builds the device pages again on the
+    /// next request and refills them from there.
+    pub fn release_idle_device(&self, idle: std::time::Duration) -> bool {
+        if self.last_active.lock().expect("kv pool poisoned").elapsed() < idle {
+            return false;
+        }
+        let refillable = self
+            .device_spec
+            .lock()
+            .expect("kv pool poisoned")
+            .as_ref()
+            .is_some_and(|spec| spec.queue.is_some());
+        // Checked and taken under the one lock a sequence needs to start, so
+        // none can start between the two.
+        let inner = self.inner.lock().expect("kv pool poisoned");
+        let quiet = inner.live == 0 && inner.reserved == 0 && inner.table_next == 0;
+        if !quiet || (!refillable && inner.sealed.iter().any(|&s| s)) {
+            return false;
+        }
+        let released = self
+            .device
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop(inner);
+        released.is_some_and(|pages| {
+            log::info!(
+                "orangu-server: [kv] device pages released after {:.0}s idle ({})",
+                idle.as_secs_f64(),
+                orangu::format::format_bytes(pages.layers.iter().map(wgpu::Buffer::size).sum())
+            );
+            true
+        })
+    }
+
+    /// The device pages, if a device was attached — built again, and refilled
+    /// from the sealed host pages, when they were released while idle.
+    pub fn device_pages(&self) -> Option<std::sync::Arc<DevicePages>> {
+        if let Some(pages) = self
+            .device
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            return Some(pages.clone());
+        }
+        let spec = self.device_spec.lock().expect("kv pool poisoned");
+        let spec = spec.as_ref()?;
+        let mut slot = self.device.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(pages) = slot.as_ref() {
+            return Some(pages.clone());
+        }
+        let pages =
+            std::sync::Arc::new(self.build_device(&spec.device, spec.storage, spec.table_entries));
+        *slot = Some(pages.clone());
+        drop(slot);
+        if let Some(queue) = &spec.queue {
+            let sealed: Vec<u32> = {
+                let inner = self.inner.lock().expect("kv pool poisoned");
+                (0..self.num_pages as u32)
+                    .filter(|&p| inner.sealed[p as usize])
+                    .collect()
+            };
+            for page in sealed {
+                for layer in 0..self.layers.len() {
+                    if self.layers[layer].ring.is_none() && self.layers[layer].kv_dim > 0 {
+                        self.fill_device(
+                            queue,
+                            layer,
+                            page,
+                            self.page_k(layer, page),
+                            self.page_v(layer, page),
+                        );
+                    }
+                }
+            }
+        }
+        log::info!(
+            "orangu-server: [kv] device pages built again after an idle spell ({})",
+            orangu::format::format_bytes(pages.layers.iter().map(wgpu::Buffer::size).sum())
+        );
+        Some(pages)
     }
 
     /// Device bytes the pool holds — the figure an operator compares against
     /// the card, and the one that no longer scales with the number of requests.
     pub fn device_bytes(&self) -> u64 {
         self.device
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .map_or(0, |d| d.layers.iter().map(|b| b.size()).sum())
     }
@@ -1189,7 +1322,7 @@ impl KvPool {
     /// offset — the same split `GpuLayerCache` uses, kept identical so the
     /// shader's `k_cache`/`v_cache` bindings mean the same thing under either.
     pub fn device_page_offsets(&self, layer: usize, page: u32) -> Option<(u64, u64, u64)> {
-        let d = self.device.as_ref()?;
+        let d = self.device_pages()?;
         if self.layers[layer].ring.is_some() {
             return None;
         }
@@ -1215,7 +1348,7 @@ impl KvPool {
         v_rows: &[f32],
     ) {
         use crate::engine::backend::vulkan_shaders::KvStorage;
-        let Some(d) = self.device.as_ref() else {
+        let Some(d) = self.device_pages() else {
             return;
         };
         let Some((k_off, v_off, _)) = self.device_page_offsets(layer, page) else {
@@ -1241,8 +1374,9 @@ impl KvPool {
     /// sequence cannot use the paged device path" rather than as a failure —
     /// the per-request mirror still serves it correctly.
     pub fn alloc_table(&self, entries: usize) -> Option<usize> {
+        // Before the lock: building released pages again takes it.
+        let cap = self.device_pages()?.table_len;
         let mut inner = self.inner.lock().expect("kv pool poisoned");
-        let cap = self.device.as_ref()?.table_len;
         if let Some(i) = inner
             .free_tables
             .iter()
@@ -1311,7 +1445,7 @@ impl KvPool {
         v_rows: &[f32],
     ) {
         use crate::engine::backend::vulkan_shaders::KvStorage;
-        let Some(d) = self.device.as_ref() else {
+        let Some(d) = self.device_pages() else {
             return;
         };
         let Some((k_off, v_off, _)) = self.device_page_offsets(layer, page) else {
@@ -1345,7 +1479,7 @@ impl KvPool {
     /// The kernel reads `table[base + logical_page]`, so `base` is what the
     /// meta uniform carries and the buffer itself never changes shape.
     pub fn write_table(&self, queue: &wgpu::Queue, base: usize, pages: &[u32]) {
-        let Some(d) = self.device.as_ref() else {
+        let Some(d) = self.device_pages() else {
             return;
         };
         assert!(
@@ -1553,6 +1687,7 @@ impl KvPool {
     /// returning the remainder ([`Self::release_reserved`]) — or the pool
     /// shrinks by that much for the life of the process.
     pub fn try_reserve(&self, pages: usize) -> bool {
+        self.touch();
         self.try_reserve_trading(pages, 0)
     }
 
@@ -1667,6 +1802,7 @@ impl KvPool {
     /// Gives back `pages` of a promise that were never claimed — what a
     /// finished sequence owes for the length it did not reach.
     pub fn release_reserved(&self, pages: usize) {
+        self.touch();
         let mut inner = self.inner.lock().expect("kv pool poisoned");
         inner.reserved = inner.reserved.saturating_sub(pages);
     }
@@ -1757,6 +1893,7 @@ impl KvPool {
     /// than it promised is a bug in the caller, and this reports it rather
     /// than dipping into someone else's promise.
     pub fn acquire_for(&self, tags: &[u64], promised: usize) -> Result<Vec<Acquired>, AllocError> {
+        self.touch();
         self.acquire_inner(tags, promised)
     }
 
@@ -1858,6 +1995,60 @@ impl KvPool {
         self.inner.lock().expect("kv pool poisoned").policy
     }
 
+    /// Every published page — sealed, named by a tag — with its tag, the ones
+    /// in use first and then the cached ones newest first: the order a save
+    /// keeps them in when it cannot keep them all.
+    pub fn published_recent_first(&self) -> Vec<(u32, u64)> {
+        let inner = self.inner.lock().expect("kv pool poisoned");
+        let named = |page: u32| inner.sealed[page as usize] && inner.tag[page as usize] != 0;
+        let mut out: Vec<(u32, u64)> = (0..self.num_pages as u32)
+            .filter(|&page| inner.refs[page as usize] > 0 && named(page))
+            .map(|page| (page, inner.tag[page as usize]))
+            .collect();
+        // The cached ones by when they were last given back, newest first —
+        // whichever replacement policy keeps its own lists.
+        let mut cached: Vec<u32> = (0..self.num_pages as u32)
+            .filter(|&page| inner.refs[page as usize] == 0 && named(page))
+            .collect();
+        cached.sort_by_key(|&page| std::cmp::Reverse(inner.release_seq[page as usize]));
+        out.extend(
+            cached
+                .into_iter()
+                .map(|page| (page, inner.tag[page as usize])),
+        );
+        out
+    }
+
+    /// Whether host pages are stored in a compact format rather than `f32`.
+    pub fn is_compact(&self) -> bool {
+        self.compact.is_some()
+    }
+
+    /// Writes `page`'s host rows to its device copy, through the queue the
+    /// pool kept ([`Self::keep_queue`]) — for a page filled on the host alone.
+    pub fn refill_device(&self, page: u32) {
+        let queue = self
+            .device_spec
+            .lock()
+            .expect("kv pool poisoned")
+            .as_ref()
+            .and_then(|spec| spec.queue.clone());
+        let Some(queue) = queue else {
+            return;
+        };
+        for layer in 0..self.layers.len() {
+            if self.layers[layer].ring.is_none() && self.layers[layer].kv_dim > 0 {
+                self.fill_device(
+                    &queue,
+                    layer,
+                    page,
+                    self.page_k(layer, page),
+                    self.page_v(layer, page),
+                );
+            }
+        }
+    }
+
     /// Whether `tag`'s content is resident — a test and introspection helper,
     /// and what a hit-rate counter would read.
     pub fn holds(&self, tag: u64) -> bool {
@@ -1892,6 +2083,7 @@ impl KvPool {
     /// contents and joins the reclaim queue, so a later request whose prefix
     /// matches can still be given it.
     pub fn release(&self, pages: &[u32]) {
+        self.touch();
         let mut inner = self.inner.lock().expect("kv pool poisoned");
         for &p in pages {
             let refs = &mut inner.refs[p as usize];

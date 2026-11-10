@@ -87,6 +87,18 @@ unsafe impl Sync for SharedOut {}
 /// It does not apply to quantized weights at all. This engine multiplies
 /// the packed bytes directly; a GEMM has to dequantize first, and the
 /// dequantize alone costs more than the whole product.
+/// `ORANGU_EXACT_MATMUL=1`: every matmul the CPU backend runs dequantizes its
+/// weights and dots them with the activations in `f32` (`matmul_dequant`),
+/// instead of quantizing the activations to `int8` for the fused kernels or
+/// taking a prompt-weight copy. Slow, and the point is that it shares none of
+/// the kernels whose drift it measures: a KL reference saved from a server
+/// running this way is the `f32` reference the precision policy compares
+/// against.
+pub(crate) fn exact_matmul() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_EXACT_MATMUL"))
+}
+
 fn packed_gemm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_PACKED_GEMM"))
@@ -1057,6 +1069,10 @@ impl Backend for CpuBackend {
         if let Some(layer) = w.layer() {
             crate::engine::dense_residency::touch(layer);
         }
+        if exact_matmul() {
+            *out = self.matmul_dequant(x, n_tokens, w);
+            return;
+        }
         // A prompt's weight with a copy for the cores' matrix instructions —
         // per-row `int8` or `bf16`, built at load when this machine measured
         // faster with one (`engine::prompt_weights`).
@@ -1095,6 +1111,10 @@ impl Backend for CpuBackend {
 
     fn matmul_decode_into(&self, out: &mut Vec<f32>, x: &[f32], n_tokens: usize, w: &QuantMatrix) {
         debug_assert_eq!(x.len(), n_tokens * w.in_dim);
+        if exact_matmul() {
+            *out = self.matmul_dequant(x, n_tokens, w);
+            return;
+        }
         if self.matmul_fused_decode_into(out, x, n_tokens, w) {
             return;
         }
@@ -1134,7 +1154,7 @@ impl Backend for CpuBackend {
 
     fn matmul_batch_into(&self, outs: &mut Vec<Vec<f32>>, ops: &[MatmulOp<'_>]) {
         outs.resize_with(ops.len(), Vec::new);
-        if ops.len() > 1 && self.matmul_batch_one_token_into(outs, ops) {
+        if ops.len() > 1 && !exact_matmul() && self.matmul_batch_one_token_into(outs, ops) {
             return;
         }
         for (out, op) in outs.iter_mut().zip(ops) {

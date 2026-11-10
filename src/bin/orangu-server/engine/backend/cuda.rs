@@ -62,8 +62,12 @@ use super::vendor_shaders::{KERNEL_NAME, SUPPORTED_TYPES};
 
 /// The complete, compile-ready CUDA-C source for `ggml_type`'s matmul
 /// kernel, or `None` if this backend has no kernel for it.
-fn kernel_source(ggml_type: u32) -> Option<String> {
-    super::vendor_shaders::kernel_source(super::vendor_shaders::Dialect::Cuda, ggml_type)
+fn kernel_source(ggml_type: u32, workgroup: usize) -> Option<String> {
+    super::vendor_shaders::kernel_source_with(
+        super::vendor_shaders::Dialect::Cuda,
+        ggml_type,
+        workgroup,
+    )
 }
 
 /// `QuantMatrix::cache_key()`'s return type — named, like `vulkan.rs`'s own
@@ -72,6 +76,9 @@ fn kernel_source(ggml_type: u32) -> Option<String> {
 type WeightCacheKey = (usize, usize);
 
 pub struct CudaBackend {
+    /// The block size the kernels were built for and launch at — see
+    /// `vendor_shaders::workgroup`.
+    workgroup: usize,
     stream: Arc<CudaStream>,
     functions: HashMap<u32, CudaFunction>,
     weight_cache: Mutex<HashMap<WeightCacheKey, Arc<CudaSlice<u8>>>>,
@@ -193,11 +200,13 @@ impl CudaBackend {
         let _ = unsafe { cudarc::driver::sys::cuDriverGetVersion(&mut driver) };
         // Before any knob is resolved, so the profile's values are the ones
         // they read.
-        super::tuning_profile::install_named("cuda", &device_name, &driver.to_string());
+        let _profile =
+            super::tuning_profile::install_named("cuda", &device_name, &driver.to_string());
 
+        let workgroup = super::vendor_shaders::workgroup();
         let mut functions = HashMap::new();
         for &ggml_type in SUPPORTED_TYPES {
-            let source = kernel_source(ggml_type)?;
+            let source = kernel_source(ggml_type, workgroup)?;
             let ptx = cudarc::nvrtc::compile_ptx(&source).ok()?;
             let module = ctx.load_module(ptx).ok()?;
             let function = module.load_function(KERNEL_NAME).ok()?;
@@ -213,6 +222,7 @@ impl CudaBackend {
             .ok()?;
 
         Some(Self {
+            workgroup,
             stream,
             functions,
             weight_cache: Mutex::new(HashMap::new()),
@@ -366,7 +376,7 @@ impl CudaBackend {
         builder.arg(&self.iq_grids);
         let cfg = LaunchConfig {
             grid_dim: (num_blocks, 1, 1),
-            block_dim: (64, 1, 1),
+            block_dim: (self.workgroup as u32, 1, 1),
             shared_mem_bytes: 0,
         };
         unsafe { builder.launch(cfg) }.expect("cuda kernel launch failed");

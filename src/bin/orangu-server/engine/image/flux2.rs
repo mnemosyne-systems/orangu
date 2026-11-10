@@ -723,10 +723,12 @@ fn result_pool_bytes() -> usize {
 /// for [`HeadSplit`] to balance.
 fn fixed_device_heads() -> Option<usize> {
     static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| match std::env::var("ORANGU_FLUX2_DEVICE_HEADS") {
-        Ok(v) if v.trim().eq_ignore_ascii_case("auto") => None,
-        Ok(v) => Some(v.trim().parse().unwrap_or(0)),
-        Err(_) => None,
+    *N.get_or_init(|| {
+        match crate::engine::backend::tuning_profile::env_var("ORANGU_FLUX2_DEVICE_HEADS") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("auto") => None,
+            Ok(v) => Some(v.trim().parse().unwrap_or(0)),
+            Err(_) => None,
+        }
     })
 }
 

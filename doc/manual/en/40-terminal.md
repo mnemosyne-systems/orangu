@@ -281,7 +281,7 @@ main                         Graph: ●                 ctx 18k/32k   gemma-4-E2
 - The second is the context one request gets on the server, from its `/props`. A server without `/props` gives no limit, and the gauge shows the count alone, for example `ctx 18k`
 - From 80% the gauge turns the theme's warning colour, and the output window says once that the context is filling up, suggesting `/compact` (drop old tool output) or `/clear` (start a new conversation). The notice comes back only after the conversation has dropped below 80% and filled up again
 - After `/compact` the count is scaled to what was removed and shown with a `~`, for example `ctx ~9.0k/32k`, until the next answer counts it again
-- `compact_at` in the `[orangu]` section compacts the conversation by itself after a turn that leaves it at least that full. See the Configuration chapter
+- After a turn that leaves the conversation `compact_at` percent full (85 unless the `[orangu]` section says otherwise), it compacts by itself: old tool output goes first, as with `/compact`, and when that is not enough the model writes a summary of the earlier turns that takes their place. The latest turns that fit a quarter of the context stay word for word, and the output window says how far the count fell. See the Configuration chapter
 
 Each workspace tab has its own conversation and its own gauge. A resumed
 session shows its gauge after its first answer.

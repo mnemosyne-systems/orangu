@@ -56,15 +56,15 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--streams-depth|--interference|--chat|--chat-fixture|--kl|--kl-rows|--kl-top|--kl-tokens|--kl-text|--perplexity|--ppl-ctx|--ppl-chunks|--hellaswag|--winogrande|--score-tasks|--score-rows|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--startup|--startup-gap|--startup-evict|--sweep|--sweep-cmd|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--streams-depth|--interference|--chat|--chat-fixture|--chat-record|--chat-workspace|--kl|--kl-rows|--kl-top|--kl-max|--kl-min-top1|--ppl-baseline|--ppl-max-increase|--kl-tokens|--kl-text|--perplexity|--ppl-ctx|--ppl-chunks|--hellaswag|--winogrande|--score-tasks|--score-rows|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--startup|--startup-gap|--startup-evict|--sweep|--sweep-cmd|--tune|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
             return 0
             ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-depth --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --kl --kl-rows --kl-top --kl-tokens --kl-text --perplexity --ppl-ctx --ppl-chunks --hellaswag --winogrande --score-tasks --score-rows --shared-prefix --shared-prefix-tokens \
-             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --sweep-as-given --write-profile --per-rep \
+            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-depth --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --chat-fixed --chat-record --chat-workspace --kl --kl-rows --kl-top --kl-max --kl-min-top1 --ppl-baseline --ppl-max-increase --kl-tokens --kl-text --perplexity --ppl-ctx --ppl-chunks --hellaswag --winogrande --score-tasks --score-rows --shared-prefix --shared-prefix-tokens \
+             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --sweep-as-given --write-profile --tune --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels --chart-grid --chart-overlay \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png --flamegraph-keep-data \
@@ -104,9 +104,16 @@ _orangu_bench() {
         '--interference[Interference mode: prompt lengths a second request prefills while one stream decodes]:list:' \
         '--chat[Chat mode: replay this many turns of a coding session through /v1/chat/completions]:turns:' \
         '--chat-fixture[The conversation --chat replays (JSON: system, tools, turns)]:file:_files' \
+        '--chat-fixed[Send each turn'"'"'s recorded replies instead of the model'"'"'s]' \
+        '--chat-record[Write the session --chat runs as a fixture]:file:_files' \
+        '--chat-workspace[The checkout whose files answer read_file and search while recording]:directory:_files -/' \
         '--kl[Compare teacher-forced distributions with this reference]:file:_files' \
         '--kl-rows[Positions per --kl pass]:n:' \
         '--kl-top[Candidates --kl keeps per position]:n:' \
+        '--kl-max[Most mean KL --kl accepts before the run is over threshold]:nats:' \
+        '--kl-min-top1[Fewest positions, in percent, whose top token --kl needs to agree]:percent:' \
+        '--ppl-baseline[The perplexity --perplexity is judged against]:perplexity:' \
+        '--ppl-max-increase[How far above --ppl-baseline perplexity may rise, in percent]:percent:' \
         '--kl-tokens[Tokens --kl runs]:n:' \
         '--kl-text[The text --kl runs]:file:_files' \
         '--perplexity[Score this text file]:file:_files' \
@@ -136,6 +143,7 @@ _orangu_bench() {
         '--fail-on-regression[After a two-value --sweep, exit 2 if the second value is worse beyond the noise]' \
         '--sweep-as-given[Run a two-value --sweep in the order written instead of as a,b,b,a]' \
         '--write-profile[After a two-value --sweep, keep the winning value in the server tuning profile]' \
+        '*--tune[Tune the device profile knob by knob: VAR=control;a;b, default or prefill]:knob:' \
         '--per-rep[Also print every repetition'"'"'s rate, in order, after each row]' \
         '--timeout[Per-request timeout in seconds]:seconds:' \
         '--model[Model id to request]:id:' \
@@ -218,9 +226,16 @@ complete -c orangu-bench -l streams-warm              -d 'Concurrency mode: pref
 complete -c orangu-bench -l interference           -x -d 'Interference mode: prompt lengths a second request prefills while one stream decodes'
 complete -c orangu-bench -l chat                   -x -d 'Chat mode: replay this many turns of a coding session through /v1/chat/completions'
 complete -c orangu-bench -l chat-fixture           -r -d 'The conversation --chat replays (JSON: system, tools, turns)'
+complete -c orangu-bench -l chat-fixed                 -d 'Send each turn'"'"'s recorded replies instead of the model'"'"'s'
+complete -c orangu-bench -l chat-record             -r -d 'Write the session --chat runs as a fixture'
+complete -c orangu-bench -l chat-workspace          -r -d 'The checkout whose files answer read_file and search while recording'
 complete -c orangu-bench -l kl                     -r -d 'Compare teacher-forced distributions with this reference'
 complete -c orangu-bench -l kl-rows                -r -d 'Positions per --kl pass'
 complete -c orangu-bench -l kl-top                 -r -d 'Candidates --kl keeps per position'
+complete -c orangu-bench -l kl-max                -r -d 'Most mean KL --kl accepts before the run is over threshold'
+complete -c orangu-bench -l kl-min-top1           -r -d 'Fewest positions, in percent, whose top token --kl needs to agree'
+complete -c orangu-bench -l ppl-baseline          -r -d 'The perplexity --perplexity is judged against'
+complete -c orangu-bench -l ppl-max-increase      -r -d 'How far above --ppl-baseline perplexity may rise, in percent'
 complete -c orangu-bench -l kl-tokens              -r -d 'Tokens --kl runs'
 complete -c orangu-bench -l kl-text                -r -d 'The text --kl runs'
 complete -c orangu-bench -l perplexity             -r -d 'Score this text file'
@@ -250,6 +265,7 @@ complete -c orangu-bench -l no-warmup                 -d 'Skip the initial warmu
 complete -c orangu-bench -l fail-on-regression        -d 'After a two-value --sweep, exit 2 if the second value is worse beyond the noise'
 complete -c orangu-bench -l sweep-as-given            -d 'Run a two-value --sweep in the order written instead of as a,b,b,a'
 complete -c orangu-bench -l write-profile             -d 'After a two-value --sweep, keep the winning value in the server tuning profile'
+complete -c orangu-bench -l tune                    -r -d 'Tune the device profile knob by knob: VAR=control;a;b, default or prefill'
 complete -c orangu-bench -l per-rep                   -d 'Also print every repetition\'s rate, in order, after each row'
 complete -c orangu-bench -l timeout                -x -d 'Per-request timeout in seconds'
 complete -c orangu-bench -l model                  -x -d 'Model id to request'
@@ -341,9 +357,16 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--interference', 'Interference mode: prompt lengths a second request prefills while one stream decodes'),
         @('--chat', 'Chat mode: replay this many turns of a coding session through /v1/chat/completions'),
         @('--chat-fixture', 'The conversation --chat replays (JSON: system, tools, turns)'),
+        @('--chat-fixed', 'Send each turn''s recorded replies instead of the model''s'),
+        @('--chat-record', 'Write the session --chat runs as a fixture'),
+        @('--chat-workspace', 'The checkout whose files answer read_file and search while recording'),
         @('--kl', 'Compare teacher-forced distributions with this reference'),
         @('--kl-rows', 'Positions per --kl pass'),
         @('--kl-top', 'Candidates --kl keeps per position'),
+        @('--kl-max', 'Most mean KL --kl accepts before the run is over threshold'),
+        @('--kl-min-top1', 'Fewest positions, in percent, whose top token --kl needs to agree'),
+        @('--ppl-baseline', 'The perplexity --perplexity is judged against'),
+        @('--ppl-max-increase', 'How far above --ppl-baseline perplexity may rise, in percent'),
         @('--kl-tokens', 'Tokens --kl runs'),
         @('--kl-text', 'The text --kl runs'),
         @('--perplexity', 'Score this text file'),
@@ -373,6 +396,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--fail-on-regression', 'After a two-value --sweep, exit 2 if the second value is worse beyond the noise'),
         @('--sweep-as-given', 'Run a two-value --sweep in the order written instead of as a,b,b,a'),
         @('--write-profile', 'After a two-value --sweep, keep the winning value in the server tuning profile'),
+        @('--tune', 'Tune the device profile knob by knob: VAR=control;a;b, default or prefill'),
         @('--per-rep', 'Also print every repetition''s rate, in order, after each row'),
         @('--timeout', 'Per-request timeout in seconds'),
         @('--model', 'Model id to request'),
@@ -443,7 +467,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         { $_ -in '--history', '--chart', '--table', '--storage-file', '--download-dir', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--streams-depth', '--interference', '--chat', '--chat-fixture', '--kl', '--kl-rows', '--kl-top', '--kl-tokens', '--kl-text', '--perplexity', '--ppl-ctx', '--ppl-chunks', '--hellaswag', '--winogrande', '--score-tasks', '--score-rows', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--startup', '--startup-gap', '--startup-evict', '--sweep', '--sweep-cmd', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--streams-depth', '--interference', '--chat', '--chat-fixture', '--chat-record', '--chat-workspace', '--kl', '--kl-rows', '--kl-top', '--kl-max', '--kl-min-top1', '--ppl-baseline', '--ppl-max-increase', '--kl-tokens', '--kl-text', '--perplexity', '--ppl-ctx', '--ppl-chunks', '--hellaswag', '--winogrande', '--score-tasks', '--score-rows', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--startup', '--startup-gap', '--startup-evict', '--sweep', '--sweep-cmd', '--tune', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

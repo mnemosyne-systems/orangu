@@ -121,19 +121,41 @@ pub fn key(device: &str, model: &Path) -> Option<String> {
     ))
 }
 
-/// The cores, named for a run with no device: the architecture and, where
-/// the system says, the processor's model name.
-fn host_key() -> String {
-    let name = std::fs::read_to_string("/proc/cpuinfo")
+/// The processor's model name as the system reports it: `/proc/cpuinfo` on
+/// Linux, `machdep.cpu.brand_string` on macOS, `PROCESSOR_IDENTIFIER` on
+/// Windows. Empty where none says.
+fn cpu_name() -> String {
+    if cfg!(target_os = "macos") {
+        return std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .filter(|out| out.status.success())
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .unwrap_or_default();
+    }
+    if cfg!(windows) {
+        return std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_default();
+    }
+    std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|text| {
             text.lines()
-                .find(|l| l.starts_with("model name"))
+                // `model name` on x86; ARM boards name the part instead.
+                .find(|l| l.starts_with("model name") || l.starts_with("Hardware"))
                 .and_then(|l| l.split_once(':'))
                 .map(|(_, v)| v.trim().to_string())
         })
-        .unwrap_or_default();
-    let slug: String = format!("cpu-{}-{name}", std::env::consts::ARCH)
+        .unwrap_or_default()
+}
+
+/// The cores, named for a run with no device: the architecture, the
+/// processor's model name, and how many cores there are — two machines
+/// whose system names no model still differ in that.
+fn host_key() -> String {
+    let name = cpu_name();
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+    let slug: String = format!("cpu-{}-{cores}-{name}", std::env::consts::ARCH)
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() {

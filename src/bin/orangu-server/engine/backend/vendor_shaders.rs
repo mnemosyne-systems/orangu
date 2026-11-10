@@ -275,7 +275,47 @@ fn render(neutral: &str, dialect: Dialect) -> String {
 /// Prelude, then that type's dequantizer, then the reduction - the same
 /// three-part assembly `vulkan_shaders::shader_source_reduce` uses, and the
 /// same order the three backends composed by hand before this module.
+#[cfg(test)]
 pub(crate) fn kernel_source(dialect: Dialect, ggml_type: u32) -> Option<String> {
+    kernel_source_with(dialect, ggml_type, DEFAULT_WORKGROUP)
+}
+
+/// The workgroup (CUDA/HIP block) size these kernels are built for unless a
+/// profile says otherwise — see [`workgroup`].
+pub(crate) const DEFAULT_WORKGROUP: usize = 64;
+
+/// The workgroup size a backend builds its kernels for and launches them at:
+/// `ORANGU_VENDOR_WORKGROUP` (32, 64, 128 or 256) through the device's tuning
+/// profile, else [`DEFAULT_WORKGROUP`]. Read while the device is brought up,
+/// so each card takes its own profile's value.
+pub(crate) fn workgroup() -> usize {
+    super::env_tuning_value(
+        "ORANGU_VENDOR_WORKGROUP",
+        DEFAULT_WORKGROUP,
+        "32, 64, 128 or 256",
+        |v: usize| matches!(v, 32 | 64 | 128 | 256),
+    )
+}
+
+/// [`kernel_source`] for a workgroup of `workgroup` lanes: each of the four
+/// output rows a group computes takes `workgroup` partial sums, reduced in
+/// halves. The launch must use the same size.
+pub(crate) fn kernel_source_with(
+    dialect: Dialect,
+    ggml_type: u32,
+    workgroup: usize,
+) -> Option<String> {
+    kernel_source_unsized(dialect, ggml_type).map(|source| {
+        source
+            .replace("@WG4@", &(4 * workgroup).to_string())
+            .replace("@WG3@", &(3 * workgroup).to_string())
+            .replace("@WG2@", &(2 * workgroup).to_string())
+            .replace("@WGHALF@", &(workgroup / 2).to_string())
+            .replace("@WG@", &workgroup.to_string())
+    })
+}
+
+fn kernel_source_unsized(dialect: Dialect, ggml_type: u32) -> Option<String> {
     // The block-hoisted pair when this type has one, unless opted out.
     // `ORANGU_NO_BLOCK_HOISTED` is deliberately the *same* variable
     // `engine::backend::vulkan` reads for the same choice: it is one question
@@ -456,7 +496,7 @@ const NEUTRAL_MAIN_REDUCE: &str = r#"
     @U32@ n_tokens,
     @U32@ row_bytes,
     @GU32C@iq_grids) {
-    @SHARED@ float partial_sums[256];
+    @SHARED@ float partial_sums[@WG4@];
 
     @U32@ n_row_groups = (out_dim + 3u) / 4u;
     @U32@ flat = @GROUPID@;
@@ -476,7 +516,7 @@ const NEUTRAL_MAIN_REDUCE: &str = r#"
     float partial1 = 0.0f;
     float partial2 = 0.0f;
     float partial3 = 0.0f;
-    for (@U32@ k = @LOCAL@; k < in_dim; k += 64u) {
+    for (@U32@ k = @LOCAL@; k < in_dim; k += @WG@u) {
         @U32@ block_idx = k / BLOCK_ELEMS;
         @U32@ local_k = k % BLOCK_ELEMS;
         @U32@ block_off = block_idx * BLOCK_BYTES;
@@ -494,29 +534,29 @@ const NEUTRAL_MAIN_REDUCE: &str = r#"
     }
 
     partial_sums[@LOCAL@] = partial0;
-    partial_sums[64u + @LOCAL@] = partial1;
-    partial_sums[128u + @LOCAL@] = partial2;
-    partial_sums[192u + @LOCAL@] = partial3;
+    partial_sums[@WG@u + @LOCAL@] = partial1;
+    partial_sums[@WG2@u + @LOCAL@] = partial2;
+    partial_sums[@WG3@u + @LOCAL@] = partial3;
     @BARRIER@;
-    for (@U32@ stride = 32u; stride > 0u; stride /= 2u) {
+    for (@U32@ stride = @WGHALF@u; stride > 0u; stride /= 2u) {
         if (@LOCAL@ < stride) {
             partial_sums[@LOCAL@] += partial_sums[@LOCAL@ + stride];
-            partial_sums[64u + @LOCAL@] += partial_sums[64u + @LOCAL@ + stride];
-            partial_sums[128u + @LOCAL@] += partial_sums[128u + @LOCAL@ + stride];
-            partial_sums[192u + @LOCAL@] += partial_sums[192u + @LOCAL@ + stride];
+            partial_sums[@WG@u + @LOCAL@] += partial_sums[@WG@u + @LOCAL@ + stride];
+            partial_sums[@WG2@u + @LOCAL@] += partial_sums[@WG2@u + @LOCAL@ + stride];
+            partial_sums[@WG3@u + @LOCAL@] += partial_sums[@WG3@u + @LOCAL@ + stride];
         }
         @BARRIER@;
     }
     if (@LOCAL@ == 0u) {
         y[t * out_dim + o0] = partial_sums[0];
         if (o1 < out_dim) {
-            y[t * out_dim + o1] = partial_sums[64u];
+            y[t * out_dim + o1] = partial_sums[@WG@u];
         }
         if (o2 < out_dim) {
-            y[t * out_dim + o2] = partial_sums[128u];
+            y[t * out_dim + o2] = partial_sums[@WG2@u];
         }
         if (o3 < out_dim) {
-            y[t * out_dim + o3] = partial_sums[192u];
+            y[t * out_dim + o3] = partial_sums[@WG3@u];
         }
     }
 }
@@ -557,7 +597,7 @@ const NEUTRAL_MAIN_BLOCK_HOISTED: &str = r#"
     @U32@ n_tokens,
     @U32@ row_bytes,
     @GU32C@iq_grids) {
-    @SHARED@ float partial_sums[256];
+    @SHARED@ float partial_sums[@WG4@];
 
     @U32@ n_row_groups = (out_dim + 3u) / 4u;
     @U32@ flat = @GROUPID@;
@@ -580,7 +620,7 @@ const NEUTRAL_MAIN_BLOCK_HOISTED: &str = r#"
 
     @U32@ sub = @LOCAL@ % LANES_PER_BLOCK;
     @U32@ slot = @LOCAL@ / LANES_PER_BLOCK;
-    @U32@ blocks_in_flight = 64u / LANES_PER_BLOCK;
+    @U32@ blocks_in_flight = @WG@u / LANES_PER_BLOCK;
     @U32@ n_blocks = in_dim / BLOCK_ELEMS;
     for (@U32@ b = slot; b < n_blocks; b += blocks_in_flight) {
         @U32@ block_off = b * BLOCK_BYTES;
@@ -598,29 +638,29 @@ const NEUTRAL_MAIN_BLOCK_HOISTED: &str = r#"
     }
 
     partial_sums[@LOCAL@] = partial0;
-    partial_sums[64u + @LOCAL@] = partial1;
-    partial_sums[128u + @LOCAL@] = partial2;
-    partial_sums[192u + @LOCAL@] = partial3;
+    partial_sums[@WG@u + @LOCAL@] = partial1;
+    partial_sums[@WG2@u + @LOCAL@] = partial2;
+    partial_sums[@WG3@u + @LOCAL@] = partial3;
     @BARRIER@;
-    for (@U32@ stride = 32u; stride > 0u; stride /= 2u) {
+    for (@U32@ stride = @WGHALF@u; stride > 0u; stride /= 2u) {
         if (@LOCAL@ < stride) {
             partial_sums[@LOCAL@] += partial_sums[@LOCAL@ + stride];
-            partial_sums[64u + @LOCAL@] += partial_sums[64u + @LOCAL@ + stride];
-            partial_sums[128u + @LOCAL@] += partial_sums[128u + @LOCAL@ + stride];
-            partial_sums[192u + @LOCAL@] += partial_sums[192u + @LOCAL@ + stride];
+            partial_sums[@WG@u + @LOCAL@] += partial_sums[@WG@u + @LOCAL@ + stride];
+            partial_sums[@WG2@u + @LOCAL@] += partial_sums[@WG2@u + @LOCAL@ + stride];
+            partial_sums[@WG3@u + @LOCAL@] += partial_sums[@WG3@u + @LOCAL@ + stride];
         }
         @BARRIER@;
     }
     if (@LOCAL@ == 0u) {
         y[t * out_dim + o0] = partial_sums[0];
         if (o1 < out_dim) {
-            y[t * out_dim + o1] = partial_sums[64u];
+            y[t * out_dim + o1] = partial_sums[@WG@u];
         }
         if (o2 < out_dim) {
-            y[t * out_dim + o2] = partial_sums[128u];
+            y[t * out_dim + o2] = partial_sums[@WG2@u];
         }
         if (o3 < out_dim) {
-            y[t * out_dim + o3] = partial_sums[192u];
+            y[t * out_dim + o3] = partial_sums[@WG3@u];
         }
     }
 }
@@ -2887,5 +2927,28 @@ mod tests {
         for dialect in DIALECTS {
             assert!(kernel_source(dialect, crate::engine::quant::GGML_TYPE_MXFP4).is_none());
         }
+    }
+    /// Every workgroup size renders a whole kernel: no placeholder left, the
+    /// shared array four rows of the size, the lanes' stride the size.
+    #[test]
+    fn every_workgroup_size_renders_a_complete_kernel() {
+        for workgroup in [32, 64, 128, 256] {
+            for &ty in SUPPORTED_TYPES {
+                for dialect in [Dialect::Cuda, Dialect::Hip, Dialect::OpenCl] {
+                    let source =
+                        kernel_source_with(dialect, ty, workgroup).expect("supported type");
+                    assert!(!source.contains("@WG"), "{ty} at {workgroup}");
+                    assert!(
+                        source.contains(&format!("partial_sums[{}]", 4 * workgroup)),
+                        "{ty} at {workgroup}"
+                    );
+                    assert!(source.contains(&format!("stride = {}u", workgroup / 2)));
+                }
+            }
+        }
+        assert_eq!(
+            kernel_source(Dialect::Cuda, SUPPORTED_TYPES[0]),
+            kernel_source_with(Dialect::Cuda, SUPPORTED_TYPES[0], DEFAULT_WORKGROUP)
+        );
     }
 }

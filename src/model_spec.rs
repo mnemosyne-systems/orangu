@@ -891,6 +891,15 @@ pub fn resolve_show_target(models_dir: &Path, requested: &str) -> Result<PathBuf
         .iter()
         .find(|group| group.matches_label(requested))
         .map(|group| group.representative_path.clone())
+        // Every spelling a server start resolves (`resolve_load_target`):
+        // `plan` prices what the coordinator is about to start, by the spec
+        // the profile names, and one it cannot find leaves that start
+        // unchecked.
+        .or_else(|| {
+            resolve_delete_target_in(models_dir, requested, &groups)
+                .ok()
+                .map(|group| group.representative_path.clone())
+        })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "'{requested}' was not found as a file, an NR, or a MODEL name; run 'orangu-server list' to see valid values"
@@ -1447,9 +1456,39 @@ impl ModelGroup {
             return true;
         }
         match (&self.hf_repo, &self.quantization) {
-            (Some(repo), Some(quant)) => requested == format!("{repo}:{quant}"),
+            (Some(repo), Some(quant)) if requested == format!("{repo}:{quant}") => true,
+            // The tag as the download chose the file by — `UD-Q4_K_XL`, where
+            // the quantization reads `Q4_K_XL` — names the same file, so a
+            // spec that started a server also prices it in `plan`.
+            (Some(repo), _) => requested
+                .split_once(':')
+                .filter(|(r, _)| r.eq_ignore_ascii_case(repo))
+                .is_some_and(|(_, tag)| self.file_carries_tag(tag)),
             _ => false,
         }
+    }
+
+    /// Whether the model's file name ends in `tag`, before `.gguf` or a
+    /// shard's `-00001-of-0000N`, in any case.
+    fn file_carries_tag(&self, tag: &str) -> bool {
+        let Some(name) = self
+            .representative_path
+            .file_name()
+            .and_then(|name| name.to_str())
+        else {
+            return false;
+        };
+        let name = name.to_ascii_lowercase();
+        let stem = name.strip_suffix(".gguf").unwrap_or(&name);
+        let stem = match stem.rsplit_once("-of-") {
+            Some((front, _)) => front.rsplit_once('-').map_or(front, |(f, _)| f),
+            None => stem,
+        };
+        let tag = tag.to_ascii_lowercase();
+        !tag.is_empty()
+            && stem
+                .strip_suffix(tag.as_str())
+                .is_some_and(|front| front.ends_with('-') || front.ends_with('.'))
     }
 
     /// Whether this row is a draft sidecar rather than a model — a
@@ -3241,6 +3280,28 @@ mod tests {
         assert!(groups[0].matches_label("bartowski/Llama-3.2-3B-Instruct-GGUF"));
         assert!(groups[0].matches_label("bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M"));
         assert!(!groups[0].matches_label("bartowski/Llama-3.2-3B-Instruct-GGUF:Q8_0"));
+    }
+
+    /// A tag the file carries but the quantization does not show — the
+    /// `UD-` of a dynamic quant — still names the file, so the spec a server
+    /// was started with resolves everywhere; a different tag does not.
+    #[test]
+    fn a_files_own_tag_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        write_hub_cache_gguf(
+            dir.path(),
+            "unsloth/gemma-4-26B-A4B-it-GGUF",
+            "rev1",
+            "gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf",
+        );
+        let groups = group_models(&scan_models_dir(dir.path()).unwrap());
+        assert_eq!(groups.len(), 1);
+        let group = &groups[0];
+        assert!(group.matches_label("unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_XL"));
+        assert!(group.matches_label("unsloth/gemma-4-26B-A4B-it-GGUF:ud-q4_k_xl"));
+        assert!(!group.matches_label("unsloth/gemma-4-26B-A4B-it-GGUF:Q8_0"));
+        assert!(!group.matches_label("unsloth/gemma-4-26B-A4B-it-GGUF:K_XL"));
+        assert!(!group.matches_label("someone/else-GGUF:UD-Q4_K_XL"));
     }
 
     /// Two quantizations of one repo share a `MODEL` cell — `QUANT` is what

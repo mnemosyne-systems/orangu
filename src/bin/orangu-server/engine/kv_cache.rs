@@ -3061,6 +3061,14 @@ pub struct KvCache {
     /// from its workers to decode alone (`crate::workers`), and the
     /// sequence goes on here. `false` for every other cache.
     pub whole: bool,
+    /// A recurrent model's state where the conversation's shared part ends —
+    /// the system prompt and tools, which other conversations repeat — kept
+    /// so a cache can be reused that far by a conversation that agrees with
+    /// it no further ([`Self::state_at`]). The attention rows behind it are
+    /// this cache's own. `None` for a cache without recurrent layers.
+    ///
+    /// Boxed: a cache is moved and returned by value on every request.
+    pub shared_checkpoint: Option<Box<(usize, Vec<RecurrentLayerState>)>>,
 }
 
 /// Where the layers a node does not run itself keep their rows — see
@@ -3148,6 +3156,7 @@ impl KvCache {
             deferred_fill: None,
             remote: None,
             whole: false,
+            shared_checkpoint: None,
         }
     }
 
@@ -3797,10 +3806,34 @@ impl KvCache {
         for (dst, src_layer) in self.layers.iter_mut().zip(src.layers.iter()) {
             dst.copy_prefix_from(src_layer, len);
         }
-        for (dst, src_r) in self.recurrent.iter_mut().zip(src.recurrent.iter()) {
+        let state = src.state_at(len).unwrap_or(&src.recurrent);
+        for (dst, src_r) in self.recurrent.iter_mut().zip(state.iter()) {
             dst.copy_from(src_r);
         }
+        self.shared_checkpoint = src
+            .shared_checkpoint
+            .as_deref()
+            .filter(|(at, _)| *at <= len)
+            .map(|(at, state)| {
+                Box::new((
+                    *at,
+                    state.iter().map(RecurrentLayerState::duplicate).collect(),
+                ))
+            });
         self.recent_tokens.clone_from(&src.recent_tokens);
+    }
+
+    /// The recurrent state this cache had at `len` positions, where it has
+    /// one: its own at its full length, or its [`Self::shared_checkpoint`]
+    /// there. `None` for any other length.
+    pub fn state_at(&self, len: usize) -> Option<&[RecurrentLayerState]> {
+        if len == self.committed_len() {
+            return Some(&self.recurrent);
+        }
+        self.shared_checkpoint
+            .as_deref()
+            .filter(|(at, state)| *at == len && state.len() == self.recurrent.len())
+            .map(|(_, state)| state.as_slice())
     }
 
     /// [`Self::copy_prefix_from`] for a paged cache, which is filled by
@@ -3864,8 +3897,21 @@ impl KvCache {
         // roll back, so `reusable_prefix_len` forces all-or-nothing there and
         // `truncate` refuses recurrent caches outright.
         if src.committed_len() > len {
-            src.truncate(len)
-                .expect("a recurrent cache is only reused at its full length");
+            match src.shared_checkpoint.take().map(|b| *b) {
+                Some((at, state)) if at == len && src.has_recurrent() => {
+                    let kept = state.iter().map(RecurrentLayerState::duplicate).collect();
+                    assert!(
+                        src.rewind_to_checkpoint(len, state),
+                        "a shared checkpoint rewinds the cache it was taken in"
+                    );
+                    src.shared_checkpoint = Some(Box::new((at, kept)));
+                }
+                kept => {
+                    src.shared_checkpoint = kept.map(Box::new);
+                    src.truncate(len)
+                        .expect("a recurrent cache is only reused at its full length");
+                }
+            }
         }
         for (dst, s) in self.layers.iter_mut().zip(src.layers.iter_mut()) {
             dst.adopt(s);
@@ -3873,6 +3919,7 @@ impl KvCache {
         for (dst, s) in self.recurrent.iter_mut().zip(src.recurrent.iter()) {
             dst.copy_from(s);
         }
+        self.shared_checkpoint = src.shared_checkpoint.take();
         self.recent_tokens = std::mem::take(&mut src.recent_tokens);
     }
 
@@ -4119,6 +4166,13 @@ impl KvCache {
             layer.truncate(len);
         }
         self.recurrent = state;
+        if self
+            .shared_checkpoint
+            .as_deref()
+            .is_some_and(|(at, _)| *at > len)
+        {
+            self.shared_checkpoint = None;
+        }
         true
     }
 
@@ -4342,6 +4396,12 @@ impl KvCache {
             // other back.
             remote: None,
             whole: self.whole,
+            shared_checkpoint: self.shared_checkpoint.as_deref().map(|(at, state)| {
+                Box::new((
+                    *at,
+                    state.iter().map(RecurrentLayerState::duplicate).collect(),
+                ))
+            }),
         }
     }
 
@@ -4505,6 +4565,7 @@ impl KvCache {
             deferred_fill: None,
             remote: None,
             whole: false,
+            shared_checkpoint: None,
         })
     }
 }

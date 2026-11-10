@@ -109,7 +109,7 @@ static RELEASING: Mutex<()> = Mutex::new(());
 /// the kernel.
 fn window() -> Option<usize> {
     *WINDOW.get_or_init(|| {
-        std::env::var("ORANGU_DENSE_WINDOW")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_DENSE_WINDOW")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|w| *w > 0)

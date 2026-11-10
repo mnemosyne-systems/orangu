@@ -172,6 +172,12 @@ pub struct GenerateRequest {
     /// the prompt has run tokens the next turn will not repeat. `None` when
     /// unknown, or for a model without recurrent state.
     pub cache_point: Option<usize>,
+    /// Where in `prompt_tokens` the conversation's shared part ends — its
+    /// system prompt and tools, which other conversations repeat. A model
+    /// with recurrent state keeps a checkpoint there too, so another
+    /// conversation reuses that much. `None` when unknown, or for a model
+    /// without recurrent state.
+    pub shared_point: Option<usize>,
     /// Work the server does for itself — the prefix warm-up after a restart
     /// (`engine::warm_prefixes`) — rather than for a client. Its cache fills
     /// a slot that retains nothing and never replaces what a client's request
@@ -216,6 +222,7 @@ impl Default for GenerateRequest {
             timings_per_token: false,
             role: None,
             cache_point: None,
+            shared_point: None,
             background: false,
             reasoning_budget: None,
             stop: Default::default(),
@@ -301,6 +308,7 @@ fn trim_to_window(req: &mut GenerateRequest, n_ctx_train: usize) {
         req.dropped_tokens += dropped;
         // The conversation it marks is not the one this prompt holds.
         req.cache_point = None;
+        req.shared_point = None;
     }
 }
 
@@ -878,14 +886,26 @@ impl Engine {
                 // inside the CPU pool below. A pool worker that blocks can be
                 // the one holding a stolen piece of the builder's own
                 // parallel work, and then the builder never finishes.
-                let prompt_pages = paged_kv.as_ref().and_then(|(pool, _)| {
+                let prompt_pages = match paged_kv.as_ref().map(|(pool, _)| {
                     wait_for_prompt_pages(
                         pool,
                         req.prompt_tokens.len(),
                         slot_store.as_deref(),
                         || task_tx.is_closed(),
                     )
-                });
+                }) {
+                    Some(Err(waited)) => {
+                        let _ = task_tx.send(StreamEvent::NoRoom(format!(
+                            "the KV cache had no room for a {}-token prompt for {:.0} s while \
+                             other requests held it; try again",
+                            req.prompt_tokens.len(),
+                            waited.as_secs_f64()
+                        )));
+                        return;
+                    }
+                    Some(Ok(pages)) => pages,
+                    None => None,
+                };
                 let prefix_claim = paged_kv
                     .as_ref()
                     .filter(|_| {
@@ -1012,18 +1032,42 @@ impl Drop for PromptPages {
 /// conversations go before anyone waits (`SlotStore::release_paged`): an
 /// idle cache gives nobody its pages back by itself.
 /// `ORANGU_KV_ADMIT_WAIT=0` turns the admission off.
+///
+/// The wait has a deadline, `ORANGU_KV_ADMIT_DEADLINE_MS` (two minutes
+/// unless set; `0` waits for as long as it takes): past it the request is
+/// refused (`Err`, with how long it waited), so a client is told to retry
+/// rather than held behind other requests' long answers with nothing to see.
 fn wait_for_prompt_pages(
     pool: &Arc<super::kv_pool::KvPool>,
     prompt_tokens: usize,
     slot_store: Option<&super::slot_store::SlotStore>,
     closed: impl Fn() -> bool,
-) -> Option<PromptPages> {
+) -> Result<Option<PromptPages>, Duration> {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         crate::engine::env::flag_on_unless_disabled("ORANGU_KV_ADMIT_WAIT")
     });
+    static DEADLINE: std::sync::LazyLock<Option<Duration>> = std::sync::LazyLock::new(|| {
+        let ms = crate::engine::backend::tuning_profile::env_var("ORANGU_KV_ADMIT_DEADLINE_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(120_000);
+        (ms > 0).then(|| Duration::from_millis(ms))
+    });
+    admit_within(pool, prompt_tokens, slot_store, closed, *ON, *DEADLINE)
+}
+
+/// [`wait_for_prompt_pages`] with its switch and deadline given.
+fn admit_within(
+    pool: &Arc<super::kv_pool::KvPool>,
+    prompt_tokens: usize,
+    slot_store: Option<&super::slot_store::SlotStore>,
+    closed: impl Fn() -> bool,
+    on: bool,
+    deadline: Option<Duration>,
+) -> Result<Option<PromptPages>, Duration> {
     let pages = pool.pages_for(prompt_tokens + 1);
-    if !*ON || pages > pool.num_pages() {
-        return None;
+    if !on || pages > pool.num_pages() {
+        return Ok(None);
     }
     let mut started: Option<Instant> = None;
     loop {
@@ -1038,10 +1082,10 @@ fn wait_for_prompt_pages(
                     started.elapsed().as_secs_f64()
                 );
             }
-            return Some(PromptPages {
+            return Ok(Some(PromptPages {
                 pool: pool.clone(),
                 pages,
-            });
+            }));
         }
         if slot_store.is_some_and(super::slot_store::SlotStore::release_paged) {
             continue;
@@ -1049,7 +1093,18 @@ fn wait_for_prompt_pages(
         // Nothing to wait for: no one else holds or has been promised a
         // page, or the client has gone.
         if idle || closed() {
-            return None;
+            return Ok(None);
+        }
+        if let (Some(started), Some(deadline)) = (started, deadline)
+            && started.elapsed() >= deadline
+        {
+            log::warn!(
+                "orangu-server: [kv] a {prompt_tokens}-token prompt is refused after waiting \
+                 {:.0}s for {pages} pages ({} free)",
+                started.elapsed().as_secs_f64(),
+                pool.available()
+            );
+            return Err(started.elapsed());
         }
         if started.is_none() {
             log::info!(
@@ -1374,6 +1429,9 @@ fn run_leg(
     // What goes on from the leg before, when the window filled during it.
     carried: Option<Carried>,
 ) -> Result<Option<Shifted>> {
+    // How long this prompt has waited, for its yield to decode steps — see
+    // `prompt_yield_layers`.
+    let _prompt_clock = PromptClock::start(arrived);
     let resuming = carried.is_some();
     let (carried_sampler, carried_text, mut tally) = match carried {
         Some(c) => (Some(c.sampler), Some(c.text), c.tally),
@@ -1584,6 +1642,8 @@ fn run_leg(
     // cost (this is never actually `None` except mid-swap).
     let mut cache = Some(new_cache);
     let mut sampler = carried_sampler.unwrap_or_else(|| Sampler::new(req.sampling.clone()));
+    // Its draws keyed by where each token stands in the whole conversation.
+    sampler.set_dropped(req.dropped_tokens);
     if let Some(top) = req.logprobs.filter(|_| !resuming) {
         sampler = sampler.with_logprobs(top);
     }
@@ -1654,12 +1714,13 @@ fn run_leg(
     // more than the steps it saves. One whose layers other nodes hold
     // cannot roll back, and does not speculate. A draft model's cache
     // follows the target's with `KvCache::truncate` alone, so a recurrent
-    // draft model is not built, and neither is an MTP head on a recurrent
+    // draft model is not used — the request drafts by prompt lookup instead,
+    // which keeps no cache — and neither is an MTP head on a recurrent
     // target, whose states the rollback would have to replay too.
     let target_recurrent = cache.as_ref().is_some_and(KvCache::has_recurrent);
-    let may_speculate = (!target_recurrent
-        || (spec_recurrent(model) && cache.as_ref().is_some_and(KvCache::can_roll_back)))
-        && !draft.is_some_and(|d| d.model.new_kv_cache(1).has_recurrent());
+    let may_speculate = !target_recurrent
+        || (spec_recurrent(model) && cache.as_ref().is_some_and(KvCache::can_roll_back));
+    let draft = draft.filter(|d| !d.model.new_kv_cache(1).has_recurrent());
     let mtp = mtp.filter(|_| !target_recurrent);
     // A configured draft model wins over the model's own MTP head, which
     // wins over prompt-lookup. All three guess at the same tokens, so
@@ -1772,21 +1833,45 @@ fn run_leg(
             && at < req.prompt_tokens.len()
             && cache.as_ref().is_some_and(KvCache::has_recurrent)
     });
-    let mut checkpoint: Option<(usize, Vec<crate::engine::kv_cache::RecurrentLayerState>)> = None;
-    let prefilled = match checkpoint_at {
+    // And at the end of the conversation's shared part — the system prompt
+    // and tools — kept with the cache, so another conversation that repeats
+    // only that much reuses it (`KvCache::shared_checkpoint`).
+    let shared_at = req.shared_point.filter(|&at| {
+        (slot_store.is_some() || prefix_cache.is_some())
+            && paged_kv.is_none()
+            && at > reused_len
+            && checkpoint_at.is_none_or(|c| at < c)
+            && at < req.prompt_tokens.len()
+            && cache.as_ref().is_some_and(KvCache::has_recurrent)
+    });
+    let mut from = reused_len;
+    let shared = match shared_at {
         Some(at) => {
             let cache = cache.as_mut().expect("cache is always Some here");
-            let head = &req.prompt_tokens[reused_len..at];
             prefill(
                 model,
                 cache,
-                head,
+                &req.prompt_tokens[reused_len..at],
                 reused_len,
                 guard.id(),
                 None,
                 &mut on_chunk,
             )
-            .and_then(|_| {
+            .map(|_| {
+                cache.shared_checkpoint = Some(Box::new((at, cache.recurrent_checkpoint())));
+                from = at;
+            })
+        }
+        None => Ok(()),
+    };
+    let done_before = from - reused_len;
+    let mut on_chunk = |processed: usize| on_chunk(done_before + processed);
+    let mut checkpoint: Option<(usize, Vec<crate::engine::kv_cache::RecurrentLayerState>)> = None;
+    let prefilled = shared.and_then(|()| match checkpoint_at {
+        Some(at) => {
+            let cache = cache.as_mut().expect("cache is always Some here");
+            let head = &req.prompt_tokens[from..at];
+            prefill(model, cache, head, from, guard.id(), None, &mut on_chunk).and_then(|_| {
                 checkpoint = Some((at, cache.recurrent_checkpoint()));
                 let done = head.len();
                 prefill(
@@ -1803,13 +1888,13 @@ fn run_leg(
         None => prefill(
             model,
             cache.as_mut().expect("cache is always Some here"),
-            &req.prompt_tokens[reused_len..],
-            reused_len,
+            &req.prompt_tokens[from..],
+            from,
             guard.id(),
             drafter.as_mut(),
             &mut on_chunk,
         ),
-    };
+    });
     let logits = match prefilled {
         Ok(l) => l,
         Err(err) if err.is::<PrefillCancelled>() => {
@@ -1864,11 +1949,6 @@ fn run_leg(
     }
     drop(prefix_claim);
     let prompt_time = prompt_start.elapsed();
-    // Prefill is never decode-shaped (`n_tokens > 1`), so it never takes a
-    // GPU-fused sampling fast path either way — this first sample always
-    // runs the plain CPU chain.
-    let mut next = sampler.sample(&logits, &history, history.len());
-
     let generate_start = Instant::now();
     let mut generated = tally.generated;
     let finish_reason;
@@ -1877,7 +1957,8 @@ fn run_leg(
     let mut last_report = Instant::now();
     let mut reported = false;
     let mut spec_buf: VecDeque<u32> = VecDeque::new();
-    let mut draft_control = super::draft_control::DraftControl::new();
+    let mut draft_control =
+        super::draft_control::DraftControl::new(drafter.as_ref().map_or(0, Drafter::price_id));
     let mut spec_accepted = 0usize;
     let mut spec_steps = 0usize;
     let CarriedText {
@@ -1897,16 +1978,40 @@ fn run_leg(
         reply: ReplyState::new(&req.stop),
     });
     let (mut reasoning_tokens, mut budget_spent) = (carried_reasoning, carried_budget);
+    // Prefill is never decode-shaped (`n_tokens > 1`), so it never takes a
+    // GPU-fused sampling fast path either way — this first sample always
+    // runs the plain CPU chain.
+    sampler.set_reasoning(header.in_reasoning());
+    let mut next = sampler.sample(&logits, &history, history.len());
     let mut reply = ReplyText::resume(&tx, carried_reply);
     let mut stopped_on_text = false;
     // When the previous token was produced, so the gap to the next one can be
     // observed. `None` until there is a previous one to measure from.
     let mut last_token_at: Option<Instant> = tally.last_token_at;
     // This slot decodes with the others from here on — one forward for all
-    // of them per step (`engine::decode_batch`). Only the plain path: a
-    // draft or a multi-token head steps on its own schedule.
-    let batches = draft.is_none() && mtp.is_none() && model.batches_decode();
+    // of them per step (`engine::decode_batch`). A request with a draft model
+    // joins too: its plain steps are rows of the batched step, and its
+    // verifies ride in it where the model batches verifies, as prompt
+    // lookup's do — its draft model's own steps run on its own cache, beside.
+    // A multi-token head stays out: every one of its steps is a verify that
+    // exports the served model's states, which a batched step does not, so
+    // it would never step with the batch and the batch would wait for it.
+    let batches = mtp.is_none() && model.batches_decode();
     let mut batch_registration = batches.then(|| decode_batcher.register()).flatten();
+    // A greedy request decoding alone takes each step before it has read the
+    // last one's token (`ModelForward::decode_lookahead`): the device runs
+    // step N+1 from step N's pick, gathered where the pick is, while the
+    // host reads N's token and emits it — the host one token behind, the
+    // device never waiting for it. Only where the pick is the device's alone
+    // to make (greedy, no repeat penalty, nothing that needs the logits) and
+    // a step taken ahead can be taken back (`KvCache::truncate`).
+    let lookahead_on = lookahead_enabled()
+        && drafter.is_none()
+        && model.vulkan_backend().is_some()
+        && cache
+            .as_ref()
+            .is_some_and(|c| !c.has_recurrent() && c.can_roll_back());
+    let mut pending: Option<(crate::engine::backend::vulkan::PendingToken, usize)> = None;
     // Another request's prefill narrows its chunks while this one decodes —
     // see `decode_yield_width`.
     let decoding = Decoding::enter();
@@ -1921,7 +2026,6 @@ fn run_leg(
         }
         history.push(next);
         generated += 1;
-        sampler.set_reasoning(header.in_reasoning());
         let logprob = sampler.take_logprob(next);
         guard.set_generated_tokens(generated);
         // Time to first token counts from arrival, so it carries the queue
@@ -1975,6 +2079,12 @@ fn run_leg(
             // while it is a message body the role hides.
             header.observe_text(decoder.push(tokenizer, next))
         };
+        // The pick after `next` goes where `next` left the reply. Not while
+        // verified tokens wait to be emitted: those were picked already, and
+        // the verify that picked them kept the sampler's state for each.
+        if spec_buf.is_empty() {
+            sampler.set_reasoning(header.in_reasoning());
+        }
         if let Some(text) = emitted {
             if header.in_reasoning() {
                 reply.flush();
@@ -1987,6 +2097,18 @@ fn run_leg(
                 finish_reason = FinishReason::Stop;
                 break;
             }
+        }
+        // A document `next` completed has nothing after it but a stop token
+        // (`Sampler::document_finished`): the reply ends here rather than
+        // running one more step to pick it. Not while verified tokens wait to
+        // be emitted: the verify kept the constraint where its last one left
+        // it, past `next`. `next` itself never ran through the model, so it
+        // leaves the history the cache is published from, as a token that
+        // stopped the text does.
+        if spec_buf.is_empty() && sampler.document_finished() {
+            history.pop();
+            finish_reason = FinishReason::Stop;
+            break;
         }
         // A reasoning budget spent: the next token closes the reasoning.
         if let Some(budget) = req.reasoning_budget
@@ -2101,7 +2223,8 @@ fn run_leg(
             && let Some(occupant) = occupant.as_ref()
             && let Some((pool, index)) = paged_kv
         {
-            let rows = 1 + drafter.as_ref().map_or(0, Drafter::max_tokens);
+            let rows =
+                1 + drafter.as_ref().map_or(0, Drafter::max_tokens) + usize::from(lookahead_on);
             let room = (start_pos + rows).min(capacity);
             let closed = || tx.is_closed();
             let found = room_for_step(
@@ -2182,9 +2305,23 @@ fn run_leg(
         // An echo in progress is verified whatever the gate says, at the
         // width that has been yielding more tokens a millisecond.
         let echo = spec_buf.is_empty() && drafter.as_mut().is_some_and(|d| d.echoes(&history));
+        let sharing = if batch_registration.is_some() {
+            decode_batcher.rows()
+        } else {
+            1
+        };
+        let in_batch = batch_registration.is_some() && model.batches_verify();
+        draft_control.at(start_pos);
         let wide = echo
-            && drafter.as_ref().is_some_and(Drafter::has_echo_draft)
-            && draft_control.echo_wide();
+            && drafter.as_ref().is_some_and(|d| {
+                d.has_echo_draft()
+                    && draft_control.echo_wide(
+                        d.draft_len(false),
+                        d.draft_len(true),
+                        sharing,
+                        in_batch,
+                    )
+            });
         // A verify that would run on the host, over rows the devices of a split
         // model are keeping, has nothing to read: this step is a plain one.
         let rows_in_reach = model.vulkan_backend().is_some()
@@ -2192,21 +2329,34 @@ fn run_leg(
             || cache
                 .as_ref()
                 .is_some_and(|cache| cache.host_holds_rows(start_pos));
-        let speculated = if spec_buf.is_empty()
-            && rows_in_reach
+        // The draft's length: an echo's and a head's own, else the one the
+        // control expects the most tokens a millisecond from — `None` for a
+        // plain step.
+        let planned = if spec_buf.is_empty() && rows_in_reach {
+            drafter.as_ref().and_then(|d| {
+                if d.verifies_with_states() || echo {
+                    Some(d.draft_len(wide))
+                } else {
+                    draft_control.plan(sharing, in_batch, d.draft_len(false))
+                }
+            })
+        } else {
+            None
+        };
+        // A draft the control planned the length of is also cut by its
+        // proposals' confidence; an echo's and a head's are verified whole.
+        let gated = !echo && drafter.as_ref().is_some_and(|d| !d.verifies_with_states());
+        let speculated = if let Some(draft_len) = planned
             && let Some(drafter) = drafter.as_mut()
-            && (drafter.verifies_with_states()
-                || draft_control.should_verify(
-                    if batch_registration.is_some() {
-                        decode_batcher.rows()
-                    } else {
-                        1
-                    },
-                    batch_registration.is_some() && model.batches_verify(),
-                )
-                || echo)
         {
+            let control = &draft_control;
+            let cut = |bins: &[u8]| control.cut(bins);
             let started = Instant::now();
+            let reasoning = sampler.watches_reasoning().then(|| ReasoningProbe {
+                tokenizer,
+                header: header.clone(),
+                decoder: decoder.clone(),
+            });
             match speculative_next(
                 model,
                 cache
@@ -2219,7 +2369,9 @@ fn run_leg(
                 capacity,
                 drafter,
                 guard.id(),
-                drafter.draft_len(wide),
+                draft_len,
+                gated.then_some(&cut as DraftCut<'_>),
+                reasoning,
                 &mut spec_buf,
                 &mut spec_accepted,
                 &mut spec_steps,
@@ -2228,9 +2380,23 @@ fn run_leg(
                     .filter(|_| model.batches_verify())
                     .map(|registration| (decode_batcher, registration)),
             ) {
-                Ok(Some((t, yielded))) => {
+                Ok(Some(SpeculativeStep {
+                    token: t,
+                    yielded,
+                    bins,
+                    rows: ran,
+                })) => {
                     if !drafter.verifies_with_states() || echo {
-                        draft_control.verified(yielded, started.elapsed(), echo.then_some(wide));
+                        draft_control.verified(
+                            yielded,
+                            bins.len(),
+                            &bins,
+                            ran,
+                            started.elapsed(),
+                            echo.then_some(wide),
+                            sharing,
+                            in_batch,
+                        );
                     }
                     Some(t)
                 }
@@ -2250,23 +2416,96 @@ fn run_leg(
             // A token an earlier speculative step already verified and
             // committed to the KV cache — emit it without another forward.
             tok
+        } else if let Some(t) = {
+            let ahead_ok = lookahead_on
+                && batch_registration.is_none()
+                && sampler.is_greedy()
+                && sampler.repeat_penalty() == 1.0
+                && !sampler.needs_host_logits();
+            let cache = cache
+                .as_mut()
+                .expect("cache is always Some between iterations");
+            // A step taken ahead for another token, or that this step does
+            // not take ahead, is taken back.
+            let current = match pending.take() {
+                Some((p, pos)) if ahead_ok && pos == start_pos => Some(p),
+                Some((p, pos)) => {
+                    let vulkan = model.vulkan_backend().expect("lookahead runs on a device");
+                    let _ = vulkan.read_token(p);
+                    cache.truncate(pos)?;
+                    None
+                }
+                None => None,
+            };
+            let current = match current {
+                Some(p) => Some(p),
+                None if ahead_ok => model.decode_lookahead(
+                    cache,
+                    crate::engine::arch::LookaheadInput::Token(next),
+                    start_pos,
+                    guard.id(),
+                )?,
+                None => None,
+            };
+            match current {
+                Some(current) => {
+                    let room = generated + 1 < req.max_tokens && start_pos + 2 < capacity;
+                    let ahead = if room {
+                        model
+                            .decode_lookahead(
+                                cache,
+                                crate::engine::arch::LookaheadInput::Pending(&current),
+                                start_pos + 1,
+                                guard.id(),
+                            )?
+                            .map(|p| (p, start_pos + 1))
+                    } else {
+                        None
+                    };
+                    let vulkan = model.vulkan_backend().expect("lookahead runs on a device");
+                    let t = vulkan.read_token(current);
+                    pending = ahead;
+                    if paged_kv.is_some() {
+                        cache.commit_pages();
+                    }
+                    Some(t)
+                }
+                None => None,
+            }
+        } {
+            sampler.note_device_pick(t);
+            t
         } else {
             let step_started = drafter.is_some().then(Instant::now);
-            // The device-side argmax picks a token without ever consulting
-            // the grammar, so a constrained request has to come back to the
-            // CPU sampler for every step. It costs the fast path; the
-            // alternative is a constraint that silently does not apply.
             // A sampled step whose sampler only looks at its top `k` can have
             // the device find those `k` (`top_k` below) and read back a few
-            // dozen pairs instead of the whole vocabulary.
+            // dozen pairs instead of the whole vocabulary. A step held to a
+            // grammar has the device find its best candidates and checks the
+            // grammar against those (`Sampler::sample_constrained`); only when
+            // they cannot settle the pick does the step run again for every
+            // logit. A cache with recurrent layers cannot run a step again, so
+            // it reads every logit each step.
             let device_top_k = sampler.device_top_k();
-            let greedy_sample = (!sampler.needs_host_logits()
-                && (sampler.is_greedy() || device_top_k > 0))
-                .then(|| GreedySampleParams {
+            let constrained_k = if cache.as_ref().is_some_and(|c| !c.has_recurrent()) {
+                sampler.device_constrained_k()
+            } else {
+                0
+            };
+            let greedy_sample = if constrained_k > 0 {
+                Some(GreedySampleParams {
                     recent_tokens: &history[recent_start..],
                     repeat_penalty: sampler.repeat_penalty(),
-                    top_k: if sampler.is_greedy() { 0 } else { device_top_k },
-                });
+                    top_k: constrained_k,
+                })
+            } else {
+                (!sampler.needs_host_logits() && (sampler.is_greedy() || device_top_k > 0)).then(
+                    || GreedySampleParams {
+                        recent_tokens: &history[recent_start..],
+                        repeat_penalty: sampler.repeat_penalty(),
+                        top_k: if sampler.is_greedy() { 0 } else { device_top_k },
+                    },
+                )
+            };
             // GPU submissions for this one decode step. `gemma.rs` had this
             // instrumentation privately; it belongs here, because the number it
             // reports is *the* difference between the two decode paths and
@@ -2299,7 +2538,18 @@ fn run_leg(
                 )
             });
             if let Some(started) = step_started {
-                draft_control.stepped(started.elapsed());
+                // A batched step's own compute, not its wait for the others.
+                let took = decode_batcher
+                    .take_last_compute()
+                    .unwrap_or_else(|| started.elapsed());
+                draft_control.stepped(
+                    took,
+                    if batch_registration.is_some() {
+                        decode_batcher.rows()
+                    } else {
+                        1
+                    },
+                );
             }
             if let Some(before) = submissions_before
                 && let Some(v) = model.vulkan_backend()
@@ -2323,6 +2573,41 @@ fn run_leg(
                     sampler.note_device_pick(t);
                     t
                 }
+                Ok(ForwardOutcome::Candidates(c)) if constrained_k > 0 => {
+                    match sampler.sample_constrained(c, history.len()) {
+                        Some(t) => t,
+                        None => {
+                            // The grammar allows none of the candidates: run
+                            // the step again over the same position for every
+                            // logit, which the host sampler masks in full.
+                            let cache = cache
+                                .as_mut()
+                                .expect("cache is always Some between iterations");
+                            if let Err(err) = cache.truncate(start_pos) {
+                                let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
+                                return Ok(None);
+                            }
+                            match decode_batcher.step(
+                                None,
+                                model,
+                                cache,
+                                next,
+                                start_pos,
+                                None,
+                                guard.id(),
+                            ) {
+                                Ok(ForwardOutcome::Logits(l)) => {
+                                    sampler.sample(&l, &history, history.len())
+                                }
+                                Ok(_) => unreachable!("a step without sampling returns logits"),
+                                Err(err) => {
+                                    let _ = tx.send(StreamEvent::Error(format!("{err:?}")));
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
+                }
                 Ok(ForwardOutcome::Candidates(c)) => {
                     sampler.sample_from_candidates(c, history.len())
                 }
@@ -2344,6 +2629,15 @@ fn run_leg(
                 }
             }
         };
+    }
+    // A step taken ahead for a token the reply never got to: its row goes.
+    if let Some((p, pos)) = pending.take() {
+        if let Some(vulkan) = model.vulkan_backend() {
+            let _ = vulkan.read_token(p);
+        }
+        if let Some(cache) = cache.as_mut() {
+            cache.truncate(pos)?;
+        }
     }
     drop(decoding);
     // Generation can stop part-way through a character — a token limit, a stop
@@ -2501,6 +2795,7 @@ fn run_leg(
             req: GenerateRequest {
                 prompt_tokens: prompt_tokens_next,
                 cache_point: None,
+                shared_point: None,
                 dropped_tokens,
                 ..req
             },
@@ -2638,7 +2933,7 @@ const MAX_HEADER_LEN: usize = 128;
 /// The name of the channel gemma-4 reasons in.
 const REASONING_CHANNEL: &str = "thought";
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct MessageHeader {
     /// `(<|start|>, <|message|>)`, or `None` when this vocabulary has no
     /// such framing and nothing here applies.
@@ -3017,7 +3312,7 @@ pub(crate) fn prefill_chunk_ceiling() -> usize {
 fn prefill_batch_override() -> Option<usize> {
     static BATCH: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *BATCH.get_or_init(|| {
-        std::env::var("ORANGU_PREFILL_BATCH")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PREFILL_BATCH")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
     })
@@ -3297,7 +3592,7 @@ fn chunk_floor() -> usize {
 fn chunk_floor_override() -> Option<usize> {
     static FLOOR: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *FLOOR.get_or_init(|| {
-        std::env::var("ORANGU_PREFILL_CHUNK_FLOOR")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PREFILL_CHUNK_FLOOR")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
     })
@@ -3326,7 +3621,7 @@ pub fn set_chunk_policy(has_submission_timeout: bool, full_width: bool) {
 /// rather than treated as one of the two: a typo in a harness must not
 /// silently select an arm.
 fn env_chunk_policy() -> Option<ChunkPolicy> {
-    match std::env::var("ORANGU_CHUNK_POLICY")
+    match crate::engine::backend::tuning_profile::env_var("ORANGU_CHUNK_POLICY")
         .ok()?
         .trim()
         .to_ascii_lowercase()
@@ -3863,6 +4158,31 @@ fn prefix_wait() -> bool {
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_PREFIX_WAIT"))
 }
 
+/// The context asked for and the tier served in its place, when the device
+/// could not hold the one asked for — see `main`'s `context_tiers_below`.
+static CONTEXT_TIER: Mutex<Option<(usize, usize)>> = Mutex::new(None);
+
+/// Records the served context tier — see [`CONTEXT_TIER`].
+pub fn set_context_tier(tier: Option<(usize, usize)>) {
+    *CONTEXT_TIER.lock().unwrap_or_else(|p| p.into_inner()) = tier;
+}
+
+/// `(asked for, served)` when a smaller context tier is served than was
+/// asked for.
+pub fn context_tier() -> Option<(usize, usize)> {
+    *CONTEXT_TIER.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Whether a greedy request decoding alone takes its steps ahead of reading
+/// their tokens — see `run_leg`. Off unless `ORANGU_DECODE_LOOKAHEAD=1`: the
+/// decode chain already submits a layer at a time, so the device rarely
+/// waits for the host's turn between tokens, and the gather a step taken
+/// ahead adds measured no faster than the plain step.
+fn lookahead_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_DECODE_LOOKAHEAD"))
+}
+
 /// How many requests are in their decode loop.
 static DECODING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
@@ -3891,22 +4211,119 @@ impl Drop for Decoding {
     }
 }
 
-/// Whether a prompt on this thread should make way for decode steps between
-/// its layers: another request is decoding, and this thread is not.
-///
-/// Requests share one device whose queue runs submissions in order, and a
-/// prompt records a whole chunk's layers ahead of the device, so a decode
-/// step issued mid-chunk waited for all of it — up to the chunk budget of
-/// seconds. While this holds, a prompt submits one layer at a time and keeps
-/// at most one more queued (`VulkanBackend::end_prefill_group`), so a decode
-/// step waits for about two layers of the chunk. `ORANGU_PREFILL_YIELD_LAYERS=0`
-/// turns it off.
-pub(crate) fn prompt_yields_to_decode() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_YIELD_LAYERS"))
-        && !DECODING_HERE.with(|here| here.get())
-        && DECODING.load(std::sync::atomic::Ordering::Relaxed) > 0
+/// Whether this thread's request is in its decode loop.
+pub(crate) fn decoding_on_this_thread() -> bool {
+    DECODING_HERE.with(|here| here.get())
 }
+
+/// Milliseconds since the process's first call, from 1 — so 0 can mean
+/// "never".
+pub(crate) fn clock_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+thread_local! {
+    /// When the request whose prompt runs on this thread arrived — see
+    /// [`PromptClock`].
+    static PROMPT_SINCE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// This thread's request's arrival, for as long as its leg runs.
+struct PromptClock;
+
+impl PromptClock {
+    fn start(arrived: Instant) -> Self {
+        PROMPT_SINCE.with(|since| since.set(Some(arrived)));
+        Self
+    }
+}
+
+impl Drop for PromptClock {
+    fn drop(&mut self) {
+        PROMPT_SINCE.with(|since| since.set(None));
+    }
+}
+
+/// How recently a decoding request must have waited on a device for a prompt
+/// there to make way for it. Longer than any decode step's gap, so a slow
+/// model's decoder still counts between its steps.
+const DECODE_RECENT_MS: u64 = 2000;
+
+/// How many layers a prompt on this thread submits at a time while it makes
+/// way for decode steps on `device` — `None` when it need not.
+///
+/// Requests share a device whose queue runs submissions in order, and a
+/// prompt records a whole chunk's layers ahead of the device, so a decode
+/// step issued mid-chunk would wait for all of it — up to the chunk budget of
+/// seconds. While another request decodes **on the same device** (it waited
+/// there within [`DECODE_RECENT_MS`]; a request decoding on another device
+/// or on the cores is not held up by this one's queue), a prompt submits a
+/// few layers at a time and keeps at most one more group queued
+/// (`VulkanBackend::end_prefill_group`), so a decode step waits for about two
+/// groups.
+///
+/// Bounded by the prompt's own wait: one layer a group until the request
+/// has waited `ORANGU_PREFILL_YIELD_TTFT_MS` since it arrived, then
+/// `ORANGU_PREFILL_YIELD_EVERY` layers, so making way for others costs a
+/// prompt a bounded share of its time to first token rather than a fixed
+/// share of all of it. `ORANGU_PREFILL_YIELD_LAYERS=0` turns the yield off.
+pub(crate) fn prompt_yield_layers(
+    device: Option<&crate::engine::backend::VulkanBackend>,
+) -> Option<usize> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON
+        .get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_YIELD_LAYERS"))
+        || decoding_on_this_thread()
+        || DECODING.load(std::sync::atomic::Ordering::Relaxed) == 0
+    {
+        return None;
+    }
+    if let Some(device) = device {
+        let seen = device.decode_seen_ms();
+        if seen == 0 || clock_ms().saturating_sub(seen) > DECODE_RECENT_MS {
+            return None;
+        }
+    }
+    let waited = PROMPT_SINCE
+        .with(|since| since.get())
+        .map(|at| at.elapsed());
+    Some(yield_group_layers(waited, yield_ttft(), yield_every()))
+}
+
+/// [`prompt_yield_layers`]'s group size for a prompt that has waited
+/// `waited`: one layer until `ttft`, `every` after it.
+fn yield_group_layers(waited: Option<Duration>, ttft: Duration, every: usize) -> usize {
+    match waited {
+        Some(waited) if waited >= ttft => every.max(1),
+        _ => 1,
+    }
+}
+
+/// `ORANGU_PREFILL_YIELD_TTFT_MS` — see [`prompt_yield_layers`].
+fn yield_ttft() -> Duration {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    Duration::from_millis(*MS.get_or_init(|| {
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PREFILL_YIELD_TTFT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(PREFILL_YIELD_TTFT_MS_DEFAULT)
+    }))
+}
+
+/// `ORANGU_PREFILL_YIELD_EVERY` — see [`prompt_yield_layers`].
+fn yield_every() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PREFILL_YIELD_EVERY")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(PREFILL_YIELD_EVERY_DEFAULT)
+    })
+}
+
+const PREFILL_YIELD_TTFT_MS_DEFAULT: u64 = 5000;
+const PREFILL_YIELD_EVERY_DEFAULT: usize = 4;
 
 /// The widest prefill chunk the next pass may take, given that other
 /// requests may be decoding: unbounded when none is.
@@ -3923,7 +4340,7 @@ pub(crate) fn prompt_yields_to_decode() -> bool {
 /// the prompt's cost; and a queued decode step still waits for whatever the
 /// prompt has in flight. On a 3B model at 150 ms it made a 2 048-token prompt
 /// seven times slower and left the decoding stream stalling for half a second.
-/// [`prompt_yields_to_decode`] bounds the stall instead, by putting decode
+/// [`prompt_yield_layers`] bounds the stall instead, by putting decode
 /// steps between a prompt's layers.
 ///
 /// Priced from `wall`, the last chunk's tokens and **wall time**
@@ -3937,7 +4354,7 @@ pub(crate) fn prompt_yields_to_decode() -> bool {
 fn decode_yield_width(wall: Option<(usize, Duration)>, policy: ChunkPolicy, batch: usize) -> usize {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let ms = *MS.get_or_init(|| {
-        std::env::var("ORANGU_PREFILL_YIELD_MS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PREFILL_YIELD_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(PREFILL_YIELD_MS_DEFAULT)
@@ -4057,7 +4474,7 @@ fn chunk_is_priced(submits: u64) -> bool {
 fn chunk_submission_spread() -> u64 {
     static SPREAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SPREAD.get_or_init(|| {
-        std::env::var("ORANGU_PREFILL_CHUNK_SPREAD")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PREFILL_CHUNK_SPREAD")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(4)
@@ -4372,7 +4789,7 @@ const PREFILL_MIN_CHUNK_TOKENS: usize = 16;
 fn prefill_chunk_budget() -> Duration {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("ORANGU_PREFILL_CHUNK_MS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PREFILL_CHUNK_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|ms| *ms > 0)
@@ -4400,7 +4817,7 @@ fn gpu_trace() -> bool {
 /// is accepted, and an echo that breaks off — an edit — leaves it behind; the
 /// measuring costs more than it finds.
 fn spec_echo_draft(on_device: bool) -> usize {
-    std::env::var("ORANGU_SPEC_ECHO_DRAFT")
+    crate::engine::backend::tuning_profile::env_var("ORANGU_SPEC_ECHO_DRAFT")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(if on_device { 16 } else { 0 })
@@ -4426,17 +4843,28 @@ fn trace_tokens() -> bool {
     *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_TRACE_TOKENS"))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Prompt lookup on, for a test on this thread that asks for it.
+    static LOOKUP_IN_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Prompt-lookup settings, read at the start of a request: on unless
 /// `ORANGU_SPECULATIVE=0`; `ORANGU_SPEC_NGRAM` (default 2) is how many
 /// trailing tokens must match an earlier spot in the context to draft, and
 /// `ORANGU_SPEC_DRAFT` (default 4) how many tokens to draft from there.
-/// `None` when it is off, under test, or when the model cannot verify.
+/// `None` when it is off, under test unless the test turns it on, or when
+/// the model cannot verify.
 fn speculative_config() -> Option<(usize, usize)> {
     // On unless turned off: with `engine::draft_control` deciding per step,
     // a draft is verified only while verifying pays, and an empty one costs
-    // nothing. Off under test, where a request's forward count is asserted.
-    if cfg!(test)
-        || NO_VERIFY.load(std::sync::atomic::Ordering::Relaxed)
+    // nothing. Off under test, where a request's forward count is asserted,
+    // unless the test turns it on (`LOOKUP_IN_TEST`).
+    #[cfg(test)]
+    if !LOOKUP_IN_TEST.with(std::cell::Cell::get) {
+        return None;
+    }
+    if NO_VERIFY.load(std::sync::atomic::Ordering::Relaxed)
         || !crate::engine::env::flag_on_unless_disabled("ORANGU_SPECULATIVE")
     {
         return None;
@@ -4459,7 +4887,7 @@ fn speculative_config() -> Option<(usize, usize)> {
 fn copy_context() -> usize {
     static CONTEXT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CONTEXT.get_or_init(|| {
-        match std::env::var("ORANGU_SPEC_COPY_CONTEXT")
+        match crate::engine::backend::tuning_profile::env_var("ORANGU_SPEC_COPY_CONTEXT")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
         {
@@ -4657,8 +5085,7 @@ impl Drafter<'_> {
                     // to forward, and `committed` never runs past it.
                     anyhow::bail!("draft cache is ahead of the committed history");
                 }
-                let mut logits =
-                    draft_forward(*model, cache, catch_up, *committed, *tokens, slot_id)?;
+                let mut logits = draft_forward(*model, cache, catch_up, *committed, slot_id)?;
                 *committed = history.len();
                 let mut drafted = Vec::with_capacity(*tokens);
                 for i in 0..*tokens {
@@ -4668,6 +5095,13 @@ impl Drafter<'_> {
                     // make the *draft* random without making the output any
                     // less determined by the target.
                     let token = crate::engine::sampling::argmax(&logits);
+                    DRAFT_PROBABILITIES.with(|p| {
+                        let mut p = p.borrow_mut();
+                        if i == 0 {
+                            p.clear();
+                        }
+                        p.push(top_probability(&logits));
+                    });
                     drafted.push(token);
                     // The last drafted token is never fed back: nothing would
                     // read its logits, and committing it to the draft cache
@@ -4676,7 +5110,7 @@ impl Drafter<'_> {
                     if i + 1 == *tokens {
                         break;
                     }
-                    logits = draft_forward(*model, cache, &[token], *committed, *tokens, slot_id)?;
+                    logits = draft_forward(*model, cache, &[token], *committed, slot_id)?;
                     *committed += 1;
                 }
                 Ok(drafted)
@@ -4893,6 +5327,37 @@ impl Drafter<'_> {
             Drafter::PromptLookup { max_draft, .. } => *max_draft,
             Drafter::Mtp { tokens, .. } => *tokens,
             _ => self.max_draft(),
+        }
+    }
+
+    /// Which kind of drafter this is, for the verify prices it keeps
+    /// (`engine::draft_control`): the kinds cost differently per row.
+    fn price_id(&self) -> u8 {
+        match self {
+            Drafter::PromptLookup { .. } => 1,
+            Drafter::Mtp { .. } => 2,
+            _ => 3,
+        }
+    }
+
+    /// How sure the drafter was of each token of the `len`-token draft it
+    /// just made, in `engine::draft_control`'s bins: prompt lookup by how
+    /// far back its match runs, a draft model by the probability it gave
+    /// each token, a head in the middle bin.
+    fn confidence_bins(&mut self, history: &[u32], len: usize) -> Vec<u8> {
+        use super::draft_control::{bin_of_match, bin_of_probability};
+        match self {
+            Drafter::PromptLookup { index, .. } => {
+                let context = index.find(history).map_or(0, |(c, _)| c);
+                vec![bin_of_match(context); len]
+            }
+            Drafter::Model { .. } => DRAFT_PROBABILITIES.with(|p| {
+                let p = p.borrow();
+                (0..len)
+                    .map(|i| bin_of_probability(p.get(i).copied().unwrap_or(0.0)))
+                    .collect()
+            }),
+            _ => vec![2; len],
         }
     }
 
@@ -5160,30 +5625,35 @@ fn draft_forward(
     cache: &mut KvCache,
     tokens: &[u32],
     start_pos: usize,
-    draft_tokens: usize,
     slot_id: usize,
 ) -> Result<Vec<f32>> {
+    // The prompt, or the tokens committed while decoding went on undrafted,
+    // run as prompt chunks: only the last position's logits are read, so no
+    // row before it pays for the output head. One token is a decode step.
+    let batch = Chunking::for_prompt(tokens.len()).width;
+    let chunk = if batch == 0 { tokens.len() } else { batch }.max(1);
     let mut last = Vec::new();
-    if start_pos == 0 {
-        // The draft model runs the same forward passes over the same prompt,
-        // so it wants the same width for the same reasons.
-        let batch = Chunking::for_prompt(tokens.len()).width;
-        let chunk = if batch == 0 { tokens.len() } else { batch }.max(1);
-        for (i, part) in tokens.chunks(chunk).enumerate() {
-            last = model.forward(cache, part, i * chunk, slot_id)?;
-        }
-        return Ok(last);
-    }
-    // A catch-up longer than a verify (decoding went on undrafted for a
-    // while) is verified a draft's width at a time.
-    let chunk = draft_tokens + 1;
     for (i, part) in tokens.chunks(chunk).enumerate() {
-        last = model
-            .forward_verify(cache, part, start_pos + i * chunk, slot_id)?
-            .pop()
-            .ok_or_else(|| anyhow::anyhow!("the draft model returned no logits"))?;
+        last = model.forward(cache, part, start_pos + i * chunk, slot_id)?;
+    }
+    if last.is_empty() {
+        anyhow::bail!("the draft model returned no logits");
     }
     Ok(last)
+}
+
+thread_local! {
+    /// The probability a draft model gave each token of the draft it just
+    /// made on this thread — see [`Drafter::confidence_bins`].
+    static DRAFT_PROBABILITIES: std::cell::RefCell<Vec<f32>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The probability of `logits`' most likely token.
+fn top_probability(logits: &[f32]) -> f32 {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let total: f32 = logits.iter().map(|v| (v - max).exp()).sum();
+    if total > 0.0 { 1.0 / total } else { 0.0 }
 }
 
 /// Prompt-lookup draft: the continuation of the earlier occurrence of
@@ -5221,13 +5691,53 @@ fn echoing(index: &mut NgramIndex, history: &[u32]) -> bool {
         .is_some_and(|(len, from)| len >= ECHO_CONTEXT && from < history.len())
 }
 
+/// Where a reply's text stands after tokens it has not emitted yet: a
+/// verify picks several in a row, and the sampler needs to know before each
+/// whether it goes into reasoning.
+struct ReasoningProbe<'t> {
+    tokenizer: &'t Tokenizer,
+    header: MessageHeader,
+    decoder: crate::engine::tokenizer::StreamDecoder,
+}
+
+impl ReasoningProbe<'_> {
+    /// Whether the token after `token` is reasoning, as the emitting loop
+    /// will see it.
+    fn after(&mut self, token: u32) -> bool {
+        if self.tokenizer.is_special(token) {
+            let _ = self.header.observe_marker(token);
+        } else {
+            let _ = self
+                .header
+                .observe_text(self.decoder.push(self.tokenizer, token));
+        }
+        self.header.in_reasoning()
+    }
+}
+
+/// How many of a draft's proposals to verify, given each one's confidence bin
+/// (`DraftControl::cut`).
+type DraftCut<'a> = &'a dyn Fn(&[u8]) -> usize;
+
+/// What one speculative step decided ([`speculative_next`]).
+struct SpeculativeStep {
+    /// The model's own next token.
+    token: u32,
+    /// Tokens the step yielded: the accepted drafts and that token.
+    yielded: usize,
+    /// Each verified proposal's confidence bin.
+    bins: Vec<u8>,
+    /// Rows the verify ran, padding included: what its time is the price of.
+    rows: usize,
+}
+
 /// One speculative step. Takes a draft from `drafter`, verifies the whole of
 /// it in a single multi-position forward (as rows of the batched step, with
 /// `batch`), keeps the longest prefix the model
 /// would itself have produced greedily, and rolls the rejected tail off both
 /// KV caches. Returns the model's own next token (identical to what plain
-/// greedy decoding produces here) with the number of tokens the step
-/// yielded, and pushes any further accepted tokens onto `spec_buf` for the
+/// greedy decoding produces here) with what else the step learned
+/// ([`SpeculativeStep`]), and pushes any further accepted tokens onto `spec_buf` for the
 /// loop to emit before its next forward; `None` when there was no draft to
 /// verify, and the loop decodes the token instead.
 /// `accepted`/`steps` accumulate acceptance stats for the final log.
@@ -5248,6 +5758,8 @@ fn speculative_next(
     drafter: &mut Drafter<'_>,
     slot_id: usize,
     draft_len: usize,
+    cut: Option<DraftCut<'_>>,
+    mut reasoning: Option<ReasoningProbe<'_>>,
     spec_buf: &mut VecDeque<u32>,
     accepted: &mut usize,
     steps: &mut usize,
@@ -5255,11 +5767,35 @@ fn speculative_next(
         &super::decode_batch::DecodeBatcher,
         &super::decode_batch::Registration<'_>,
     )>,
-) -> Result<Option<(u32, usize)>> {
+) -> Result<Option<SpeculativeStep>> {
     // `current` takes the first of the remaining rows; the draft gets the
-    // rest, up to the step's `draft_len`.
-    let room = capacity.saturating_sub(start_pos + 1).min(draft_len);
-    let draft = drafter.draft(history, room, cache, slot_id)?;
+    // rest, up to the step's `draft_len`. The last row's pick is the token
+    // after the draft, so the rows end one short of the window: the last
+    // token a window holds is picked from the row before it, as plain
+    // decoding picks it, and nothing is picked past it that a context shift
+    // would then have to take back from the sampler.
+    let mut room = capacity.saturating_sub(start_pos + 2).min(draft_len);
+    let mut draft = drafter.draft(history, room, cache, slot_id)?;
+    // Each proposal's confidence, and the draft cut where its proposals stop
+    // paying for their rows (`DraftControl::cut`): a cut draft then runs at
+    // the narrowest of the control's widths that holds what is kept. An uncut
+    // one keeps the step's width, so a drafter whose drafts vary in length
+    // verifies at one width.
+    let mut bins = drafter.confidence_bins(history, draft.len());
+    if let Some(cut) = cut
+        && !draft.is_empty()
+        && cut(&bins) < draft.len()
+    {
+        let keep = cut(&bins).max(1);
+        draft.truncate(keep);
+        bins.truncate(keep);
+        room = super::draft_control::LENGTHS
+            .iter()
+            .copied()
+            .find(|&l| l >= keep)
+            .unwrap_or(keep)
+            .min(room);
+    }
     // Nothing to verify: the plain decode step is the cheaper way to the
     // same token. A head-based drafter still needs this pass's states.
     if draft.is_empty() && !drafter.verifies_with_states() {
@@ -5270,6 +5806,7 @@ fn speculative_next(
     input.extend_from_slice(&draft);
     // A recurrent state takes in every token the verify runs, so it is saved
     // here, at the anchor, for a rejected draft to return to.
+    let mut ran = input.len();
     let checkpoint = cache
         .has_recurrent()
         .then(|| cache.rollback_point(start_pos))
@@ -5281,11 +5818,11 @@ fn speculative_next(
     // the same pass — the next draft reads the state behind whichever token
     // the verification below goes on to accept last, and only this forward
     // ever computes it.
-    let logits = if drafter.verifies_with_states() {
+    let rows: Vec<ForwardOutcome> = if drafter.verifies_with_states() {
         let (logits, states) =
             model.forward_all_logits_with_states(cache, &input, start_pos, slot_id)?;
         drafter.observe_states(start_pos, &states);
-        logits
+        logits.into_iter().map(ForwardOutcome::Logits).collect()
     } else {
         // Every non-empty draft verified at the step's full width (one of
         // two: the drafter's own and its echo width): a device keeps
@@ -5300,17 +5837,49 @@ fn speculative_next(
         if real > 1 && real < width && checkpoint.is_none() {
             input.resize(width, current);
         }
+        ran = input.len();
+        // A solo verify whose sampler the device can run samples each row
+        // where its logits are and reads back a token or a few candidates a
+        // row (`ModelForward::forward_verify_sampled`): the greedy token, or
+        // the `top_k` a sampled step looks at. Only where the sampler is the
+        // same at every row but for its position — no repeat penalty, whose
+        // window moves with each accepted token — and needs nothing else of
+        // the logits.
+        let device_top_k = sampler.device_top_k();
+        let sampled_on_device = batch.is_none()
+            && sampler.repeat_penalty() == 1.0
+            && !sampler.needs_host_logits()
+            && (sampler.is_greedy() || device_top_k > 0)
+            && input.len() <= crate::engine::arch::MAX_VERIFY_ROWS;
+        let sampled = if sampled_on_device {
+            let params = crate::engine::arch::GreedySampleParams {
+                recent_tokens: &[],
+                repeat_penalty: 1.0,
+                top_k: if sampler.is_greedy() { 0 } else { device_top_k },
+            };
+            let rows = vec![params; input.len()];
+            model.forward_verify_sampled(cache, &input, start_pos, slot_id, &rows)?
+        } else {
+            None
+        };
         // A slot in the batch verifies as rows of the batched step, so the
         // other slots step with it rather than wait for it.
-        let mut logits = match batch {
-            Some((batcher, registration)) => {
-                batcher.verify(Some(registration), model, cache, &input, start_pos, slot_id)?
-            }
-            None => model.forward_verify(cache, &input, start_pos, slot_id)?,
+        let mut rows = match (sampled, batch) {
+            (Some(outcomes), _) => outcomes,
+            (None, Some((batcher, registration))) => batcher
+                .verify(Some(registration), model, cache, &input, start_pos, slot_id)?
+                .into_iter()
+                .map(ForwardOutcome::Logits)
+                .collect(),
+            (None, None) => model
+                .forward_verify(cache, &input, start_pos, slot_id)?
+                .into_iter()
+                .map(ForwardOutcome::Logits)
+                .collect(),
         };
-        logits.truncate(real);
+        rows.truncate(real);
         input.truncate(real);
-        logits
+        rows
     };
 
     // Verify with the request's own sampler, row by row. `recent` mirrors
@@ -5325,11 +5894,31 @@ fn speculative_next(
     // it.
     let rl = sampler.repeat_last_n();
     let mut recent: Vec<u32> = history[history.len().saturating_sub(rl)..].to_vec();
-    let mut chosen = vec![sampler.sample(&logits[0], &recent, start_pos + 1)];
+    // A row as the device left it: a picked token, candidates for the
+    // sampler's own draw, or the logits it samples from in full.
+    let pick = |sampler: &mut Sampler, row: &ForwardOutcome, recent: &[u32], pos: usize| match row {
+        ForwardOutcome::Token(t) => {
+            sampler.note_device_pick(*t);
+            *t
+        }
+        ForwardOutcome::Candidates(c) => sampler.sample_from_candidates(c.clone(), pos),
+        ForwardOutcome::Logits(l) => sampler.sample(l, recent, pos),
+    };
+    let mut chosen = vec![pick(sampler, &rows[0], &recent, start_pos + 1)];
     recent.push(chosen[0]);
     let mut matched = 0usize;
     while matched < draft.len() && draft[matched] == chosen[matched] {
-        let next = sampler.sample(&logits[matched + 1], &recent, start_pos + 2 + matched);
+        // Each pick goes where the tokens before it left the reply, which the
+        // loop learns only as it emits them.
+        if let Some(probe) = reasoning.as_mut() {
+            sampler.set_reasoning(probe.after(chosen[matched]));
+        }
+        let next = pick(
+            sampler,
+            &rows[matched + 1],
+            &recent,
+            start_pos + 2 + matched,
+        );
         recent.push(next);
         chosen.push(next);
         matched += 1;
@@ -5365,7 +5954,12 @@ fn speculative_next(
     for &t in &chosen[1..] {
         spec_buf.push_back(t);
     }
-    Ok(Some((chosen[0], chosen.len())))
+    Ok(Some(SpeculativeStep {
+        token: chosen[0],
+        yielded: chosen.len(),
+        bins,
+        rows: ran,
+    }))
 }
 
 #[cfg(test)]
@@ -6004,6 +6598,9 @@ mod tests {
         meet: usize,
         meet_position: usize,
         started: AtomicUsize,
+        /// Whether its requests decode as rows of one batched step
+        /// (`ModelForward::batches_decode`).
+        batches: bool,
     }
 
     impl DeterministicModel {
@@ -6032,6 +6629,7 @@ mod tests {
                 meet: 0,
                 meet_position: 0,
                 started: AtomicUsize::new(0),
+                batches: false,
             }
         }
 
@@ -6093,6 +6691,10 @@ mod tests {
     impl ModelForward for DeterministicModel {
         fn config(&self) -> &ModelConfig {
             &self.config
+        }
+
+        fn batches_decode(&self) -> bool {
+            self.batches
         }
 
         fn new_kv_cache(&self, capacity: usize) -> KvCache {
@@ -6303,6 +6905,7 @@ mod tests {
             timings_per_token: false,
             role: None,
             cache_point: None,
+            shared_point: None,
             background: false,
             reasoning_budget: None,
             ..Default::default()
@@ -6361,6 +6964,7 @@ mod tests {
             timings_per_token: false,
             role: None,
             cache_point: None,
+            shared_point: None,
             background: false,
             reasoning_budget: None,
             ..Default::default()
@@ -6429,7 +7033,8 @@ mod tests {
         max_tokens: usize,
     ) -> (String, bool) {
         let (tx, rx) = mpsc::unbounded_channel();
-        let prompt_pages = wait_for_prompt_pages(&paged.0, prompt_tokens.len(), None, || false);
+        let prompt_pages =
+            wait_for_prompt_pages(&paged.0, prompt_tokens.len(), None, || false).unwrap();
         let req = GenerateRequest {
             json_output: false,
             json_schema: None,
@@ -6442,6 +7047,7 @@ mod tests {
             timings_per_token: false,
             role: None,
             cache_point: None,
+            shared_point: None,
             background: false,
             reasoning_budget: None,
             ..Default::default()
@@ -6708,22 +7314,37 @@ mod tests {
             let _decoding = Decoding::enter();
             entered
                 .send((
-                    prompt_yields_to_decode(),
-                    crate::engine::arch::gemma::prefill_group_layers(4),
+                    prompt_yield_layers(None),
+                    crate::engine::arch::gemma::prefill_group_layers(4, None),
                 ))
                 .unwrap();
             done.recv().unwrap();
         });
         let (decoder_yields, decoder_group) = decoding.recv().unwrap();
-        assert!(
-            !decoder_yields,
+        assert_eq!(
+            decoder_yields, None,
             "the decoding thread's own passes do not yield"
         );
         assert_eq!(decoder_group, 4);
-        assert!(prompt_yields_to_decode(), "another thread decodes");
-        assert_eq!(crate::engine::arch::gemma::prefill_group_layers(4), 1);
+        let _clock = PromptClock::start(Instant::now());
+        assert_eq!(prompt_yield_layers(None), Some(1), "another thread decodes");
+        assert_eq!(crate::engine::arch::gemma::prefill_group_layers(4, None), 1);
         release.send(()).unwrap();
         decoder.join().unwrap();
+    }
+
+    /// A prompt yields a layer at a time until it has waited the target,
+    /// then a group at a time.
+    #[test]
+    fn a_prompt_past_its_target_yields_less_often() {
+        let target = Duration::from_millis(2000);
+        assert_eq!(yield_group_layers(None, target, 4), 1);
+        assert_eq!(
+            yield_group_layers(Some(Duration::from_millis(10)), target, 4),
+            1
+        );
+        assert_eq!(yield_group_layers(Some(target), target, 4), 4);
+        assert_eq!(yield_group_layers(Some(target * 2), target, 0), 1);
     }
 
     /// While a request decodes, a timed prefill is sized to the yield budget
@@ -6761,6 +7382,27 @@ mod tests {
         cache_point: Option<usize>,
         max_tokens: usize,
     ) -> (String, bool) {
+        run_request_with_points(
+            model,
+            tokenizer,
+            store,
+            prompt_tokens,
+            cache_point,
+            None,
+            max_tokens,
+        )
+    }
+
+    /// [`run_request_with_slots`] with a shared point as well.
+    fn run_request_with_points(
+        model: &DeterministicModel,
+        tokenizer: &Tokenizer,
+        store: &crate::engine::slot_store::SlotStore,
+        prompt_tokens: Vec<u32>,
+        cache_point: Option<usize>,
+        shared_point: Option<usize>,
+        max_tokens: usize,
+    ) -> (String, bool) {
         let slots = SlotPool::new(1);
         let guard = pollster::block_on(slots.acquire());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -6769,6 +7411,7 @@ mod tests {
             sampling: greedy_params(),
             max_tokens,
             cache_point,
+            shared_point,
             background: false,
             reasoning_budget: None,
             ..Default::default()
@@ -6826,6 +7469,52 @@ mod tests {
             forwarded,
             cold_model.forwarded_tokens.load(Ordering::Relaxed) - 6,
             "the checkpoint was not reused"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Another conversation on a hybrid model that repeats only the first's
+    /// system part reuses exactly that much, from the state checkpointed at
+    /// its end, and answers as a cold prefill of the same tokens does.
+    #[test]
+    fn a_hybrid_conversation_reuses_another_ones_system_part() {
+        let tokenizer = letter_tokenizer(8);
+        let dir = std::env::temp_dir().join(format!("orangu-m5-{}", std::process::id()));
+        let store = crate::engine::slot_store::SlotStore::at(dir.clone(), "test".into(), 1);
+        // A "system part" of 4 tokens, a user message to 7, then 2 of
+        // generation prompt.
+        let first: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 7, 7];
+        let model = DeterministicModel::hybrid(8);
+        run_request_with_points(
+            &model,
+            &tokenizer,
+            &store,
+            first.clone(),
+            Some(7),
+            Some(4),
+            5,
+        );
+        // A new conversation: the same system part, another user message.
+        let second: Vec<u32> = first[..4].iter().copied().chain([6, 2, 6, 7, 7]).collect();
+        let before = model.forwarded_tokens.load(Ordering::Relaxed);
+        let warm = run_request_with_points(
+            &model,
+            &tokenizer,
+            &store,
+            second.clone(),
+            Some(7),
+            Some(4),
+            6,
+        );
+        let forwarded = model.forwarded_tokens.load(Ordering::Relaxed) - before;
+
+        let cold_model = DeterministicModel::hybrid(8);
+        let cold = run_request(&cold_model, &tokenizer, None, second.clone(), 6);
+        assert_eq!(warm, cold, "the shared checkpoint changed the answer");
+        assert_eq!(
+            forwarded,
+            cold_model.forwarded_tokens.load(Ordering::Relaxed) - 4,
+            "the system part was not reused"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -7122,6 +7811,54 @@ mod tests {
         shifted_tokens_match_a_cold_read(&small_window(DeterministicModel::new(26), 16), true);
     }
 
+    /// Sampled, each token after a shift is the one a cold request for the
+    /// trimmed conversation draws, told how much was dropped ahead of it: a
+    /// draw goes by the token's place in the whole conversation, so the
+    /// positions the window counts again after a shift draw afresh.
+    #[test]
+    fn a_shifted_sampled_reply_draws_by_the_place_in_the_conversation() {
+        let model = small_window(DeterministicModel::new(26), 16);
+        let sampling = SamplingParams {
+            temperature: 0.8,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_last_n: 0,
+            seed: 11,
+            ..SamplingParams::default()
+        };
+        let (keep, step) = crate::engine::context_shift::ContextShift {
+            keep: 2,
+            drop_fraction: 0.5,
+        }
+        .plan(16, None)
+        .unwrap();
+        let prompt = vec![1u32, 2, 3, 4, 5];
+        let shifted = run_shifting(&model, None, None, |req| {
+            req.prompt_tokens = prompt.clone();
+            req.max_tokens = 50;
+            req.sampling = sampling.clone();
+        });
+        assert!(shifted.stats.dropped_tokens > 0);
+        let (mut live, mut dropped) = (prompt, 0);
+        for (i, expected) in letter_ids(&shifted.text).into_iter().enumerate() {
+            let cold = run_shifting(&model, None, None, |req| {
+                req.prompt_tokens = live.clone();
+                req.max_tokens = 1;
+                req.sampling = sampling.clone();
+                req.context_shift = None;
+                req.dropped_tokens = dropped;
+            });
+            assert_eq!(letter_ids(&cold.text), vec![expected], "token {i}");
+            live.push(expected);
+            if live.len() >= 16 {
+                live.drain(keep..keep + step);
+                dropped += step;
+            }
+        }
+    }
+
     /// A prompt longer than the window is answered from what stays of it, and
     /// says how much did not.
     #[test]
@@ -7204,6 +7941,256 @@ mod tests {
         });
         assert_eq!(stopped.text, whole.text[..first_seen]);
         assert!(matches!(stopped.finish, FinishReason::Stop));
+    }
+
+    /// A request that may shift, with `drafting` speculating on it: a draft
+    /// model of `tokens`, or prompt lookup for `None`.
+    fn shift_events(
+        model: &DeterministicModel,
+        tokenizer: &Tokenizer,
+        drafting: Option<Option<(usize, usize)>>,
+        req: GenerateRequest,
+    ) -> Vec<StreamEvent> {
+        let draft = drafting
+            .flatten()
+            .map(|(disagree_every, tokens)| DraftModel {
+                model: Arc::new(DeterministicModel::drafting(
+                    model.config.n_vocab,
+                    disagree_every,
+                )),
+                tokens,
+                label: "test-draft".to_string(),
+            });
+        let lookup = matches!(drafting, Some(None));
+        LOOKUP_IN_TEST.with(|on| on.set(lookup));
+        let events = events_of(model, tokenizer, draft.as_ref(), req);
+        LOOKUP_IN_TEST.with(|on| on.set(false));
+        events
+    }
+
+    /// Every drafting a shift is tried under: draft models wrong at several
+    /// rates and depths, and prompt lookup.
+    fn draftings() -> Vec<Option<(usize, usize)>> {
+        let mut all = vec![None];
+        for disagree_every in [0usize, 2, 3] {
+            for tokens in [1usize, 2, 4, 7] {
+                all.push(Some((disagree_every, tokens)));
+            }
+        }
+        all
+    }
+
+    fn shifting_request(prompt: Vec<u32>, max_tokens: usize) -> GenerateRequest {
+        GenerateRequest {
+            prompt_tokens: prompt,
+            sampling: greedy_params(),
+            max_tokens,
+            context_shift: Some(crate::engine::context_shift::ContextShift {
+                keep: 2,
+                drop_fraction: 0.5,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn shift_records(events: &[StreamEvent]) -> Vec<(u32, usize)> {
+        logprobs_of(events)
+            .iter()
+            .map(|r| (r.id, r.top.len()))
+            .collect()
+    }
+
+    /// A shift that falls while verified tokens wait to be emitted changes
+    /// nothing a reply reports: the text, one record a token, in order, and
+    /// the same count, greedy or sampled, with any drafter.
+    #[test]
+    fn speculation_across_a_shift_emits_and_reports_as_plain_decoding() {
+        let tokenizer = letter_tokenizer(8);
+        let sampled = SamplingParams {
+            temperature: 0.8,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_last_n: 0,
+            seed: 7,
+            ..SamplingParams::default()
+        };
+        for window in [12usize, 16, 17] {
+            for sampling in [greedy_params(), sampled.clone()] {
+                let request = || GenerateRequest {
+                    logprobs: Some(2),
+                    sampling: sampling.clone(),
+                    ..shifting_request(vec![1, 2, 3, 4, 1, 2], 48)
+                };
+                let model = || small_window(DeterministicModel::new(8), window);
+                let plain = shift_events(&model(), &tokenizer, None, request());
+                let (_, generated) = finish_of(&plain);
+                assert_eq!(generated, 48);
+                assert_eq!(shift_records(&plain).len(), 48);
+                for drafting in draftings() {
+                    let drafted = shift_events(&model(), &tokenizer, Some(drafting), request());
+                    let at = format!("window {window}, {drafting:?}, t {}", sampling.temperature);
+                    assert_eq!(text_of(&drafted), text_of(&plain), "{at}");
+                    assert_eq!(shift_records(&drafted), shift_records(&plain), "{at}");
+                    assert_eq!(finish_of(&drafted).1, 48, "{at}");
+                }
+            }
+        }
+    }
+
+    /// Prompt lookup does verify here, or the test above compared plain
+    /// decoding with itself.
+    #[test]
+    fn prompt_lookup_verifies_in_the_shift_tests() {
+        let tokenizer = letter_tokenizer(8);
+        let plain_model = small_window(DeterministicModel::new(8), 16);
+        let looked_model = small_window(DeterministicModel::new(8), 16);
+        let request = || shifting_request(vec![1, 2, 3, 4, 1, 2], 48);
+        shift_events(&plain_model, &tokenizer, None, request());
+        shift_events(&looked_model, &tokenizer, Some(None), request());
+        assert!(
+            looked_model.forward_calls.load(Ordering::Relaxed)
+                < plain_model.forward_calls.load(Ordering::Relaxed),
+            "no lookup draft was accepted"
+        );
+    }
+
+    /// A constraint follows the tokens emitted, across a shift, with every
+    /// drafter: the verify left nothing picked that the reply never wrote.
+    #[test]
+    fn a_constraint_goes_across_a_shift_under_speculation() {
+        let tokenizer = json_tokenizer();
+        let sampled = SamplingParams {
+            temperature: 0.8,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_last_n: 0,
+            seed: 7,
+            ..SamplingParams::default()
+        };
+        for window in [12usize, 16] {
+            for sampling in [greedy_params(), sampled.clone()] {
+                let request = || GenerateRequest {
+                    json_output: true,
+                    stop_token_ids: vec![7],
+                    sampling: sampling.clone(),
+                    ..shifting_request(vec![1, 2, 3, 4, 1, 2], 60)
+                };
+                let model = || small_window(DeterministicModel::new(9), window);
+                let plain = shift_events(&model(), &tokenizer, None, request());
+                let text = text_of(&plain);
+                assert!(
+                    text.starts_with('{')
+                        && crate::engine::constraint::JsonPrefix::object().allows(text.as_bytes()),
+                    "the constraint did not hold: {text:?}"
+                );
+                for drafting in draftings() {
+                    let drafted = shift_events(&model(), &tokenizer, Some(drafting), request());
+                    assert_eq!(
+                        text_of(&drafted),
+                        text,
+                        "window {window}, {drafting:?}, t {}",
+                        sampling.temperature
+                    );
+                }
+            }
+        }
+    }
+
+    /// Letters, `<think>`/`</think>` as control tokens, and a call trigger
+    /// `<c>` that is text.
+    fn reasoning_tokenizer() -> Tokenizer {
+        let pieces = ["a", "b", "c", "d", "<think>", "</think>", "<c>", "x"];
+        let gguf = GgufFile {
+            version: 3,
+            metadata: vec![
+                (
+                    "tokenizer.ggml.tokens".to_string(),
+                    GgufValue::Array(
+                        pieces
+                            .iter()
+                            .map(|t| GgufValue::String(t.to_string()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tokenizer.ggml.model".to_string(),
+                    GgufValue::String("llama".to_string()),
+                ),
+                (
+                    "tokenizer.ggml.token_type".to_string(),
+                    GgufValue::Array(
+                        pieces
+                            .iter()
+                            .map(|t| GgufValue::I32(if t.contains("think") { 3 } else { 1 }))
+                            .collect(),
+                    ),
+                ),
+            ],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        };
+        Tokenizer::from_gguf(&gguf).unwrap()
+    }
+
+    /// The events a reasoning reply under a call grammar sends.
+    fn reasoning_events(
+        model: &DeterministicModel,
+        drafting: Option<Option<(usize, usize)>>,
+        prompt: Vec<u32>,
+    ) -> Vec<String> {
+        let tokenizer = reasoning_tokenizer();
+        let calls = crate::engine::tool_learn::CallGrammar {
+            trigger: "<c>".to_string(),
+            after_trigger: crate::engine::grammar::Grammar::parse("root ::= \"x\" \"x\" \"x\"\n")
+                .unwrap(),
+            initial: None,
+        };
+        let req = GenerateRequest {
+            calls: Some(Arc::new(calls)),
+            ..shifting_request(prompt, 60)
+        };
+        shift_events(model, &tokenizer, drafting, req)
+            .into_iter()
+            .filter_map(|e| match e {
+                StreamEvent::Token(t) => Some(format!("T{t}")),
+                StreamEvent::Reasoning(t) => Some(format!("R{t}")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A pick goes where the tokens before it left the reply: a call opener
+    /// written as reasoning is a mention, one written right after reasoning
+    /// closes opens the call — however many tokens a verify picks at once.
+    #[test]
+    fn a_verify_picks_each_token_where_the_reply_stands() {
+        let model = || small_window(DeterministicModel::new(8), 20);
+        let mut opened = 0;
+        for prompt in [
+            vec![1u32, 4],
+            vec![2, 3, 4],
+            vec![5, 1, 2],
+            vec![3, 3, 1, 4, 0],
+        ] {
+            let plain = reasoning_events(&model(), None, prompt.clone());
+            opened += plain
+                .windows(3)
+                .filter(|w| w.iter().all(|e| e == "Tx"))
+                .count();
+            for drafting in draftings() {
+                assert_eq!(
+                    reasoning_events(&model(), Some(drafting), prompt.clone()),
+                    plain,
+                    "prompt {prompt:?}, {drafting:?}"
+                );
+            }
+        }
+        assert!(opened > 0, "no call ever opened");
     }
 
     /// The prompt reports of the same request with no shift.
@@ -8743,6 +9730,7 @@ mod tests {
                 timings_per_token: false,
                 role: None,
                 cache_point: None,
+                shared_point: None,
                 background: false,
                 reasoning_budget: None,
                 ..Default::default()
@@ -9216,6 +10204,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A request with a draft model decodes as a row of the batched step
+    /// beside a plain one, and each answers as it does alone.
+    #[test]
+    fn a_drafted_request_decodes_in_the_batch_and_answers_as_alone() {
+        let tokenizer = letter_tokenizer(8);
+        let prompts: [Vec<u32>; 2] = [vec![1, 2, 3, 4, 1, 2], vec![5, 6, 7, 5, 6, 7]];
+        let make = || {
+            let mut model = DeterministicModel::new(8);
+            model.batches = true;
+            model.pause = Duration::from_millis(1);
+            model
+        };
+        let draft_of = |i: usize| {
+            (i == 0).then(|| DraftModel {
+                model: Arc::new(DeterministicModel::drafting(8, 2)),
+                tokens: 4,
+                label: "test-draft".to_string(),
+            })
+        };
+        let run_one = |model: &DeterministicModel,
+                       batcher: &crate::engine::decode_batch::DecodeBatcher,
+                       slots: &Arc<SlotPool>,
+                       i: usize| {
+            let guard = pollster::block_on(slots.acquire());
+            let (tx, rx) = mpsc::unbounded_channel();
+            let req = GenerateRequest {
+                prompt_tokens: prompts[i].clone(),
+                sampling: greedy_params(),
+                max_tokens: 24,
+                ..Default::default()
+            };
+            let draft = draft_of(i);
+            run(
+                model,
+                &tokenizer,
+                draft.as_ref(),
+                None,
+                None,
+                None,
+                None,
+                batcher,
+                &guard,
+                req,
+                crate::config::Role::default(),
+                crate::config::Role::default(),
+                false,
+                &crate::engine::metrics::ServerMetrics::new(),
+                Instant::now(),
+                tx,
+                None,
+                None,
+            )
+            .unwrap();
+            drain(rx)
+        };
+        let alone: Vec<(String, bool)> = (0..2)
+            .map(|i| {
+                run_one(
+                    &make(),
+                    &crate::engine::decode_batch::DecodeBatcher::new(),
+                    &SlotPool::new(1),
+                    i,
+                )
+            })
+            .collect();
+        let model = make();
+        let batcher = crate::engine::decode_batch::DecodeBatcher::new();
+        let slots = SlotPool::new(2);
+        let together: Vec<(String, bool)> = std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..2)
+                .map(|i| {
+                    let (model, batcher, slots, run_one) = (&model, &batcher, &slots, &run_one);
+                    scope.spawn(move || run_one(model, batcher, slots, i))
+                })
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).collect()
+        });
+        assert_eq!(together, alone);
     }
 
     /// `run_request_drafted` under any sampling, with or without a draft.
@@ -9711,13 +10779,49 @@ mod admission_tests {
         ))
     }
 
+    /// A prompt that waits past the deadline is refused, saying how long it
+    /// waited; one admitted inside it is not.
+    #[test]
+    fn a_prompt_that_waits_past_the_deadline_is_refused() {
+        let pool = pool();
+        let _all = admit_within(&pool, 31, None, || false, true, None)
+            .unwrap()
+            .expect("admitted");
+        let Err(waited) = admit_within(
+            &pool,
+            3,
+            None,
+            || false,
+            true,
+            Some(Duration::from_millis(50)),
+        ) else {
+            panic!("admitted past the deadline");
+        };
+        assert!(waited >= Duration::from_millis(50), "{waited:?}");
+        drop(_all);
+        assert!(
+            admit_within(
+                &pool,
+                3,
+                None,
+                || false,
+                true,
+                Some(Duration::from_millis(50))
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
     /// A prompt the pool has room for is admitted at once and its pages
     /// promised until the promise is dropped.
     #[test]
     fn a_prompt_with_room_is_admitted_and_its_pages_held() {
         let pool = pool();
         // 11 tokens and the one generated: three pages of four.
-        let held = wait_for_prompt_pages(&pool, 11, None, || false).expect("admitted");
+        let held = wait_for_prompt_pages(&pool, 11, None, || false)
+            .unwrap()
+            .expect("admitted");
         assert_eq!(held.pages, 3);
         assert_eq!(pool.available(), 5);
         drop(held);
@@ -9730,14 +10834,18 @@ mod admission_tests {
     #[test]
     fn a_prompt_waits_for_the_pages_others_hold() {
         let pool = pool();
-        let first = wait_for_prompt_pages(&pool, 19, None, || false).expect("admitted");
+        let first = wait_for_prompt_pages(&pool, 19, None, || false)
+            .unwrap()
+            .expect("admitted");
         assert_eq!(first.pages, 5);
         let started = Instant::now();
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             drop(first);
         });
-        let second = wait_for_prompt_pages(&pool, 19, None, || false).expect("admitted after");
+        let second = wait_for_prompt_pages(&pool, 19, None, || false)
+            .unwrap()
+            .expect("admitted after");
         assert!(started.elapsed() >= std::time::Duration::from_millis(90));
         assert_eq!(pool.available(), 3);
         releaser.join().unwrap();
@@ -9770,6 +10878,7 @@ mod admission_tests {
         let started = Instant::now();
         let gave_up = || started.elapsed() > std::time::Duration::from_millis(300);
         let held = wait_for_prompt_pages(&pool, 19, Some(&store), gave_up)
+            .unwrap()
             .expect("admitted once the idle cache is dropped");
         assert_eq!(held.pages, 5);
         assert!(started.elapsed() < std::time::Duration::from_millis(250));
@@ -9780,10 +10889,20 @@ mod admission_tests {
     #[test]
     fn a_prompt_that_cannot_be_helped_by_waiting_does_not_wait() {
         let pool = pool();
-        assert!(wait_for_prompt_pages(&pool, 40, None, || false).is_none());
-        let _all = wait_for_prompt_pages(&pool, 31, None, || false).expect("admitted");
+        assert!(
+            wait_for_prompt_pages(&pool, 40, None, || false)
+                .unwrap()
+                .is_none()
+        );
+        let _all = wait_for_prompt_pages(&pool, 31, None, || false)
+            .unwrap()
+            .expect("admitted");
         let started = Instant::now();
-        assert!(wait_for_prompt_pages(&pool, 3, None, || true).is_none());
+        assert!(
+            wait_for_prompt_pages(&pool, 3, None, || true)
+                .unwrap()
+                .is_none()
+        );
         assert!(started.elapsed() < std::time::Duration::from_millis(50));
     }
 }

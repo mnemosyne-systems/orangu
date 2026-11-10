@@ -223,8 +223,15 @@ beside the ones already running instead of replacing them, and going back
 to any of them restarts nothing. A profile has a place of its own when it
 listens on its own `port` and runs on the CPU (`backend = cpu`) or on a
 `device` no running profile names. Two profiles that name no device both
-use the default one, and two servers on one card would each size their
-memory as if they had it alone, so those still swap. When the set is full,
+use the default one.
+
+Two profiles on one card, each on its own `port`, run side by side when their
+card needs fit the card together. A server on a card another profile could
+share is started with its share of the card: what its plan says it needs
+there, with half a gigabyte for a prompt's working memory, and it places its
+weights and sizes its KV cache within that. A profile joins the ones already
+on the card when its share fits beside theirs, and replaces them when it does
+not. When the set is full,
 the least recently used profile is the one stopped. A server stopped either
 way finishes what it is streaming and saves its slots first, exactly as a
 swap does.
@@ -232,20 +239,29 @@ swap does.
 Before a profile starts — whether it replaces a running one or starts beside
 them — the coordinator asks `orangu-server plan --deep --json` whether its
 model can run here: its shards are present, this build knows its
-architecture, and what it needs fits. What it needs is the weights every
-token touches plus, when the profile sets `context`, that context's KV cache;
-what the machine has is its memory plus its dedicated cards' memory; and the
-models that stay running beside it count against that too. A start that does
-not fit is refused with what it would take, and every running profile keeps
-serving:
+architecture, and what it needs fits. What it needs comes in two parts. The
+weights a card would take, with their KV cache for every slot at the profile's
+`context`, want a card. The rest of the weights and the host KV pool need the
+machine's memory. The models that stay running beside it add their two parts
+to these. Card bytes fill the dedicated cards together, whatever the cards
+cannot hold runs from the machine's memory, and the machine's memory decides:
+a card's free room never stands in for memory only the host can give. A start
+that does not fit is refused with what it would take, and every running
+profile keeps serving:
 
 ```text
 'big' cannot run on this machine: it needs 40.2 GB, and beside 'chat' (30.1 GB)
-that is more than this machine's 66.8 GB — 'chat' keeps serving
+that is 70.4 GB of host memory where this machine has 66.8 GB — 'chat' keeps serving
 ```
 
 Only a definite answer refuses: a plan that cannot be had in time, or a
 server too old to report what a model needs, lets the start go ahead.
+
+The check runs beside the profiles already serving, not in their way: their
+requests go on while it runs, and the checks a start needs (its own, and those
+of running profiles whose need is not yet known) run side by side. A verdict
+answers for 30 seconds, so requests that arrive together for a profile that is
+not running ask once.
 
 ```ini
 [orangu-coordinator]
@@ -295,9 +311,12 @@ the first one pays the same cold start as any other request.
   cold-load cost, same as starting `orangu-server` fresh.
 - A swap saves the outgoing model's conversations to disk first, and the
   model's next start loads them back, so a conversation picks up where it
-  was instead of reading its whole history again. Saving a long conversation
-  adds a few seconds to the swap away from it (a 4 800-token one on a 3B
-  model is a 1.1 GB file).
+  was instead of reading its whole history again. That is each slot's latest
+  conversation and every other one the model's shared cache still holds,
+  whichever slot ran it: a client with more conversations than slots, such as
+  one running subagents, keeps them all, up to `ORANGU_POOL_SAVE_MIB` (1 GiB)
+  of cache. Saving a long conversation adds a few seconds to the swap away
+  from it.
 - Once connected to a coordinator, orangu shows "Automatic" for the model
   everywhere in the UI (the header banner, the status line, `/review` and
   `/auto_review`) instead of a specific model id, since the coordinator — not
@@ -313,9 +332,17 @@ the first one pays the same cold start as any other request.
   with a progress line every two seconds — SSE comment lines such as
   `: orangu-coordinator: making 'code' active: loading org/model (12s) — <the
   server's last line of output>`, which every OpenAI-compatible client
-  ignores — and then the model's answer. A swap that fails after that point
-  arrives as an error event in the stream rather than a `502`. Any client can
-  also read the same progress from `GET /v1/coordinator` under `activating`.
+  ignores — and then the model's answer. The status line has gone by then,
+  so a refusal after that point arrives as an error event that carries it:
+  `data: {"error": {"message": …, "type": …, "code": …, "status": 400}}`,
+  the server's own error object with the status it would have had. A prompt
+  too long for the server is `type: "invalid_request_error"` with
+  `code: "context_length_exceeded"`, so a client that shortens its prompt on
+  a `400` can do the same here; a server out of room is `overloaded_error`
+  (`503`), and a swap that fails is `coordinator_error` (`502`). On the
+  Messages API (`/v1/messages`) the same failure is that API's own
+  `event: error`. Any client can also read the same progress from
+  `GET /v1/coordinator` under `activating`.
 - **Crash recovery**: a profile whose `orangu-server` has stopped — it lost
   its GPU device to a driver reset (see the Server chapter), was OOM-killed,
   or was killed by hand — is simply started again on the next request. A

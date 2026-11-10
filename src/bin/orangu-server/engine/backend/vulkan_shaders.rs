@@ -48,9 +48,10 @@
 use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
-    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
-    GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K,
-    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_PQ2_0,
+    GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0,
 };
 
 /// Storage/uniform bindings every shader shares, plus byte- and half-float-
@@ -209,6 +210,27 @@ fn mxfp4_kvalue(i: u32) -> f32 {
         return -mag;
     }
     return mag;
+}
+"#;
+
+/// `NVFP4`'s sub-block scale, appended with [`MXFP4_PRELUDE`]'s codebook
+/// for that type by [`prelude_for`].
+const NVFP4_PRELUDE: &str = r#"
+// `quant::ue4m3_to_f32_half`, transcribed: an unsigned E4M3 (top bit
+// ignored), halved for the doubled codebook — `(8 + m) * 2^(e - 11)` for a
+// normal value and `m * 2^-10` for a subnormal one, both exact, built from
+// the exponent bits. The bytes `0x00` and `0x7F` read as zero; `0xFF` and
+// `0x80` decode with their top bit dropped, as on the host.
+fn nvfp4_scale(x: u32) -> f32 {
+    if (x == 0u || x == 0x7Fu) {
+        return 0.0;
+    }
+    let e = (x >> 3u) & 0xFu;
+    let m = x & 7u;
+    if (e == 0u) {
+        return f32(m) * bitcast<f32>(117u << 23u);
+    }
+    return f32(8u + m) * bitcast<f32>((e + 116u) << 23u);
 }
 "#;
 
@@ -2459,6 +2481,27 @@ fn dequant_element(byte_offset: u32, k: u32) -> f32 {
 }
 "#;
 
+/// `block_nvfp4`: mirrors `quant::dequantize_nvfp4` — four one-byte UE4M3
+/// sub-block scales, then 32 `qs` bytes; within each 16-element sub-block
+/// the low nibbles of its 8 bytes are its first 8 values and the high
+/// nibbles its last 8, over `MXFP4`'s codebook.
+const NVFP4_COOP_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 36u;
+const BLOCK_ELEMS: u32 = 64u;
+var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
+fn dequant_element(byte_offset: u32, k: u32) -> f32 {
+    let s = k / 16u;
+    let j = k % 16u;
+    let d = nvfp4_scale(read_u8(byte_offset + s));
+    let byte = read_u8(byte_offset + 4u + s * 8u + (j % 8u));
+    var nib: u32 = byte & 0xFu;
+    if (j >= 8u) {
+        nib = byte >> 4u;
+    }
+    return d * mxfp4_kvalue(nib);
+}
+"#;
+
 /// `block_iq4_nl`: mirrors `quant::dequantize_iq4_nl` — `Q4_0`'s 18-byte
 /// block and low/high-nibble split, with the nibble selecting one of the 16
 /// non-uniformly spaced levels in `iq_kvalue` instead of being read as a
@@ -2715,6 +2758,33 @@ fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
         let byte = read_u8(byte_offset + 1u + j);
         acc = acc + (d * mxfp4_kvalue(byte & 0xFu)) * x[x_off + j];
         acc = acc + (d * mxfp4_kvalue(byte >> 4u)) * x[x_off + 16u + j];
+        m = m + 1u;
+    }
+    return acc;
+}
+"#;
+
+/// `block_nvfp4` for [`block_hoisted_suffix`]: 8 lanes per 64-element
+/// block, two to each 16-element sub-block and its scale, each lane taking
+/// 4 of the sub-block's 8 `qs` bytes and both nibbles of each.
+const NVFP4_BLOCK_MIDDLE: &str = r#"
+const BLOCK_BYTES: u32 = 36u;
+const BLOCK_ELEMS: u32 = 64u;
+const LANES_PER_BLOCK: u32 = 8u;
+fn block_dot(byte_offset: u32, x_off: u32, sub: u32) -> f32 {
+    let s = sub / 2u;
+    let d = nvfp4_scale(read_u8(byte_offset + s));
+    let base = x_off + s * 16u;
+    var acc: f32 = 0.0;
+    var m: u32 = 0u;
+    loop {
+        if (m >= 4u) {
+            break;
+        }
+        let j = (sub % 2u) * 4u + m;
+        let byte = read_u8(byte_offset + 4u + s * 8u + j);
+        acc = acc + (d * mxfp4_kvalue(byte & 0xFu)) * x[base + j];
+        acc = acc + (d * mxfp4_kvalue(byte >> 4u)) * x[base + 8u + j];
         m = m + 1u;
     }
     return acc;
@@ -5556,6 +5626,7 @@ fn block_hoisted_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ4_NL => IQ4_NL_BLOCK_MIDDLE,
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_BLOCK_MIDDLE,
         t if t == GGML_TYPE_MXFP4 => MXFP4_BLOCK_MIDDLE,
+        t if t == GGML_TYPE_NVFP4 => NVFP4_BLOCK_MIDDLE,
         _ => return None,
     })
 }
@@ -5612,6 +5683,7 @@ fn coop_middle(ggml_type: u32) -> Option<&'static str> {
         t if t == GGML_TYPE_IQ4_NL => IQ4_NL_COOP_MIDDLE,
         t if t == GGML_TYPE_IQ4_XS => IQ4_XS_COOP_MIDDLE,
         t if t == GGML_TYPE_MXFP4 => MXFP4_COOP_MIDDLE,
+        t if t == GGML_TYPE_NVFP4 => NVFP4_COOP_MIDDLE,
         t if t == GGML_TYPE_Q2_0 => Q2_0_COOP_MIDDLE,
         t if t == GGML_TYPE_PQ2_0 => PQ2_0_COOP_MIDDLE,
         t if t == GGML_TYPE_PTQ1_0 => PTQ1_0_COOP_MIDDLE,
@@ -5641,6 +5713,8 @@ fn prelude_for(ggml_type: u32) -> String {
         format!("{PRELUDE}\n{IQ_GRID_PRELUDE}")
     } else if ggml_type == GGML_TYPE_MXFP4 {
         format!("{PRELUDE}\n{MXFP4_PRELUDE}")
+    } else if ggml_type == GGML_TYPE_NVFP4 {
+        format!("{PRELUDE}\n{MXFP4_PRELUDE}\n{NVFP4_PRELUDE}")
     } else {
         PRELUDE.to_string()
     }
@@ -5731,6 +5805,39 @@ pub fn shader_source_reduce_float_wide(ggml_type: u32, subgroup: bool) -> Option
 /// `shader_source_coop` does — both dispatch strategies share the
 /// exact same `dequant_element` per type, only `MAIN_REDUCE_SUFFIX` vs.
 /// `MAIN_COOP_SUFFIX` (and so the resulting compute `main`) differs.
+/// The entry point of [`shader_source_row_gather`]: one thread an element.
+const ROW_GATHER_MAIN: &str = r#"
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let k = gid.x;
+    if (k >= params.in_dim) {
+        return;
+    }
+    let id = bitcast<u32>(x[0]);
+    if (id >= params.out_dim) {
+        y[k] = 0.0;
+        return;
+    }
+    let block_idx = k / BLOCK_ELEMS;
+    let local_k = k % BLOCK_ELEMS;
+    y[k] = dequant_element(id * params.row_bytes + block_idx * BLOCK_BYTES, local_k)
+        * bitcast<f32>(params.n_tokens);
+}
+"#;
+
+/// A kernel that dequantizes one row of a weight matrix, scaled, where the
+/// row is named by the token id a sampler left on the device (`x[0]`'s
+/// bits): the next decode step's embedding, without the host learning the
+/// token first. The matmul bindings: `weights` the matrix, `x` the sampler's
+/// output, `y` the row, `params` with `in_dim` the row's length, `out_dim`
+/// the rows, `row_bytes` the device stride and `n_tokens` the scale's bits.
+/// `None` for a type with no dequantizer here.
+pub fn shader_source_row_gather(ggml_type: u32) -> Option<String> {
+    let middle = coop_middle(ggml_type)?;
+    let prelude = prelude_for(ggml_type);
+    Some(format!("{prelude}\n{middle}\n{ROW_GATHER_MAIN}"))
+}
+
 pub fn shader_source_reduce(ggml_type: u32, n_rows: usize, subgroup: bool) -> Option<String> {
     let middle = coop_middle(ggml_type)?;
     let prelude = prelude_for(ggml_type);

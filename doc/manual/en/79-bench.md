@@ -455,6 +455,32 @@ both read higher. The reply's decode rate is recorded beside it as mode
 `chat-tg`: what a decode-side change such as speculation moves, and a
 prompt-side one should leave alone.
 
+**Tool calls are checked.** Every call a reply makes is held against the
+declared tools: a name no tool has, arguments that are not a JSON object, or a
+required argument missing makes it invalid. Each invalid call is printed with
+its turn, the summary line counts them, and the run records the count as mode
+`chat-invalid-calls`. A decode change that keeps its speed and breaks its tool
+calls is a regression too.
+
+**Recording a session.** `--chat-record PATH` runs the session as an agent
+would and writes it out as a fixture. Each turn's tool rounds go on until the
+model answers in prose, up to six. `read_file` and `search` are answered from
+the checkout `--chat-workspace` names (a result is cut at 24 KiB);
+`write_file` and `run_command` are acknowledged and not run. The fixture keeps
+every message that followed each user turn under `replies`.
+
+**Fixed replies.** From turn 2 on, the prompt holds the model's own earlier
+replies, so two builds that pick different tokens replay different
+conversations, and their timings cannot be compared. `--chat-fixed` sends each
+turn's recorded replies instead of the model's: every build sends the same
+prompts, turn for turn. The model still answers each turn, and its time to
+first token and decode rate are what is measured.
+
+```sh
+orangu-bench --chat 8 --chat-record session.json --chat-workspace .
+orangu-bench --chat 8 --chat-fixture session.json --chat-fixed --reps 3
+```
+
 ### Interference mode (`--interference`) — one request's prefill against another's decode
 
 Two agents on one server share one device, and a decode step queued behind a
@@ -497,12 +523,46 @@ orangu-bench --kl ref.json --kl-rows 8
 orangu-bench --kl ref.json
 ```
 
-Each side keeps `--kl-top` candidates a position (default 32), so the
-divergence is taken over the reference's candidates and one bucket for the
-rest. A candidate the other side did not keep is given that side's smallest
-kept probability, which is an upper bound on what it held. The recorded
+Each side keeps `--kl-top` candidates a position (default 256, the most
+`/logits` returns), so the divergence is taken over the reference's
+candidates and one bucket for the rest. A candidate the other side did not
+keep is given that side's smallest kept probability, which is an upper bound
+on what it held. Merging the tail into one bucket hides the divergence it
+holds, so the figure is a **lower bound** on the true KL. On a 32k vocabulary
+with a long tail it reads 5–26% low at 256 candidates and 8–42% low at 32,
+furthest low at the small divergences drift is measured in. The recorded
 values are mode `kl` (the mean, lower is better) and mode `top1` (agreement
 in percent), with `n` the rows a pass.
+
+**Thresholds.** Each run is judged against a threshold and says `within` or
+`OVER`. Unless `--kl-max` and `--kl-min-top1` set one, the threshold comes
+from the weight type the server's model label names:
+
+| Weight type | Mean KL at most | Top-1 agreement at least |
+| :-- | --: | --: |
+| `F32`, `F16`, `BF16` | 0.002 | 99% |
+| 4-bit and wider (`Q4_K_M`, `Q6_K`, `Q8_0`, `Q4_1`, …) | 0.01 | 98% |
+| 3- and 2-bit (`Q3_K`, `Q2_K`, `IQ1`–`IQ3`, their `UD-` forms) | 0.02 | 97% |
+
+`--perplexity` is judged the same way against `--ppl-baseline` when one is
+given: over threshold when it rises more than `--ppl-max-increase` percent
+(default 1). With `--fail-on-regression` a run over its threshold exits `2`,
+after its rows are recorded.
+
+**An `f32` reference.** A reference saved from the same build's default
+configuration shares its kernels with every run compared against it, so
+drift those kernels share cannot show. On the CPU backend,
+`ORANGU_EXACT_MATMUL=1` runs every matmul as an `f32` dot over the
+dequantized weights, sharing none of the integer kernels. A reference saved
+from a server started that way measures each later configuration against
+arithmetic that only the weights' own quantization limits:
+
+```sh
+ORANGU_EXACT_MATMUL=1 orangu-server -c cpu.conf <model> &   # backend = cpu
+orangu-bench --kl ref-f32.json                               # saves the reference
+# restart without it, on any backend, then:
+orangu-bench --kl ref-f32.json --kl-rows 8 --fail-on-regression
+```
 
 Read a mean KL near zero and agreement near 100% as the same model. Two
 runs of one build on one device are the floor to compare against: a device
@@ -864,10 +924,53 @@ orangu-bench --sweep 'ORANGU_REDUCE_N_ROWS=1,2' \
   --sweep-cmd "orangu-server -c bench.conf <model>" --write-profile
 ```
 
-It needs a sweep the verdict can judge (two values, each run twice), an
-`ORANGU_*` variable, and every point on the same device; the profile is
+Variables that only make sense together are swept as one: name them joined
+by `+`, and write each point's values the same way. Every point sets all of
+them, an empty point leaves all of them unset, and the winner writes all of
+them:
+
+```sh
+orangu-bench --sweep 'ORANGU_MMQ_ROWS+ORANGU_MMQ_WIDE_MIN_WG=;64+8' \
+  --sweep-cmd "orangu-server -c bench.conf <model>" --write-profile
+```
+
+It needs a sweep the verdict can judge (two values, each run twice),
+`ORANGU_*` variables, and every point on the same device; the profile is
 written under the home directory of the user running `orangu-bench`, which
 is the server's when `--sweep-cmd` starts it on this machine.
+
+### Tuning a device (`--tune`)
+
+`--tune` searches the device's tuning profile knob by knob. Each knob is
+written `VAR=control;a;b`: its control value first (empty for the built-in
+default) and the candidates after it. Each candidate is swept against the
+knob's current winner as a two-value sweep (`a,b,b,a`) and judged by the
+verdict, measuring whatever the run's own flags ask for (`--pp`, `--depths`,
+…). A candidate better at some point and worse at none is written to the
+profile (`--write-profile`) and becomes the winner the next candidate faces.
+A knob decided is in the profile while the next one is searched, so the
+search walks the knobs as their best combination so far, one knob at a time
+rather than every combination. The server's start-up self-check refuses a
+kernel that disagrees with the reference kernel, so a candidate that is fast
+because it is wrong never gets measured.
+
+`--tune default` searches the decode knobs: the reduce kernels' rows, the
+`Q4_K` integer-dot kernel's rows and groups, the norm's workgroup and the
+attention split. `--tune prefill` searches the prompt's: the GEMM's row tile
+and when it goes wide, the thin tile, where the cooperative tiles take over,
+and the split attention's workgroups. Measure prefill at the prompt lengths
+the device will see, since the best tile is a property of the length as much
+as of the card. Several `--tune` flags run in order.
+
+```sh
+orangu-bench --tune default --depths 0,4096 --gen 128 --reps 2 \
+  --sweep-cmd "orangu-server -c bench.conf <model>"
+orangu-bench --tune prefill --pp 512,4096 --reps 2 \
+  --sweep-cmd "orangu-server -c bench.conf <model>"
+```
+
+It runs a sweep of four servers for each candidate, so `--tune default` is
+about eighty server starts: start it on an idle machine and leave it.
 
 ### Storage mode (`--storage-probe`) — what request size is worth
 
@@ -1379,9 +1482,16 @@ Options:
       --interference <LIST>            Interference mode: prompt lengths a second request prefills while one stream decodes; reports the decoder's stalls
       --chat <TURNS>                   Chat mode: replay this many turns of a coding session through /v1/chat/completions; 0 disables [default: 0]
       --chat-fixture <PATH>            The conversation `--chat` replays (JSON: system, tools, turns). Default: the built-in coding session
+      --chat-fixed                     Send each turn's recorded replies instead of the model's, so every build sees the same prompts
+      --chat-record <PATH>             Write the session `--chat` runs, the model's replies and tool results included, as a fixture
+      --chat-workspace <DIR>           The checkout whose files answer read_file and search while recording
       --kl <PATH>                      KL mode: compare the server's teacher-forced distributions with this reference, saving it first if absent
       --kl-rows <N>                    Positions per `--kl` pass: 1 runs decode steps, more runs verify passes [default: 1]
-      --kl-top <N>                     Candidates `--kl` keeps per position [default: 32]
+      --kl-top <N>                     Candidates `--kl` keeps per position [default: 256]
+      --kl-max <NATS>                  Most mean KL `--kl` accepts before it reports the run over threshold. Default: by the weight type
+      --kl-min-top1 <PCT>              Fewest positions, in percent, whose top token `--kl` needs to agree. Default: by the weight type
+      --ppl-baseline <PPL>             The perplexity `--perplexity` is judged against
+      --ppl-max-increase <PCT>         How far above `--ppl-baseline`, in percent, perplexity may rise before the run is over threshold [default: 1]
       --kl-tokens <N>                  Tokens `--kl` runs [default: 1024]
       --kl-text <PATH>                 The text `--kl` runs. Default: the chat fixture's system prompt and turns
       --perplexity <PATH>              Perplexity mode: score this text file through `/logits`
@@ -1445,6 +1555,7 @@ Options:
       --fail-on-regression             After a two-value --sweep, exit 2 if the second value is worse beyond the noise
       --sweep-as-given                 Run a two-value --sweep in the order written instead of as a,b,b,a
       --write-profile                  After a two-value --sweep, keep the winning value in the server's tuning profile
+      --tune <VAR=VALUES>              Tune the device's profile knob by knob: `VAR=control;a;b`, repeatable, or `default` / `prefill`
       --sweep-env <K=V>                Environment held constant across every `--sweep` point (repeatable)
       --sweep-start-timeout <SECONDS>  Seconds to wait for a swept server to come up [default: 300]
       --render-profile <PATH>          Re-render an already-collapsed `.folded` profile to SVG; measure nothing

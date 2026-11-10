@@ -656,7 +656,7 @@ pub(crate) struct MlaLayer {
 fn delta_heads_per_task(n_head: usize) -> usize {
     static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let forced = *OVERRIDE.get_or_init(|| {
-        std::env::var("ORANGU_DELTA_HEADS_PER_TASK")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_DELTA_HEADS_PER_TASK")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|n| *n > 0)

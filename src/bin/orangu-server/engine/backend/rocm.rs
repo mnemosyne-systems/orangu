@@ -74,8 +74,12 @@ use super::vendor_shaders::{KERNEL_NAME, SUPPORTED_TYPES};
 
 /// The complete, compile-ready HIP-C source for `ggml_type`'s matmul
 /// kernel, or `None` if this backend has no kernel for it.
-fn kernel_source(ggml_type: u32) -> Option<String> {
-    super::vendor_shaders::kernel_source(super::vendor_shaders::Dialect::Hip, ggml_type)
+fn kernel_source(ggml_type: u32, workgroup: usize) -> Option<String> {
+    super::vendor_shaders::kernel_source_with(
+        super::vendor_shaders::Dialect::Hip,
+        ggml_type,
+        workgroup,
+    )
 }
 
 unsafe fn compile_and_load(source: &str) -> Option<(hipModule_t, hipFunction_t)> {
@@ -159,6 +163,9 @@ struct RocmState {
 unsafe impl Send for RocmState {}
 
 pub struct RocmBackend {
+    /// The block size the kernels were built for and launch at — see
+    /// `vendor_shaders::workgroup`.
+    workgroup: usize,
     state: Mutex<RocmState>,
     /// The device's own name (e.g. `"AMD Radeon RX 7900 XTX"`) — for the
     /// startup banner.
@@ -266,16 +273,18 @@ impl RocmBackend {
             let _ = hipDriverGetVersion(&mut driver);
             // Before any knob is resolved, so the profile's values are the
             // ones they read.
-            super::tuning_profile::install_named("rocm", &device_name, &driver.to_string());
+            let _profile =
+                super::tuning_profile::install_named("rocm", &device_name, &driver.to_string());
 
             let mut stream: hipStream_t = ptr::null_mut();
             if hipStreamCreate(&mut stream) != HIP_SUCCESS {
                 return None;
             }
 
+            let workgroup = super::vendor_shaders::workgroup();
             let mut functions = HashMap::new();
             for &ggml_type in SUPPORTED_TYPES {
-                let source = kernel_source(ggml_type)?;
+                let source = kernel_source(ggml_type, workgroup)?;
                 let (module, function) = compile_and_load(&source)?;
                 functions.insert(ggml_type, (module, function));
             }
@@ -300,6 +309,7 @@ impl RocmBackend {
             }
 
             Some(Self {
+                workgroup,
                 state: Mutex::new(RocmState {
                     stream,
                     functions,
@@ -414,7 +424,7 @@ impl Backend for RocmBackend {
                     num_blocks,
                     1,
                     1,
-                    64,
+                    self.workgroup as u32,
                     1,
                     1,
                     0,
@@ -575,7 +585,7 @@ impl Backend for RocmBackend {
                             num_blocks,
                             1,
                             1,
-                            64,
+                            self.workgroup as u32,
                             1,
                             1,
                             0,

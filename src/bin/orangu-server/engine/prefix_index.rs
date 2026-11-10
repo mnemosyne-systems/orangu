@@ -327,6 +327,15 @@ impl PrefixIndex {
         self.changed.notify_all();
     }
 
+    /// The token ids a remembered page was built from.
+    pub fn tokens_of(&self, tag: u64) -> Option<Vec<u32>> {
+        self.known
+            .lock()
+            .expect("prefix index poisoned")
+            .get(&tag)
+            .cloned()
+    }
+
     /// Drops a tag — for a page the pool has reclaimed, whose content is gone.
     ///
     /// Without this the index grows without bound and, worse, starts promising

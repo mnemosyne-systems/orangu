@@ -1137,7 +1137,7 @@ pub fn global() -> &'static dyn ExpertStore {
 /// active rule is reported back in `/moe-stats` for the same reason, so a
 /// sweep's own output says which arm actually ran.
 fn tier_policy() -> Policy {
-    match std::env::var("ORANGU_EXPERT_CACHE_POLICY").as_deref() {
+    match crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_CACHE_POLICY").as_deref() {
         Ok("lfru") => Policy::Lfru,
         Ok("lfu") => Policy::Lfu,
         _ => Policy::Lru,
@@ -1145,7 +1145,7 @@ fn tier_policy() -> Policy {
 }
 
 fn tier_budget_bytes() -> Option<u64> {
-    let Ok(raw) = std::env::var("ORANGU_EXPERT_CACHE_GB") else {
+    let Ok(raw) = crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_CACHE_GB") else {
         return DEFAULT_TIER_BYTES.get().copied();
     };
     let gib: f64 = raw.trim().parse().ok()?;

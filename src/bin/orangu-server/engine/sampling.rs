@@ -367,6 +367,11 @@ pub struct Sampler {
     /// comes ahead of the token's turn to be emitted, by several tokens when a
     /// speculative step verifies a draft.
     recorded: std::collections::VecDeque<TokenLogprob>,
+    /// The tokens a context shift has dropped from ahead of the positions
+    /// this sampler is handed, added to each before its draw: a draw is keyed
+    /// by the token's place in the whole conversation, so the positions a
+    /// shift makes the window count again draw afresh.
+    dropped: usize,
 }
 
 impl Sampler {
@@ -378,7 +383,14 @@ impl Sampler {
             forced: None,
             logprobs: None,
             recorded: std::collections::VecDeque::new(),
+            dropped: 0,
         }
+    }
+
+    /// How many tokens of the conversation lie dropped ahead of the window
+    /// whose positions [`Self::sample`] is given.
+    pub fn set_dropped(&mut self, dropped: usize) {
+        self.dropped = dropped;
     }
 
     /// Records each pick's [`TokenLogprob`], listing `top` alternatives.
@@ -436,8 +448,15 @@ impl Sampler {
         self
     }
 
+    /// Whether [`Self::set_reasoning`] changes anything: a tool-call grammar
+    /// is waiting for its call.
+    pub fn watches_reasoning(&self) -> bool {
+        self.waiting_call.is_some()
+    }
+
     /// Whether what is being written is reasoning, where a call's opener is
-    /// only a mention of one.
+    /// only a mention of one: set before each pick to whether the token picked
+    /// goes into a reasoning body.
     pub fn set_reasoning(&mut self, reasoning: bool) {
         if let Some(waiting) = self.waiting_call.as_mut() {
             waiting.paused = reasoning;
@@ -624,7 +643,7 @@ impl Sampler {
     /// probability, for position `pos`.
     fn draw(&self, candidates: &[(u32, f32)], pos: usize) -> u32 {
         let total: f32 = candidates.iter().map(|(_, p)| p).sum();
-        let mut draw = position_draw(self.params.seed, pos) * total;
+        let mut draw = position_draw(self.params.seed, pos + self.dropped) * total;
         for &(id, p) in candidates {
             draw -= p;
             if draw <= 0.0 {
@@ -640,7 +659,7 @@ impl Sampler {
     /// [`Self::needs_host_logits`]). See
     /// [`Self::sample_from_candidates`].
     pub fn device_top_k(&self) -> u32 {
-        const CAP: usize = 64;
+        const CAP: usize = DEVICE_CANDIDATES;
         // `ORANGU_NO_DEVICE_TOPK=1` keeps the whole-vocabulary path, as the
         // control arm of a sweep.
         static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -655,6 +674,87 @@ impl Sampler {
             return 0;
         }
         k as u32
+    }
+
+    /// Whether the constraint holds a finished document after which only a
+    /// stop token may come: the reply is over, and the step that would pick
+    /// the stop token need not run.
+    pub fn document_finished(&self) -> bool {
+        self.constraint.as_ref().is_some_and(|c| {
+            c.grammar.is_complete() && c.grammar.ends_when_complete() && !c.stop_ids.is_empty()
+        })
+    }
+
+    /// How many candidates the device may pre-select for a step held to a
+    /// constraint — the grammar is checked against those instead of the
+    /// whole vocabulary ([`Self::sample_constrained`]). `0` when there is no
+    /// constraint, or when anything besides it needs every logit: a forced
+    /// token, `logprobs`, a bias, the presence or frequency penalty, or a
+    /// sampled step with no `top_k` (or one past the device's cap).
+    ///
+    /// A greedy step asks for [`DEVICE_CANDIDATES`]: the best allowed one is
+    /// among them far more often than not. A sampled one asks for its own
+    /// `top_k`, which is exactly the field the host masks.
+    pub fn device_constrained_k(&self) -> u32 {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| crate::engine::env::flag_on("ORANGU_NO_DEVICE_CONSTRAINED")) {
+            return 0;
+        }
+        if self.constraint.is_none()
+            || self.forced.is_some()
+            || self.logprobs.is_some()
+            || !self.params.logit_bias.is_empty()
+            || self.params.presence_penalty != 0.0
+            || self.params.frequency_penalty != 0.0
+        {
+            return 0;
+        }
+        if self.is_greedy() {
+            return DEVICE_CANDIDATES as u32;
+        }
+        match self.params.top_k {
+            0 => 0,
+            k if k > DEVICE_CANDIDATES => 0,
+            k => k as u32,
+        }
+    }
+
+    /// A constrained pick from the device's candidates (the largest
+    /// penalized logits, largest first; [`Self::device_constrained_k`] said
+    /// how many), or `None` when they cannot settle it and the step needs
+    /// every logit.
+    ///
+    /// The same pick [`Self::sample`] makes. Greedy: the first candidate the
+    /// grammar allows is the best allowed token in the vocabulary; when none
+    /// of them is, the answer lies further down. Sampled: the candidates are
+    /// the step's `top_k`, the field the host masks after truncating, so the
+    /// allowed ones are exactly its field — unless none is allowed, where
+    /// the host refills from the whole vocabulary.
+    pub fn sample_constrained(&mut self, candidates: Vec<(u32, f32)>, pos: usize) -> Option<u32> {
+        let constraint = self.constraint.as_mut()?;
+        let mut candidates = candidates;
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if self.params.temperature <= 0.0 {
+            let id = candidates
+                .iter()
+                .map(|&(id, _)| id)
+                .find(|&id| constraint.allows(id))?;
+            self.accept_into_constraint(id);
+            return Some(id);
+        }
+        candidates.retain(|&(id, _)| constraint.allows(id));
+        if candidates.is_empty() {
+            return None;
+        }
+        for (_, v) in candidates.iter_mut() {
+            *v /= self.params.temperature;
+        }
+        softmax_pairs(&mut candidates);
+        apply_top_p(&mut candidates, self.params.top_p);
+        apply_min_p(&mut candidates, self.params.min_p);
+        let id = self.draw(&candidates, pos);
+        self.accept_into_constraint(id);
+        Some(id)
     }
 
     /// [`Self::sample`] for a step whose repeat penalty and `top_k` were
@@ -678,6 +778,9 @@ impl Sampler {
         id
     }
 }
+
+/// The most candidates the device pre-selects for one step.
+const DEVICE_CANDIDATES: usize = 64;
 
 /// A uniform number in `[0, 1)` for the draw at absolute position `pos`
 /// under `seed`: SplitMix64 over the two, so every position has its own
@@ -1263,6 +1366,32 @@ mod constraint_tests {
         assert!(!sampler.needs_host_logits());
     }
 
+    /// A draw is keyed by where its token stands in the whole conversation,
+    /// so a window that a shift moved along draws afresh at positions it
+    /// counted before.
+    #[test]
+    fn draws_go_by_the_place_in_the_conversation() {
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            seed: 3,
+            ..Default::default()
+        };
+        let logits = vec![0f32; 64];
+        let picks = |dropped: usize, from: usize| {
+            let mut sampler = Sampler::new(params.clone());
+            sampler.set_dropped(dropped);
+            (from..from + 32)
+                .map(|pos| sampler.sample(&logits, &[], pos))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(picks(10, 5), picks(0, 15));
+        assert_ne!(picks(10, 5), picks(0, 5));
+    }
+
     #[test]
     fn a_call_mentioned_in_reasoning_is_only_a_mention() {
         let mut sampler = call_sampler(false);
@@ -1319,6 +1448,114 @@ mod constraint_tests {
             2,
             "only stopping is left"
         );
+    }
+
+    /// The device's candidates settle a constrained pick exactly as the host
+    /// does over every logit — greedy and sampled, step after step with the
+    /// constraint advancing — and say so when they cannot.
+    #[test]
+    fn device_candidates_pick_what_the_host_picks_under_a_constraint() {
+        let mut seed = 7u64;
+        let mut noise = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) * 8.0 - 4.0
+        };
+        for params in [
+            SamplingParams {
+                temperature: 0.0,
+                repeat_penalty: 1.0,
+                ..Default::default()
+            },
+            SamplingParams {
+                temperature: 0.8,
+                top_k: 4,
+                top_p: 1.0,
+                min_p: 0.0,
+                repeat_penalty: 1.0,
+                seed: 3,
+                ..Default::default()
+            },
+        ] {
+            let mut host = Sampler::new(params.clone()).with_constraint(json_constraint());
+            let mut device = Sampler::new(params.clone()).with_constraint(json_constraint());
+            let mut settled = 0;
+            for pos in 0..40 {
+                let logits: Vec<f32> = (0..100).map(|_| noise()).collect();
+                let want = host.sample(&logits, &[], pos);
+                let k = device.device_constrained_k() as usize;
+                if k == 0 {
+                    assert!(device.document_finished() || device.constraint.is_none());
+                    break;
+                }
+                let mut top: Vec<(u32, f32)> = logits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i as u32, v))
+                    .collect();
+                top.sort_by(|a, b| b.1.total_cmp(&a.1));
+                top.truncate(k);
+                let got = match device.sample_constrained(top, pos) {
+                    Some(id) => {
+                        settled += 1;
+                        id
+                    }
+                    None => device.sample(&logits, &[], pos),
+                };
+                assert_eq!(got, want, "pos {pos} at {params:?}");
+                if host.document_finished() {
+                    break;
+                }
+            }
+            assert!(settled > 0, "the candidates settled some picks");
+        }
+    }
+
+    /// Anything besides the constraint that needs every logit keeps the
+    /// whole readback; so does a sampled step with no `top_k`.
+    #[test]
+    fn only_a_constraint_alone_takes_device_candidates() {
+        let greedy = SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        assert_eq!(Sampler::new(greedy.clone()).device_constrained_k(), 0);
+        let constrained = || Sampler::new(greedy.clone()).with_constraint(json_constraint());
+        assert_eq!(
+            constrained().device_constrained_k(),
+            DEVICE_CANDIDATES as u32
+        );
+        assert_eq!(constrained().with_logprobs(1).device_constrained_k(), 0);
+        let mut forced = constrained();
+        forced.force(0);
+        assert_eq!(forced.device_constrained_k(), 0);
+        let open_field = SamplingParams {
+            temperature: 0.7,
+            top_k: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            Sampler::new(open_field)
+                .with_constraint(json_constraint())
+                .device_constrained_k(),
+            0
+        );
+    }
+
+    /// A closed document has nothing after it but a stop token.
+    #[test]
+    fn a_closed_document_is_finished() {
+        let mut sampler = Sampler::new(SamplingParams {
+            temperature: 0.0,
+            ..Default::default()
+        })
+        .with_constraint(json_constraint());
+        assert!(!sampler.document_finished());
+        sampler.note_device_pick(0);
+        assert!(!sampler.document_finished(), "`{{` is open");
+        sampler.note_device_pick(1);
+        assert!(sampler.document_finished(), "`{{}}` is a whole document");
     }
 
     fn json_constraint() -> Constraint {

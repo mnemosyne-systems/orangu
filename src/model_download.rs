@@ -790,6 +790,41 @@ impl RemoteModel {
         self.shards.iter().map(move |file| self.header(file))
     }
 
+    /// The first `len` bytes of tensor `name`'s data, with its entry and the
+    /// header of the shard that holds it — `None` when no shard has it. Two
+    /// ranged requests per shard looked at: the header, and the slice.
+    pub fn tensor_prefix(
+        &self,
+        name: &str,
+        len: u64,
+    ) -> Result<Option<(GgufFile, crate::gguf::TensorInfo, Vec<u8>)>> {
+        for file in &self.shards {
+            let header = self.header(file)?;
+            let Some(tensor) = header.tensors.iter().find(|t| t.name == name).cloned() else {
+                continue;
+            };
+            let url = format!(
+                "{HUB_ENDPOINT}/{}/resolve/{}/{}",
+                self.repo,
+                self.commit,
+                urlencode_path(&file.path)
+            );
+            let start = header.data_offset + tensor.offset;
+            let len = len.min(file.size.saturating_sub(start));
+            let mut bytes = Vec::with_capacity(len as usize);
+            ranged(
+                &self.client,
+                &url,
+                self.token.as_deref(),
+                Some((start, len)),
+            )?
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed reading {name} from {url}"))?;
+            return Ok(Some((header, tensor, bytes)));
+        }
+        Ok(None)
+    }
+
     /// One shard's header. Streams the file and stops at the end of the
     /// tensor table — dropping the response cancels the rest of the
     /// transfer, so this costs the header rather than the file.

@@ -20,6 +20,38 @@ use crate::{
 };
 use anyhow::{Result, anyhow};
 
+/// What a summarising pass asks the model — see [`ChatSession::summarise`].
+const SUMMARY_REQUEST: &str = "The conversation is near the end of the context. Write a summary of \
+everything above that a continuation of this work needs: the task and what the user asked for, \
+decisions made and why, files read or changed and what changed in them, commands run and what \
+they showed, and what is still to do. Be specific: names, paths, values. Do not call a tool; \
+answer with the summary alone.";
+
+/// What heads the summary in the transcript, so the model reads it as the
+/// earlier turns it stands for.
+const SUMMARY_HEADER: &str = "[Summary of the earlier conversation, which it replaces]";
+
+/// A transcript's size in bytes: each message's text and its tool calls'
+/// arguments.
+fn transcript_bytes(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|m| {
+            m.content.len()
+                + m.tool_calls.as_ref().map_or(0, |calls| {
+                    calls
+                        .iter()
+                        .map(|c| {
+                            c.function.name.len()
+                                + serde_json::to_string(&c.function.arguments)
+                                    .map_or(0, |a| a.len())
+                        })
+                        .sum()
+                })
+        })
+        .sum()
+}
+
 /// The user's answer to an MCP tool call that asks for approval.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolApproval {
@@ -337,6 +369,98 @@ impl ChatSession {
         (before, after)
     }
 
+    /// The share of the context the turns a summary keeps word for word may
+    /// take: a quarter.
+    const SUMMARY_KEEP_DIVISOR: u64 = 4;
+
+    /// The longest summary asked for, in tokens.
+    const SUMMARY_MAX_TOKENS: u32 = 2048;
+
+    /// Tokens a transcript of `bytes` holds, from what the server last
+    /// counted for the whole transcript; four bytes a token before it has.
+    fn tokens_of_bytes(&self, bytes: usize) -> u64 {
+        let total = transcript_bytes(&self.messages);
+        match self.context.used {
+            Some(used) if total > 0 => (bytes as u128 * used as u128 / total as u128) as u64,
+            _ => bytes as u64 / 4,
+        }
+    }
+
+    /// Where a summary's kept turns begin: the earliest user message from
+    /// which the rest of the transcript fits `keep` tokens — and the last
+    /// user message whatever it costs, so the conversation still ends in a
+    /// whole turn. `None` when that leaves nothing before it to summarise.
+    fn summary_split(&self, keep: u64) -> Option<usize> {
+        let users: Vec<usize> = (1..self.messages.len())
+            .filter(|&i| self.messages[i].role == "user")
+            .collect();
+        let fits = |&i: &usize| self.tokens_of_bytes(transcript_bytes(&self.messages[i..])) <= keep;
+        let split = users
+            .iter()
+            .copied()
+            .find(fits)
+            .or_else(|| users.last().copied())?;
+        (split > 1).then_some(split)
+    }
+
+    /// Replaces the earlier turns of the conversation with a summary the
+    /// model writes of them, keeping the system prompt and the latest turns —
+    /// as many as fit a quarter of the context — word for word.
+    ///
+    /// The summary is asked for in the conversation itself, with its own
+    /// system prompt and tools, so the request extends what the server has
+    /// already processed and costs only the question and the answer. An
+    /// answer that is a tool call, or empty, or an error leaves the
+    /// transcript as it was. Returns the gauge's tokens before and after, or
+    /// `None` when nothing was summarised.
+    pub async fn summarise(
+        &mut self,
+        profile: &LlmConfiguration,
+        tools: &ToolExecutor,
+    ) -> Result<Option<(u64, u64)>> {
+        let Some(limit) = self.context_gauge().and_then(|gauge| gauge.limit) else {
+            return Ok(None);
+        };
+        let Some(split) = self.summary_split(limit / Self::SUMMARY_KEEP_DIVISOR) else {
+            return Ok(None);
+        };
+        let probe_client = self.probe_client.clone();
+        let id_slot = self.ensure_slot_assigned(profile, &probe_client).await;
+        let client = OpenAiClient::from_profile(profile)?
+            .with_max_tokens(Self::SUMMARY_MAX_TOKENS)
+            .with_id_slot(id_slot);
+        let mut asked = self.messages.clone();
+        asked.push(ChatMessage::user(SUMMARY_REQUEST));
+        let summary = match client
+            .chat(
+                &asked,
+                &tools.definitions(),
+                &mut |_: &str| {},
+                &mut |_: StreamMetrics| {},
+            )
+            .await?
+        {
+            LlmResponse::Text(text) if !text.trim().is_empty() => text,
+            _ => return Ok(None),
+        };
+        let before = self.context.used.unwrap_or_default();
+        let before_bytes = transcript_bytes(&self.messages);
+        let mut kept = self.messages.split_off(split);
+        self.messages.truncate(1);
+        kept[0].content = format!(
+            "{SUMMARY_HEADER}\n\n{}\n\n---\n\n{}",
+            summary.trim(),
+            kept[0].content
+        );
+        self.messages.extend(kept);
+        let after_bytes = transcript_bytes(&self.messages);
+        let after = (before as u128 * after_bytes as u128 / before_bytes.max(1) as u128) as u64;
+        self.context.used = Some(after);
+        self.context.estimated = true;
+        self.rearm_context_warning();
+        Ok(Some((before, after)))
+    }
+
     /// Keeps a turn that runs out of `max_tool_rounds` in the transcript
     /// instead of rolling it back, so the model can still be asked what it
     /// got done: a subagent's partial answer.
@@ -509,9 +633,11 @@ impl ChatSession {
         self.messages.truncate(checkpoint);
     }
 
-    /// Floor on a compaction pass: below this there is nothing worth the
-    /// disruption, however the ratio below works out.
-    const COMPACT_MIN_RECLAIM_BYTES: usize = 4 * 1024;
+    /// Floor on a compaction pass, in tokens: below this there is nothing
+    /// worth the disruption, however the ratio below works out. Counted in
+    /// tokens, since tokens are what the context holds and a byte of code is
+    /// not a byte of prose.
+    const COMPACT_MIN_RECLAIM_TOKENS: u64 = 1024;
 
     /// Compaction runs only when it can reclaim at least this fraction of the
     /// transcript — `2` meaning half of it.
@@ -539,7 +665,7 @@ impl ChatSession {
     /// costs. See [`Self::COMPACT_MIN_RECLAIM_RATIO`].
     pub fn compact_transcript(&mut self) {
         let reclaimable = self.compactable_bytes();
-        if reclaimable < Self::COMPACT_MIN_RECLAIM_BYTES {
+        if self.tokens_of_bytes(reclaimable) < Self::COMPACT_MIN_RECLAIM_TOKENS {
             return;
         }
         let transcript: usize = self.messages.iter().map(|m| m.content.len()).sum();
@@ -1018,7 +1144,10 @@ mod tests {
     #[test]
     fn a_small_backlog_is_not_worth_a_re_prefill_and_is_left_alone() {
         let mut session = tool_conversation(6, 2_000);
-        assert!(session.compactable_bytes() < ChatSession::COMPACT_MIN_RECLAIM_BYTES);
+        assert!(
+            session.tokens_of_bytes(session.compactable_bytes())
+                < ChatSession::COMPACT_MIN_RECLAIM_TOKENS
+        );
 
         let before: Vec<String> = session
             .messages()
@@ -1078,7 +1207,8 @@ mod tests {
         session.compact_transcript();
         assert!(evicted_count(&session) > 0);
         assert!(
-            session.compactable_bytes() < ChatSession::COMPACT_MIN_RECLAIM_BYTES,
+            session.tokens_of_bytes(session.compactable_bytes())
+                < ChatSession::COMPACT_MIN_RECLAIM_TOKENS,
             "evicted stubs are still being counted as reclaimable"
         );
     }
@@ -1572,5 +1702,71 @@ data: [DONE]
             "{}",
             results[1]
         );
+    }
+    /// A conversation that nears the end of its context: two old turns, and
+    /// the latest whose text is long enough to need a quarter of it.
+    fn nearly_full_session() -> ChatSession {
+        let mut session = ChatSession::new("system");
+        for turn in 0..3 {
+            session.push_user(&format!("question {turn} {}", "x".repeat(400)));
+            session
+                .messages
+                .push(crate::llm::ChatMessage::assistant(&"answer ".repeat(100)));
+        }
+        session.context.used = Some(900);
+        session.context.limit = Some(("http://unused".to_string(), Some(1000)));
+        session
+    }
+
+    /// The turns kept word for word are the latest that fit a quarter of the
+    /// context, starting at a user message, and always the last turn.
+    #[test]
+    fn a_summary_keeps_the_latest_turns_that_fit() {
+        let session = nearly_full_session();
+        // Each turn is about 300 tokens of the 900: only the last fits 250,
+        // and it is kept whatever it costs.
+        assert_eq!(session.summary_split(250), Some(5));
+        assert_eq!(session.summary_split(700), Some(3));
+        // Everything fits: nothing before it to summarise.
+        assert_eq!(session.summary_split(10_000), None);
+        let mut short = ChatSession::new("system");
+        short.push_user("only turn");
+        assert_eq!(short.summary_split(0), None);
+    }
+
+    /// The summary is asked for in the conversation, with its tools, and
+    /// takes the earlier turns' place inside the first kept user message;
+    /// the gauge follows the shorter transcript.
+    #[tokio::test]
+    async fn a_summary_replaces_the_earlier_turns() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = crate::tools::ToolExecutor::new(workspace.path());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = serve_chat_responses(
+            listener,
+            vec![crate::test_support::text_stream("they asked two questions")],
+        );
+        let mut session = nearly_full_session();
+        let (before, after) = session
+            .summarise(&test_profile(&endpoint), &tools)
+            .await
+            .expect("summarised")
+            .expect("something to summarise");
+        let requests = server.join().unwrap();
+        let asked = requests.last().expect("one request");
+        assert!(asked.contains("\"tools\""), "asked with its tools: {asked}");
+        assert!(
+            asked.contains("question 0"),
+            "asked of the whole conversation"
+        );
+        let roles: Vec<&str> = session.messages().iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["system", "user", "assistant"]);
+        let first = &session.messages()[1].content;
+        assert!(first.starts_with(super::SUMMARY_HEADER), "{first}");
+        assert!(first.contains("they asked two questions") && first.contains("question 2"));
+        assert_eq!(before, 900);
+        assert!(after < 450, "{after}");
+        assert!(session.context_gauge().unwrap().estimated);
     }
 }

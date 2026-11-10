@@ -1059,7 +1059,7 @@ pub(crate) fn value_product() -> ValueProduct {
     static CHOICE: std::sync::OnceLock<ValueProduct> = std::sync::OnceLock::new();
     *CHOICE.get_or_init(|| {
         let bf16 = crate::engine::vecdot::have_bf16mm();
-        match std::env::var("ORANGU_IMAGE_PV")
+        match crate::engine::backend::tuning_profile::env_var("ORANGU_IMAGE_PV")
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref()
         {
@@ -1076,7 +1076,7 @@ pub(crate) fn int8_step_attention() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         crate::engine::vecdot::have_i8_scores()
-            && !std::env::var("ORANGU_IMAGE_ATTENTION")
+            && !crate::engine::backend::tuning_profile::env_var("ORANGU_IMAGE_ATTENTION")
                 .is_ok_and(|v| v.trim().eq_ignore_ascii_case("f32"))
     })
 }
@@ -1106,7 +1106,7 @@ const ATTN_QUERIES: usize = 48;
 fn attn_queries() -> usize {
     static QUERIES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *QUERIES.get_or_init(|| {
-        std::env::var("ORANGU_IMAGE_ATTN_QUERIES")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_IMAGE_ATTN_QUERIES")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|q| (4..=96).contains(q) && q.is_multiple_of(4))

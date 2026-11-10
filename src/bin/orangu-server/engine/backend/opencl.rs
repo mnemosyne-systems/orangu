@@ -80,16 +80,14 @@ use super::{Backend, MatmulOp};
 // rather than written once per backend.
 use super::vendor_shaders::{KERNEL_NAME, SUPPORTED_TYPES};
 
-/// The reduction workgroup size — must match `LOCAL_WORK_SIZE` used at
-/// dispatch time and the hardcoded `64`/`partial_sums[256]` layout below,
-/// the same relationship `vulkan_shaders`'s `MAIN_REDUCE_SUFFIX` has to
-/// `@workgroup_size(64)`.
-const LOCAL_WORK_SIZE: usize = 64;
-
 /// The complete, compile-ready OpenCL-C source for `ggml_type`'s matmul
 /// kernel, or `None` if this backend has no kernel for it.
-fn kernel_source(ggml_type: u32) -> Option<String> {
-    super::vendor_shaders::kernel_source(super::vendor_shaders::Dialect::OpenCl, ggml_type)
+fn kernel_source(ggml_type: u32, workgroup: usize) -> Option<String> {
+    super::vendor_shaders::kernel_source_with(
+        super::vendor_shaders::Dialect::OpenCl,
+        ggml_type,
+        workgroup,
+    )
 }
 
 /// `QuantMatrix::cache_key()`'s return type — named, like `vulkan.rs`'s own
@@ -103,6 +101,9 @@ type WeightCacheKey = (usize, usize);
 const MALI_DEVICE: &str = "/dev/mali0";
 
 pub struct OpenClBackend {
+    /// The workgroup size the kernels were built for and launch at — see
+    /// `vendor_shaders::workgroup`.
+    workgroup: usize,
     context: Context,
     queue: Mutex<CommandQueue>,
     kernels: Mutex<HashMap<u32, (Program, Kernel)>>,
@@ -237,7 +238,7 @@ impl OpenClBackend {
         let device_name = device.name().unwrap_or_else(|_| "OpenCL".to_string());
         // Before any knob is resolved, so the profile's values are the ones
         // they read.
-        super::tuning_profile::install_named(
+        let _profile = super::tuning_profile::install_named(
             "opencl",
             &device_name,
             &device.driver_version().unwrap_or_default(),
@@ -245,9 +246,10 @@ impl OpenClBackend {
         let context = Context::from_device(&device).ok()?;
         let queue = CommandQueue::create_default(&context, 0).ok()?;
 
+        let workgroup = super::vendor_shaders::workgroup();
         let mut kernels = HashMap::new();
         for &ggml_type in SUPPORTED_TYPES {
-            let source = kernel_source(ggml_type)?;
+            let source = kernel_source(ggml_type, workgroup)?;
             let program = Program::create_and_build_from_source(&context, &source, "").ok()?;
             let kernel = Kernel::create(&program, KERNEL_NAME).ok()?;
             kernels.insert(ggml_type, (program, kernel));
@@ -270,6 +272,7 @@ impl OpenClBackend {
             .ok()?;
 
         Some(Self {
+            workgroup,
             context,
             queue: Mutex::new(queue),
             kernels: Mutex::new(kernels),
@@ -333,7 +336,7 @@ impl Backend for OpenClBackend {
 
         let n_row_groups = (out_dim as usize).div_ceil(4);
         let num_groups = (n_row_groups * n_tokens).max(1);
-        let global_work_size = num_groups * LOCAL_WORK_SIZE;
+        let global_work_size = num_groups * self.workgroup;
 
         let queue = self.queue.lock().expect("opencl queue poisoned");
         let mut x_buf = unsafe {
@@ -375,7 +378,7 @@ impl Backend for OpenClBackend {
                 .set_arg(&n_tokens_u32)
                 .set_arg(&row_bytes)
                 .set_arg(&self.iq_grids)
-                .set_local_work_size(LOCAL_WORK_SIZE)
+                .set_local_work_size(self.workgroup)
                 .set_global_work_size(global_work_size)
                 .enqueue_nd_range(&queue)
         }
@@ -439,7 +442,7 @@ impl Backend for OpenClBackend {
 
                 let n_row_groups = (out_dim as usize).div_ceil(4);
                 let num_groups = (n_row_groups * stripe.n_tokens).max(1);
-                let global_work_size = num_groups * LOCAL_WORK_SIZE;
+                let global_work_size = num_groups * self.workgroup;
 
                 let mut x_buf = unsafe {
                     Buffer::<f32>::create(
@@ -483,7 +486,7 @@ impl Backend for OpenClBackend {
                         .set_arg(&n_tokens_u32)
                         .set_arg(&row_bytes)
                         .set_arg(&self.iq_grids)
-                        .set_local_work_size(LOCAL_WORK_SIZE)
+                        .set_local_work_size(self.workgroup)
                         .set_global_work_size(global_work_size)
                         .enqueue_nd_range(&queue)
                 }

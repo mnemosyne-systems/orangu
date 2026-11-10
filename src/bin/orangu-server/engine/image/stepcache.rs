@@ -67,7 +67,7 @@ pub fn set(choice: ImageCache) {
 
 /// The configured choice, `ORANGU_IMAGE_CACHE` over the configuration.
 pub fn configured() -> ImageCache {
-    std::env::var("ORANGU_IMAGE_CACHE")
+    crate::engine::backend::tuning_profile::env_var("ORANGU_IMAGE_CACHE")
         .ok()
         .and_then(|v| ImageCache::parse(&v).ok())
         .unwrap_or_else(|| *CHOICE.lock().unwrap_or_else(|p| p.into_inner()))

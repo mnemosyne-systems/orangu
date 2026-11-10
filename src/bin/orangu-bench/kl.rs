@@ -83,6 +83,74 @@ pub fn compare(reference: &[(u32, f32)], other: &[(u32, f32)]) -> Position {
 
 /// The text a reference is taken over: the chat fixture's system prompt
 /// and turns, which are mostly code and tool definitions.
+/// Set when a run's measurement crossed its threshold — read after the run
+/// is recorded, so `--fail-on-regression` exits `2` with the rows on file.
+static OVER_THRESHOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks this run as over its threshold.
+pub fn note_over_threshold() {
+    OVER_THRESHOLD.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a measurement of this run crossed its threshold.
+pub fn over_threshold() -> bool {
+    OVER_THRESHOLD.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The weight type a model label names: the tag after `:`, or the last
+/// `-`-separated part of a file name that reads as one (`Q4_K_M`,
+/// `UD-Q6_K_XL`, `Q8_0`, `IQ3_XXS`, `BF16`).
+pub fn quant_of(label: &str) -> Option<String> {
+    let name = label.rsplit('/').next().unwrap_or(label);
+    let name = name.strip_suffix(".gguf").unwrap_or(name);
+    let tag = match name.rsplit_once(':') {
+        Some((_, tag)) => tag.to_string(),
+        None => {
+            let parts: Vec<&str> = name.split('-').collect();
+            let at = parts.iter().rposition(|p| looks_like_quant(p))?;
+            if at > 0 && parts[at - 1].eq_ignore_ascii_case("UD") {
+                format!("UD-{}", parts[at])
+            } else {
+                parts[at].to_string()
+            }
+        }
+    };
+    looks_like_quant(tag.trim_start_matches("UD-")).then_some(tag.to_ascii_uppercase())
+}
+
+fn looks_like_quant(part: &str) -> bool {
+    let p = part.to_ascii_uppercase();
+    matches!(p.as_str(), "F32" | "F16" | "BF16")
+        || ((p.starts_with('Q') || p.starts_with("IQ"))
+            && p.chars()
+                .nth(if p.starts_with("IQ") { 2 } else { 1 })
+                .is_some_and(|c| c.is_ascii_digit()))
+}
+
+/// The drift a weight type is allowed against its reference: the most mean
+/// KL, and the fewest positions whose top token may agree, in percent.
+///
+/// Set from the baseline (PERF-BASELINE.md §1): every architecture and type
+/// measured drifted under 0.007 nats with at least 98.4% agreement against
+/// one-row decode, so 4-bit and wider types are held to 0.01 and 98%, and the
+/// 3- and 2-bit types, whose rounding is coarser, to twice the KL. Floats
+/// leave only the order of summation, and are held tighter.
+pub fn drift_threshold(quant: Option<&str>) -> (f64, f64) {
+    let q = quant.unwrap_or("").trim_start_matches("UD-");
+    match q {
+        "F32" | "F16" | "BF16" => (0.002, 99.0),
+        _ if q.starts_with("Q2")
+            || q.starts_with("Q3")
+            || q.starts_with("IQ1")
+            || q.starts_with("IQ2")
+            || q.starts_with("IQ3") =>
+        {
+            (0.02, 97.0)
+        }
+        _ => (0.01, 98.0),
+    }
+}
+
 fn text(args: &Args) -> anyhow::Result<String> {
     if let Some(path) = &args.kl_text {
         return std::fs::read_to_string(path)
@@ -204,6 +272,28 @@ pub fn run_kl(
             ms_ref
         );
     }
+    // Judged against `--kl-max` / `--kl-min-top1` where given, else against
+    // the served weight type's own threshold.
+    let quant = crate::moe::get_json(client, &format!("{}/props", args.url))
+        .get("model")
+        .and_then(|m| m.as_str())
+        .and_then(quant_of);
+    let (max_kl, min_top1) = drift_threshold(quant.as_deref());
+    let (max_kl, min_top1) = (
+        args.kl_max.unwrap_or(max_kl),
+        args.kl_min_top1.unwrap_or(min_top1),
+    );
+    let over = mean > max_kl || agree < min_top1;
+    if over {
+        note_over_threshold();
+    }
+    if !args.json {
+        println!(
+            "threshold  KL mean ≤ {max_kl} and top-1 ≥ {min_top1}% ({}): {}",
+            quant.as_deref().unwrap_or("type unknown"),
+            if over { "OVER" } else { "within" }
+        );
+    }
     let record = |mode: &str, value: f64| history::Record {
         date: history::today(),
         label: label.to_string(),
@@ -253,5 +343,80 @@ mod tests {
         let q_rest = 1.0 - 0.5 - 0.1;
         let want = 0.4 * (0.4f64 / 0.1).ln() + rest * (rest / q_rest).ln();
         assert!((c.kl - want).abs() < 1e-6, "{} vs {want}", c.kl);
+    }
+
+    /// A label names its weight type in either spelling a server reports.
+    #[test]
+    fn the_weight_type_is_read_from_the_label() {
+        assert_eq!(
+            quant_of("bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M").as_deref(),
+            Some("Q4_K_M")
+        );
+        assert_eq!(
+            quant_of("/m/gemma-4-E2B-it-UD-Q6_K_XL.gguf").as_deref(),
+            Some("UD-Q6_K_XL")
+        );
+        assert_eq!(quant_of("/m/model-Q8_0.gguf").as_deref(), Some("Q8_0"));
+        assert_eq!(
+            quant_of("/m/model-IQ3_XXS.gguf").as_deref(),
+            Some("IQ3_XXS")
+        );
+        assert_eq!(quant_of("/m/model-bf16.gguf").as_deref(), Some("BF16"));
+        assert_eq!(quant_of("smoke"), None);
+        assert_eq!(drift_threshold(Some("Q4_K_M")), (0.01, 98.0));
+        assert_eq!(drift_threshold(Some("UD-Q2_K_XL")), (0.02, 97.0));
+        assert_eq!(drift_threshold(Some("BF16")), (0.002, 99.0));
+        assert_eq!(drift_threshold(None), (0.01, 98.0));
+    }
+
+    /// The estimator keeps the top `k` of each distribution and one bucket
+    /// for the rest, so it never reads above the exact divergence: what the
+    /// tail adds is merged away. Over a 32k vocabulary with a long tail it
+    /// reads 8–42% low at 32 candidates and 5–26% low at 256, worst at the
+    /// smallest divergences — the range drift is measured in — which is why
+    /// `--kl-top` keeps 256.
+    #[test]
+    fn the_truncated_estimator_is_close_to_the_exact_divergence_at_256() {
+        let n = 32_000usize;
+        let zipf = |shift: f64, wobble: f64| -> Vec<f64> {
+            let w: Vec<f64> = (0..n)
+                .map(|i| {
+                    let r = (i as f64 + 1.0 + shift).powf(-1.1);
+                    r * (1.0 + wobble * ((i * 2_654_435_761) % 1000) as f64 / 1000.0)
+                })
+                .collect();
+            let total: f64 = w.iter().sum();
+            w.iter().map(|v| v / total).collect()
+        };
+        let top = |p: &[f64], k: usize| -> Vec<(u32, f32)> {
+            let mut idx: Vec<usize> = (0..p.len()).collect();
+            idx.sort_by(|&a, &b| p[b].total_cmp(&p[a]));
+            idx.truncate(k);
+            idx.iter().map(|&i| (i as u32, p[i].ln() as f32)).collect()
+        };
+        let p = zipf(0.0, 0.0);
+        let mut worst = [0.0f64; 2];
+        for (case, wobble) in [0.05, 0.2, 0.5].into_iter().enumerate() {
+            let q = zipf(0.3 * case as f64, wobble);
+            let exact: f64 = p.iter().zip(&q).map(|(a, b)| a * (a / b).ln()).sum();
+            for (slot, k) in [32usize, 256].into_iter().enumerate() {
+                let estimate = compare(&top(&p, k), &top(&q, k)).kl;
+                let bias = (estimate - exact).abs() / exact;
+                assert!(
+                    estimate <= exact * (1.0 + 1e-9),
+                    "a lower bound: {estimate} > {exact}"
+                );
+                worst[slot] = worst[slot].max(bias);
+            }
+        }
+        assert!(worst[1] < 0.3, "bias at 256 candidates: {:.3}", worst[1]);
+        assert!(
+            worst[0] > worst[1],
+            "fewer candidates read further low: {worst:?}"
+        );
+        assert!(
+            worst[1] <= worst[0] + 1e-9,
+            "256 is no worse than 32: {worst:?}"
+        );
     }
 }

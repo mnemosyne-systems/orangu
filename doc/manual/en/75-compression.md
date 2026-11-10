@@ -148,7 +148,7 @@ over fourteen tool-using turns it produced **3.5× more prefill work** than neve
 compacting at all, with nine consecutive turns reusing almost nothing.
 
 So a pass runs only when it can reclaim at least **half the transcript** (and at
-least 4 KiB). Paying one re-prefill to halve the transcript means the next pass
+least 1024 tokens, counted from the server's own count of the transcript). Paying one re-prefill to halve the transcript means the next pass
 cannot come due until it has roughly doubled again, so compaction gets rarer as
 a conversation grows rather than arriving every turn. On the same workload that
 is one expensive turn in fourteen instead of nine, for **2.7× less re-prefill**
@@ -158,8 +158,16 @@ compacting does not.
 Nothing about *what* gets compacted changed; only when.
 
 `/compact` runs the same pass at once, whatever it reclaims, and `compact_at`
-in the `[orangu]` section runs it after any turn that leaves the conversation
-that full of the context. See **Context gauge** in the Terminal chapter.
+in the `[orangu]` section (85% unless set) runs it after any turn that leaves
+the conversation that full of the context. When dropping old output does not
+bring it below that, the model summarises the earlier turns. The request is the
+conversation itself, with its own system prompt and tools, plus one question,
+so the server's prefix cache covers everything but the question and the
+answer. The summary then takes the place of every turn before the latest ones
+that fit a quarter of the context, folded into the first kept user message so
+the roles still alternate. An answer that is a tool call or empty, or a failed
+request, leaves the conversation as it was. See **Context gauge** in the
+Terminal chapter.
 
 ### Metrics & `/usage`
 

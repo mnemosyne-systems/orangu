@@ -475,7 +475,8 @@ fn layer_norm_affine(dst: &mut Vec<f32>, src: &[f32], w: &[f32], b: &[f32], dim:
 /// Whether the vision tower's weights are requantized to `Q6_K` for the
 /// `int8` kernel — the default; `ORANGU_IMAGE_VISION=f32` keeps them `BF16`.
 fn vision_int8() -> bool {
-    !std::env::var("ORANGU_IMAGE_VISION").is_ok_and(|v| v.trim().eq_ignore_ascii_case("f32"))
+    !crate::engine::backend::tuning_profile::env_var("ORANGU_IMAGE_VISION")
+        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("f32"))
 }
 
 /// Rotates each head's `(j, j + head_dim/2)` pairs — the `rotate_half`

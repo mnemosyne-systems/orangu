@@ -123,23 +123,43 @@ fn estimate_total_vram_bytes(
     (model_bytes + RUNTIME_OVERHEAD_BYTES as f64 + kv_cache_bytes + compute_buffer_bytes) as u64
 }
 
-/// What a catalogue model needs at `context`: its file, the runtime
-/// overhead, and the KV cache and compute buffer
-/// [`estimate_total_vram_bytes`] estimates from its parameter count.
-fn catalogue_needs_bytes(entry: &orangu::model_catalogue::CatalogueEntry, context: u64) -> u64 {
-    let weights_estimate = (entry.params_billion * 1e9 * DEFAULT_BITS_PER_WEIGHT / 8.0) as u64;
-    let estimate = estimate_total_vram_bytes(
-        entry.params_billion,
-        DEFAULT_BITS_PER_WEIGHT,
-        context,
-        KV_CACHE_BITS,
-    );
-    entry.file_bytes + estimate.saturating_sub(weights_estimate)
+/// What a catalogue model needs at `context`, as `(card, host)`: the card
+/// holds what is not a routed expert, the runtime overhead and the KV cache
+/// (the model's own per token where the catalogue has it, else estimated
+/// from its parameter count, with the compute buffer); the routed experts
+/// run from host memory.
+fn catalogue_needs_bytes(
+    entry: &orangu::model_catalogue::CatalogueEntry,
+    context: u64,
+) -> (u64, u64) {
+    let experts = entry.file_bytes - entry.dense_bytes;
+    let card = if entry.kv_bytes_per_token > 0 {
+        entry.dense_bytes + RUNTIME_OVERHEAD_BYTES + entry.kv_bytes_per_token * context
+    } else {
+        let weights_estimate = (entry.params_billion * 1e9 * DEFAULT_BITS_PER_WEIGHT / 8.0) as u64;
+        let estimate = estimate_total_vram_bytes(
+            entry.params_billion,
+            DEFAULT_BITS_PER_WEIGHT,
+            context,
+            KV_CACHE_BITS,
+        );
+        entry.dense_bytes + estimate.saturating_sub(weights_estimate)
+    };
+    (card, experts)
 }
 
-/// The catalogue's models that fit `budget`, largest file first, each with
-/// the largest context of [`CONTEXT_LADDER`] that fits, up to its own.
-fn catalogue_fits(budget: u64) -> Vec<(&'static orangu::model_catalogue::CatalogueEntry, u64)> {
+/// The catalogue's models that fit, largest file first, each with the
+/// largest context of [`CONTEXT_LADDER`] that fits, up to its own: what a
+/// card holds within `budget`, and the routed experts within `host` — or
+/// within `budget` too when `host` is `None`, one pool holding everything.
+fn catalogue_fits(
+    budget: u64,
+    host: Option<u64>,
+) -> Vec<(&'static orangu::model_catalogue::CatalogueEntry, u64)> {
+    let fits = |(card, experts): (u64, u64)| match host {
+        Some(host) => card <= budget && experts <= host,
+        None => card + experts <= budget,
+    };
     let mut fit: Vec<_> = orangu::model_catalogue::CATALOGUE
         .iter()
         .filter_map(|e| {
@@ -148,7 +168,7 @@ fn catalogue_fits(budget: u64) -> Vec<(&'static orangu::model_catalogue::Catalog
                 .rev()
                 .copied()
                 .filter(|&c| c <= e.context)
-                .find(|&c| catalogue_needs_bytes(e, c) <= budget)
+                .find(|&c| fits(catalogue_needs_bytes(e, c)))
                 .map(|c| (e, c))
         })
         .collect();
@@ -156,11 +176,40 @@ fn catalogue_fits(budget: u64) -> Vec<(&'static orangu::model_catalogue::Catalog
     fit
 }
 
+/// The catalogue's models that fit this machine, with the context that
+/// fits: on its largest dedicated card with the routed experts in host
+/// memory, or in its largest pool without a card.
+pub(crate) fn catalogue_for(
+    cpu: &CpuInfo,
+    gpus: &[GpuInfo],
+) -> Vec<(&'static orangu::model_catalogue::CatalogueEntry, u64)> {
+    match dedicated_vram_budget_bytes(gpus) {
+        0 => catalogue_fits(total_budget_bytes(cpu, gpus), None),
+        card => catalogue_fits(card, Some(cpu.total_memory_bytes)),
+    }
+}
+
 /// The catalogue's models that fit `budget` ([`catalogue_fits`]), as a
 /// table under the size suggestion of the same budget.
-fn push_catalogue_block(out: &mut String, budget: u64) {
-    let fit = catalogue_fits(budget);
+///
+/// With a measured `rate` (weight bytes a second, [`crate::speed`]), each
+/// row also gives the decode rate that reading its weights at that rate
+/// allows: a best case, at depth zero, on one stream.
+fn push_catalogue_block(
+    out: &mut String,
+    budget: u64,
+    host: Option<u64>,
+    rate: Option<&crate::speed::Rate>,
+) {
+    let fit = catalogue_fits(budget, host);
     out.push_str("\n  Catalogue models that fit, with the context that fits:\n");
+    if let Some(rate) = rate {
+        out.push_str(&format!(
+            "    (decode estimate: weights read at {:.1} GB/s on {}, measured here)\n",
+            rate.bytes_per_second / 1e9,
+            rate.device
+        ));
+    }
     if fit.is_empty() {
         out.push_str("    none\n");
         return;
@@ -172,8 +221,17 @@ fn push_catalogue_block(out: &mut String, budget: u64) {
             Some(orangu::model_catalogue::Drafter::MtpHead(_)) => "  MTP head".to_string(),
             None => String::new(),
         };
+        let speed = rate.map_or_else(String::new, |r| {
+            format!(
+                "  ~{:.0} tok/s",
+                crate::speed::tokens_per_second(
+                    crate::speed::bytes_per_token(e),
+                    r.bytes_per_second
+                )
+            )
+        });
         out.push_str(&format!(
-            "    {:<width$}  {:>7}  {:>4}  {}{drafter}\n",
+            "    {:<width$}  {:>7}  {:>4}{speed}  {}{drafter}\n",
             e.spec(),
             orangu::model_catalogue::format_size(e.file_bytes),
             format_context_size(context),
@@ -396,12 +454,17 @@ fn push_suggestion_block(out: &mut String, label: &str, budget: u64, source: Opt
 /// prints, followed by two model-size suggestions — one sized against
 /// dedicated GPU VRAM alone (the fast path), one against the largest memory
 /// pool on the machine, GPU or system RAM (see [`total_budget_bytes`]).
+///
+/// `rates` are this machine's measured weight-read rates ([`crate::speed`]):
+/// the cores' first, then the card's. Empty, the tables carry no estimate.
 pub fn format_suggestion(
     os: &OsInfo,
     cpu: &CpuInfo,
     gpus: &[GpuInfo],
     npu: Option<&NpuInfo>,
+    rates: &[crate::speed::Rate],
 ) -> String {
+    let (cpu_rate, card_rate) = (rates.first(), rates.get(1));
     let mut out = system::format_report(os, cpu, gpus, npu, &system::detect_power());
 
     // A "Dedicated" budget of 0 (no GPU with real, hard-ceiling VRAM at
@@ -415,7 +478,12 @@ pub fn format_suggestion(
             dedicated_vram_budget_bytes(gpus),
             Some(&gpu.name),
         );
-        push_catalogue_block(&mut out, dedicated_vram_budget_bytes(gpus));
+        push_catalogue_block(
+            &mut out,
+            dedicated_vram_budget_bytes(gpus),
+            Some(cpu.total_memory_bytes),
+            card_rate.or(cpu_rate),
+        );
     }
     let total = total_budget_bytes(cpu, gpus);
     push_suggestion_block(
@@ -428,7 +496,12 @@ pub fn format_suggestion(
                 .unwrap_or_else(|| "system RAM".to_string()),
         ),
     );
-    push_catalogue_block(&mut out, total);
+    // The largest pool is a card's when one is named, the cores' otherwise.
+    let total_rate = match largest_total_pool(cpu, gpus) {
+        Some(_) => card_rate.or(cpu_rate),
+        None => cpu_rate,
+    };
+    push_catalogue_block(&mut out, total, None, total_rate);
 
     out
 }
@@ -537,7 +610,7 @@ mod tests {
             named_gpu("Big Card", MemoryKind::Dedicated, Some(24 * GIB)),
             named_gpu("iGPU", MemoryKind::Shared, Some(64 * GIB)),
         ];
-        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus, None);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus, None, &[]);
         assert!(report.contains("24.00 GiB (Big Card)"), "{report}");
         // The `Total` block's winner here is system RAM, tied with the
         // iGPU's shared pool — and a tie must not be reported as the GPU,
@@ -550,7 +623,7 @@ mod tests {
     #[test]
     fn the_total_budget_names_a_gpu_when_the_gpu_is_the_largest_pool() {
         let gpus = vec![named_gpu("Big Card", MemoryKind::Dedicated, Some(80 * GIB))];
-        let report = format_suggestion(&orangu::os::detect(), &cpu(32 * GIB), &gpus, None);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(32 * GIB), &gpus, None, &[]);
         assert!(report.contains("80.00 GiB (Big Card)"), "{report}");
     }
 
@@ -727,7 +800,7 @@ mod tests {
             gpu(MemoryKind::Dedicated, Some(4 * GIB)),
             gpu(MemoryKind::Shared, Some(64 * GIB)),
         ];
-        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus, None);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus, None, &[]);
         assert!(report.contains("CPU"));
         assert!(report.contains("GPU"));
         assert!(report.contains("Suggested model size (Dedicated)"));
@@ -761,7 +834,7 @@ mod tests {
             ("shared-only", vec![gpu(MemoryKind::Shared, Some(64 * GIB))]),
             ("no gpus", Vec::new()),
         ] {
-            let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus, None);
+            let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &gpus, None, &[]);
             assert!(
                 !report.contains("Suggested model size (Dedicated)"),
                 "unexpected Dedicated table for case: {case}"
@@ -775,7 +848,7 @@ mod tests {
     /// with its own blank line, so the report doesn't run together.
     #[test]
     fn format_suggestion_has_no_gpu_section_without_a_gpu() {
-        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &[], None);
+        let report = format_suggestion(&orangu::os::detect(), &cpu(64 * GIB), &[], None, &[]);
         assert!(!report.contains("GPU"), "unexpected GPU section:\n{report}");
         assert!(
             report.contains("\n\nSuggested model size (Total)\n"),
@@ -789,11 +862,12 @@ mod tests {
     /// first.
     #[test]
     fn catalogue_models_are_listed_at_the_context_that_fits() {
-        let fit = catalogue_fits(4 * GIB);
+        let fit = catalogue_fits(4 * GIB, None);
         assert!(!fit.is_empty());
         for (e, context) in &fit {
             assert!(*context <= e.context, "{}", e.repo);
-            assert!(catalogue_needs_bytes(e, *context) <= 4 * GIB, "{}", e.repo);
+            let (card, experts) = catalogue_needs_bytes(e, *context);
+            assert!(card + experts <= 4 * GIB, "{}", e.repo);
             assert!(e.file_bytes < 4 * GIB, "{}", e.repo);
         }
         assert!(
@@ -804,6 +878,19 @@ mod tests {
         // than one a tenth of it.
         let ctx = |repo: &str| fit.iter().find(|(e, _)| e.repo == repo).map(|f| f.1);
         assert!(ctx("bartowski/Llama-3.2-3B-Instruct-GGUF") < ctx("unsloth/Qwen3.5-0.8B-GGUF"));
-        assert!(catalogue_fits(0).is_empty());
+        assert!(catalogue_fits(0, None).is_empty());
+    }
+
+    /// A mixture's routed experts run from host memory: on a 4 GiB card
+    /// with 32 GiB of RAM it is listed, against 4 GiB alone it is not.
+    #[test]
+    fn a_mixture_needs_its_dense_part_on_the_card_and_its_experts_in_ram() {
+        let coder = "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF";
+        let listed = |fit: Vec<(&orangu::model_catalogue::CatalogueEntry, u64)>| {
+            fit.iter().any(|(e, _)| e.repo == coder)
+        };
+        assert!(listed(catalogue_fits(4 * GIB, Some(32 * GIB))));
+        assert!(!listed(catalogue_fits(4 * GIB, Some(8 * GIB))));
+        assert!(!listed(catalogue_fits(4 * GIB, None)));
     }
 }

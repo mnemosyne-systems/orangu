@@ -453,6 +453,7 @@ const OTHER_CONTENT_TOKENS: &[&str] = &[
 
 /// A vocabulary's message-body kind markers — see
 /// [`Tokenizer::content_kinds`].
+#[derive(Clone)]
 pub struct ContentKinds {
     /// The marker that opens a reasoning body.
     pub reasoning: u32,
@@ -465,7 +466,14 @@ pub struct ContentKinds {
 /// unescape it back on the way out.
 const SPM_SPACE: char = '\u{2581}';
 
+/// How many prompt heads [`Tokenizer::encode_prompt`] keeps: a client's
+/// conversation and its subagents, with room to spare.
+const PROMPT_HEADS: usize = 16;
+
 pub struct Tokenizer {
+    /// Recently encoded prompt heads, cut on a special token's edge, with
+    /// their tokens — see [`Tokenizer::encode_prompt`].
+    heads: std::sync::Mutex<std::collections::VecDeque<(String, std::sync::Arc<[u32]>)>>,
     /// Byte-mapped-unicode (`VocabKind::Gpt2Byte`) or raw-UTF-8 (every other
     /// `VocabKind`) token string -> id. `FxHashMap`: the fixed vocab
     /// needs no HashDoS resistance, so the stdlib's SipHash default was pure
@@ -917,6 +925,7 @@ impl Tokenizer {
             byte_fallback,
             scores,
             add_space_prefix,
+            heads: std::sync::Mutex::default(),
         })
     }
 
@@ -1092,6 +1101,110 @@ impl Tokenizer {
                 }
             }
         }
+    }
+
+    /// [`Self::encode`] of a chat prompt (no BOS), reusing the tokens of the
+    /// longest recently encoded prompt this one extends.
+    ///
+    /// A conversation's next request repeats its last one and adds a turn,
+    /// and its prompt used to be encoded in full every time. Each prompt is
+    /// remembered up to its last special token — the last place the encoder
+    /// is sure to break it — so a later prompt that begins with it encodes
+    /// only what follows. [`PROMPT_HEADS`] are kept, newest first, so several
+    /// conversations (a client's subagents) each find their own.
+    pub fn encode_prompt(&self, text: &str) -> Vec<u32> {
+        let found = {
+            let heads = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+            heads
+                .iter()
+                .filter(|(head, _)| text.starts_with(head.as_str()))
+                .max_by_key(|(head, _)| head.len())
+                .cloned()
+        };
+        let tokens = found
+            .and_then(|(head, tokens)| self.encode_after(&head, &tokens, text))
+            .unwrap_or_else(|| self.encode(text, false));
+        self.remember_head(text, &tokens);
+        tokens
+    }
+
+    /// Keeps `text` up to its last special token, with that part's tokens.
+    fn remember_head(&self, text: &str, tokens: &[u32]) {
+        let Some(matcher) = &self.special_matcher else {
+            return;
+        };
+        let Some(last) = matcher.find_iter(text).last() else {
+            return;
+        };
+        let head = &text[..last.end()];
+        // After a special token the encoder starts afresh, so the text past
+        // the last one encodes the same on its own: its length says where
+        // the head's tokens end.
+        let tail = &text[last.end()..];
+        let tail_len = if tail.is_empty() {
+            0
+        } else {
+            self.encode_segments(vec![Segment::Plain(tail)], false)
+                .len()
+        };
+        let Some(len) = tokens.len().checked_sub(tail_len).filter(|&n| n > 0) else {
+            return;
+        };
+        let mut heads = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+        heads.retain(|(h, _)| !head.starts_with(h.as_str()));
+        heads.push_front((head.to_string(), tokens[..len].into()));
+        heads.truncate(PROMPT_HEADS);
+    }
+
+    /// [`Self::encode`] of `text`, which begins with `head`, reusing
+    /// `head_tokens` (`encode(head, false)`) and encoding only the rest.
+    ///
+    /// The result equals a full encode only where the encoder itself breaks
+    /// the text at `head`'s end: on a special token's edge. Plain text merges
+    /// across any other cut, so `None` there, and the caller encodes in full.
+    pub fn encode_after(&self, head: &str, head_tokens: &[u32], text: &str) -> Option<Vec<u32>> {
+        if !text.starts_with(head) {
+            return None;
+        }
+        let cut = head.len();
+        if cut == 0 {
+            return Some(self.encode(text, false));
+        }
+        let matcher = self.special_matcher.as_ref()?;
+        // Whether a special token ends or starts exactly at the cut, found in
+        // the whole text: a match running across the cut means the head's
+        // own split differs from the text's.
+        let mut on_edge = false;
+        let mut segments = Vec::new();
+        let mut at = cut;
+        for found in matcher.find_iter(text) {
+            if found.end() <= cut {
+                on_edge |= found.end() == cut;
+                continue;
+            }
+            if found.start() < cut {
+                return None;
+            }
+            on_edge |= found.start() == cut;
+            if found.start() > at {
+                segments.push(Segment::Plain(&text[at..found.start()]));
+            }
+            segments.push(Segment::Special(
+                self.special_tokens[found.pattern().as_usize()].1,
+            ));
+            at = found.end();
+        }
+        if !on_edge {
+            return None;
+        }
+        if at < text.len() {
+            segments.push(Segment::Plain(&text[at..]));
+        }
+        // After a special token the rest starts afresh, which is what
+        // `encode_segments` assumes; before one, the rest starts with it.
+        let mut tokens = head_tokens.to_vec();
+        tokens.extend(self.encode_segments(segments, false));
+        Some(tokens)
     }
 
     /// Splits `text` around any literal occurrence of a control/special
@@ -1862,7 +1975,7 @@ pub(crate) fn byte_to_unicode_table() -> [char; 256] {
 /// immediately, exactly as `from_utf8_lossy` would. Waiting for a continuation
 /// that can never come would stall the rest of the stream behind one corrupt
 /// byte.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StreamDecoder {
     /// The tail of an incomplete UTF-8 sequence, waiting for the token that
     /// finishes it. Empty between characters, which is almost always.
@@ -2119,6 +2232,111 @@ mod tests {
         assert_eq!(tokenizer.encode("<a><a>b<a>", false), [a, ab, a]);
         assert_eq!(tokenizer.encode("x<a>y", false).len(), 3);
         assert!(tokenizer.encode("", false).is_empty());
+    }
+
+    /// Reusing a head's tokens gives exactly a full encode wherever it is
+    /// allowed, at every cut of a chat-shaped text, and is refused at a cut
+    /// the encoder would merge across.
+    #[test]
+    fn encoding_after_a_head_equals_encoding_the_whole() {
+        let tokenizer =
+            with_specials(&["<s>".to_string(), "<s>x".to_string(), "<|end|>".to_string()]);
+        let text = "<s>user hi<|end|>\n<s>assistant ok<|end|><s>xtail<|end|>";
+        let whole = tokenizer.encode(text, false);
+        let mut reused = 0;
+        for cut in (0..=text.len()).filter(|&c| text.is_char_boundary(c)) {
+            let head = &text[..cut];
+            let head_tokens = tokenizer.encode(head, false);
+            if let Some(tokens) = tokenizer.encode_after(head, &head_tokens, text) {
+                assert_eq!(tokens, whole, "cut at {cut}: {head:?}");
+                reused += 1;
+            }
+        }
+        // Each edge of every special token, the start, and nothing inside
+        // `<s>x` (its `<s>` prefix ends mid-match).
+        assert!(reused >= 9, "{reused}");
+        let at = text.find("ok").unwrap();
+        assert!(tokenizer.encode_after(&text[..at], &[], text).is_none());
+        let inside = text.find("<s>xtail").unwrap() + 3;
+        assert!(tokenizer.encode_after(&text[..inside], &[], text).is_none());
+        assert!(tokenizer.encode_after("nope", &[], text).is_none());
+    }
+
+    /// A conversation growing turn by turn, and a second one beside it,
+    /// encode exactly as a full encode would, and each turn's head is
+    /// remembered for the next.
+    #[test]
+    fn a_growing_conversation_encodes_as_a_whole_prompt_does() {
+        let tokenizer = with_specials(&["<s>".to_string(), "<|end|>".to_string()]);
+        let mut a = String::from("<s>system be brief<|end|>");
+        let mut b = String::from("<s>system other<|end|>");
+        for turn in 0..6 {
+            for convo in [&mut a, &mut b] {
+                convo.push_str(&format!("<s>user q{turn}<|end|>"));
+                let prompt = format!("{convo}<s>assistant ");
+                assert_eq!(
+                    tokenizer.encode_prompt(&prompt),
+                    tokenizer.encode(&prompt, false)
+                );
+                convo.push_str(&format!("<s>assistant reply {turn}<|end|>"));
+            }
+        }
+        let heads = tokenizer.heads.lock().unwrap();
+        // One head per conversation: each turn's replaced the one before.
+        assert_eq!(
+            heads.len(),
+            2,
+            "{:?}",
+            heads.iter().map(|h| &h.0).collect::<Vec<_>>()
+        );
+        for (head, tokens) in heads.iter() {
+            assert!(head.ends_with("<s>"));
+            assert_eq!(&tokenizer.encode(head, false)[..], &tokens[..]);
+        }
+    }
+
+    /// [`a_growing_conversation_encodes_as_a_whole_prompt_does`] on real
+    /// vocabularies, whose plain-text encoders (byte BPE, raw BPE, SPM with
+    /// its space prefix) are where a reused head could differ. Run with
+    /// `ORANGU_TEST_MODELS=a.gguf:b.gguf cargo test … -- --ignored`.
+    #[test]
+    #[ignore]
+    fn prompt_heads_match_a_full_encode_on_real_vocabularies() {
+        let paths = std::env::var("ORANGU_TEST_MODELS").unwrap_or_default();
+        for path in paths.split(':').filter(|p| !p.is_empty()) {
+            let gguf = GgufFile::open(std::path::Path::new(path)).expect("open the model");
+            let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+            let marks: Vec<String> = tok
+                .special_tokens
+                .iter()
+                .rev()
+                .filter(|(t, _)| !t.is_empty())
+                .take(3)
+                .map(|(t, _)| t.clone())
+                .collect();
+            let [open, close, role] = [&marks[0], &marks[1], &marks[2]];
+            let mut convo =
+                format!("{open}system\nYou are brief.  Answer in Ünïcode, 12345.{close}\n");
+            for turn in 0..8 {
+                convo.push_str(&format!(
+                    "{open}user\n  turn {turn}: what is {}?\n\n{close}\n",
+                    turn * 37
+                ));
+                for prompt in [
+                    format!("{convo}{open}assistant\n"),
+                    format!("{convo}{role} assistant"),
+                    convo.clone(),
+                ] {
+                    assert_eq!(
+                        tok.encode_prompt(&prompt),
+                        tok.encode(&prompt, false),
+                        "{path}: {prompt:?}"
+                    );
+                }
+                convo.push_str(&format!("{open}assistant\n It is {}.{close}\n", turn * 37));
+            }
+            eprintln!("{path}: ok ({} heads)", tok.heads.lock().unwrap().len());
+        }
     }
 
     /// A request full of special tokens is a client's to send, and the

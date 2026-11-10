@@ -137,10 +137,47 @@ impl Spec {
                  --sweep '{var}=off;all;3,1'"
             );
         }
-        Ok(Spec {
+        let parsed = Spec {
             var: var.to_string(),
             values,
-        })
+        };
+        let names = parsed.vars().len();
+        if let Some(bad) = parsed
+            .values
+            .iter()
+            .find(|v| !v.is_empty() && v.split('+').count() != names)
+        {
+            anyhow::bail!(
+                "--sweep {spec:?}: {bad:?} has {} part(s) for {names} variable(s) — a point \
+                 of `A+B=…` is written `a+b`, or left empty for all of them unset",
+                bad.split('+').count()
+            );
+        }
+        Ok(parsed)
+    }
+
+    /// The variables one point sets: `A+B=…` sweeps two together, each
+    /// point written `a+b`.
+    pub fn vars(&self) -> Vec<&str> {
+        self.var.split('+').map(str::trim).collect()
+    }
+
+    /// What one point sets each variable to; an empty point leaves every
+    /// one of them unset.
+    pub fn assignments(&self, value: &str) -> Vec<(String, String)> {
+        let vars = self.vars();
+        if vars.len() == 1 {
+            return vec![(vars[0].to_string(), value.to_string())];
+        }
+        let parts: Vec<&str> = if value.is_empty() {
+            vec![""; vars.len()]
+        } else {
+            value.split('+').map(str::trim).collect()
+        };
+        vars.iter()
+            .zip(parts)
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     /// A two-value sweep written `a,b` run as `a,b,b,a`, so each value holds
@@ -746,6 +783,25 @@ mod tests {
             s.interleave_two_arms();
             assert_eq!(s.values, want, "{spec}");
         }
+    }
+
+    #[test]
+    fn several_variables_move_together_and_an_empty_point_unsets_them() {
+        let spec = Spec::parse("ORANGU_A+ORANGU_B=;1+2;3+4").unwrap();
+        assert_eq!(spec.vars(), ["ORANGU_A", "ORANGU_B"]);
+        assert_eq!(
+            spec.assignments("3+4"),
+            [
+                ("ORANGU_A".to_string(), "3".to_string()),
+                ("ORANGU_B".to_string(), "4".to_string())
+            ]
+        );
+        assert!(spec.assignments("").iter().all(|(_, v)| v.is_empty()));
+        assert!(Spec::parse("ORANGU_A+ORANGU_B=1+2,3").is_err());
+        assert_eq!(
+            Spec::parse("ORANGU_A=1,2").unwrap().assignments("2"),
+            [("ORANGU_A".to_string(), "2".to_string())]
+        );
     }
 
     #[test]

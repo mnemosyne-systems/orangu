@@ -1180,6 +1180,13 @@ async fn send_message(
             // template-rendering error diagnosable at all.
             Err(err) => return (StatusCode::BAD_REQUEST, format!("{err:#}")).into_response(),
         };
+    // The head first, so the prompt that extends it reuses its tokens.
+    let head = match head {
+        Some(head) => {
+            Some(crate::http::encode_prompt_off_runtime(&state.engine.tokenizer, head).await)
+        }
+        None => None,
+    };
     let tokens = match (&state.engine.vision, pictures.is_empty()) {
         (Some(vision), false) => {
             // The session's stored pictures, as the data URLs a chat
@@ -1213,16 +1220,10 @@ async fn send_message(
                 }
             }
         }
-        _ => crate::http::encode_off_runtime(&state.engine.tokenizer, prompt, false).await,
+        _ => crate::http::encode_prompt_off_runtime(&state.engine.tokenizer, prompt).await,
     };
     // As for an OpenAI chat request: see `GenerateRequest::cache_point`.
-    let cache_point = match head {
-        Some(head) => {
-            let head = crate::http::encode_off_runtime(&state.engine.tokenizer, head, false).await;
-            crate::http::openai::cache_point_of(&head, &tokens)
-        }
-        None => None,
-    };
+    let cache_point = head.and_then(|head| crate::http::openai::cache_point_of(&head, &tokens));
     let stop_token_ids = state.engine.tokenizer.stop_token_ids();
     // The chat's own settings over the server's defaults.
     let defaults = SamplingParams::default();

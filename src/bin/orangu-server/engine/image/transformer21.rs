@@ -724,7 +724,7 @@ impl QwenImage21Transformer {
         if self.backend.is_cpu() || self.rowi8.is_some() {
             return None;
         }
-        let configured = std::env::var("ORANGU_IMAGE_OVERLAP")
+        let configured = crate::engine::backend::tuning_profile::env_var("ORANGU_IMAGE_OVERLAP")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok());
         let chunk = match configured {
@@ -1142,10 +1142,12 @@ fn device_weights(block: &Block) -> Vec<&QuantMatrix> {
 /// slower and the step no faster and less steady, on the cards measured.
 fn fixed_device_heads() -> Option<usize> {
     static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *N.get_or_init(|| match std::env::var("ORANGU_IMAGE_DEVICE_HEADS") {
-        Ok(v) if v.trim().eq_ignore_ascii_case("auto") => None,
-        Ok(v) => Some(v.trim().parse().unwrap_or(0)),
-        Err(_) => Some(0),
+    *N.get_or_init(|| {
+        match crate::engine::backend::tuning_profile::env_var("ORANGU_IMAGE_DEVICE_HEADS") {
+            Ok(v) if v.trim().eq_ignore_ascii_case("auto") => None,
+            Ok(v) => Some(v.trim().parse().unwrap_or(0)),
+            Err(_) => Some(0),
+        }
     })
 }
 
@@ -1254,7 +1256,7 @@ pub fn set_weights(choice: ImageWeights) {
 /// The configured [`ImageWeights`], `ORANGU_IMAGE_WEIGHTS` (`int8`/`file`)
 /// over the configuration for an A/B.
 fn configured_weights() -> ImageWeights {
-    std::env::var("ORANGU_IMAGE_WEIGHTS")
+    crate::engine::backend::tuning_profile::env_var("ORANGU_IMAGE_WEIGHTS")
         .ok()
         .and_then(|v| ImageWeights::parse(&v))
         .unwrap_or(match WEIGHTS.load(std::sync::atomic::Ordering::Relaxed) {

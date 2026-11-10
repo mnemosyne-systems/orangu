@@ -3227,7 +3227,7 @@ unsafe fn i8_scores_4rows_avx2(
 pub fn k_rows_per_task() -> usize {
     static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ROWS.get_or_init(|| {
-        let rows = std::env::var("ORANGU_EXPERT_K_ROWS")
+        let rows = crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_K_ROWS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(K_ROWS_PER_TASK_DEFAULT);

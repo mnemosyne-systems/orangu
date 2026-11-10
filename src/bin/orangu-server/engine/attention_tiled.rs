@@ -62,7 +62,7 @@ pub fn enabled() -> bool {
 pub fn min_tokens() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("ORANGU_ATTENTION_TILED_MIN_TOKENS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_ATTENTION_TILED_MIN_TOKENS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(32)

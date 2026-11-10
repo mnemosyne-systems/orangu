@@ -35,6 +35,12 @@ pub struct CatalogueEntry {
     pub quant: &'static str,
     /// The quantization's file size, all shards, in bytes.
     pub file_bytes: u64,
+    /// The bytes that are not routed experts — the whole file for a dense
+    /// model. What a card has to hold; the experts run from host memory.
+    pub dense_bytes: u64,
+    /// The KV cache a token takes on the card (`f16`), from the model's
+    /// attention layers; `0` where it is estimated from the parameters.
+    pub kv_bytes_per_token: u64,
     /// Parameters, in billions — what the context's memory is estimated
     /// from.
     pub params_billion: f64,
@@ -63,6 +69,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "ggml-org/embeddinggemma-300M-GGUF",
         quant: "Q8_0",
         file_bytes: 333_590_944,
+        dense_bytes: 333_590_944,
+        kv_bytes_per_token: 24_576,
         params_billion: 0.3,
         context: 2048,
         roles: &["embeddings"],
@@ -72,6 +80,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "unsloth/Qwen3.5-0.8B-GGUF",
         quant: "Q4_K_M",
         file_bytes: 532_517_120,
+        dense_bytes: 532_517_120,
+        kv_bytes_per_token: 0,
         params_billion: 0.8,
         context: 32768,
         roles: &["explorer"],
@@ -81,6 +91,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "Qwen/Qwen3-Embedding-0.6B-GGUF",
         quant: "Q8_0",
         file_bytes: 639_150_592,
+        dense_bytes: 639_150_592,
+        kv_bytes_per_token: 114_688,
         params_billion: 0.6,
         context: 8192,
         roles: &["embeddings"],
@@ -90,6 +102,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "unsloth/Qwen3-1.7B-GGUF",
         quant: "Q4_K_M",
         file_bytes: 1_107_409_472,
+        dense_bytes: 1_107_409_472,
+        kv_bytes_per_token: 114_688,
         params_billion: 1.7,
         context: 32768,
         roles: &["explorer"],
@@ -99,6 +113,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "bartowski/Llama-3.2-3B-Instruct-GGUF",
         quant: "Q4_K_M",
         file_bytes: 2_019_377_696,
+        dense_bytes: 2_019_377_696,
+        kv_bytes_per_token: 114_688,
         params_billion: 3.2,
         context: 32768,
         roles: &["all", "explorer"],
@@ -110,6 +126,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "unsloth/Qwen3-4B-GGUF",
         quant: "Q4_K_M",
         file_bytes: 2_497_281_312,
+        dense_bytes: 2_497_281_312,
+        kv_bytes_per_token: 147_456,
         params_billion: 4.0,
         context: 32768,
         roles: &["all", "code"],
@@ -119,6 +137,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "unsloth/gemma-4-E2B-it-GGUF",
         quant: "Q4_K_M",
         file_bytes: 3_106_738_272,
+        dense_bytes: 3_106_738_272,
+        kv_bytes_per_token: 18_432,
         params_billion: 5.1,
         context: 32768,
         roles: &["all", "code", "review"],
@@ -128,6 +148,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "unsloth/gemma-4-E4B-it-GGUF",
         quant: "Q4_K_M",
         file_bytes: 4_977_171_584,
+        dense_bytes: 4_977_171_584,
+        kv_bytes_per_token: 57_344,
         params_billion: 8.0,
         context: 32768,
         roles: &["all", "code", "review"],
@@ -137,6 +159,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "bartowski/Ornith-1.5-9B-GGUF",
         quant: "Q4_K_M",
         file_bytes: 5_910_782_848,
+        dense_bytes: 5_910_782_848,
+        kv_bytes_per_token: 131_072,
         params_billion: 9.0,
         context: 32768,
         roles: &["code", "review"],
@@ -146,6 +170,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "unsloth/gemma-4-12b-it-GGUF",
         quant: "Q4_K_M",
         file_bytes: 7_121_861_440,
+        dense_bytes: 7_121_861_440,
+        kv_bytes_per_token: 0,
         params_billion: 12.0,
         context: 32768,
         roles: &["all", "code", "review"],
@@ -155,6 +181,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "unsloth/gemma-4-26B-A4B-it-GGUF",
         quant: "UD-Q4_K_XL",
         file_bytes: 17_010_980_576,
+        dense_bytes: 2_578_676_856,
+        kv_bytes_per_token: 225_280,
         params_billion: 26.0,
         context: 32768,
         roles: &["all", "code", "review"],
@@ -164,6 +192,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
         quant: "Q4_K_M",
         file_bytes: 18_556_689_568,
+        dense_bytes: 997_554_176,
+        kv_bytes_per_token: 98_304,
         params_billion: 30.5,
         context: 65536,
         roles: &["code"],
@@ -173,6 +203,8 @@ pub const CATALOGUE: &[CatalogueEntry] = &[
         repo: "unsloth/Qwen3.6-35B-A3B-GGUF",
         quant: "UD-Q4_K_M",
         file_bytes: 22_134_528_992,
+        dense_bytes: 2_555_013_632,
+        kv_bytes_per_token: 81_920,
         params_billion: 35.0,
         context: 65536,
         roles: &["all", "code", "review"],
@@ -216,6 +248,11 @@ mod tests {
             assert_eq!(e.repo.matches('/').count(), 1, "{}", e.repo);
             assert!(!e.quant.is_empty() && !e.quant.contains(':'), "{}", e.repo);
             assert!(e.file_bytes > 0 && e.params_billion > 0.0 && e.context >= 1024);
+            assert!(
+                e.dense_bytes > 0 && e.dense_bytes <= e.file_bytes,
+                "{}",
+                e.repo
+            );
             assert!(
                 !e.roles.is_empty() && e.roles.iter().all(|r| ROLES.contains(r)),
                 "{}",

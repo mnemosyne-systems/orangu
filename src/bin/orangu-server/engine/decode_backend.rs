@@ -143,7 +143,7 @@ pub fn seconds_per_token_unless(
 /// value below 1 makes a slower CPU "win", which is how the switch itself
 /// is exercised on a machine whose device is the faster.
 pub fn min_gain() -> f64 {
-    std::env::var("ORANGU_DECODE_PROBE_MIN_GAIN")
+    crate::engine::backend::tuning_profile::env_var("ORANGU_DECODE_PROBE_MIN_GAIN")
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|g| g.is_finite() && *g > 0.0)

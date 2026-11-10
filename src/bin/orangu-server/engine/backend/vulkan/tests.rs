@@ -20,9 +20,10 @@ use crate::engine::loader::test_quant_matrix;
 use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
-    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
-    GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K,
-    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_PQ2_0,
+    GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0,
 };
 
 /// The RMSNorm width rule must reproduce every width it was measured at,
@@ -1481,7 +1482,7 @@ fn block_elems(ggml_type: u32) -> usize {
         {
             32
         }
-        t if t == GGML_TYPE_Q2_0 => 64,
+        t if t == GGML_TYPE_Q2_0 || t == GGML_TYPE_NVFP4 => 64,
         t if t == GGML_TYPE_PQ2_0 || t == GGML_TYPE_PTQ1_0 => 128,
         _ => 256,
     }
@@ -3744,6 +3745,48 @@ fn matmul_matches_cpu_backend_for_mxfp4() {
     cross_check(GGML_TYPE_MXFP4, 896, 5);
 }
 
+/// `NVFP4`'s sub-block scale on the device against the host over every
+/// byte, the NaN pattern `0x7F` and the top-bit codes included: one row per
+/// code, all four sub-blocks scaled by it and carrying every codebook entry,
+/// read out element by element with a one-hot activation. Every scale is a
+/// normal f32 (the smallest is `2^-10`), so the two must agree exactly.
+#[test]
+fn nvfp4_scale_decode_matches_the_host_over_every_code() {
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let mut bytes = Vec::new();
+    for code in 0..=255u8 {
+        bytes.extend([code; 4]);
+        for _ in 0..4 {
+            bytes.extend((0..8u8).map(|j| j | ((j + 8) << 4)));
+        }
+    }
+    let w = test_quant_matrix(&bytes, GGML_TYPE_NVFP4, 64, 256);
+    for k in 0..64usize {
+        let mut x = vec![0f32; 64];
+        x[k] = 1.0;
+        let gpu = vulkan.matmul(&x, 1, &w);
+        let cpu = CpuBackend.matmul_dequant(&x, 1, &w);
+        for (code, (g, c)) in gpu.iter().zip(&cpu).enumerate() {
+            assert!(
+                g.to_bits() == c.to_bits() || (*g == 0.0 && *c == 0.0),
+                "scale code {code:#04x}, element {k}: gpu {g:e} != cpu {c:e}"
+            );
+        }
+    }
+}
+
+/// `NVFP4` on the decode path: `in_dim = 960` is a multiple of its 64-element
+/// block and not of 256, and its 36-byte block with four sub-block scales
+/// puts each lane pair on its own scale.
+#[test]
+fn matmul_matches_cpu_backend_for_nvfp4() {
+    cross_check(GGML_TYPE_NVFP4, 960, 5);
+}
+
 /// Prism's two ternary types on the decode path — `in_dim = 5120`, the
 /// served 27B's own width, is a multiple of 128 but **not** of 256, and
 /// `PQ2_0`'s 34-byte block puts every other block at a half-word offset
@@ -4061,6 +4104,12 @@ fn matmul_matches_cpu_backend_cooperative_path_iq4_nl() {
 #[test]
 fn matmul_matches_cpu_backend_cooperative_path_mxfp4() {
     cross_check_n_tokens(GGML_TYPE_MXFP4, 896, 64, 130);
+}
+
+/// The cooperative-tiled (prefill) path over an `NVFP4` weight.
+#[test]
+fn matmul_matches_cpu_backend_cooperative_path_nvfp4() {
+    cross_check_n_tokens(GGML_TYPE_NVFP4, 960, 64, 130);
 }
 
 /// The cooperative tiled kernel past its own `COOP_TILE_ROWS = 32` output
@@ -17393,6 +17442,79 @@ fn a_copy_under_the_region_guard_stays_off_the_rayon_pool() {
         assert!(
             on_caller || !pool_worker,
             "a piece ran on another rayon worker"
+        );
+    }
+}
+
+/// An idle pool gives its device pages back, and the next use builds them
+/// again with every sealed page's rows refilled from the host; a pool with a
+/// page held keeps them.
+#[test]
+fn idle_device_pages_are_released_and_built_again_with_their_rows() {
+    use crate::engine::backend::vulkan_shaders::KvStorage;
+    use crate::engine::kv_pool::{KvPool, LayerGeometry};
+    let Some(vulkan) = shared_vulkan() else {
+        return;
+    };
+    if vulkan.kv_storage() != KvStorage::F32 && vulkan.kv_storage() != KvStorage::F16 {
+        return;
+    }
+    let (page_tokens, kv_dim) = (4usize, 32usize);
+    let mut pool = KvPool::new(
+        4,
+        page_tokens,
+        vec![LayerGeometry {
+            kv_dim,
+            stride: 1,
+            ring: None,
+        }],
+    );
+    let (device, queue) = vulkan.device_and_queue();
+    assert!(pool.attach_device(device, vulkan.kv_storage(), 16));
+    pool.keep_queue(queue);
+    let bytes = pool.device_bytes();
+    assert!(bytes > 0);
+
+    // One page of data, sealed and given back, as a finished reply leaves it.
+    let page = pool.alloc(1).expect("room")[0];
+    let k: Vec<f32> = (0..page_tokens * kv_dim).map(|i| i as f32 * 0.25).collect();
+    let v: Vec<f32> = k.iter().map(|x| -x).collect();
+    pool.fill(0, page, &k, &v);
+    pool.seal(page);
+    // Held: not released, however long it has been idle.
+    assert!(!pool.release_idle_device(std::time::Duration::ZERO));
+    pool.release(&[page]);
+    assert!(
+        !pool.release_idle_device(std::time::Duration::from_secs(3600)),
+        "not idle long enough"
+    );
+    assert!(pool.release_idle_device(std::time::Duration::ZERO));
+    assert_eq!(pool.device_bytes(), 0);
+
+    let pages = pool.device_pages().expect("built again");
+    assert_eq!(pool.device_bytes(), bytes);
+    let (k_off, v_off, stride) = pool.device_page_offsets(0, page).expect("offsets");
+    let floats = (pages.layers[0].size() / 4) as usize;
+    let all = vulkan.readback_for_test(&pages.layers[0], floats);
+    let read = |off: u64| -> Vec<f32> {
+        match vulkan.kv_storage() {
+            KvStorage::F32 => all[(off / 4) as usize..((off + stride) / 4) as usize].to_vec(),
+            _ => {
+                let raw: &[u8] = bytemuck::cast_slice(&all);
+                raw[off as usize..(off + stride) as usize]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| half::f16::from_le_bytes(*b).to_f32())
+                    .collect()
+            }
+        }
+    };
+    let (got_k, got_v) = (read(k_off), read(v_off));
+    for (got, want) in got_k.iter().zip(&k).chain(got_v.iter().zip(&v)) {
+        assert!(
+            (got - want).abs() <= want.abs() * 1e-3 + 1e-3,
+            "{got} vs {want}"
         );
     }
 }

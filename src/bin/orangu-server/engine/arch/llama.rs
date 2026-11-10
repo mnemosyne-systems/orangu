@@ -506,7 +506,7 @@ const MIN_FUSED_TOKENS: usize = 24;
 pub fn min_fused_tokens() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("ORANGU_FUSED_MIN_TOKENS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_FUSED_MIN_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(MIN_FUSED_TOKENS)
@@ -723,6 +723,7 @@ impl LlamaModel {
             cache,
             0..self.layers.len(),
             &x0,
+            None,
             start_pos,
             slot_id,
             tail,
@@ -769,6 +770,7 @@ impl LlamaModel {
         cache: &mut KvCache,
         layers: std::ops::Range<usize>,
         x_in: &[f32],
+        first: Option<&wgpu::Buffer>,
         start_pos: usize,
         slot_id: usize,
         tail: Tail,
@@ -906,9 +908,10 @@ impl LlamaModel {
             let x_input = if (npu.is_some() || moe_seam) && !host_x.is_empty() {
                 GpuInput::Cpu(&host_x)
             } else {
-                match bufs.last() {
-                    Some((buf, offset)) => GpuInput::Gpu(buf, (*offset / 4) as usize),
-                    None => GpuInput::Cpu(x_in),
+                match (bufs.last(), first) {
+                    (Some((buf, offset)), _) => GpuInput::Gpu(buf, (*offset / 4) as usize),
+                    (None, Some(buf)) => GpuInput::Gpu(buf, 0),
+                    (None, None) => GpuInput::Cpu(x_in),
                 }
             };
             // `None` on a mixture layer, which is what tells the chain to
@@ -1370,6 +1373,7 @@ impl LlamaModel {
                 cache,
                 layers.clone(),
                 &x,
+                None,
                 start_pos,
                 slot_id,
                 if with_tail { Tail::Device } else { Tail::None },
@@ -2561,6 +2565,122 @@ impl ModelForward for LlamaModel {
         }
     }
 
+    fn decode_lookahead(
+        &self,
+        cache: &mut KvCache,
+        input: super::LookaheadInput<'_>,
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<Option<crate::engine::backend::vulkan::PendingToken>> {
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            return Ok(None);
+        };
+        // The pick has to be made where the logits are, and the chain has
+        // to be the whole step on one device.
+        if !self.mul.is_identity() || !vulkan.gpu_sample() || self.tail_on_host() || self.is_moe() {
+            return Ok(None);
+        }
+        let n_embd = self.config.n_embd;
+        let (x0, gathered) = match input {
+            super::LookaheadInput::Token(token) => {
+                if token as usize >= self.config.n_vocab {
+                    return Ok(None);
+                }
+                (self.tok_embeddings.row(token as usize).to_vec(), None)
+            }
+            super::LookaheadInput::Pending(prev) => {
+                let mut encoder = vulkan.new_encoder("orangu-server lookahead gather");
+                let Some(row) =
+                    vulkan.record_row_gather(&mut encoder, &prev.ids, &self.tok_embeddings, 1.0)
+                else {
+                    return Ok(None);
+                };
+                vulkan.submit_now(encoder);
+                (vec![0.0; n_embd], Some(row))
+            }
+        };
+        let Some((mut encoder, logits_buf, logits_offset)) = self.record_decode_run(
+            vulkan,
+            cache,
+            0..self.layers.len(),
+            &x0,
+            gathered.as_ref(),
+            start_pos,
+            slot_id,
+            Tail::Device,
+        ) else {
+            return Ok(None);
+        };
+        let sample_buf = vulkan.record_argmax_sample(
+            &mut encoder,
+            crate::engine::backend::vulkan::GpuArgmaxSampleInput {
+                logits: crate::engine::backend::vulkan::GpuInput::Gpu(
+                    &logits_buf,
+                    (logits_offset / 4) as usize,
+                ),
+                n_vocab: self.output_weight.out_dim,
+                recent_tokens: &[],
+                repeat_penalty: 1.0,
+                logit_softcap: None,
+            },
+            slot_id + 1,
+        );
+        Ok(Some(vulkan.submit_token(encoder, &sample_buf)))
+    }
+
+    fn forward_verify_sampled(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+        samples: &[super::GreedySampleParams<'_>],
+    ) -> Result<Option<Vec<super::ForwardOutcome>>> {
+        let Some(vulkan) = self.backend.as_wgpu() else {
+            return Ok(None);
+        };
+        // Granite divides its logits, which the device samplers do not, and a
+        // head on the host has no device rows to sample.
+        if tokens.len() < 2
+            || samples.len() != tokens.len()
+            || !vulkan.gpu_sample()
+            || self.mul.logit != 1.0
+            || self.tail_on_host()
+        {
+            return Ok(None);
+        }
+        let Some(x) = self.run_layers_resident(cache, tokens, start_pos, true)? else {
+            return Ok(None);
+        };
+        // Each row its own sampler scratch: the verify's rows are one
+        // request's, and share its slot everywhere else.
+        let slots: Vec<usize> = (0..tokens.len())
+            .map(|r| super::VERIFY_SAMPLE_SLOTS + slot_id * super::MAX_VERIFY_ROWS + r)
+            .collect();
+        let rows: Vec<Option<super::GreedySampleParams<'_>>> =
+            samples.iter().cloned().map(Some).collect();
+        if let Some(outcomes) = vulkan.decode_batch_tail(
+            crate::engine::backend::vulkan::AttnOutSrc::Host(&x),
+            tokens.len(),
+            &self.output_norm,
+            self.config.rms_eps,
+            &self.output_weight,
+            None,
+            &rows,
+            &slots,
+        ) {
+            return Ok(Some(outcomes));
+        }
+        // The layers ran and the rows are in the cache; the head runs on the
+        // host's copy of the residual instead.
+        Ok(Some(
+            self.head_rows(x, tokens.len())?
+                .into_iter()
+                .map(super::ForwardOutcome::Logits)
+                .collect(),
+        ))
+    }
+
     fn supports_layer_split(&self) -> bool {
         true
     }
@@ -2587,9 +2707,10 @@ impl ModelForward for LlamaModel {
     ///
     /// The chain's per-sequence GPU resources are cached by slot, and a
     /// worker runs several sequences' forwards at once without knowing
-    /// their slots: these chains share one slot of their own
-    /// ([`super::RANGE_SLOT`]) and take turns ([`super::RANGE_CHAINS`]) — which costs
-    /// nothing, since one device runs one submission at a time anyway.
+    /// their slots: each chain holds a range slot of its own
+    /// ([`super::range_turn`]) while it is recorded and run, so sequences
+    /// record side by side; prompt chunks take turns
+    /// ([`super::RANGE_PREFILL`]).
     fn forward_layers(
         &self,
         cache: &mut KvCache,
@@ -2603,16 +2724,15 @@ impl ModelForward for LlamaModel {
             && super::range_chains()
             && let Some(vulkan) = self.backend.as_wgpu()
         {
-            let _turn = super::RANGE_CHAINS
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let turn = super::range_turn(cache);
             if let Some((encoder, buf, offset)) = self.record_decode_run(
                 vulkan,
                 cache,
                 layers.clone(),
                 &hidden,
+                None,
                 start_pos,
-                super::RANGE_SLOT,
+                turn.slot,
                 Tail::None,
             ) {
                 return Ok(vulkan.submit_and_read_at(encoder, &buf, offset, self.config.n_embd));
@@ -2623,7 +2743,7 @@ impl ModelForward for LlamaModel {
             && super::range_chains()
             && self.resident_prefill_serves(tokens.len())
         {
-            let _turn = super::RANGE_CHAINS
+            let _turn = super::RANGE_PREFILL
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(x) =
@@ -3558,6 +3678,121 @@ mod batch_tests {
             return;
         };
         super::super::batch_checks::decode_batch_matches_each_rows_solo_step(&model, 3.5e-3);
+    }
+
+    /// A verify sampled on the device picks, row by row, the token the
+    /// rows' own logits pick — greedy as the argmax, sampled as the largest
+    /// candidates, largest first.
+    #[test]
+    #[ignore]
+    fn a_verify_sampled_on_the_device_picks_what_its_logits_pick() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let tokens: Vec<u32> = vec![128000, 791, 6864, 315, 9822, 374, 12366, 13, 578, 6864];
+        let (prompt, draft) = tokens.split_at(4);
+        let mut base = model.new_kv_cache(64);
+        model.forward(&mut base, prompt, 0, 0).expect("prompt");
+        let mut plain = base.duplicate();
+        let logits = model
+            .forward_verify(&mut plain, draft, prompt.len(), 0)
+            .expect("verify");
+        for top_k in [0u32, 8] {
+            let mut cache = base.duplicate();
+            let params = super::super::GreedySampleParams {
+                recent_tokens: &[],
+                repeat_penalty: 1.0,
+                top_k,
+            };
+            let rows = model
+                .forward_verify_sampled(
+                    &mut cache,
+                    draft,
+                    prompt.len(),
+                    0,
+                    &vec![params; draft.len()],
+                )
+                .expect("sampled verify")
+                .expect("the device path runs");
+            for (row, logits) in rows.iter().zip(&logits) {
+                let want = crate::engine::sampling::argmax(logits);
+                match row {
+                    super::super::ForwardOutcome::Token(t) => assert_eq!(*t, want),
+                    super::super::ForwardOutcome::Candidates(c) => {
+                        assert_eq!(c.len(), top_k as usize);
+                        assert_eq!(c[0].0, want);
+                        assert!(c.windows(2).all(|w| w[0].1 >= w[1].1));
+                    }
+                    super::super::ForwardOutcome::Logits(_) => panic!("read back whole rows"),
+                }
+            }
+        }
+    }
+
+    /// Steps submitted before the previous pick is read, each gathering its
+    /// input from that pick on the device, decode the tokens plain greedy
+    /// steps decode.
+    #[test]
+    #[ignore]
+    fn steps_taken_ahead_decode_what_plain_greedy_steps_decode() {
+        let Some(model) = model() else {
+            println!("no Vulkan device; nothing to check");
+            return;
+        };
+        let vulkan = model.backend.as_wgpu().expect("a device");
+        let prompt: Vec<u32> = vec![128000, 791, 6864, 315, 9822, 374];
+        let mut base = model.new_kv_cache(64);
+        let logits = model.forward(&mut base, &prompt, 0, 0).expect("prompt");
+        let first = crate::engine::sampling::argmax(&logits);
+        let greedy = super::super::GreedySampleParams {
+            recent_tokens: &[],
+            repeat_penalty: 1.0,
+            top_k: 0,
+        };
+        const STEPS: usize = 16;
+        let mut plain = vec![first];
+        let mut cache = base.duplicate();
+        for i in 0..STEPS {
+            let pos = prompt.len() + i;
+            let out = model
+                .forward_maybe_sampling(&mut cache, &[plain[i]], pos, Some(greedy), 0)
+                .expect("step");
+            match out {
+                super::super::ForwardOutcome::Token(t) => plain.push(t),
+                _ => panic!("the device did not pick"),
+            }
+        }
+        let mut ahead = vec![first];
+        let mut cache = base.duplicate();
+        let mut pending = model
+            .decode_lookahead(
+                &mut cache,
+                super::super::LookaheadInput::Token(first),
+                prompt.len(),
+                0,
+            )
+            .expect("step")
+            .expect("the lookahead path runs");
+        for i in 0..STEPS {
+            let next = (i + 1 < STEPS).then(|| {
+                model
+                    .decode_lookahead(
+                        &mut cache,
+                        super::super::LookaheadInput::Pending(&pending),
+                        prompt.len() + i + 1,
+                        0,
+                    )
+                    .expect("step")
+                    .expect("the lookahead path runs")
+            });
+            ahead.push(vulkan.read_token(pending));
+            match next {
+                Some(p) => pending = p,
+                None => break,
+            }
+        }
+        assert_eq!(ahead, plain);
     }
 
     #[test]

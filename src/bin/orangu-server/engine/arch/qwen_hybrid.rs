@@ -2532,7 +2532,7 @@ impl<F: HybridFfn> Trunk<F> {
             }
             bufs.swap(0, 1);
             group_layers += 1;
-            if group_layers >= super::gemma::prefill_group_layers(layers_per_submit) {
+            if group_layers >= super::gemma::prefill_group_layers(layers_per_submit, Some(vulkan)) {
                 vulkan.end_prefill_group();
                 vulkan.begin_prefill_group();
                 group_layers = 0;

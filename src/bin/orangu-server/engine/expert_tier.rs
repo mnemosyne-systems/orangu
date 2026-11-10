@@ -150,7 +150,7 @@ const COVERAGE_FLOOR_DEFAULT: f64 = 0.25;
 pub fn coverage_floor() -> f64 {
     static FLOOR: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *FLOOR.get_or_init(|| {
-        std::env::var("ORANGU_EXPERT_TIER_FLOOR")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_TIER_FLOOR")
             .ok()
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|percent| (0.0..=100.0).contains(percent))

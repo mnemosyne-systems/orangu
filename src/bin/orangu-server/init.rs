@@ -58,7 +58,16 @@ pub fn run_init() -> Result<()> {
     let groups = orangu::model_spec::scan_models_dir(Path::new(&models))
         .map(|models| orangu::model_spec::group_models(&models))
         .unwrap_or_default();
-    let model = prompt_model(&groups)?;
+    // The catalogue's models that fit here and are not installed, offered
+    // after the installed ones: a spec not yet downloaded is fetched when
+    // the server first starts with it.
+    let catalogue = catalogue_offer(&groups);
+    let model = prompt_model(&groups, &catalogue)?;
+    let drafter = orangu::model_catalogue::entry_for(model.split(':').next().unwrap_or(&model))
+        .and_then(|e| match e.drafter {
+            Some(orangu::model_catalogue::Drafter::Model(d)) => Some(d),
+            _ => None,
+        });
     // A picture generator's role is not a choice (`Role::fixed_by_model`):
     // the file decides it, so the prompt is answered rather than asked —
     // echoed in the `key: value` shape the answered prompt would have had.
@@ -118,7 +127,7 @@ pub fn run_init() -> Result<()> {
     } else {
         prompt_line("api_key (blank = no authentication)", "")?
     };
-    let serving = prompt_serving_keys(role)?;
+    let serving = prompt_serving_keys(role, drafter.unwrap_or(""))?;
     // A storage knob rather than a deployment one, so it is asked after
     // everything that decides *what* is served and *where*, and answered by
     // pressing Enter unless the operator has measured their own drive. The
@@ -578,8 +587,10 @@ impl Helper for OptionCompleter {}
 /// one model (see [`sole_model`]) — there's nothing to choose between, so
 /// it's taken and echoed as a plain `model: <label>` line rather than
 /// typed out.
-fn prompt_model(groups: &[orangu::model_spec::ModelGroup]) -> Result<String> {
-    if let Some(only) = sole_model(groups) {
+fn prompt_model(groups: &[orangu::model_spec::ModelGroup], catalogue: &[String]) -> Result<String> {
+    if catalogue.is_empty()
+        && let Some(only) = sole_model(groups)
+    {
         // Echoed in the same `key: value` shape as the prompts around it,
         // so the transcript reads as if it had been answered.
         println!("model: {}", only.label);
@@ -590,10 +601,11 @@ fn prompt_model(groups: &[orangu::model_spec::ModelGroup]) -> Result<String> {
         .completion_type(rustyline::CompletionType::List)
         .build();
     let mut editor: Editor<ModelCompleter, DefaultHistory> = Editor::with_config(config)?;
-    editor.set_helper(Some(ModelCompleter {
-        options: model_completion_options(groups),
-        labels: model_hint_options(groups),
-    }));
+    let mut options = model_completion_options(groups);
+    let mut labels = model_hint_options(groups);
+    options.extend(catalogue.iter().cloned());
+    labels.extend(catalogue.iter().cloned());
+    editor.set_helper(Some(ModelCompleter { options, labels }));
 
     match editor.readline("model []: ") {
         Ok(line) => Ok(line.trim().to_string()),
@@ -602,6 +614,41 @@ fn prompt_model(groups: &[orangu::model_spec::ModelGroup]) -> Result<String> {
         }
         Err(err) => Err(err.into()),
     }
+}
+
+/// The catalogue's models that fit this machine and are not in `groups`,
+/// printed as a table, their specs returned for the `model` prompt to
+/// offer after the installed ones.
+fn catalogue_offer(groups: &[orangu::model_spec::ModelGroup]) -> Vec<String> {
+    let cpu = orangu::hardware::detect_cpu();
+    let gpus = orangu::hardware::detect_gpus(cpu.total_memory_bytes);
+    let installed = |repo: &str| {
+        groups.iter().any(|g| {
+            g.hf_repo
+                .as_deref()
+                .is_some_and(|r| r.eq_ignore_ascii_case(repo))
+        })
+    };
+    let fit: Vec<_> = crate::suggest::catalogue_for(&cpu, &gpus)
+        .into_iter()
+        .filter(|(e, _)| !installed(e.repo))
+        .collect();
+    if fit.is_empty() {
+        return Vec::new();
+    }
+    println!("Catalogue models that fit this machine (fetched on first start):");
+    let width = fit.iter().map(|(e, _)| e.spec().len()).max().unwrap_or(0);
+    for (e, context) in &fit {
+        println!(
+            "  {:<width$}  {:>7}  {:>6} tokens  {}",
+            e.spec(),
+            orangu::model_catalogue::format_size(e.file_bytes),
+            context,
+            e.roles.join(","),
+        );
+    }
+    println!();
+    fit.into_iter().map(|(e, _)| e.spec()).collect()
 }
 
 /// TAB-completes the `model` prompt over `options` — every `NR` and every
@@ -1598,7 +1645,9 @@ fn changed(value: String, default: &str) -> Option<String> {
 /// Asks for the serving and hardware keys, each with the default the loader
 /// applies when it is absent. A picture model is asked only the keys that
 /// apply to it; its own keys come from [`prompt_image_keys`].
-fn prompt_serving_keys(role: Role) -> Result<ServingKeys> {
+/// `drafter` is the draft model the catalogue pairs with the chosen model,
+/// offered as `draft_model`'s default; empty for none.
+fn prompt_serving_keys(role: Role, drafter: &str) -> Result<ServingKeys> {
     let text = !role.fixed_by_model();
     let tls_cert = prompt_line("tls_cert (blank = plain HTTP)", "")?;
     let tls_key = if tls_cert.is_empty() {
@@ -1643,7 +1692,16 @@ fn prompt_serving_keys(role: Role) -> Result<ServingKeys> {
         )?;
         let kv_tags: Vec<&str> = KvCache::ALL.iter().map(|kv| kv.tag()).collect();
         let kv_cache = prompt_choice("kv_cache", KvCache::default().tag(), &kv_tags)?;
-        let draft_model = prompt_line("draft_model (blank = no speculative decoding)", "")?;
+        let draft_model = if drafter.is_empty() {
+            prompt_line("draft_model (blank = no speculative decoding)", "")?
+        } else {
+            let answer = prompt_line("draft_model (none = no speculative decoding)", drafter)?;
+            if answer.eq_ignore_ascii_case("none") {
+                String::new()
+            } else {
+                answer
+            }
+        };
         let default_draft_tokens = DEFAULT_DRAFT_TOKENS.to_string();
         let draft_tokens = if draft_model.is_empty() {
             String::new()

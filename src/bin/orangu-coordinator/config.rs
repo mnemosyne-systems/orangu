@@ -153,8 +153,10 @@ pub struct CoordinatorConfiguration {
     pub idle_timeout_seconds: Option<u64>,
     /// How many profiles' `orangu-server`s may run at once (`resident`,
     /// default 1). Above one, a profile that can run beside the others
-    /// ([`CoordinatorLlmEntry::can_reside_with`]) starts without stopping
-    /// them, and the least recently used is stopped when the set is full.
+    /// ([`CoordinatorLlmEntry::can_reside_with`]), or shares a card with
+    /// them that holds them all ([`CoordinatorLlmEntry::shares_card_with`]),
+    /// starts without stopping them, and the least recently used is stopped
+    /// when the set is full.
     pub resident: usize,
     /// Shared secret required to use `GET /v1/coordinator/shutdown`. When
     /// absent the endpoint is disabled entirely.
@@ -297,14 +299,31 @@ impl CoordinatorLlmEntry {
     /// memory as if they had it alone, so a profile that names no device
     /// shares the default one with every other that names none.
     pub fn can_reside_with(&self, other: &Self) -> bool {
-        let place = |e: &Self| {
-            if e.backend.as_deref() == Some("cpu") {
-                Some("cpu".to_string())
-            } else {
-                e.device.as_ref().map(|d| d.trim().to_lowercase())
-            }
-        };
-        self.origin() != other.origin() && self.port != other.port && place(self) != place(other)
+        self.listens_apart_from(other) && self.place() != other.place()
+    }
+
+    /// Whether this profile's `orangu-server` could run beside `other`'s on
+    /// the same card — a listener of its own and the same card, which then
+    /// holds both only when their needs fit it together and each is started
+    /// with its share.
+    pub fn shares_card_with(&self, other: &Self) -> bool {
+        self.listens_apart_from(other)
+            && self.place() == other.place()
+            && self.place().as_deref() != Some("cpu")
+    }
+
+    fn listens_apart_from(&self, other: &Self) -> bool {
+        self.origin() != other.origin() && self.port != other.port
+    }
+
+    /// Where this profile's server runs: `cpu`, the device it names, or
+    /// `None` for the default card.
+    fn place(&self) -> Option<String> {
+        if self.backend.as_deref() == Some("cpu") {
+            Some("cpu".to_string())
+        } else {
+            self.device.as_ref().map(|d| d.trim().to_lowercase())
+        }
     }
 
     /// The origin (`http://host:port`) requests are proxied to once this
@@ -1216,5 +1235,16 @@ mod tests {
             ..base.clone()
         };
         assert!(!on("5500M").can_reside_with(&with(8101, None, Some("5500m"))));
+        // The same card on a port of its own may share it; the CPU or the
+        // same port never does.
+        assert!(on("5500M").shares_card_with(&with(8101, None, Some("5500m"))));
+        assert!(base.shares_card_with(&with(8101, None, None)));
+        assert!(!base.shares_card_with(&with(8100, None, None)));
+        assert!(!base.shares_card_with(&with(8101, None, Some("igpu"))));
+        let cpu = CoordinatorLlmEntry {
+            backend: Some("cpu".to_string()),
+            ..base.clone()
+        };
+        assert!(!cpu.shares_card_with(&with(8101, Some("cpu"), None)));
     }
 }

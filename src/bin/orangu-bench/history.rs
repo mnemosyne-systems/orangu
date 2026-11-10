@@ -84,23 +84,36 @@ pub struct Record {
     pub device: Option<String>,
 }
 
+/// A value as the file writes it: two decimals from 1 up, three significant
+/// figures below.
+///
+/// Rates in tokens/second read fine at two decimals, but a `kl` row's mean is
+/// a few thousandths of a nat, and two decimals write every one of them as
+/// `0.00` — a history of drift that records no drift.
+fn figure(v: f64) -> String {
+    if v == 0.0 || !v.is_finite() || v.abs() >= 1.0 {
+        return format!("{v:.2}");
+    }
+    let decimals = (2 - v.abs().log10().floor() as i32).max(2) as usize;
+    format!("{v:.decimals$}")
+}
+
 impl Record {
     fn to_row(&self) -> String {
         let mut s = String::new();
         let _ = write!(
             s,
-            "{}\t{}\t{}\t{}\t{:.2}\t{:.2}\t{:.2}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             self.date,
             self.label,
             self.mode,
             self.n,
-            self.best,
-            self.mean,
-            self.sd,
+            figure(self.best),
+            figure(self.mean),
+            figure(self.sd),
             // Empty rather than `0.00`: one repetition has no sample spread,
             // and a zero would claim it was measured.
-            self.sd_sample
-                .map_or_else(String::new, |sd| format!("{sd:.2}")),
+            self.sd_sample.map_or_else(String::new, figure),
             self.device.as_deref().unwrap_or(""),
         );
         s
@@ -289,6 +302,28 @@ mod tests {
             device: Some("api/first card".into()),
         };
         assert_eq!(Record::from_row(&r.to_row()), Some(r));
+    }
+
+    /// A drift measurement is thousandths of a nat; the row has to keep it.
+    #[test]
+    fn a_small_value_keeps_its_figures() {
+        let r = Record {
+            date: "2026-11-10".into(),
+            label: "e2b".into(),
+            mode: "kl".into(),
+            n: 8,
+            best: 0.003792,
+            mean: 0.003792,
+            sd_sample: None,
+            sd: 0.0,
+            device: None,
+        };
+        let row = r.to_row();
+        assert!(row.contains("\t0.00379\t0.00379\t0.00\t"), "{row}");
+        assert_eq!(figure(1000.783), "1000.78");
+        assert_eq!(figure(98.93), "98.93");
+        assert_eq!(figure(0.5), "0.500");
+        assert_eq!(figure(-0.0123), "-0.0123");
     }
 
     /// The device column arrived the same way `sd_sample` did — appended to a

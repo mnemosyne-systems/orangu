@@ -102,7 +102,19 @@ impl CachedPrefill {
                 self.cache.committed_len()
             };
             if prefix_len != cached_len || cached_len != state_len {
-                return 0;
+                // Short of the whole state: as far as the shared part of the
+                // conversation, where a checkpoint was kept, when both agree
+                // that far.
+                return match self.cache.shared_checkpoint.as_deref() {
+                    Some((at, _))
+                        if *at <= prefix_len
+                            && !self.cache.layers.is_empty()
+                            && self.cache.remote.is_none() =>
+                    {
+                        *at
+                    }
+                    _ => 0,
+                };
             }
         }
         prefix_len

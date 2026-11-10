@@ -781,6 +781,9 @@ pub struct VulkanBackend {
     /// and bind groups across every decode token instead of allocating a
     /// fresh set each time.
     argmax_sample_cache: Mutex<HashMap<usize, ArgmaxSampleResources>>,
+    /// [`Self::record_row_gather`]'s pipelines, by weight type, built on
+    /// first use.
+    row_gather_pipelines: Mutex<HashMap<u32, wgpu::ComputePipeline>>,
     /// Per-slot resources of the per-layer-embedding projection
     /// (`record_ple_projection`) — built on first use, keyed by the same
     /// `batch_slot` every other per-slot cache here uses.
@@ -1151,6 +1154,11 @@ pub struct VulkanBackend {
     /// The last prefill group's submission (`end_prefill_group`), for a
     /// readback parked on it to wait for exactly that.
     last_group_submission: Mutex<Option<wgpu::SubmissionIndex>>,
+    /// When a decoding request last waited on this device, in milliseconds
+    /// of [`crate::engine::generate::clock_ms`] — what scopes a prompt's
+    /// yield to decode steps on its own device
+    /// ([`crate::engine::generate::prompt_yield_layers`]).
+    decode_seen_ms: std::sync::atomic::AtomicU64,
     /// GPU RoPE (`vulkan_shaders::shader_source_rope`) — reuses
     /// `elem3_bind_group_layout` (its bindings match that shape).
     rope_pipeline: wgpu::ComputePipeline,
@@ -3773,6 +3781,7 @@ pub(crate) const SUPPORTED_TYPES: &[u32] = &[
     crate::engine::quant::GGML_TYPE_IQ4_NL,
     crate::engine::quant::GGML_TYPE_IQ4_XS,
     crate::engine::quant::GGML_TYPE_MXFP4,
+    crate::engine::quant::GGML_TYPE_NVFP4,
     crate::engine::quant::GGML_TYPE_Q2_0,
     crate::engine::quant::GGML_TYPE_PQ2_0,
     crate::engine::quant::GGML_TYPE_PTQ1_0,
@@ -4662,7 +4671,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         let info = adapter.get_info();
         // Before any knob is resolved below, so the profile's values are the
         // ones they read.
-        super::tuning_profile::install(&info);
+        let _profile = super::tuning_profile::install(&info);
         let adapter_name = format!("{} ({:?})", info.name, info.backend);
         let wgpu_backend = info.backend;
         // Request the adapter's own limits rather than wgpu's conservative
@@ -6236,10 +6245,11 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             op_cache: Mutex::new(HashMap::new()),
             streamed_weights: Mutex::new(HashSet::new()),
             argmax_sample_cache: Mutex::new(HashMap::new()),
+            row_gather_pipelines: Mutex::new(HashMap::new()),
             ple_projection_cache: Mutex::new(HashMap::new()),
             uniform_arena: Mutex::new(ScratchArena::new()),
             adapter_name,
-            devices: candidates,
+            devices: device::capped(candidates),
             device_selection: selected,
             wgpu_backend,
             elem4_bind_group_layout,
@@ -6327,6 +6337,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             submission_count: std::sync::atomic::AtomicU64::new(0),
             intermediate_done: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_group_submission: Mutex::new(None),
+            decode_seen_ms: std::sync::atomic::AtomicU64::new(0),
             rope_pipeline,
             perhead_rmsnorm_pipeline,
             fused_norm_rope_pipeline,
@@ -10315,6 +10326,15 @@ pub enum GpuInput<'a> {
     #[allow(dead_code)]
     Cpu(&'a [f32]),
     Gpu(&'a wgpu::Buffer, usize),
+}
+
+/// A decode step submitted with its token pick left on the device — see
+/// [`VulkanBackend::submit_token`].
+pub struct PendingToken {
+    /// The pick, where the next step's gather reads it.
+    pub ids: wgpu::Buffer,
+    readback: wgpu::Buffer,
+    wait: std::sync::Arc<MapWait>,
 }
 
 /// Everything [`VulkanBackend::fused_post_attention`] needs: a gemma4
@@ -14788,6 +14808,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// running out of it is the caller's cue to poll again, not a lost
     /// device.
     fn poll_until(&self, poll_type: wgpu::PollType, context: &str) {
+        self.note_decode_wait();
         match self.device.poll(poll_type) {
             Ok(_) | Err(wgpu::PollError::Timeout) => {}
             Err(err) => crate::device_lost::fail(context, err),
@@ -14834,6 +14855,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// [`Self::poll_blocking`] with the poll mode chosen by the caller —
     /// a staging map's spin needs `PollType::Poll`.
     fn poll_blocking_with(&self, poll_type: wgpu::PollType, context: &str) {
+        self.note_decode_wait();
         if let Err(err) = self.device.poll(poll_type) {
             crate::device_lost::fail(context, err);
         }
@@ -14859,6 +14881,58 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             .slice(..)
             .get_mapped_range()
             .unwrap_or_else(|err| crate::device_lost::fail(context, err))
+    }
+
+    /// Submits `encoder` with the token id its sampler left in `src`, and
+    /// returns without waiting: the id is copied into a buffer of its own,
+    /// for the next step's gather ([`Self::record_row_gather`]) to read —
+    /// `src` is the sampler's scratch, which that step's own pick overwrites
+    /// — and into a readback [`Self::read_token`] maps when the host wants
+    /// it.
+    pub fn submit_token(
+        &self,
+        mut encoder: wgpu::CommandEncoder,
+        src: &wgpu::Buffer,
+    ) -> PendingToken {
+        let ids = self.fresh_buffer(1);
+        encoder.copy_buffer_to_buffer(src, 0, &ids, 0, 4);
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server pending token readback"),
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_buffer_to_buffer(src, 0, &readback, 0, 4);
+        self.queue.submit(Some(encoder.finish()));
+        self.submission_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
+        let wait = self.map_read(&readback);
+        PendingToken {
+            ids,
+            readback,
+            wait,
+        }
+    }
+
+    /// The token id a [`Self::submit_token`] step picked, waiting for that
+    /// step and nothing submitted after it.
+    pub fn read_token(&self, token: PendingToken) -> u32 {
+        const CONTEXT: &str = "reading back a token picked ahead";
+        self.wait_mapped(&token.wait, CONTEXT);
+        let data = self.mapped_bytes(&token.readback, CONTEXT);
+        let id: u32 = bytemuck::cast_slice::<u8, u32>(&data)[0];
+        drop(data);
+        token.readback.unmap();
+        id
+    }
+
+    /// Submits `encoder` without waiting — for work later submissions read.
+    pub fn submit_now(&self, encoder: wgpu::CommandEncoder) {
+        self.queue.submit(Some(encoder.finish()));
+        self.submission_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        crate::engine::decode_stages::record_submission();
     }
 
     pub fn submit_and_readback_u32(
@@ -26337,6 +26411,24 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         (g.output_buffer.clone(), g.output_offset)
     }
 
+    /// Records that a decoding request waits on this device — every decode
+    /// step waits for its result through one of the polls.
+    fn note_decode_wait(&self) {
+        if crate::engine::generate::decoding_on_this_thread() {
+            self.decode_seen_ms.store(
+                crate::engine::generate::clock_ms(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// When a decoding request last waited on this device — see
+    /// `decode_seen_ms`.
+    pub fn decode_seen_ms(&self) -> u64 {
+        self.decode_seen_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Opens a prefill submission group: until `end_prefill_group`, the
     /// prefill chains record into one encoder — see `PREFILL_ENCODER`.
     pub fn begin_prefill_group(&self) {
@@ -26352,7 +26444,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// and closes the group.
     ///
     /// While the prompt makes way for another request's decode steps
-    /// (`generate::prompt_yields_to_decode`), it then waits for its own
+    /// (`generate::prompt_yield_layers`), it then waits for its own
     /// previous group: the queue holds one group of this prompt besides the
     /// one running, so a decode step submitted now runs after those two
     /// instead of after the whole chunk.
@@ -26366,7 +26458,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 .expect("group submission poisoned") = Some(index.clone());
             let previous = PREVIOUS_PREFILL_GROUP.with(|slot| slot.replace(Some(index)));
             if let Some(previous) = previous
-                && crate::engine::generate::prompt_yields_to_decode()
+                && crate::engine::generate::prompt_yield_layers(Some(self)).is_some()
             {
                 self.poll_blocking_with(
                     wgpu::PollType::Wait {
@@ -26814,9 +26906,23 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     /// ago reads slowly now (`ORANGU_VRAM_REPORT=1`).
     /// The device-local memory the driver says this process may still take
     /// without eviction, and what it holds — see
-    /// `vulkan_replay::device_local_budget`.
+    /// `vulkan_replay::device_local_budget`. Under
+    /// [`device::device_bytes_cap`] the budget is no more than
+    /// the cap, and what it holds is what this process's allocator has
+    /// reserved: a driver may report the card's usage by every process,
+    /// which would charge the server sharing the card to this one's share.
     pub fn device_local_budget(&self) -> Option<(u64, u64)> {
-        super::vulkan_replay::device_local_budget(&self.device)
+        let (budget, usage) = super::vulkan_replay::device_local_budget(&self.device)?;
+        match device::device_bytes_cap() {
+            None => Some((budget, usage)),
+            Some(cap) => {
+                let own = self
+                    .device
+                    .generate_allocator_report()
+                    .map_or(usage, |report| report.total_reserved_bytes);
+                Some((budget.min(cap), own))
+            }
+        }
     }
 
     pub fn report_device_memory(&self, tag: &str) {
@@ -27723,6 +27829,114 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     /// Submits `encoder` and reads the `k` `(token, logit)` candidates
     /// [`Self::record_topk_sample`] left in `out`, largest first.
+    /// Records a gather of row `id` of `w`, times `scale`, into a new buffer
+    /// of `w.in_dim` values, where `id` is the token id `ids` holds at its
+    /// first element — what [`Self::record_argmax_sample`] leaves. The next
+    /// decode step's input, made on the device from the last step's pick
+    /// before the host has read it. `None` for a weight type the gather has
+    /// no kernel for.
+    pub fn record_row_gather(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        ids: &wgpu::Buffer,
+        w: &QuantMatrix,
+        scale: f32,
+    ) -> Option<wgpu::Buffer> {
+        let ty = w.ggml_type();
+        let pipeline = {
+            let mut pipelines = self
+                .row_gather_pipelines
+                .lock()
+                .expect("gather cache poisoned");
+            match pipelines.get(&ty) {
+                Some(p) => p.clone(),
+                None => {
+                    let source = vulkan_shaders::shader_source_row_gather(ty)?;
+                    let module = self
+                        .device
+                        .create_shader_module(wgpu::ShaderModuleDescriptor {
+                            label: Some("orangu-server row gather shader"),
+                            source: wgpu::ShaderSource::Wgsl(source.into()),
+                        });
+                    let layout =
+                        self.device
+                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                                label: Some("orangu-server row gather pipeline layout"),
+                                bind_group_layouts: &[Some(&self.bind_group_layout)],
+                                immediate_size: 0,
+                            });
+                    let p = self
+                        .device
+                        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                            label: Some("orangu-server row gather pipeline"),
+                            layout: Some(&layout),
+                            module: &module,
+                            entry_point: Some("main"),
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            cache: None,
+                        });
+                    pipelines.insert(ty, p.clone());
+                    p
+                }
+            }
+        };
+        let (wbuf, woff, wsize) = self.weight_buffer(w);
+        let out = self.fresh_buffer(w.in_dim);
+        let meta = Meta {
+            in_dim: w.in_dim as u32,
+            out_dim: w.out_dim as u32,
+            n_tokens: scale.to_bits(),
+            row_bytes: Self::device_row_stride(w.row_bytes()) as u32,
+        };
+        let meta_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("orangu-server row gather meta"),
+            size: std::mem::size_of::<Meta>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue
+            .write_buffer(&meta_buffer, 0, bytemuck::bytes_of(&meta));
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("orangu-server row gather bind group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &wbuf,
+                        offset: woff,
+                        size: std::num::NonZeroU64::new(wsize),
+                    }),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ids.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: meta_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: self.iq_grid_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("orangu-server row gather pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups((w.in_dim as u32).div_ceil(64), 1, 1);
+        drop(pass);
+        Some(out)
+    }
+
     pub fn submit_and_readback_topk(
         &self,
         encoder: wgpu::CommandEncoder,

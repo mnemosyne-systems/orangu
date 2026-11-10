@@ -2306,7 +2306,8 @@ gemma 4 checkpoint."
                         // the whole layer, scale included, and the result is
                         // the next layer's input already.
                         group_layers += 1;
-                        if group_layers >= prefill_group_layers(layers_per_submit)
+                        if group_layers
+                            >= prefill_group_layers(layers_per_submit, backend.as_wgpu())
                             && let Some(v) = backend.as_wgpu()
                         {
                             v.end_prefill_group();
@@ -2650,7 +2651,8 @@ gemma 4 checkpoint."
                                 x_dev = Some(bufs[0].clone());
                             }
                             group_layers += 1;
-                            if group_layers >= prefill_group_layers(layers_per_submit)
+                            if group_layers
+                                >= prefill_group_layers(layers_per_submit, backend.as_wgpu())
                                 && let Some(v) = backend.as_wgpu()
                             {
                                 v.end_prefill_group();
@@ -3386,16 +3388,14 @@ impl ModelForward for GemmaModel {
         // chain (`record_one_sequence_decode`, which the multi-device split
         // decode runs per device), its residual read back — the dense
         // model's own chain, at the cost of a readback at each end. Under
-        // the shared range slot, taking turns, as `LlamaModel`'s does.
+        // a range slot of its own, as `LlamaModel`'s is.
         if tokens.len() == 1
             && !layers.is_empty()
             && !self.is_moe
             && super::range_chains()
             && let Some(vulkan) = self.backend.as_wgpu()
         {
-            let _turn = super::RANGE_CHAINS
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+            let turn = super::range_turn(cache);
             let mut encoder = vulkan.new_encoder("orangu-server gemma range decode");
             let (buf, offset) = self.record_one_sequence_decode(
                 vulkan,
@@ -3404,7 +3404,7 @@ impl ModelForward for GemmaModel {
                 tokens[0],
                 start_pos,
                 &hidden,
-                super::RANGE_SLOT,
+                turn.slot,
                 None,
                 layers,
                 false,
@@ -4883,21 +4883,23 @@ fn prefill_stream_ple_inputs() -> bool {
     crate::engine::env::flag_on_unless_disabled("ORANGU_PREFILL_PLE_INPUTS")
 }
 
-/// How many layers a prompt's next submission groups: `configured`, or one
-/// while it makes way for another request's decode steps
-/// (`generate::prompt_yields_to_decode`).
-pub(crate) fn prefill_group_layers(configured: usize) -> usize {
-    if configured > 0 && crate::engine::generate::prompt_yields_to_decode() {
-        1
-    } else {
-        configured.max(1)
+/// How many layers a prompt's next submission groups on `device`:
+/// `configured`, or fewer while it makes way for another request's decode
+/// steps there (`generate::prompt_yield_layers`).
+pub(crate) fn prefill_group_layers(
+    configured: usize,
+    device: Option<&crate::engine::backend::VulkanBackend>,
+) -> usize {
+    match crate::engine::generate::prompt_yield_layers(device) {
+        Some(layers) if configured > 0 => layers.min(configured),
+        _ => configured.max(1),
     }
 }
 
 pub(crate) fn prefill_layers_per_submit() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_PREFILL_LAYERS_PER_SUBMIT")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PREFILL_LAYERS_PER_SUBMIT")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(4)

@@ -119,7 +119,7 @@ const DEFAULT_MIN_GPU_DECODE_POS: usize = 256;
 pub fn min_gpu_tokens() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("ORANGU_ATTENTION_MIN_TOKENS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_ATTENTION_MIN_TOKENS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MIN_GPU_TOKENS)
@@ -129,7 +129,7 @@ pub fn min_gpu_tokens() -> usize {
 pub(crate) fn min_gpu_decode_pos() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("ORANGU_DECODE_ATTENTION_MIN_POS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_DECODE_ATTENTION_MIN_POS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_MIN_GPU_DECODE_POS)
@@ -569,7 +569,7 @@ pub fn multi_head_attention(
 fn batch_width() -> usize {
     static CACHED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
-        std::env::var("ORANGU_ATTENTION_BATCH")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_ATTENTION_BATCH")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(tensor::DOT_MULTI)

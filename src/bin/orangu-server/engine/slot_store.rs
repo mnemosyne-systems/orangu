@@ -433,6 +433,75 @@ impl SlotStore {
             .collect()
     }
 
+    /// Writes the paged pool's published pages to `<dir>/<filename>`: every
+    /// conversation the pool still holds, not only the slots' last ones —
+    /// what a swap would otherwise throw away with the process. In use first,
+    /// then newest first, until `cap_bytes` of rows. Returns the pages
+    /// written. A pool whose host pages are compact is not saved.
+    pub fn save_pool(
+        &self,
+        pool: &super::kv_pool::KvPool,
+        index: &super::prefix_index::PrefixIndex,
+        filename: &str,
+        cap_bytes: u64,
+    ) -> Result<usize> {
+        let path = self.resolve(filename)?;
+        if pool.is_compact() {
+            return Ok(0);
+        }
+        let layers = pool.layers().len();
+        let mut out = Vec::new();
+        out.extend_from_slice(POOL_FILE_MAGIC);
+        out.extend_from_slice(&POOL_FILE_VERSION.to_le_bytes());
+        out.extend_from_slice(&(self.fingerprint.len() as u32).to_le_bytes());
+        out.extend_from_slice(self.fingerprint.as_bytes());
+        out.extend_from_slice(&(pool.page_tokens() as u32).to_le_bytes());
+        out.extend_from_slice(&(layers as u32).to_le_bytes());
+        let count_at = out.len();
+        out.extend_from_slice(&0u32.to_le_bytes());
+        let mut written = 0u32;
+        for (page, tag) in pool.published_recent_first() {
+            let Some(tokens) = index.tokens_of(tag) else {
+                continue;
+            };
+            if out.len() as u64 >= cap_bytes {
+                break;
+            }
+            out.extend_from_slice(&tag.to_le_bytes());
+            for t in &tokens {
+                out.extend_from_slice(&t.to_le_bytes());
+            }
+            for layer in 0..layers {
+                for rows in [pool.page_k(layer, page), pool.page_v(layer, page)] {
+                    out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                    out.extend_from_slice(bytemuck::cast_slice(rows));
+                }
+            }
+            written += 1;
+        }
+        out[count_at..count_at + 4].copy_from_slice(&written.to_le_bytes());
+        write_atomic(&path, &out)?;
+        Ok(written as usize)
+    }
+
+    /// Reads pages [`Self::save_pool`] wrote back into the pool and the
+    /// index, each published as its own request would have left it, so the
+    /// conversations they held are found again by their tokens. A missing,
+    /// foreign or damaged file restores nothing; a page the pool already holds
+    /// or has no room for is skipped. Returns the pages restored.
+    pub fn restore_pool(
+        &self,
+        pool: &super::kv_pool::KvPool,
+        index: &super::prefix_index::PrefixIndex,
+        filename: &str,
+    ) -> Result<usize> {
+        let path = self.resolve(filename)?;
+        let Ok(bytes) = std::fs::read(&path) else {
+            return Ok(0);
+        };
+        Ok(decode_pool(&bytes, &self.fingerprint, pool, index).unwrap_or(0))
+    }
+
     /// Resolves `filename` to a path inside `dir`, rejecting anything that is
     /// not a single safe filename component — the only defense between a
     /// client-supplied name and `fs::read`/`fs::write`, so path traversal
@@ -443,6 +512,86 @@ impl SlotStore {
         }
         Ok(self.dir.join(filename))
     }
+}
+
+const POOL_FILE_MAGIC: &[u8] = b"ORGUPOOL";
+const POOL_FILE_VERSION: u32 = 1;
+
+/// [`SlotStore::restore_pool`]'s reader: `None` for a file that is not this
+/// model's or does not parse to its end.
+fn decode_pool(
+    bytes: &[u8],
+    fingerprint: &str,
+    pool: &super::kv_pool::KvPool,
+    index: &super::prefix_index::PrefixIndex,
+) -> Option<usize> {
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let slice = bytes.get(at..at + n)?;
+        at += n;
+        Some(slice)
+    };
+    let u32_of = |b: &[u8]| u32::from_le_bytes(b.try_into().unwrap());
+    if take(POOL_FILE_MAGIC.len())? != POOL_FILE_MAGIC || u32_of(take(4)?) != POOL_FILE_VERSION {
+        return None;
+    }
+    let fp_len = u32_of(take(4)?) as usize;
+    if take(fp_len)? != fingerprint.as_bytes() {
+        return None;
+    }
+    let page_tokens = u32_of(take(4)?) as usize;
+    let layers = u32_of(take(4)?) as usize;
+    if page_tokens != pool.page_tokens() || layers != pool.layers().len() || pool.is_compact() {
+        return None;
+    }
+    let count = u32_of(take(4)?) as usize;
+    let mut restored = 0;
+    for _ in 0..count {
+        let tag = u64::from_le_bytes(take(8)?.try_into().unwrap());
+        let tokens: Vec<u32> = take(page_tokens * 4)?
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| u32::from_le_bytes(*b))
+            .collect();
+        let mut rows: Vec<(Vec<f32>, Vec<f32>)> = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            let mut side = || -> Option<Vec<f32>> {
+                let n = u32_of(take(4)?) as usize;
+                Some(
+                    take(n * 4)?
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|b| f32::from_le_bytes(*b))
+                        .collect(),
+                )
+            };
+            let k = side()?;
+            let v = side()?;
+            rows.push((k, v));
+        }
+        if pool.holds(tag) {
+            continue;
+        }
+        let Ok(acquired) = pool.acquire(&[tag]) else {
+            break;
+        };
+        let page = acquired[0].page;
+        if !acquired[0].hit {
+            for (layer, (k, v)) in rows.iter().enumerate() {
+                if !k.is_empty() {
+                    pool.fill(layer, page, k, v);
+                }
+            }
+            pool.seal(page);
+            pool.refill_device(page);
+            index.remember(tag, &tokens);
+            restored += 1;
+        }
+        pool.release(&[page]);
+    }
+    Some(restored)
 }
 
 /// A safe filename is a non-empty single component of `[A-Za-z0-9._-]` that
@@ -856,5 +1005,56 @@ mod tests {
         let s = store(&tmp.0, 1);
         assert_eq!(s.save(0, "empty.bin").unwrap(), 0);
         assert!(!tmp.0.join("empty.bin").exists());
+    }
+
+    /// The pool's published pages survive a save and a restore into a fresh
+    /// pool: the same tag, the same tokens, the same rows, found again; a
+    /// file of another model's restores nothing.
+    #[test]
+    fn the_pools_pages_survive_a_save_and_a_restore() {
+        use crate::engine::kv_pool::{KvPool, LayerGeometry};
+        use crate::engine::prefix_index::PrefixIndex;
+        let geometry = || {
+            vec![LayerGeometry {
+                kv_dim: 4,
+                stride: 1,
+                ring: None,
+            }]
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = SlotStore::at(dir.path().to_path_buf(), "fp".into(), 1);
+        let (pool, index) = (KvPool::new(4, 2, geometry()), PrefixIndex::new(2));
+        let tag = 0xABCD_u64;
+        let page = pool.acquire(&[tag]).unwrap()[0].page;
+        let (k, v) = (vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![-1.0; 8]);
+        pool.fill(0, page, &k, &v);
+        pool.seal(page);
+        index.remember(tag, &[11, 12]);
+        pool.release(&[page]);
+        assert_eq!(store.save_pool(&pool, &index, "p.bin", 1 << 20).unwrap(), 1);
+
+        let (fresh, fresh_index) = (KvPool::new(4, 2, geometry()), PrefixIndex::new(2));
+        assert_eq!(
+            store.restore_pool(&fresh, &fresh_index, "p.bin").unwrap(),
+            1
+        );
+        assert!(fresh.holds(tag));
+        assert_eq!(fresh_index.tokens_of(tag), Some(vec![11, 12]));
+        let back = fresh.acquire(&[tag]).unwrap()[0];
+        assert!(back.hit);
+        assert_eq!(fresh.page_k(0, back.page), &k[..]);
+        assert_eq!(fresh.page_v(0, back.page), &v[..]);
+
+        let other = SlotStore::at(dir.path().to_path_buf(), "other".into(), 1);
+        let (third, third_index) = (KvPool::new(4, 2, geometry()), PrefixIndex::new(2));
+        assert_eq!(
+            other.restore_pool(&third, &third_index, "p.bin").unwrap(),
+            0
+        );
+        assert!(
+            other
+                .restore_pool(&third, &third_index, "../p.bin")
+                .is_err()
+        );
     }
 }

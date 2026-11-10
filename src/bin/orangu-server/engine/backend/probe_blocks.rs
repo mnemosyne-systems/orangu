@@ -53,9 +53,10 @@
 use crate::engine::quant::{
     GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ1_M, GGML_TYPE_IQ1_S,
     GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ3_XXS,
-    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0,
-    GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K,
-    GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0,
+    GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4, GGML_TYPE_NVFP4, GGML_TYPE_PQ2_0,
+    GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0,
+    GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+    GGML_TYPE_Q8_0,
 };
 
 pub(crate) fn next_byte(seed: &mut u64) -> u8 {
@@ -133,6 +134,13 @@ pub(crate) fn build_block(ggml_type: u32, seed: &mut u64) -> Vec<u8> {
         }
         t if t == GGML_TYPE_Q8_0 => {
             out.extend_from_slice(&f16_bytes(next_bounded_f32(seed)));
+            out.extend(next_bytes(seed, 32));
+        }
+        // Four UE4M3 sub-block scales, then 32 bytes of nibbles. Every
+        // scale byte decodes to a finite value no larger than 224 (the top
+        // bit is ignored, `0x7F` reads as zero), so they stay random.
+        t if t == GGML_TYPE_NVFP4 => {
+            out.extend(next_bytes(seed, 4));
             out.extend(next_bytes(seed, 32));
         }
         t if t == GGML_TYPE_Q2_0 => {

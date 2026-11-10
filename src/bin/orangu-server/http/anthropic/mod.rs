@@ -1672,6 +1672,7 @@ async fn drive_turns(
         RenderedChat {
             tokens: Vec::new(),
             cache_point: None,
+            shared_point: None,
         },
     );
     match prepared.prompt.resumed.take() {
@@ -1730,6 +1731,7 @@ async fn drive_turns(
                 timings_per_token: false,
                 role: Some(prepared.prompt.role),
                 cache_point: rendered.cache_point,
+                shared_point: rendered.shared_point,
                 background: false,
                 reasoning_budget: thinking_budget(&prepared.prompt.fields),
                 call_markers: prepared

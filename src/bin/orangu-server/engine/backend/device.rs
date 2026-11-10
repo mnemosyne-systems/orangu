@@ -298,6 +298,32 @@ impl fmt::Display for DeviceError {
 
 impl std::error::Error for DeviceError {}
 
+/// `ORANGU_DEVICE_BYTES`: the card memory this process may take, when it
+/// shares the card with another server — what placement, the KV pool and
+/// the driver's budget are read against in place of the whole card.
+pub fn device_bytes_cap() -> Option<u64> {
+    static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        super::tuning_profile::env_var("ORANGU_DEVICE_BYTES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&b| b > 0)
+    })
+}
+
+/// `candidates` with every card's memory capped at [`device_bytes_cap`].
+/// What the card held at start-up is then the other servers' and outside
+/// this one's share, so it is not counted against it.
+pub fn capped(mut candidates: Vec<DeviceCandidate>) -> Vec<DeviceCandidate> {
+    if let Some(cap) = device_bytes_cap() {
+        for c in &mut candidates {
+            c.vram_total_bytes = c.vram_total_bytes.map(|b| b.min(cap));
+            c.vram_used_at_start = None;
+        }
+    }
+    candidates
+}
+
 /// Every candidate's index, best first, by the policy in the module doc.
 pub fn preference_order(candidates: &[DeviceCandidate]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..candidates.len()).collect();

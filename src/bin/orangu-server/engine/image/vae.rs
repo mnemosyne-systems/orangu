@@ -718,7 +718,8 @@ pub(crate) fn row_matrix(
 ) -> Option<crate::engine::vecdot::RowI8> {
     if precision != VaePrecision::Int8
         || !crate::engine::vecdot::have_rowi8_tile()
-        || std::env::var("ORANGU_IMAGE_ROWI8_CONV").is_ok_and(|v| v == "off")
+        || crate::engine::backend::tuning_profile::env_var("ORANGU_IMAGE_ROWI8_CONV")
+            .is_ok_and(|v| v == "off")
     {
         return None;
     }

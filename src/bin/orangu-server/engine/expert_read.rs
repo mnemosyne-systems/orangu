@@ -96,11 +96,13 @@ impl Source {
 /// `ORANGU_EXPERT_READ`, when it names a route.
 fn configured_source() -> Option<Source> {
     static CONFIGURED: OnceLock<Option<Source>> = OnceLock::new();
-    *CONFIGURED.get_or_init(|| match std::env::var("ORANGU_EXPERT_READ").as_deref() {
-        Ok("mmap") => Some(Source::Mmap),
-        Ok("pread") => Some(Source::Pread),
-        Ok("direct") => Some(Source::Direct),
-        _ => None,
+    *CONFIGURED.get_or_init(|| {
+        match crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_READ").as_deref() {
+            Ok("mmap") => Some(Source::Mmap),
+            Ok("pread") => Some(Source::Pread),
+            Ok("direct") => Some(Source::Direct),
+            _ => None,
+        }
     })
 }
 

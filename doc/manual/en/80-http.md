@@ -208,6 +208,7 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `GET /props` | model and server metadata: backend, devices, build, slot count, workspace |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
 | `POST /slots/{id_slot}` | `?action=save\|restore` — persist or reload that slot's KV cache |
+| `POST /slots/pool` | `?action=save\|restore` — persist or reload every conversation the paged KV pool holds |
 | `GET /metrics` | Prometheus text: gauges, latency histograms, outcome and token counters |
 | `POST /completion` | native, streaming; `grammar`, `stop`, `logit_bias`, `presence_penalty`, `frequency_penalty`; `cache_prompt`/`id_slot`; disabled under `--embedding` |
 | `POST /infill` | code completion at a cursor, for a model with fill-in-the-middle tokens; `501` on any other |
@@ -2252,6 +2253,34 @@ missing `filename`, or an `action` that is neither `save` nor `restore`.
 Persisted files are swept by `orangu-server prune` once untouched for 30 days
 — they are a pure reprefill-avoidance cache, so an over-eager sweep only ever
 costs a one-time prefill.
+
+#### `POST /slots/pool?action=save|restore`
+
+Persists the paged KV pool's published pages to, or restores them from,
+`~/.orangu/server/<fingerprint>/slots/<filename>`: every conversation the pool
+still holds, not only each slot's last one. Each page is written with the
+tokens it was built from and its keys and values, the ones in use first and
+then the cached ones newest first, until `ORANGU_POOL_SAVE_MIB` (1024) of rows.
+A restored page is published as its own request would have left it, so the
+next prompt that begins with its tokens reuses it. The body is the slot
+endpoint's:
+
+```sh
+curl -s -X POST 'localhost:8100/slots/pool?action=save' \
+  -H 'Content-Type: application/json' -d '{"filename": "pool.bin"}'
+```
+
+```json
+{"filename":"pool.bin","n_saved":212,"page_tokens":64}
+```
+
+`restore` answers with `n_restored`. A missing file, one saved by another
+model, or one whose page size differs restores nothing, without an error; a
+page the pool already holds or has no room for is skipped. A pool that keeps
+its host pages in a compact format (`kv_cache` on the CPU backend) is not
+saved. `501` when the server keeps no paged pool or slot persistence is off;
+`400` for an empty `filename` or an unknown `action`. A server started with
+`ORANGU_SLOT_RESTORE=<prefix>` restores `<prefix>-pool.bin` beside its slots.
 
 #### `GET /metrics`
 

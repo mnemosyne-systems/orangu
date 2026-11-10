@@ -37,30 +37,72 @@
 //! choice is fastest; a profile from the previous driver is not applied to
 //! the next one. `ORANGU_TUNING_PROFILE=0` ignores the profile.
 //!
-//! The knobs are process-wide and read once, so one profile applies: the
-//! first device's. A second device with a profile of its own is told so at
-//! start-up rather than half-applied.
+//! Every device's profile is loaded. While a device is being brought up —
+//! between [`install`] and the end of its scope — [`var`] reads that
+//! device's profile, so the knobs a backend reads into its own instance
+//! follow its own card on a split model. A knob kept process-wide (a
+//! `static` read once) takes the profile of the device that first read it:
+//! the first device's, in practice.
 //!
 //! Every tuning variable reads through [`var`], [`env_var`] or [`var_os`] —
 //! the boolean flags too, through `engine::env` — so a profile can set any
 //! of them. A variable read before the first device is installed sees the
-//! environment alone.
+//! environment alone; when the profile then sets it, start-up says so.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
-/// What was loaded, once per process.
+/// One device's loaded profile.
 struct Profile {
     path: PathBuf,
     values: HashMap<String, String>,
 }
 
-static PROFILE: OnceLock<Option<Profile>> = OnceLock::new();
+/// Every installed device's profile by [`file_name`] key, `None` where the
+/// device has none. Leaked: a handful per process, alive for all of it.
+static PROFILES: Mutex<Vec<(String, Option<&'static Profile>)>> = Mutex::new(Vec::new());
+
+/// The first device's profile — what a read outside any device's bring-up
+/// sees.
+static PROFILE: OnceLock<Option<&'static Profile>> = OnceLock::new();
 
 /// The device's identity as [`file_name`] spells it, without the extension —
 /// what anything kept per device is keyed by.
 static DEVICE_KEY: OnceLock<String> = OnceLock::new();
+
+/// Names read before the first profile was installed — see [`value`].
+static EARLY: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Whether reads are still recorded into [`EARLY`]: until the first profile
+/// is installed, or start-up says it is over ([`settled`]) — so a process
+/// that never installs one (the CPU backend) pays nothing per read after
+/// start-up.
+static RECORDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Start-up is over: later reads are not recorded as early ones.
+pub fn settled() {
+    RECORDING.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    /// The device being brought up on this thread, if any — see [`Scope`].
+    static CURRENT: std::cell::Cell<Option<Option<&'static Profile>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// While alive, [`var`] on this thread reads the device's profile that
+/// [`install`] returned it for. Dropped at the end of the device's bring-up.
+#[must_use = "the device's profile applies only while the scope is alive"]
+pub struct Scope {
+    previous: Option<Option<&'static Profile>>,
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        CURRENT.with(|c| c.set(self.previous));
+    }
+}
 
 #[derive(serde::Deserialize)]
 struct File {
@@ -100,48 +142,84 @@ pub fn dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".orangu/server/tuning"))
 }
 
-/// Loads the profile for this adapter. Only the first call counts: knobs are
-/// read once, and a second device's profile arriving later could not change
-/// them consistently.
-pub fn install(info: &wgpu::AdapterInfo) {
+/// Loads the profile for this adapter, and applies it on this thread until
+/// the returned scope ends.
+pub fn install(info: &wgpu::AdapterInfo) -> Scope {
     install_file(file_name(
         info.vendor,
         info.device,
         &info.driver,
         &info.driver_info,
-    ));
+    ))
 }
 
 /// [`install`] for a device of another API — see [`named_file_name`].
-pub fn install_named(api: &str, device: &str, driver: &str) {
-    install_file(named_file_name(api, device, driver));
+pub fn install_named(api: &str, device: &str, driver: &str) -> Scope {
+    install_file(named_file_name(api, device, driver))
 }
 
-fn install_file(name: String) {
+fn install_file(name: String) -> Scope {
     let key = name.trim_end_matches(".json").to_string();
+    let profile = {
+        let mut profiles = PROFILES.lock().unwrap_or_else(|e| e.into_inner());
+        match profiles.iter().find(|(k, _)| *k == key) {
+            Some((_, profile)) => *profile,
+            None => {
+                let profile = (!disabled())
+                    .then(|| dir().and_then(|d| load(d.join(&name))))
+                    .flatten()
+                    .map(|p| &*Box::leak(Box::new(p)));
+                profiles.push((key.clone(), profile));
+                profile
+            }
+        }
+    };
     let first = DEVICE_KEY.get_or_init(|| key.clone());
-    if *first != key {
-        // A second device: the knobs were read for the first one's.
-        if disabled() {
-            return;
-        }
-        if let Some(path) = dir().map(|d| d.join(&name)).filter(|p| p.exists()) {
-            log::warn!(
-                "orangu-server: tuning profile {} is not applied: the tuning variables are \
-                 read once for the whole process, and the first device's profile ({}) is \
-                 the one in use",
-                path.display(),
-                loaded_path().map_or_else(|| "none".to_string(), |p| p.display().to_string())
-            );
-        }
-        return;
+    if *first == key {
+        PROFILE.get_or_init(|| {
+            if let Some(profile) = profile {
+                warn_early_reads(profile);
+            }
+            settled();
+            profile
+        });
+    } else if let Some(profile) = profile {
+        log::info!(
+            "orangu-server: tuning profile {} applies to this device's own knobs; \
+             process-wide ones keep the first device's ({})",
+            profile.path.display(),
+            loaded_path().map_or_else(|| "none".to_string(), |p| p.display().to_string())
+        );
     }
-    PROFILE.get_or_init(|| {
-        if disabled() {
-            return None;
-        }
-        load(dir()?.join(&name))
-    });
+    Scope {
+        previous: CURRENT.with(|c| c.replace(Some(profile))),
+    }
+}
+
+/// Says which of `profile`'s values were read before it was installed, and
+/// so are not in effect.
+fn warn_early_reads(profile: &Profile) {
+    let early = EARLY.lock().unwrap_or_else(|e| e.into_inner());
+    let missed = early_and_set(&early, profile);
+    if !missed.is_empty() {
+        log::warn!(
+            "orangu-server: tuning profile {} sets {} — read before the profile was \
+             installed, so this run uses the environment or the default for them",
+            profile.path.display(),
+            missed.join(", ")
+        );
+    }
+}
+
+/// The names in `early` that `profile` sets, in order, once each.
+fn early_and_set(early: &[String], profile: &Profile) -> Vec<String> {
+    let mut missed: Vec<String> = early
+        .iter()
+        .filter(|n| profile.values.contains_key(n.as_str()))
+        .cloned()
+        .collect();
+    missed.dedup();
+    missed
 }
 
 fn disabled() -> bool {
@@ -207,14 +285,25 @@ pub fn var_os(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name).or_else(|| value(name).map(std::ffi::OsString::from))
 }
 
-/// `name` from the profile alone.
+/// `name` from the profile alone: the device being brought up on this
+/// thread, else the first device's.
 pub fn value(name: &str) -> Option<&'static str> {
-    PROFILE
-        .get()?
-        .as_ref()?
-        .values
-        .get(name)
-        .map(String::as_str)
+    let profile = match CURRENT.with(std::cell::Cell::get) {
+        Some(current) => current,
+        None => match PROFILE.get() {
+            Some(first) => *first,
+            None => {
+                if RECORDING.load(std::sync::atomic::Ordering::Relaxed) {
+                    let mut early = EARLY.lock().unwrap_or_else(|e| e.into_inner());
+                    if !early.iter().any(|n| n == name) {
+                        early.push(name.to_string());
+                    }
+                }
+                return None;
+            }
+        },
+    };
+    profile?.values.get(name).map(String::as_str)
 }
 
 /// The loaded profile's path, for the startup report and `/props`.
@@ -244,12 +333,12 @@ mod tests {
         );
     }
 
-    /// Every `ORANGU_*` read under `engine::backend` goes through the
+    /// Every `ORANGU_*` read under `engine` goes through the
     /// profile's readers, so a profile can set it — except the variables
     /// below, which select a test, a probe or a diagnostic rather than tune a
     /// kernel.
     #[test]
-    fn every_backend_tuning_variable_reads_through_the_profile() {
+    fn every_engine_tuning_variable_reads_through_the_profile() {
         const NOT_TUNING: &[&str] = &[
             "ORANGU_TEST_",
             "ORANGU_BENCH_",
@@ -265,9 +354,17 @@ mod tests {
             "ORANGU_TUNING_PROFILE",
             "ORANGU_NPU_MODE",
             "ORANGU_Q2K_STUB",
+            // Instruments: they report on a run rather than tune it.
+            "ORANGU_DECODE_STAGES",
+            "ORANGU_GPU_TRACE",
+            "ORANGU_MOE_TIME",
+            "ORANGU_NPU_DUMP_ACT",
+            "ORANGU_EXPERT_USAGE",
+            // A quality cap the configuration also sets, not a kernel choice.
+            "ORANGU_IMAGE_REFERENCE",
         ];
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/bin/orangu-server/engine/backend");
+        let root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/orangu-server/engine");
         let mut files = Vec::new();
         let mut dirs = vec![root];
         while let Some(dir) = dirs.pop() {
@@ -289,6 +386,9 @@ mod tests {
             for (n, line) in text.lines().enumerate() {
                 if line.trim() == "mod tests {" {
                     break;
+                }
+                if line.trim_start().starts_with("//") {
+                    continue;
                 }
                 for reader in ["std::env::var(\"", "std::env::var_os(\""] {
                     let Some(at) = line.find(reader) else {
@@ -312,6 +412,43 @@ mod tests {
              tuning_profile::var/env_var/var_os, or env_tuning_value:\n{}",
             direct.join("\n")
         );
+    }
+
+    fn leaked(values: &[(&str, &str)]) -> &'static super::Profile {
+        Box::leak(Box::new(super::Profile {
+            path: "test.json".into(),
+            values: values
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }))
+    }
+
+    /// While a device is brought up, its own profile answers on that thread
+    /// alone, and the answer ends with the scope.
+    #[test]
+    fn a_devices_profile_answers_during_its_bring_up() {
+        let second = leaked(&[("ORANGU_SCOPE_TEST_KNOB", "7")]);
+        assert_eq!(super::value("ORANGU_SCOPE_TEST_KNOB"), None);
+        {
+            let _scope = super::Scope {
+                previous: super::CURRENT.with(|c| c.replace(Some(Some(second)))),
+            };
+            assert_eq!(super::value("ORANGU_SCOPE_TEST_KNOB"), Some("7"));
+            let elsewhere = std::thread::spawn(|| super::value("ORANGU_SCOPE_TEST_KNOB"));
+            assert_eq!(elsewhere.join().unwrap(), None);
+        }
+        assert_eq!(super::value("ORANGU_SCOPE_TEST_KNOB"), None);
+    }
+
+    /// A knob read before the profile arrived is named when the profile
+    /// sets it, and only then.
+    #[test]
+    fn a_knob_read_too_early_is_named() {
+        let profile = leaked(&[("A", "1"), ("C", "3")]);
+        let early = ["A".to_string(), "B".to_string(), "C".to_string()];
+        assert_eq!(super::early_and_set(&early, profile), ["A", "C"]);
+        assert!(super::early_and_set(&["B".to_string()], profile).is_empty());
     }
 
     #[test]

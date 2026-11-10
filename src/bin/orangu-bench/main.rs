@@ -231,6 +231,18 @@ struct Args {
     #[arg(long, value_name = "PATH")]
     chat_fixture: Option<PathBuf>,
 
+    /// Send each turn's recorded replies instead of the model's, so every build sees the same prompts.
+    #[arg(long, default_value_t = false)]
+    chat_fixed: bool,
+
+    /// Write the session `--chat` runs, the model's replies and tool results included, as a fixture.
+    #[arg(long, value_name = "PATH")]
+    chat_record: Option<PathBuf>,
+
+    /// The checkout whose files answer read_file and search while recording.
+    #[arg(long, value_name = "DIR")]
+    chat_workspace: Option<PathBuf>,
+
     /// KL mode: compare the server's teacher-forced distributions with this reference, saving it first if absent.
     #[arg(long, value_name = "PATH")]
     kl: Option<PathBuf>,
@@ -240,8 +252,24 @@ struct Args {
     kl_rows: usize,
 
     /// Candidates `--kl` keeps per position.
-    #[arg(long, default_value_t = 32, value_name = "N")]
+    #[arg(long, default_value_t = 256, value_name = "N")]
     kl_top: usize,
+
+    /// Most mean KL `--kl` accepts before it reports the run over threshold. Default: by the weight type.
+    #[arg(long, value_name = "NATS")]
+    kl_max: Option<f64>,
+
+    /// Fewest positions, in percent, whose top token `--kl` needs to agree. Default: by the weight type.
+    #[arg(long, value_name = "PCT")]
+    kl_min_top1: Option<f64>,
+
+    /// The perplexity `--perplexity` is judged against.
+    #[arg(long, value_name = "PPL")]
+    ppl_baseline: Option<f64>,
+
+    /// How far above `--ppl-baseline`, in percent, perplexity may rise before the run is over threshold.
+    #[arg(long, default_value_t = 1.0, value_name = "PCT")]
+    ppl_max_increase: f64,
 
     /// Tokens `--kl` runs.
     #[arg(long, default_value_t = 1024, value_name = "N")]
@@ -482,6 +510,10 @@ struct Args {
     /// After a two-value `--sweep`, keep the winning value in the server's tuning profile.
     #[arg(long)]
     write_profile: bool,
+
+    /// Tune the device's profile knob by knob: `VAR=control;a;b`, repeatable, or `default` / `prefill`.
+    #[arg(long, value_name = "VAR=VALUES")]
+    tune: Vec<String>,
 
     /// Environment held constant across every `--sweep` point (repeatable).
     #[arg(long = "sweep-env", value_name = "K=V")]
@@ -1253,8 +1285,14 @@ fn stream_and_time(
         line.clear();
         // A mid-stream read error (server dropped the connection, timeout) ends
         // the stream rather than crashing — we time whatever tokens did arrive.
+        // Before the first token there is nothing to time: that is a failed
+        // request, not a decode at 0 tok/s.
         let read = match reader.read_line(&mut line) {
             Ok(read) => read,
+            Err(e) if n == 0 && reported.is_none() => anyhow::bail!(
+                "no token arrived after {:.0} s ({e}); a long prefill needs a larger --timeout",
+                t0.elapsed().as_secs_f64()
+            ),
             Err(_) => break,
         };
         if read == 0 {
@@ -1411,6 +1449,9 @@ fn run(args: &Args) -> anyhow::Result<()> {
 
     // Starts its own servers, so it comes before the client below is pointed
     // at one that is not up yet.
+    if !args.tune.is_empty() {
+        return run_tune(args);
+    }
     if args.sweep.is_some() {
         return run_sweep(args);
     }
@@ -1571,6 +1612,10 @@ fn measure_run(
     write_bundle(args, args.bundle.as_deref(), &env, &measured)?;
     record_and_chart(args, &measured)?;
     write_report(args, &env, &measured, profile.as_ref())?;
+    if args.fail_on_regression && kl::over_threshold() {
+        eprintln!("orangu-bench: the measurement is over its threshold");
+        std::process::exit(2);
+    }
     Ok(measured)
 }
 
@@ -2199,7 +2244,106 @@ fn capped(cmd: &str, cap: Option<&str>) -> String {
     }
 }
 
+/// The knobs `--tune default` searches, each with its control first: the
+/// decode kernels' rows and workgroups, the norm's workgroup, the attention
+/// split, and where prefill turns to the cooperative tiles.
+const DEFAULT_TUNE: &[&str] = &[
+    "ORANGU_REDUCE_N_ROWS=;1;2;4",
+    "ORANGU_Q4K_I8_ROWS=;1;2;4",
+    "ORANGU_Q4K_I8_GROUPS=;1;2;4",
+    "ORANGU_NORM_WG=;64;128;256",
+    "ORANGU_ATTN_SPLIT_K=;8;16;32;64",
+    "ORANGU_COOP_MIN_TOKENS=;16;24;32;48",
+];
+
+/// The knobs `--tune prefill` searches: the prompt GEMM's row tile and when
+/// it goes wide, the thin tile, where the cooperative tiles take over, and
+/// how many workgroups a prefill pass's split attention aims for. Judged at
+/// the prompt lengths `--pp` names, which is what makes it a search per
+/// context.
+const PREFILL_TUNE: &[&str] = &[
+    "ORANGU_MMQ_ROWS=;64;128",
+    "ORANGU_MMQ_WIDE_MIN_WG=;16;32;64",
+    "ORANGU_THIN_TILE_SIZE=;4;8;16",
+    "ORANGU_COOP_MIN_TOKENS=;16;24;32;48",
+    "ORANGU_ATTN_PREFILL_SPLIT=;128;256;512",
+];
+
+/// One knob of `--tune`: the variable, its control value and the candidates.
+fn tune_plan(spec: &str) -> anyhow::Result<(String, String, Vec<String>)> {
+    let (var, values) = spec
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--tune wants VAR=control;a;b, got {spec:?}"))?;
+    let mut values: Vec<String> = values.split(';').map(|v| v.trim().to_string()).collect();
+    if values.len() < 2 {
+        anyhow::bail!("--tune {spec:?} has no candidate besides its control");
+    }
+    let control = values.remove(0);
+    Ok((var.trim().to_string(), control, values))
+}
+
+/// `--tune`: each knob in turn, each candidate value against the knob's
+/// current winner as a two-value sweep (`a,b,b,a`) judged by its verdict,
+/// and a candidate that is better somewhere and worse nowhere written to the
+/// device's tuning profile and made the winner the next candidate faces. A
+/// knob decided is in the profile when the next is searched, so the search
+/// moves through the knobs as their best combination found so far — one
+/// knob at a time, not every combination. The server's start-up self-check
+/// refuses a kernel that disagrees with the reference, so a candidate that
+/// is fast because it is wrong never runs.
+fn run_tune(args: &Args) -> anyhow::Result<()> {
+    let specs: Vec<String> = args
+        .tune
+        .iter()
+        .flat_map(|t| match t.as_str() {
+            "default" => DEFAULT_TUNE.iter().map(|s| s.to_string()).collect(),
+            "prefill" => PREFILL_TUNE.iter().map(|s| s.to_string()).collect(),
+            other => vec![other.to_string()],
+        })
+        .collect();
+    let mut decided = Vec::new();
+    for spec in &specs {
+        let (var, mut winner, candidates) = tune_plan(spec)?;
+        for candidate in &candidates {
+            if *candidate == winner {
+                continue;
+            }
+            println!("\n### tune {var}: {winner:?} against {candidate:?}");
+            let mut point = args.clone();
+            point.tune.clear();
+            point.sweep = Some(format!("{var}={winner};{candidate}"));
+            point.write_profile = true;
+            point.fail_on_regression = false;
+            if run_sweep_judged(&point)?.is_some_and(|j| j.better && !j.worse) {
+                winner = candidate.clone();
+            }
+        }
+        println!(
+            "### tune {var}: {}",
+            if winner.is_empty() {
+                "<unset>"
+            } else {
+                &winner
+            }
+        );
+        decided.push((var, winner));
+    }
+    println!("\ntuned:");
+    for (var, value) in decided {
+        println!(
+            "  {var} = {}",
+            if value.is_empty() { "<unset>" } else { &value }
+        );
+    }
+    Ok(())
+}
+
 fn run_sweep(args: &Args) -> anyhow::Result<()> {
+    run_sweep_judged(args).map(|_| ())
+}
+
+/// [`run_sweep`], handing back the verdict.
+fn run_sweep_judged(args: &Args) -> anyhow::Result<Option<Judged>> {
     let mut spec = sweep::Spec::parse(args.sweep.as_deref().expect("checked by the caller"))?;
     if !args.sweep_as_given {
         spec.interleave_two_arms();
@@ -2207,10 +2351,11 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
     if args.fail_on_regression || args.write_profile {
         check_verdict_runs(&spec)?;
     }
-    if args.write_profile && !spec.var.starts_with("ORANGU_") {
+    if args.write_profile
+        && let Some(var) = spec.vars().into_iter().find(|v| !v.starts_with("ORANGU_"))
+    {
         anyhow::bail!(
-            "--write-profile keeps a tuning variable, and {} is not one (an `ORANGU_*` name)",
-            spec.var
+            "--write-profile keeps tuning variables, and {var} is not one (an `ORANGU_*` name)"
         );
     }
     let cmd = args.sweep_cmd.as_deref().ok_or_else(|| {
@@ -2255,7 +2400,7 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
         // one's.
         let log = std::path::PathBuf::from(format!("orangu-sweep-{}.log", slug(&label)));
         let mut env = fixed.clone();
-        env.push((spec.var.clone(), value.clone()));
+        env.extend(spec.assignments(value));
         let server = sweep::start(cmd, &env, port, &log, timeout, &baseline)?;
         sweep::wait_until_serving(&client, &args.url, &server, timeout)?;
 
@@ -2334,7 +2479,7 @@ fn run_sweep(args: &Args) -> anyhow::Result<()> {
         eprintln!("orangu-bench: the candidate is worse than the control beyond the noise");
         std::process::exit(2);
     }
-    Ok(())
+    Ok(judged)
 }
 
 /// Refuses a `--fail-on-regression` sweep that could never reach a verdict —
@@ -2432,7 +2577,9 @@ fn write_sweep_profile(
     let home = home::home_dir()
         .ok_or_else(|| anyhow::anyhow!("--write-profile: no home directory to write under"))?;
     let path = tuning_profile::path_under(&home, key);
-    tuning_profile::write(&path, &spec.var, &candidate)?;
+    for (var, value) in spec.assignments(&candidate) {
+        tuning_profile::write(&path, &var, &value)?;
+    }
     println!(
         "profile: {}={shown} written to {}",
         spec.var,
@@ -7017,6 +7164,7 @@ mod tests {
     #[test]
     fn every_flag_is_offered_by_every_completion_script() {
         use clap::CommandFactory;
+
         let missing = super::shell_completions::unoffered(
             &super::Args::command(),
             &super::COMPLETION_SCRIPTS,
@@ -7623,5 +7771,24 @@ mod tests {
         assert!((s.continuation_tok_per_s() - 64.0).abs() < 1e-9);
         // What the plain sweep would have reported for the same response.
         assert!((s.tok_per_s() - 512.0).abs() < 1e-9);
+    }
+
+    /// A knob's plan is its control and its candidates; every default plan
+    /// parses, and a knob with nothing to try is refused.
+    #[test]
+    fn a_tune_plan_names_a_control_and_its_candidates() {
+        let (var, control, candidates) = super::tune_plan("ORANGU_NORM_WG=;64;128").unwrap();
+        assert_eq!((var.as_str(), control.as_str()), ("ORANGU_NORM_WG", ""));
+        assert_eq!(candidates, ["64", "128"]);
+        for spec in super::DEFAULT_TUNE.iter().chain(super::PREFILL_TUNE) {
+            let (var, _, candidates) = super::tune_plan(spec).unwrap();
+            assert!(
+                var.starts_with("ORANGU_") && !candidates.is_empty(),
+                "{spec}"
+            );
+            assert!(super::sweep::Spec::parse(&format!("{var}=;{}", candidates[0])).is_ok());
+        }
+        assert!(super::tune_plan("ORANGU_X=1").is_err());
+        assert!(super::tune_plan("nothing").is_err());
     }
 }

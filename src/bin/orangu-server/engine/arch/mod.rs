@@ -302,7 +302,7 @@ const ATTN_KEY_TILE: usize = 32;
 fn attn_token_tile() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_ATTN_TOKEN_TILE")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_ATTN_TOKEN_TILE")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|n| *n > 0)
@@ -2007,7 +2007,7 @@ pub(crate) fn moe_overlap(
 pub(crate) fn moe_overlap_min_tokens() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_MOE_OVERLAP_MIN_TOKENS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_MOE_OVERLAP_MIN_TOKENS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(1)
@@ -2172,7 +2172,9 @@ impl Drop for MoeSpan {
 /// that drifts.
 pub(crate) fn moe_shared_on_npu() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| !std::env::var("ORANGU_NPU_MOE").is_ok_and(|v| v == "0"))
+    *ON.get_or_init(|| {
+        !crate::engine::backend::tuning_profile::env_var("ORANGU_NPU_MOE").is_ok_and(|v| v == "0")
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2734,7 +2736,7 @@ const EXPERT_STREAM_CHUNK_TOKENS: usize = 2048;
 pub(crate) fn expert_gemm_min_tokens() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| {
-        std::env::var("ORANGU_EXPERT_GEMM_TOKENS")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_GEMM_TOKENS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(EXPERT_GEMM_TOKENS_DEFAULT)
@@ -3021,7 +3023,7 @@ pub(crate) fn project_expert(
 pub(crate) fn expert_budget() -> usize {
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {
-        std::env::var("ORANGU_EXPERT_BUDGET")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_EXPERT_BUDGET")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0)
@@ -3307,6 +3309,22 @@ pub enum ForwardOutcome {
     /// largest first — see [`GreedySampleParams::top_k`].
     Candidates(Vec<(u32, f32)>),
 }
+
+/// What a [`ModelForward::decode_lookahead`] step runs.
+pub enum LookaheadInput<'a> {
+    /// A token the host has.
+    Token(u32),
+    /// The pick of a step still pending.
+    Pending(&'a crate::engine::backend::vulkan::PendingToken),
+}
+
+/// The first sampler-scratch slot a verify's rows take
+/// ([`ModelForward::forward_verify_sampled`]): past every request slot's own
+/// (`slot + 1`), so a verify row never shares a request's scratch.
+pub const VERIFY_SAMPLE_SLOTS: usize = 1 << 16;
+
+/// The widest verify a row's sampler scratch is laid out for.
+pub const MAX_VERIFY_ROWS: usize = 64;
 
 /// One sequence's share of a batched decode step — its cache, the position
 /// its next token takes, and the slot whose per-slot device resources it
@@ -3609,7 +3627,7 @@ pub(crate) fn run_layers_resident<'a>(
         }
         bufs.swap(0, 1);
         group_layers += 1;
-        if group_layers >= gemma::prefill_group_layers(layers_per_submit) {
+        if group_layers >= gemma::prefill_group_layers(layers_per_submit, Some(vulkan)) {
             vulkan.end_prefill_group();
             vulkan.begin_prefill_group();
             group_layers = 0;
@@ -3852,10 +3870,47 @@ pub(crate) fn batch_verify() -> bool {
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_BATCH_VERIFY"))
 }
 
-/// The slot a range's decode chain caches its GPU resources under
-/// (`ModelForward::forward_layers`): far above any request slot, so it
-/// never meets one.
+/// The first of the [`RANGE_SLOTS`] slots a range's decode chain caches its
+/// GPU resources under (`ModelForward::forward_layers`): far above any
+/// request slot, so it never meets one.
 pub(crate) const RANGE_SLOT: usize = usize::MAX / 2;
+
+/// How many sequences on one worker can record a range's decode chain at
+/// once, each under its own slot from [`RANGE_SLOT`] up.
+pub(crate) const RANGE_SLOTS: usize = 4;
+
+static RANGE_TURNS: [std::sync::Mutex<()>; RANGE_SLOTS] =
+    [const { std::sync::Mutex::new(()) }; RANGE_SLOTS];
+
+/// A range slot held for one decode chain: `slot` is the `batch_slot` its
+/// resources are cached under, and nobody else records under it until this
+/// is dropped.
+pub(crate) struct RangeTurn {
+    pub slot: usize,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Takes a range slot for `cache`'s sequence: the one its cache maps to when
+/// free, so a sequence keeps finding its own resources, else any free one,
+/// else waits for its own.
+pub(crate) fn range_turn(cache: &crate::engine::kv_cache::KvCache) -> RangeTurn {
+    let home = (cache.layers.as_ptr() as usize / std::mem::align_of::<usize>()) % RANGE_SLOTS;
+    let at = |i: usize, turn| RangeTurn {
+        slot: RANGE_SLOT + i,
+        _turn: turn,
+    };
+    for i in (0..RANGE_SLOTS).map(|k| (home + k) % RANGE_SLOTS) {
+        match RANGE_TURNS[i].try_lock() {
+            Ok(turn) => return at(i, turn),
+            Err(std::sync::TryLockError::Poisoned(p)) => return at(i, p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+    }
+    at(
+        home,
+        RANGE_TURNS[home].lock().unwrap_or_else(|p| p.into_inner()),
+    )
+}
 
 /// `ORANGU_WORKERS_RANGE_CHAIN=0`: a range's decode step takes the host
 /// step path instead of one recorded chain — the control arm the chain was
@@ -3865,9 +3920,9 @@ pub(crate) fn range_chains() -> bool {
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_WORKERS_RANGE_CHAIN"))
 }
 
-/// Held while a range's decode chain is recorded and run, so two sequences
-/// on one worker never share [`RANGE_SLOT`]'s resources at once.
-pub(crate) static RANGE_CHAINS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Held while a range's prompt chunk runs on the device-resident stream, so
+/// two sequences' prompt chunks on one worker take turns with its scratch.
+pub(crate) static RANGE_PREFILL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub trait ModelForward: Send + Sync {
     fn config(&self) -> &ModelConfig;
@@ -4175,6 +4230,46 @@ pub trait ModelForward: Send + Sync {
         slot_id: usize,
     ) -> Result<Vec<Vec<f32>>> {
         self.forward_all_logits(cache, tokens, start_pos, slot_id)
+    }
+
+    /// A greedy decode step whose pick stays on the device until asked for,
+    /// so the step after it can be submitted first — the host then reads
+    /// this step's token while the device runs the next. `input` is the
+    /// token to run: one the host has, or the pick of a step still pending,
+    /// gathered on the device from where that step left it. `None`, with
+    /// nothing run, where the architecture or device has no such path.
+    ///
+    /// The step's row is in `cache` when this returns, whatever its token
+    /// turns out to be: a caller that will not use it truncates it.
+    fn decode_lookahead(
+        &self,
+        cache: &mut KvCache,
+        input: LookaheadInput<'_>,
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<Option<crate::engine::backend::vulkan::PendingToken>> {
+        let _ = (cache, input, start_pos, slot_id);
+        Ok(None)
+    }
+
+    /// [`Self::forward_verify`] with each row sampled where its logits are:
+    /// row `r` as `samples[r]` asks — the greedy token, or the `top_k`
+    /// largest `(token, logit)` pairs — read back instead of the row's logits,
+    /// as a batched decode step's rows already are. `None`, with nothing run,
+    /// where the architecture or device has no such path; the caller then
+    /// verifies with [`Self::forward_verify`]. Every row's sampler has to be
+    /// the same apart from position: the device applies one repeat-penalty
+    /// window to all of them.
+    fn forward_verify_sampled(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+        samples: &[GreedySampleParams<'_>],
+    ) -> Result<Option<Vec<ForwardOutcome>>> {
+        let _ = (cache, tokens, start_pos, slot_id, samples);
+        Ok(None)
     }
 
     /// Every token's final hidden state (`[n_tokens, n_embd]`, before the

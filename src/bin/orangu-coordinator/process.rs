@@ -31,7 +31,7 @@ use std::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
     process::Command,
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
     time::Instant,
 };
 
@@ -73,6 +73,9 @@ struct ActiveProcess {
     /// request — can still be reported with its own diagnostic output
     /// attached, the same as a startup failure.
     tail: OutputTail,
+    /// The card bytes it was started with (`ORANGU_DEVICE_BYTES`), when it
+    /// shares its card; a server without one may take the whole card.
+    device_cap: Option<u64>,
 }
 
 /// An `orangu-server` found already listening on a profile's address.
@@ -216,9 +219,44 @@ pub struct Coordinator {
     /// What the swap or start under way is doing, for the clients waiting on
     /// it — see [`Coordinator::progress`].
     progress: StdMutex<Option<Progress>>,
-    /// Each profile's need from its fit check ([`PlanFit::needs`]), by
+    /// Each profile's need from its fit check ([`PlanFit::need`]), by
     /// [`needs_key`].
-    needs: StdMutex<HashMap<String, u64>>,
+    needs: StdMutex<HashMap<String, Need>>,
+    /// The latest fit verdict for each profile, by [`needs_key`], with when
+    /// it was had: one asked by a request answers for the requests that
+    /// waited beside it ([`FIT_VERDICT_FRESH`]).
+    verdicts: StdMutex<HashMap<String, (Instant, FitVerdict)>>,
+    /// Held while fit checks run, outside the lock on the active set, so
+    /// that the requests for one profile run its check once.
+    fit_checks: Mutex<()>,
+    /// Fit checks run under test too, against the stand-in server.
+    #[cfg(test)]
+    plan_in_test: std::sync::atomic::AtomicBool,
+}
+
+/// What a fit check says: `Err` with its problems when the model does not
+/// run here, otherwise what it needs (`None` when the plan cannot say).
+type FitVerdict = std::result::Result<Option<PlanFit>, String>;
+
+/// How long a fit verdict answers for its profile before it is asked again.
+const FIT_VERDICT_FRESH: Duration = Duration::from_secs(30);
+
+/// The fit checks one activation has run, outside the lock on the active set.
+#[derive(Default)]
+struct FitChecks {
+    /// The verdict for the profile being made active.
+    verdict: Option<FitVerdict>,
+    /// The profiles whose need was asked, answered or not, by [`needs_key`].
+    asked: Vec<String>,
+}
+
+/// Where [`Coordinator::activate`] got to.
+enum Activation {
+    /// The profile is serving at this origin.
+    Active(String),
+    /// The fit checks these profiles need run first, with the lock on the
+    /// active set released: `true` marks the profile being made active.
+    Check(Vec<(CoordinatorLlmEntry, bool)>),
 }
 
 /// What a profile's need is kept under: the settings it depends on.
@@ -251,6 +289,19 @@ impl Drop for ProgressGuard<'_> {
     }
 }
 
+/// Clears [`Coordinator::progress`] after a fit check toward the profile it
+/// names, unless a swap toward another has taken it over meanwhile.
+struct CheckProgress<'a>(&'a Coordinator, String);
+
+impl Drop for CheckProgress<'_> {
+    fn drop(&mut self) {
+        let mut progress = self.0.progress.lock().unwrap();
+        if progress.as_ref().is_some_and(|p| p.profile == self.1) {
+            *progress = None;
+        }
+    }
+}
+
 /// One proxied request, counted in [`Coordinator::in_flight`] until it is
 /// dropped — which the proxy arranges to happen when the response body has
 /// been streamed to the client, or the client has gone.
@@ -262,7 +313,7 @@ impl Drop for InFlight {
     }
 }
 
-/// How long [`Coordinator::fit_verdict`] waits for `orangu-server plan`. It
+/// How long [`run_plan`] waits for `orangu-server plan`. It
 /// reads tensor tables only, which is seconds even for a model of many
 /// shards.
 const FIT_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
@@ -270,13 +321,48 @@ const FIT_CHECK_TIMEOUT: Duration = Duration::from_secs(20);
 /// The verdict in `orangu-server plan --json`'s output: `Err` with its
 /// problems only when it says the model does not run.
 /// What a model needs of the machine and what the machine has, from
-/// `plan --json`: the weights every token touches plus the configured
-/// context's KV cache, against the machine's memory and its dedicated
-/// cards'.
+/// `plan --json`: what wants a card (the weights a device uploads and their
+/// KV) and what lives in host memory (the rest of the weights and the host
+/// KV pool), against the cards' memory and the machine's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PlanFit {
-    needs: u64,
-    capacity: u64,
+    need: Need,
+    /// The dedicated cards' memory together.
+    cards: u64,
+    /// The memory of the card the profile lands on; `0` when not reported.
+    card: u64,
+    /// The machine's own memory.
+    memory: u64,
+}
+
+/// One model's need, split where it can be met.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Need {
+    /// Bytes that run from a card when there is room on one, and from host
+    /// memory when there is not.
+    device: u64,
+    /// Bytes that only host memory holds.
+    host: u64,
+}
+
+impl Need {
+    fn total(self) -> u64 {
+        self.device + self.host
+    }
+}
+
+/// Runs a fit check's `plan`. Only a definite "does not run" refuses: no
+/// command, a server too old to answer, one that takes longer than
+/// [`FIT_CHECK_TIMEOUT`], or an answer that does not parse lets the swap go
+/// ahead.
+async fn run_plan(command: Option<Command>) -> FitVerdict {
+    let Some(mut command) = command else {
+        return Ok(None);
+    };
+    let Ok(Ok(output)) = tokio::time::timeout(FIT_CHECK_TIMEOUT, command.output()).await else {
+        return Ok(None);
+    };
+    fit_from_plan(&output.stdout)
 }
 
 /// `plan --json`'s verdict: `Err` with its problems when it says the model
@@ -291,10 +377,34 @@ fn fit_from_plan(stdout: &[u8]) -> std::result::Result<Option<PlanFit>, String> 
         return Ok(None);
     };
     if v["runs"].as_bool() != Some(false) {
-        return Ok(v["needs_bytes"]
+        // The split, where the server reports it; a server without it
+        // reports one pooled need, which counts as host memory against the
+        // pooled capacity.
+        let split = v["device_needs_bytes"]
             .as_u64()
-            .zip(v["capacity_bytes"].as_u64())
-            .map(|(needs, capacity)| PlanFit { needs, capacity }));
+            .zip(v["host_needs_bytes"].as_u64())
+            .zip(
+                v["device_memory_bytes"]
+                    .as_u64()
+                    .zip(v["memory_bytes"].as_u64()),
+            )
+            .map(|((device, host), (cards, memory))| PlanFit {
+                need: Need { device, host },
+                cards,
+                memory,
+                card: v["card_bytes"].as_u64().unwrap_or(0),
+            });
+        return Ok(split.or_else(|| {
+            v["needs_bytes"]
+                .as_u64()
+                .zip(v["capacity_bytes"].as_u64())
+                .map(|(host, memory)| PlanFit {
+                    card: 0,
+                    need: Need { device: 0, host },
+                    cards: 0,
+                    memory,
+                })
+        }));
     }
     let problems: Vec<&str> = v["problems"]
         .as_array()
@@ -307,23 +417,27 @@ fn fit_from_plan(stdout: &[u8]) -> std::result::Result<Option<PlanFit>, String> 
     })
 }
 
-/// Whether a model needing `fit.needs` runs beside the models that stay
-/// loaded (`beside`: each profile's name and need), within `fit.capacity`.
-/// `Err` says what it would take.
-fn fits_beside(fit: PlanFit, beside: &[(String, u64)]) -> std::result::Result<(), String> {
-    let staying: u64 = beside.iter().map(|(_, n)| n).sum();
-    if fit.needs.saturating_add(staying) <= fit.capacity {
+/// Whether a model needing `fit.need` runs beside the models that stay
+/// loaded (`beside`: each profile's name and need). Their card bytes fill the
+/// cards together, what the cards cannot hold runs from host memory, and
+/// host memory decides. `Err` says what it would take.
+fn fits_beside(fit: PlanFit, beside: &[(String, Need)]) -> std::result::Result<(), String> {
+    let device = fit.need.device + beside.iter().map(|(_, n)| n.device).sum::<u64>();
+    let host = fit.need.host + beside.iter().map(|(_, n)| n.host).sum::<u64>();
+    let memory_needs = host + device.saturating_sub(fit.cards);
+    if memory_needs <= fit.memory {
         return Ok(());
     }
     let names: Vec<String> = beside
         .iter()
-        .map(|(name, needs)| format!("'{name}' ({})", orangu::format::format_bytes(*needs)))
+        .map(|(name, need)| format!("'{name}' ({})", orangu::format::format_bytes(need.total())))
         .collect();
     Err(format!(
-        "it needs {}, and beside {} that is more than this machine's {}",
-        orangu::format::format_bytes(fit.needs),
+        "it needs {}, and beside {} that is {} of host memory where this machine has {}",
+        orangu::format::format_bytes(fit.need.total()),
         names.join(" and "),
-        orangu::format::format_bytes(fit.capacity)
+        orangu::format::format_bytes(memory_needs),
+        orangu::format::format_bytes(fit.memory)
     ))
 }
 
@@ -349,6 +463,10 @@ fn swap_slot_prefix(profile: &str) -> String {
         .collect();
     format!("coordinator-{name}")
 }
+
+/// What a server sharing its card is given past its planned need: the
+/// prefill's transient scratch and the start-up probes' hold.
+const CARD_SHARE_MARGIN: u64 = 512 << 20;
 
 /// How long a swap waits for the outgoing server's in-flight responses.
 /// Bounded, so one stuck stream cannot keep every other profile out.
@@ -388,6 +506,10 @@ impl Coordinator {
             in_flight: StdMutex::new(HashMap::new()),
             progress: StdMutex::new(None),
             needs: StdMutex::new(HashMap::new()),
+            verdicts: StdMutex::new(HashMap::new()),
+            fit_checks: Mutex::new(()),
+            #[cfg(test)]
+            plan_in_test: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -551,6 +673,30 @@ impl Coordinator {
                 );
             }
         }
+        // Every other conversation the server's pool still holds, whichever
+        // slot ran it, to `<prefix>-pool.bin`, which its next start restores
+        // beside the slots. A server without a pool answers 501, which costs
+        // nothing.
+        let started = Instant::now();
+        let saved = self
+            .http_client()
+            .post(format!("{origin}/slots/pool?action=save"))
+            .json(&serde_json::json!({ "filename": format!("{prefix}-pool.bin") }))
+            .timeout(SLOT_FILE_TIMEOUT)
+            .send()
+            .await
+            .ok()
+            .filter(|reply| reply.status().is_success());
+        if let Some(reply) = saved
+            && let Ok(body) = reply.json::<serde_json::Value>().await
+            && let Some(pages) = body.get("n_saved").and_then(serde_json::Value::as_u64)
+            && pages > 0
+        {
+            log::info!(
+                "saved {pages} pool page(s) of '{profile}' in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+        }
     }
 
     /// The shared HTTP client used both for readiness probes and, by the
@@ -707,8 +853,7 @@ impl Coordinator {
     /// by the time the new `orangu-server` binds that address, the old one's
     /// listening socket has been released, not merely asked to release it.
     pub async fn ensure_active(&self, entry: &CoordinatorLlmEntry) -> Result<String> {
-        let mut guard = self.active.lock().await;
-        self.activate(&mut guard, entry).await
+        self.activate_locked(entry).await.map(|(origin, _)| origin)
     }
 
     /// [`Self::ensure_active`] for a request that is about to be proxied:
@@ -720,18 +865,114 @@ impl Coordinator {
         &self,
         entry: &CoordinatorLlmEntry,
     ) -> Result<(String, InFlight)> {
-        let mut guard = self.active.lock().await;
-        let origin = self.activate(&mut guard, entry).await?;
+        let (origin, _guard) = self.activate_locked(entry).await?;
         let in_flight = self.begin_request(&origin);
         Ok((origin, in_flight))
     }
 
-    /// The body of [`Self::ensure_active`], run with the active set locked.
+    /// Makes `entry` active and returns its origin with the active set still
+    /// locked. A fit check runs `orangu-server plan` for up to
+    /// [`FIT_CHECK_TIMEOUT`], with the lock released: requests for the
+    /// models already serving go on meanwhile, and the activation starts
+    /// over from what the set holds once the lock is back.
+    async fn activate_locked(
+        &self,
+        entry: &CoordinatorLlmEntry,
+    ) -> Result<(String, MutexGuard<'_, Vec<ActiveProcess>>)> {
+        let mut checks = FitChecks::default();
+        loop {
+            let mut guard = self.active.lock().await;
+            match self.activate(&mut guard, entry, &checks).await? {
+                Activation::Active(origin) => return Ok((origin, guard)),
+                Activation::Check(asks) => {
+                    drop(guard);
+                    self.run_fit_checks(entry, asks, &mut checks).await;
+                }
+            }
+        }
+    }
+
+    /// Runs the fit checks `asks` lists, side by side, and records them in
+    /// `checks`. A verdict another request had within [`FIT_VERDICT_FRESH`],
+    /// or a need already known, is not asked again.
+    async fn run_fit_checks(
+        &self,
+        entry: &CoordinatorLlmEntry,
+        asks: Vec<(CoordinatorLlmEntry, bool)>,
+        checks: &mut FitChecks,
+    ) {
+        let _progress = self.note_check(&entry.name);
+        let _one_at_a_time = self.fit_checks.lock().await;
+        let fresh = |profile: &CoordinatorLlmEntry| {
+            self.verdicts
+                .lock()
+                .unwrap()
+                .get(&needs_key(profile))
+                .filter(|(at, _)| at.elapsed() < FIT_VERDICT_FRESH)
+                .map(|(_, verdict)| verdict.clone())
+        };
+        let mut plans = tokio::task::JoinSet::new();
+        for (profile, is_entry) in asks {
+            let key = needs_key(&profile);
+            if is_entry {
+                if let Some(verdict) = fresh(&profile) {
+                    checks.verdict = Some(verdict);
+                    continue;
+                }
+            } else {
+                checks.asked.push(key.clone());
+                if self.needs.lock().unwrap().contains_key(&key) || fresh(&profile).is_some() {
+                    continue;
+                }
+            }
+            let command = self.plan_command(&profile);
+            plans.spawn(async move { (key, is_entry, run_plan(command).await) });
+        }
+        while let Some(joined) = plans.join_next().await {
+            let Ok((key, is_entry, verdict)) = joined else {
+                continue;
+            };
+            if let Ok(Some(fit)) = &verdict {
+                self.needs.lock().unwrap().insert(key.clone(), fit.need);
+            }
+            self.verdicts
+                .lock()
+                .unwrap()
+                .insert(key, (Instant::now(), verdict.clone()));
+            if is_entry {
+                checks.verdict = Some(verdict);
+            }
+        }
+        // A check that could not run says nothing, as one that timed out.
+        checks.verdict.get_or_insert(Ok(None));
+    }
+
+    /// Reports the fit check toward `profile` to the clients waiting on it,
+    /// unless a swap toward another is reporting already; the guard clears
+    /// it again.
+    fn note_check(&self, profile: &str) -> Option<CheckProgress<'_>> {
+        let mut progress = self.progress.lock().unwrap();
+        if progress.as_ref().is_some_and(|p| p.profile != profile) {
+            return None;
+        }
+        let started = progress.as_ref().map_or_else(Instant::now, |p| p.started);
+        *progress = Some(Progress {
+            profile: profile.to_string(),
+            step: "checking that it fits beside what stays".to_string(),
+            started,
+            tail: None,
+        });
+        Some(CheckProgress(self, profile.to_string()))
+    }
+
+    /// The body of [`Self::ensure_active`], run with the active set locked:
+    /// [`Activation::Check`] when it needs a fit check `checks` lacks.
     async fn activate(
         &self,
         guard: &mut Vec<ActiveProcess>,
         entry: &CoordinatorLlmEntry,
-    ) -> Result<String> {
+        checks: &FitChecks,
+    ) -> Result<Activation> {
         // The same profile, or a different one a running process already
         // serves: `serves_same_process_as` is true exactly when the only
         // difference is the role, which travels per request instead
@@ -748,7 +989,7 @@ impl Coordinator {
                 Ok(None) => {
                     let active = guard.remove(i);
                     guard.insert(0, active);
-                    return Ok(entry.origin());
+                    return Ok(Activation::Active(entry.origin()));
                 }
                 Ok(Some(status)) => {
                     // A device-loss exit is expected, self-inflicted, and
@@ -783,9 +1024,26 @@ impl Coordinator {
         // What has to go for `entry` to start: what it cannot run beside,
         // then the least recently used while the set is full. A model that
         // cannot run here at all is refused before any of them is touched.
-        let resident = self.config.read().unwrap().resident;
+        // A card two profiles may share holds both when their needs fit it
+        // together; each is then started with its share, so a server on
+        // it is started with one whenever another profile might join it.
+        let (resident, sharing) = {
+            let config = self.config.read().unwrap();
+            let sharing = config.resident > 1
+                && config
+                    .llms
+                    .values()
+                    .any(|p| p.name != entry.name && entry.shares_card_with(p));
+            (config.resident, sharing)
+        };
         let mut leaving: Vec<usize> = (0..guard.len())
-            .filter(|&i| !entry.can_reside_with(&guard[i].entry_at_start))
+            .filter(|&i| {
+                let other = &guard[i];
+                !entry.can_reside_with(&other.entry_at_start)
+                    && !(sharing
+                        && other.device_cap.is_some()
+                        && entry.shares_card_with(&other.entry_at_start))
+            })
             .collect();
         let mut staying = guard.len() - leaving.len();
         for i in (0..guard.len()).rev() {
@@ -803,19 +1061,60 @@ impl Coordinator {
             .iter_mut()
             .map(|a| matches!(a.child.try_wait(), Ok(None)))
             .collect();
-        let stays: Vec<usize> = (0..guard.len())
+        let mut stays: Vec<usize> = (0..guard.len())
             .filter(|i| !leaving.contains(i) && alive[*i])
             .collect();
-        if leaving.iter().any(|&i| alive[i]) || !stays.is_empty() {
-            self.note_step(&entry.name, "checking that it fits beside what stays");
-            let verdict = match self.fit_verdict(entry).await {
+        let mut device_cap = None;
+        if leaving.iter().any(|&i| alive[i]) || !stays.is_empty() || sharing {
+            // A staying model's need is asked once when not known: one
+            // started before any check, or an adopted server.
+            let unknown: Vec<(CoordinatorLlmEntry, bool)> = stays
+                .iter()
+                .map(|&i| &guard[i].entry_at_start)
+                .filter(|staying| {
+                    let key = needs_key(staying);
+                    !checks.asked.contains(&key) && !self.needs.lock().unwrap().contains_key(&key)
+                })
+                .map(|staying| (staying.clone(), false))
+                .collect();
+            let Some(verdict) = checks.verdict.clone() else {
+                let mut asks = vec![(entry.clone(), true)];
+                asks.extend(unknown);
+                return Ok(Activation::Check(asks));
+            };
+            if !unknown.is_empty() && matches!(verdict, Ok(Some(_))) {
+                return Ok(Activation::Check(unknown));
+            }
+            if sharing
+                && let Ok(Some(fit)) = &verdict
+                && fit.card > 0
+            {
+                let mine = (fit.need.device + CARD_SHARE_MARGIN).min(fit.card);
+                let same: Vec<usize> = stays
+                    .iter()
+                    .copied()
+                    .filter(|&i| entry.shares_card_with(&guard[i].entry_at_start))
+                    .collect();
+                let theirs: u64 = same
+                    .iter()
+                    .map(|&i| guard[i].device_cap.unwrap_or(fit.card))
+                    .sum();
+                if mine + theirs > fit.card {
+                    stays.retain(|i| !same.contains(i));
+                    leaving.extend(same);
+                }
+                device_cap = Some(mine);
+            }
+            let verdict = match verdict {
                 Ok(Some(fit)) if !stays.is_empty() => {
-                    let mut beside = Vec::new();
-                    for &i in &stays {
-                        if let Some(needs) = self.needs_of(&guard[i].entry_at_start).await {
-                            beside.push((guard[i].entry_name.clone(), needs));
-                        }
-                    }
+                    let needs = self.needs.lock().unwrap();
+                    let beside: Vec<(String, Need)> = stays
+                        .iter()
+                        .filter_map(|&i| {
+                            let need = needs.get(&needs_key(&guard[i].entry_at_start))?;
+                            Some((guard[i].entry_name.clone(), *need))
+                        })
+                        .collect();
                     fits_beside(fit, &beside)
                 }
                 other => other.map(|_| ()),
@@ -872,9 +1171,10 @@ impl Coordinator {
                         // Nothing was captured from a process this one did not
                         // start; its output belongs to whoever did.
                         tail: Arc::new(Mutex::new(VecDeque::new())),
+                        device_cap: None,
                     },
                 );
-                return Ok(entry.origin());
+                return Ok(Activation::Active(entry.origin()));
             }
             // Serving something else. This is a *swap*, and the fact that
             // this coordinator did not start the incumbent changes nothing
@@ -901,12 +1201,13 @@ impl Coordinator {
                     entry_at_start: entry.clone(),
                     child: ServerHandle::Adopted { pid: occupant.pid },
                     tail: Arc::new(Mutex::new(VecDeque::new())),
+                    device_cap: None,
                 })
                 .await;
             }
         }
 
-        let (child, tail) = self.start(entry).await?;
+        let (child, tail) = self.start(entry, device_cap).await?;
         guard.insert(
             0,
             ActiveProcess {
@@ -914,9 +1215,10 @@ impl Coordinator {
                 entry_at_start: entry.clone(),
                 child: ServerHandle::Spawned(Box::new(child)),
                 tail,
+                device_cap,
             },
         );
-        Ok(entry.origin())
+        Ok(Activation::Active(entry.origin()))
     }
 
     /// What is already listening at `entry`'s address, when it is an
@@ -1000,11 +1302,13 @@ impl Coordinator {
         }
 
         let mut guard = self.active.lock().await;
+        let mut device_cap = None;
         if let Some(i) = guard
             .iter()
             .position(|active| active.entry_at_start.origin() == entry.origin())
         {
             let active = guard.remove(i);
+            device_cap = active.device_cap;
             log::warn!(
                 "'{}' stopped answering on {}; restarting it",
                 active.entry_name,
@@ -1017,7 +1321,7 @@ impl Coordinator {
             Self::stop(active).await;
         }
         let _progress = ProgressGuard(self);
-        let (child, tail) = self.start(entry).await?;
+        let (child, tail) = self.start(entry, device_cap).await?;
         guard.insert(
             0,
             ActiveProcess {
@@ -1025,6 +1329,7 @@ impl Coordinator {
                 entry_at_start: entry.clone(),
                 child: ServerHandle::Spawned(Box::new(child)),
                 tail,
+                device_cap,
             },
         );
         Ok(entry.origin())
@@ -1148,32 +1453,25 @@ impl Coordinator {
         PathBuf::from(binary_name)
     }
 
-    /// Whether `entry`'s model can run on this machine at all, asked of
-    /// `orangu-server plan --deep --json` before a swap stops the model that
-    /// is serving — so a load that was always going to fail (an architecture
-    /// this build lacks, a missing shard, weights larger than the machine's
-    /// memory) is refused while the resident model keeps serving, instead
-    /// of evicting it first and finding out after the load.
-    ///
-    /// Only a definite "does not run" refuses. A server too old to answer,
-    /// one that takes longer than [`FIT_CHECK_TIMEOUT`], or an answer that
-    /// does not parse lets the swap go ahead as it always has. The need it
-    /// reports is kept for the profile, so a later start beside it can be
-    /// weighed against it ([`Self::needs_of`]).
-    async fn fit_verdict(
-        &self,
-        entry: &CoordinatorLlmEntry,
-    ) -> std::result::Result<Option<PlanFit>, String> {
-        if cfg!(test) {
-            return Ok(None);
+    /// The `orangu-server plan --deep --json` that says whether `entry`'s
+    /// model can run on this machine at all, asked before a swap stops the
+    /// model that is serving — so a load that was always going to fail (an
+    /// architecture this build lacks, a missing shard, weights larger than
+    /// the machine's memory) is refused while the resident model keeps
+    /// serving, instead of evicting it first and finding out after the load.
+    /// The need it reports is kept for the profile, so a later start beside
+    /// it can be weighed against it. `None` when there is no config to give
+    /// it.
+    fn plan_command(&self, entry: &CoordinatorLlmEntry) -> Option<Command> {
+        #[cfg(test)]
+        if !self.plan_in_test.load(Ordering::Relaxed) {
+            return None;
         }
         let (models_dir, log) = {
             let config = self.config.read().unwrap();
             (config.models.clone(), config.log.clone())
         };
-        let Ok(server_config_path) = write_server_config(entry, &models_dir, &log) else {
-            return Ok(None);
-        };
+        let server_config_path = write_server_config(entry, &models_dir, &log).ok()?;
         let mut command = Command::new(self.resolve_server_binary());
         command
             .arg("--config")
@@ -1185,36 +1483,15 @@ impl Coordinator {
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let Ok(Ok(output)) = tokio::time::timeout(FIT_CHECK_TIMEOUT, command.output()).await else {
-            return Ok(None);
-        };
-        let fit = fit_from_plan(&output.stdout)?;
-        if let Some(fit) = fit {
-            self.needs
-                .lock()
-                .unwrap()
-                .insert(needs_key(entry), fit.needs);
-        }
-        Ok(fit)
+        Some(command)
     }
 
-    /// What `entry`'s model needs of the machine, from its own fit check —
-    /// asked now if it has had none (a profile started before any check, or
-    /// an adopted server). `None` when the plan cannot say.
-    async fn needs_of(&self, entry: &CoordinatorLlmEntry) -> Option<u64> {
-        if let Some(&needs) = self.needs.lock().unwrap().get(&needs_key(entry)) {
-            return Some(needs);
-        }
-        self.fit_verdict(entry)
-            .await
-            .ok()
-            .flatten()
-            .map(|f| f.needs)
-    }
-
+    /// Starts `entry`'s `orangu-server`, held to `device_cap` bytes of its
+    /// card when it shares one.
     async fn start(
         &self,
         entry: &CoordinatorLlmEntry,
+        device_cap: Option<u64>,
     ) -> Result<(tokio::process::Child, OutputTail)> {
         let (models_dir, log) = {
             let config = self.config.read().unwrap();
@@ -1246,6 +1523,9 @@ impl Coordinator {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(cap) = device_cap {
+            command.env("ORANGU_DEVICE_BYTES", cap.to_string());
+        }
         die_with_parent(&mut command);
         let mut child = command.spawn().with_context(|| {
             format!(
@@ -1760,8 +2040,10 @@ mod tests {
         assert_eq!(
             fit_from_plan(br#"{"runs":true,"problems":[],"needs_bytes":5,"capacity_bytes":9}"#),
             Ok(Some(PlanFit {
-                needs: 5,
-                capacity: 9
+                need: Need { device: 0, host: 5 },
+                cards: 0,
+                memory: 9,
+                card: 0,
             }))
         );
         assert_eq!(
@@ -1777,20 +2059,93 @@ mod tests {
     #[test]
     fn a_start_beside_residents_counts_what_they_need() {
         const GB: u64 = 1_000_000_000;
+        let host = |n| Need { device: 0, host: n };
         let fit = PlanFit {
-            needs: 20 * GB,
-            capacity: 64 * GB,
+            need: host(20 * GB),
+            cards: 0,
+            memory: 64 * GB,
+            card: 0,
         };
         assert_eq!(fits_beside(fit, &[]), Ok(()));
-        assert_eq!(fits_beside(fit, &[("a".into(), 30 * GB)]), Ok(()));
-        let refused =
-            fits_beside(fit, &[("a".into(), 30 * GB), ("b".into(), 20 * GB)]).unwrap_err();
+        assert_eq!(fits_beside(fit, &[("a".into(), host(30 * GB))]), Ok(()));
+        let refused = fits_beside(
+            fit,
+            &[("a".into(), host(30 * GB)), ("b".into(), host(20 * GB))],
+        )
+        .unwrap_err();
         assert!(
             refused.contains("'a'") && refused.contains("'b'"),
             "{refused}"
         );
         // Exactly full still fits.
-        assert_eq!(fits_beside(fit, &[("a".into(), 44 * GB)]), Ok(()));
+        assert_eq!(fits_beside(fit, &[("a".into(), host(44 * GB))]), Ok(()));
+    }
+
+    /// Card bytes share the cards and spill to host memory together, and a
+    /// card's free room never holds a host-only need.
+    #[test]
+    fn card_room_holds_card_bytes_and_only_those() {
+        const GB: u64 = 1_000_000_000;
+        let fit = PlanFit {
+            need: Need {
+                device: 6 * GB,
+                host: 2 * GB,
+            },
+            cards: 8 * GB,
+            memory: 16 * GB,
+            card: 0,
+        };
+        // 6 + 2 on the card; 2 + 10 in host memory.
+        let beside = [(
+            "a".to_string(),
+            Need {
+                device: 2 * GB,
+                host: 10 * GB,
+            },
+        )];
+        assert_eq!(fits_beside(fit, &beside), Ok(()));
+        // 6 + 6 wants the card: 4 spill, and 2 + 10 + 4 is 16, full.
+        let beside = [(
+            "a".to_string(),
+            Need {
+                device: 6 * GB,
+                host: 10 * GB,
+            },
+        )];
+        assert_eq!(fits_beside(fit, &beside), Ok(()));
+        // One more host byte and it does not fit, with the card's room unused
+        // by host bytes: a pooled sum (8 + 16 = 24 ≥ 6+2+6+11) would have
+        // said yes.
+        let beside = [(
+            "a".to_string(),
+            Need {
+                device: 6 * GB,
+                host: 11 * GB,
+            },
+        )];
+        assert!(fits_beside(fit, &beside).is_err());
+    }
+
+    /// A server that reports the split gives it; one that reports only the
+    /// pooled numbers counts them as host memory.
+    #[test]
+    fn a_plan_with_the_split_is_read_by_it() {
+        let fit = fit_from_plan(
+            br#"{"runs":true,"needs_bytes":8,"capacity_bytes":30,"device_needs_bytes":6,"host_needs_bytes":2,"device_memory_bytes":10,"memory_bytes":20}"#,
+        );
+        assert_eq!(
+            fit,
+            Ok(Some(PlanFit {
+                need: Need { device: 6, host: 2 },
+                cards: 10,
+                memory: 20,
+                card: 0,
+            }))
+        );
+        let fit = fit_from_plan(
+            br#"{"runs":true,"device_needs_bytes":6,"host_needs_bytes":2,"device_memory_bytes":10,"memory_bytes":20,"card_bytes":4}"#,
+        );
+        assert_eq!(fit.map(|f| f.map(|f| f.card)), Ok(Some(4)));
     }
 
     /// A swap saves every slot of the outgoing server under its profile's
@@ -1840,6 +2195,7 @@ mod tests {
             vec![
                 "POST /slots/0?action=save HTTP/1.1 coordinator-code_big_model-0.bin",
                 "POST /slots/1?action=save HTTP/1.1 coordinator-code_big_model-1.bin",
+                "POST /slots/pool?action=save HTTP/1.1 coordinator-code_big_model-pool.bin",
             ]
         );
         assert_eq!(
@@ -2760,6 +3116,120 @@ while True:
             !process_is_alive(a_pid),
             "a was stopped once its request ended"
         );
+        coordinator.shutdown().await;
+        std::fs::remove_file(&fake_bin).ok();
+    }
+
+    /// A stand-in whose `plan` takes `seconds` to answer — that the model
+    /// fits, or for a model named `*nofit*` that it does not run — and which
+    /// otherwise serves as [`listening_fake_server`] does.
+    #[cfg(unix)]
+    fn slow_plan_fake_server(seconds: u32) -> Option<PathBuf> {
+        let serving = std::fs::read_to_string(listening_fake_server()?).ok()?;
+        let serving = serving.strip_prefix("#!/bin/sh\n")?;
+        Some(fake_server_script(&format!(
+            r#"if [ "$3" = plan ]; then
+  sleep {seconds}
+  case "$6" in
+    *nofit*) echo '{{"runs": false, "problems": ["weights larger than memory"]}}' ;;
+    *) echo '{{"runs": true, "needs_bytes": 1, "capacity_bytes": 100}}' ;;
+  esac
+  exit 0
+fi
+{serving}"#
+        )))
+    }
+
+    /// A fit check runs with the active set unlocked: while one profile's
+    /// `plan` runs, a request for a model already serving is let through at
+    /// once, and the profile then starts beside it.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_fit_check_does_not_hold_up_the_models_serving() {
+        let Some(fake_bin) = slow_plan_fake_server(3) else {
+            println!("no python3 to stand in for orangu-server; nothing to check");
+            return;
+        };
+        let [pa, pb] = free_ports::<2>();
+        let config = minimal_config(
+            "startup_timeout = 10\nresident = 2",
+            &format!(
+                "[fit-a]\nrole = all\nmodel = org/a\nport = {pa}\n\
+                 [fit-b]\nrole = explorer\nmodel = org/b\nport = {pb}\nbackend = cpu\n"
+            ),
+        );
+        let coordinator = Arc::new(Coordinator::new(config, Some(fake_bin.clone())).unwrap());
+        coordinator.plan_in_test.store(true, Ordering::Relaxed);
+        let entry = |name: &str| coordinator.config.read().unwrap().llms[name].clone();
+        coordinator.ensure_active(&entry("fit-a")).await.unwrap();
+
+        let swap = tokio::spawn({
+            let coordinator = coordinator.clone();
+            let b = entry("fit-b");
+            async move { coordinator.ensure_active(&b).await }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!swap.is_finished(), "b's plan answered too soon to test");
+        let started = std::time::Instant::now();
+        let (origin, in_flight) = coordinator
+            .begin_active_request(&entry("fit-a"))
+            .await
+            .unwrap();
+        assert_eq!(origin, entry("fit-a").origin());
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a's request waited {:?} on b's fit check",
+            started.elapsed()
+        );
+        assert!(!swap.is_finished(), "the request did not overlap the check");
+        drop(in_flight);
+        swap.await.unwrap().unwrap();
+        assert_eq!(
+            residents(&coordinator)
+                .await
+                .iter()
+                .map(|r| r.0.as_str())
+                .collect::<Vec<_>>(),
+            ["fit-b", "fit-a"]
+        );
+        coordinator.shutdown().await;
+        std::fs::remove_file(&fake_bin).ok();
+    }
+
+    /// A model whose fit check says it does not run is refused, and the one
+    /// serving goes on serving.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_model_that_does_not_fit_leaves_the_one_serving() {
+        let Some(fake_bin) = slow_plan_fake_server(0) else {
+            println!("no python3 to stand in for orangu-server; nothing to check");
+            return;
+        };
+        let [pa, pb] = free_ports::<2>();
+        let config = minimal_config(
+            "startup_timeout = 10",
+            &format!(
+                "[nofit-a]\nrole = all\nmodel = org/a\nport = {pa}\n\
+                 [fit-big]\nrole = all\nmodel = org/nofit\nport = {pb}\n"
+            ),
+        );
+        let coordinator = Arc::new(Coordinator::new(config, Some(fake_bin.clone())).unwrap());
+        coordinator.plan_in_test.store(true, Ordering::Relaxed);
+        let entry = |name: &str| coordinator.config.read().unwrap().llms[name].clone();
+        coordinator.ensure_active(&entry("nofit-a")).await.unwrap();
+        let a_pid = residents(&coordinator).await[0].1;
+        let err = coordinator
+            .ensure_active(&entry("fit-big"))
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("weights larger than memory"), "{message}");
+        assert!(message.contains("'nofit-a' keeps serving"), "{message}");
+        assert_eq!(
+            residents(&coordinator).await,
+            [("nofit-a".to_string(), a_pid)]
+        );
+        assert!(coordinator.progress().await.is_none());
         coordinator.shutdown().await;
         std::fs::remove_file(&fake_bin).ok();
     }

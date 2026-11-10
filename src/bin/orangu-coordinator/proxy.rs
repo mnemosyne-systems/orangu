@@ -415,19 +415,58 @@ fn progress_line(progress: &Value) -> String {
     format!(": {}\n", text.replace(['\r', '\n'], " "))
 }
 
-/// An SSE event carrying an error, as an OpenAI-compatible stream reports one.
-fn error_event(message: &str) -> Bytes {
-    Bytes::from(format!(
-        "data: {}\n\n",
-        json!({"error": {"message": message, "type": "coordinator_error"}})
-    ))
+/// An SSE event carrying the answer a request would have had as its status
+/// line, had the stream not begun already: the upstream's own error object
+/// (`body`) with the `status` it came with, in the shape the path's API
+/// reports an error in mid-stream. A refusal that only a shorter prompt can
+/// get past keeps the message a client matches on and carries the
+/// `context_length_exceeded` code, so a client that shortens its prompt on a
+/// `400` can do so here too.
+fn error_event(path: &str, status: StatusCode, body: &str) -> Bytes {
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let mut error = match parsed.as_ref().and_then(|v| v.get("error")) {
+        Some(Value::Object(object)) => object.clone(),
+        Some(Value::String(message)) => {
+            serde_json::Map::from_iter([("message".to_string(), json!(message))])
+        }
+        _ => serde_json::Map::from_iter([("message".to_string(), json!(body.trim()))]),
+    };
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let too_long = orangu::llm::is_context_too_long(&message);
+    let kind = if too_long || status.is_client_error() {
+        "invalid_request_error"
+    } else if status == StatusCode::SERVICE_UNAVAILABLE {
+        "overloaded_error"
+    } else if status == StatusCode::BAD_GATEWAY {
+        "coordinator_error"
+    } else {
+        "server_error"
+    };
+    if path.starts_with("/v1/messages") {
+        return Bytes::from(format!(
+            "event: error\ndata: {}\n\n",
+            json!({"type": "error", "error": {"type": kind, "message": message}})
+        ));
+    }
+    if error.get("type").is_none_or(Value::is_null) {
+        error.insert("type".to_string(), json!(kind));
+    }
+    if too_long && error.get("code").is_none_or(Value::is_null) {
+        error.insert("code".to_string(), json!("context_length_exceeded"));
+    }
+    error.insert("status".to_string(), json!(status.as_u16()));
+    Bytes::from(format!("data: {}\n\n", json!({ "error": error })))
 }
 
 /// A streamed answer started before its server is ready: `200` with SSE
 /// headers now, a progress comment every [`PROGRESS_EVERY`] until the swap
 /// is done, then the upstream's own events. A swap or request that fails
-/// after this point is reported as an error event, the status line having
-/// gone already.
+/// after this point is reported as an error event carrying the status it
+/// would have had ([`error_event`]), the status line having gone already.
 fn progress_stream(
     f: Forward,
     mut activation: std::pin::Pin<
@@ -450,24 +489,25 @@ fn progress_stream(
                 }
             }
         };
+        let path = f.path_and_query.clone();
         let (origin, _in_flight) = match done {
             Ok(active) => active,
             Err(message) => {
-                yield Ok(error_event(&message));
+                yield Ok(error_event(&path, StatusCode::BAD_GATEWAY, &message));
                 return;
             }
         };
         let mut upstream = match forward(&f, &origin).await {
             Ok(upstream) => upstream,
             Err(message) => {
-                yield Ok(error_event(&message));
+                yield Ok(error_event(&path, StatusCode::BAD_GATEWAY, &message));
                 return;
             }
         };
         if !upstream.status().is_success() {
             let status = upstream.status();
             let text = upstream.text().await.unwrap_or_default();
-            yield Ok(error_event(&format!("{status}: {}", text.trim())));
+            yield Ok(error_event(&path, status, &text));
             return;
         }
         loop {
@@ -497,6 +537,96 @@ fn progress_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The JSON of the one SSE event `bytes` holds, and its event name.
+    fn event_of(bytes: &Bytes) -> (Option<String>, Value) {
+        let text = std::str::from_utf8(bytes).unwrap();
+        assert!(text.ends_with("\n\n"), "{text:?}");
+        let mut name = None;
+        let mut data = None;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("event: ") {
+                name = Some(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("data: ") {
+                data = Some(serde_json::from_str(rest).unwrap());
+            }
+        }
+        (name, data.expect("an event carries data"))
+    }
+
+    /// The server's refusal of a prompt too long for it, sent after the
+    /// stream began, says what its status line would have: the status, the
+    /// type and code an OpenAI client acts on, and the message orangu's own
+    /// client matches.
+    #[test]
+    fn a_late_context_refusal_says_what_its_status_would_have() {
+        let refusal = format!(
+            "prompt (41843 tokens) plus one generated token needs 41844 {}, more than \
+             the 16384 this server has room for on its device\n",
+            orangu::llm::CONTEXT_TOO_LONG_MARKER
+        );
+        let (name, event) = event_of(&error_event(
+            "/v1/chat/completions",
+            StatusCode::BAD_REQUEST,
+            &refusal,
+        ));
+        assert_eq!(name, None);
+        let error = &event["error"];
+        assert_eq!(error["status"], 400);
+        assert_eq!(error["type"], "invalid_request_error");
+        assert_eq!(error["code"], "context_length_exceeded");
+        assert!(orangu::llm::is_context_too_long(
+            error["message"].as_str().unwrap()
+        ));
+    }
+
+    /// An upstream's own error object goes through whole, with the status
+    /// added; a bare message gets a type from its status.
+    #[test]
+    fn a_late_error_keeps_the_upstreams_object() {
+        let body = r#"{"error":{"message":"bad tool","type":"invalid_request_error","param":"tools","code":"bad_tool"}}"#;
+        let (_, event) = event_of(&error_event(
+            "/v1/chat/completions",
+            StatusCode::BAD_REQUEST,
+            body,
+        ));
+        assert_eq!(
+            event,
+            json!({"error": {"message": "bad tool", "type": "invalid_request_error",
+                "param": "tools", "code": "bad_tool", "status": 400}})
+        );
+        let (_, event) = event_of(&error_event(
+            "/v1/completions",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no room for this prompt now",
+        ));
+        assert_eq!(event["error"]["type"], "overloaded_error");
+        assert_eq!(event["error"]["status"], 503);
+        assert!(event["error"].get("code").is_none());
+        let (_, event) = event_of(&error_event(
+            "/v1/chat/completions",
+            StatusCode::BAD_GATEWAY,
+            "orangu-coordinator: failed to start default profile 'x'",
+        ));
+        assert_eq!(event["error"]["type"], "coordinator_error");
+    }
+
+    /// The Messages API reports an error mid-stream as an `error` event of its
+    /// own shape.
+    #[test]
+    fn a_late_error_on_the_messages_api_is_its_error_event() {
+        let (name, event) = event_of(&error_event(
+            "/v1/messages?beta=true",
+            StatusCode::BAD_REQUEST,
+            &format!("needs 9 {}", orangu::llm::CONTEXT_TOO_LONG_MARKER),
+        ));
+        assert_eq!(name.as_deref(), Some("error"));
+        assert_eq!(event["type"], "error");
+        assert_eq!(event["error"]["type"], "invalid_request_error");
+        assert!(orangu::llm::is_context_too_long(
+            event["error"]["message"].as_str().unwrap()
+        ));
+    }
     // Only the two Unix-only retry tests below drive a socket by hand.
     #[cfg(unix)]
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

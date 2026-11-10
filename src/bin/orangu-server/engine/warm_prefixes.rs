@@ -82,7 +82,7 @@ static STATE: Mutex<Option<State>> = Mutex::new(None);
 /// Whether `[orangu-server].prefix_warmup` (or `ORANGU_PREFIX_WARMUP`, which
 /// wins) leaves this on. Default on.
 pub fn enabled(configured: bool) -> bool {
-    match std::env::var("ORANGU_PREFIX_WARMUP") {
+    match crate::engine::backend::tuning_profile::env_var("ORANGU_PREFIX_WARMUP") {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "off" | "false" | "no"

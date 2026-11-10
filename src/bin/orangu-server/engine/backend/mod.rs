@@ -1109,11 +1109,10 @@ pub trait Backend: Send + Sync {
     /// the set differences and fails if any of them moves. Read the
     /// assertions, not this paragraph, if the two ever disagree. As of that
     /// test: `VulkanBackend` lacks the three lowest-bit `IQ1_*` ids that
-    /// are not ggml's own (`quant`'s 64..=66), the two FP8 types,
-    /// `F8_E4M3` and `MXFP8` (`quant`'s 43/144), and `NVFP4` (40); the
-    /// vendor backends
+    /// are not ggml's own (`quant`'s 64..=66) and the two FP8 types,
+    /// `F8_E4M3` and `MXFP8` (`quant`'s 43/144); the vendor backends
     /// (`CudaBackend`/`RocmBackend`/`OpenClBackend`, which share one shader
-    /// source) lack those, `MXFP4`, `Q2_0`, and Prism's ternary `PQ2_0`/
+    /// source) lack those, `MXFP4`, `NVFP4`, `Q2_0`, and Prism's ternary `PQ2_0`/
     /// `PTQ1_0` (`quant`'s 142/143). The vendor list is a strict subset of
     /// Vulkan's, and the test holds it that way on purpose — Vulkan is the
     /// backend with hardware to verify a kernel on, so a new one lands there
@@ -1477,7 +1476,7 @@ mod tests {
             .collect();
         assert_eq!(
             vulkan_only,
-            ["MXFP4", "Q2_0", "PQ2_0", "PTQ1_0"],
+            ["MXFP4", "NVFP4", "Q2_0", "PQ2_0", "PTQ1_0"],
             "the set of types Vulkan has a kernel for and the vendor backends do \
              not has changed; update `Backend::supports_type`'s doc to match"
         );
@@ -1491,7 +1490,7 @@ mod tests {
 
         assert_eq!(
             gap(vulkan),
-            ["NVFP4", "F8_E4M3", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS", "MXFP8"],
+            ["F8_E4M3", "IQ1_XS", "IQ1_XXS", "IQ1_XXXS", "MXFP8"],
             "the set of types the CPU path reads and Vulkan has no kernel for has \
              changed; update `Backend::supports_type` and \
              `arch::gpu_project_expert`'s doc comments to match"

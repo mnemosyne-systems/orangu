@@ -408,6 +408,20 @@ pub fn run_perplexity(
             windows.len(),
         );
     }
+    if let Some(baseline) = args.ppl_baseline {
+        let rise = 100.0 * (perplexity - baseline) / baseline;
+        let over = rise > args.ppl_max_increase;
+        if over {
+            crate::kl::note_over_threshold();
+        }
+        if !args.json {
+            println!(
+                "threshold  {rise:+.2}% against {baseline} (at most +{}%): {}",
+                args.ppl_max_increase,
+                if over { "OVER" } else { "within" }
+            );
+        }
+    }
     Ok(vec![record(label, "perplexity", n_ctx, perplexity, error)])
 }
 

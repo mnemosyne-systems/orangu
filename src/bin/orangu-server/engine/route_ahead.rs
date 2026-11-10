@@ -95,7 +95,7 @@ thread_local! {
 pub fn prefetch_width() -> usize {
     static WIDTH: OnceLock<usize> = OnceLock::new();
     *WIDTH.get_or_init(|| {
-        std::env::var("ORANGU_PREFETCH_K")
+        crate::engine::backend::tuning_profile::env_var("ORANGU_PREFETCH_K")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0)

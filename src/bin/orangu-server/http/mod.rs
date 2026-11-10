@@ -279,6 +279,23 @@ const ENCODE_INLINE_BYTES: usize = 16 * 1024;
 /// is time no other connection — another agent's stream, a health check —
 /// is served. A short one is cheaper encoded where it is than handed to
 /// another thread.
+/// [`encode_off_runtime`] for a rendered chat prompt: through
+/// `Tokenizer::encode_prompt`, so a prompt that extends a recent one
+/// encodes only its new part.
+pub async fn encode_prompt_off_runtime(
+    tokenizer: &Arc<crate::engine::tokenizer::Tokenizer>,
+    text: String,
+) -> Vec<u32> {
+    if text.len() < ENCODE_INLINE_BYTES {
+        return tokenizer.encode_prompt(&text);
+    }
+    let tokenizer = tokenizer.clone();
+    match tokio::task::spawn_blocking(move || tokenizer.encode_prompt(&text)).await {
+        Ok(tokens) => tokens,
+        Err(err) => std::panic::resume_unwind(err.into_panic()),
+    }
+}
+
 pub async fn encode_off_runtime(
     tokenizer: &Arc<crate::engine::tokenizer::Tokenizer>,
     text: String,
@@ -360,6 +377,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/model-cache", get(native::model_cache))
         .route("/model-cache/drop", post(native::drop_model_cache))
         .route("/slots", get(native::slots))
+        .route("/slots/pool", post(native::pool_action))
         .route("/slots/{id_slot}", post(native::slot_action))
         .route("/metrics", get(native::metrics))
         .route("/tokenize", post(native::tokenize))

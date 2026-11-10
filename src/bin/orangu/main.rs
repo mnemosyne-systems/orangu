@@ -1387,7 +1387,7 @@ async fn run() -> Result<()> {
                     if let Some(step) = after_turn {
                         push_after_turn(&mut output_state, step, tools.workspace(), &answer);
                     }
-                    watch_context(&mut session, &mut output_state, config.compact_at);
+                    watch_context(&mut session, &mut output_state, &tools, config.compact_at).await;
                     if config.feedback {
                         output_state.push_text(FEEDBACK_OK);
                     }
@@ -2915,7 +2915,7 @@ async fn run() -> Result<()> {
                 if let Some(step) = after_turn {
                     push_after_turn(&mut output_state, step, tools.workspace(), &answer);
                 }
-                watch_context(&mut session, &mut output_state, config.compact_at);
+                watch_context(&mut session, &mut output_state, &tools, config.compact_at).await;
                 if config.feedback {
                     output_state.push_text(FEEDBACK_OK);
                 }
@@ -3058,16 +3058,40 @@ fn resolve_existing_dir_arg(arg: &str) -> Option<PathBuf> {
 
 /// After a turn: compact the conversation once it fills `compact_at` percent
 /// of the context (`0` never does), or else say once that it is getting full.
-fn watch_context(session: &mut ChatSession, output_state: &mut OutputState, compact_at: u8) {
+///
+/// Compaction drops what is cheapest to lose first — stale working-tree
+/// snapshots and old tool output. When the conversation is still that full
+/// after it, the model summarises the earlier turns and the summary takes
+/// their place (`ChatSession::summarise`).
+async fn watch_context(
+    session: &mut ChatSession,
+    output_state: &mut OutputState,
+    tools: &orangu::tools::ToolExecutor,
+    compact_at: u8,
+) {
     // Shown now, so the frame that draws the answer carries it.
     orangu::tui::context_gauge::show(session.context_gauge());
     let Some(gauge) = session.context_gauge() else {
         return;
     };
     if compact_at > 0 && gauge.at_least(u64::from(compact_at)) {
-        let (before, after) = session.compact_now();
-        if after < before
-            && let Some(compacted) = session.context_gauge()
+        session.compact_now();
+        let still_full = session
+            .context_gauge()
+            .is_some_and(|g| g.at_least(u64::from(compact_at)));
+        if still_full && let Some(profile) = tools.active_profile() {
+            match session.summarise(&profile, tools).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {}
+                Err(err) => output_state.push_text(&format!(
+                    "Context {}% full: summarising the conversation failed ({err:#}); \
+                     it is kept as it was.",
+                    gauge.percent().unwrap_or_default()
+                )),
+            }
+        }
+        if let Some(compacted) = session.context_gauge()
+            && compacted.used < gauge.used
         {
             output_state.push_text(&format!(
                 "Context {}% full: compacted the conversation from {} to {} tokens.",

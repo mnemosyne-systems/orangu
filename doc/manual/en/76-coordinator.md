@@ -138,8 +138,11 @@ each response body's stream and dropped with it), bounded by `DRAIN_TIMEOUT`
 (two minutes), and then saves each of the outgoing server's slots
 (`Coordinator::save_slots`: `GET /slots`, then `POST /slots/{id}?action=save`
 per slot, each bounded by `SLOT_FILE_TIMEOUT`) to `coordinator-<profile>-<slot>.bin`
-in that model's slot directory. Every server the coordinator starts gets
-`ORANGU_SLOT_RESTORE=coordinator-<profile>` and restores those files at start,
+in that model's slot directory, then the paged pool's published pages
+(`POST /slots/pool?action=save`) to `coordinator-<profile>-pool.bin`: every
+conversation the pool still holds, not only the slots' last ones. Every server the coordinator starts gets
+`ORANGU_SLOT_RESTORE=coordinator-<profile>` and restores those files, the
+pool's included (`SlotStore::restore_pool`), at start,
 before its prefix warm-up, so a conversation the swap stopped is still
 cached when its model comes back. A profile's
 `host` travels into that generated config verbatim, so it takes exactly the
