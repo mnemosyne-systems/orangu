@@ -29,6 +29,16 @@ pub(crate) fn local_command_error(err: Error) -> CommandOutcome {
     }
 }
 
+/// The context message the model gets for a local command whose output is
+/// plain text, such as `/log` and `/fetch`, so it sees what the user saw.
+/// Colour codes are dropped: they are for the terminal, not the model.
+fn plain_output_llm_context(command: &str, output: &str) -> String {
+    format!(
+        "The user executed `{command}`. Output:\n\n```\n{}\n```",
+        crate::export::strip_ansi(output)
+    )
+}
+
 /// `/create_file <path> [with <mode>] [containing <text>]`.
 ///
 /// A path that already exists is overwritten — the same on every surface
@@ -2240,7 +2250,17 @@ pub(crate) fn handle_command(
             ))
         }
         LocalCommand::Log(count) => match log_output(workspace, count) {
-            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Ok(output) => {
+                let command = match count {
+                    Some(count) => format!("/log {count}"),
+                    None => "/log".to_string(),
+                };
+                let llm_context = plain_output_llm_context(&command, &output);
+                Ok(CommandOutcome::OutputWithLlmContext {
+                    display: output,
+                    llm_context,
+                })
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Show(commit) => match show_output(workspace, commit.as_deref()) {
@@ -2277,7 +2297,17 @@ pub(crate) fn handle_command(
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Fetch(remote) => match fetch_output(workspace, remote.as_deref(), forge) {
-            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Ok(output) => {
+                let command = match remote.as_deref() {
+                    Some(remote) => format!("/fetch {remote}"),
+                    None => "/fetch".to_string(),
+                };
+                let llm_context = plain_output_llm_context(&command, &output);
+                Ok(CommandOutcome::OutputWithLlmContext {
+                    display: output,
+                    llm_context,
+                })
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::AddRepository(None) => Ok(CommandOutcome::OutputError(
@@ -3021,6 +3051,41 @@ mod tests {
     use std::collections::HashMap;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn plain_output_llm_context_names_the_command_and_drops_colour() {
+        let context = plain_output_llm_context(
+            "/log 2",
+            "* \x1b[33mabc1234\x1b[m (\x1b[1;36mHEAD\x1b[m) fix it\n* def5678 add it",
+        );
+        assert_eq!(
+            context,
+            "The user executed `/log 2`. Output:\n\n```\n* abc1234 (HEAD) fix it\n* def5678 add it\n```"
+        );
+    }
+
+    #[test]
+    fn log_and_fetch_give_the_model_their_output() {
+        let workspace = tempdir().expect("workspace");
+        let root = workspace.path();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.com"])
+                .args(args)
+                .status()
+                .expect("git runs");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "first commit"]);
+
+        let log = log_output(root, Some(1)).expect("log output");
+        let context = plain_output_llm_context("/log 1", &log);
+        assert!(context.contains("first commit"), "{context}");
+        assert!(!context.contains('\x1b'), "{context}");
+    }
 
     #[test]
     fn rewind_lists_turns_with_their_age_and_files() {
