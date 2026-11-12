@@ -1365,7 +1365,7 @@ Two deterministic checks add to the **Memory** category of C and C++ files (`.c`
 
 These are reported as **medium** findings.
 
-**The sanitizer pass** builds the project and runs its tests under AddressSanitizer, LeakSanitizer, and UndefinedBehaviorSanitizer while the model reviews. It runs when a changed C or C++ file is reviewed in **Deep** mode (`review_sanitize = deep`, the default), whenever a C or C++ file is reviewed (`always`), or never (`off`); see the Configuration chapter.
+**The sanitizer pass** builds the project and runs its tests under AddressSanitizer, LeakSanitizer, and UndefinedBehaviorSanitizer while the model reviews. It runs when a changed C or C++ file is reviewed in **Deep** mode (`review_sanitize = deep`, the default), whenever a C or C++ file is reviewed (`always`), or never (`off`); see the Configuration chapter. The pass runs on Linux; on other systems the note under **Overall** says it did not run.
 
 - **Where it builds.** The repository's tracked and untracked (not ignored) files are copied into `.git/orangu-sanitize/src`, and only changed files are copied on later runs, so the build there stays incremental. The working tree is never touched.
 - **How it builds.** CMake (`CMakeLists.txt`), Meson (`meson.build`), Autotools (`configure.ac` or `configure`), or a Makefile is detected at the workspace or the repository root, and the project is built in Debug with the sanitizers, then tested: `ctest`, `meson test`, `make check`, or the makefile's `check` or `test` target. A project with no test step is built but nothing is run, and the report says so.

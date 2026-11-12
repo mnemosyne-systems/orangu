@@ -625,11 +625,14 @@ fn sync_mirror(repo: &Path, mirror: &Path, manifest: &Path) -> Result<usize> {
             std::fs::create_dir_all(parent)?;
         }
         if meta.file_type().is_symlink() {
-            let link = std::fs::read_link(&source)?;
-            if std::fs::read_link(&target).ok().as_deref() != Some(link.as_path()) {
-                let _ = std::fs::remove_file(&target);
-                std::os::unix::fs::symlink(&link, &target)?;
-                copied += 1;
+            #[cfg(unix)]
+            {
+                let link = std::fs::read_link(&source)?;
+                if std::fs::read_link(&target).ok().as_deref() != Some(link.as_path()) {
+                    let _ = std::fs::remove_file(&target);
+                    std::os::unix::fs::symlink(&link, &target)?;
+                    copied += 1;
+                }
             }
             continue;
         }
@@ -747,7 +750,6 @@ impl Runner {
         extra_env: &[(String, String)],
         log: &Path,
     ) -> std::result::Result<bool, StepError> {
-        use std::os::unix::process::CommandExt;
         let mut log = std::fs::File::options()
             .create(true)
             .append(true)
@@ -762,8 +764,12 @@ impl Runner {
             .envs(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
             .stdin(Stdio::null())
             .stdout(stdout)
-            .stderr(log)
-            .process_group(0);
+            .stderr(log);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let mut child = command
             .spawn()
             .map_err(|err| StepError::Failed(format!("cannot start {program}: {err}")))?;
@@ -776,11 +782,14 @@ impl Runner {
             let cancelled = self.cancel.load(Ordering::Relaxed);
             if cancelled || Instant::now() >= self.deadline {
                 // The step leads its own process group; take all of it.
-                let pid = child.id() as libc::pid_t;
-                // SAFETY: signalling a process group we created; no memory
-                // is shared with it.
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
+                #[cfg(unix)]
+                {
+                    let pid = child.id() as libc::pid_t;
+                    // SAFETY: signalling a process group we created; no
+                    // memory is shared with it.
+                    unsafe {
+                        libc::kill(-pid, libc::SIGKILL);
+                    }
                 }
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1029,6 +1038,11 @@ fn run_c(request: &SanitizeRequest, outcome: &mut SanitizeOutcome) -> Result<()>
         .into_iter()
         .find_map(|dir| detect_c_build(&dir).map(|build| (dir, build)))
         .ok_or_else(|| anyhow!("no CMake, Meson, Autotools, or Make build was found"))?;
+    // The injection shim links through GNU ld's `--wrap`, and LeakSanitizer
+    // and bubblewrap are Linux tools.
+    if !cfg!(target_os = "linux") {
+        return Err(anyhow!("the sanitizer pass runs on Linux only"));
+    }
     let build_dir = match build {
         CBuild::CMake | CBuild::Meson => root.join("build"),
         CBuild::Autotools | CBuild::Make => sources.clone(),
@@ -1612,6 +1626,7 @@ SUMMARY: AddressSanitizer: 48 byte(s) leaked in 2 allocation(s).
         dir
     }
 
+    #[cfg(target_os = "linux")]
     fn tool_available(program: &str) -> bool {
         Command::new(program)
             .arg("--version")
@@ -1631,6 +1646,7 @@ SUMMARY: AddressSanitizer: 48 byte(s) leaked in 2 allocation(s).
         })
     }
 
+    #[cfg(target_os = "linux")]
     const OVERFLOW: &str = "#include <stdlib.h>\n#include <string.h>\n\
         int fill(int n) {\n    int *v = malloc(4 * sizeof *v);\n\
             for (int i = 0; i <= n; i++) v[i] = i;\n    int r = v[0];\n\
@@ -1638,6 +1654,7 @@ SUMMARY: AddressSanitizer: 48 byte(s) leaked in 2 allocation(s).
 
     /// The whole pass on a Make project whose test writes past a heap
     /// buffer: built, run, reported, and placed on the reviewed file.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_make_project_overflow_is_found_end_to_end() {
         if !tool_available("cc") || !tool_available("make") {
@@ -1685,6 +1702,7 @@ SUMMARY: AddressSanitizer: 48 byte(s) leaked in 2 allocation(s).
 
     /// CMake with ctest: a leak and a signed overflow, both found, and the
     /// notes say the tests ran sandboxed when bubblewrap works.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_cmake_project_leak_and_overflow_are_found() {
         if !tool_available("cc") || !tool_available("cmake") || !tool_available("ctest") {
@@ -1736,6 +1754,7 @@ SUMMARY: AddressSanitizer: 48 byte(s) leaked in 2 allocation(s).
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_meson_project_use_after_free_is_found() {
         if !tool_available("cc") || !tool_available("meson") || !tool_available("ninja") {
@@ -1772,8 +1791,22 @@ SUMMARY: AddressSanitizer: 48 byte(s) leaked in 2 allocation(s).
         assert!(outcome.notes[0].contains("no CMake, Meson, Autotools, or Make build"));
     }
 
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn other_platforms_say_the_pass_is_linux_only() {
+        let dir = c_project(&[("a.c", "int x;\n"), ("Makefile", "a.o: a.c\n")]);
+        let outcome = run(dir.path());
+        assert!(outcome.reports.is_empty());
+        assert!(
+            outcome.notes[0].contains("runs on Linux only"),
+            "{:?}",
+            outcome.notes
+        );
+    }
+
     /// An unchecked `malloc` passes the plain test run and is found by the
     /// rerun that makes that allocation fail — and a checked one is not.
+    #[cfg(target_os = "linux")]
     #[test]
     fn an_unchecked_allocation_is_found_by_injection() {
         if !tool_available("cc") || !tool_available("make") {
