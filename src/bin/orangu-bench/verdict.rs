@@ -113,7 +113,18 @@ pub fn judge(control: &[Run], candidate: &[Run], lower_is_better: bool) -> Optio
 
 /// Modes whose recorded value is a cost, so a smaller one is the better.
 pub fn lower_is_better(mode: &str) -> bool {
-    matches!(mode, "cpu" | "itl" | "kl" | "ttft" | "ttft-cold")
+    matches!(
+        mode,
+        "cpu" | "itl" | "kl" | "ttft" | "ttft-cold" | "io_majflt" | "io_mb_per_token"
+    )
+}
+
+/// Modes that describe how a point was measured rather than how fast it ran:
+/// the page faults and disk reads behind a rate. A change in one is shown
+/// beside the verdict and never decides it — the rate already carries what
+/// the reads cost, and a fault count moves by a few between identical runs.
+pub fn is_diagnostic(mode: &str) -> bool {
+    mode.starts_with("io_")
 }
 
 #[cfg(test)]
@@ -164,6 +175,23 @@ mod tests {
         assert_eq!(v.outcome, Outcome::Worse);
         assert!(lower_is_better("itl") && lower_is_better("kl") && !lower_is_better("tg"));
         assert!(lower_is_better("ttft") && lower_is_better("ttft-cold"));
+    }
+
+    /// More faults or more disk read per token is a cost, never a gain, and
+    /// neither decides a verdict: a sweep once kept a slower setting because
+    /// its fault count rose 159% and was read as "better".
+    #[test]
+    fn read_counters_are_costs_and_only_diagnostics() {
+        assert!(lower_is_better("io_majflt") && lower_is_better("io_mb_per_token"));
+        let v = judge(
+            &[run(4.0, 0.1), run(4.0, 0.1)],
+            &[run(10.0, 0.1), run(10.0, 0.1)],
+            lower_is_better("io_majflt"),
+        )
+        .unwrap();
+        assert_eq!(v.outcome, Outcome::Worse);
+        assert!(is_diagnostic("io_majflt") && is_diagnostic("io_mb_per_token"));
+        assert!(!is_diagnostic("tg") && !is_diagnostic("pp") && !is_diagnostic("itl"));
     }
 
     #[test]

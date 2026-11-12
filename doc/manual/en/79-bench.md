@@ -892,6 +892,11 @@ and each point reads `better`, `WORSE` or `within noise`. The run-to-run
 spread is measured from an arm's own runs, so a value run once has none, and
 a sweep with such a value prints `no verdict` instead.
 
+The read counters (`io_majflt`, `io_mb_per_token`) are judged as costs —
+fewer is better — and marked `(diagnostic)`: they are shown, but neither
+`--fail-on-regression` nor `--write-profile` acts on them, since the rate
+already carries what the reads cost.
+
 ```
 verdict — on against 0, noise = max(2 × standard error, one arm's run-to-run spread)
   tg 0             +3.4%  noise ±  1.2%  better

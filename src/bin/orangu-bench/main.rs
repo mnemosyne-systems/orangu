@@ -2652,14 +2652,17 @@ verdict — {} against {}, noise = max(2 × standard error, one arm's run-to-run
         ) else {
             continue;
         };
-        let j = judged.get_or_insert(Judged {
-            better: false,
-            worse: false,
-        });
-        j.worse |= v.outcome == verdict::Outcome::Worse;
-        j.better |= v.outcome == verdict::Outcome::Better;
+        let diagnostic = verdict::is_diagnostic(mode);
+        if !diagnostic {
+            let j = judged.get_or_insert(Judged {
+                better: false,
+                worse: false,
+            });
+            j.worse |= v.outcome == verdict::Outcome::Worse;
+            j.better |= v.outcome == verdict::Outcome::Better;
+        }
         println!(
-            "  {:<12}  {:>+7.1}%  noise ±{:>5.1}%  {}",
+            "  {:<12}  {:>+7.1}%  noise ±{:>5.1}%  {}{}",
             format!("{mode} {n}"),
             v.change * 100.0,
             v.noise * 100.0,
@@ -2667,7 +2670,8 @@ verdict — {} against {}, noise = max(2 × standard error, one arm's run-to-run
                 verdict::Outcome::Better => "better",
                 verdict::Outcome::Worse => "WORSE",
                 verdict::Outcome::WithinNoise => "within noise",
-            }
+            },
+            if diagnostic { " (diagnostic)" } else { "" }
         );
     }
     judged

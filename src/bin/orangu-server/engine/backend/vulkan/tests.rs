@@ -16594,6 +16594,51 @@ fn wide_projections_take_the_four_row_block_hoisted_pipeline() {
     assert!(vulkan.block_hoisted_wide_for(&wide, 64).is_none());
 }
 
+/// A wide projection of a K-quant with a light kernel takes it at two rows
+/// a workgroup at decode, a narrow one keeps one row — and the two-row
+/// kernel agrees with the CPU backend at a model's widths, with an odd
+/// leftover row (`out_dim` not a multiple of the two).
+#[test]
+fn wide_light_projections_take_two_rows_and_match_cpu_backend() {
+    for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K] {
+        {
+            let _gpu_lock = super::gpu_test_lock();
+            let Some(vulkan) = shared_vulkan() else {
+                eprintln!("{NO_GPU_SKIP}");
+                return;
+            };
+            if !vulkan.light_wide_pipelines.contains_key(&ggml_type) {
+                eprintln!("type {ggml_type}: no light kernel on this device, nothing to check");
+                continue;
+            }
+            let mut seed = 0x2B0E_u64;
+            let block = build_block(ggml_type, &mut seed);
+            let wide = test_quant_matrix(&block.repeat(12 * 2048), ggml_type, 3072, 2048);
+            let narrow = test_quant_matrix(&block.repeat(12 * 1024), ggml_type, 3072, 1024);
+            assert!(vulkan.block_hoisted_wide_for(&wide, 1).is_some());
+            assert_eq!(vulkan.decode_rows_per_workgroup(&wide, 1), LIGHT_WIDE_ROWS);
+            assert!(vulkan.block_hoisted_wide_for(&narrow, 1).is_none());
+            assert_eq!(
+                vulkan.decode_rows_per_workgroup(&narrow, 1),
+                reduce_n_rows()
+            );
+        }
+        // Above the host-matmul threshold, or a one-token weight is served
+        // by the CPU and the kernel under test never runs; odd, so the last
+        // row group holds one row.
+        for in_dim in [3072, 8192] {
+            let (block_bytes, block_elems) = crate::engine::quant::block_layout(ggml_type).unwrap();
+            let row_bytes = in_dim / block_elems * block_bytes;
+            let out_dim = (crate::engine::backend::host_matmul_threshold_bytes()
+                .div_ceil(row_bytes)
+                .max(2048)
+                + 7)
+                | 1;
+            cross_check_n_tokens(ggml_type, in_dim, out_dim, 1);
+        }
+    }
+}
+
 /// The activation+multiply with the q8 epilogue: the product itself
 /// matches the plain fused kernel's, and the q8 rows match the CPU
 /// quantizer of that product block for block — at a width that leaves a

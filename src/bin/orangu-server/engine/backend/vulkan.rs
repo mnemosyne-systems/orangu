@@ -1384,6 +1384,15 @@ pub struct VulkanBackend {
     /// token at four rows, the 256-wide per-layer projections 0.41 → 1.58 —
     /// hence the split by width). `ORANGU_BLOCK_HOISTED_WIDE=0` turns it off.
     block_hoisted_wide_pipelines: HashMap<u32, wgpu::ComputePipeline>,
+    /// The `Q4_K`/`Q5_K`/`Q6_K` light decode kernels at [`LIGHT_WIDE_ROWS`]
+    /// rows per workgroup, taken for a projection of
+    /// [`BLOCK_HOISTED_WIDE_MIN_OUT`] rows or more where the ladder picks the
+    /// type's light kernel — the same split by width, for the same reason:
+    /// two rows share each activation load across a longer-lived workgroup,
+    /// and on a narrow projection they leave too few workgroups (measured on
+    /// Llama-3.2-3B: `ffn.down` −7.5%, `attn.wq`/`wo` −1.3%, the 1024-row
+    /// `attn.wv` +5.4%). `ORANGU_LIGHT_WIDE=0` turns it off.
+    light_wide_pipelines: HashMap<u32, wgpu::ComputePipeline>,
     /// The **integer-dot** block-hoisted decode pipelines
     /// (`vulkan_shaders::shader_source_reduce_block_hoisted_i8`), one and
     /// four rows per workgroup, for the types with an i8 `block_dot`. Taken
@@ -2768,6 +2777,11 @@ static Q4K_GLSL_GEMV_SPIRV: &[u8] = include_bytes!("shaders/q4k_gemv.spv");
 /// `VulkanBackend::block_hoisted_wide_pipelines`.
 const BLOCK_HOISTED_WIDE_ROWS: usize = 4;
 const BLOCK_HOISTED_WIDE_MIN_OUT: usize = 2048;
+
+/// Rows per workgroup of the K-quant light kernels on a projection of
+/// [`BLOCK_HOISTED_WIDE_MIN_OUT`] rows or more —
+/// `VulkanBackend::light_wide_pipelines`.
+const LIGHT_WIDE_ROWS: usize = 2;
 /// Rows per workgroup of the integer-dot ternary decode kernels
 /// (`ternary_idot_pipelines`): the activations are quantized once per block
 /// per workgroup and reused for every row, so more rows amortize that.
@@ -3746,6 +3760,7 @@ struct DisabledKernels {
     wide_unroll: Option<wgpu::ComputePipeline>,
     block_hoisted: Option<wgpu::ComputePipeline>,
     block_hoisted_wide: Option<wgpu::ComputePipeline>,
+    light_wide: Option<wgpu::ComputePipeline>,
     block_hoisted_i8: Option<wgpu::ComputePipeline>,
     block_hoisted_i8_wide: Option<wgpu::ComputePipeline>,
     ternary_idot: Option<wgpu::ComputePipeline>,
@@ -6036,6 +6051,49 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
                 subgroup_reduce,
             ))
         });
+
+        // See `Self::light_wide_pipelines`: each light kernel that is built
+        // again at two rows, for the wide projections. Not where the rows are
+        // already that many, and not under the raw-Vulkan replay, whose
+        // capture compiles every matmul at `reduce_n_rows()`.
+        let light_wide_pipelines: HashMap<u32, wgpu::ComputePipeline> = if reduce_n_rows()
+            < LIGHT_WIDE_ROWS
+            && crate::engine::env::flag_on_unless_disabled("ORANGU_LIGHT_WIDE")
+            && !crate::engine::env::flag_on("ORANGU_REPLAY")
+        {
+            use crate::engine::quant::{GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K};
+            let mut map = HashMap::new();
+            if q4_k_light_pipeline.is_some() {
+                map.insert(
+                    GGML_TYPE_Q4_K,
+                    build_pipeline(vulkan_shaders::shader_source_reduce_q4k_light(
+                        LIGHT_WIDE_ROWS,
+                        subgroup_reduce,
+                    )),
+                );
+            }
+            if q5_k_light_pipeline.is_some() {
+                map.insert(
+                    GGML_TYPE_Q5_K,
+                    build_pipeline(vulkan_shaders::shader_source_reduce_q5k_light(
+                        LIGHT_WIDE_ROWS,
+                        subgroup_reduce,
+                    )),
+                );
+            }
+            if q6_k_light_pipeline.is_some() {
+                map.insert(
+                    GGML_TYPE_Q6_K,
+                    build_pipeline(vulkan_shaders::shader_source_reduce_q6k_light(
+                        LIGHT_WIDE_ROWS,
+                        subgroup_reduce,
+                    )),
+                );
+            }
+            map
+        } else {
+            HashMap::new()
+        };
         let q6_k_light_tokens_pipeline = (wide_unroll
             && q6k_light
             && reduce_n_rows() == 1
@@ -6377,6 +6435,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             wide_unroll_pipelines,
             block_hoisted_pipelines,
             block_hoisted_wide_pipelines,
+            light_wide_pipelines,
             block_hoisted_i8_pipelines,
             block_hoisted_i8_wide_pipelines,
             q4_k_i8_tokens_pipeline,
@@ -6540,6 +6599,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             wide_unroll: self.wide_unroll_pipelines.remove(&ggml_type),
             block_hoisted: self.block_hoisted_pipelines.remove(&ggml_type),
             block_hoisted_wide: self.block_hoisted_wide_pipelines.remove(&ggml_type),
+            light_wide: self.light_wide_pipelines.remove(&ggml_type),
             block_hoisted_i8: self.block_hoisted_i8_pipelines.remove(&ggml_type),
             block_hoisted_i8_wide: self.block_hoisted_i8_wide_pipelines.remove(&ggml_type),
             ternary_idot: self.ternary_idot_pipelines.remove(&ggml_type),
@@ -6580,6 +6640,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             wide_unroll,
             block_hoisted,
             block_hoisted_wide,
+            light_wide,
             block_hoisted_i8,
             block_hoisted_i8_wide,
             ternary_idot,
@@ -6598,6 +6659,9 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         }
         if let Some(p) = block_hoisted_wide {
             self.block_hoisted_wide_pipelines.insert(ggml_type, p);
+        }
+        if let Some(p) = light_wide {
+            self.light_wide_pipelines.insert(ggml_type, p);
         }
         if let Some(p) = block_hoisted_i8 {
             self.block_hoisted_i8_pipelines.insert(ggml_type, p);
@@ -8504,7 +8568,12 @@ impl VulkanBackend {
         let (_, name) = self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens);
         let pipeline = self.matmul_pipeline_for(w, n_tokens);
         let name = if self.block_hoisted_wide_for(w, n_tokens).is_some() {
-            "block-hoisted-wide"
+            match name {
+                "q4_k-light" => "q4_k-light-wide",
+                "q5_k-light" => "q5_k-light-wide",
+                "q6_k-light" => "q6_k-light-wide",
+                _ => "block-hoisted-wide",
+            }
         } else {
             name
         };
@@ -9054,9 +9123,10 @@ impl VulkanBackend {
         self.pipeline_for_named(ggml_type, in_dim, n_tokens).0
     }
 
-    /// The wide block-hoisted pipeline for this op, when it applies: a
-    /// decode shape the ladder would give the block-hoisted kernel, on a
-    /// projection of `BLOCK_HOISTED_WIDE_MIN_OUT` rows or more.
+    /// The wide pipeline for this op, when it applies: a decode shape the
+    /// ladder would give the block-hoisted or a light kernel, on a
+    /// projection of `BLOCK_HOISTED_WIDE_MIN_OUT` rows or more — see
+    /// [`Self::wide_decode_for`].
     fn block_hoisted_wide_for(
         &self,
         w: &QuantMatrix,
@@ -9070,11 +9140,12 @@ impl VulkanBackend {
     }
 
     /// The wide decode pipeline for `w` and the rows per workgroup it was
-    /// built for — the integer-dot ternary kernel at [`TERNARY_IDOT_ROWS`]
-    /// where it exists, else the block-hoisted words kernel at
-    /// [`BLOCK_HOISTED_WIDE_ROWS`]; `None` below
-    /// [`BLOCK_HOISTED_WIDE_MIN_OUT`] rows or where the ladder would not
-    /// pick the block-hoisted family at all.
+    /// built for — the type's light kernel at [`LIGHT_WIDE_ROWS`] where the
+    /// ladder picks a light kernel; otherwise the integer-dot ternary kernel
+    /// at [`TERNARY_IDOT_ROWS`] where it exists, else the block-hoisted
+    /// words kernel at [`BLOCK_HOISTED_WIDE_ROWS`]; `None` below
+    /// [`BLOCK_HOISTED_WIDE_MIN_OUT`] rows or where the ladder picks neither
+    /// family.
     fn wide_decode_for(
         &self,
         w: &QuantMatrix,
@@ -9082,6 +9153,13 @@ impl VulkanBackend {
     ) -> Option<(&wgpu::ComputePipeline, usize)> {
         if w.out_dim < BLOCK_HOISTED_WIDE_MIN_OUT {
             return None;
+        }
+        let ladder = self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens).1;
+        if matches!(ladder, "q4_k-light" | "q5_k-light" | "q6_k-light") {
+            return self
+                .light_wide_pipelines
+                .get(&w.ggml_type())
+                .map(|p| (p, LIGHT_WIDE_ROWS));
         }
         let picked = self
             .ternary_idot_pipelines
@@ -9092,8 +9170,7 @@ impl VulkanBackend {
                     .get(&w.ggml_type())
                     .map(|p| (p, BLOCK_HOISTED_WIDE_ROWS))
             })?;
-        (self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens).1 == "block-hoisted")
-            .then_some(picked)
+        (ladder == "block-hoisted").then_some(picked)
     }
 
     /// Whether `matmul` on `w` at `n_tokens` runs the integer-dot ternary
