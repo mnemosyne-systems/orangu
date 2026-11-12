@@ -4230,7 +4230,7 @@ fn emit_text(
 
 /// Remove ANSI escape sequences (CSI, plus the `ESC O x` cursor keys) so the
 /// console export shows the plain text the terminal rendered.
-fn strip_ansi(line: &str) -> String {
+pub(crate) fn strip_ansi(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut chars = line.chars().peekable();
     'outer: while let Some(ch) = chars.next() {
