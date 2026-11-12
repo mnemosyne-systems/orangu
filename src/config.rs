@@ -196,6 +196,44 @@ pub struct LlmConfiguration {
     /// Minimum confidence score (0–100) for `/auto_review` findings; findings
     /// below this threshold are silently dropped. `0` disables filtering.
     pub review_confidence_threshold: u32,
+    /// Minimum confidence score (0–100) for `/auto_review` Security findings.
+    /// Security findings between this and `review_confidence_threshold` are
+    /// kept and marked as needing verification. `0` keeps every one.
+    pub security_confidence_threshold: u32,
+    /// When `/auto_review` builds the reviewed C/C++ project with sanitizers
+    /// and runs its tests.
+    pub review_sanitize: ReviewSanitize,
+    /// Wall-clock limit for the `/auto_review` sanitizer pass, in seconds.
+    pub review_sanitize_timeout: u64,
+    /// How many `/auto_review` sanitizer reruns fail an allocation: rerun
+    /// `n` fails the `n`th allocation of every test process. `0` turns the
+    /// injection off.
+    pub review_sanitize_alloc_failures: u32,
+}
+
+/// When `/auto_review` runs the sanitizer pass on C/C++ changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+pub enum ReviewSanitize {
+    /// Never.
+    Off,
+    /// When a changed C/C++ file is reviewed in Deep mode.
+    #[default]
+    Deep,
+    /// Whenever a C/C++ file is reviewed.
+    Always,
+}
+
+impl FromStr for ReviewSanitize {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" | "no" => Ok(Self::Off),
+            "deep" => Ok(Self::Deep),
+            "always" | "on" | "true" | "1" | "yes" => Ok(Self::Always),
+            other => Err(format!("expected off, deep, or always (got '{other}')")),
+        }
+    }
 }
 
 pub const CLIENT_SECTION: &str = "orangu";
@@ -225,6 +263,18 @@ pub fn default_review_max_tokens() -> u32 {
 
 pub fn default_review_confidence_threshold() -> u32 {
     80
+}
+
+pub fn default_security_confidence_threshold() -> u32 {
+    50
+}
+
+pub fn default_review_sanitize_timeout() -> u64 {
+    1_800
+}
+
+pub fn default_review_sanitize_alloc_failures() -> u32 {
+    8
 }
 
 /// Default chat-response cap: `0`, no cap — normal coding responses are
@@ -305,6 +355,22 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         "review_confidence_threshold",
         default_review_confidence_threshold,
     )?;
+    let security_confidence_threshold = parse_client_field(
+        &client,
+        "security_confidence_threshold",
+        default_security_confidence_threshold,
+    )?;
+    let review_sanitize = parse_client_field(&client, "review_sanitize", ReviewSanitize::default)?;
+    let review_sanitize_timeout = parse_client_field(
+        &client,
+        "review_sanitize_timeout",
+        default_review_sanitize_timeout,
+    )?;
+    let review_sanitize_alloc_failures = parse_client_field(
+        &client,
+        "review_sanitize_alloc_failures",
+        default_review_sanitize_alloc_failures,
+    )?;
     let code_max_tokens = parse_client_field(&client, "code_max_tokens", default_code_max_tokens)?;
     let compression = client
         .get("compression")
@@ -381,6 +447,12 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
             max_tool_rounds,
             review_max_tokens,
             review_confidence_threshold,
+            security_confidence_threshold,
+            (
+                review_sanitize,
+                review_sanitize_timeout,
+                review_sanitize_alloc_failures,
+            ),
             code_max_tokens,
             system_prompt,
             default_model,
@@ -936,6 +1008,12 @@ fn parse_llm_profiles(
     max_tool_rounds: usize,
     review_max_tokens: u32,
     review_confidence_threshold: u32,
+    security_confidence_threshold: u32,
+    (review_sanitize, review_sanitize_timeout, review_sanitize_alloc_failures): (
+        ReviewSanitize,
+        u64,
+        u32,
+    ),
     code_max_tokens: u32,
     system_prompt: String,
     default_model: Option<String>,
@@ -980,6 +1058,10 @@ fn parse_llm_profiles(
                     system_prompt: system_prompt.clone(),
                     model_verbosity,
                     review_confidence_threshold,
+                    security_confidence_threshold,
+                    review_sanitize,
+                    review_sanitize_timeout,
+                    review_sanitize_alloc_failures,
                 },
             ))
         })

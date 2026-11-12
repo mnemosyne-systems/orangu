@@ -201,6 +201,10 @@ mod tests {
             system_prompt: String::new(),
             model_verbosity: None,
             review_confidence_threshold: 0,
+            security_confidence_threshold: 0,
+            review_sanitize: Default::default(),
+            review_sanitize_timeout: 1_800,
+            review_sanitize_alloc_failures: 8,
         }
     }
 

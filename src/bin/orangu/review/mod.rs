@@ -17,9 +17,13 @@ use crate::*;
 
 mod auto;
 mod interactive;
+mod sanitize;
+pub(crate) mod secrets;
+mod security;
 
 pub(crate) use auto::*;
 pub(crate) use interactive::*;
+pub(crate) use security::*;
 
 use std::cell::RefCell;
 
