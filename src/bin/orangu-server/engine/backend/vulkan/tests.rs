@@ -16613,10 +16613,17 @@ fn wide_light_projections_take_two_rows_and_match_cpu_backend() {
             }
             let mut seed = 0x2B0E_u64;
             let block = build_block(ggml_type, &mut seed);
-            let wide = test_quant_matrix(&block.repeat(12 * 2048), ggml_type, 3072, 2048);
+            // `Q6_K` takes two rows only on long rows (`Q6K_LIGHT_WIDE_MIN_IN`).
+            let long = if ggml_type == GGML_TYPE_Q6_K { 32 } else { 12 };
+            let wide = test_quant_matrix(&block.repeat(long * 2048), ggml_type, long * 256, 2048);
             let narrow = test_quant_matrix(&block.repeat(12 * 1024), ggml_type, 3072, 1024);
             assert!(vulkan.block_hoisted_wide_for(&wide, 1).is_some());
             assert_eq!(vulkan.decode_rows_per_workgroup(&wide, 1), LIGHT_WIDE_ROWS);
+            if ggml_type == GGML_TYPE_Q6_K {
+                let short = test_quant_matrix(&block.repeat(12 * 2048), ggml_type, 3072, 2048);
+                assert!(vulkan.block_hoisted_wide_for(&short, 1).is_none());
+                assert_eq!(vulkan.decode_rows_per_workgroup(&short, 1), reduce_n_rows());
+            }
             assert!(vulkan.block_hoisted_wide_for(&narrow, 1).is_none());
             assert_eq!(
                 vulkan.decode_rows_per_workgroup(&narrow, 1),
@@ -17562,4 +17569,19 @@ fn idle_device_pages_are_released_and_built_again_with_their_rows() {
             "{got} vs {want}"
         );
     }
+}
+
+/// The device's `Q6_K` layout moves only the blocks that start two bytes off
+/// a word, and moves their `d` in front of the runs; the rest are the file's.
+#[test]
+fn q6k_device_layout_puts_d_first_only_on_misaligned_blocks() {
+    let bytes: Vec<u8> = (0..3 * 210).map(|i| (i % 251) as u8).collect();
+    let out = super::q6k_device_layout(&bytes);
+    assert_eq!(out.len(), bytes.len());
+    // Blocks 0 and 2 start at 0 and 420: aligned, untouched.
+    assert_eq!(out[..210], bytes[..210]);
+    assert_eq!(out[420..], bytes[420..]);
+    // Block 1 starts at 210 (two past a word): `d`, then the 208 bytes before it.
+    assert_eq!(out[210..212], bytes[418..420]);
+    assert_eq!(out[212..420], bytes[210..418]);
 }

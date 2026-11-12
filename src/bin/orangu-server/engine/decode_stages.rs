@@ -534,6 +534,96 @@ pub fn take_json() -> serde_json::Value {
     })
 }
 
+/// `ORANGU_CPU_TIMESTAMPS` for a chained decode step: when, from the step's
+/// start, each of its submissions was made and how long the call took, and
+/// how the last one splits into the submission and the wait for the device.
+///
+/// The stage timer says how much of a pass is spent in `device.submit`; it
+/// cannot say whether the device was idle while the host was there. Read
+/// against `ORANGU_GPU_TIMESTAMPS=ops`'s `idle before`, these marks place the
+/// host's turn between tokens: a late first submission shows as a large
+/// first offset, a slow driver call as a long duration.
+pub mod host_step {
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+
+    /// Whether `ORANGU_CPU_TIMESTAMPS` is set; read once.
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| crate::engine::env::flag_on("ORANGU_CPU_TIMESTAMPS"))
+    }
+
+    #[derive(Default)]
+    struct Step {
+        start: Option<Instant>,
+        last_end: Option<Instant>,
+        since_return: Option<Duration>,
+        marks: Vec<(&'static str, Duration, Duration)>,
+    }
+
+    thread_local! {
+        static STEP: RefCell<Step> = RefCell::new(Step::default());
+    }
+
+    /// Opens a step on this thread. Inert unless [`enabled`].
+    pub fn begin() {
+        if !enabled() {
+            return;
+        }
+        STEP.with(|s| {
+            let mut s = s.borrow_mut();
+            let now = Instant::now();
+            s.since_return = s.last_end.map(|t| now - t);
+            s.start = Some(now);
+            s.marks.clear();
+        });
+    }
+
+    /// Runs `f` and records it under `label`: its offset from the step's
+    /// start and its duration. Just `f` outside an open step.
+    pub fn mark<T>(label: &'static str, f: impl FnOnce() -> T) -> T {
+        if !enabled() {
+            return f();
+        }
+        let at = Instant::now();
+        let out = f();
+        let took = at.elapsed();
+        STEP.with(|s| {
+            let mut s = s.borrow_mut();
+            if let Some(start) = s.start {
+                s.marks.push((label, at - start, took));
+            }
+        });
+        out
+    }
+
+    /// Closes the step and prints its `[cpu-trace]` line.
+    pub fn end(pos: usize) {
+        if !enabled() {
+            return;
+        }
+        STEP.with(|s| {
+            let mut s = s.borrow_mut();
+            let Some(start) = s.start.take() else {
+                return;
+            };
+            let now = Instant::now();
+            let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+            let mut line = format!(
+                "orangu-server: [cpu-trace] pos {pos}: since-return {}, step {:.3}ms",
+                s.since_return
+                    .map_or("-".to_string(), |d| format!("{:.3}ms", ms(d))),
+                ms(now - start)
+            );
+            for (label, at, took) in &s.marks {
+                line.push_str(&format!(", {label} @{:.3}+{:.3}", ms(*at), ms(*took)));
+            }
+            eprintln!("{line}");
+            s.last_end = Some(now);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

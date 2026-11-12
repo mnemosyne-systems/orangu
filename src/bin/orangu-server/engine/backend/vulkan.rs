@@ -2782,6 +2782,15 @@ const BLOCK_HOISTED_WIDE_MIN_OUT: usize = 2048;
 /// [`BLOCK_HOISTED_WIDE_MIN_OUT`] rows or more —
 /// `VulkanBackend::light_wide_pipelines`.
 const LIGHT_WIDE_ROWS: usize = 2;
+
+/// The shortest `Q6_K` row, in elements, that a wide projection takes at
+/// [`LIGHT_WIDE_ROWS`]. Below it a row is under sixteen blocks, and since
+/// each block is one load a field (`VulkanBackend::device_weight_bytes`) a
+/// second row's accumulator and scale words cost more than the shared
+/// workgroup saves: a 3072-wide vocabulary projection read 1875 µs at one
+/// row a workgroup against 1958 at two, while the 8192-wide down
+/// projection still reads 116 µs at two against 118 at one.
+const Q6K_LIGHT_WIDE_MIN_IN: usize = 4096;
 /// Rows per workgroup of the integer-dot ternary decode kernels
 /// (`ternary_idot_pipelines`): the activations are quantized once per block
 /// per workgroup and reused for every row, so more rows amortize that.
@@ -7249,7 +7258,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         encoder: Option<&mut wgpu::CommandEncoder>,
     ) -> Option<(wgpu::Buffer, u64, u64)> {
         let (waddr, wlen) = w.cache_key();
-        let bytes = w.raw_bytes();
+        let device_bytes = Self::device_weight_bytes(w);
+        let bytes = &*device_bytes;
         let key = (waddr, wlen, w.ggml_type(), bytes.len());
         let size = (bytes.len() as u64).next_multiple_of(16);
         let align = (self.device.limits().min_storage_buffer_offset_alignment as u64).max(16);
@@ -7320,7 +7330,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             return;
         };
         let (waddr, wlen) = w.cache_key();
-        let bytes = w.raw_bytes();
+        let device_bytes = Self::device_weight_bytes(w);
+        let bytes = &*device_bytes;
         let key = (waddr, wlen, w.ggml_type(), bytes.len());
         if let Some(arena) = self
             .stream_arena
@@ -7438,7 +7449,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     fn staged_half(&self, w: &QuantMatrix) -> (usize, WeightCacheKey) {
         let min = self.upload_staging_min.expect("the staging pair is in use");
         let (waddr, wlen) = w.cache_key();
-        let bytes = w.raw_bytes();
+        let device_bytes = Self::device_weight_bytes(w);
+        let bytes = &*device_bytes;
         let key = (waddr, wlen, w.ggml_type(), bytes.len());
         let mut staging = self.stream_staging.lock().expect("upload staging poisoned");
         let found = staging
@@ -7535,7 +7547,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         {
             Some(at) => at,
             None => {
-                self.stage_into(&mut staging, min, key, w.raw_bytes());
+                self.stage_into(&mut staging, min, key, &Self::device_weight_bytes(w));
                 staging
                     .iter()
                     .position(|s| s.filled.is_some_and(|(k, _)| k == key))
@@ -7578,6 +7590,23 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     /// The padding is never read: every kernel addresses a row through this
     /// same stride and stops at the row's real bytes. It costs one 256-byte gap
     /// per row — 1.5% of a 12288-wide `Q4_1` row, less of anything wider.
+    /// The bytes of `w` as the device holds them: the file's, except that a
+    /// `Q6_K` block starting two bytes off a four-byte word (every other one:
+    /// blocks are 210 bytes) is stored with its two-byte `d` **first**, so its
+    /// `ql`, `qh` and scale runs start on a word and each field a kernel
+    /// reads is one aligned load rather than two. Same size, same block
+    /// positions; only those blocks' bytes move. Every kernel that reads
+    /// `Q6_K` on the device addresses this layout, and every upload goes
+    /// through here.
+    pub(crate) fn device_weight_bytes(w: &QuantMatrix) -> std::borrow::Cow<'_, [u8]> {
+        let bytes = w.raw_bytes();
+        if w.ggml_type() == crate::engine::quant::GGML_TYPE_Q6_K {
+            std::borrow::Cow::Owned(q6k_device_layout(bytes))
+        } else {
+            std::borrow::Cow::Borrowed(bytes)
+        }
+    }
+
     pub(crate) fn device_row_stride(row_bytes: usize) -> usize {
         if row_bytes != 0 && row_bytes.is_multiple_of(512) {
             row_bytes + 256
@@ -7641,7 +7670,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         stride: usize,
     ) {
         let row_bytes = w.row_bytes();
-        let bytes = w.raw_bytes();
+        let device_bytes = Self::device_weight_bytes(w);
+        let bytes = &*device_bytes;
         let mut staged = vec![0u8; stride * w.out_dim];
         for (row, dst) in staged.chunks_exact_mut(stride).enumerate() {
             dst[..row_bytes].copy_from_slice(&bytes[row * row_bytes..(row + 1) * row_bytes]);
@@ -7691,7 +7721,8 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
 
     fn weight_buffer(&self, w: &QuantMatrix) -> (wgpu::Buffer, u64, u64) {
         let (waddr, wlen) = w.cache_key();
-        let bytes = w.raw_bytes();
+        let device_bytes = Self::device_weight_bytes(w);
+        let bytes = &*device_bytes;
         let key = (waddr, wlen, w.ggml_type(), bytes.len());
         // The device's own row stride, which the padded types do not share
         // with the file's (`Self::device_row_stride`).
@@ -9141,7 +9172,9 @@ impl VulkanBackend {
 
     /// The wide decode pipeline for `w` and the rows per workgroup it was
     /// built for — the type's light kernel at [`LIGHT_WIDE_ROWS`] where the
-    /// ladder picks a light kernel; otherwise the integer-dot ternary kernel
+    /// ladder picks a light kernel (a `Q6_K` row at least
+    /// [`Q6K_LIGHT_WIDE_MIN_IN`] long; `None` for a shorter one, which keeps
+    /// the light kernel's one row); otherwise the integer-dot ternary kernel
     /// at [`TERNARY_IDOT_ROWS`] where it exists, else the block-hoisted
     /// words kernel at [`BLOCK_HOISTED_WIDE_ROWS`]; `None` below
     /// [`BLOCK_HOISTED_WIDE_MIN_OUT`] rows or where the ladder picks neither
@@ -9156,6 +9189,9 @@ impl VulkanBackend {
         }
         let ladder = self.pipeline_for_named(w.ggml_type(), w.in_dim, n_tokens).1;
         if matches!(ladder, "q4_k-light" | "q5_k-light" | "q6_k-light") {
+            if ladder == "q6_k-light" && w.in_dim < Q6K_LIGHT_WIDE_MIN_IN {
+                return None;
+            }
             return self
                 .light_wide_pipelines
                 .get(&w.ggml_type())
@@ -15025,12 +15061,13 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             mapped_at_creation: false,
         });
         encoder.copy_buffer_to_buffer(src, 0, &readback_buffer, 0, 4);
-        self.queue.submit(Some(encoder.finish()));
+        use crate::engine::decode_stages::host_step;
+        host_step::mark("last-submit", || self.queue.submit(Some(encoder.finish())));
         self.submission_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         crate::engine::decode_stages::record_submission();
         let wait = self.map_read(&readback_buffer);
-        self.wait_mapped(&wait, CONTEXT);
+        host_step::mark("wait", || self.wait_mapped(&wait, CONTEXT));
         let data = self.mapped_bytes(&readback_buffer, CONTEXT);
         let result: u32 = bytemuck::cast_slice::<u8, u32>(&data)[0];
         drop(data);
@@ -29129,6 +29166,25 @@ pub(crate) struct OpCaptureBuffers {
 
 #[cfg(test)]
 mod kv_cache_selection_tests;
+
+/// [`VulkanBackend::device_weight_bytes`]'s `Q6_K` layout: each 210-byte
+/// block whose offset from the tensor's start is two past a word becomes
+/// `d` (2 bytes), then `ql`, `qh` and the scales (208). A tensor is placed
+/// on at least a four-byte boundary, so an offset from its start has the
+/// same alignment as the address a kernel reads.
+fn q6k_device_layout(bytes: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 210;
+    let mut out = bytes.to_vec();
+    let mut b = 0;
+    while b + BLOCK <= bytes.len() {
+        if b % 4 == 2 {
+            out[b..b + 2].copy_from_slice(&bytes[b + 208..b + BLOCK]);
+            out[b + 2..b + BLOCK].copy_from_slice(&bytes[b..b + 208]);
+        }
+        b += BLOCK;
+    }
+    out
+}
 #[cfg(test)]
 mod tests;
 

@@ -88,6 +88,32 @@ pub fn seconds_per_token_unless(
     steps: usize,
     give_up_above: f64,
 ) -> Option<f64> {
+    let times = step_times(model, warmup, steps, give_up_above)?;
+    Some(times[times.len() / 2])
+}
+
+/// The fastest of [`STEPS`] decode steps of `model`, after the same warm-up as
+/// [`seconds_per_token`] — the step's cost with nothing else on the device.
+///
+/// For choosing between two kernel families on one device, where the median
+/// is the wrong statistic: another client of the card (a compositor copying
+/// frames onto a display it drives) only ever *adds* time to the steps it
+/// lands in. When it lands in more than half of them it carries both arms'
+/// medians, and two kernels a few percent apart read as a tie. The fastest
+/// step is the one it missed.
+pub fn fastest_step_seconds(model: &Arc<dyn ModelForward>) -> Option<f64> {
+    let times = step_times(model, WARMUP, STEPS, f64::INFINITY)?;
+    times.first().copied()
+}
+
+/// The timed steps behind [`seconds_per_token_unless`] and
+/// [`fastest_step_seconds`], sorted, fastest first.
+fn step_times(
+    model: &Arc<dyn ModelForward>,
+    warmup: usize,
+    steps: usize,
+    give_up_above: f64,
+) -> Option<Vec<f64>> {
     let (warmup_steps, timed) = (warmup, steps.max(1));
     let cap = warmup_steps.max(WARMUP_CAP);
     let mut cache = model.new_kv_cache(cap + timed + 1);
@@ -136,7 +162,7 @@ pub fn seconds_per_token_unless(
         }
     }
     times.sort_by(f64::total_cmp);
-    Some(times[times.len() / 2])
+    Some(times)
 }
 
 /// [`MIN_GAIN`], or `ORANGU_DECODE_PROBE_MIN_GAIN` for a measurement — a

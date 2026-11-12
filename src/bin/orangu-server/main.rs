@@ -4166,7 +4166,8 @@ fn choose_integer_dot(model: &Arc<dyn engine::arch::ModelForward>, path: &Path) 
             layer: "decode kernels",
             tunable: vulkan.integer_dot_decode_tunable(),
             set: &|on| vulkan.set_integer_dot_decode(on),
-            time: &|| engine::decode_backend::seconds_per_token(model),
+            // The fastest step, not the median: see `fastest_step_seconds`.
+            time: &|| engine::decode_backend::fastest_step_seconds(model),
         },
         Choice {
             what: "mmq",

@@ -1798,15 +1798,18 @@ fn coop_tiled_run_fill(ggml_type: u32, run: u32) -> String {
                 "    let block_idx = k0 / BLOCK_ELEMS;\n\
                  \x20   let local_k0 = k0 % BLOCK_ELEMS;\n\
                  \x20   let byte_offset = row_byte_base + block_idx * BLOCK_BYTES;\n\
-                 \x20   let d = f16_to_f32(read_u8(byte_offset + 208u) | (read_u8(byte_offset + 209u) << 8u));\n\
+                 \x20   // The device layout (`VulkanBackend::device_weight_bytes`).\n\
+                 \x20   let d_at = select(byte_offset + 208u, byte_offset, (byte_offset & 2u) != 0u);\n\
+                 \x20   let fields = byte_offset + (byte_offset & 2u);\n\
+                 \x20   let d = f16_to_f32(read_u8(d_at) | (read_u8(d_at + 1u) << 8u));\n\
                  \x20   let idx = local_k0 / 128u;\n\
                  \x20   // Which of the four interleaved 32-wide output ranges this run sits\n\
                  \x20   // in, and where in it — both constant over the run.\n\
                  \x20   let which_q = (local_k0 % 128u) / 32u;\n\
                  \x20   let l0 = local_k0 % 32u;\n\
-                 \x20   let ql_base = byte_offset + idx * 64u + l0;\n\
-                 \x20   let qh_base = byte_offset + 128u + idx * 32u + l0;\n\
-                 \x20   var sc: i32 = i32(read_u8(byte_offset + 192u + idx * 8u + l0 / 16u + which_q * 2u));\n\
+                 \x20   let ql_base = fields + idx * 64u + l0;\n\
+                 \x20   let qh_base = fields + 128u + idx * 32u + l0;\n\
+                 \x20   var sc: i32 = i32(read_u8(fields + 192u + idx * 8u + l0 / 16u + which_q * 2u));\n\
                  \x20   if (sc >= 128) {\n        sc = sc - 256;\n    }\n\
                  \x20   let dsc = d * f32(sc);\n\
                  \x20   var ql_extra: u32 = 0u;\n\
@@ -2140,10 +2143,13 @@ const BLOCK_BYTES: u32 = 210u;
 const BLOCK_ELEMS: u32 = 256u;
 var<workgroup> shared_vals: array<f32, BLOCK_ELEMS>;
 fn dequant_element(byte_offset: u32, k: u32) -> f32 {
-    let ql_off = byte_offset;
-    let qh_off = byte_offset + 128u;
-    let sc_off = byte_offset + 192u;
-    let d = f16_to_f32(read_u8(byte_offset + 208u) | (read_u8(byte_offset + 209u) << 8u));
+    // The device layout (`VulkanBackend::device_weight_bytes`): a block two
+    // bytes off a word holds `d` first and its runs from the next word.
+    let ql_off = byte_offset + (byte_offset & 2u);
+    let qh_off = ql_off + 128u;
+    let sc_off = ql_off + 192u;
+    let d_at = select(byte_offset + 208u, byte_offset, (byte_offset & 2u) != 0u);
+    let d = f16_to_f32(read_u8(d_at) | (read_u8(d_at + 1u) << 8u));
     let y_off = (k / 128u) * 128u;
     let idx = y_off / 128u;
     let local_in_group = k % 128u;
@@ -4650,7 +4656,7 @@ pub fn shader_source_q6k_i8_tokens(n_rows: usize, groups: usize, tile: usize) ->
     s.push_str("        let b = it * 8u + slot;\n        let bvalid = b < n_blocks;\n        let bb = min(b, n_blocks - 1u);\n        let zero = select(0u, 0xFFFFFFFFu, bvalid);\n        let fzero = select(0.0, 1.0, bvalid);\n");
     for r in 0..n_rows {
         s.push_str(&format!(
-            "        let bo{r} = row{r} + bb * 210u;\n        let sh{r} = (bo{r} & 3u) * 8u;\n        let rh{r} = (32u - sh{r}) & 31u;\n        let lw{r} = (bo{r} + ql_off) / 4u;\n        let hw{r} = (bo{r} + qh_off) / 4u;\n"
+            "        let bo{r} = row{r} + bb * 210u;\n        let p{r} = bo{r} + (bo{r} & 2u);\n        let sh{r} = (p{r} & 3u) * 8u;\n        let rh{r} = (32u - sh{r}) & 31u;\n        let lw{r} = (p{r} + ql_off) / 4u;\n        let hw{r} = (p{r} + qh_off) / 4u;\n"
         ));
         // Each 32-byte run as nine aligned words shifted into eight.
         for (name, base) in [("ql", "lw"), ("qh", "hw")] {
@@ -4667,7 +4673,7 @@ pub fn shader_source_q6k_i8_tokens(n_rows: usize, groups: usize, tile: usize) ->
             }
         }
         s.push_str(&format!(
-            "        let scw{r} = read_u16_even(bo{r} + sc_off);\n        let d{r} = f16_to_f32(read_u16_even(bo{r} + 208u)) * fzero;\n        let a0_{r} = d{r} * f32(i32(scw{r} << 24u) >> 24u);\n        let a1_{r} = d{r} * f32(i32(scw{r} << 16u) >> 24u);\n"
+            "        let scw{r} = read_u16_even(p{r} + sc_off);\n        let d{r} = f16_to_f32(read_u16_even(select(bo{r} + 208u, bo{r}, (bo{r} & 2u) != 0u))) * fzero;\n        let a0_{r} = d{r} * f32(i32(scw{r} << 24u) >> 24u);\n        let a1_{r} = d{r} * f32(i32(scw{r} << 16u) >> 24u);\n"
         ));
         for k in 0..8 {
             s.push_str(&format!(
@@ -6472,10 +6478,12 @@ const Q6_K_WIDE_MIDDLE: &str = r#"
 const BLOCK_BYTES: u32 = 210u;
 const BLOCK_ELEMS: u32 = 256u;
 fn dequant_element(byte_offset: u32, k: u32) -> f32 {
-    let ql_off = byte_offset;
-    let qh_off = byte_offset + 128u;
-    let sc_off = byte_offset + 192u;
-    let d_offset = byte_offset + 208u;
+    // The device layout (`VulkanBackend::device_weight_bytes`): a block two
+    // bytes off a word holds `d` first and its runs from the next word.
+    let ql_off = byte_offset + (byte_offset & 2u);
+    let qh_off = ql_off + 128u;
+    let sc_off = ql_off + 192u;
+    let d_offset = select(byte_offset + 208u, byte_offset, (byte_offset & 2u) != 0u);
     let dword = read_word_v4(d_offset - (d_offset % 4u));
     let d = f16_to_f32(select(dword & 0xFFFFu, dword >> 16u, (d_offset % 4u) != 0u));
     let y_off = (k / 128u) * 128u;
@@ -6721,10 +6729,12 @@ fn q6k_elem(d: f32, sc_off: u32, idx: u32, w_lo: u32, half: u32, is: u32, ql: u3
 }
 
 fn block_dot(byte_offset: u32, local: u32, x0: f32, x1: f32, x2: f32, x3: f32) -> f32 {
-    let ql_off = byte_offset;
-    let qh_off = byte_offset + 128u;
-    let sc_off = byte_offset + 192u;
-    let d_offset = byte_offset + 208u;
+    // The device layout (`VulkanBackend::device_weight_bytes`): a block two
+    // bytes off a word holds `d` first and its runs from the next word.
+    let ql_off = byte_offset + (byte_offset & 2u);
+    let qh_off = ql_off + 128u;
+    let sc_off = ql_off + 192u;
+    let d_offset = select(byte_offset + 208u, byte_offset, (byte_offset & 2u) != 0u);
     let dword = read_word_v4(d_offset - (d_offset % 4u));
     let d = f16_to_f32(select(dword & 0xFFFFu, dword >> 16u, (d_offset % 4u) != 0u));
     let l = local % 32u;
@@ -7728,42 +7738,22 @@ fn main(
             let j = b % 4u;
             let byte0 = (row0 + r) * params.row_bytes + sb * 210u;
             let e = (k * ROWS + r) * 11u;
-            let w0 = byte0 / 4u;
+            // The device layout (`VulkanBackend::device_weight_bytes`): the
+            // block's runs start on a word whatever its own alignment, and a
+            // block two bytes off holds `d` in the word before them.
+            let w0 = (byte0 + (byte0 & 2u)) / 4u;
             let qlb = w0 + 16u * h + 8u * (j % 2u);
             let qhb = w0 + 32u + 8u * h;
-            var ql0: u32; var ql1: u32; var ql2: u32; var ql3: u32;
-            var ql4: u32; var ql5: u32; var ql6: u32; var ql7: u32;
-            var qh0: u32; var qh1: u32; var qh2: u32; var qh3: u32;
-            var qh4: u32; var qh5: u32; var qh6: u32; var qh7: u32;
-            var sc_word: u32;
+            let ql0 = weights[qlb]; let ql1 = weights[qlb + 1u]; let ql2 = weights[qlb + 2u]; let ql3 = weights[qlb + 3u];
+            let ql4 = weights[qlb + 4u]; let ql5 = weights[qlb + 5u]; let ql6 = weights[qlb + 6u]; let ql7 = weights[qlb + 7u];
+            let qh0 = weights[qhb]; let qh1 = weights[qhb + 1u]; let qh2 = weights[qhb + 2u]; let qh3 = weights[qhb + 3u];
+            let qh4 = weights[qhb + 4u]; let qh5 = weights[qhb + 5u]; let qh6 = weights[qhb + 6u]; let qh7 = weights[qhb + 7u];
+            let sc_word = weights[w0 + 48u + b / 2u];
             var d_word: u32;
-            if ((byte0 & 3u) == 0u) {
-                ql0 = weights[qlb]; ql1 = weights[qlb + 1u]; ql2 = weights[qlb + 2u]; ql3 = weights[qlb + 3u];
-                ql4 = weights[qlb + 4u]; ql5 = weights[qlb + 5u]; ql6 = weights[qlb + 6u]; ql7 = weights[qlb + 7u];
-                qh0 = weights[qhb]; qh1 = weights[qhb + 1u]; qh2 = weights[qhb + 2u]; qh3 = weights[qhb + 3u];
-                qh4 = weights[qhb + 4u]; qh5 = weights[qhb + 5u]; qh6 = weights[qhb + 6u]; qh7 = weights[qhb + 7u];
-                sc_word = weights[w0 + 48u + b / 2u];
+            if ((byte0 & 2u) == 0u) {
                 d_word = weights[w0 + 52u];
             } else {
-                let a0 = weights[qlb]; let a1 = weights[qlb + 1u]; let a2 = weights[qlb + 2u]; let a3 = weights[qlb + 3u];
-                let a4 = weights[qlb + 4u]; let a5 = weights[qlb + 5u]; let a6 = weights[qlb + 6u]; let a7 = weights[qlb + 7u];
-                let a8 = weights[qlb + 8u];
-                ql0 = (a0 >> 16u) | (a1 << 16u); ql1 = (a1 >> 16u) | (a2 << 16u);
-                ql2 = (a2 >> 16u) | (a3 << 16u); ql3 = (a3 >> 16u) | (a4 << 16u);
-                ql4 = (a4 >> 16u) | (a5 << 16u); ql5 = (a5 >> 16u) | (a6 << 16u);
-                ql6 = (a6 >> 16u) | (a7 << 16u); ql7 = (a7 >> 16u) | (a8 << 16u);
-                let c0 = weights[qhb]; let c1 = weights[qhb + 1u]; let c2 = weights[qhb + 2u]; let c3 = weights[qhb + 3u];
-                let c4 = weights[qhb + 4u]; let c5 = weights[qhb + 5u]; let c6 = weights[qhb + 6u]; let c7 = weights[qhb + 7u];
-                let c8 = weights[qhb + 8u];
-                qh0 = (c0 >> 16u) | (c1 << 16u); qh1 = (c1 >> 16u) | (c2 << 16u);
-                qh2 = (c2 >> 16u) | (c3 << 16u); qh3 = (c3 >> 16u) | (c4 << 16u);
-                qh4 = (c4 >> 16u) | (c5 << 16u); qh5 = (c5 >> 16u) | (c6 << 16u);
-                qh6 = (c6 >> 16u) | (c7 << 16u); qh7 = (c7 >> 16u) | (c8 << 16u);
-                let s0 = weights[w0 + 48u + b / 2u];
-                let s1 = weights[w0 + 49u + b / 2u];
-                sc_word = (s0 >> 16u) | (s1 << 16u);
-                // `d` is the block's last half-word: only its own word is read.
-                d_word = weights[w0 + 52u] >> 16u;
+                d_word = weights[w0 - 1u] >> 16u;
             }
             let nsh = 4u * (j / 2u);
             let hsh = 2u * j;
@@ -8654,17 +8644,15 @@ fn f16_to_f32(bits: u32) -> f32 {{
 // Word `k` of the block whose first byte is `byte0` — the block may start
 // two bytes into a word.
 fn block_word(byte0: u32, k: u32) -> u32 {{
-    let w0 = byte0 / 4u;
-    let lo = weights[w0 + k];
-    if ((byte0 & 3u) == 0u) {{
-        return lo;
-    }}
-    // The last word only needs its low half (`d`), and reading past it
-    // could run off the binding.
+    // The device layout (`VulkanBackend::device_weight_bytes`): the runs
+    // start on a word whatever the block's own alignment; `d` (word 52) is
+    // the block's last half-word, or its first where the block starts two
+    // bytes off.
     if (k >= 52u) {{
-        return lo >> 16u;
+        let at = select(byte0 + 208u, byte0, (byte0 & 2u) != 0u);
+        return weights[at / 4u] >> ((at & 2u) * 8u);
     }}
-    return (lo >> 16u) | (weights[w0 + k + 1u] << 16u);
+    return weights[(byte0 + (byte0 & 2u)) / 4u + k];
 }}
 
 const TILE_ROWS: u32 = {rows}u;
@@ -9425,10 +9413,11 @@ fn scale_i8(sc_off: u32, i: u32) -> f32 {
 // staging all sixteen through LDS and a barrier.
 fn sb(block_byte_off: u32, x_block_elem: u32, ql_offset: u32, qh_offset: u32,
       s_offset: u32, y_offset: u32) -> f32 {
-    let ql_off = block_byte_off;
-    let qh_off = block_byte_off + 128u;
-    let sc_off = block_byte_off + 192u;
-    let d = f16_to_f32(read_word_u(block_byte_off + 208u) & 0xFFFFu);
+    // The device layout (`VulkanBackend::device_weight_bytes`).
+    let ql_off = block_byte_off + (block_byte_off & 2u);
+    let qh_off = ql_off + 128u;
+    let sc_off = ql_off + 192u;
+    let d = f16_to_f32(read_word_u(select(block_byte_off + 208u, block_byte_off, (block_byte_off & 2u) != 0u)) & 0xFFFFu);
 
     let ql0 = read_word_u(ql_off + ql_offset);
     let ql32 = read_word_u(ql_off + ql_offset + 32u);
@@ -9512,23 +9501,26 @@ fn scale_of(w0: u32, w1: u32, w2: u32, k: u32) -> f32 {
 }
 
 // Contribution of super-block `i` of one output row, computed by the 16
-// threads that own it; `sh` is this thread's misalignment, see the doc.
+// threads that own it. Under the device layout
+// (`VulkanBackend::device_weight_bytes`) every run starts on a word, so each
+// field is one load, and the four scale bytes `s_offset + {0,2,4,6}` lie in
+// two words; `d` is the low half of the block's last word or, where the
+// block starts two bytes off, the high half of the word before its runs.
 fn sb(block_byte_off: u32, x_block_elem: u32, ql_offset: u32, qh_offset: u32,
-      s_offset: u32, y_offset: u32, sh: u32) -> f32 {
-    let d = f16_to_f32(word_sh(block_byte_off + 208u, sh));
+      s_offset: u32, y_offset: u32) -> f32 {
+    let p = block_byte_off + (block_byte_off & 2u);
+    let d_at = select(block_byte_off + 208u, block_byte_off, (block_byte_off & 2u) != 0u);
+    let d = f16_to_f32(weights[d_at / 4u] >> ((d_at & 2u) * 8u));
 
-    let ql0 = word_sh(block_byte_off + ql_offset, sh);
-    let ql32 = word_sh(block_byte_off + ql_offset + 32u, sh);
-    let qh = word_sh(block_byte_off + 128u + qh_offset, sh);
+    let ql0 = weights[(p + ql_offset) / 4u];
+    let ql32 = weights[(p + ql_offset + 32u) / 4u];
+    let qh = weights[(p + 128u + qh_offset) / 4u];
 
-    // The scale bytes at s_offset + {0, 2, 4, 6} span seven bytes: three
-    // aligned words cover them from any start.
-    let sb0 = block_byte_off + 192u + s_offset;
+    let sb0 = p + 192u + s_offset;
     let sw = sb0 / 4u;
     let sk = sb0 % 4u;
     let w0 = weights[sw];
     let w1 = weights[sw + 1u];
-    let w2 = weights[sw + 2u];
 
     let q0 = (ql0 & 0x0F0F0F0Fu) | ((qh & 0x03030303u) << 4u);
     let q1 = (ql32 & 0x0F0F0F0Fu) | ((qh & 0x0C0C0C0Cu) << 2u);
@@ -9537,10 +9529,10 @@ fn sb(block_byte_off: u32, x_block_elem: u32, ql_offset: u32, qh_offset: u32,
 
     let y0 = (x_block_elem + y_offset) / 4u;
     var sum: f32 = 0.0;
-    sum = sum + scale_of(w0, w1, w2, sk) * dot(xv[y0], unpack4_f_bias32(q0));
-    sum = sum + scale_of(w0, w1, w2, sk + 2u) * dot(xv[y0 + 8u], unpack4_f_bias32(q1));
-    sum = sum + scale_of(w0, w1, w2, sk + 4u) * dot(xv[y0 + 16u], unpack4_f_bias32(q2));
-    sum = sum + scale_of(w0, w1, w2, sk + 6u) * dot(xv[y0 + 24u], unpack4_f_bias32(q3));
+    sum = sum + scale_of(w0, w1, w1, sk) * dot(xv[y0], unpack4_f_bias32(q0));
+    sum = sum + scale_of(w0, w1, w1, sk + 2u) * dot(xv[y0 + 8u], unpack4_f_bias32(q1));
+    sum = sum + scale_of(w0, w1, w1, sk + 4u) * dot(xv[y0 + 16u], unpack4_f_bias32(q2));
+    sum = sum + scale_of(w0, w1, w1, sk + 6u) * dot(xv[y0 + 24u], unpack4_f_bias32(q3));
     return d * sum;
 }
 "#;
@@ -9590,27 +9582,11 @@ pub fn shader_source_reduce_q6k_light(n_rows: usize, subgroup: bool) -> String {
     for i in 0..n_rows {
         s.push_str(&format!("    var acc{i}: f32 = 0.0;\n"));
     }
-    if words {
-        // Fixed for the loop: two blocks are 420 bytes, a multiple of four,
-        // and every row shares one row length.
-        s.push_str("    let sh0 = ((o0 * params.row_bytes + ix * 210u) % 4u) * 8u;\n");
-        for r in 1..n_rows {
-            s.push_str(&format!(
-                "    let sh{r} = ((o{r} * params.row_bytes + ix * 210u) % 4u) * 8u;\n"
-            ));
-        }
-    }
     s.push_str("    var i: u32 = ix;\n    loop {\n        if (i >= num_blocks) {\n            break;\n        }\n        let xrb = x_tok + i * 256u;\n");
     for r in 0..n_rows {
-        if words {
-            s.push_str(&format!(
-                "        acc{r} = acc{r} + sb(o{r} * params.row_bytes + i * 210u, xrb, ql_offset, qh_offset, s_offset, y_offset, sh{r});\n"
-            ));
-        } else {
-            s.push_str(&format!(
-                "        acc{r} = acc{r} + sb(o{r} * params.row_bytes + i * 210u, xrb, ql_offset, qh_offset, s_offset, y_offset);\n"
-            ));
-        }
+        s.push_str(&format!(
+            "        acc{r} = acc{r} + sb(o{r} * params.row_bytes + i * 210u, xrb, ql_offset, qh_offset, s_offset, y_offset);\n"
+        ));
     }
     s.push_str("        i = i + 2u;\n    }\n");
     for r in 0..n_rows {
@@ -9690,15 +9666,10 @@ pub fn shader_source_reduce_q6k_light_tokens(n_rows: usize, tile: usize, subgrou
             s.push_str(&format!("    var acc{r}_{tt}: f32 = 0.0;\n"));
         }
     }
-    for r in 0..n_rows {
-        s.push_str(&format!(
-            "    let sh{r} = ((r{r} * params.row_bytes + ix * 210u) % 4u) * 8u;\n"
-        ));
-    }
     s.push_str("    var i: u32 = ix;\n    loop {\n        if (i >= num_blocks) {\n            break;\n        }\n");
     // `sb`'s body with each row's block decode hoisted out of the token loop.
     for r in 0..n_rows {
-        s.push_str(&format!("        let bo{r} = r{r} * params.row_bytes + i * 210u;\n        let d{r} = f16_to_f32(word_sh(bo{r} + 208u, sh{r}));\n        let ql0_{r} = word_sh(bo{r} + ql_offset, sh{r});\n        let ql32_{r} = word_sh(bo{r} + ql_offset + 32u, sh{r});\n        let qh{r} = word_sh(bo{r} + 128u + qh_offset, sh{r});\n        let sb{r} = bo{r} + 192u + s_offset;\n        let sw{r} = sb{r} / 4u;\n        let sk{r} = sb{r} % 4u;\n        let w0_{r} = weights[sw{r}];\n        let w1_{r} = weights[sw{r} + 1u];\n        let w2_{r} = weights[sw{r} + 2u];\n"));
+        s.push_str(&format!("        let bo{r} = r{r} * params.row_bytes + i * 210u;\n        let p{r} = bo{r} + (bo{r} & 2u);\n        let dat{r} = select(bo{r} + 208u, bo{r}, (bo{r} & 2u) != 0u);\n        let d{r} = f16_to_f32(weights[dat{r} / 4u] >> ((dat{r} & 2u) * 8u));\n        let ql0_{r} = weights[(p{r} + ql_offset) / 4u];\n        let ql32_{r} = weights[(p{r} + ql_offset + 32u) / 4u];\n        let qh{r} = weights[(p{r} + 128u + qh_offset) / 4u];\n        let sb{r} = p{r} + 192u + s_offset;\n        let sw{r} = sb{r} / 4u;\n        let sk{r} = sb{r} % 4u;\n        let w0_{r} = weights[sw{r}];\n        let w1_{r} = weights[sw{r} + 1u];\n        let w2_{r} = w1_{r};\n"));
         s.push_str(&format!("        let f0_{r} = unpack4_f_bias32((ql0_{r} & 0x0F0F0F0Fu) | ((qh{r} & 0x03030303u) << 4u));\n        let f1_{r} = unpack4_f_bias32((ql32_{r} & 0x0F0F0F0Fu) | ((qh{r} & 0x0C0C0C0Cu) << 2u));\n        let f2_{r} = unpack4_f_bias32(((ql0_{r} >> 4u) & 0x0F0F0F0Fu) | (qh{r} & 0x30303030u));\n        let f3_{r} = unpack4_f_bias32(((ql32_{r} >> 4u) & 0x0F0F0F0Fu) | ((qh{r} & 0xC0C0C0C0u) >> 2u));\n        let c0_{r} = scale_of(w0_{r}, w1_{r}, w2_{r}, sk{r});\n        let c1_{r} = scale_of(w0_{r}, w1_{r}, w2_{r}, sk{r} + 2u);\n        let c2_{r} = scale_of(w0_{r}, w1_{r}, w2_{r}, sk{r} + 4u);\n        let c3_{r} = scale_of(w0_{r}, w1_{r}, w2_{r}, sk{r} + 6u);\n"));
     }
     for tt in 0..tile {
@@ -10204,10 +10175,12 @@ fn q6k_elem(d: f32, sc_off: u32, idx: u32, w_lo: u32, half: u32, is: u32, ql: u3
 fn block_dot_dual(byte_offset: u32, local: u32,
                   xl0: f32, xh0: f32, xl1: f32, xh1: f32,
                   xl2: f32, xh2: f32, xl3: f32, xh3: f32) -> f32 {
-    let ql_off = byte_offset;
-    let qh_off = byte_offset + 128u;
-    let sc_off = byte_offset + 192u;
-    let d_offset = byte_offset + 208u;
+    // The device layout (`VulkanBackend::device_weight_bytes`): a block two
+    // bytes off a word holds `d` first and its runs from the next word.
+    let ql_off = byte_offset + (byte_offset & 2u);
+    let qh_off = ql_off + 128u;
+    let sc_off = ql_off + 192u;
+    let d_offset = select(byte_offset + 208u, byte_offset, (byte_offset & 2u) != 0u);
     let dword = read_word_v4(d_offset - (d_offset % 4u));
     let d = f16_to_f32(select(dword & 0xFFFFu, dword >> 16u, (d_offset % 4u) != 0u));
     let l = local;

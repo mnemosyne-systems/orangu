@@ -1011,7 +1011,9 @@ impl LlamaModel {
                     let _submit = crate::engine::decode_stages::enter(
                         crate::engine::decode_stages::Stage::DeviceSubmit,
                     );
-                    vulkan.submit_intermediate(finished);
+                    crate::engine::decode_stages::host_step::mark("submit", || {
+                        vulkan.submit_intermediate(finished)
+                    });
                 }
                 recording = crate::engine::decode_stages::enter(
                     crate::engine::decode_stages::Stage::DeviceRecord,
@@ -2325,6 +2327,9 @@ impl ModelForward for LlamaModel {
             .then(|| super::hold_clock_for_step(self.backend.as_ref(), tokens.len()))
             .flatten();
         let outcome = (|| -> Result<super::ForwardOutcome> {
+            if tokens.len() == 1 {
+                crate::engine::decode_stages::host_step::begin();
+            }
             if tokens.len() == 1
                 && self.mul.is_identity()
                 && let Some(params) = &greedy_sample
@@ -2372,6 +2377,7 @@ impl ModelForward for LlamaModel {
                     );
                     vulkan.submit_and_readback_u32(encoder, &sample_buf)
                 };
+                crate::engine::decode_stages::host_step::end(start_pos);
                 if vulkan.gpu_timestamps() {
                     vulkan.report_timestamps(start_pos, self.layers.len());
                 }
