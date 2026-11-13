@@ -215,13 +215,15 @@ pub fn format_hits(query: &str, hits: &[SearchHit]) -> String {
             Some(sym) => format!("  (via {sym})"),
             None => String::new(),
         };
+        let exact = if hit.exact { "  (exact)" } else { "" };
         out.push_str(&format!(
-            "{:>2}. {} — [{}:{}]  {:.3}{}\n",
+            "{:>2}. {} — [{}:{}]  {:.3}{}{}\n",
             i + 1,
             hit.symbol,
             hit.file,
             hit.start_line,
             hit.score,
+            exact,
             via,
         ));
     }

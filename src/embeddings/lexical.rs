@@ -44,6 +44,11 @@ pub const LEXICAL_INDEX_VERSION: u32 = 1;
 const BM25_K1: f32 = 1.2;
 const BM25_B: f32 = 0.75;
 
+/// How many BM25 candidates to source-verify for a quoted phrase or explicit
+/// identifier. Common phrases can match many documents; verifying a larger set
+/// is cheap because each candidate file is read at most once per query.
+const MAX_VERIFY_CANDIDATES: usize = 5_000;
+
 /// Token repetition weights approximate field weighting without a multi-field
 /// BM25 implementation: a symbol name counts more than a file path, which in
 /// turn counts more than the body.
@@ -93,6 +98,8 @@ pub struct LexicalHit {
     pub start_line: usize,
     pub end_line: usize,
     pub score: f32,
+    /// Verified as an exact identifier or quoted-phrase match in the source.
+    pub exact: bool,
 }
 
 impl LexicalHit {
@@ -105,6 +112,7 @@ impl LexicalHit {
             end_line: self.end_line,
             score: self.score,
             expanded_from,
+            exact: self.exact,
         }
     }
 }
@@ -344,20 +352,32 @@ impl LexicalIndex {
         terms
     }
 
-    /// Rank documents for `query` with BM25.
-    pub fn rank(&self, _workspace: &Path, query: &str) -> Vec<LexicalHit> {
+    /// Rank documents for `query` with BM25, giving verified exact identifier
+    /// and quoted-phrase matches priority.
+    pub fn rank(&self, workspace: &Path, query: &str) -> Vec<LexicalHit> {
         if self.docs.is_empty() {
             return Vec::new();
         }
-        let terms = query_terms(query);
-        if terms.is_empty() {
+        let parsed = parse_query(query);
+        if parsed.terms.is_empty() {
             return Vec::new();
         }
-        let scores = self.bm25(&terms);
+        let scores = self.bm25(&parsed.terms);
+
+        let mut exact: HashSet<usize> = HashSet::new();
+        if let Some(identifier) = &parsed.identifier {
+            let candidates = self.identifier_candidates(identifier, &scores);
+            exact.extend(self.verify(workspace, &candidates, &[], Some(identifier)));
+        }
+        for phrase in &parsed.phrases {
+            let candidates = self.phrase_candidates(phrase, &scores);
+            exact.extend(self.verify(workspace, &candidates, std::slice::from_ref(phrase), None));
+        }
 
         let mut hits = Vec::new();
         for (index, score) in scores.into_iter().enumerate() {
-            if score <= 0.0 {
+            let is_exact = exact.contains(&index);
+            if score <= 0.0 && !is_exact {
                 continue;
             }
             let doc = &self.docs[index];
@@ -368,9 +388,15 @@ impl LexicalIndex {
                 start_line: doc.start_line,
                 end_line: doc.end_line,
                 score,
+                exact: is_exact,
             });
         }
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        hits.sort_by(|a, b| {
+            b.exact
+                .cmp(&a.exact)
+                .then_with(|| b.score.total_cmp(&a.score))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         hits
     }
 
@@ -417,6 +443,7 @@ impl LexicalIndex {
                                     doc,
                                     hit.score * super::index::EXPANSION_DECAY,
                                     Some(hit.symbol.clone()),
+                                    false,
                                 ),
                             );
                         }
@@ -426,7 +453,11 @@ impl LexicalIndex {
         }
 
         let mut hits: Vec<SearchHit> = best.into_values().collect();
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        hits.sort_by(|a, b| {
+            b.exact
+                .cmp(&a.exact)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
         budget_cut(hits, top_k, semantic_budget_tokens)
     }
 
@@ -461,15 +492,231 @@ impl LexicalIndex {
         }
         scores
     }
+
+    /// Candidate documents for an explicit identifier: its exact-token postings
+    /// plus symbol-name matches. These are already narrow, so unlike phrase
+    /// candidates they do not fall back to the broader BM25 ranking.
+    fn identifier_candidates(&self, identifier: &str, scores: &[f32]) -> Vec<usize> {
+        let tokens = unique(tokenize(identifier));
+        let mut candidates: HashSet<usize> = HashSet::new();
+
+        if let Some(full) = tokens.first()
+            && let Some(postings) = self.postings.get(full)
+        {
+            candidates.extend(postings.iter().map(|posting| posting.0 as usize));
+        }
+        if candidates.is_empty() {
+            candidates.extend(self.intersect_postings(&tokens[1..]));
+        }
+        for (index, doc) in self.docs.iter().enumerate() {
+            if doc.symbol.eq_ignore_ascii_case(identifier) {
+                candidates.insert(index);
+            }
+        }
+        self.cap_candidates(candidates, scores)
+    }
+
+    /// Candidate documents for a quoted phrase: documents containing every
+    /// phrase term, capped to the strongest BM25 candidates.
+    fn phrase_candidates(&self, phrase: &[String], scores: &[f32]) -> Vec<usize> {
+        let candidates = self.intersect_postings(phrase);
+        self.cap_candidates(candidates, scores)
+    }
+
+    fn intersect_postings(&self, terms: &[String]) -> HashSet<usize> {
+        let mut unique_terms = unique(terms.to_vec());
+        if unique_terms.is_empty() {
+            return HashSet::new();
+        }
+        let Some(first) = self.postings.get(&unique_terms[0]) else {
+            return HashSet::new();
+        };
+        let mut result: HashSet<usize> = first.iter().map(|posting| posting.0 as usize).collect();
+        for term in unique_terms.drain(1..) {
+            let Some(postings) = self.postings.get(&term) else {
+                return HashSet::new();
+            };
+            let docs: HashSet<usize> = postings.iter().map(|posting| posting.0 as usize).collect();
+            result.retain(|doc| docs.contains(doc));
+            if result.is_empty() {
+                break;
+            }
+        }
+        result
+    }
+
+    fn cap_candidates(&self, candidates: HashSet<usize>, scores: &[f32]) -> Vec<usize> {
+        let mut candidates: Vec<usize> = candidates.into_iter().collect();
+        candidates.sort_by(|a, b| {
+            scores[*b]
+                .total_cmp(&scores[*a])
+                .then_with(|| self.docs[*a].id.cmp(&self.docs[*b].id))
+        });
+        candidates.truncate(MAX_VERIFY_CANDIDATES);
+        candidates
+    }
+
+    /// Verify candidate documents against the current source. Reads each file at
+    /// most once per query and checks only the symbol's line range.
+    fn verify(
+        &self,
+        workspace: &Path,
+        candidates: &[usize],
+        phrases: &[Vec<String>],
+        identifier: Option<&str>,
+    ) -> HashSet<usize> {
+        let mut by_file: HashMap<&str, Vec<usize>> = HashMap::new();
+        for &index in candidates {
+            if let Some(doc) = self.docs.get(index) {
+                by_file.entry(doc.file.as_str()).or_default().push(index);
+            }
+        }
+
+        let mut verified = HashSet::new();
+        for (file, indices) in by_file {
+            let Ok(content) = std::fs::read_to_string(workspace.join(file)) else {
+                continue;
+            };
+            let lines: Vec<&str> = content.lines().collect();
+            for index in indices {
+                let doc = &self.docs[index];
+                let Some(slice) = slice_lines(&lines, doc.start_line, doc.end_line) else {
+                    continue;
+                };
+                if let Some(identifier) = identifier {
+                    let symbol_match = doc.symbol.eq_ignore_ascii_case(identifier);
+                    let source_match = contains_identifier(&slice, identifier);
+                    if symbol_match || source_match {
+                        verified.insert(index);
+                        continue;
+                    }
+                }
+                let haystack = phrase_tokens(&slice);
+                if phrases
+                    .iter()
+                    .any(|phrase| contains_sequence(&haystack, phrase))
+                {
+                    verified.insert(index);
+                }
+            }
+        }
+        verified
+    }
 }
 
-/// Tokenise a plain query into unique BM25 terms.
-fn query_terms(query: &str) -> Vec<String> {
+/// One parsed query: BM25 terms, quoted phrases, and an explicit identifier.
+struct ParsedQuery {
+    terms: Vec<String>,
+    phrases: Vec<Vec<String>>,
+    identifier: Option<String>,
+}
+
+fn parse_query(query: &str) -> ParsedQuery {
+    let mut phrases = Vec::new();
+    let mut outside = String::new();
+    let mut inside = String::new();
+    let mut in_quote = false;
+
+    for character in query.chars() {
+        if character == '"' {
+            if in_quote {
+                let phrase = phrase_tokens(&inside);
+                if !phrase.is_empty() {
+                    phrases.push(phrase);
+                }
+                inside.clear();
+            }
+            in_quote = !in_quote;
+        } else if in_quote {
+            inside.push(character);
+        } else {
+            outside.push(character);
+        }
+    }
+    // An unmatched quote is treated as a phrase rather than dropped.
+    if in_quote {
+        let phrase = phrase_tokens(&inside);
+        if !phrase.is_empty() {
+            phrases.push(phrase);
+        }
+    }
+
+    let mut terms = tokenize(&outside);
+    for phrase in &phrases {
+        terms.extend(phrase.iter().cloned());
+    }
+    let terms = unique(terms);
+
+    let trimmed = query.trim();
+    let identifier = if phrases.is_empty() && looks_like_identifier(trimmed) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    };
+
+    ParsedQuery {
+        terms,
+        phrases,
+        identifier,
+    }
+}
+
+/// A single identifier-like query with no spaces: `MAX_CHUNK_CHARS`,
+/// `GraphStore::lookup`, `src/embeddings/index.rs`.
+fn looks_like_identifier(query: &str) -> bool {
+    !query.is_empty()
+        && !query.chars().any(char::is_whitespace)
+        && !query.contains('"')
+        && (query.contains('_')
+            || query.contains("::")
+            || query.contains('.')
+            || query.contains('/')
+            || (query.chars().any(|c| c.is_uppercase()) && query.chars().any(|c| c.is_lowercase())))
+}
+
+/// Tokenise text for phrase verification: only lowercase separator/camel-case
+/// parts, so `graph_store` and `GraphStore` compare as the same two words.
+fn phrase_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for span in spans(text) {
+        for segment in split_segments(&span) {
+            tokens.extend(camel_parts(&segment));
+        }
+    }
+    tokens
+}
+
+fn unique(tokens: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
-    tokenize(query)
+    tokens
         .into_iter()
         .filter(|token| seen.insert(token.clone()))
         .collect()
+}
+
+/// Whether `haystack` contains `needle` as a whole identifier-like token.
+fn contains_identifier(haystack: &str, needle: &str) -> bool {
+    let needle = needle.to_lowercase();
+    spans(haystack)
+        .iter()
+        .any(|span| span.to_lowercase() == needle)
+}
+
+fn slice_lines(lines: &[&str], start: usize, end: usize) -> Option<String> {
+    if start == 0 || end < start || start > lines.len() {
+        return None;
+    }
+    let end = end.min(lines.len());
+    Some(lines[start - 1..end].join("\n"))
+}
+
+fn contains_sequence(haystack: &[String], needle: &[String]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// Term frequencies for one document, with symbol name and path weighted above
@@ -610,6 +857,70 @@ mod tests {
         assert!(tokens.contains(&"store".to_string()));
         assert!(tokens.contains(&"embeddings".to_string()));
         assert!(tokens.contains(&"index".to_string()));
+    }
+
+    #[test]
+    fn phrase_tokens_normalise_separators_and_case() {
+        assert_eq!(
+            phrase_tokens("graph_store mutex poisoned"),
+            vec!["graph", "store", "mutex", "poisoned"]
+        );
+        assert_eq!(
+            phrase_tokens("GraphStore mutex poisoned"),
+            vec!["graph", "store", "mutex", "poisoned"]
+        );
+    }
+
+    #[test]
+    fn quoted_phrase_is_verified_against_source_and_prioritised() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("a.rs"),
+            "fn first() {\n    log::error!(\"graph_store mutex poisoned\");\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("b.rs"),
+            "fn second() {\n    // graph store and mutex poisoned in prose\n}\n",
+        )
+        .unwrap();
+        let index = LexicalIndex::build_or_update(workspace.path(), 1).unwrap();
+        let ranked = index.rank(workspace.path(), "\"graph_store mutex poisoned\"");
+        assert_eq!(ranked.first().unwrap().symbol, "first");
+        assert!(ranked.first().unwrap().exact);
+    }
+
+    #[test]
+    fn explicit_identifier_is_verified_and_prioritised() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("a.rs"),
+            "fn lookup() {\n    store.lookup(\"x\");\n}\n\
+             fn lookup_extra() {\n    store.lookup_extra(\"y\");\n}\n",
+        )
+        .unwrap();
+        let index = LexicalIndex::build_or_update(workspace.path(), 1).unwrap();
+        let ranked = index.rank(workspace.path(), "store.lookup");
+        assert_eq!(ranked.first().unwrap().symbol, "lookup");
+        assert!(ranked.first().unwrap().exact);
+    }
+
+    #[test]
+    fn identifier_verification_uses_token_boundaries() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("a.rs"),
+            "pub fn rrf_k() {}\npub fn rrf_k_extra() {}\n",
+        )
+        .unwrap();
+        let index = LexicalIndex::build_or_update(workspace.path(), 1).unwrap();
+        let ranked = index.rank(workspace.path(), "rrf_k");
+        let exact: Vec<&str> = ranked
+            .iter()
+            .filter(|hit| hit.exact)
+            .map(|hit| hit.symbol.as_str())
+            .collect();
+        assert_eq!(exact, vec!["rrf_k"]);
     }
 
     #[test]
