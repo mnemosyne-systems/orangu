@@ -32,13 +32,17 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::chunk::lexical_chunks;
-use super::index::EmbeddingIndex;
+use super::index::{EmbeddingIndex, SearchHit, budget_cut, hit_from_doc, insert_hit};
 use super::source::{SourceFile, scan_workspace};
 use crate::graph::extract::GraphExtractor;
+use crate::graph::store::GraphStore;
 
 /// Independent sidecar version. Bump when the tokenizer, postings format, or
 /// BM25 fields change — never when the embedding format changes.
 pub const LEXICAL_INDEX_VERSION: u32 = 1;
+
+const BM25_K1: f32 = 1.2;
+const BM25_B: f32 = 0.75;
 
 /// Token repetition weights approximate field weighting without a multi-field
 /// BM25 implementation: a symbol name counts more than a file path, which in
@@ -78,6 +82,31 @@ pub struct LexicalIndex {
     postings: HashMap<String, Vec<Posting>>,
     #[serde(default)]
     avg_length: f32,
+}
+
+/// One ranked lexical result, before graph expansion and budgeting.
+#[derive(Debug, Clone)]
+pub struct LexicalHit {
+    pub id: String,
+    pub symbol: String,
+    pub file: String,
+    pub start_line: usize,
+    pub end_line: usize,
+    pub score: f32,
+}
+
+impl LexicalHit {
+    fn to_search_hit(&self, expanded_from: Option<String>) -> SearchHit {
+        SearchHit {
+            id: self.id.clone(),
+            symbol: self.symbol.clone(),
+            file: self.file.clone(),
+            start_line: self.start_line,
+            end_line: self.end_line,
+            score: self.score,
+            expanded_from,
+        }
+    }
 }
 
 /// One document together with its term frequencies, used while building.
@@ -314,6 +343,133 @@ impl LexicalIndex {
         }
         terms
     }
+
+    /// Rank documents for `query` with BM25.
+    pub fn rank(&self, _workspace: &Path, query: &str) -> Vec<LexicalHit> {
+        if self.docs.is_empty() {
+            return Vec::new();
+        }
+        let terms = query_terms(query);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let scores = self.bm25(&terms);
+
+        let mut hits = Vec::new();
+        for (index, score) in scores.into_iter().enumerate() {
+            if score <= 0.0 {
+                continue;
+            }
+            let doc = &self.docs[index];
+            hits.push(LexicalHit {
+                id: doc.id.clone(),
+                symbol: doc.symbol.clone(),
+                file: doc.file.clone(),
+                start_line: doc.start_line,
+                end_line: doc.end_line,
+                score,
+            });
+        }
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.id.cmp(&b.id)));
+        hits
+    }
+
+    /// Lexical-only retrieval: rank, expand graph neighbours, and apply the
+    /// token budget. Used when no embeddings server is available.
+    pub fn search(
+        &self,
+        workspace: &Path,
+        query: &str,
+        graph: Option<&GraphStore>,
+        top_k: usize,
+        semantic_budget_tokens: usize,
+    ) -> Vec<SearchHit> {
+        let ranked = self.rank(workspace, query);
+        if ranked.is_empty() {
+            return Vec::new();
+        }
+        let id_to_index: HashMap<&str, usize> = self
+            .docs
+            .iter()
+            .enumerate()
+            .map(|(index, doc)| (doc.id.as_str(), index))
+            .collect();
+
+        let mut best: HashMap<String, SearchHit> = HashMap::new();
+        let seed_count = top_k.saturating_mul(2).max(top_k);
+        for hit in ranked.iter().take(seed_count) {
+            insert_hit(&mut best, hit.to_search_hit(None));
+        }
+
+        if let Some(graph) = graph {
+            for hit in ranked.iter().take(seed_count) {
+                for result in graph.lookup(&hit.symbol) {
+                    if result.node.id != hit.id {
+                        continue;
+                    }
+                    let neighbours = result.callers.iter().chain(result.callees.iter());
+                    for edge in neighbours {
+                        if let Some(&index) = id_to_index.get(edge.node_id.as_str()) {
+                            let doc = &self.docs[index];
+                            insert_hit(
+                                &mut best,
+                                hit_from_doc(
+                                    doc,
+                                    hit.score * super::index::EXPANSION_DECAY,
+                                    Some(hit.symbol.clone()),
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut hits: Vec<SearchHit> = best.into_values().collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        budget_cut(hits, top_k, semantic_budget_tokens)
+    }
+
+    /// BM25 score for every document. Returns a zero for documents containing
+    /// none of the query terms.
+    fn bm25(&self, query_terms: &[String]) -> Vec<f32> {
+        let mut scores = vec![0.0f32; self.docs.len()];
+        let n = self.docs.len() as f32;
+        let avg_length = self.avg_length.max(1.0);
+        let mut seen: HashSet<&str> = HashSet::new();
+
+        for term in query_terms {
+            if !seen.insert(term.as_str()) {
+                continue;
+            }
+            let Some(postings) = self.postings.get(term) else {
+                continue;
+            };
+            let df = postings.len() as f32;
+            let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
+            for posting in postings {
+                let Some(doc) = self.docs.get(posting.0 as usize) else {
+                    continue;
+                };
+                let tf = posting.1 as f32;
+                let length = doc.length as f32;
+                let denominator = tf + BM25_K1 * (1.0 - BM25_B + BM25_B * length / avg_length);
+                if denominator > 0.0 {
+                    scores[posting.0 as usize] += idf * (tf * (BM25_K1 + 1.0)) / denominator;
+                }
+            }
+        }
+        scores
+    }
+}
+
+/// Tokenise a plain query into unique BM25 terms.
+fn query_terms(query: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    tokenize(query)
+        .into_iter()
+        .filter(|token| seen.insert(token.clone()))
+        .collect()
 }
 
 /// Term frequencies for one document, with symbol name and path weighted above
@@ -564,5 +720,36 @@ mod tests {
         assert_eq!(index.len(), 1);
         assert!(index.docs[0].length > 500);
         assert!(index.postings.contains_key("word"));
+    }
+
+    #[test]
+    fn bm25_ranks_exact_identifier_above_unrelated_docs() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("a.rs"),
+            "pub fn retry() {}\n\
+             pub fn retry_backoff() {\n    retry();\n}\n\
+             pub fn other() {}\n",
+        )
+        .unwrap();
+        let index = LexicalIndex::build_or_update(workspace.path(), 1).unwrap();
+        let ranked = index.rank(workspace.path(), "retry_backoff");
+        assert_eq!(ranked.first().unwrap().symbol, "retry_backoff");
+        assert!(!ranked.iter().any(|hit| hit.symbol == "other"));
+    }
+
+    #[test]
+    fn lexical_search_returns_ranked_hits_without_vectors() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("a.rs"),
+            "pub fn retry_backoff() {\n    sleep(1);\n}\n",
+        )
+        .unwrap();
+        let index = LexicalIndex::build_or_update(workspace.path(), 1).unwrap();
+        let hits = index.search(workspace.path(), "retry_backoff", None, 5, 16_384);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].symbol, "retry_backoff");
+        assert!(hits[0].score > 0.0);
     }
 }

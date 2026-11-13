@@ -429,16 +429,18 @@ impl ToolExecutor {
         compile_workers: usize,
         budget_tokens: usize,
     ) -> Result<()> {
-        let search = profile
-            .map(|profile| {
-                crate::embeddings::SemanticSearch::from_profile(
-                    profile,
-                    is_coordinator,
-                    compile_workers,
-                    budget_tokens,
-                )
-            })
-            .transpose()?;
+        let search = match profile {
+            Some(profile) => Some(crate::embeddings::SemanticSearch::from_profile(
+                profile,
+                is_coordinator,
+                compile_workers,
+                budget_tokens,
+            )?),
+            None => Some(crate::embeddings::SemanticSearch::lexical_only(
+                compile_workers,
+                budget_tokens,
+            )),
+        };
         *self
             .semantic_search
             .lock()
@@ -753,7 +755,7 @@ impl ToolExecutor {
 
         defs.push(tool(
             "semantic_search",
-            "Search workspace code by meaning. Refreshes the embedding index before searching; requires an embeddings server.",
+            "Search workspace code by meaning and exact tokens. Uses lexical ranking when no embeddings server is available.",
             json!({
                 "type": "object",
                 "properties": { "query": { "type": "string", "minLength": 1 } },
@@ -4007,6 +4009,34 @@ mod semantic_search_tests {
     }
 
     #[tokio::test]
+    async fn semantic_search_works_without_an_embeddings_server() {
+        let workspace = tempfile::tempdir().unwrap();
+        let _cache = CacheCleanup(crate::embeddings::EmbeddingIndex::cache_dir(
+            workspace.path(),
+        ));
+        fs::write(
+            workspace.path().join("retry.rs"),
+            "pub fn retry_backoff() {}\n",
+        )
+        .unwrap();
+        let tools = ToolExecutor::new_read_only(workspace.path());
+        tools
+            .configure_semantic_search(None, false, 1, 16384)
+            .unwrap();
+        let answer = tools
+            .execute(
+                "semantic_search",
+                json!({"query": "retry_backoff"}).as_object().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            answer.contains("retry_backoff") && answer.contains("retry.rs:1"),
+            "{answer}"
+        );
+    }
+
+    #[tokio::test]
     async fn semantic_search_reports_unavailable_and_rejects_invalid_queries() {
         let workspace = tempfile::tempdir().unwrap();
         let tools = ToolExecutor::new_read_only(workspace.path());
@@ -4117,13 +4147,13 @@ mod semantic_search_tests {
         tools
             .configure_semantic_search(None, false, 1, 16384)
             .unwrap();
-        assert!(
-            tools
-                .clone()
-                .execute("semantic_search", arguments.as_object().unwrap())
-                .await
-                .is_err()
-        );
+        // With no embeddings server, search degrades to lexical-only rather
+        // than failing outright.
+        let answer = tools
+            .execute("semantic_search", arguments.as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(answer.contains("No semantic matches"), "{answer}");
         server.abort();
     }
 }

@@ -2149,42 +2149,40 @@ pub(crate) fn handle_command(
             "Usage: /search <query>".to_string(),
         )),
         LocalCommand::Search(Some(query)) => {
-            // Semantic search is enabled only when an embeddings-capable endpoint
-            // was detected at startup; `embeddings_server` holds that server's
-            // name, or is empty when none responded.
-            if embeddings_server.is_empty() {
-                return Ok(CommandOutcome::OutputError(
-                    "Semantic /search is unavailable: no embeddings-capable server was detected \
-                     at startup. Give a server section `role = embeddings` (or load an embedding \
-                     model on your default server) and restart. Meanwhile, use /grep or the \
-                     knowledge graph."
-                        .to_string(),
-                ));
-            }
-            let Some(profile) = llms.get(embeddings_server) else {
-                return Ok(CommandOutcome::OutputError(format!(
-                    "The embeddings server '{embeddings_server}' is not a configured server \
-                     section."
-                )));
-            };
-            // Under a confirmed coordinator, it alone owns model/role
-            // decisions: force `.model = "embeddings"` on the active
-            // connection rather than sending whatever it's normally
-            // configured with (e.g. "all"), which — since a coordinator
-            // matches an exact model/role name before it ever considers the
-            // request path — could otherwise route this to the wrong
-            // backend entirely.
-            let search = match orangu::embeddings::SemanticSearch::from_profile(
-                profile,
-                is_coordinator,
-                compile_workers,
-                semantic_budget_tokens,
-            ) {
-                Ok(search) => search,
-                Err(err) => {
+            // `embeddings_server` holds the embeddings-capable server detected
+            // at startup, or is empty when none responded. Either way `/search`
+            // works: without embeddings it ranks with the lexical BM25 sidecar.
+            let search = if embeddings_server.is_empty() {
+                orangu::embeddings::SemanticSearch::lexical_only(
+                    compile_workers,
+                    semantic_budget_tokens,
+                )
+            } else {
+                let Some(profile) = llms.get(embeddings_server) else {
                     return Ok(CommandOutcome::OutputError(format!(
-                        "Could not initialise embeddings client: {err:#}"
+                        "The embeddings server '{embeddings_server}' is not a configured server \
+                         section."
                     )));
+                };
+                // Under a confirmed coordinator, it alone owns model/role
+                // decisions: force `.model = "embeddings"` on the active
+                // connection rather than sending whatever it's normally
+                // configured with (e.g. "all"), which — since a coordinator
+                // matches an exact model/role name before it ever considers the
+                // request path — could otherwise route this to the wrong
+                // backend entirely.
+                match orangu::embeddings::SemanticSearch::from_profile(
+                    profile,
+                    is_coordinator,
+                    compile_workers,
+                    semantic_budget_tokens,
+                ) {
+                    Ok(search) => search,
+                    Err(err) => {
+                        return Ok(CommandOutcome::OutputError(format!(
+                            "Could not initialise embeddings client: {err:#}"
+                        )));
+                    }
                 }
             };
             let workspace = workspace.to_path_buf();
