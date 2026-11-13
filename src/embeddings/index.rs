@@ -31,11 +31,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Result;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use super::chunk::chunk_file;
 use super::client::EmbeddingClient;
-use crate::graph::extract::{GraphExtractor, SupportedLanguage};
+use super::source::{SourceFile, scan_workspace};
+use crate::graph::extract::GraphExtractor;
 use crate::graph::store::GraphStore;
 
 const INDEX_VERSION: u32 = 1;
@@ -222,6 +222,29 @@ impl EmbeddingIndex {
         progress: &std::sync::atomic::AtomicU64,
         eta: &std::sync::atomic::AtomicU64,
     ) -> Result<Self> {
+        let scan = scan_workspace(workspace);
+        Self::build_or_update_from_scan(
+            workspace,
+            &scan,
+            client,
+            cancel,
+            compile_workers,
+            progress,
+            eta,
+        )
+        .await
+    }
+
+    /// [`Self::build_or_update`] over a scan shared with the lexical sidecar.
+    pub async fn build_or_update_from_scan(
+        workspace: &Path,
+        scan: &[SourceFile],
+        client: &EmbeddingClient,
+        cancel: &AtomicBool,
+        compile_workers: usize,
+        progress: &std::sync::atomic::AtomicU64,
+        eta: &std::sync::atomic::AtomicU64,
+    ) -> Result<Self> {
         let started = std::time::Instant::now();
         let mut previous = Self::load(workspace);
 
@@ -229,7 +252,6 @@ impl EmbeddingIndex {
         // (so the saved `meta.json` lists every file once the local phase is
         // done); an unchanged file that still has cached chunks is reused, the
         // rest are queued for (re-)embedding.
-        let files = collect_source_files(workspace);
         let mut new_hashes: HashMap<String, String> = HashMap::new();
         let mut kept: Vec<EmbeddedChunk> = Vec::new();
         let mut stale_files: Vec<(PathBuf, String, String)> = Vec::new();
@@ -243,16 +265,9 @@ impl EmbeddingIndex {
                 .push(chunk);
         }
 
-        for path in files {
-            let rel = path
-                .strip_prefix(workspace)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let hash = sha256(&content);
+        for file in scan {
+            let rel = file.rel.clone();
+            let hash = file.hash.clone();
             new_hashes.insert(rel.clone(), hash.clone());
             // Reuse only when unchanged AND the chunks are actually cached — a
             // file that was analysed but not embedded (no chunks) is re-embedded.
@@ -261,7 +276,7 @@ impl EmbeddingIndex {
             {
                 kept.extend(chunks.iter().cloned());
             } else {
-                stale_files.push((path, rel, hash));
+                stale_files.push((file.path.clone(), rel, hash));
             }
         }
 
@@ -706,35 +721,6 @@ fn append_manifest<'a>(path: &Path, files: impl Iterator<Item = &'a str>) {
     {
         let _ = f.write_all(body.as_bytes());
     }
-}
-
-/// Compute the sha256 hex digest of `content`.
-fn sha256(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-/// Collect the workspace's source files, honouring `.gitignore`, restricted to
-/// languages the Tree-sitter extractor understands.
-fn collect_source_files(workspace: &Path) -> Vec<PathBuf> {
-    ignore::WalkBuilder::new(workspace)
-        .hidden(true)
-        .git_ignore(true)
-        .build()
-        .filter_map(|entry| {
-            let path = entry.ok()?.into_path();
-            if !path.is_file() {
-                return None;
-            }
-            let ext = path.extension().and_then(|e| e.to_str())?;
-            SupportedLanguage::from_extension(ext).map(|_| path)
-        })
-        .collect()
 }
 
 #[cfg(test)]

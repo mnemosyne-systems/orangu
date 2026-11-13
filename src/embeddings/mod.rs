@@ -29,6 +29,7 @@ pub mod chunk;
 pub mod client;
 pub mod index;
 pub mod sketch;
+pub mod source;
 
 use crate::config::LlmConfiguration;
 use crate::llm::normalized_openai_endpoint;
