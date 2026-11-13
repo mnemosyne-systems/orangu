@@ -107,6 +107,8 @@ pub struct SearchHit {
     /// `None` for a direct semantic hit, or `Some(symbol)` when this chunk was
     /// pulled in because it neighbours that semantic hit in the graph.
     pub expanded_from: Option<String>,
+    /// Verified as an exact identifier or quoted-phrase match in the source.
+    pub exact: bool,
 }
 
 /// A completed file's embedding result: its workspace-relative path, content
@@ -623,6 +625,7 @@ fn hit_from(chunk: &EmbeddedChunk, score: f32, expanded_from: Option<String>) ->
         end_line: chunk.end_line,
         score,
         expanded_from,
+        exact: false,
     }
 }
 
@@ -632,6 +635,7 @@ pub(super) fn hit_from_doc(
     doc: &LexicalDoc,
     score: f32,
     expanded_from: Option<String>,
+    exact: bool,
 ) -> SearchHit {
     SearchHit {
         id: doc.id.clone(),
@@ -641,6 +645,7 @@ pub(super) fn hit_from_doc(
         end_line: doc.end_line,
         score,
         expanded_from,
+        exact,
     }
 }
 
