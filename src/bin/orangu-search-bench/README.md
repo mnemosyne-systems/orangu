@@ -30,25 +30,25 @@ The fixture avoids phrases that only exist in test code.
 
 ## Results
 
-Run on the `hybrid-search-phases` branch, 2026-11-13: 22,492 indexed symbols,
+Run on the `hybrid-search-phases` branch, 2026-11-14: 22,493 indexed symbols,
 18 scored queries (10 conceptual, 7 exact, 1 phrase). Embeddings:
 `ggml-org/embeddinggemma-300M-GGUF:Q8_0` (768 dims, CPU).
 
 | metric | semantic-only | lexical-only | hybrid |
 |---|---|---|---|
-| overall MRR | 0.294 | 0.536 | 0.483 |
+| overall MRR | 0.294 | 0.541 | 0.567 |
 | overall Recall@5 | 0.444 | 0.667 | 0.667 |
-| conceptual MRR (n=10) | 0.278 | 0.165 | 0.220 |
-| conceptual Recall@5 (n=10) | 0.500 | 0.400 | 0.500 |
-| exact MRR / Recall@5 (n=7) | 0.357 / 0.429 | 1.000 / 1.000 | 0.857 / 1.000 |
-| phrase rank | miss | 1 (verified exact) | 2 |
-| mean query latency | 230 ms | 17 ms | 276 ms |
+| conceptual MRR (n=10) | 0.278 | 0.173 | 0.220 |
+| conceptual Recall@5 (n=10) | 0.500 | 0.400 | 0.400 |
+| exact MRR / Recall@5 (n=7) | 0.357 / 0.429 | 1.000 / 1.000 | 1.000 / 1.000 |
+| phrase rank | miss | 1 (verified exact) | 1 (verified exact) |
+| mean query latency | 85 ms | 6 ms | 101 ms |
 
-Semantic and hybrid latency include one query embedding request (~200 ms).
+Semantic and hybrid latency include one query embedding request.
 
 | index | cold build | warm build | on disk |
 |---|---|---|---|
-| lexical sidecar | 10.8 s | 2.8 s | 43,921 KiB (42.9 MiB) |
+| lexical sidecar | 10.8 s | 2.8 s | 43,927 KiB (42.9 MiB) |
 | semantic index | ~4.8 h | 26 s | 210 MB |
 
 Standalone constants (`MAX_CHUNK_CHARS`, `EMBED_BATCH_TOKEN_BUDGET`, `RRF_K`)

@@ -653,11 +653,17 @@ impl EmbeddingIndex {
             *fused.entry(hit.id.as_str()).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
         }
 
-        let exact: std::collections::HashSet<&str> = lexical_hits
-            .iter()
-            .filter(|hit| hit.exact)
-            .map(|hit| hit.id.as_str())
-            .collect();
+        // Verified exact hits are prioritised ahead of the fusion and keep the
+        // order the lexical ranking gave them (BM25 among exact hits, so a
+        // definition outranks a caller). RRF only orders the remaining
+        // candidates: its rank-only scores cannot separate lexical #1 from #2
+        // once either also appears anywhere in the semantic list.
+        let mut exact_order: HashMap<&str, usize> = HashMap::new();
+        for hit in lexical_hits.iter().filter(|hit| hit.exact) {
+            let next = exact_order.len();
+            exact_order.entry(hit.id.as_str()).or_insert(next);
+        }
+        let exact_rank = |id: &str| exact_order.get(id).copied().unwrap_or(usize::MAX);
         let chunk_by_id: HashMap<&str, &EmbeddedChunk> = self
             .chunks
             .iter()
@@ -668,7 +674,7 @@ impl EmbeddingIndex {
         let mut candidates: Vec<SearchHit> = fused
             .into_iter()
             .map(|(id, score)| {
-                let is_exact = exact.contains(id);
+                let is_exact = exact_order.contains_key(id);
                 match chunk_by_id.get(id) {
                     Some(chunk) => hit_from(chunk, score, None, is_exact),
                     None => match lexical_by_id.get(id) {
@@ -691,8 +697,8 @@ impl EmbeddingIndex {
         // Plain RRF can tie a lexical-only top hit with the semantic top hit.
         // Prefer the semantic candidate on equal scores, then the document id.
         candidates.sort_by(|a, b| {
-            b.exact
-                .cmp(&a.exact)
+            exact_rank(&a.id)
+                .cmp(&exact_rank(&b.id))
                 .then_with(|| b.score.total_cmp(&a.score))
                 .then_with(|| {
                     from_semantic
@@ -746,8 +752,8 @@ impl EmbeddingIndex {
 
         let mut hits: Vec<SearchHit> = best.into_values().collect();
         hits.sort_by(|a, b| {
-            b.exact
-                .cmp(&a.exact)
+            exact_rank(&a.id)
+                .cmp(&exact_rank(&b.id))
                 .then_with(|| b.score.total_cmp(&a.score))
                 .then_with(|| {
                     from_semantic
@@ -762,10 +768,18 @@ impl EmbeddingIndex {
 
 /// Insert `hit` into `best` unless an equal-or-better score for the same id is
 /// already recorded.
-pub(super) fn insert_hit(best: &mut HashMap<String, SearchHit>, hit: SearchHit) {
-    match best.get(&hit.id) {
-        Some(existing) if existing.score >= hit.score => {}
-        _ => {
+pub(super) fn insert_hit(best: &mut HashMap<String, SearchHit>, mut hit: SearchHit) {
+    match best.get_mut(&hit.id) {
+        Some(existing) if existing.score >= hit.score => {
+            existing.exact |= hit.exact;
+        }
+        Some(existing) => {
+            // A verified exact match stays exact even when a higher-scoring
+            // copy of the same symbol (e.g. a graph expansion) replaces it.
+            hit.exact |= existing.exact;
+            *existing = hit;
+        }
+        None => {
             best.insert(hit.id.clone(), hit);
         }
     }
@@ -1161,6 +1175,65 @@ mod tests {
         );
         assert_eq!(hits.first().unwrap().symbol, "target_fn");
         assert!(hits.first().unwrap().exact);
+    }
+
+    #[test]
+    fn hybrid_search_keeps_lexical_order_among_exact_hits() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("a.rs"),
+            "pub fn ping_backend() {}\npub fn ping_backend_retries() {\n    ping_backend();\n}\n",
+        )
+        .unwrap();
+        let lexical =
+            crate::embeddings::lexical::LexicalIndex::build_or_update(workspace.path(), 1).unwrap();
+        let lexical_order: Vec<String> = lexical
+            .rank(workspace.path(), "ping_backend")
+            .into_iter()
+            .filter(|hit| hit.exact)
+            .map(|hit| hit.symbol)
+            .collect();
+        assert_eq!(lexical_order, ["ping_backend", "ping_backend_retries"]);
+
+        let index = EmbeddingIndex {
+            version: INDEX_VERSION,
+            file_hashes: HashMap::new(),
+            module_sketches: HashMap::new(),
+            chunks: vec![
+                EmbeddedChunk {
+                    id: "a::ping_backend".into(),
+                    symbol: "ping_backend".into(),
+                    file: "a.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    vector: vec![-1.0, 0.0],
+                },
+                EmbeddedChunk {
+                    id: "a::ping_backend_retries".into(),
+                    symbol: "ping_backend_retries".into(),
+                    file: "a.rs".into(),
+                    start_line: 2,
+                    end_line: 4,
+                    vector: vec![1.0, 0.0],
+                },
+            ],
+        };
+        // Both symbols verify as exact (the caller mentions `ping_backend` in its
+        // body), and only the caller is a semantic candidate. Plain RRF would
+        // rank the caller first for appearing in both lists; the definition
+        // must keep the lead the lexical ranking gave it.
+        let hits = index.hybrid_search(
+            workspace.path(),
+            "ping_backend",
+            &[1.0, 0.0],
+            &lexical,
+            None,
+            5,
+            16384,
+        );
+        let symbols: Vec<&str> = hits.iter().map(|hit| hit.symbol.as_str()).collect();
+        assert_eq!(&symbols[..2], ["ping_backend", "ping_backend_retries"]);
+        assert!(hits[0].exact && hits[1].exact);
     }
 
     #[test]
