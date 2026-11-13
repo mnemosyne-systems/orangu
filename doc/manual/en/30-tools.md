@@ -387,9 +387,11 @@ answer, so the main conversation's context stays small. Each subagent:
   `use_ssh`, which only copies files
 - runs at the same time as the other subagents the model starts in the same
   turn, up to four at once; their answers come back in the order the model
-  asked for them. Other tools in the turn still run one after another, in
-  order. Subagents that write share the workspace, so give concurrent writers
-  separate files
+  asked for them. Read-only tools the model starts together in one turn also
+  run at the same time, and `run_agent` asked to `list` counts as one of them;
+  a tool that writes, or a subagent beside a read, keeps the order the model
+  asked for. Subagents that write share the workspace, so give concurrent
+  writers separate files
 - has a fixed budget of model requests, whatever `max_tool_rounds` says
 - runs silently: no streaming; `/tasks` shows the tool it is on and the
   tokens it has used

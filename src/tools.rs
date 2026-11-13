@@ -979,6 +979,50 @@ impl ToolExecutor {
             || crate::subagents::find(name).is_some()
     }
 
+    /// Whether `name` is a read-only tool that may share one turn with
+    /// another such call.
+    ///
+    /// A name-level allowlist: a tool whose safety depends on its arguments
+    /// has its own test (see [`Self::lists_agents`]). `browse` is stateful
+    /// (link numbers refer to the page it last showed), the graph tools may
+    /// build or refresh a cache, and MCP tools have unknown side effects, so
+    /// none of those qualify. Subagent starters are [`Self::runs_subagent`]'s
+    /// business, not this list's.
+    pub fn parallel_safe(&self, name: &str) -> bool {
+        matches!(
+            name,
+            "show_file"
+                | "list_directory"
+                | "search_text"
+                | "expand_context"
+                | "fetch_url"
+                | "web_search"
+                | "use_skill"
+        )
+    }
+
+    /// Whether this call asks `run_agent` to list matching agents. That is a
+    /// local search, not a subagent start, so it may share a turn with other
+    /// read-only calls.
+    pub fn lists_agents(
+        &self,
+        name: &str,
+        arguments: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> bool {
+        name == "run_agent"
+            && arguments
+                .get("agent")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|agent| agent.trim().eq_ignore_ascii_case("list"))
+    }
+
+    /// Whether a hook runs around every tool call in this executor. Hooks can
+    /// observe call order, so the chat loop does not overlap otherwise
+    /// parallel-safe calls when one is installed.
+    pub fn has_agent_hooks(&self) -> bool {
+        self.agent_hooks.is_some()
+    }
+
     /// Lets this conversation's subagents run in the background: an
     /// interactive client, which hands their reports to the model later.
     pub fn with_background_tasks(mut self) -> Self {
