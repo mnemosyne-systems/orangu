@@ -73,6 +73,11 @@ pub(super) const EXPANSION_DECAY: f32 = 0.6;
 /// across lexical and semantic lists.
 const RRF_K: f32 = 60.0;
 
+/// How many top-scoring chunks the diversity pass may consider. Scoring every
+/// chunk against every seed is quadratic, so this bounds the pass to the part
+/// of the ranking that can still reach the result set.
+const DIVERSITY_CANDIDATE_LIMIT: usize = 256;
+
 // ── On-disk format ────────────────────────────────────────────────────────────
 
 /// One embedded code chunk: a symbol plus its vector.
@@ -567,6 +572,13 @@ impl EmbeddingIndex {
             .map(|(i, c)| (i, cosine(query_vector, &c.vector)))
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        // The diversity pass below is quadratic in the number of candidates
+        // (each chunk is compared with every seed selected before it), which is
+        // minutes per query on a 20k-symbol workspace. Only the head of the
+        // ranking can reach the result set, so bound the pool: `search` reads at
+        // most `top_k * 2` entries and RRF fuses the head of this ranking.
+        scored.truncate(DIVERSITY_CANDIDATE_LIMIT);
 
         // Pluribus Diversity-Aware Planner: track selected seeds to penalize redundant semantics
         let mut selected_seed_indices: Vec<usize> = Vec::new();
@@ -1067,6 +1079,40 @@ mod tests {
         assert_eq!(hits[0].symbol, "one");
         // "three" should beat "two" due to the diversity penalty
         assert_eq!(hits[1].symbol, "three");
+    }
+
+    #[test]
+    fn diversity_pass_only_scores_the_head_of_the_ranking() {
+        // Every chunk here is on the unit circle, evenly spread, so most pairs
+        // are *not* near-duplicates and the seed list keeps growing — the
+        // quadratic worst case. The pass must stop at the bounded pool instead
+        // of comparing every chunk against every seed.
+        let total = DIVERSITY_CANDIDATE_LIMIT * 2;
+        let chunks: Vec<EmbeddedChunk> = (0..total)
+            .map(|i| {
+                let angle = std::f32::consts::TAU * i as f32 / total as f32;
+                EmbeddedChunk {
+                    id: format!("a::c{i}"),
+                    symbol: format!("c{i}"),
+                    file: "a.rs".into(),
+                    start_line: i + 1,
+                    end_line: i + 1,
+                    vector: vec![angle.cos(), angle.sin()],
+                }
+            })
+            .collect();
+        let index = EmbeddingIndex {
+            version: INDEX_VERSION,
+            file_hashes: HashMap::new(),
+            module_sketches: HashMap::new(),
+            chunks,
+        };
+
+        let ranked = index.semantic_ranked(&[1.0, 0.0]);
+        assert_eq!(ranked.len(), DIVERSITY_CANDIDATE_LIMIT);
+        // Bound the head, not the tail: the closest chunk is still first.
+        assert_eq!(ranked[0].0, 0);
+        assert!(ranked[0].1 > 0.999);
     }
 
     #[test]
