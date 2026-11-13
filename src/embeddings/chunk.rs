@@ -66,6 +66,21 @@ fn slice_lines(content: &str, start: usize, end: usize) -> String {
 /// headroom under that default rather than requiring users to raise it.
 const MAX_CHUNK_CHARS: usize = 1_600;
 
+/// Truncate `text` to at most `limit` bytes without splitting a UTF-8 code
+/// point. [`String::truncate`] panics when the boundary falls inside a
+/// multi-byte character, which is easy to hit in files containing comments or
+/// string literals outside ASCII.
+fn truncate_on_char_boundary(text: &mut String, limit: usize) {
+    if text.len() <= limit {
+        return;
+    }
+    let mut cut = limit;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+}
+
 /// Extract embeddable chunks from one file's content. Returns an empty vector
 /// for unsupported languages or files with no extractable symbols.
 pub fn chunk_file(
@@ -83,7 +98,7 @@ pub fn chunk_file(
         .filter_map(|node| {
             let (start, end) = parse_location(&node.source_location)?;
             let mut body = slice_lines(content, start, end);
-            body.truncate(MAX_CHUNK_CHARS);
+            truncate_on_char_boundary(&mut body, MAX_CHUNK_CHARS);
             // Prefix the symbol name so the embedding captures intent even when
             // the body is truncated or terse.
             let text = format!("{} in {}\n{}", node.label, node.source_file, body);
@@ -115,5 +130,18 @@ mod tests {
         let src = "a\nb\nc\nd\ne";
         assert_eq!(slice_lines(src, 2, 4), "b\nc\nd");
         assert_eq!(slice_lines(src, 1, 1), "a");
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_never_splits_a_code_point() {
+        // "é" is two bytes, so a 1_600-byte cut can land inside it.
+        let mut text = "a".repeat(1_599) + "é" + "tail";
+        truncate_on_char_boundary(&mut text, 1_600);
+        assert_eq!(text.len(), 1_599);
+        assert!(text.is_char_boundary(text.len()));
+
+        let mut short = "abc".to_string();
+        truncate_on_char_boundary(&mut short, 1_600);
+        assert_eq!(short, "abc");
     }
 }
