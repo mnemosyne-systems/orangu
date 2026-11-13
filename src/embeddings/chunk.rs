@@ -36,8 +36,12 @@ pub struct Chunk {
     pub start_line: usize,
     /// 1-indexed inclusive end line.
     pub end_line: usize,
-    /// The source text embedded for this chunk (symbol name + body).
+    /// The source text embedded for this chunk (symbol name + truncated body).
     pub text: String,
+    /// The full, untruncated symbol body. Kept separate from [`Self::text`] so
+    /// the lexical index can cover the whole extracted symbol range without
+    /// changing what gets embedded.
+    pub body: String,
 }
 
 /// Parse the `L<start>-L<end>` location string the extractor records into a
@@ -82,12 +86,36 @@ fn truncate_on_char_boundary(text: &mut String, limit: usize) {
 }
 
 /// Extract embeddable chunks from one file's content. Returns an empty vector
-/// for unsupported languages or files with no extractable symbols.
+/// for unsupported languages or files with no extractable symbols. Bodies are
+/// truncated to [`MAX_CHUNK_CHARS`] for embedding; [`lexical_chunks`] keeps the
+/// full extracted symbol range for lexical indexing.
 pub fn chunk_file(
     extractor: &GraphExtractor,
     path: &std::path::Path,
     rel_path: &str,
     content: &str,
+) -> Vec<Chunk> {
+    chunks_with_body_limit(extractor, path, rel_path, content, Some(MAX_CHUNK_CHARS))
+}
+
+/// Extract chunks with the full symbol body, for the lexical index. The
+/// embedding index intentionally keeps its own truncation, so the two caches
+/// share extraction but not the indexed text boundary.
+pub fn lexical_chunks(
+    extractor: &GraphExtractor,
+    path: &std::path::Path,
+    rel_path: &str,
+    content: &str,
+) -> Vec<Chunk> {
+    chunks_with_body_limit(extractor, path, rel_path, content, None)
+}
+
+fn chunks_with_body_limit(
+    extractor: &GraphExtractor,
+    path: &std::path::Path,
+    rel_path: &str,
+    content: &str,
+    body_limit: Option<usize>,
 ) -> Vec<Chunk> {
     let Ok((nodes, _edges)) = extractor.extract_from_file(path, rel_path, content) else {
         return Vec::new();
@@ -97,11 +125,14 @@ pub fn chunk_file(
         .into_iter()
         .filter_map(|node| {
             let (start, end) = parse_location(&node.source_location)?;
-            let mut body = slice_lines(content, start, end);
-            truncate_on_char_boundary(&mut body, MAX_CHUNK_CHARS);
+            let body = slice_lines(content, start, end);
+            let mut embedded_body = body.clone();
+            if let Some(limit) = body_limit {
+                truncate_on_char_boundary(&mut embedded_body, limit);
+            }
             // Prefix the symbol name so the embedding captures intent even when
             // the body is truncated or terse.
-            let text = format!("{} in {}\n{}", node.label, node.source_file, body);
+            let text = format!("{} in {}\n{}", node.label, node.source_file, embedded_body);
             Some(Chunk {
                 id: node.id,
                 symbol: node.label,
@@ -109,6 +140,7 @@ pub fn chunk_file(
                 start_line: start,
                 end_line: end,
                 text,
+                body,
             })
         })
         .collect()
