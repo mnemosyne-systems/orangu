@@ -3183,7 +3183,6 @@ impl<F: HybridFfn> Trunk<F> {
     // Eight because the scratch buffers are threaded rather than held in
     // `self`; grouping them into `LayerScratch` already removed one.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn forward_full_attn_layer(
         &self,
         backend: &dyn Backend,
@@ -3291,7 +3290,6 @@ impl<F: HybridFfn> Trunk<F> {
     // Eight because the scratch buffers are threaded rather than held in
     // `self`, the same reason `forward_full_attn_layer` carries this allow:
     // `forward` takes `&self` and two layers may be in flight at once.
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn apply_ffn(
         &self,

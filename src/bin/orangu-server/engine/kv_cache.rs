@@ -6196,17 +6196,17 @@ mod tests {
         }
 
         // And it reads what the first sequence computed, in every layer.
-        for layer in 0..2 {
+        for (layer, cache) in second.layers.iter().enumerate().take(2) {
             for r in 0..12 {
                 let expect: Vec<f32> = (0..KV).map(|d| row(r, d)).collect();
                 assert_eq!(
-                    second.layers[layer].key_at(r, 0, KV),
+                    cache.key_at(r, 0, KV),
                     &expect[..],
                     "layer {layer} row {r} keys"
                 );
                 let expect_v: Vec<f32> = expect.iter().map(|x| -x).collect();
                 assert_eq!(
-                    second.layers[layer].value_at(r, 0, KV),
+                    cache.value_at(r, 0, KV),
                     &expect_v[..],
                     "layer {layer} row {r} values"
                 );
