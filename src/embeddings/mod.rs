@@ -137,7 +137,12 @@ impl SemanticSearch {
             None,
         )
         .ok();
-        let index = EmbeddingIndex::build_or_update_from_scan(
+        // Try the embedding half. A server that was available at startup can
+        // disappear later; in that case fall through to lexical-only rather
+        // than failing the whole search.
+        let mut semantic = None;
+        let mut embedding_error = None;
+        match EmbeddingIndex::build_or_update_from_scan(
             workspace,
             &scan,
             client,
@@ -146,34 +151,58 @@ impl SemanticSearch {
             progress,
             eta,
         )
-        .await?;
+        .await
+        {
+            Ok(index) if !index.is_empty() => match client.embed_one(query).await {
+                Ok(vector) => semantic = Some((index, vector)),
+                Err(err) => embedding_error = Some(err),
+            },
+            Ok(_) => {}
+            Err(err) => embedding_error = Some(err),
+        }
+
         let mut result = SemanticSearchResult {
-            indexed_symbols: index.len(),
+            indexed_symbols: lexical.as_ref().map_or(0, |index| index.len()),
             hits: Vec::new(),
             cancelled: cancel.load(Ordering::Relaxed),
-            used_embeddings: true,
+            used_embeddings: false,
         };
-        if result.cancelled || index.is_empty() {
+        if result.cancelled {
             return Ok(result);
         }
-        let query_vector = client.embed_one(query).await?;
-        result.cancelled = cancel.load(Ordering::Relaxed);
-        if !result.cancelled {
-            let guard = graph
-                .lock()
-                .map_err(|_| anyhow::anyhow!("graph_store mutex poisoned"))?;
-            result.hits = match &lexical {
-                Some(lexical) => index.hybrid_search(
-                    workspace,
-                    query,
-                    &query_vector,
-                    lexical,
-                    guard.as_ref(),
-                    10,
-                    self.budget_tokens,
-                ),
-                None => index.search(&query_vector, guard.as_ref(), 10, self.budget_tokens),
-            };
+
+        let guard = graph
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph_store mutex poisoned"))?;
+
+        match semantic {
+            Some((index, query_vector)) => {
+                result.indexed_symbols = index.len();
+                result.used_embeddings = true;
+                result.hits = match &lexical {
+                    Some(lexical) => index.hybrid_search(
+                        workspace,
+                        query,
+                        &query_vector,
+                        lexical,
+                        guard.as_ref(),
+                        10,
+                        self.budget_tokens,
+                    ),
+                    None => index.search(&query_vector, guard.as_ref(), 10, self.budget_tokens),
+                };
+            }
+            None => {
+                if let Some(lexical) = &lexical {
+                    result.indexed_symbols = lexical.len();
+                    result.hits =
+                        lexical.search(workspace, query, guard.as_ref(), 10, self.budget_tokens);
+                } else if let Some(err) = embedding_error {
+                    return Err(err);
+                } else {
+                    anyhow::bail!("lexical search index could not be built for this workspace");
+                }
+            }
         }
         Ok(result)
     }
@@ -224,12 +253,18 @@ pub async fn probe_endpoint(profile: &LlmConfiguration) -> Result<(), String> {
 }
 
 /// Render search hits as a human-readable block for the output window, with each
-/// result anchored to its `file:line` so it is clickable.
-pub fn format_hits(query: &str, hits: &[SearchHit]) -> String {
+/// result anchored to its `file:line` so it is clickable. `used_embeddings`
+/// selects the header so a lexical-only fallback does not claim to be semantic.
+pub fn format_hits(query: &str, hits: &[SearchHit], used_embeddings: bool) -> String {
+    let label = if used_embeddings {
+        "Semantic"
+    } else {
+        "Lexical"
+    };
     if hits.is_empty() {
-        return format!("No semantic matches for \"{query}\".");
+        return format!("No matches for \"{query}\".");
     }
-    let mut out = format!("Semantic matches for \"{query}\":\n");
+    let mut out = format!("{label} matches for \"{query}\":\n");
     for (i, hit) in hits.iter().enumerate() {
         let via = match &hit.expanded_from {
             Some(sym) => format!("  (via {sym})"),

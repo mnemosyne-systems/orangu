@@ -2220,7 +2220,7 @@ pub(crate) fn handle_command(
                     }
                     if result.indexed_symbols == 0 {
                         let _ = sink.send(
-                            "The embedding index is empty — no supported source files found to \
+                            "The search index is empty — no supported source files found to \
                              search."
                                 .to_string(),
                         );
@@ -2231,7 +2231,11 @@ pub(crate) fn handle_command(
                         result.indexed_symbols,
                         format_status_duration(started.elapsed())
                     ));
-                    let _ = sink.send(orangu::embeddings::format_hits(&query, &result.hits));
+                    let _ = sink.send(orangu::embeddings::format_hits(
+                        &query,
+                        &result.hits,
+                        result.used_embeddings,
+                    ));
                     Ok(())
                 }),
                 Some(control),

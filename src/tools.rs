@@ -1344,7 +1344,11 @@ impl ToolExecutor {
                 &AtomicU64::new(0),
                 &AtomicU64::new(0),
             ))?;
-            Ok(crate::embeddings::format_hits(&query, &result.hits))
+            Ok(crate::embeddings::format_hits(
+                &query,
+                &result.hits,
+                result.used_embeddings,
+            ))
         })
         .await?
     }
@@ -4137,7 +4141,7 @@ mod semantic_search_tests {
             .execute("semantic_search", arguments.as_object().unwrap())
             .await
             .unwrap();
-        assert!(answer.contains("No semantic matches"), "{answer}");
+        assert!(answer.contains("No matches"), "{answer}");
         assert_eq!(
             requests.lock().unwrap().len(),
             5,
@@ -4153,7 +4157,64 @@ mod semantic_search_tests {
             .execute("semantic_search", arguments.as_object().unwrap())
             .await
             .unwrap();
-        assert!(answer.contains("No semantic matches"), "{answer}");
+        assert!(answer.contains("No matches"), "{answer}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn semantic_search_falls_back_to_lexical_when_embeddings_go_down_after_startup() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Requests::default();
+        let app = Router::new()
+            .route("/v1/embeddings", post(embed))
+            .with_state(requests);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let workspace = tempfile::tempdir().unwrap();
+        let _cache = CacheCleanup(crate::embeddings::EmbeddingIndex::cache_dir(
+            workspace.path(),
+        ));
+        fs::write(
+            workspace.path().join("retry.rs"),
+            "pub fn retry_backoff() {}\n",
+        )
+        .unwrap();
+        let tools = ToolExecutor::new_read_only(workspace.path());
+        let profile = crate::config::LlmConfiguration {
+            endpoint,
+            model: "chat-model".into(),
+            role: "all".into(),
+            api_key: None,
+            request_timeout_seconds: 1,
+            max_tool_rounds: 1,
+            review_max_tokens: 0,
+            code_max_tokens: 0,
+            system_prompt: String::new(),
+            model_verbosity: None,
+            review_confidence_threshold: 0,
+            security_confidence_threshold: 0,
+            review_sanitize: Default::default(),
+            review_sanitize_timeout: 1_800,
+            review_sanitize_alloc_failures: 8,
+        };
+        tools
+            .configure_semantic_search(Some(&profile), true, 1, 16384)
+            .unwrap();
+        let arguments = json!({"query": "retry_backoff"});
+        let answer = tools
+            .execute("semantic_search", arguments.as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(answer.contains("retry_backoff"), "{answer}");
+
+        // The server disappears after startup. The next search must still
+        // return ranked lexical results instead of failing.
+        server.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let answer = tools
+            .execute("semantic_search", arguments.as_object().unwrap())
+            .await
+            .expect("lexical fallback should not fail");
+        assert!(answer.contains("retry_backoff"), "{answer}");
     }
 }
