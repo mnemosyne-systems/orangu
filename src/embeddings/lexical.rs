@@ -157,6 +157,11 @@ impl LexicalIndex {
         self.docs.is_empty()
     }
 
+    /// A map from document id to its metadata, for graph expansion by id.
+    pub fn doc_by_id(&self) -> HashMap<&str, &LexicalDoc> {
+        self.docs.iter().map(|doc| (doc.id.as_str(), doc)).collect()
+    }
+
     /// Build or incrementally update the lexical index for `workspace`.
     ///
     /// Only files whose content hash changed are re-parsed and re-tokenised;

@@ -129,8 +129,17 @@ impl SemanticSearch {
             return Ok(result);
         };
 
-        let index = EmbeddingIndex::build_or_update(
+        let scan = crate::embeddings::source::scan_workspace(workspace);
+        let lexical = crate::embeddings::lexical::LexicalIndex::build_or_update_from_scan(
             workspace,
+            &scan,
+            self.compile_workers,
+            None,
+        )
+        .ok();
+        let index = EmbeddingIndex::build_or_update_from_scan(
+            workspace,
+            &scan,
             client,
             cancel,
             self.compile_workers,
@@ -153,7 +162,18 @@ impl SemanticSearch {
             let guard = graph
                 .lock()
                 .map_err(|_| anyhow::anyhow!("graph_store mutex poisoned"))?;
-            result.hits = index.search(&query_vector, guard.as_ref(), 10, self.budget_tokens);
+            result.hits = match &lexical {
+                Some(lexical) => index.hybrid_search(
+                    workspace,
+                    query,
+                    &query_vector,
+                    lexical,
+                    guard.as_ref(),
+                    10,
+                    self.budget_tokens,
+                ),
+                None => index.search(&query_vector, guard.as_ref(), 10, self.budget_tokens),
+            };
         }
         Ok(result)
     }

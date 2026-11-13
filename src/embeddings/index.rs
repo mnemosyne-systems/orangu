@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use super::chunk::chunk_file;
 use super::client::EmbeddingClient;
-use super::lexical::LexicalDoc;
+use super::lexical::{LexicalDoc, LexicalIndex};
 use super::source::{SourceFile, scan_workspace};
 use crate::graph::extract::GraphExtractor;
 use crate::graph::store::GraphStore;
@@ -67,6 +67,11 @@ const EMBED_CONCURRENCY: usize = 8;
 /// strong semantic hit in the knowledge graph. Below `1.0` so a graph-expanded
 /// result never outranks the semantic hit that surfaced it.
 pub(super) const EXPANSION_DECAY: f32 = 0.6;
+
+/// Reciprocal Rank Fusion constant. The standard default (60) damps the
+/// influence of very high individual ranks while keeping the fusion stable
+/// across lexical and semantic lists.
+const RRF_K: f32 = 60.0;
 
 // ── On-disk format ────────────────────────────────────────────────────────────
 
@@ -467,9 +472,9 @@ impl EmbeddingIndex {
         Ok(())
     }
 
-    /// Hybrid search: rank chunks by cosine similarity to `query_vector`, then,
-    /// when a graph is available, expand the strongest hits along their call
-    /// edges. Returns up to `top_k` results, most relevant first.
+    /// Semantic-only search: rank chunks by cosine similarity to
+    /// `query_vector`, then, when a graph is available, expand the strongest
+    /// hits along their call edges. Returns up to `top_k` results.
     pub fn search(
         &self,
         query_vector: &[f32],
@@ -481,6 +486,51 @@ impl EmbeddingIndex {
             return Vec::new();
         }
 
+        let penalized_scores = self.semantic_ranked(query_vector);
+        let id_to_index: HashMap<&str, usize> = self
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.id.as_str(), i))
+            .collect();
+
+        // Take the strongest semantic hits as seeds for expansion.
+        let seed_count = top_k.saturating_mul(2).max(top_k);
+        let mut best: HashMap<String, SearchHit> = HashMap::new();
+        for &(idx, score) in penalized_scores.iter().take(seed_count) {
+            let chunk = &self.chunks[idx];
+            insert_hit(&mut best, hit_from(chunk, score, None, false));
+
+            // Structural expansion: pull the graph neighbours of this symbol.
+            if let Some(graph) = graph {
+                for result in graph.lookup(&chunk.symbol) {
+                    if result.node.id != chunk.id {
+                        continue;
+                    }
+                    let neighbours = result.callers.iter().chain(result.callees.iter());
+                    for edge in neighbours {
+                        if let Some(&nidx) = id_to_index.get(edge.node_id.as_str()) {
+                            let n = &self.chunks[nidx];
+                            let boosted = score * EXPANSION_DECAY;
+                            insert_hit(
+                                &mut best,
+                                hit_from(n, boosted, Some(chunk.symbol.clone()), false),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut hits: Vec<SearchHit> = best.into_values().collect();
+        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+        budget_cut(hits, top_k, semantic_budget_tokens)
+    }
+
+    /// Score every chunk against `query_vector`, apply the existing
+    /// occupancy-aware sketch filter and diversity penalty, and return the
+    /// chunk indices in descending score order.
+    fn semantic_ranked(&self, query_vector: &[f32]) -> Vec<(usize, f32)> {
         // Occupancy-Aware Sketch Filtering
         // Determine candidate modules that are close enough to the query.
         // Recall safety net: always force-include the 3 most recently modified files
@@ -506,10 +556,6 @@ impl EmbeddingIndex {
             }
         }
 
-        // Track divergence/recall in debug builds
-        #[cfg(debug_assertions)]
-        let _unfiltered_count = self.chunks.len();
-
         let filter_candidates = !candidate_files.is_empty();
 
         // Semantic pass: cosine of the query against every chunk.
@@ -522,18 +568,7 @@ impl EmbeddingIndex {
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-        // Best score seen per chunk id, so expansion never demotes a direct hit.
-        let mut best: HashMap<String, SearchHit> = HashMap::new();
-        let id_to_index: HashMap<&str, usize> = self
-            .chunks
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.id.as_str(), i))
-            .collect();
-
-        // Take the strongest semantic hits as seeds for expansion.
         // Pluribus Diversity-Aware Planner: track selected seeds to penalize redundant semantics
-        let seed_count = top_k.saturating_mul(2).max(top_k);
         let mut selected_seed_indices: Vec<usize> = Vec::new();
 
         const DIVERSITY_THRESHOLD: f32 = 0.85;
@@ -560,23 +595,137 @@ impl EmbeddingIndex {
         }
 
         penalized_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+        penalized_scores
+    }
 
-        for &(idx, score) in penalized_scores.iter().take(seed_count) {
-            let chunk = &self.chunks[idx];
-            insert_hit(&mut best, hit_from(chunk, score, None));
+    /// Hybrid search: fuse the semantic ranking with the lexical BM25 ranking
+    /// using Reciprocal Rank Fusion, giving verified exact identifier/phrase
+    /// matches priority, then apply the existing graph expansion and token
+    /// budget. Falls back to lexical-only when the embedding index is empty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hybrid_search(
+        &self,
+        workspace: &Path,
+        query: &str,
+        query_vector: &[f32],
+        lexical: &LexicalIndex,
+        graph: Option<&GraphStore>,
+        top_k: usize,
+        semantic_budget_tokens: usize,
+    ) -> Vec<SearchHit> {
+        if self.chunks.is_empty() || query_vector.is_empty() {
+            return lexical.search(workspace, query, graph, top_k, semantic_budget_tokens);
+        }
 
-            // Structural expansion: pull the graph neighbours of this symbol.
-            if let Some(graph) = graph {
-                for result in graph.lookup(&chunk.symbol) {
-                    if result.node.id != chunk.id {
+        let semantic = self.semantic_ranked(query_vector);
+        let lexical_hits = lexical.rank(workspace, query);
+        if lexical_hits.is_empty() {
+            return self.search(query_vector, graph, top_k, semantic_budget_tokens);
+        }
+
+        // Reciprocal Rank Fusion: rank-based, so BM25 scores and cosine
+        // similarities never need a shared scale.
+        let mut fused: HashMap<&str, f32> = HashMap::new();
+        let mut from_semantic: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (rank, (idx, score)) in semantic.iter().enumerate() {
+            // Zero/negative cosine chunks are not semantic candidates at all;
+            // giving them a rank would let an unrelated lexical hit win.
+            if *score <= 0.0 {
+                continue;
+            }
+            let id = self.chunks[*idx].id.as_str();
+            from_semantic.insert(id);
+            *fused.entry(id).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
+        }
+        for (rank, hit) in lexical_hits.iter().enumerate() {
+            *fused.entry(hit.id.as_str()).or_default() += 1.0 / (RRF_K + rank as f32 + 1.0);
+        }
+
+        let exact: std::collections::HashSet<&str> = lexical_hits
+            .iter()
+            .filter(|hit| hit.exact)
+            .map(|hit| hit.id.as_str())
+            .collect();
+        let chunk_by_id: HashMap<&str, &EmbeddedChunk> = self
+            .chunks
+            .iter()
+            .map(|chunk| (chunk.id.as_str(), chunk))
+            .collect();
+        let lexical_by_id = lexical.doc_by_id();
+
+        let mut candidates: Vec<SearchHit> = fused
+            .into_iter()
+            .map(|(id, score)| {
+                let is_exact = exact.contains(id);
+                match chunk_by_id.get(id) {
+                    Some(chunk) => hit_from(chunk, score, None, is_exact),
+                    None => match lexical_by_id.get(id) {
+                        Some(doc) => hit_from_doc(doc, score, None, is_exact),
+                        // Should not happen: every lexical id belongs to a doc.
+                        None => SearchHit {
+                            id: id.to_string(),
+                            symbol: String::new(),
+                            file: String::new(),
+                            start_line: 0,
+                            end_line: 0,
+                            score,
+                            expanded_from: None,
+                            exact: is_exact,
+                        },
+                    },
+                }
+            })
+            .collect();
+        // Plain RRF can tie a lexical-only top hit with the semantic top hit.
+        // Prefer the semantic candidate on equal scores, then the document id.
+        candidates.sort_by(|a, b| {
+            b.exact
+                .cmp(&a.exact)
+                .then_with(|| b.score.total_cmp(&a.score))
+                .then_with(|| {
+                    from_semantic
+                        .contains(b.id.as_str())
+                        .cmp(&from_semantic.contains(a.id.as_str()))
+                })
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let mut best: HashMap<String, SearchHit> = HashMap::new();
+        for hit in &candidates {
+            insert_hit(&mut best, hit.clone());
+        }
+
+        // Structural expansion from the strongest fused seeds, so lexical hits
+        // also pull in their callers/callees.
+        let seed_count = top_k.saturating_mul(2).max(top_k);
+        if let Some(graph) = graph {
+            for hit in candidates.iter().take(seed_count) {
+                for result in graph.lookup(&hit.symbol) {
+                    if result.node.id != hit.id {
                         continue;
                     }
                     let neighbours = result.callers.iter().chain(result.callees.iter());
                     for edge in neighbours {
-                        if let Some(&nidx) = id_to_index.get(edge.node_id.as_str()) {
-                            let n = &self.chunks[nidx];
-                            let boosted = score * EXPANSION_DECAY;
-                            insert_hit(&mut best, hit_from(n, boosted, Some(chunk.symbol.clone())));
+                        if let Some(chunk) = chunk_by_id.get(edge.node_id.as_str()) {
+                            insert_hit(
+                                &mut best,
+                                hit_from(
+                                    chunk,
+                                    hit.score * EXPANSION_DECAY,
+                                    Some(hit.symbol.clone()),
+                                    false,
+                                ),
+                            );
+                        } else if let Some(doc) = lexical_by_id.get(edge.node_id.as_str()) {
+                            insert_hit(
+                                &mut best,
+                                hit_from_doc(
+                                    doc,
+                                    hit.score * EXPANSION_DECAY,
+                                    Some(hit.symbol.clone()),
+                                    false,
+                                ),
+                            );
                         }
                     }
                 }
@@ -584,24 +733,18 @@ impl EmbeddingIndex {
         }
 
         let mut hits: Vec<SearchHit> = best.into_values().collect();
-        hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-
-        let mut total_tokens = 0;
-        let mut final_hits = Vec::new();
-        for hit in hits {
-            let chunk_lines = hit.end_line.saturating_sub(hit.start_line) + 1;
-            let chunk_tokens = chunk_lines * 10;
-            if total_tokens + chunk_tokens > semantic_budget_tokens && !final_hits.is_empty() {
-                break;
-            }
-            total_tokens += chunk_tokens;
-            final_hits.push(hit);
-            if final_hits.len() >= top_k {
-                break;
-            }
-        }
-
-        final_hits
+        hits.sort_by(|a, b| {
+            b.exact
+                .cmp(&a.exact)
+                .then_with(|| b.score.total_cmp(&a.score))
+                .then_with(|| {
+                    from_semantic
+                        .contains(b.id.as_str())
+                        .cmp(&from_semantic.contains(a.id.as_str()))
+                })
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        budget_cut(hits, top_k, semantic_budget_tokens)
     }
 }
 
@@ -616,7 +759,12 @@ pub(super) fn insert_hit(best: &mut HashMap<String, SearchHit>, hit: SearchHit) 
     }
 }
 
-fn hit_from(chunk: &EmbeddedChunk, score: f32, expanded_from: Option<String>) -> SearchHit {
+fn hit_from(
+    chunk: &EmbeddedChunk,
+    score: f32,
+    expanded_from: Option<String>,
+    exact: bool,
+) -> SearchHit {
     SearchHit {
         id: chunk.id.clone(),
         symbol: chunk.symbol.clone(),
@@ -625,7 +773,7 @@ fn hit_from(chunk: &EmbeddedChunk, score: f32, expanded_from: Option<String>) ->
         end_line: chunk.end_line,
         score,
         expanded_from,
-        exact: false,
+        exact,
     }
 }
 
@@ -919,5 +1067,101 @@ mod tests {
         assert_eq!(hits[0].symbol, "one");
         // "three" should beat "two" due to the diversity penalty
         assert_eq!(hits[1].symbol, "three");
+    }
+
+    #[test]
+    fn hybrid_search_prioritises_verified_exact_identifier() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("a.rs"),
+            "pub fn target_fn() {}\npub fn other_fn() {}\n",
+        )
+        .unwrap();
+        let lexical =
+            crate::embeddings::lexical::LexicalIndex::build_or_update(workspace.path(), 1).unwrap();
+        let index = EmbeddingIndex {
+            version: INDEX_VERSION,
+            file_hashes: HashMap::new(),
+            module_sketches: HashMap::new(),
+            chunks: vec![
+                EmbeddedChunk {
+                    id: "a::target_fn".into(),
+                    symbol: "target_fn".into(),
+                    file: "a.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    vector: vec![0.0, 1.0],
+                },
+                EmbeddedChunk {
+                    id: "a::other_fn".into(),
+                    symbol: "other_fn".into(),
+                    file: "a.rs".into(),
+                    start_line: 2,
+                    end_line: 2,
+                    vector: vec![1.0, 0.0],
+                },
+            ],
+        };
+        // The semantic ranking prefers `other_fn`, but `target_fn` is a verified
+        // exact identifier and must be promoted ahead of it.
+        let hits = index.hybrid_search(
+            workspace.path(),
+            "target_fn",
+            &[1.0, 0.0],
+            &lexical,
+            None,
+            5,
+            16384,
+        );
+        assert_eq!(hits.first().unwrap().symbol, "target_fn");
+        assert!(hits.first().unwrap().exact);
+    }
+
+    #[test]
+    fn hybrid_search_keeps_semantic_lead_for_a_conceptual_query() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("a.rs"),
+            "pub fn semantic() {}\n\
+             pub fn lexical() {\n    retry();\n    backoff();\n    timeout();\n}\n",
+        )
+        .unwrap();
+        let lexical =
+            crate::embeddings::lexical::LexicalIndex::build_or_update(workspace.path(), 1).unwrap();
+        let index = EmbeddingIndex {
+            version: INDEX_VERSION,
+            file_hashes: HashMap::new(),
+            module_sketches: HashMap::new(),
+            chunks: vec![
+                EmbeddedChunk {
+                    id: "a::semantic".into(),
+                    symbol: "semantic".into(),
+                    file: "a.rs".into(),
+                    start_line: 1,
+                    end_line: 1,
+                    vector: vec![1.0, 0.0],
+                },
+                EmbeddedChunk {
+                    id: "a::lexical".into(),
+                    symbol: "lexical".into(),
+                    file: "a.rs".into(),
+                    start_line: 2,
+                    end_line: 6,
+                    vector: vec![0.0, 1.0],
+                },
+            ],
+        };
+        // BM25 strongly prefers `lexical`, but the query is conceptual (no
+        // verified exact match), so the semantic list must stay on top.
+        let hits = index.hybrid_search(
+            workspace.path(),
+            "retry backoff timeout",
+            &[1.0, 0.0],
+            &lexical,
+            None,
+            5,
+            16384,
+        );
+        assert_eq!(hits.first().unwrap().symbol, "semantic");
     }
 }
