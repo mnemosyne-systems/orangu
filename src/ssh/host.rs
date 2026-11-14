@@ -26,8 +26,13 @@ pub struct SshPaths {
     pub known_hosts: PathBuf,
     /// Where the default identity files live.
     pub directory: PathBuf,
+    /// The agent's socket, or on Windows its named pipe; `None` for no agent.
     pub agent_socket: Option<PathBuf>,
 }
+
+/// Where the agent that comes with Windows listens.
+#[cfg(windows)]
+const WINDOWS_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
 impl SshPaths {
     /// The current user's `~/.ssh`, and their `SSH_AUTH_SOCK`.
@@ -37,9 +42,29 @@ impl SshPaths {
             config: directory.join("config"),
             known_hosts: directory.join("known_hosts"),
             directory,
-            agent_socket: std::env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+            agent_socket: agent_socket(std::env::var_os("SSH_AUTH_SOCK")),
         }
     }
+}
+
+/// The agent `SSH_AUTH_SOCK` names.
+#[cfg(not(windows))]
+fn agent_socket(auth_sock: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    auth_sock.map(PathBuf::from)
+}
+
+/// The agent `SSH_AUTH_SOCK` names when it is a named pipe, as `ssh` reads
+/// it, or else the agent that comes with Windows. A Unix socket path, such as
+/// Git Bash sets, is no use to a Windows program.
+#[cfg(windows)]
+fn agent_socket(auth_sock: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let pipe = auth_sock
+        .filter(|path| {
+            path.to_str()
+                .is_some_and(|path| path.to_ascii_lowercase().starts_with(r"\\.\pipe\"))
+        })
+        .map_or_else(|| PathBuf::from(WINDOWS_AGENT_PIPE), PathBuf::from);
+    Some(pipe)
 }
 
 /// Where a login goes and with what.
