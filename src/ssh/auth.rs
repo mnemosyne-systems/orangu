@@ -21,16 +21,21 @@ use super::{HostKeyCheck, Prompts};
 use anyhow::{Result, anyhow};
 use russh::MethodKind;
 use russh::client::{AuthResult, Handle};
+use russh::keys::agent::client::AgentClient;
 use russh::keys::{self, PrivateKeyWithHashAlg};
 use std::path::Path;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 /// How many times one passphrase or password may be asked for.
 const PROMPT_ATTEMPTS: usize = 3;
-/// How many of an agent's keys are offered: a server cuts a client off after
-/// a few failures (6 by default), and key files and passwords come after.
-#[cfg(unix)]
+/// How many agent keys are offered: a server cuts a client off after a few
+/// failures (6 by default), and key files and passwords come after.
 const MAX_AGENT_KEYS: usize = 4;
+/// How long reaching the agent may take. A busy Windows pipe is retried
+/// until it frees up, so this bounds the wait.
+#[cfg(windows)]
+const AGENT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// What the next method needs to know from the last failure.
 enum Attempt {
@@ -71,15 +76,12 @@ pub async fn authenticate(
     let mut tried: Vec<String> = Vec::new();
 
     if offered.contains(&MethodKind::PublicKey) {
-        #[cfg(unix)]
         if let Some(socket) = &paths.agent_socket
             && let Some(method) =
                 with_agent(handle, target, socket, &mut offered, &mut tried).await?
         {
             return Ok(method);
         }
-        #[cfg(not(unix))]
-        let _ = paths;
         if !handle.is_closed()
             && let Some(method) =
                 with_key_files(handle, target, prompts, &mut offered, &mut tried).await?
@@ -144,7 +146,7 @@ async fn rsa_hash(handle: &Handle<HostKeyCheck>) -> Option<keys::HashAlg> {
         .flatten()
 }
 
-/// Offers the agent's keys, those of the host's identity files first.
+/// Offers the keys of the agent at `socket`, at most [`MAX_AGENT_KEYS`].
 #[cfg(unix)]
 async fn with_agent(
     handle: &mut Handle<HostKeyCheck>,
@@ -153,11 +155,56 @@ async fn with_agent(
     offered: &mut Vec<MethodKind>,
     tried: &mut Vec<String>,
 ) -> Result<Option<String>> {
-    use keys::agent::client::AgentClient;
-
     let Ok(mut agent) = AgentClient::connect_uds(socket).await else {
         return Ok(None);
     };
+    let mut budget = MAX_AGENT_KEYS;
+    offer_agent_keys(handle, target, &mut agent, &mut budget, offered, tried).await
+}
+
+/// Offers the keys of the agent at the named pipe `socket`, then those of
+/// PuTTY's Pageant, which has no pipe; at most [`MAX_AGENT_KEYS`] between them.
+#[cfg(windows)]
+async fn with_agent(
+    handle: &mut Handle<HostKeyCheck>,
+    target: &Target,
+    socket: &Path,
+    offered: &mut Vec<MethodKind>,
+    tried: &mut Vec<String>,
+) -> Result<Option<String>> {
+    use tokio::time::timeout;
+
+    let mut budget = MAX_AGENT_KEYS;
+    if let Ok(Ok(mut agent)) = timeout(
+        AGENT_CONNECT_TIMEOUT,
+        AgentClient::connect_named_pipe(socket),
+    )
+    .await
+        && let Some(method) =
+            offer_agent_keys(handle, target, &mut agent, &mut budget, offered, tried).await?
+    {
+        return Ok(Some(method));
+    }
+    if budget == 0 || handle.is_closed() || !offered.contains(&MethodKind::PublicKey) {
+        return Ok(None);
+    }
+    let Ok(Ok(mut agent)) = timeout(AGENT_CONNECT_TIMEOUT, AgentClient::connect_pageant()).await
+    else {
+        return Ok(None);
+    };
+    offer_agent_keys(handle, target, &mut agent, &mut budget, offered, tried).await
+}
+
+/// Offers `agent`'s keys, those of the host's identity files first, until one
+/// works or `budget` keys have been offered.
+async fn offer_agent_keys<S: AsyncRead + AsyncWrite + Unpin + Send>(
+    handle: &mut Handle<HostKeyCheck>,
+    target: &Target,
+    agent: &mut AgentClient<S>,
+    budget: &mut usize,
+    offered: &mut Vec<MethodKind>,
+    tried: &mut Vec<String>,
+) -> Result<Option<String>> {
     if let Some(binding) = handle.agent_session_binding().cloned() {
         // Older agents do not know session binding, and still sign.
         let _ = agent.bind_session(&binding, false).await;
@@ -179,7 +226,8 @@ async fn with_agent(
         .map(|identity| identity.public_key().into_owned())
         .collect();
     keys.sort_by_key(|key| !preferred.contains(key));
-    keys.truncate(MAX_AGENT_KEYS);
+    keys.truncate(*budget);
+    *budget -= keys.len();
 
     let hash = rsa_hash(handle).await;
     for key in keys {
@@ -187,7 +235,7 @@ async fn with_agent(
         let hash_alg = key.algorithm().is_rsa().then_some(hash).flatten();
         // A key the agent will not sign with fails this attempt only.
         let Ok(result) = handle
-            .authenticate_publickey_with(&target.user, key, hash_alg, &mut agent)
+            .authenticate_publickey_with(&target.user, key, hash_alg, agent)
             .await
         else {
             tried.push(format!("{label} (the agent did not sign)"));

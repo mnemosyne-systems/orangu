@@ -575,7 +575,9 @@ reaches the model, the transcript or the session files. `ssh_login` tries, in
 order, until one works:
 
 1. The keys in your SSH agent (`SSH_AUTH_SOCK`), those matching the host's
-   `IdentityFile` first, at most four. Not on Windows.
+   `IdentityFile` first, at most four. On Windows that is the OpenSSH agent's
+   named pipe, `SSH_AUTH_SOCK` when it names a pipe and
+   `\\.\pipe\openssh-ssh-agent` otherwise, and then PuTTY's Pageant.
 2. The host's `IdentityFile` entries, or `~/.ssh/id_ed25519`, `id_ecdsa` and
    `id_rsa`. An encrypted key asks for its passphrase.
 3. A password, if the server offers password login.
