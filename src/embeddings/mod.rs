@@ -107,11 +107,30 @@ impl SemanticSearch {
             return self.lexical_search(workspace, query, graph, cancel, progress);
         };
 
-        // A server that was available at startup can disappear later. Fall
-        // back to lexical ranking instead of failing the search; the lexical
-        // index is only built when it is actually needed.
-        let index = match EmbeddingIndex::build_or_update(
+        // Both indexes are refreshed from one workspace scan. The lexical half
+        // does not depend on the embeddings server; if it cannot be built the
+        // search continues semantic-only.
+        let scan = crate::embeddings::source::scan_workspace(workspace);
+        let lexical = match crate::embeddings::lexical::LexicalIndex::build_or_update_from_scan(
             workspace,
+            &scan,
+            self.compile_workers,
+            None,
+        ) {
+            Ok(lexical) => Some(lexical),
+            Err(err) => {
+                log::warn!("semantic search: lexical index unavailable ({err:#}); semantic only");
+                None
+            }
+        };
+
+        // A server that was available at startup can disappear later. In that
+        // case fall back to lexical ranking rather than failing the search.
+        let mut semantic = None;
+        let mut embedding_error = None;
+        match EmbeddingIndex::build_or_update_from_scan(
+            workspace,
+            &scan,
             client,
             cancel,
             self.compile_workers,
@@ -120,38 +139,60 @@ impl SemanticSearch {
         )
         .await
         {
-            Ok(index) => index,
-            Err(err) => {
-                log::warn!(
-                    "semantic search: embedding index unavailable ({err:#}); using lexical search"
-                );
-                return self.lexical_search(workspace, query, graph, cancel, progress);
-            }
-        };
+            Ok(index) if !index.is_empty() => match client.embed_one(query).await {
+                Ok(vector) => semantic = Some((index, vector)),
+                Err(err) => embedding_error = Some(err),
+            },
+            Ok(_) => {}
+            Err(err) => embedding_error = Some(err),
+        }
+
         let mut result = SemanticSearchResult {
-            indexed_symbols: index.len(),
+            indexed_symbols: lexical.as_ref().map_or(0, |index| index.len()),
             hits: Vec::new(),
             cancelled: cancel.load(Ordering::Relaxed),
-            used_embeddings: true,
+            used_embeddings: false,
         };
-        if result.cancelled || index.is_empty() {
+        if result.cancelled {
             return Ok(result);
         }
-        let query_vector = match client.embed_one(query).await {
-            Ok(vector) => vector,
-            Err(err) => {
-                log::warn!(
-                    "semantic search: query embedding failed ({err:#}); using lexical search"
-                );
-                return self.lexical_search(workspace, query, graph, cancel, progress);
+
+        let guard = graph
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph_store mutex poisoned"))?;
+
+        match semantic {
+            Some((index, query_vector)) => {
+                result.indexed_symbols = index.len();
+                result.used_embeddings = true;
+                result.hits = match &lexical {
+                    Some(lexical) => index.hybrid_search(
+                        workspace,
+                        query,
+                        &query_vector,
+                        lexical,
+                        guard.as_ref(),
+                        10,
+                        self.budget_tokens,
+                    ),
+                    None => index.search(&query_vector, guard.as_ref(), 10, self.budget_tokens),
+                };
             }
-        };
-        result.cancelled = cancel.load(Ordering::Relaxed);
-        if !result.cancelled {
-            let guard = graph
-                .lock()
-                .map_err(|_| anyhow::anyhow!("graph_store mutex poisoned"))?;
-            result.hits = index.search(&query_vector, guard.as_ref(), 10, self.budget_tokens);
+            None => {
+                if let Some(err) = &embedding_error {
+                    log::warn!(
+                        "semantic search: embeddings unavailable ({err:#}); using lexical search"
+                    );
+                }
+                if let Some(lexical) = &lexical {
+                    result.hits =
+                        lexical.search(workspace, query, guard.as_ref(), 10, self.budget_tokens);
+                } else if let Some(err) = embedding_error {
+                    return Err(err);
+                } else {
+                    anyhow::bail!("lexical search index could not be built for this workspace");
+                }
+            }
         }
         Ok(result)
     }
