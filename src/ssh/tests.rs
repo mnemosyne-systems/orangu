@@ -648,6 +648,54 @@ async fn hashed_known_hosts_entries_are_recognised() {
     server.unattended().login(&server.spec()).await.unwrap();
 }
 
+/// `known_hosts` naming this server by a wildcard, with `public_key_file`'s key.
+fn wildcard_known_hosts_line(server: &Server, public_key_file: &Path) -> String {
+    let exact = format!("[127.0.0.1]:{}", server.port);
+    let pattern = format!("[127.0.0.*]:{},!example.com", server.port);
+    server
+        .known_hosts_line(public_key_file)
+        .replacen(&exact, &pattern, 1)
+}
+
+#[tokio::test]
+async fn wildcard_known_hosts_entries_are_recognised() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    std::fs::write(
+        server.known_hosts(),
+        wildcard_known_hosts_line(&server, &server.root().join("host_key.pub")),
+    )
+    .unwrap();
+    server.unattended().login(&server.spec()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_changed_key_under_a_wildcard_entry_is_refused_without_asking() {
+    let Some(server) = Server::start() else {
+        return;
+    };
+    let other = server.root().join("other");
+    Server::keygen(&other, "ed25519", "");
+    std::fs::write(
+        server.known_hosts(),
+        format!(
+            "# trusted by pattern\n{}",
+            wildcard_known_hosts_line(&server, &other.with_extension("pub"))
+        ),
+    )
+    .unwrap();
+    let script = Script::with(&["yes", "yes", "yes"]);
+    let error = server
+        .attended(SshMode::Auto, &script)
+        .login(&server.spec())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("CHANGED"), "{error}");
+    assert!(error.to_string().contains("known_hosts:2"), "{error}");
+    assert!(script.asked().is_empty(), "{:?}", script.asked());
+}
+
 #[tokio::test]
 async fn approval_is_asked_once_and_before_connecting() {
     let Some(server) = Server::start() else {
