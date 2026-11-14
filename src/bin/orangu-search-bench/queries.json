@@ -1,0 +1,154 @@
+{
+  "queries": [
+    {
+      "query": "where is the embedding batch size capped",
+      "kind": "conceptual",
+      "expected": [
+        "batches_within_budget"
+      ]
+    },
+    {
+      "query": "how are near-duplicate search results penalised",
+      "kind": "conceptual",
+      "expected": [
+        "semantic_ranked"
+      ]
+    },
+    {
+      "query": "grep that respects gitignore",
+      "kind": "conceptual",
+      "expected": [
+        "search_text"
+      ]
+    },
+    {
+      "query": "how does the knowledge graph find callers",
+      "kind": "conceptual",
+      "expected": [
+        "src_graph_store::lookup"
+      ]
+    },
+    {
+      "query": "walk the workspace source files",
+      "kind": "conceptual",
+      "expected": [
+        "src_embeddings_source::collect_source_files"
+      ]
+    },
+    {
+      "query": "probe the embeddings endpoint with a timeout",
+      "kind": "conceptual",
+      "expected": [
+        "probe_endpoint"
+      ]
+    },
+    {
+      "query": "split camel case identifiers",
+      "kind": "conceptual",
+      "expected": [
+        "camel_parts"
+      ]
+    },
+    {
+      "query": "apply the semantic token budget",
+      "kind": "conceptual",
+      "expected": [
+        "budget_cut"
+      ]
+    },
+    {
+      "query": "fuse lexical and semantic rankings",
+      "kind": "conceptual",
+      "expected": [
+        "hybrid_search"
+      ]
+    },
+    {
+      "query": "incrementally update the lexical sidecar",
+      "kind": "conceptual",
+      "expected": [
+        "src_embeddings_lexical::build_or_update"
+      ]
+    },
+    {
+      "query": "batches_within_budget",
+      "kind": "exact",
+      "expected": [
+        "batches_within_budget"
+      ]
+    },
+    {
+      "query": "probe_endpoint",
+      "kind": "exact",
+      "expected": [
+        "probe_endpoint"
+      ]
+    },
+    {
+      "query": "collect_source_files",
+      "kind": "exact",
+      "expected": [
+        "collect_source_files"
+      ]
+    },
+    {
+      "query": "camel_parts",
+      "kind": "exact",
+      "expected": [
+        "camel_parts"
+      ]
+    },
+    {
+      "query": "budget_cut",
+      "kind": "exact",
+      "expected": [
+        "budget_cut"
+      ]
+    },
+    {
+      "query": "hybrid_search",
+      "kind": "exact",
+      "expected": [
+        "hybrid_search"
+      ]
+    },
+    {
+      "query": "lexical_chunks",
+      "kind": "exact",
+      "expected": [
+        "lexical_chunks"
+      ]
+    },
+    {
+      "query": "\"lexical search index could not be built\"",
+      "kind": "phrase",
+      "expected": [
+        "src_embeddings_mod::search"
+      ]
+    },
+    {
+      "query": "MAX_CHUNK_CHARS",
+      "kind": "exact",
+      "expected": [
+        "MAX_CHUNK_CHARS"
+      ],
+      "coverage_gap": true
+    },
+    {
+      "query": "EMBED_BATCH_TOKEN_BUDGET",
+      "kind": "exact",
+      "expected": [
+        "EMBED_BATCH_TOKEN_BUDGET"
+      ],
+      "coverage_gap": true
+    },
+    {
+      "query": "RRF_K",
+      "kind": "exact",
+      "expected": [
+        "RRF_K"
+      ],
+      "coverage_gap": true
+    }
+  ]
+}

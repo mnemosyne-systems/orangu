@@ -28,6 +28,12 @@ path = "src/bin/orangu-server/main.rs"
 name = "orangu-bench"
 path = "src/bin/orangu-bench/main.rs"
 
+# Developer retrieval benchmark for the hybrid lexical/semantic search PoC.
+# See src/bin/orangu-search-bench/README.md.
+[[bin]]
+name = "orangu-search-bench"
+path = "src/bin/orangu-search-bench/main.rs"
+
 # Builds a model file: trains one from a manifest of permissively-licensed
 # repositories, or rewrites an existing one at another weight format.
 # Documented in doc/manual/en/77-gguf.md.
