@@ -64,7 +64,7 @@ _orangu_bench() {
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
             "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-depth --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --chat-fixed --chat-record --chat-workspace --kl --kl-rows --kl-top --kl-max --kl-min-top1 --ppl-baseline --ppl-max-increase --kl-tokens --kl-text --perplexity --ppl-ctx --ppl-chunks --hellaswag --winogrande --score-tasks --score-rows --shared-prefix --shared-prefix-tokens \
-             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --sweep-as-given --write-profile --tune --per-rep \
+             --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --sweep-as-given --streamed --write-profile --tune --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels --chart-grid --chart-overlay \
              --flamegraph --flamegraph-pid --flamegraph-freq --flamegraph-call-graph --flamegraph-png --flamegraph-keep-data \
@@ -142,6 +142,7 @@ _orangu_bench() {
         '--no-warmup[Skip the initial warmup run]' \
         '--fail-on-regression[After a two-value --sweep, exit 2 if the second value is worse beyond the noise]' \
         '--sweep-as-given[Run a two-value --sweep in the order written instead of as a,b,b,a]' \
+        '--streamed[Decode mode for a model streamed from disk]' \
         '--write-profile[After a two-value --sweep, keep the winning value in the server tuning profile]' \
         '*--tune[Tune the device profile knob by knob: VAR=control;a;b, default or prefill]:knob:' \
         '--per-rep[Also print every repetition'"'"'s rate, in order, after each row]' \
@@ -264,6 +265,7 @@ complete -c orangu-bench -l drop-model-cache          -d 'Evict the model from t
 complete -c orangu-bench -l no-warmup                 -d 'Skip the initial warmup run'
 complete -c orangu-bench -l fail-on-regression        -d 'After a two-value --sweep, exit 2 if the second value is worse beyond the noise'
 complete -c orangu-bench -l sweep-as-given            -d 'Run a two-value --sweep in the order written instead of as a,b,b,a'
+complete -c orangu-bench -l streamed                  -d 'Decode mode for a model streamed from disk'
 complete -c orangu-bench -l write-profile             -d 'After a two-value --sweep, keep the winning value in the server tuning profile'
 complete -c orangu-bench -l tune                    -r -d 'Tune the device profile knob by knob: VAR=control;a;b, default or prefill'
 complete -c orangu-bench -l per-rep                   -d 'Also print every repetition\'s rate, in order, after each row'
@@ -395,6 +397,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--no-warmup', 'Skip the initial warmup run'),
         @('--fail-on-regression', 'After a two-value --sweep, exit 2 if the second value is worse beyond the noise'),
         @('--sweep-as-given', 'Run a two-value --sweep in the order written instead of as a,b,b,a'),
+        @('--streamed', 'Decode mode for a model streamed from disk'),
         @('--write-profile', 'After a two-value --sweep, keep the winning value in the server tuning profile'),
         @('--tune', 'Tune the device profile knob by knob: VAR=control;a;b, default or prefill'),
         @('--per-rep', 'Also print every repetition''s rate, in order, after each row'),

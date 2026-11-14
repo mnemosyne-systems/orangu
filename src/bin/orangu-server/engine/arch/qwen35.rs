@@ -201,6 +201,66 @@ impl ModelForward for Qwen35Model {
         self.trunk.verifies_on_device()
     }
 
+    /// A verify on a split model is the per-layer loop a prompt chunk runs:
+    /// each layer's attention on the device its weights are on, over the
+    /// rows that device keeps.
+    fn verifies_rows_on_split_devices(&self) -> bool {
+        true
+    }
+
+    /// A paired draft head reads the residual stream after the final norm,
+    /// one `n_embd` row a position — exported where every pass already runs
+    /// the host layer loop (a model split across devices, or the CPU).
+    /// Elsewhere the device's whole-model passes return logits alone, and a
+    /// head would move every step onto the host loop; `ORANGU_QWEN35_MTP`
+    /// forces the choice either way.
+    fn mtp_state_width(&self) -> Option<usize> {
+        crate::engine::env::flag_setting("ORANGU_QWEN35_MTP")
+            .unwrap_or_else(|| self.trunk.runs_host_loop())
+            .then_some(self.trunk.dims().n_embd)
+    }
+
+    fn forward_with_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let (mut logits, states) = self
+            .trunk
+            .forward_states(cache, tokens, start_pos, slot_id, false)?;
+        Ok((logits.swap_remove(0), states))
+    }
+
+    fn forward_all_logits_with_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot_id: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+        self.trunk
+            .forward_states(cache, tokens, start_pos, slot_id, true)
+    }
+
+    fn load_mtp_head(
+        &self,
+        loaded: &LoadedModel,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<Arc<dyn super::MtpHead>> {
+        anyhow::ensure!(
+            self.mtp_state_width().is_some(),
+            "this model's passes run on its device, which exports no draft-head state \
+             (ORANGU_QWEN35_MTP=1 runs them on the host loop instead)"
+        );
+        Ok(Arc::new(super::qwen35_mtp::Qwen35MtpHead::load(
+            loaded,
+            backend.clone(),
+            &self.trunk,
+        )?))
+    }
+
     /// The trunk's prompt loop with the head over every row; a recurrent
     /// layer's state takes in every token, and speculation returns it to a
     /// copy saved before the verify (`KvCache::rollback`).
@@ -351,7 +411,7 @@ mod real_model_tests {
             .forward_all_logits(&mut verified, &[40, 41, 42, 43], pos, 0)
             .expect("verify");
         assert!(
-            verified.keep_verified(&point, 2),
+            verified.keep_verified(&point, &[40, 41]),
             "the device kept the rows"
         );
         step(&mut stepped, &[40, 41], pos);

@@ -980,6 +980,10 @@ impl Qwen4ExpModel {
             ) {
                 *o += g + tensor::silu(*c);
             }
+            // The last row's history is the pass's own result.
+            if t + 1 < n_tokens {
+                state.keep_row();
+            }
         }
     }
 }

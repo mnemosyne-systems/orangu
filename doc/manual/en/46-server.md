@@ -2339,9 +2339,14 @@ is rejected it goes back to that copy and the accepted tokens run again.
 `ORANGU_SPEC_RECURRENT=0` turns it off everywhere. Either way the output is
 what plain decoding emits, up to the same rounding. A draft
 model that is itself hybrid is not used — its state cannot be cut back to an
-accepted prefix — and prompt lookup drafts in its place; an MTP head on a
-hybrid model is not built either, nor any drafter for a model split across
-nodes of a tree.
+accepted prefix — and prompt lookup drafts in its place. A hybrid model's own
+multi-token-prediction head is used (`qwen4exp`, and a dense `qwen35` that is
+split across devices or on the CPU, see `ORANGU_QWEN35_MTP`), and such a model
+speculates by default: the head's own cache is attention rows alone, and while
+a verify runs on the host each recurrent layer keeps its state behind every
+row, so a partly rejected draft returns to the last accepted row instead of
+running the accepted tokens again. No drafter is built for a model split
+across nodes of a tree.
 
 **Whether it pays is a question about your hardware, not about the models.**
 Measured here on a 4 GiB card with a target that does not fit on it

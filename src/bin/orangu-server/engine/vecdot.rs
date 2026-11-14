@@ -38,21 +38,21 @@
 //! kernel against the `quant::dequantize` reference).
 //!
 //! The types with a fused kernel are the ones [`supports`] accepts — the
-//! 32-element legacy formats, the K-quants, `IQ4_NL`/`IQ4_XS`, Prism's
+//! 32-element legacy formats, the K-quants, `IQ3_S`/`IQ4_NL`/`IQ4_XS`, Prism's
 //! `PQ2_0`/`PTQ1_0` and `NVFP4`. Anything else returns `false` from
 //! [`supports`] and the caller keeps the dequantize path.
 
-use super::iq_grids::KVALUES_IQ4NL;
+use super::iq_grids::{IQ3S_GRID, KVALUES_IQ4NL};
 use super::quant;
 #[cfg(target_arch = "aarch64")]
 use super::quant::unpack_block_pq2_0_neon;
 use super::quant::{
-    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS,
-    GGML_TYPE_NVFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0, GGML_TYPE_Q2_K,
-    GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_K,
-    GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, PQ2_0_BLOCK_BYTES, PTQ1_0_BLOCK_BYTES, Q2_0_BLOCK_BYTES,
-    QK_PRISM, QK2_0, get_scale_min_k4, read_f16, unpack_block_pq2_0, unpack_block_ptq1_0,
-    unpack_block_q2_0, unpack_q3_k_scales,
+    GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL,
+    GGML_TYPE_IQ4_XS, GGML_TYPE_NVFP4, GGML_TYPE_PQ2_0, GGML_TYPE_PTQ1_0, GGML_TYPE_Q2_0,
+    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+    GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, PQ2_0_BLOCK_BYTES, PTQ1_0_BLOCK_BYTES,
+    Q2_0_BLOCK_BYTES, QK_PRISM, QK2_0, get_scale_min_k4, read_f16, unpack_block_pq2_0,
+    unpack_block_ptq1_0, unpack_block_q2_0, unpack_q3_k_scales,
 };
 use rayon::prelude::*;
 
@@ -274,7 +274,10 @@ fn quantize_block<const SUMS: bool>(chunk: &[f32], out: &mut [i8], sums: &mut Ve
 ///    super-block type that should take the K-quant GEMM.
 /// 5. [`supports_flat`] — only if it is symmetric with per-32 scales.
 ///
-/// 4 and 5 are mutually exclusive, and a type may need neither. Adding
+/// 4 and 5 are mutually exclusive, and a type may need neither. A
+/// 256-element super-block type also takes decode through [`supports_k_row`]
+/// and `dot_k_row_impl`, which `supports_k_row_is_a_superset_of_supports_k`
+/// pins against step 4. Adding
 /// `Q5_K` needed 1-4; step 2 was missed on the first attempt and the
 /// `q5_k_matches_dequantize_reference` test is what caught it.
 pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
@@ -283,7 +286,7 @@ pub fn supports(ggml_type: u32, in_dim: usize) -> bool {
             in_dim.is_multiple_of(32)
         }
         GGML_TYPE_Q2_K | GGML_TYPE_Q3_K | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K
-        | GGML_TYPE_IQ4_XS => in_dim.is_multiple_of(256),
+        | GGML_TYPE_IQ3_S | GGML_TYPE_IQ4_XS => in_dim.is_multiple_of(256),
         GGML_TYPE_Q2_0 => in_dim.is_multiple_of(QK2_0),
         GGML_TYPE_PQ2_0 | GGML_TYPE_PTQ1_0 => in_dim.is_multiple_of(QK_PRISM),
         GGML_TYPE_NVFP4 => in_dim.is_multiple_of(NVFP4_BLOCK),
@@ -383,6 +386,7 @@ pub fn unpack_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut UnpackedR
         GGML_TYPE_Q5_1 => unpack_q5_1(row, out),
         GGML_TYPE_IQ4_NL => unpack_iq4_nl(row, out),
         GGML_TYPE_IQ4_XS => unpack_iq4_xs(row, out),
+        GGML_TYPE_IQ3_S => unpack_iq3_s(row, out),
         GGML_TYPE_NVFP4 => unpack_nvfp4(row, out),
         GGML_TYPE_Q2_K => unpack_q2_k(row, out),
         GGML_TYPE_Q3_K => unpack_q3_k(row, out),
@@ -1521,12 +1525,10 @@ fn unpack_q5_1(row: &[u8], out: &mut UnpackedRow) {
 /// `IQ4_XS` into the generic [`UnpackedRow`] form — per-32 `f32` scales,
 /// no min.
 ///
-/// Not reachable through [`supports`] today: `IQ4_XS` requires `256 | in_dim`
-/// there, which is exactly [`supports_k`]'s condition, so prefill always
-/// routes to [`dot_k_pair`] instead. It exists because `unpack_row`'s
-/// fallthrough is a `panic!`, and a gating change that silently turned a
-/// missing arm into a crash would be a poor trade for the dozen lines this
-/// costs.
+/// The dense prefill never takes it: `IQ4_XS` requires `256 | in_dim` in
+/// [`supports`], which is exactly [`supports_k`]'s condition, so it routes
+/// to [`dot_k_pair`] instead. A routed expert's multi-token GEMM unpacks
+/// through [`unpack_row`] whatever the type, and that is where this runs.
 fn unpack_iq4_xs(row: &[u8], out: &mut UnpackedRow) {
     const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
     out.has_min = false;
@@ -1557,6 +1559,73 @@ fn unpack_iq4_nl(row: &[u8], out: &mut UnpackedRow) {
         unpack_block_iq4_nl(&block[2..], w);
         out.scale[b] = dw;
         out.min[b] = 0.0;
+    }
+}
+
+// ---------------------------------------------------------------- IQ3_S
+
+/// `block_iq3_s`: `{ d: f16, qs: [u8; 64], qh: [u8; 8], signs: [u8; 32],
+/// scales: [u8; 4] }`, 256 elements as eight sub-blocks of 32.
+const IQ3S_BLOCK_BYTES: usize = 2 + SUPER_BLOCK / 4 + SUPER_BLOCK / 32 + SUPER_BLOCK / 8 + 4;
+/// Offsets of the `qh`, `signs` and `scales` planes inside a block.
+const IQ3S_QH: usize = 2 + SUPER_BLOCK / 4;
+const IQ3S_SIGNS: usize = IQ3S_QH + SUPER_BLOCK / 32;
+const IQ3S_SCALES: usize = IQ3S_SIGNS + SUPER_BLOCK / 8;
+
+/// The integer scale of `IQ3_S` sub-block `ib`: `1 + 2·s` for its 4-bit
+/// `s`, so `1..=31` — the whole per-32 multiplier apart from the block's
+/// `f16` `d`.
+#[inline(always)]
+fn iq3_s_scale(block: &[u8; IQ3S_BLOCK_BYTES], ib: usize) -> i32 {
+    1 + 2 * ((block[IQ3S_SCALES + ib / 2] >> (4 * (ib % 2))) & 0x0F) as i32
+}
+
+/// The 32-bit sign word of `IQ3_S` sub-block `ib`: bit `e` negates element
+/// `e` of the sub-block.
+#[inline(always)]
+fn iq3_s_signs(block: &[u8; IQ3S_BLOCK_BYTES], ib: usize) -> u32 {
+    let at = IQ3S_SIGNS + 4 * ib;
+    u32::from_le_bytes([block[at], block[at + 1], block[at + 2], block[at + 3]])
+}
+
+/// Index of `IQ3_S` lattice point `k` (of eight) in sub-block `ib`: eight
+/// bits from `qs`, the ninth bit `k` of the sub-block's `qh` byte.
+#[inline(always)]
+fn iq3_s_grid_index(block: &[u8; IQ3S_BLOCK_BYTES], ib: usize, k: usize) -> usize {
+    let hb = block[IQ3S_QH + ib] as usize;
+    block[2 + 8 * ib + k] as usize | ((hb << (8 - k)) & 256)
+}
+
+/// Unpacks `IQ3_S` sub-block `ib` into `w` as signed integers: each
+/// lattice point's four magnitudes (`1..=15`), negated where the sign word
+/// has the element's bit set. The sub-block scale and `d` stay outside.
+#[inline(always)]
+fn unpack_block_iq3_s(block: &[u8; IQ3S_BLOCK_BYTES], ib: usize, w: &mut [i8; 32]) {
+    let signs = iq3_s_signs(block, ib);
+    for k in 0..8 {
+        let grid = IQ3S_GRID[iq3_s_grid_index(block, ib, k)].to_le_bytes();
+        for (j, &g) in grid.iter().enumerate() {
+            let e = 4 * k + j;
+            let v = g as i8;
+            w[e] = if (signs >> e) & 1 != 0 { -v } else { v };
+        }
+    }
+}
+
+/// `IQ3_S` into the generic [`UnpackedRow`] form: per-32 `f32` scale
+/// `d · (1 + 2·s)`, no min. Taken by the callers that unpack through
+/// [`unpack_row`] whatever the type — a routed expert's multi-token GEMM.
+fn unpack_iq3_s(row: &[u8], out: &mut UnpackedRow) {
+    out.has_min = false;
+    for (s, block) in row.as_chunks::<IQ3S_BLOCK_BYTES>().0.iter().enumerate() {
+        let d = read_f16(block, 0);
+        for ib in 0..SUBS {
+            let b = s * SUBS + ib;
+            let w: &mut [i8; 32] = (&mut out.q[b * 32..b * 32 + 32]).try_into().unwrap();
+            unpack_block_iq3_s(block, ib, w);
+            out.scale[b] = d * iq3_s_scale(block, ib) as f32;
+            out.min[b] = 0.0;
+        }
     }
 }
 
@@ -2243,6 +2312,7 @@ pub fn supports_k(ggml_type: u32, in_dim: usize) -> bool {
             | GGML_TYPE_Q4_K
             | GGML_TYPE_Q5_K
             | GGML_TYPE_Q6_K
+            | GGML_TYPE_IQ3_S
             | GGML_TYPE_IQ4_XS
             | GGML_TYPE_PQ2_0
             | GGML_TYPE_PTQ1_0
@@ -2450,6 +2520,12 @@ pub fn unpack_k_row(ggml_type: u32, row: &[u8], in_dim: usize, out: &mut KRow) {
         GGML_TYPE_IQ4_XS => {
             out.resize_for(in_dim, KKind::Iq4Xs);
             unpack_k_iq4_xs(row, out);
+        }
+        // `IQ4_XS`'s shape: a positive integer scale per 32 and no min; the
+        // quants are the signed lattice magnitudes, `-15..=15`.
+        GGML_TYPE_IQ3_S => {
+            out.resize_for(in_dim, KKind::Iq4Xs);
+            unpack_k_iq3_s(row, out);
         }
         GGML_TYPE_PQ2_0 => {
             out.resize_for(in_dim, KKind::Iq4Xs);
@@ -5567,6 +5643,22 @@ fn unpack_k_iq4_xs(row: &[u8], out: &mut KRow) {
     }
 }
 
+/// Unpacks an `IQ3_S` row into [`KKind::Iq4Xs`] form: the `f16` `d` per
+/// super-block, the integer `1 + 2·s` per 32, and the signed lattice
+/// magnitudes as `int8`.
+fn unpack_k_iq3_s(row: &[u8], out: &mut KRow) {
+    for (s, block) in row.as_chunks::<IQ3S_BLOCK_BYTES>().0.iter().enumerate() {
+        out.d[s] = read_f16(block, 0);
+        for ib in 0..SUBS {
+            out.sc[s * SUBS + ib] = iq3_s_scale(block, ib) as i16;
+            let w: &mut [i8; 32] = (&mut out.q[(s * SUBS + ib) * 32..][..32])
+                .try_into()
+                .unwrap();
+            unpack_block_iq3_s(block, ib, w);
+        }
+    }
+}
+
 fn gemm_k_q6_k<const ISA: u8>(
     w0: &KRow,
     w1: &KRow,
@@ -6309,6 +6401,7 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
             GGML_TYPE_Q2_0 => return unsafe { dot_q2_0_avx2(row, act) },
             GGML_TYPE_Q5_0 => return unsafe { dot_q5_x_avx2::<false>(row, act) },
             GGML_TYPE_Q5_1 => return unsafe { dot_q5_x_avx2::<true>(row, act) },
+            GGML_TYPE_IQ4_NL => return unsafe { dot_iq4_nl_avx2(row, act) },
             _ => {}
         }
     }
@@ -6324,6 +6417,7 @@ fn dot_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8) -> f32 {
         GGML_TYPE_Q5_K => dot_q5_k::<ISA>(row, act),
         GGML_TYPE_Q6_K => dot_q6_k::<ISA>(row, act),
         GGML_TYPE_IQ4_XS => dot_iq4_xs::<ISA>(row, act),
+        GGML_TYPE_IQ3_S => dot_iq3_s::<ISA>(row, act),
         GGML_TYPE_Q2_0 => dot_q2_0::<ISA>(row, act),
         GGML_TYPE_PQ2_0 => dot_pq2_0::<ISA>(row, act),
         GGML_TYPE_PTQ1_0 => dot_ptq1_0::<ISA>(row, act),
@@ -6988,6 +7082,40 @@ unsafe fn dot_q4_0_avx2(row: &[u8], act: &ActQ8) -> f32 {
     }
 }
 
+/// `IQ4_NL`: [`dot_q4_0_avx2`] with the `- 8` replaced by a `vpshufb`
+/// lookup of each nibble in [`KVALUES_IQ4NL`], and the blocks split over
+/// two float accumulators so consecutive blocks' FMAs do not wait on each
+/// other.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_iq4_nl_avx2(row: &[u8], act: &ActQ8) -> f32 {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 2 + 16;
+    unsafe {
+        let table =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+        let ones = _mm256_set1_epi16(1);
+        let m4 = _mm256_set1_epi8(0x0F);
+        let mut acc = [_mm256_setzero_ps(); 2];
+        for (b, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let dw = read_f16(block, 0);
+            let q = _mm_loadu_si128(block.as_ptr().add(2) as *const __m128i);
+            // Low nibbles in the low lane, high nibbles in the high lane.
+            let both = _mm256_set_m128i(_mm_srli_epi16(q, 4), q);
+            let w = _mm256_shuffle_epi8(table, _mm256_and_si256(both, m4));
+            let x = _mm256_loadu_si256(act.q.as_ptr().add(b * 32) as *const __m256i);
+            let p = _mm256_maddubs_epi16(_mm256_abs_epi8(x), _mm256_sign_epi8(w, x));
+            let sum = _mm256_madd_epi16(p, ones);
+            acc[b & 1] = _mm256_fmadd_ps(
+                _mm256_set1_ps(dw * act.d[b]),
+                _mm256_cvtepi32_ps(sum),
+                acc[b & 1],
+            );
+        }
+        hsum_ps_avx2(_mm256_add_ps(acc[0], acc[1]))
+    }
+}
+
 /// `Q2_0`: [`dot_q4_0_avx2`]'s dot over the two 32-element activation
 /// blocks one weight block spans, under the one weight scale.
 #[cfg(target_arch = "x86_64")]
@@ -7299,6 +7427,23 @@ fn dot_iq4_xs<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
     total
 }
 
+/// `IQ3_S` against a per-32 activation scale: one `dot32` per sub-block,
+/// as [`dot_iq4_xs`]. Reached only where [`supports_k_row`] is not.
+fn dot_iq3_s<const ISA: u8>(row: &[u8], act: &ActQ8) -> f32 {
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (s, block) in row.as_chunks::<IQ3S_BLOCK_BYTES>().0.iter().enumerate() {
+        let d = read_f16(block, 0);
+        for ib in 0..SUBS {
+            let b = s * SUBS + ib;
+            unpack_block_iq3_s(block, ib, &mut w);
+            let ls = iq3_s_scale(block, ib) as f32;
+            total += act.d[b] * d * ls * dot32::<ISA>(&w, &act.q[b * 32..]) as f32;
+        }
+    }
+    total
+}
+
 // =====================================================================
 // K-quant decode with a per-super-block activation scale.
 //
@@ -7427,6 +7572,7 @@ pub fn quantize_act_k_row(x: &[f32]) -> ActQ8KRow {
 /// | `Q5_K` | 63 | 31 | 6.3e7 |
 /// | `Q6_K` | 127 | 32 | 1.4e8 |
 /// | `IQ4_XS` | 32 | 127 | 1.4e8 |
+/// | `IQ3_S` | 31 | 15 | 1.5e7 |
 ///
 /// All are at least an order of magnitude inside `i32::MAX` (2.1e9), the
 /// tightest being `Q6_K` and `IQ4_XS` at ~15x margin.
@@ -7444,6 +7590,7 @@ pub fn supports_k_row(ggml_type: u32, in_dim: usize) -> bool {
             | GGML_TYPE_Q4_K
             | GGML_TYPE_Q5_K
             | GGML_TYPE_Q6_K
+            | GGML_TYPE_IQ3_S
             | GGML_TYPE_IQ4_XS
             | GGML_TYPE_PQ2_0
             | GGML_TYPE_PTQ1_0
@@ -7499,8 +7646,8 @@ unsafe fn dot_k_row_avx2(ggml_type: u32, row: &[u8], act: &ActQ8KRow) -> f32 {
 }
 
 fn dot_k_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8KRow) -> f32 {
-    // The three types a `Q4_K_M` file is made of take the super-block-wide
-    // AVX2 kernels: the per-32 unpack-then-dot form below costs a horizontal
+    // The types a `Q4_K_M` file is made of, and the `IQ` types of the
+    // dynamic quants, take the super-block-wide AVX2 kernels: the per-32 unpack-then-dot form below costs a horizontal
     // sum and a scalar nibble loop per 32 elements, and measured on a 12B
     // model's host layers it read weights at 24 GB/s where the block-wide
     // form reads at the memory's own rate.
@@ -7512,6 +7659,8 @@ fn dot_k_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8KRow) ->
             GGML_TYPE_Q4_K => return unsafe { dot_k_row_q4_k_avx2(row, act) },
             GGML_TYPE_Q5_K => return unsafe { dot_k_row_q5_k_avx2(row, act) },
             GGML_TYPE_Q6_K => return unsafe { dot_k_row_q6_k_avx2(row, act) },
+            GGML_TYPE_IQ4_XS => return unsafe { dot_k_row_iq4_xs_avx2(row, act) },
+            GGML_TYPE_IQ3_S => return unsafe { dot_k_row_iq3_s_avx2(row, act) },
             _ => {}
         }
     }
@@ -7534,6 +7683,7 @@ fn dot_k_row_impl<const ISA: u8>(ggml_type: u32, row: &[u8], act: &ActQ8KRow) ->
         GGML_TYPE_Q5_K => dot_k_row_q5_k::<ISA>(row, act),
         GGML_TYPE_Q6_K => dot_k_row_q6_k::<ISA>(row, act),
         GGML_TYPE_IQ4_XS => dot_k_row_iq4_xs::<ISA>(row, act),
+        GGML_TYPE_IQ3_S => dot_k_row_iq3_s::<ISA>(row, act),
         GGML_TYPE_PQ2_0 => dot_k_row_prism::<ISA, false>(row, act),
         GGML_TYPE_PTQ1_0 => dot_k_row_prism::<ISA, true>(row, act),
         other => panic!("vecdot::dot_k_row called for unsupported ggml_type {other}"),
@@ -7714,6 +7864,108 @@ unsafe fn dot_k_row_q6_k_avx2(row: &[u8], act: &ActQ8KRow) -> f32 {
     }
 }
 
+/// `IQ4_XS` one super-block per pass in AVX2. Each sub-block's sixteen
+/// bytes become its 32 weights in one register — low nibbles in the low
+/// lane, high nibbles in the high lane, as the format orders them — looked
+/// up in [`KVALUES_IQ4NL`] with one `vpshufb`. The levels are signed, so the
+/// multiply is [`dot_k_row_q6_k_avx2`]'s: the activation's magnitude against
+/// the weight carrying the activation's sign (`|x| · sign(x)·w == x·w`, at
+/// most `2 · 127 · 127` per pair, inside `i16`). The 6-bit scale, less 32,
+/// widens the sub-block's pair sums in one `vpmaddwd`; one float conversion
+/// per super-block and one horizontal sum per row.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_iq4_xs_avx2(row: &[u8], act: &ActQ8KRow) -> f32 {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
+    unsafe {
+        let table =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+        let m4 = _mm256_set1_epi8(0x0F);
+        let mut accf = _mm256_setzero_ps();
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let d = read_f16(block, 0);
+            let mut sh = u16::from_le_bytes([block[2], block[3]]) as i32;
+            let qs = block.as_ptr().add(8);
+            let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+            // One accumulator per sub-block of a pair, so the adds of
+            // neighbouring sub-blocks do not chain.
+            let mut acc0 = _mm256_setzero_si256();
+            let mut acc1 = _mm256_setzero_si256();
+            for p in 0..SUBS / 2 {
+                let sl = block[4 + p] as i32;
+                let ls0 = ((sl & 0x0F) | ((sh << 4) & 0x30)) - 32;
+                let ls1 = ((sl >> 4) | ((sh << 2) & 0x30)) - 32;
+                sh >>= 4;
+                let sub = |ib: usize, ls: i32, acc: __m256i| {
+                    let q = _mm_loadu_si128(qs.add(ib * 16) as *const __m128i);
+                    let both = _mm256_set_m128i(_mm_srli_epi16(q, 4), q);
+                    let w = _mm256_shuffle_epi8(table, _mm256_and_si256(both, m4));
+                    let xv = _mm256_loadu_si256(x.add(ib * 32) as *const __m256i);
+                    let pr = _mm256_maddubs_epi16(_mm256_abs_epi8(xv), _mm256_sign_epi8(w, xv));
+                    _mm256_add_epi32(acc, _mm256_madd_epi16(pr, _mm256_set1_epi16(ls as i16)))
+                };
+                acc0 = sub(2 * p, ls0, acc0);
+                acc1 = sub(2 * p + 1, ls1, acc1);
+            }
+            let acc = _mm256_add_epi32(acc0, acc1);
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(act.d[s] * d), _mm256_cvtepi32_ps(acc), accf);
+        }
+        hsum_ps_avx2(accf)
+    }
+}
+
+/// `IQ3_S` one super-block per pass in AVX2, the arrangement ggml uses.
+/// Each sub-block's eight lattice points are looked up as `u32`s — four
+/// unsigned magnitudes each — by scalar loads (a `vpgatherdd` of the same
+/// eight is slower) and assembled into one register; its 32 sign
+/// bits are spread to byte masks (each byte selects its sign byte with
+/// `vpshufb`, tests its own bit, and compares) and applied to the
+/// *activations*, which keeps the weights unsigned for `vpmaddubsw`. At most
+/// `2 · 15 · 127` per pair; the `1 + 2·s` scale widens the pair sums in one
+/// `vpmaddwd`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_iq3_s_avx2(row: &[u8], act: &ActQ8KRow) -> f32 {
+    use std::arch::x86_64::*;
+    unsafe {
+        // Byte `e` of a sub-block reads sign byte `e / 8` and tests bit `e % 8`.
+        let sign_byte = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let sign_bit = _mm256_set1_epi64x(i64::from_le_bytes([1, 2, 4, 8, 16, 32, 64, 128]));
+        let mut accf = _mm256_setzero_ps();
+        for (s, block) in row.as_chunks::<IQ3S_BLOCK_BYTES>().0.iter().enumerate() {
+            let d = read_f16(block, 0);
+            let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+            let mut acc0 = _mm256_setzero_si256();
+            let mut acc1 = _mm256_setzero_si256();
+            for ib in 0..SUBS {
+                let g = |k: usize| IQ3S_GRID[iq3_s_grid_index(block, ib, k)] as i32;
+                let w = _mm256_setr_epi32(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7));
+                let signs = _mm256_set1_epi32(iq3_s_signs(block, ib) as i32);
+                let bits = _mm256_and_si256(_mm256_shuffle_epi8(signs, sign_byte), sign_bit);
+                let neg = _mm256_cmpeq_epi8(bits, sign_bit);
+                let xv = _mm256_loadu_si256(x.add(ib * 32) as *const __m256i);
+                // `(x ^ m) - m` is `-x` where the mask is all ones, `x` where
+                // it is zero.
+                let xs = _mm256_sub_epi8(_mm256_xor_si256(xv, neg), neg);
+                let pr = _mm256_maddubs_epi16(w, xs);
+                let p = _mm256_madd_epi16(pr, _mm256_set1_epi16(iq3_s_scale(block, ib) as i16));
+                if ib % 2 == 0 {
+                    acc0 = _mm256_add_epi32(acc0, p);
+                } else {
+                    acc1 = _mm256_add_epi32(acc1, p);
+                }
+            }
+            let acc = _mm256_add_epi32(acc0, acc1);
+            accf = _mm256_fmadd_ps(_mm256_set1_ps(act.d[s] * d), _mm256_cvtepi32_ps(acc), accf);
+        }
+        hsum_ps_avx2(accf)
+    }
+}
+
 /// The most tokens [`dot_k_row_tokens`] takes in one pass over a row.
 pub const K_ROW_TOKENS_MAX: usize = 8;
 
@@ -7742,7 +7994,10 @@ pub fn dot_k_row_tokens(ggml_type: u32, row: &[u8], acts: &[ActQ8KRow], out: &mu
         }
         match ggml_type {
             GGML_TYPE_Q4_K => by_count!(dot_k_row_tokens_q4_k_avx2),
+            GGML_TYPE_Q5_K => by_count!(dot_k_row_tokens_q5_k_avx2),
             GGML_TYPE_Q6_K => by_count!(dot_k_row_tokens_q6_k_avx2),
+            GGML_TYPE_IQ4_XS => by_count!(dot_k_row_tokens_iq4_xs_avx2),
+            GGML_TYPE_IQ3_S => by_count!(dot_k_row_tokens_iq3_s_avx2),
             _ => {}
         }
     }
@@ -7817,6 +8072,192 @@ unsafe fn dot_k_row_tokens_q4_k_avx2<const N: usize>(
         }
         for t in 0..N {
             out[t] = hsum_ps_avx2(accf[t]) - total_min[t];
+        }
+    }
+}
+
+/// [`dot_k_row_q5_k_avx2`] over `N` tokens: each 32-run's five-bit
+/// weights built once, its min term [`dot_k_row_tokens_q4_k_avx2`]'s.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_tokens_q5_k_avx2<const N: usize>(
+    row: &[u8],
+    acts: &[ActQ8KRow],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
+    let acts: &[ActQ8KRow; N] = acts.try_into().expect("N activations");
+    unsafe {
+        let m4 = _mm256_set1_epi8(0x0F);
+        let one = _mm256_set1_epi8(1);
+        let mut accf = [_mm256_setzero_ps(); N];
+        let mut total_min = [0f32; N];
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let d = read_f16(block, 0);
+            let dmin = read_f16(block, 2);
+            let scales = &block[4..16];
+            let qh = _mm256_loadu_si256(block.as_ptr().add(16) as *const __m256i);
+            let qs = block.as_ptr().add(48);
+            let mut sc = [0i16; 8];
+            let mut mins = [0i16; 8];
+            for (j, (sc_j, m_j)) in sc.iter_mut().zip(&mut mins).enumerate() {
+                let (a, m) = get_scale_min_k4(j, scales);
+                *sc_j = a as i16;
+                *m_j = m as i16;
+            }
+            let minv = _mm_loadu_si128(mins.as_ptr() as *const __m128i);
+            let mut acc = [_mm256_setzero_si256(); N];
+            for g in 0..4 {
+                let q = _mm256_loadu_si256(qs.add(g * 32) as *const __m256i);
+                let h0 = _mm256_slli_epi16(
+                    _mm256_and_si256(_mm256_srl_epi16(qh, _mm_cvtsi32_si128((2 * g) as i32)), one),
+                    4,
+                );
+                let h1 = _mm256_slli_epi16(
+                    _mm256_and_si256(
+                        _mm256_srl_epi16(qh, _mm_cvtsi32_si128((2 * g + 1) as i32)),
+                        one,
+                    ),
+                    4,
+                );
+                let lo = _mm256_or_si256(_mm256_and_si256(q, m4), h0);
+                let hi = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q, 4), m4), h1);
+                let sc0 = _mm256_set1_epi16(sc[2 * g]);
+                let sc1 = _mm256_set1_epi16(sc[2 * g + 1]);
+                for (acc, act) in acc.iter_mut().zip(acts) {
+                    let x = act.q.as_ptr().add(s * SUPER_BLOCK);
+                    let x0 = _mm256_loadu_si256(x.add(g * 64) as *const __m256i);
+                    let x1 = _mm256_loadu_si256(x.add(g * 64 + 32) as *const __m256i);
+                    let p0 = _mm256_maddubs_epi16(lo, x0);
+                    let p1 = _mm256_maddubs_epi16(hi, x1);
+                    *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(p0, sc0));
+                    *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(p1, sc1));
+                }
+            }
+            for t in 0..N {
+                let act = &acts[t];
+                let bs = _mm_loadu_si128(act.block_sums.as_ptr().add(s * SUBS) as *const __m128i);
+                let p = _mm_madd_epi16(minv, bs);
+                let p = _mm_add_epi32(p, _mm_shuffle_epi32(p, 0b01_00_11_10));
+                let p = _mm_add_epi32(p, _mm_shuffle_epi32(p, 0b10_11_00_01));
+                let imin = _mm_cvtsi128_si32(p);
+                accf[t] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(act.d[s] * d),
+                    _mm256_cvtepi32_ps(acc[t]),
+                    accf[t],
+                );
+                total_min[t] += act.d[s] * dmin * imin as f32;
+            }
+        }
+        for t in 0..N {
+            out[t] = hsum_ps_avx2(accf[t]) - total_min[t];
+        }
+    }
+}
+
+/// [`dot_k_row_iq4_xs_avx2`] over `N` tokens: each sub-block's looked-up
+/// weights and scale built once. One integer accumulator per token where
+/// the single-token kernel keeps two; `i32` addition is exact, so the sums
+/// — and the float steps after them — are the same.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_tokens_iq4_xs_avx2<const N: usize>(
+    row: &[u8],
+    acts: &[ActQ8KRow],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    const BLOCK_BYTES: usize = 2 + 2 + SUPER_BLOCK / 64 + SUPER_BLOCK / 2;
+    let acts: &[ActQ8KRow; N] = acts.try_into().expect("N activations");
+    unsafe {
+        let table =
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(KVALUES_IQ4NL.as_ptr() as *const __m128i));
+        let m4 = _mm256_set1_epi8(0x0F);
+        let mut accf = [_mm256_setzero_ps(); N];
+        for (s, block) in row.as_chunks::<BLOCK_BYTES>().0.iter().enumerate() {
+            let d = read_f16(block, 0);
+            let sh = u16::from_le_bytes([block[2], block[3]]) as i32;
+            let qs = block.as_ptr().add(8);
+            let mut acc = [_mm256_setzero_si256(); N];
+            for ib in 0..SUBS {
+                let low = (block[4 + ib / 2] as i32 >> (4 * (ib % 2))) & 0x0F;
+                let ls = (low | (((sh >> (2 * ib)) & 3) << 4)) - 32;
+                let q = _mm_loadu_si128(qs.add(ib * 16) as *const __m128i);
+                let both = _mm256_set_m128i(_mm_srli_epi16(q, 4), q);
+                let w = _mm256_shuffle_epi8(table, _mm256_and_si256(both, m4));
+                let scv = _mm256_set1_epi16(ls as i16);
+                for (acc, act) in acc.iter_mut().zip(acts) {
+                    let xv = _mm256_loadu_si256(
+                        act.q.as_ptr().add(s * SUPER_BLOCK + ib * 32) as *const __m256i
+                    );
+                    let pr = _mm256_maddubs_epi16(_mm256_abs_epi8(xv), _mm256_sign_epi8(w, xv));
+                    *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(pr, scv));
+                }
+            }
+            for t in 0..N {
+                accf[t] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(acts[t].d[s] * d),
+                    _mm256_cvtepi32_ps(acc[t]),
+                    accf[t],
+                );
+            }
+        }
+        for t in 0..N {
+            out[t] = hsum_ps_avx2(accf[t]);
+        }
+    }
+}
+
+/// [`dot_k_row_iq3_s_avx2`] over `N` tokens: each sub-block's lattice
+/// lookups, sign mask and scale built once, the sign applied to every
+/// token's activations. One integer accumulator per token, exact as in
+/// [`dot_k_row_tokens_iq4_xs_avx2`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_k_row_tokens_iq3_s_avx2<const N: usize>(
+    row: &[u8],
+    acts: &[ActQ8KRow],
+    out: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+    let acts: &[ActQ8KRow; N] = acts.try_into().expect("N activations");
+    unsafe {
+        let sign_byte = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3,
+            3, 3, 3,
+        );
+        let sign_bit = _mm256_set1_epi64x(i64::from_le_bytes([1, 2, 4, 8, 16, 32, 64, 128]));
+        let mut accf = [_mm256_setzero_ps(); N];
+        for (s, block) in row.as_chunks::<IQ3S_BLOCK_BYTES>().0.iter().enumerate() {
+            let d = read_f16(block, 0);
+            let mut acc = [_mm256_setzero_si256(); N];
+            for ib in 0..SUBS {
+                let g = |k: usize| IQ3S_GRID[iq3_s_grid_index(block, ib, k)] as i32;
+                let w = _mm256_setr_epi32(g(0), g(1), g(2), g(3), g(4), g(5), g(6), g(7));
+                let signs = _mm256_set1_epi32(iq3_s_signs(block, ib) as i32);
+                let bits = _mm256_and_si256(_mm256_shuffle_epi8(signs, sign_byte), sign_bit);
+                let neg = _mm256_cmpeq_epi8(bits, sign_bit);
+                let scv = _mm256_set1_epi16(iq3_s_scale(block, ib) as i16);
+                for (acc, act) in acc.iter_mut().zip(acts) {
+                    let xv = _mm256_loadu_si256(
+                        act.q.as_ptr().add(s * SUPER_BLOCK + ib * 32) as *const __m256i
+                    );
+                    let xs = _mm256_sub_epi8(_mm256_xor_si256(xv, neg), neg);
+                    let pr = _mm256_maddubs_epi16(w, xs);
+                    *acc = _mm256_add_epi32(*acc, _mm256_madd_epi16(pr, scv));
+                }
+            }
+            for t in 0..N {
+                accf[t] = _mm256_fmadd_ps(
+                    _mm256_set1_ps(acts[t].d[s] * d),
+                    _mm256_cvtepi32_ps(acc[t]),
+                    accf[t],
+                );
+            }
+        }
+        for t in 0..N {
+            out[t] = hsum_ps_avx2(accf[t]);
         }
     }
 }
@@ -8517,6 +8958,26 @@ fn dot_k_row_iq4_xs<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
     total
 }
 
+/// `IQ3_S`: [`dot_k_row_iq4_xs`]'s loop over the unpacked lattice values.
+///
+/// Accumulator bound: `|sc| <= 31`, `|q| <= 15`, `|x| <= 127`, 256 elements
+/// — at most `1.5e7`, two orders inside `i32`.
+fn dot_k_row_iq3_s<const ISA: u8>(row: &[u8], act: &ActQ8KRow) -> f32 {
+    let mut total = 0f32;
+    let mut w = [0i8; 32];
+    for (s, block) in row.as_chunks::<IQ3S_BLOCK_BYTES>().0.iter().enumerate() {
+        let d = read_f16(block, 0);
+        let base = s * SUPER_BLOCK;
+        let mut isum = 0i32;
+        for ib in 0..SUBS {
+            unpack_block_iq3_s(block, ib, &mut w);
+            isum += iq3_s_scale(block, ib) * dot32::<ISA>(&w, &act.q[base + ib * 32..]);
+        }
+        total += act.d[s] * d * isum as f32;
+    }
+    total
+}
+
 /// `Q3_K`: `sum_s d_s * act_d_s * sum_g sc_g * (q_g . x_g)`, the inner sum
 /// entirely in `i32`.
 ///
@@ -8698,6 +9159,7 @@ mod tests {
             GGML_TYPE_Q5_K => (176, 256),
             GGML_TYPE_Q6_K => (210, 256),
             GGML_TYPE_IQ4_XS => (136, 256),
+            GGML_TYPE_IQ3_S => (110, 256),
             GGML_TYPE_Q2_0 => (18, 64),
             GGML_TYPE_PQ2_0 => (34, 128),
             GGML_TYPE_PTQ1_0 => (28, 128),
@@ -8734,6 +9196,9 @@ mod tests {
                 GGML_TYPE_Q3_K => block[108..110].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_Q6_K => block[208..210].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                // `d` only: every other `IQ3_S` field is valid for any bits —
+                // a 4-bit scale, 9-bit lattice indices, sign bits.
+                GGML_TYPE_IQ3_S => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_Q2_0 | GGML_TYPE_PQ2_0 => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 // `PTQ1_0` is the other type with a trailing `d`.
                 GGML_TYPE_PTQ1_0 => block[26..28].copy_from_slice(&[0x00, 0x30]),
@@ -8924,6 +9389,7 @@ mod tests {
             GGML_TYPE_Q5_K => (176, 256),
             GGML_TYPE_Q6_K => (210, 256),
             GGML_TYPE_IQ4_XS => (136, 256),
+            GGML_TYPE_IQ3_S => (110, 256),
             GGML_TYPE_Q2_0 => (18, 64),
             GGML_TYPE_PQ2_0 => (34, 128),
             GGML_TYPE_PTQ1_0 => (28, 128),
@@ -8934,7 +9400,7 @@ mod tests {
         for block in row.chunks_exact_mut(block_bytes) {
             match ggml_type {
                 GGML_TYPE_Q8_0 | GGML_TYPE_Q5_0 | GGML_TYPE_Q4_0 | GGML_TYPE_IQ4_NL
-                | GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                | GGML_TYPE_IQ4_XS | GGML_TYPE_IQ3_S => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 GGML_TYPE_Q5_1 | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K => {
                     block[0..2].copy_from_slice(&[0x00, 0x30]);
                     block[2..4].copy_from_slice(&[0x00, 0x2c]);
@@ -8984,6 +9450,7 @@ mod tests {
                 GGML_TYPE_Q5_1,
                 GGML_TYPE_IQ4_NL,
                 GGML_TYPE_IQ4_XS,
+                GGML_TYPE_IQ3_S,
                 GGML_TYPE_Q2_K,
                 GGML_TYPE_Q3_K,
                 GGML_TYPE_Q4_K,
@@ -9259,6 +9726,18 @@ mod tests {
         }
     }
 
+    /// `IQ3_S` through `dot_row` and the unpack form, against
+    /// `quant::dequantize`. Random payloads are legal blocks — only `d` is
+    /// pinned — so every scale, lattice index and sign pattern is exercised.
+    #[test]
+    fn iq3_s_matches_dequantize_reference() {
+        for seed in [1, 7, 99] {
+            check(GGML_TYPE_IQ3_S, 256, seed);
+            check(GGML_TYPE_IQ3_S, 5120, seed);
+            check(GGML_TYPE_IQ3_S, 17408, seed);
+        }
+    }
+
     #[test]
     fn q2_k_matches_dequantize_reference() {
         for seed in [1, 7, 99] {
@@ -9368,6 +9847,7 @@ mod tests {
             GGML_TYPE_Q5_K,
             GGML_TYPE_Q6_K,
             GGML_TYPE_IQ4_XS,
+            GGML_TYPE_IQ3_S,
             GGML_TYPE_PQ2_0,
             GGML_TYPE_PTQ1_0,
         ] {
@@ -9509,6 +9989,148 @@ mod tests {
         std::hint::black_box(&out);
     }
 
+    /// Weight-read rate of the `IQ` decode row dots on an `ffn_up`-shaped
+    /// matrix (`in_dim` 5120, 17408 rows), one thread and every thread:
+    /// the row-wide AVX2 kernels against the forms they replace — the
+    /// per-32 unpack-then-dot for `IQ4_XS`/`IQ4_NL`, and dequantize-to-`f32`
+    /// plus an `f32` dot for `IQ3_S`.
+    ///
+    /// `cargo test --profile release-with-debug _scratch_measure_iq_row_bandwidth -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    #[cfg(target_arch = "x86_64")]
+    fn _scratch_measure_iq_row_bandwidth() {
+        use rayon::prelude::*;
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn iq4_xs_per32(row: &[u8], act: &ActQ8KRow) -> f32 {
+            dot_k_row_iq4_xs::<ISA_AVX2>(row, act)
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn iq4_nl_per32(row: &[u8], act: &ActQ8) -> f32 {
+            dot_iq4_nl::<ISA_AVX2>(row, act)
+        }
+        type RowDot<'a> = dyn Fn(&[u8]) -> f32 + Sync + 'a;
+        let (in_dim, out_dim) = (5120usize, 17408usize);
+        let x = activations(in_dim);
+        let act_k = quantize_act_k_row(&x);
+        let act = quantize_act(&x);
+        let threads_max = std::thread::available_parallelism().map_or(1, |n| n.get());
+        for ggml_type in [GGML_TYPE_IQ4_XS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL] {
+            let row_bytes = fixture_row(ggml_type, in_dim, 0).len();
+            let mut m = Vec::with_capacity(out_dim * row_bytes);
+            for r in 0..out_dim {
+                m.extend(fixture_row(ggml_type, in_dim, r as u32));
+            }
+            let bytes = m.len() as f64;
+            let kernels: [(&str, &RowDot); 2] = match ggml_type {
+                GGML_TYPE_IQ4_XS => [
+                    ("per-32", &|r| unsafe { iq4_xs_per32(r, &act_k) }),
+                    ("row AVX2", &|r| dot_k_row(ggml_type, r, &act_k)),
+                ],
+                GGML_TYPE_IQ3_S => [
+                    ("dequantize f32", &|r| {
+                        let w = quant::dequantize(ggml_type, r, in_dim).unwrap();
+                        crate::engine::tensor::dot(&x, &w)
+                    }),
+                    ("row AVX2", &|r| dot_k_row(ggml_type, r, &act_k)),
+                ],
+                _ => [
+                    ("per-32", &|r| unsafe { iq4_nl_per32(r, &act) }),
+                    ("row AVX2", &|r| dot_row(ggml_type, r, &act)),
+                ],
+            };
+            let mut out = vec![0f32; out_dim];
+            for threads in [1usize, threads_max] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                for (label, kernel) in &kernels {
+                    let mut best = f64::MAX;
+                    for _ in 0..5 {
+                        let t = std::time::Instant::now();
+                        pool.install(|| {
+                            out.par_chunks_mut(1).with_min_len(64).enumerate().for_each(
+                                |(r, o)| {
+                                    o[0] = kernel(&m[r * row_bytes..(r + 1) * row_bytes]);
+                                },
+                            );
+                        });
+                        best = best.min(t.elapsed().as_secs_f64());
+                    }
+                    eprintln!(
+                        "  {} {label:>15}, {threads:2} threads: {:6.1} GB/s ({:.2} ms)",
+                        orangu::gguf::ggml_type_name(ggml_type),
+                        bytes / 1e9 / best,
+                        best * 1e3
+                    );
+                }
+            }
+            std::hint::black_box(&out);
+        }
+    }
+
+    /// Per-token cost of a row dotted against `N` tokens at once against
+    /// one token alone, single thread, on an `ffn_up`-shaped matrix
+    /// (`in_dim` 5120, 17408 rows) — the speculative-verify shape.
+    ///
+    /// `cargo test --profile release-with-debug _scratch_measure_k_row_tokens -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn _scratch_measure_k_row_tokens() {
+        let (in_dim, out_dim) = (5120usize, 17408usize);
+        let acts: Vec<ActQ8KRow> = (0..K_ROW_TOKENS_MAX)
+            .map(|t| {
+                let x: Vec<f32> = (0..in_dim)
+                    .map(|i| (((i + 31 * t) * 7919) % 251) as f32 / 125.0 - 1.0)
+                    .collect();
+                quantize_act_k_row(&x)
+            })
+            .collect();
+        for ggml_type in [
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ4_XS,
+            GGML_TYPE_IQ3_S,
+        ] {
+            let row_bytes = fixture_row(ggml_type, in_dim, 0).len();
+            let mut m = Vec::with_capacity(out_dim * row_bytes);
+            for r in 0..out_dim {
+                m.extend(fixture_row(ggml_type, in_dim, r as u32));
+            }
+            let mut out = vec![0f32; K_ROW_TOKENS_MAX];
+            let mut per_token = Vec::new();
+            for n in [1usize, 5] {
+                let mut best = f64::MAX;
+                for _ in 0..5 {
+                    let t = std::time::Instant::now();
+                    for r in 0..out_dim {
+                        let row = &m[r * row_bytes..(r + 1) * row_bytes];
+                        if n == 1 {
+                            out[0] = dot_k_row(ggml_type, row, &acts[0]);
+                        } else {
+                            dot_k_row_tokens(ggml_type, row, &acts[..n], &mut out[..n]);
+                        }
+                        std::hint::black_box(&out);
+                    }
+                    best = best.min(t.elapsed().as_secs_f64());
+                }
+                per_token.push(best / n as f64);
+            }
+            eprintln!(
+                "  {:>6}: N=1 {:6.2} ms/token, N=5 {:6.2} ms/token ({:.2}x)",
+                orangu::gguf::ggml_type_name(ggml_type),
+                per_token[0] * 1e3,
+                per_token[1] * 1e3,
+                per_token[0] / per_token[1]
+            );
+        }
+    }
+
     /// The super-block-wide AVX2 kernels compute the same integers as the
     /// per-32 form they replace — the same products, the same scales — and
     /// differ from it only in the order the super-blocks' floats are
@@ -9521,7 +10143,13 @@ mod tests {
         if !is_x86_feature_detected!("avx2") {
             return;
         }
-        for ggml_type in [GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K] {
+        for ggml_type in [
+            GGML_TYPE_Q4_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_Q6_K,
+            GGML_TYPE_IQ4_XS,
+            GGML_TYPE_IQ3_S,
+        ] {
             for in_dim in [256usize, 2048, 5632] {
                 for seed in [1u32, 7, 99, 1234] {
                     let row = fixture_row(ggml_type, in_dim, seed);
@@ -9557,6 +10185,7 @@ mod tests {
             GGML_TYPE_Q4_0,
             GGML_TYPE_Q5_0,
             GGML_TYPE_Q5_1,
+            GGML_TYPE_IQ4_NL,
         ] {
             for in_dim in [32usize, 2048, 3840] {
                 for seed in [1u32, 7, 99, 1234] {
@@ -9723,7 +10352,14 @@ mod tests {
     /// one without.
     #[test]
     fn a_row_against_several_tokens_is_each_token_alone_bit_for_bit() {
-        for ggml_type in [quant::GGML_TYPE_Q4_K, quant::GGML_TYPE_Q6_K, GGML_TYPE_Q5_K] {
+        for ggml_type in [
+            quant::GGML_TYPE_Q4_K,
+            quant::GGML_TYPE_Q6_K,
+            GGML_TYPE_Q5_K,
+            GGML_TYPE_IQ4_XS,
+            GGML_TYPE_IQ3_S,
+            GGML_TYPE_Q3_K,
+        ] {
             let in_dim = 3 * SUPER_BLOCK;
             let mut seed = 0x51ED_u64;
             let mut row = Vec::new();
@@ -9764,6 +10400,7 @@ mod tests {
             GGML_TYPE_Q5_K,
             GGML_TYPE_Q6_K,
             GGML_TYPE_IQ4_XS,
+            GGML_TYPE_IQ3_S,
         ] {
             assert!(supports_k_row(t, 2048), "type {t}");
             // Decode must cover everything prefill's K-GEMM does.
@@ -9818,6 +10455,7 @@ mod tests {
             (GGML_TYPE_Q5_K, 63, 31),
             (GGML_TYPE_Q6_K, 127, 32),
             (GGML_TYPE_IQ4_XS, 32, 127),
+            (GGML_TYPE_IQ3_S, 31, 15),
         ] {
             // Every element of a super-block at its extreme, against |x| = 127.
             let worst = sc * q * 127 * SUPER_BLOCK as i64;
@@ -10448,6 +11086,7 @@ mod tests {
         let (block_bytes, block_elems) = match ggml_type {
             GGML_TYPE_Q4_K => (144, 256),
             GGML_TYPE_IQ4_XS => (136, 256), // 2 + 2 + 4 + 128
+            GGML_TYPE_IQ3_S => (110, 256),  // 2 + 64 + 8 + 32 + 4
             GGML_TYPE_PQ2_0 => (34, 128),
             GGML_TYPE_PTQ1_0 => (28, 128),
             _ => (210, 256), // Q6_K
@@ -10463,7 +11102,7 @@ mod tests {
                 // `d` only; the 6-bit scales stay pseudo-random, which is
                 // what exercises the `scales_l`/`scales_h` split and the -32
                 // bias (so a sub-block scale can legitimately be negative).
-                GGML_TYPE_IQ4_XS => block[0..2].copy_from_slice(&[0x00, 0x30]),
+                GGML_TYPE_IQ4_XS | GGML_TYPE_IQ3_S => block[0..2].copy_from_slice(&[0x00, 0x30]),
                 // A scale that *differs* between the two blocks of every
                 // super-block (and is negative now and then), so the
                 // base-plus-integer encoding is exercised rather than hidden
@@ -10759,6 +11398,7 @@ mod tests {
             GGML_TYPE_Q4_K,
             GGML_TYPE_Q6_K,
             GGML_TYPE_IQ4_XS,
+            GGML_TYPE_IQ3_S,
             GGML_TYPE_PQ2_0,
             GGML_TYPE_PTQ1_0,
         ] {

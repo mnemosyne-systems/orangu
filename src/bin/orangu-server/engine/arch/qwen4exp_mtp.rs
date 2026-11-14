@@ -346,8 +346,11 @@ impl MtpHead for Qwen4ExpMtpHead {
             n_tokens,
         );
         let inject = inject.expect("a block mixer always carries its injection weights");
+        // Attention runs on the host: the head's cache is host rows alone —
+        // placeholders and truncation included — which a device's
+        // attention, keeping rows of its own, would not follow.
         let attn_out = self.attn.forward(
-            self.backend.as_ref(),
+            &crate::engine::backend::CpuBackend,
             &self.dims,
             cache,
             &cur,

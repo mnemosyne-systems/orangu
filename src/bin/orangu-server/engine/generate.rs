@@ -1715,13 +1715,15 @@ fn run_leg(
     // cannot roll back, and does not speculate. A draft model's cache
     // follows the target's with `KvCache::truncate` alone, so a recurrent
     // draft model is not used — the request drafts by prompt lookup instead,
-    // which keeps no cache — and neither is an MTP head on a recurrent
-    // target, whose states the rollback would have to replay too.
+    // which keeps no cache. An MTP head on a recurrent target is: its own
+    // cache is attention rows alone, cut back as a draft model's is, and the
+    // states it reads behind the accepted tokens are the verify's, computed
+    // before any rollback.
     let target_recurrent = cache.as_ref().is_some_and(KvCache::has_recurrent);
+    let with_head = mtp.is_some() && model.mtp_state_width().is_some();
     let may_speculate = !target_recurrent
-        || (spec_recurrent(model) && cache.as_ref().is_some_and(KvCache::can_roll_back));
+        || (spec_recurrent(model, with_head) && cache.as_ref().is_some_and(KvCache::can_roll_back));
     let draft = draft.filter(|d| !d.model.new_kv_cache(1).has_recurrent());
-    let mtp = mtp.filter(|_| !target_recurrent);
     // A configured draft model wins over the model's own MTP head, which
     // wins over prompt-lookup. All three guess at the same tokens, so
     // running more than one only turns the loser's misses into a second,
@@ -1874,13 +1876,16 @@ fn run_leg(
             prefill(model, cache, head, from, guard.id(), None, &mut on_chunk).and_then(|_| {
                 checkpoint = Some((at, cache.recurrent_checkpoint()));
                 let done = head.len();
+                // The drafter catches up on the prompt's end, which this
+                // segment holds; what came before it is a prefix the head
+                // keeps as placeholders.
                 prefill(
                     model,
                     cache,
                     &req.prompt_tokens[at..],
                     at,
                     guard.id(),
-                    None,
+                    drafter.as_mut(),
                     &mut |processed| on_chunk(done + processed),
                 )
             })
@@ -3825,6 +3830,12 @@ fn prefill_in_chunks(
     // reads it. Everything else takes the forward it always took: exporting
     // a state row per position costs a `hc * n_embd` buffer per chunk, and
     // there is no reason to build one nobody will read.
+    // The head catches up on the prompt's last positions only: the served
+    // model's state already carries everything before them, and the head's
+    // own block runs on the host, where a long prompt's catch-up would cost
+    // more than its drafts return. Earlier positions are placeholders the
+    // head never attends (`MtpHead::forward`'s `first_pos`).
+    let head_from = (start_pos + tokens.len()).saturating_sub(mtp_prompt_tail());
     let mut chunk = |model: &dyn ModelForward,
                      cache: &mut KvCache,
                      part: &[u32],
@@ -3850,7 +3861,10 @@ fn prefill_in_chunks(
         drafter.observe_states(pos, &states);
         // The head runs over the chunk that was just committed, so the
         // states it needs never have to outlive one chunk.
-        drafter.catch_up(part, pos)?;
+        let skip = head_from.saturating_sub(pos).min(part.len());
+        if skip < part.len() {
+            drafter.catch_up(&part[skip..], pos + skip)?;
+        }
         Ok(logits)
     };
     run_in_chunks(
@@ -4140,14 +4154,21 @@ fn keep_pictures_whole(rest: &[u32], n: usize, limit: usize) -> usize {
 
 /// Whether a model with recurrent layers speculates: `ORANGU_SPEC_RECURRENT`
 /// where it is set, otherwise where the model verifies on its device
-/// (`ModelForward::verifies_recurrent_on_device`); always in this module's
-/// tests, which check the rollback.
-fn spec_recurrent(model: &dyn ModelForward) -> bool {
+/// (`ModelForward::verifies_recurrent_on_device`) or drafts with its own
+/// multi-token-prediction head (`with_head`), whose guesses are accepted
+/// often enough to pay for a host verify — unless its experts are read from
+/// the disk (`expert_store::streaming_regime`), where a verify reads every
+/// row's selection and costs several steps; always in this module's tests,
+/// which check the rollback.
+fn spec_recurrent(model: &dyn ModelForward, with_head: bool) -> bool {
     static SET: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
     cfg!(test)
         || SET
             .get_or_init(|| crate::engine::env::flag_setting("ORANGU_SPEC_RECURRENT"))
-            .unwrap_or_else(|| model.verifies_recurrent_on_device())
+            .unwrap_or_else(|| {
+                (with_head && !crate::engine::expert_store::streaming_regime())
+                    || model.verifies_recurrent_on_device()
+            })
 }
 
 /// Whether a request waits for a peer that is building the same new prompt
@@ -4398,6 +4419,21 @@ fn last_chunk_wall() -> Option<(usize, Duration)> {
 }
 
 const PREFILL_YIELD_MS_DEFAULT: u64 = 0;
+
+/// How many of a prompt's last positions a multi-token-prediction head
+/// catches up on during the prefill — `ORANGU_MTP_PROMPT_TAIL`, default
+/// [`MTP_PROMPT_TAIL_DEFAULT`]; `0` none.
+fn mtp_prompt_tail() -> usize {
+    static TAIL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TAIL.get_or_init(|| {
+        crate::engine::backend::tuning_profile::env_var("ORANGU_MTP_PROMPT_TAIL")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(MTP_PROMPT_TAIL_DEFAULT)
+    })
+}
+
+const MTP_PROMPT_TAIL_DEFAULT: usize = 256;
 
 /// Whether `ORANGU_PREFILL_CHUNKS=1` asked for one line per prefill naming the
 /// widths the sizer chose.
@@ -5811,6 +5847,9 @@ fn speculative_next(
         .has_recurrent()
         .then(|| cache.rollback_point(start_pos))
         .transpose()?;
+    if checkpoint.is_some() {
+        cache.keep_verify_rows();
+    }
 
     // Per-position logits for `current` and every drafted token, from one
     // forward that appends all of them to the cache. A head-based drafter
@@ -5936,7 +5975,7 @@ fn speculative_next(
         // — either way it holds exactly what plain decoding would have
         // given it. Their logits are not needed.
         Some(checkpoint) if chosen.len() < input.len() => {
-            if !cache.keep_verified(checkpoint, chosen.len()) {
+            if !cache.keep_verified(checkpoint, &input[..chosen.len()]) {
                 cache.rollback(checkpoint)?;
                 model.forward(cache, &input[..chosen.len()], start_pos, slot_id)?;
             }
@@ -5945,6 +5984,7 @@ fn speculative_next(
         Some(_) => {}
         None => cache.truncate(committed_tokens)?,
     }
+    cache.end_verify_rows();
     // The draft's cache follows the target's exactly, which is what keeps the
     // two models looking at the same context. A drafter with no cache of its
     // own ignores this.
@@ -6601,6 +6641,9 @@ mod tests {
         /// Whether its requests decode as rows of one batched step
         /// (`ModelForward::batches_decode`).
         batches: bool,
+        /// Exports a state row per position, for a paired MTP head — see
+        /// [`StatefulModel::states`].
+        states: bool,
     }
 
     impl DeterministicModel {
@@ -6630,6 +6673,7 @@ mod tests {
                 meet_position: 0,
                 started: AtomicUsize::new(0),
                 batches: false,
+                states: false,
             }
         }
 
@@ -6691,6 +6735,32 @@ mod tests {
     impl ModelForward for DeterministicModel {
         fn config(&self) -> &ModelConfig {
             &self.config
+        }
+
+        fn mtp_state_width(&self) -> Option<usize> {
+            self.states.then_some(STATE_WIDTH)
+        }
+
+        fn forward_with_states(
+            &self,
+            cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+            slot_id: usize,
+        ) -> Result<(Vec<f32>, Vec<f32>)> {
+            let logits = self.forward(cache, tokens, start_pos, slot_id)?;
+            Ok((logits, StatefulModel::states(tokens, start_pos)))
+        }
+
+        fn forward_all_logits_with_states(
+            &self,
+            cache: &mut KvCache,
+            tokens: &[u32],
+            start_pos: usize,
+            slot_id: usize,
+        ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+            let logits = self.forward_all_logits(cache, tokens, start_pos, slot_id)?;
+            Ok((logits, StatefulModel::states(tokens, start_pos)))
         }
 
         fn batches_decode(&self) -> bool {
@@ -7470,6 +7540,65 @@ mod tests {
             cold_model.forwarded_tokens.load(Ordering::Relaxed) - 6,
             "the checkpoint was not reused"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hybrid model with a multi-token-prediction head, on a conversation
+    /// with a cache point: the prompt runs in two parts around the
+    /// checkpoint, and the head still catches up on its end — its first
+    /// draft would otherwise ask for a state the prefill never exported —
+    /// and the answer is the one decoding without the head gives.
+    #[test]
+    fn a_hybrid_conversation_with_a_cache_point_feeds_its_draft_head() {
+        let tokenizer = letter_tokenizer(8);
+        let dir = std::env::temp_dir().join(format!("orangu-mtp-cp-{}", std::process::id()));
+        let store = crate::engine::slot_store::SlotStore::at(dir.clone(), "test".into(), 1);
+        let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 7, 7];
+        let model = DeterministicModel {
+            states: true,
+            ..DeterministicModel::hybrid(8)
+        };
+        let mtp = MtpDraft {
+            head: Arc::new(RecordingHead::new()),
+            tokens: 2,
+            label: "test-head".to_string(),
+        };
+        let slots = SlotPool::new(1);
+        let guard = pollster::block_on(slots.acquire());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let req = GenerateRequest {
+            prompt_tokens: prompt.clone(),
+            sampling: greedy_params(),
+            max_tokens: 6,
+            cache_point: Some(6),
+            background: false,
+            reasoning_budget: None,
+            ..Default::default()
+        };
+        run(
+            &model,
+            &tokenizer,
+            None,
+            Some(&mtp),
+            None,
+            Some(&store),
+            None,
+            &crate::engine::decode_batch::DecodeBatcher::new(),
+            &guard,
+            req,
+            crate::config::Role::default(),
+            crate::config::Role::default(),
+            false,
+            &crate::engine::metrics::ServerMetrics::new(),
+            Instant::now(),
+            tx,
+            None,
+            None,
+        )
+        .expect("a request with a draft head and a cache point");
+        let with_head = drain(rx);
+        let plain = run_request(&DeterministicModel::hybrid(8), &tokenizer, None, prompt, 6);
+        assert_eq!(with_head, plain, "the draft head changed the answer");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

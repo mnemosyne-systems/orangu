@@ -50,6 +50,7 @@ use std::time::Instant;
 use clap::Parser;
 
 mod bundle;
+mod ceiling;
 mod chart;
 mod chat;
 mod download;
@@ -214,6 +215,10 @@ struct Args {
     /// Number of tokens to generate per timed run.
     #[arg(long = "gen", default_value_t = 128, value_name = "N")]
     n_gen: u32,
+
+    /// Decode mode for a model streamed from disk: a four-word prompt, one repetition, seconds per token.
+    #[arg(long, default_value_t = false)]
+    streamed: bool,
 
     /// Interference mode: prompt lengths a second request prefills while one stream decodes; reports the decoder's stalls.
     #[arg(long = "interference", value_delimiter = ',', value_name = "LIST")]
@@ -863,6 +868,14 @@ impl Sample {
     }
 }
 
+/// The prompt of `--streamed`: a few tokens, since every prompt token of a
+/// model streamed from disk reads its own selection of every layer's experts.
+const STREAMED_PROMPT: &str = "Once upon a time";
+
+/// How long one `--streamed` request may take, at least: tens of seconds a
+/// token is that mode's normal case.
+const STREAMED_TIMEOUT_S: u64 = 4 * 3600;
+
 /// Build a prompt whose token count is approximately `depth`. Content is
 /// irrelevant to decode speed — only the resulting KV length matters — but it
 /// must be *coherent* text ending on an open-ended instruction, or a greedy
@@ -1367,6 +1380,16 @@ fn main() {
         eprintln!("orangu-bench: {e}");
         std::process::exit(1);
     }
+    if args.streamed {
+        if args.depths.iter().any(|&d| d != 0) {
+            eprintln!("orangu-bench: --streamed measures at depth 0 only");
+            std::process::exit(1);
+        }
+        // One repetition, and a request that may take hours: every token
+        // of a model past the page cache waits on the disk.
+        args.reps = 1;
+        args.timeout = args.timeout.max(STREAMED_TIMEOUT_S);
+    }
     let args = args;
     if let Err(e) = run(&args) {
         // A single clean line (e.g. a refused connection), not anyhow's
@@ -1557,6 +1580,18 @@ fn measure_run(
             // The picture pipeline has threads of its own, which a text
             // completion would not create — see `image::warmup`.
             image::warmup(client, &args.url, &args.model)?;
+        } else if args.streamed {
+            // One token: enough for the server to create its threads (what
+            // a profile needs) without a prefill of the full instruction,
+            // which on a streamed model reads most of every layer's experts.
+            run_once(
+                client,
+                &args.url,
+                STREAMED_PROMPT,
+                1,
+                &args.model,
+                args.temperature,
+            )?;
         } else if args.embed.is_empty() {
             run_once(client, &args.url, &p, 8, &args.model, args.temperature)?;
             settle_tail_probe(client, args, &p)?;
@@ -3661,7 +3696,11 @@ fn run_tg(
         if point > 0 {
             args.settle();
         }
-        let prompt = build_prompt(depth);
+        let prompt = if args.streamed {
+            STREAMED_PROMPT.to_string()
+        } else {
+            build_prompt(depth)
+        };
         let mut rates = Vec::new();
         let mut last_sample: Option<Sample> = None;
         // Discarded, for the reason `run_pp` documents.
@@ -3725,6 +3764,9 @@ fn run_tg(
                 stats.mean,
                 stats.plus_minus(5, 2)
             );
+            if args.streamed && stats.mean > 0.0 {
+                println!("{:>8}   {:.1} s/token", "", 1.0 / stats.mean);
+            }
             // The repetitions in the order they ran: a first one well under
             // the rest is a server still settling after its load, which the
             // best and the mean each hide in their own way.
@@ -3779,6 +3821,15 @@ fn run_tg(
             let after = moe::get_json(client, &format!("{}/props", args.url));
             if let Some(line) = tail_line(tail_before.as_deref(), after.get("tail")) {
                 println!("{line}");
+            }
+            // Measured after the window, so the probe never shares it.
+            if let Some((bytes, upper)) = ceiling::host_weight_bytes(after.get("gpu")) {
+                let measured = ceiling::is_local(&args.url)
+                    .then(ceiling::host_read_gib_s)
+                    .flatten();
+                if let Some(line) = ceiling::line(bytes, upper, stats.mean, measured) {
+                    println!("{line}");
+                }
             }
         }
     }

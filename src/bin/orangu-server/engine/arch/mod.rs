@@ -76,6 +76,7 @@ pub mod nemotron;
 pub mod phi;
 pub mod position;
 pub mod qwen35;
+pub mod qwen35_mtp;
 pub mod qwen35moe;
 pub mod qwen3next;
 pub mod qwen4exp;
@@ -6046,7 +6047,7 @@ pub(crate) mod batch_checks {
     ) {
         match checkpoint {
             Some(checkpoint) => {
-                if !cache.keep_verified(checkpoint, kept) {
+                if !cache.keep_verified(checkpoint, &input[..kept]) {
                     cache.rollback(checkpoint).expect("roll back");
                     model
                         .forward(cache, &input[..kept], pos, slot)

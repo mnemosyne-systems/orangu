@@ -1000,6 +1000,10 @@ impl Recurrent {
                 self.delta_token(
                     dims, ssm_state, q_conv, k_conv, v_conv, beta_t, decay_t, z_t, gate, attn_out,
                 );
+                // The last row's state is the pass's own result.
+                if t + 1 < n_tokens {
+                    ssm_state.keep_row();
+                }
             });
         }
 
@@ -2205,6 +2209,91 @@ impl<F: HybridFfn> Trunk<F> {
             self.dims.rms_eps,
         );
         Ok(x)
+    }
+
+    pub(crate) fn dims(&self) -> &Dims {
+        &self.dims
+    }
+
+    pub(crate) fn tok_embeddings(&self) -> &QuantMatrix {
+        &self.tok_embeddings
+    }
+
+    pub(crate) fn output_norm(&self) -> &[f32] {
+        &self.output_norm
+    }
+
+    pub(crate) fn output_weight(&self) -> &QuantMatrix {
+        &self.output_weight
+    }
+
+    /// Whether the output projection reads the normed residual stream as it
+    /// is, with no fold to rotate it into first — what a draft head that
+    /// borrows the projection needs.
+    pub(crate) fn head_is_unfolded(&self) -> bool {
+        self.head_in.is_none() && self.embd_inverse.is_none()
+    }
+
+    /// Whether every pass runs the host layer loop — no whole-model device
+    /// path (a model split across devices, or the CPU) — so exporting each
+    /// position's state costs nothing a pass did not already do.
+    pub(crate) fn runs_host_loop(&self) -> bool {
+        self.backend.as_wgpu().is_none() && self.prefill_backend.is_none()
+    }
+
+    /// `tokens` from `start_pos` through the host layer loop, every row's
+    /// final hidden state after the final norm (`[n_tokens, n_embd]`) — the
+    /// state a multi-token-prediction head reads — and the logits of the
+    /// rows `all_logits` asks for: every row, or the last.
+    pub(crate) fn forward_states(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+        slot: usize,
+        all_logits: bool,
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>)> {
+        let n_tokens = tokens.len();
+        let n_embd = self.dims.n_embd;
+        anyhow::ensure!(n_tokens > 0, "no tokens to forward");
+        anyhow::ensure!(
+            self.head_is_unfolded(),
+            "a folded model exports no draft-head state"
+        );
+        // A device's token loop may have left rows on the device alone; the
+        // host loop reads every earlier position from the host.
+        if let Some(vulkan) = self.backend.as_wgpu() {
+            anyhow::ensure!(
+                vulkan.fetch_kv_rows(cache),
+                "this cache's device-only rows cannot be brought home"
+            );
+        }
+        let x = decode_stages::scope(Stage::Embed, || self.embed(tokens))?;
+        let mut x =
+            self.forward_range(cache, x, n_tokens, start_pos, 0..self.layers.len(), slot)?;
+        let logits = decode_stages::scope(Stage::Head, || {
+            tensor::rmsnorm_inplace(
+                &mut x,
+                &self.output_norm,
+                n_tokens,
+                n_embd,
+                self.dims.rms_eps,
+            );
+            let (rows, n_rows) = if all_logits {
+                (&x[..], n_tokens)
+            } else {
+                (&x[(n_tokens - 1) * n_embd..], 1)
+            };
+            let n_vocab = self.output_weight.out_dim;
+            let flat = self.backend.matmul(rows, n_rows, &self.output_weight);
+            anyhow::ensure!(
+                flat.len() == n_rows * n_vocab,
+                "the head produced {} logits, expected {n_rows} rows of {n_vocab}",
+                flat.len()
+            );
+            Ok(flat.chunks_exact(n_vocab).map(<[f32]>::to_vec).collect())
+        })?;
+        Ok((logits, x))
     }
 
     /// [`Self::forward`]'s head over each of `n_rows` rows of the last

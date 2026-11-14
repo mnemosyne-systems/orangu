@@ -4245,27 +4245,54 @@ impl KvCache {
     /// Back to `checkpoint`: every recurrent layer's state as it was saved
     /// and every attention layer cut back to the position it was saved at,
     /// as if nothing since had been pushed.
-    /// Keeps the first `kept` tokens of the verify run from `checkpoint`
+    /// Keeps `kept`, the first tokens of the verify run from `checkpoint`,
     /// without running them again: every recurrent state goes back to the
-    /// one behind its `kept`-th row (`DeviceStateMirror::restore_row`) and
-    /// the attention rows past them are cut. `false` where some state has
-    /// no such row on the device, or the verify extended
-    /// [`Self::recent_tokens`]; the cache is then for
-    /// [`Self::rollback`], which puts every state back whatever this
-    /// restored.
-    pub fn keep_verified(&mut self, checkpoint: &RollbackPoint, kept: usize) -> bool {
-        if kept == 0
-            || self.recent_tokens.len() != checkpoint.recent_tokens.len()
-            || checkpoint.layers.len() != self.recurrent.len()
-        {
+    /// one behind its last kept row (`DeviceStateMirror::restore_row`, or
+    /// the host's [`Self::keep_verify_rows`]), the attention rows past them
+    /// are cut and [`Self::recent_tokens`] holds what stepping only them
+    /// would have left. `false` where some state kept no such row; the
+    /// cache is then for [`Self::rollback`], which puts every state back
+    /// whatever this restored.
+    /// Every recurrent layer stepped on the host keeps its state behind each
+    /// row of the next multi-token pass — a verify's — so
+    /// [`Self::keep_verified`] can return to the one behind its last
+    /// accepted token without running the accepted tokens again. Ended by
+    /// [`Self::end_verify_rows`].
+    pub fn keep_verify_rows(&mut self) {
+        for state in &mut self.recurrent {
+            state.kept_rows = Some(Vec::new());
+        }
+    }
+
+    /// Drops what [`Self::keep_verify_rows`] kept and keeps nothing more.
+    pub fn end_verify_rows(&mut self) {
+        for state in &mut self.recurrent {
+            state.kept_rows = None;
+        }
+    }
+
+    pub fn keep_verified(&mut self, checkpoint: &RollbackPoint, kept: &[u32]) -> bool {
+        if kept.is_empty() || checkpoint.layers.len() != self.recurrent.len() {
             return false;
         }
         for state in &mut self.recurrent {
-            if !state.restore_row(kept - 1) {
+            if !state.restore_row(kept.len() - 1) {
                 return false;
             }
         }
-        self.truncate_attention(checkpoint.len + kept);
+        self.truncate_attention(checkpoint.len + kept.len());
+        // The verify pushed every row's token into the window; the kept ones
+        // after the checkpoint's window, trimmed to the window's length,
+        // are what stepping only them would have left — the window holds
+        // `min(lookback, tokens seen)`, and the verify saw at least `kept`.
+        if !self.recent_tokens.is_empty() || !checkpoint.recent_tokens.is_empty() {
+            let width = self.recent_tokens.len();
+            let mut window = checkpoint.recent_tokens.clone();
+            window.extend_from_slice(kept);
+            let drop = window.len().saturating_sub(width);
+            window.drain(..drop);
+            self.recent_tokens = window;
+        }
         true
     }
 
@@ -4725,6 +4752,11 @@ pub trait DeviceStateMirror: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
 }
 
+/// The most rows of one verify a host-stepped recurrent layer keeps the
+/// state behind ([`RecurrentLayerState::keep_row`]): the widest draft
+/// length plus the anchor.
+const KEPT_VERIFY_ROWS: usize = 17;
+
 /// One recurrent layer's state as it stood — [`RecurrentLayerState::
 /// checkpoint`]: on the device where the state is current there and the
 /// backend copies it there, on the host otherwise.
@@ -4806,6 +4838,10 @@ pub struct RecurrentLayerState {
     mirror: Option<Box<dyn DeviceStateMirror>>,
     /// Which of the two copies is current.
     fresh: Fresh,
+    /// While a verify's rows are kept ([`KvCache::keep_verify_rows`]): the
+    /// conv window and state behind each row the host stepped, for
+    /// [`Self::restore_row`] to return to. `None` otherwise.
+    kept_rows: Option<Vec<(Vec<f32>, Vec<f32>)>>,
 }
 
 impl RecurrentLayerState {
@@ -4819,6 +4855,7 @@ impl RecurrentLayerState {
             state_dim: spec.state_dim,
             mirror: None,
             fresh: Fresh::Both,
+            kept_rows: None,
         }
     }
 
@@ -4841,6 +4878,7 @@ impl RecurrentLayerState {
             state_dim,
             mirror: None,
             fresh: Fresh::Both,
+            kept_rows: None,
         }
     }
 
@@ -4867,6 +4905,7 @@ impl RecurrentLayerState {
             state_dim: self.state_dim,
             mirror: None,
             fresh: Fresh::Both,
+            kept_rows: None,
         }
     }
 
@@ -4971,11 +5010,29 @@ impl RecurrentLayerState {
     /// the device — [`DeviceStateMirror::restore_row`]. `false`, with
     /// nothing changed, where the device keeps no such row.
     fn restore_row(&mut self, row: usize) -> bool {
+        if self.fresh == Fresh::Host
+            && let Some((conv, state)) = self.kept_rows.as_ref().and_then(|rows| rows.get(row))
+        {
+            self.conv_history.clone_from(conv);
+            self.delta_state.clone_from(state);
+            return true;
+        }
         self.fresh == Fresh::Device
             && self
                 .mirror
                 .as_ref()
                 .is_some_and(|mirror| mirror.restore_row(row))
+    }
+
+    /// Keeps the state as it stands behind the row the host just stepped,
+    /// while a verify's rows are kept ([`KvCache::keep_verify_rows`]); a
+    /// no-op otherwise.
+    pub fn keep_row(&mut self) {
+        if let Some(rows) = self.kept_rows.as_mut()
+            && rows.len() < KEPT_VERIFY_ROWS
+        {
+            rows.push((self.conv_history.clone(), self.delta_state.clone()));
+        }
     }
 
     /// Whether this state holds nothing: a layer another node of a tree
@@ -6888,6 +6945,57 @@ mod tests {
         // last tap: 0*1 + 0*10 + 5*100 = 500.
         let out = state.conv_step(&[5.0], &kernel);
         assert_eq!(out, vec![500.0]);
+    }
+
+    /// A host-stepped verify keeps the state behind each row while armed, so
+    /// keeping two of four rows equals stepping only those two — the state,
+    /// the attention rows and the token window — and nothing is kept once
+    /// the verify ends.
+    #[test]
+    fn a_host_verify_keeps_the_state_behind_its_accepted_rows() {
+        let kernel = [1.0, 10.0, 100.0];
+        let step = |cache: &mut KvCache, tok: u32| {
+            let state = &mut cache.recurrent[0];
+            let out = state.conv_step(&[tok as f32], &kernel);
+            let (states, _) = state.delta_states_mut();
+            states[0] += out[0];
+            cache.layers[0].push(&[tok as f32], &[tok as f32]);
+            cache.push_recent_token(tok, 3);
+        };
+        let new = || KvCache::new_mixed(16, &[1], &[RecurrentSpec::delta_net(1, 3, 1, 1)]);
+
+        let mut verified = new();
+        let mut stepped = new();
+        for tok in [1, 2] {
+            step(&mut verified, tok);
+            step(&mut stepped, tok);
+        }
+        let point = verified.rollback_point(2).expect("checkpoint");
+        verified.keep_verify_rows();
+        let input = [3u32, 4, 5, 6];
+        for (t, &tok) in input.iter().enumerate() {
+            step(&mut verified, tok);
+            if t + 1 < input.len() {
+                verified.recurrent[0].keep_row();
+            }
+        }
+        assert!(verified.keep_verified(&point, &input[..2]));
+        verified.end_verify_rows();
+        for tok in [3, 4] {
+            step(&mut stepped, tok);
+        }
+
+        assert_eq!(
+            verified.recurrent[0].delta_state,
+            stepped.recurrent[0].delta_state
+        );
+        assert_eq!(
+            verified.recurrent[0].conv_history,
+            stepped.recurrent[0].conv_history
+        );
+        assert_eq!(verified.layers[0].len, stepped.layers[0].len);
+        assert_eq!(verified.recent_tokens, stepped.recent_tokens);
+        assert!(verified.recurrent[0].kept_rows.is_none());
     }
 
     #[test]

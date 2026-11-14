@@ -1108,6 +1108,48 @@ afternoon.
 A warm run reads nothing and says `(fully cached)` rather than showing a bare
 zero, because "read nothing" and "could not measure" must not look alike.
 
+### The `ceiling` line — how close decode is to the memory
+
+Under each decode point of a model whose weights are partly or wholly in
+host memory, a line such as
+
+```
+  ceiling  host weights 12.44 GiB/token × 1.81 tok/s = 22.5 GiB/s of 36.2 GiB/s measured (62%)
+```
+
+multiplies the bytes the host reads for one token by the measured rate, and
+sets that against the rate this machine's memory can be read at. The bytes
+come from the server's `/props`: every device that reports no capacity of its
+own (the host's share of a split, or the CPU), plus routed experts kept in
+system RAM — a token reads only its own selection of those, so then the line
+says it is an upper bound. The ceiling is measured by the bench itself, once
+per run and after the measured window, by reading a 512 MiB buffer from every
+core and keeping the best of four passes; it is only printed for a server on
+this machine (`127.*`, `localhost`, `[::1]`).
+
+Near the ceiling a faster kernel cannot help: only fewer bytes per token or
+more tokens per read of the weights can. Well below it, the kernels or the
+turn around each layer are where the time goes. A share over 100% means more
+than one token came out of one read of the weights — speculation — and the
+line says so, except on an upper bound, where the share overstates the
+bytes rather than the tokens.
+
+### A model streamed from disk (`--streamed`)
+
+A mixture-of-experts model larger than RAM reads its routed experts from disk
+on every token, and every prompt token reads its own selection of every
+layer's experts. The ordinary decode point's 33-token instruction is then a
+prefill of tens of minutes, and its eight-token warm-up as long again.
+`--streamed` measures such a model at depth 0 with the prompt "Once upon a
+time", one repetition, a one-token warm-up (enough for the server to create
+the threads a `--flamegraph` needs) and a request timeout of at least four
+hours, and prints the rate as seconds per token too. Read it with the `io`
+line, which gives the MiB read from disk per token:
+
+```sh
+orangu-bench --streamed --gen 16 --flamegraph /path/streamed.svg
+```
+
 ### Measuring across cards, and across models
 
 `orangu-bench` is an HTTP client, so it never chooses a device: the server
@@ -1514,6 +1556,7 @@ Options:
       --image-prompt <TEXT>            The prompt every `--image` picture is drawn from [default: "Create an image of a cat"]
       --image-init <PATH>              A picture attached to every `--image` request: an edit on a Qwen-Image 2.1 server with its vision projector, a start picture otherwise
       --gen <N>                        Number of tokens to generate per timed run [default: 128]
+      --streamed                       Decode mode for a model streamed from disk: a four-word prompt, one repetition, seconds per token
       --curve <N>                      Curve mode: one generation of this many tokens, bucketed by context; 0 disables [default: 0]
       --bucket <N>                     Bucket width (in context tokens) for `--curve` [default: 256]
       --reps <N>                       Repetitions per depth; the reported rate is the best run with mean±sd [default: 3]
