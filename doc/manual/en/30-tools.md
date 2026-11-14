@@ -608,9 +608,13 @@ be hashed, and `UserKnownHostsFile` is honoured; wildcard entries are not
 matched, so such a host counts as unknown.
 
 **`~/.ssh/config`.** `Host`, `HostName`, `User`, `Port`, `IdentityFile`,
-`UserKnownHostsFile` and settings before the first `Host` are read. `Include`,
-`Match` and the system-wide configuration are not, so a host can resolve
-differently than with `ssh`; the login result says so when the file uses either.
+`UserKnownHostsFile` and settings before the first `Host` are read, and so are
+the files `Include` names. As in `ssh`, a relative path is under `~/.ssh`, a
+file name may hold `*`, `?` or `[...]` and its matches are read in order, and a
+missing file is skipped. A file included inside a `Host` block is read for that
+host when it holds only settings; one with blocks of its own is not read there.
+`Match` and the system-wide configuration are not read, so a host can resolve
+differently than with `ssh`; the login result says so when that happens.
 A host with `ProxyJump` or `ProxyCommand` is refused rather than connected to
 directly.
 
