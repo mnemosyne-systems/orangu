@@ -4362,7 +4362,6 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
 
     /// The norm-pair bind group: `x` (the `wo` output), `w1`, the residual,
     /// `w2`, `y1` (the FFN residual), `y2` (the FFN norm's output), meta.
-    #[allow(clippy::too_many_arguments)]
     /// `q8` is the 8-bit form of `y2` the kernel writes when `meta`'s
     /// `aux` is 1 — a layer's `FfnQ8` — or the placeholder otherwise.
     #[allow(clippy::too_many_arguments)]
@@ -15388,7 +15387,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         buf
     }
 
-    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn rope_meta_buffer(
         &self,

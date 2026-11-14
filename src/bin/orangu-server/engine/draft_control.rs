@@ -745,9 +745,9 @@ mod tests {
         c.planned = Some(Planned {
             widths: vec![(1, 18.0), (2, 19.0), (4, 21.0), (8, 25.0)],
         });
-        for d in 0..DEPTHS {
-            c.accept_bin[d][3] = 0.95;
-            c.accept_bin[d][0] = 0.05;
+        for bins in c.accept_bin.iter_mut() {
+            bins[3] = 0.95;
+            bins[0] = 0.05;
         }
         assert_eq!(c.cut(&[3, 3, 3, 3, 3, 3, 3, 3]), 8);
         assert_eq!(c.cut(&[3, 3, 0, 0, 0, 0, 0, 0]), 2);
