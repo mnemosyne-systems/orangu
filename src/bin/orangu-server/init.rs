@@ -1416,7 +1416,10 @@ fn prompt_image_keys(
     // Qwen-Image 2.1 has none: nothing to ask.
     let found = match variant {
         Variant::QwenImage => orangu::model_spec::find_qwen_image_lightning(models_dir),
-        Variant::QwenImage21 | Variant::Flux2Klein | Variant::MossImage => None,
+        Variant::QwenImage21
+        | Variant::Flux2Klein
+        | Variant::MossImage
+        | Variant::MiniMaxH3Image => None,
     };
     let image_lora = if variant != Variant::QwenImage {
         "auto".to_string()

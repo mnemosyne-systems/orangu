@@ -75,11 +75,24 @@
 //! levels ([`scheduler::moss_sigmas`]) and its guidance runs the negative
 //! prompt with one block skipped ([`MOSS_UNCOND_SKIP`]) — fifty steps at
 //! guidance 3.
+//!
+//! **MiniMax-H3-Image** (`minimax_h3_image`, [`Variant::MiniMaxH3Image`])
+//! goes through it with a fifth: a 33-billion-parameter single-stream
+//! transformer ([`minimax_h3`]) conditioned on the fiftieth layer of a
+//! Qwen3-VL-32B-Instruct encoder for the bare prompt (no chat framing; read
+//! through [`qwen3vl::TextModel::forward_layers_masked`]), refined once per
+//! prompt by the transformer's own text blocks, and its own vision-
+//! transformer VAE ([`vae_h3`]): 24 latent channels at a sixteenth of the
+//! picture, 2x2 cells folded into a 96-wide token, so a token covers 32
+//! pixels. It is distilled to six steps of a fixed schedule
+//! ([`scheduler::minimax_h3_sigmas`]) without guidance, its output layer a
+//! head per step.
 
 pub mod codec;
 pub mod encoded_cache;
 pub mod flux2;
 pub mod lora;
+pub mod minimax_h3;
 pub mod moss;
 pub mod qwen3vl;
 pub mod safetensors;
@@ -90,6 +103,7 @@ pub mod transformer21;
 pub mod vae;
 pub mod vae21;
 pub mod vae_flux2;
+pub mod vae_h3;
 
 use crate::engine::arch::ModelForward;
 use crate::engine::backend::Backend;
@@ -103,12 +117,14 @@ use std::time::Instant;
 
 pub use codec::ImageFormat;
 use flux2::Flux2Transformer;
+use minimax_h3::H3Transformer;
 use moss::MossTransformer;
 use scheduler::{Noise, ScheduleConfig};
 use transformer::{ForwardInput, QwenImageTransformer};
 use transformer21::QwenImage21Transformer;
 use vae::{Feature, LATENTS_MEAN, LATENTS_STD, QwenImageVae, SPATIAL_COMPRESSION, Z_DIM};
 use vae_flux2::Flux2Vae;
+use vae_h3::H3ImageVae;
 use vae21::QwenImage21Vae;
 
 /// The text encoder's chat framing around a prompt — diffusers'
@@ -150,6 +166,10 @@ const MOSS_PROMPT_TOKENS: usize = 4096;
 /// `uncond_skip_layers`'s release default.
 pub const MOSS_UNCOND_SKIP: [usize; 1] = [22];
 
+/// The most of a MiniMax-H3-Image prompt the encoder reads. The prompt is
+/// read bare, without a chat template.
+const MINIMAX_H3_PROMPT_TOKENS: usize = 4096;
+
 /// Which picture model the pipeline serves — decided by the transformer
 /// file's architecture, and deciding every companion and default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +186,9 @@ pub enum Variant {
     /// `moss_image`: MOSS-Image — single-stream, 5 billion parameters,
     /// Qwen3.5-9B encoder, the FLUX.2 latent space.
     MossImage,
+    /// `minimax_h3_image`: MiniMax-H3-Image — single-stream, 33 billion
+    /// parameters, Qwen3-VL-32B encoder, its own vision-transformer VAE.
+    MiniMaxH3Image,
 }
 
 impl Variant {
@@ -176,6 +199,7 @@ impl Variant {
             orangu::model_spec::QWEN_IMAGE_21_ARCHITECTURE => Some(Self::QwenImage21),
             orangu::model_spec::FLUX2_KLEIN_ARCHITECTURE => Some(Self::Flux2Klein),
             orangu::model_spec::MOSS_IMAGE_ARCHITECTURE => Some(Self::MossImage),
+            orangu::model_spec::MINIMAX_H3_IMAGE_ARCHITECTURE => Some(Self::MiniMaxH3Image),
             _ => None,
         }
     }
@@ -186,6 +210,7 @@ impl Variant {
             Self::QwenImage21 => orangu::model_spec::QWEN_IMAGE_21_ARCHITECTURE,
             Self::Flux2Klein => orangu::model_spec::FLUX2_KLEIN_ARCHITECTURE,
             Self::MossImage => orangu::model_spec::MOSS_IMAGE_ARCHITECTURE,
+            Self::MiniMaxH3Image => orangu::model_spec::MINIMAX_H3_IMAGE_ARCHITECTURE,
         }
     }
 
@@ -195,7 +220,7 @@ impl Variant {
     /// `base` one.
     pub fn is_step_distilled(self, file_name: &str) -> bool {
         match self {
-            Self::QwenImage | Self::MossImage => false,
+            Self::QwenImage | Self::MossImage | Self::MiniMaxH3Image => false,
             Self::QwenImage21 => orangu::model_spec::is_turbo(file_name),
             Self::Flux2Klein => orangu::model_spec::is_distilled_klein(file_name),
         }
@@ -206,12 +231,48 @@ impl Variant {
     /// transformer packs 2x2 cells into a token; Qwen-Image 2.1's cell is 16
     /// pixels, one token each, and diffusers still rounds to 32. FLUX.2's
     /// cell is 8 pixels, 2x2 of them a token, and MOSS-Image's the same.
+    /// MiniMax-H3-Image's cell is 16 pixels, 2x2 of them a token.
     pub fn size_unit(self) -> usize {
         match self {
             Self::QwenImage => 2 * SPATIAL_COMPRESSION,
             Self::QwenImage21 => 2 * vae21::SPATIAL_COMPRESSION,
             Self::Flux2Klein | Self::MossImage => 2 * vae_flux2::SPATIAL_COMPRESSION,
+            Self::MiniMaxH3Image => 2 * vae_h3::SPATIAL_COMPRESSION,
         }
+    }
+
+    /// Pixels one transformer token covers along each side: 16 for every
+    /// model but MiniMax-H3-Image, whose tokens are 32.
+    pub fn token_pixels(self) -> usize {
+        match self {
+            Self::MiniMaxH3Image => 2 * vae_h3::SPATIAL_COMPRESSION,
+            Self::QwenImage | Self::QwenImage21 | Self::Flux2Klein | Self::MossImage => 16,
+        }
+    }
+
+    /// The smallest picture area, in pixels, the variant draws well: 512x512
+    /// for MiniMax-H3-Image, whose pictures fall apart below it; none for
+    /// the others.
+    pub fn min_generation_area(self) -> usize {
+        match self {
+            Self::MiniMaxH3Image => 512 * 512,
+            Self::QwenImage | Self::QwenImage21 | Self::Flux2Klein | Self::MossImage => 0,
+        }
+    }
+
+    /// The canvas a `width` x `height` request is drawn on: the request
+    /// itself, or for one smaller than `min_generation_area` the same aspect
+    /// ratio scaled up to it, each side rounded up to a multiple of
+    /// `size_unit`. The picture is scaled back to the request afterwards.
+    pub fn generation_canvas(self, width: usize, height: usize) -> (usize, usize) {
+        let floor = self.min_generation_area();
+        if width * height >= floor {
+            return (width, height);
+        }
+        let unit = self.size_unit();
+        let scale = (floor as f64 / (width * height) as f64).sqrt();
+        let side = |v: usize| (v as f64 * scale / unit as f64).ceil() as usize * unit;
+        (side(width), side(height))
     }
 
     /// The architecture and width of the text encoder the transformer reads.
@@ -221,6 +282,10 @@ impl Variant {
             Self::QwenImage21 => ("qwen3vl", 4096),
             Self::Flux2Klein => ("qwen3", orangu::model_spec::FLUX2_KLEIN_TEXT_ENCODER_WIDTH),
             Self::MossImage => ("qwen35", orangu::model_spec::MOSS_IMAGE_TEXT_ENCODER_WIDTH),
+            Self::MiniMaxH3Image => (
+                "qwen3vl",
+                orangu::model_spec::MINIMAX_H3_IMAGE_TEXT_ENCODER_WIDTH,
+            ),
         }
     }
 
@@ -240,6 +305,10 @@ impl Variant {
                 orangu::model_download::MOSS_IMAGE_TEXT_ENCODER_REPO,
                 orangu::model_download::MOSS_IMAGE_TEXT_ENCODER_TAG,
             ),
+            Self::MiniMaxH3Image => (
+                orangu::model_download::MINIMAX_H3_IMAGE_TEXT_ENCODER_REPO,
+                orangu::model_download::MINIMAX_H3_IMAGE_TEXT_ENCODER_TAG,
+            ),
         }
     }
 
@@ -258,6 +327,10 @@ impl Variant {
                 orangu::model_download::MOSS_IMAGE_VAE_REPO,
                 orangu::model_download::MOSS_IMAGE_VAE_FILE,
             ),
+            Self::MiniMaxH3Image => (
+                orangu::model_download::MINIMAX_H3_IMAGE_VAE_REPO,
+                orangu::model_download::MINIMAX_H3_IMAGE_VAE_FILE,
+            ),
         }
     }
 
@@ -265,7 +338,8 @@ impl Variant {
     /// [`ImageDefaults::default`] for Qwen-Image's. Qwen-Image 2.1's are
     /// forty steps without guidance (`true_cfg_scale = 1.0`, "meant to be
     /// sampled without guidance"); FLUX.2 [klein] base's are fifty at
-    /// guidance 4; MOSS-Image's fifty at guidance 3.
+    /// guidance 4; MOSS-Image's fifty at guidance 3; MiniMax-H3-Image's the
+    /// six it was distilled for, without guidance.
     pub fn release_steps_and_cfg(self) -> (usize, f32) {
         match self {
             Self::QwenImage => {
@@ -275,6 +349,7 @@ impl Variant {
             Self::QwenImage21 => (40, 1.0),
             Self::Flux2Klein => (50, 4.0),
             Self::MossImage => (50, 3.0),
+            Self::MiniMaxH3Image => (6, 1.0),
         }
     }
 
@@ -285,7 +360,7 @@ impl Variant {
     pub fn turbo_steps_and_cfg(self) -> (usize, f32) {
         match self {
             Self::Flux2Klein => (4, 1.0),
-            Self::MossImage => self.release_steps_and_cfg(),
+            Self::MossImage | Self::MiniMaxH3Image => self.release_steps_and_cfg(),
             Self::QwenImage | Self::QwenImage21 => (8, 1.0),
         }
     }
@@ -295,7 +370,7 @@ impl Variant {
     /// string for FLUX.2 and MOSS-Image, whose pipelines guide against `""`.
     fn blank_negative(self) -> &'static str {
         match self {
-            Self::Flux2Klein | Self::MossImage => "",
+            Self::Flux2Klein | Self::MossImage | Self::MiniMaxH3Image => "",
             Self::QwenImage | Self::QwenImage21 => " ",
         }
     }
@@ -311,6 +386,10 @@ impl Variant {
             Self::Flux2Klein => 3.1e9,
             // `4 × 3072² + 3 × 3072 × 8192` per block, forty-two blocks.
             Self::MossImage => 4.8e9,
+            // `5376 × 3 × 7168 + 7168 × 5376 + 3 × 5376 × 14336` per block,
+            // fifty blocks, over a 32-pixel token: a quarter of it per
+            // 16-pixel cell, the unit the rate model counts in.
+            Self::MiniMaxH3Image => 4.8e9,
         }
     }
 }
@@ -400,7 +479,13 @@ impl Companions {
             None => find_vae(models_dir, variant)?,
         };
         let vision = match (variant, vision) {
-            (Variant::QwenImage | Variant::Flux2Klein | Variant::MossImage, _)
+            (
+                Variant::QwenImage
+                | Variant::Flux2Klein
+                | Variant::MossImage
+                | Variant::MiniMaxH3Image,
+                _,
+            )
             | (_, Some("none")) => None,
             (Variant::QwenImage21, Some(path)) => {
                 let path = PathBuf::from(path);
@@ -434,6 +519,9 @@ fn find_text_encoder(models_dir: &Path, variant: Variant) -> Result<PathBuf> {
         Variant::QwenImage21 => orangu::model_spec::find_qwen_image21_text_encoder(models_dir),
         Variant::Flux2Klein => orangu::model_spec::find_flux2_klein_text_encoder(models_dir),
         Variant::MossImage => orangu::model_spec::find_moss_image_text_encoder(models_dir),
+        Variant::MiniMaxH3Image => {
+            orangu::model_spec::find_minimax_h3_image_text_encoder(models_dir)
+        }
     };
     let (architecture, width) = variant.text_encoder();
     let (repo, tag) = variant.text_encoder_download();
@@ -442,6 +530,7 @@ fn find_text_encoder(models_dir: &Path, variant: Variant) -> Result<PathBuf> {
         Variant::QwenImage21 => "Qwen3-VL-8B",
         Variant::Flux2Klein => "Qwen3-4B",
         Variant::MossImage => "Qwen3.5-9B",
+        Variant::MiniMaxH3Image => "Qwen3-VL-32B-Instruct",
     };
     found.ok_or_else(|| {
         anyhow::anyhow!(
@@ -474,6 +563,10 @@ fn find_vae(models_dir: &Path, variant: Variant) -> Result<PathBuf> {
                 .or_else(|| orangu::model_spec::find_flux2_vae(models_dir)),
             "MOSS-Image or FLUX.2 VAE (a .safetensors with a 32-channel decoder and its latent \
              batch statistics)",
+        ),
+        Variant::MiniMaxH3Image => (
+            orangu::model_spec::find_minimax_h3_image_vae(models_dir),
+            "MiniMax-H3-Image VAE (a .safetensors with a 24-channel vision-transformer decoder)",
         ),
     };
     let (repo, file) = variant.vae_download();
@@ -558,6 +651,7 @@ fn calibration_tensor(transformer: &LoadedModel) -> &'static str {
         "transformer_blocks.0.img_mlp.proj.weight",
         Flux2Transformer::CALIBRATION_TENSOR,
         MossTransformer::CALIBRATION_TENSOR,
+        H3Transformer::CALIBRATION_TENSOR,
     ]
     .into_iter()
     .find(|name| transformer.has_tensor(name))
@@ -607,7 +701,7 @@ impl Variant {
     pub fn encoder_tokens(self) -> usize {
         match self {
             Self::Flux2Klein => FLUX2_PROMPT_TOKENS,
-            Self::QwenImage | Self::QwenImage21 | Self::MossImage => 64,
+            Self::QwenImage | Self::QwenImage21 | Self::MossImage | Self::MiniMaxH3Image => 64,
         }
     }
 }
@@ -999,6 +1093,13 @@ enum Model {
         transformer: MossTransformer,
         vae: Flux2Vae,
     },
+    MiniMaxH3Image {
+        transformer: H3Transformer,
+        vae: H3ImageVae,
+        /// The Qwen3-VL encoder read through the reference forward, which
+        /// returns an inner layer.
+        text: qwen3vl::TextModel,
+    },
 }
 
 /// A prompt as the transformer reads it: Qwen-Image's text-encoder hidden
@@ -1150,6 +1251,48 @@ impl Pipeline {
                 )
             })?;
         let (_, text_width) = variant.text_encoder();
+        if variant == Variant::MiniMaxH3Image {
+            ensure!(
+                lora.is_none(),
+                "no adapter is served for {}: set [orangu-server].image_lora = none",
+                variant.architecture()
+            );
+            let transformer = H3Transformer::load(transformer, backend.clone())
+                .context("building the minimax_h3_image transformer")?;
+            ensure!(
+                transformer.config.txt_dim == encoder.config().n_embd,
+                "the transformer reads {}-wide text states but the text encoder produces {} \
+                 (MiniMax-H3-Image reads Qwen3-VL-32B-Instruct: point \
+                 [orangu-server].text_encoder at it)",
+                transformer.config.txt_dim,
+                encoder.config().n_embd
+            );
+            let weights = encoder_placement
+                .open(&companions.text_encoder)
+                .context("mapping the text encoder")?;
+            ensure!(
+                weights.config.n_layer >= orangu::model_spec::MINIMAX_H3_IMAGE_TEXT_LAYER,
+                "the text encoder has {} layers; the transformer reads layer {}",
+                weights.config.n_layer,
+                orangu::model_spec::MINIMAX_H3_IMAGE_TEXT_LAYER
+            );
+            let text = qwen3vl::TextModel::load(&weights, encoder_placement.backend.clone())?;
+            let vae = H3ImageVae::load(&companions.vae, backend, vae_precision)
+                .context("loading the VAE")?;
+            return Ok(Self::assemble(
+                Model::MiniMaxH3Image {
+                    transformer,
+                    vae,
+                    text,
+                },
+                variant,
+                encoder,
+                tokenizer,
+                defaults,
+                companions,
+                rate,
+            ));
+        }
         if variant == Variant::MossImage {
             ensure!(
                 lora.is_none(),
@@ -1371,6 +1514,7 @@ impl Pipeline {
             Model::QwenImage21 { transformer, .. } => &transformer.config,
             Model::Flux2Klein { transformer, .. } => &transformer.config,
             Model::MossImage { transformer, .. } => &transformer.config,
+            Model::MiniMaxH3Image { transformer, .. } => &transformer.config,
         }
     }
 
@@ -1415,6 +1559,9 @@ impl Pipeline {
             Model::MossImage { .. } => self.encode_prompt_moss(PROMPT).map(drop),
             Model::Flux2Klein { text, .. } => self
                 .encode_prompt_flux2(text, PROMPT, &AtomicBool::new(false))
+                .map(drop),
+            Model::MiniMaxH3Image { text, .. } => self
+                .encode_prompt_h3(text, PROMPT, &AtomicBool::new(false))
                 .map(drop),
         }
     }
@@ -1524,6 +1671,29 @@ impl Pipeline {
         Ok(hidden)
     }
 
+    /// MiniMax-H3-Image's conditioning: the bare prompt (no chat template)
+    /// through the encoder's first [`orangu::model_spec::
+    /// MINIMAX_H3_IMAGE_TEXT_LAYER`] layers — `[n, 5120]`, before the
+    /// transformer's text blocks.
+    fn encode_prompt_h3(
+        &self,
+        text: &qwen3vl::TextModel,
+        prompt: &str,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<f32>> {
+        let mut tokens = self.tokenizer.encode(prompt, false);
+        tokens.truncate(MINIMAX_H3_PROMPT_TOKENS);
+        ensure!(!tokens.is_empty(), "the prompt encoded to no tokens");
+        let n = tokens.len();
+        text.forward_layers_masked(
+            &tokens,
+            n,
+            &[orangu::model_spec::MINIMAX_H3_IMAGE_TEXT_LAYER],
+            Some(cancel),
+        )
+        .context("running the text encoder")
+    }
+
     /// A prompt as the transformer reads it (see [`Condition`]).
     fn condition(&self, prompt: &str, cancel: &AtomicBool) -> Result<Condition> {
         match &self.model {
@@ -1544,6 +1714,25 @@ impl Pipeline {
                     hidden.len() / self.encoder.config().n_embd.max(1),
                 );
                 Ok(Condition::Hidden(text))
+            }
+            Model::MiniMaxH3Image {
+                transformer, text, ..
+            } => {
+                let started = Instant::now();
+                let hidden = self.encode_prompt_h3(text, prompt, cancel)?;
+                let encoded = started.elapsed();
+                if cancelled(Some(cancel)) {
+                    bail!("cancelled");
+                }
+                let refined = transformer.embed_text(&hidden)?;
+                log::info!(
+                    "orangu-server: [image] prompt: text encoder {:.1}s, text blocks {:.1}s \
+                     ({} tokens)",
+                    encoded.as_secs_f64(),
+                    (started.elapsed() - encoded).as_secs_f64(),
+                    hidden.len() / transformer.config.txt_dim.max(1),
+                );
+                Ok(Condition::Hidden(refined))
             }
             Model::Flux2Klein { text, .. } => {
                 let started = Instant::now();
@@ -1714,18 +1903,22 @@ impl Pipeline {
             Model::QwenImage21 { transformer, .. } => transformer.take_stages(),
             Model::Flux2Klein { transformer, .. } => transformer.take_stages(),
             Model::MossImage { transformer, .. } => transformer.take_stages(),
+            Model::MiniMaxH3Image { transformer, .. } => transformer.take_stages(),
         }
     }
 
-    /// One velocity prediction for `latents` under `condition`. `negative`
-    /// marks the guidance branch, which MOSS-Image runs with
-    /// [`MOSS_UNCOND_SKIP`] left out.
+    /// One velocity prediction for `latents` under `condition`, for a step
+    /// from `sigma` to `sigma_next` (MiniMax-H3-Image picks its output heads
+    /// by both). `negative` marks the guidance branch, which MOSS-Image runs
+    /// with [`MOSS_UNCOND_SKIP`] left out.
+    #[allow(clippy::too_many_arguments)]
     fn velocity(
         &self,
         latents: &[f32],
         grid: (usize, usize),
         condition: &Condition,
         sigma: f32,
+        sigma_next: f32,
         negative: bool,
         cancel: &AtomicBool,
     ) -> Result<Vec<f32>> {
@@ -1766,6 +1959,15 @@ impl Pipeline {
                     cancel: Some(cancel),
                 })
             }
+            (Model::MiniMaxH3Image { transformer, .. }, Condition::Hidden(txt)) => transformer
+                .forward(&minimax_h3::ForwardInput {
+                    img: latents,
+                    grid,
+                    txt,
+                    sigma,
+                    sigma_next,
+                    cancel: Some(cancel),
+                }),
             _ => bail!("a prompt encoded for one picture model was given to the other"),
         }
     }
@@ -1788,7 +1990,10 @@ impl Pipeline {
     fn guide(&self, positive: &mut [f32], negative: &[f32], scale: f32, token_width: usize) {
         match self.variant {
             Variant::QwenImage => guide(positive, negative, scale, token_width),
-            Variant::QwenImage21 | Variant::Flux2Klein | Variant::MossImage => {
+            Variant::QwenImage21
+            | Variant::Flux2Klein
+            | Variant::MossImage
+            | Variant::MiniMaxH3Image => {
                 for (p, n) in positive.iter_mut().zip(negative) {
                     *p = n + scale * (*p - n);
                 }
@@ -1858,6 +2063,11 @@ impl Pipeline {
                 normalize_flux2(&mut tokens, vae);
                 Ok(tokens)
             }
+            Model::MiniMaxH3Image { .. } => bail!(
+                "{} draws from text alone: its VAE is published without the encoder an \
+                 attached picture would need",
+                self.variant.architecture()
+            ),
         }
     }
 
@@ -1902,6 +2112,15 @@ impl Pipeline {
                 let z = unpack_patches(&tokens, h8, w8, vae_flux2::Z_DIM);
                 vae.decode_unless(&Feature::new(h8, w8, vae_flux2::Z_DIM, z), Some(cancel))
             }
+            Model::MiniMaxH3Image { vae, .. } => {
+                let (h16, w16) = (
+                    height / vae_h3::SPATIAL_COMPRESSION,
+                    width / vae_h3::SPATIAL_COMPRESSION,
+                );
+                let mut z = unpack_patches(latents, h16, w16, vae_h3::Z_DIM);
+                vae_h3::denormalize(&mut z);
+                vae.decode_unless(&Feature::new(h16, w16, vae_h3::Z_DIM, z), Some(cancel))
+            }
         }
     }
 
@@ -1930,10 +2149,25 @@ impl Pipeline {
         );
         ensure!(request.steps > 0, "steps must be at least 1");
         ensure!(!request.prompt.trim().is_empty(), "the prompt is empty");
-        // One token per 16 pixels along each side for both models: 2x2
-        // eight-pixel cells packed, or one sixteen-pixel cell.
-        let grid = (request.height / 16, request.width / 16);
+        ensure!(
+            request.init.is_none() || self.variant != Variant::MiniMaxH3Image,
+            "{} draws from text alone: its VAE is published without the encoder an attached \
+             picture would need",
+            self.variant.architecture()
+        );
+        // One token per 16 pixels along each side for all but MiniMax-H3-
+        // Image: 2x2 eight-pixel cells packed, or one sixteen-pixel cell.
+        // Its tokens are 2x2 sixteen-pixel cells, 32 pixels.
+        // A request below the variant's smallest good area is drawn on a
+        // larger canvas and scaled back down after the VAE.
+        let (width, height) = self
+            .variant
+            .generation_canvas(request.width, request.height);
+        let cell = self.variant.token_pixels();
+        let grid = (height / cell, width / cell);
         let n_tokens = grid.0 * grid.1;
+        // The rate model counts sixteen-pixel cells whatever a token covers.
+        let rate_tokens = (height / 16) * (width / 16);
         let seed = request.seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1953,13 +2187,13 @@ impl Pipeline {
         // and every block before the first step.
         let passes_per_step = if request.cfg_scale > 1.0 { 2.0 } else { 1.0 };
         let reference_tokens = self.reference_tokens(request);
-        let keys = n_tokens + reference_tokens;
+        let keys = rate_tokens + reference_tokens;
         if let Some(rate) = self.rate_model() {
             progress(Progress {
                 step: 0,
                 steps: request.steps,
                 // A reused step costs next to nothing: the share that runs.
-                seconds_per_step: rate.seconds_per_step_over(n_tokens, keys, passes_per_step)
+                seconds_per_step: rate.seconds_per_step_over(rate_tokens, keys, passes_per_step)
                     * rate.step_share(),
                 pending_seconds: if reference_tokens > 0 {
                     rate.edit_encode(reference_tokens, passes_per_step)
@@ -2017,6 +2251,8 @@ impl Pipeline {
             scheduler::flux2_sigmas(request.steps, n_tokens)
         } else if self.variant == Variant::MossImage {
             scheduler::moss_sigmas(request.steps)
+        } else if self.variant == Variant::MiniMaxH3Image {
+            scheduler::minimax_h3_sigmas(request.steps)
         } else if self.turbo {
             scheduler::resample(&scheduler::QWEN_IMAGE_21_TURBO, request.steps)
         } else {
@@ -2030,13 +2266,7 @@ impl Pipeline {
         let mut latents = noise.normals(n_tokens * token_width);
         let mut first_step = 0;
         if let Some(init) = request.init.as_ref().filter(|_| reference.is_none()) {
-            let clean = self.latent_from_picture(
-                &init.bytes,
-                request.width,
-                request.height,
-                &mut noise,
-                cancel,
-            )?;
+            let clean = self.latent_from_picture(&init.bytes, width, height, &mut noise, cancel)?;
             first_step = scheduler::first_step_for_strength(steps, init.strength);
             if first_step >= steps {
                 // Strength 0: nothing to run; the picture comes straight back
@@ -2058,7 +2288,7 @@ impl Pipeline {
             if cancelled(Some(cancel)) {
                 bail!("cancelled");
             }
-            let sigma = sigmas[i];
+            let (sigma, sigma_next) = (sigmas[i], sigmas[i + 1]);
             let reused = cache.as_mut().and_then(|c| c.reuse(done, &latents));
             let velocity = match reused {
                 Some(velocity) => velocity,
@@ -2066,25 +2296,33 @@ impl Pipeline {
                     let (velocity, unguided) = match &negative {
                         Some(negative) if self.passes_overlap() => std::thread::scope(|scope| {
                             let unguided = scope.spawn(|| {
-                                self.velocity(&latents, grid, negative, sigma, true, cancel)
+                                self.velocity(
+                                    &latents, grid, negative, sigma, sigma_next, true, cancel,
+                                )
                             });
-                            let velocity =
-                                self.velocity(&latents, grid, &positive, sigma, false, cancel);
+                            let velocity = self.velocity(
+                                &latents, grid, &positive, sigma, sigma_next, false, cancel,
+                            );
                             let unguided = unguided
                                 .join()
                                 .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
                             (velocity, Some(unguided))
                         }),
                         Some(negative) => {
-                            let velocity =
-                                self.velocity(&latents, grid, &positive, sigma, false, cancel);
+                            let velocity = self.velocity(
+                                &latents, grid, &positive, sigma, sigma_next, false, cancel,
+                            );
                             let unguided = velocity.is_ok().then(|| {
-                                self.velocity(&latents, grid, negative, sigma, true, cancel)
+                                self.velocity(
+                                    &latents, grid, negative, sigma, sigma_next, true, cancel,
+                                )
                             });
                             (velocity, unguided)
                         }
                         None => (
-                            self.velocity(&latents, grid, &positive, sigma, false, cancel),
+                            self.velocity(
+                                &latents, grid, &positive, sigma, sigma_next, false, cancel,
+                            ),
                             None,
                         ),
                     };
@@ -2098,7 +2336,7 @@ impl Pipeline {
                     velocity
                 }
             };
-            scheduler::euler_step(&mut latents, &velocity, sigma, sigmas[i + 1]);
+            scheduler::euler_step(&mut latents, &velocity, sigma, sigma_next);
             progress(Progress {
                 step: done + 1,
                 steps: steps_to_run,
@@ -2125,10 +2363,10 @@ impl Pipeline {
         // 256-pixel picture as an hour and a half.
         if steps_to_run > 0
             && timings.denoise.as_secs_f64() > 0.0
-            && n_tokens >= RATE_MODEL_MIN_TOKENS
+            && rate_tokens >= RATE_MODEL_MIN_TOKENS
         {
             let passed = steps_to_run - skipped;
-            let token_passes = (n_tokens * passed.max(1)) as f64 * passes_per_step;
+            let token_passes = (rate_tokens * passed.max(1)) as f64 * passes_per_step;
             let attention = timings.stages.attention.as_secs_f64();
             let linear = (timings.denoise.as_secs_f64() - attention).max(0.0);
             let mut rate = self
@@ -2143,9 +2381,8 @@ impl Pipeline {
             *rate = Some(RateModel {
                 linear_per_token_pass: linear / token_passes,
                 attention_per_token_pass: attention / token_passes,
-                attention_tokens: (n_tokens + edited.unwrap_or(0)) as f64,
-                decode_per_pixel: timings.decode.as_secs_f64()
-                    / (request.width * request.height) as f64,
+                attention_tokens: (rate_tokens + edited.unwrap_or(0)) as f64,
+                decode_per_pixel: timings.decode.as_secs_f64() / (width * height) as f64,
                 encode: match (edited, previous) {
                     (Some(_), Some(p)) => p.encode,
                     _ => encode,
@@ -2163,9 +2400,12 @@ impl Pipeline {
 
         let decode_started = Instant::now();
         let _ = vae::take_conv_clock();
-        let picture = self
-            .picture_from_latent(&latents, request.width, request.height, cancel)
+        let mut picture = self
+            .picture_from_latent(&latents, width, height, cancel)
             .context("decoding the picture")?;
+        if (width, height) != (request.width, request.height) {
+            picture = codec::resize(&picture, request.width, request.height)?;
+        }
         let vae_done = decode_started.elapsed();
         let convs = vae::take_conv_clock();
         let bytes = codec::encode(&picture, request.format)?;
@@ -2186,10 +2426,15 @@ impl Pipeline {
             (timings.decode - vae_done).as_secs_f64(),
         );
         log::info!(
-            "orangu-server: [image] {}x{} in {:.1}s: encode {:.1}s, {} step(s) {:.1}s ({:.1}s each), \
-             decode {:.1}s",
+            "orangu-server: [image] {}x{}{} in {:.1}s: encode {:.1}s, {} step(s) {:.1}s \
+             ({:.1}s each), decode {:.1}s",
             request.width,
             request.height,
+            if (width, height) != (request.width, request.height) {
+                format!(" (drawn at {width}x{height})")
+            } else {
+                String::new()
+            },
             started.elapsed().as_secs_f64(),
             timings.encode.as_secs_f64(),
             steps_to_run,
@@ -2470,6 +2715,17 @@ pub(crate) fn unpack_patches(tokens: &[f32], h8: usize, w8: usize, channels: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_small_minimax_h3_request_is_drawn_on_a_larger_canvas() {
+        let h3 = Variant::MiniMaxH3Image;
+        assert_eq!(h3.generation_canvas(256, 256), (512, 512));
+        assert_eq!(h3.generation_canvas(512, 512), (512, 512));
+        assert_eq!(h3.generation_canvas(1024, 768), (1024, 768));
+        let (w, h) = h3.generation_canvas(384, 192);
+        assert_eq!((w, h), (736, 384));
+        assert_eq!(Variant::QwenImage.generation_canvas(256, 256), (256, 256));
+    }
 
     /// The rate model scales attention with the token count and the rest
     /// linearly: a step at four times the tokens of the measurement costs

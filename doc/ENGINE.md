@@ -333,6 +333,30 @@ are FLUX.2's. `scheduler::moss_sigmas` shifts by 5 and snaps to the
 thousand training levels, so a large step count can run fewer steps, and
 the guidance pass skips block 22 (`MOSS_UNCOND_SKIP`).
 
+`minimax_h3_image`, MiniMax-H3-Image, is the fifth. Its GGUFs say
+`hyvid`; `model_spec::architecture_from_tensors` names it by
+`video_patch_proj` with `condition_proj` and no `audio_patch_proj` (the
+MiniMax-H3 video model's). The transformer (`image::minimax_h3`) is fifty
+single-stream blocks over `[text | picture]` with a 7168-wide attention
+(56 heads of 128) in a 5376-wide stream, a SwiGLU feed-forward, and
+three-axis rotate-half rotary positions over the first 96 of each head's
+values (`rope.inv_freq`; text at `(i, 0, 0)`, the picture at the text's
+length with its rows and columns spread over a 32-unit side by aspect
+ratio). Each block's `adaln_proj` writes picture, text and audio
+modulation sets from eight curve coordinates interpolated out of
+`adaln_t_table` at `t = 1 - sigma` (the checkpoint's "pruned" curve form,
+no SiLU); a two-block text refiner runs once per prompt
+(`H3Transformer::embed_text`). The output layer holds six heads, the base
+and one offset per distilled step, weighted by `pdd_head_weights`, and
+the velocity is their negated sum. The text encoder is Qwen3-VL-32B-
+Instruct read through `qwen3vl::TextModel::forward_layers_masked` at layer
+50 on the bare prompt. The VAE (`image::vae_h3`) is a 24-block ViT
+decoder with four register tokens, weightless q/k RMS norms and a
+two-axis base-100 rotary over half of each 64-wide head, decoded in
+16-cell tiles overlapping by a quarter with smootherstep blending, as the
+reference does. `scheduler::minimax_h3_sigmas` is the six release levels,
+resampled for another count.
+
 `ltxv`, LTX-2.5's audio-video diffusion transformer, is the other family
 outside the table, in `engine::video`. It draws a clip's frames and its
 sound together: two token streams, video and audio, through 48 blocks that

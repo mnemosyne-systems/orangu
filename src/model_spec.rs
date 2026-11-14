@@ -182,6 +182,19 @@ pub const MOSS_IMAGE_ARCHITECTURE: &str = "moss_image";
 /// The width of the text encoder MOSS-Image reads: Qwen3.5-9B's.
 pub const MOSS_IMAGE_TEXT_ENCODER_WIDTH: u64 = 4096;
 
+/// The architecture of a MiniMax-H3-Image diffusion transformer — a name
+/// this project gives it: its GGUFs say `general.architecture = hyvid`, the
+/// name the MiniMax-H3 video-and-audio transformers carry too.
+pub const MINIMAX_H3_IMAGE_ARCHITECTURE: &str = "minimax_h3_image";
+
+/// The width of the text encoder MiniMax-H3-Image reads: MiniMax-H3's
+/// Qwen3-VL-32B.
+pub const MINIMAX_H3_IMAGE_TEXT_ENCODER_WIDTH: u64 = 5120;
+
+/// The encoder layer whose hidden states MiniMax-H3-Image reads
+/// (`hidden_states[50]`: the output of the fiftieth decoder layer).
+pub const MINIMAX_H3_IMAGE_TEXT_LAYER: usize = 50;
+
 /// The prefix the ComfyUI/stable-diffusion.cpp GGUF tooling writes before
 /// every tensor of a diffusion model (`model.diffusion_model.img_in.weight`)
 /// — the `unsloth/Qwen-Image-2.1-GGUF` files keep it.
@@ -201,6 +214,10 @@ pub const DIFFUSION_MODEL_PREFIX: &str = "model.diffusion_model.";
 /// (`double_stream_modulation_img`, …) where FLUX.1's carry their own, and
 /// [klein] has no guidance embedder (FLUX.2 [dev], which does, is left as
 /// `flux`).
+///
+/// `unsloth/MiniMax-H3-Image-GGUF` says `hyvid`, as the MiniMax-H3 video
+/// GGUFs do: the picture model is the one without an audio input
+/// projection (`audio_patch_proj`).
 pub fn architecture_from_tensors(gguf: &GgufFile) -> Option<&'static str> {
     let has = |name: &str| {
         gguf.tensors.iter().any(|t| {
@@ -217,6 +234,13 @@ pub fn architecture_from_tensors(gguf: &GgufFile) -> Option<&'static str> {
     {
         return Some(FLUX2_KLEIN_ARCHITECTURE);
     }
+    if has("video_patch_proj.weight")
+        && has("condition_proj.weight")
+        && has("token_refiner.blocks.0.attn.qkv_proj.weight")
+        && !has("audio_patch_proj.weight")
+    {
+        return Some(MINIMAX_H3_IMAGE_ARCHITECTURE);
+    }
     (has("txt_in.text_norm.weight")
         && has("modulation.1.weight")
         && has("transformer_blocks.0.attn.to_q.weight")
@@ -231,6 +255,7 @@ pub const IMAGE_ARCHITECTURES: &[&str] = &[
     QWEN_IMAGE_21_ARCHITECTURE,
     FLUX2_KLEIN_ARCHITECTURE,
     MOSS_IMAGE_ARCHITECTURE,
+    MINIMAX_H3_IMAGE_ARCHITECTURE,
 ];
 
 /// Whether `architecture` is one of [`IMAGE_ARCHITECTURES`].
@@ -479,6 +504,67 @@ pub fn is_moss_image_vae(path: &Path) -> bool {
 /// FLUX.2 VAE ([`find_flux2_vae`]) decodes the same latents.
 pub fn find_moss_image_vae(dir: &Path) -> Option<PathBuf> {
     first_safetensors(dir, is_moss_image_vae)
+}
+
+/// Whether `path` is the text encoder a `minimax_h3_image` model needs —
+/// Qwen3-VL-32B-Instruct, which MiniMax-H3's text encoder is unchanged: a
+/// `qwen3vl` GGUF 5120 wide with at least the fifty layers the transformer
+/// reads from, whose header names it an instruct model and not the
+/// thinking one, and that is not an embedding model (which declares a
+/// `pooling_type`). Judged from its header alone.
+pub fn is_minimax_h3_image_text_encoder(path: &Path) -> bool {
+    let Ok(gguf) = GgufFile::open_summary(path) else {
+        return false;
+    };
+    let key = |name: &str| {
+        gguf.metadata
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v)
+    };
+    let names: Vec<String> = ["general.basename", "general.name", "general.finetune"]
+        .iter()
+        .filter_map(|k| match key(k) {
+            Some(crate::gguf::GgufValue::String(s)) => Some(s.to_ascii_lowercase()),
+            _ => None,
+        })
+        .collect();
+    let instruct = names.iter().any(|n| n.contains("instruct"))
+        && !names.iter().any(|n| n.contains("thinking"));
+    architecture_of(&gguf).as_deref() == Some("qwen3vl")
+        && key("qwen3vl.embedding_length").and_then(|v| v.as_u64())
+            == Some(MINIMAX_H3_IMAGE_TEXT_ENCODER_WIDTH)
+        && key("qwen3vl.block_count")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|n| n >= MINIMAX_H3_IMAGE_TEXT_LAYER as u64)
+        && key("qwen3vl.pooling_type").is_none()
+        && instruct
+}
+
+/// Every MiniMax-H3-Image text encoder under `dir` (see
+/// [`is_minimax_h3_image_text_encoder`]), largest file first.
+pub fn find_minimax_h3_image_text_encoder(dir: &Path) -> Option<PathBuf> {
+    largest_gguf(dir, is_minimax_h3_image_text_encoder)
+}
+
+/// Whether `path` is MiniMax-H3-Image's VAE: a `safetensors` whose decoder
+/// is the 2-D vision transformer — 24 latent channels into 1024-wide tokens
+/// (`decoder.x_embedder.weight`, `[1024, 24]`) and one 16x16 RGB patch out
+/// of each (`decoder.proj_out.weight`, `[768, 1024]`). Judged from the
+/// header; MiniMax-H3's video VAE writes four frames a token and does not
+/// match.
+pub fn is_minimax_h3_image_vae(path: &Path) -> bool {
+    let Some(header) = safetensors_header(path) else {
+        return false;
+    };
+    shape_of(&header, "decoder.x_embedder.weight").is_some_and(|s| s == [1024, 24])
+        && shape_of(&header, "decoder.proj_out.weight").is_some_and(|s| s == [768, 1024])
+        && header.get("post_quant_conv.weight").is_some()
+}
+
+/// The first MiniMax-H3-Image VAE under `dir`, in path order.
+pub fn find_minimax_h3_image_vae(dir: &Path) -> Option<PathBuf> {
+    first_safetensors(dir, is_minimax_h3_image_vae)
 }
 
 /// Whether `path` is the vision half of Qwen3-VL-8B — the `mmproj-*.gguf`
@@ -2399,6 +2485,23 @@ mod tests {
         assert_eq!(
             architecture_of(&file(&dev, Some("flux"))).as_deref(),
             Some("flux")
+        );
+        // MiniMax-H3-Image under the video model's label; the video model,
+        // which has an audio input, keeps it.
+        let h3 = [
+            "video_patch_proj.weight",
+            "condition_proj.weight",
+            "token_refiner.blocks.0.attn.qkv_proj.weight",
+        ];
+        assert_eq!(
+            architecture_of(&file(&h3, Some("hyvid"))).as_deref(),
+            Some(MINIMAX_H3_IMAGE_ARCHITECTURE)
+        );
+        let mut h3_video = h3.to_vec();
+        h3_video.push("audio_patch_proj.weight");
+        assert_eq!(
+            architecture_of(&file(&h3_video, Some("hyvid"))).as_deref(),
+            Some("hyvid")
         );
         let flux1 = [
             "double_blocks.0.img_mod.lin.weight",

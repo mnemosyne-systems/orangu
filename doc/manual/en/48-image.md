@@ -315,6 +315,54 @@ RX 5500M a 512 × 512 picture at twenty guided steps takes about seven
 minutes, the transformer on the card and the encoder on the integrated
 GPU.
 
+### MiniMax-H3-Image
+
+**MiniMax-H3-Image** (MiniMax's text-to-image model: a 33-billion-parameter
+transformer distilled to six steps without guidance) is served as
+`minimax_h3_image`. It needs two companions, which the download fetches
+beside it:
+
+```sh
+orangu-server download unsloth/MiniMax-H3-Image-GGUF:UD-Q4_K_XL
+```
+
+- **The transformer** — `minimax_h3_image_pruned-UD-Q4_K_XL.gguf` from
+  `unsloth/MiniMax-H3-Image-GGUF`, 12.7 GiB (`UD-Q2_K_XL` is 8.1 GiB,
+  `Q8_0` 20.5 GiB).
+- **The text encoder** — `Qwen3-VL-32B-Instruct-Q4_K_M.gguf` from
+  `unsloth/Qwen3-VL-32B-Instruct-GGUF`, 18.4 GiB. MiniMax-H3's text encoder
+  is Qwen3-VL-32B-Instruct unchanged; the picture is conditioned on its
+  fiftieth layer. Any quantization of it under `models` is used instead
+  (not the Thinking model). The `qwen3vl_32b_minimax_h3-*.gguf` files of
+  `unsloth/MiniMax-H3-GGUF` carry no tokenizer and are not read.
+- **The VAE** — `vae/diffusion_pytorch_model.safetensors` from
+  `MiniMaxAI/MiniMax-H3-Image`, 2.2 GiB: a vision-transformer decoder with
+  16 pixels to a latent cell, run in 256-pixel tiles.
+
+`list` shows the transformer as `Yes (minimax_h3_image)`. Its file says
+`hyvid`, the name the MiniMax-H3 video GGUFs carry as well; the server
+recognises the picture model by its tensors, and a video file stays
+`No (hyvid)`.
+
+It is released to run **six steps without guidance**, which is what
+`image_steps` and `image_cfg_scale` default to under it; each step uses the
+output head the model was distilled with for it, so another step count is
+an approximation. Sides are multiples of **32 pixels**, and the prompt is
+read as written — no chat template — up to 4,096 tokens.
+
+The model falls apart on small canvases: its makers give 4 megapixels and
+up as its working range. A request under 512 × 512 in area is drawn at the
+same aspect ratio on a canvas of at least that area and scaled down to the
+requested size, so a 256 × 256 picture costs as much as a 512 × 512 one.
+Larger sizes give more detail and cost more time.
+
+MiniMax-H3-Image does not draw transparency, and it draws from text
+alone: a request with an attached picture is refused, because the
+published VAE has no encoder. There is no adapter for it: `image_lora`
+stays `auto` (nothing) or `none`. Hold about 34 GiB of memory for the
+three files. On a laptop with a 4 GB RX 5500M a 512 × 512 picture takes
+about seven minutes, a minute a step.
+
 ## Starting the server
 
 The image model is served in its own role, `image`, and `--image` is the
@@ -392,9 +440,9 @@ not say otherwise. Each row has an **(i)** that explains it on hover.
 
 | setting | choices | |
 | :-- | :-- | :-- |
-| **Size** | 256 × 256 up to 2048 × 2048, or *Other…* for any `WIDTHxHEIGHT` | Both sides a multiple of 32 for Qwen-Image 2.1 (16 for Qwen-Image 2512, FLUX.2 [klein] and MOSS-Image); a preset the served model cannot draw, such as 1280 × 720 on 2.1, is greyed. 1024 × 1024 is the default; 2048 × 2048 is 2.1's native size, and hours on a CPU. 512 × 512 is a preview in minutes |
-| **Steps** | 4, 8, 20, 40, 50, or a number | The time is linear in them. Qwen-Image 2.1 is made for 40, and 20 is a usable draft. For 2512, the 8-step adapter is made for 8, the 4-step file for 4, and the base model without an adapter needs 50. FLUX.2 [klein] base is made for 50, a distilled [klein] for 4, MOSS-Image for 50 |
-| **Guidance** | Off, 4, 6, or a number | Classifier-free guidance pushes the picture towards the prompt and away from the negative one; it doubles the work of every step. Qwen-Image 2.1 is released to run with it off (stable-diffusion.cpp's examples use 6). For 2512: off under a Lightning adapter, which was trained without it, and 4 for the base model. FLUX.2 [klein] base: 4; a distilled [klein]: off; MOSS-Image: 3 |
+| **Size** | 256 × 256 up to 2048 × 2048, or *Other…* for any `WIDTHxHEIGHT` | Both sides a multiple of 32 for Qwen-Image 2.1 and MiniMax-H3-Image (16 for Qwen-Image 2512, FLUX.2 [klein] and MOSS-Image); a preset the served model cannot draw, such as 1280 × 720 on 2.1, is greyed. 1024 × 1024 is the default; 2048 × 2048 is 2.1's native size, and hours on a CPU. 512 × 512 is a preview in minutes |
+| **Steps** | 4, 8, 20, 40, 50, or a number | The time is linear in them. Qwen-Image 2.1 is made for 40, and 20 is a usable draft. For 2512, the 8-step adapter is made for 8, the 4-step file for 4, and the base model without an adapter needs 50. FLUX.2 [klein] base is made for 50, a distilled [klein] for 4, MOSS-Image for 50, MiniMax-H3-Image for 6 |
+| **Guidance** | Off, 4, 6, or a number | Classifier-free guidance pushes the picture towards the prompt and away from the negative one; it doubles the work of every step. Qwen-Image 2.1 is released to run with it off (stable-diffusion.cpp's examples use 6). For 2512: off under a Lightning adapter, which was trained without it, and 4 for the base model. FLUX.2 [klein] base: 4; a distilled [klein]: off; MOSS-Image: 3; MiniMax-H3-Image: off |
 | **Negative prompt** | text | What the picture is pushed away from — *blurry, text, extra limbs*. Read only when guidance is on |
 | **Strength** | 0 – 1 | For a picture started from an attached one (not an edit — see **Editing a picture**): how much of the schedule to run over it. 1 ignores the attachment's content and keeps only its size; 0 returns it unchanged; 0.6 keeps the composition and redraws the rest |
 | **Format** | PNG, JPEG, GIF, WebP, SVG | What the picture comes back as. PNG and WebP are lossless and keep a transparent picture's alpha, JPEG smaller (a transparent picture on white), GIF one frame on 256 colours, SVG a document of the picture's size carrying it as PNG (there is no pixels-to-vector). A picture started from an attachment comes back in the attachment's own format |

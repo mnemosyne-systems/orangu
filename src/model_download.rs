@@ -378,6 +378,17 @@ pub const MOSS_IMAGE_TEXT_ENCODER_TAG: &str = "Q8_0";
 pub const MOSS_IMAGE_VAE_REPO: &str = "OpenMOSS-Team/MOSS-Image-Base";
 pub const MOSS_IMAGE_VAE_FILE: &str = "vae/diffusion_pytorch_model.safetensors";
 
+/// The text encoder a `minimax_h3_image` model conditions on: MiniMax-H3's
+/// text encoder is Qwen3-VL-32B-Instruct unchanged, so the language model's
+/// own GGUF serves (the copy MiniMax publishes beside its video GGUFs has
+/// neither metadata nor a tokenizer). `Q4_K_M` is the quantization the
+/// transformer's GGUFs were measured with.
+pub const MINIMAX_H3_IMAGE_TEXT_ENCODER_REPO: &str = "unsloth/Qwen3-VL-32B-Instruct-GGUF";
+pub const MINIMAX_H3_IMAGE_TEXT_ENCODER_TAG: &str = "Q4_K_M";
+/// MiniMax-H3-Image's VAE, from the model's own repository.
+pub const MINIMAX_H3_IMAGE_VAE_REPO: &str = "MiniMaxAI/MiniMax-H3-Image";
+pub const MINIMAX_H3_IMAGE_VAE_FILE: &str = "vae/diffusion_pytorch_model.safetensors";
+
 /// Fetches what a picture model (`architecture`, one of
 /// [`crate::model_spec::IMAGE_ARCHITECTURES`]) needs beside it and does not
 /// carry. For `qwen_image`: the Qwen2.5-VL-7B text encoder (a `qwen2vl`
@@ -387,7 +398,8 @@ pub const MOSS_IMAGE_VAE_FILE: &str = "vae/diffusion_pytorch_model.safetensors";
 /// (`mmproj`, for editing a picture) and its own VAE — there is no adapter
 /// for it. For `flux2_klein`: the Qwen3-4B text encoder and the FLUX.2 VAE.
 /// For `moss_image`: the Qwen3.5-9B text encoder and MOSS-Image's VAE.
-/// Each is skipped when the models directory already
+/// For `minimax_h3_image`: the Qwen3-VL-32B-Instruct text encoder and the
+/// model's own VAE. Each is skipped when the models directory already
 /// holds one — a second quantization of the encoder is a choice, not a
 /// default — so a re-download, or a second checkpoint, fetches nothing
 /// twice.
@@ -399,6 +411,35 @@ pub fn download_image_companions(
     architecture: &str,
     progress: Option<Arc<DownloadProgress>>,
 ) -> Result<()> {
+    if architecture == crate::model_spec::MINIMAX_H3_IMAGE_ARCHITECTURE {
+        if crate::model_spec::find_minimax_h3_image_text_encoder(models_dir).is_none() {
+            eprintln!(
+                "Fetching the text encoder a {architecture} model needs \
+                 ({MINIMAX_H3_IMAGE_TEXT_ENCODER_REPO}:{MINIMAX_H3_IMAGE_TEXT_ENCODER_TAG})"
+            );
+            download_model_reporting(
+                models_dir,
+                &format!(
+                    "{MINIMAX_H3_IMAGE_TEXT_ENCODER_REPO}:{MINIMAX_H3_IMAGE_TEXT_ENCODER_TAG}"
+                ),
+                progress.clone(),
+            )
+            .with_context(|| format!("downloading the {architecture} text encoder"))?;
+        }
+        if crate::model_spec::find_minimax_h3_image_vae(models_dir).is_none() {
+            eprintln!(
+                "Fetching the VAE a {architecture} model needs ({MINIMAX_H3_IMAGE_VAE_REPO})"
+            );
+            download_repo_file(
+                models_dir,
+                MINIMAX_H3_IMAGE_VAE_REPO,
+                MINIMAX_H3_IMAGE_VAE_FILE,
+                progress,
+            )
+            .with_context(|| format!("downloading the {architecture} VAE"))?;
+        }
+        return Ok(());
+    }
     if architecture == crate::model_spec::MOSS_IMAGE_ARCHITECTURE {
         if crate::model_spec::find_moss_image_text_encoder(models_dir).is_none() {
             eprintln!(

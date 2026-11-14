@@ -143,7 +143,7 @@ pick from a table of installed models interactively.
 output), and `--embedding` (embeddings only — chat and completion endpoints are
 disabled). They are mutually exclusive, and `all` is the default, so passing
 `--all` is a statement of intent rather than a change of behaviour. A sixth,
-`--image`, is not picked: a Qwen-Image (`qwen_image` or `qwen_image_2_1`) , FLUX.2 [klein] (`flux2_klein`) or MOSS-Image (`moss_image`)
+`--image`, is not picked: a Qwen-Image (`qwen_image` or `qwen_image_2_1`) , FLUX.2 [klein] (`flux2_klein`), MOSS-Image (`moss_image`) or MiniMax-H3-Image (`minimax_h3_image`)
 picture generator always comes up in it, and no other model can. A seventh,
 `--video`, is the same for an LTX-2.5 (`ltxv`) video generator, and an
 eighth, `--audio`, for a Qwen3-TTS (`qwen3tts`) speech generator.

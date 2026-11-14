@@ -183,7 +183,7 @@ struct RoleFlags {
     /// Embedding only.
     #[arg(long)]
     embedding: bool,
-    /// Picture generation — a qwen_image, qwen_image_2_1, flux2_klein or moss_image model, the only kind this role
+    /// Picture generation — a qwen_image, qwen_image_2_1, flux2_klein, moss_image or minimax_h3_image model, the only kind this role
     /// serves and the only role such a model is served in.
     #[arg(long)]
     image: bool,
@@ -6371,7 +6371,8 @@ fn fix_role_for_model(
                 config::Role::Video => ("video generators (ltxv)", "a video"),
                 config::Role::Audio => ("speech generators (qwen3tts)", "a speech"),
                 _ => (
-                    "picture generators (qwen_image, qwen_image_2_1, flux2_klein, moss_image)",
+                    "picture generators (qwen_image, qwen_image_2_1, flux2_klein, moss_image, \
+                     minimax_h3_image)",
                     "an image",
                 ),
             };

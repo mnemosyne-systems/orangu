@@ -108,8 +108,8 @@ pub fn props_json(pipeline: &Pipeline) -> serde_json::Value {
         })
     };
     json!({
-        // `qwen_image`, `qwen_image_2_1`, `flux2_klein` or `moss_image`, and the pixels a side must be a
-        // multiple of for it.
+        // `qwen_image`, `qwen_image_2_1`, `flux2_klein`, `moss_image` or `minimax_h3_image`, and the
+        // pixels a side must be a multiple of for it.
         "architecture": pipeline.variant.architecture(),
         "size_unit": pipeline.size_unit(),
         // Qwen-Image 2.1's step-distilled checkpoint, on its own schedule.

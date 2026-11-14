@@ -2076,8 +2076,8 @@ shown.
 | `mlp_unroll`            | decided at startup                         | force the GPU's block-unroll decode kernels on or off; unset, each quantized type is checked against the CPU and dropped if wrong                                                                                                                                                                                                                                                                                                                                                                    |
 | `npu_precompile`        | `yes`                                      | whether this model may use the NPU at all; `no` neither compiles nor loads blocks                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `npu_cache_gb`          | a quarter of memory, 1–16                  | GiB of compiled NPU blocks one model may use; `0` stops compiling but still loads cached blocks                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `text_encoder`          | largest found                              | the text encoder GGUF: `qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`, `qwen3` (Qwen3-4B) for `flux2_klein`, `qwen35` (Qwen3.5-9B) for `moss_image`, LTX's Gemma 4 with its projection heads for `ltxv` (a GGUF, or the published `.safetensors`, converted once)                                                                                                                                                                                                                                                                                                      |
-| `vae`                   | first found                                | the model's VAE (`.safetensors`): Qwen-Image's, Qwen-Image 2.1's own, FLUX.2's, MOSS-Image's, or LTX's convolutional video VAE for `ltxv`                                                                                                                                                                                                                                                                                                                                                                                    |
+| `text_encoder`          | largest found                              | the text encoder GGUF: `qwen2vl` for `qwen_image`, `qwen3vl` for `qwen_image_2_1`, `qwen3` (Qwen3-4B) for `flux2_klein`, `qwen35` (Qwen3.5-9B) for `moss_image`, `qwen3vl` (Qwen3-VL-32B-Instruct) for `minimax_h3_image`, LTX's Gemma 4 with its projection heads for `ltxv` (a GGUF, or the published `.safetensors`, converted once)                                                                                                                                                                                                                                                                                                      |
+| `vae`                   | first found                                | the model's VAE (`.safetensors`): Qwen-Image's, Qwen-Image 2.1's own, FLUX.2's, MOSS-Image's, MiniMax-H3-Image's, or LTX's convolutional video VAE for `ltxv`                                                                                                                                                                                                                                                                                                                                                                                    |
 | `vision`                | found beside the model or text encoder     | the vision projector (`mmproj-*.gguf`): a gemma-4 model reads chat pictures with it (see **Pictures in a chat**), a `qwen_image_2_1` model edits attached pictures with it; `none` reads no pictures, or draws over them |
 | `vision_tokens`         | `280`                                      | the most prompt tokens one chat picture becomes, `70` to `1120`; a larger picture is read at a smaller size |
 | `image_lora`            | `auto`                                     | the adapter applied to the picture transformer: `auto` the Lightning file under `models` (fetched with the model; a picture in 8 unguided steps), `none` the base model, or a `.safetensors` (or 4-step variant, rougher)                                                                                                                                                                                                                                                                            |
@@ -4192,6 +4192,33 @@ negative prompt is the empty one. There is no adapter and no editing.
 `orangu-server download unsloth/MOSS-Image-Base-GGUF:Q8_0` fetches the
 three files.
 
+**MiniMax-H3-Image** is served the same way:
+`unsloth/MiniMax-H3-Image-GGUF` (`list`'s `Yes (minimax_h3_image)`; the
+files say `hyvid`, and the picture model is told apart from MiniMax-H3's
+video model by its missing audio input). It is a 33-billion-parameter
+single-stream transformer of fifty blocks over `[text | picture]`, each
+modulating text and picture tokens with their own `shift, scale, gate`
+sets read off a tabulated time curve, with a two-block text refiner of
+its own and an output head per distilled step (`engine::image::minimax_h3`),
+and two companions found the same way:
+
+- **The text encoder** — Qwen3-VL-32B-Instruct, a `qwen3vl` GGUF of width
+  5120 whose header names the instruct model (any quantization;
+  `download` fetches `unsloth/Qwen3-VL-32B-Instruct-GGUF:Q4_K_M`).
+  MiniMax-H3's encoder is that model unchanged. The bare prompt, without
+  a chat template, is read at the encoder's fiftieth layer.
+- **The VAE** — `vae/diffusion_pytorch_model.safetensors` from
+  `MiniMaxAI/MiniMax-H3-Image`: 24 latent channels at 16 pixels a cell,
+  decoded by a 24-block vision transformer in overlapping 256-pixel tiles
+  (`engine::image::vae_h3`).
+
+Its release settings are six steps without guidance on the schedule the
+heads were distilled on; another step count resamples it and blends the
+heads. Sizes are multiples of 32. There is no adapter, and an attached
+picture is refused: the VAE is published without an encoder.
+`orangu-server download unsloth/MiniMax-H3-Image-GGUF:UD-Q4_K_XL` fetches
+the three files.
+
 Everything below applies to every picture model except where it names
 Qwen-Image's own files.
 
@@ -4359,14 +4386,14 @@ is asked none of these.
 
 Six keys set what a picture request gets when it does not say. The
 defaults are the model's own release settings — Qwen-Image 2.1's forty
-unguided steps, Qwen-Image's and FLUX.2 [klein] base's fifty at guidance 4, MOSS-Image's fifty at guidance 3 — except that under a
+unguided steps, Qwen-Image's and FLUX.2 [klein] base's fifty at guidance 4, MOSS-Image's fifty at guidance 3, MiniMax-H3-Image's six unguided — except that under a
 Lightning adapter — the default, when one is under `models` — `image_steps`
 and `image_cfg_scale` follow the adapter (its step count, guidance off)
 unless the file sets them:
 
 | `[orangu-server]`       | default                                         |                                                                                                                                                                                                                                                                                      |
 | :---------------------- | :---------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `image_size`            | `1024x1024`                                     | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch (Qwen-Image, FLUX.2 [klein], MOSS-Image); 32 for Qwen-Image 2.1                                                                                                                                                   |
+| `image_size`            | `1024x1024`                                     | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch (Qwen-Image, FLUX.2 [klein], MOSS-Image); 32 for Qwen-Image 2.1 and MiniMax-H3-Image                                                                                                                                                   |
 | `image_steps`           | `50` (2.1: `40`); the adapter's (`8`) under one | denoising steps; the time a picture takes is close to linear in this                                                                                                                                                                                                                 |
 | `image_cfg_scale`       | `4` (2.1: `1`); `1` under an adapter            | classifier-free guidance: how far the picture is pushed towards the prompt and away from the negative one. `1` turns guidance off, which halves the work per step                                                                                                                    |
 | `image_negative_prompt` | a single space                                  | what the picture is pushed away from; only read when guidance is on                                                                                                                                                                                                                  |
@@ -5179,7 +5206,8 @@ the experts form `expert_group_count` groups and only the best
 `expert_group_used_count` of them may serve a token), and Qwen-Image
 (`qwen_image`, e.g. `unsloth/Qwen-Image-2512-GGUF`, `flux2_klein`,
 `unsloth/FLUX.2-klein-base-4B-GGUF` with a `qwen3` encoder, `moss_image`,
-`unsloth/MOSS-Image-Base-GGUF` with a `qwen35` encoder, and `qwen_image_2_1`,
+`unsloth/MOSS-Image-Base-GGUF` with a `qwen35` encoder, `minimax_h3_image`,
+`unsloth/MiniMax-H3-Image-GGUF` with a `qwen3vl` encoder, and `qwen_image_2_1`,
 `unsloth/Qwen-Image-2.1-GGUF` with a `qwen3vl` encoder — not a language model:
 a dual-stream diffusion transformer that denoises a latent picture under a
 prompt's hidden states, served with a `qwen2vl` text encoder and the

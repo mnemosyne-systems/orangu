@@ -225,6 +225,23 @@ pub fn euler_step(latents: &mut [f32], velocity: &[f32], sigma: f32, sigma_next:
     }
 }
 
+/// MiniMax-H3-Image's schedule: the six release levels it was distilled on
+/// ([`super::minimax_h3::PDD_SIGMAS`]) at six steps, and at any other count
+/// that curve resampled — step `i` of `n` at position `6 i / n` along it,
+/// linearly between its points.
+pub fn minimax_h3_sigmas(steps: usize) -> Vec<f32> {
+    assert!(steps > 0, "a schedule needs at least one step");
+    let grid = &super::minimax_h3::PDD_SIGMAS;
+    let segments = grid.len() - 1;
+    (0..=steps)
+        .map(|i| {
+            let position = (i * segments) as f32 / steps as f32;
+            let index = (position as usize).min(segments - 1);
+            grid[index] + (position - index as f32) * (grid[index + 1] - grid[index])
+        })
+        .collect()
+}
+
 /// diffusers' `scale_noise`: the latent an image-to-image run starts from,
 /// `sigma * noise + (1 - sigma) * clean`.
 pub fn scale_noise(clean: &[f32], noise: &[f32], sigma: f32) -> Vec<f32> {
@@ -309,6 +326,16 @@ impl Noise {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Six steps are the release levels exactly; three take every other.
+    #[test]
+    fn minimax_h3_runs_its_release_levels() {
+        let six = minimax_h3_sigmas(6);
+        assert_eq!(six, super::super::minimax_h3::PDD_SIGMAS.to_vec());
+        let three = minimax_h3_sigmas(3);
+        let grid = super::super::minimax_h3::PDD_SIGMAS;
+        assert_eq!(three, vec![grid[0], grid[2], grid[4], grid[6]]);
+    }
 
     /// Against `MOSSImageScheduler.set_timesteps` worked in NumPy: fifty
     /// steps keep fifty distinct training levels; five hundred collapse to

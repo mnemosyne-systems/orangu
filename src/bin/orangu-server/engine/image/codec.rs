@@ -183,6 +183,37 @@ fn decode_resized(bytes: &[u8], width: usize, height: usize) -> Result<image::Rg
     Ok(resized)
 }
 
+/// `picture` scaled to `width` x `height` with a Lanczos filter, in the
+/// same `[-1, 1]` feature layout.
+pub fn resize(picture: &Feature, width: usize, height: usize) -> Result<Feature> {
+    let (w, h, c) = (
+        picture.width as u32,
+        picture.height as u32,
+        picture.channels,
+    );
+    let filter = image::imageops::FilterType::Lanczos3;
+    let data = match c {
+        3 => image::imageops::resize(
+            &image::Rgb32FImage::from_raw(w, h, picture.data.clone())
+                .ok_or_else(|| anyhow!("the picture's data does not match its size"))?,
+            width as u32,
+            height as u32,
+            filter,
+        )
+        .into_raw(),
+        4 => image::imageops::resize(
+            &image::Rgba32FImage::from_raw(w, h, picture.data.clone())
+                .ok_or_else(|| anyhow!("the picture's data does not match its size"))?,
+            width as u32,
+            height as u32,
+            filter,
+        )
+        .into_raw(),
+        other => bail!("a picture has 3 or 4 channels, not {other}"),
+    };
+    Ok(Feature::new(height, width, c, data))
+}
+
 /// The pixel size of a picture without decoding all of it, for choosing a
 /// generation size from an attachment.
 pub fn dimensions(bytes: &[u8]) -> Result<(usize, usize)> {

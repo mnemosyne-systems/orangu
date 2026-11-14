@@ -2608,8 +2608,12 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
     let flux2 = architecture == orangu::model_spec::FLUX2_KLEIN_ARCHITECTURE;
     // MOSS-Image: the reference's own names (`video_embedder`, `layers.N`).
     let moss = architecture == orangu::model_spec::MOSS_IMAGE_ARCHITECTURE;
+    // MiniMax-H3-Image: `video_patch_proj`, `blocks.N.attn.q_norm`.
+    let h3 = architecture == orangu::model_spec::MINIMAX_H3_IMAGE_ARCHITECTURE;
     let img_in = if moss {
         dims("video_embedder.weight")?
+    } else if h3 {
+        dims("video_patch_proj.weight")?
     } else {
         dims("img_in.weight")?
     };
@@ -2617,6 +2621,8 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
         dims("double_blocks.0.img_attn.norm.query_norm.scale")?
     } else if moss {
         dims("layers.0.q_norm.weight")?
+    } else if h3 {
+        dims("blocks.0.attn.q_norm.weight")?
     } else {
         dims("transformer_blocks.0.attn.norm_q.weight")?
     };
@@ -2647,6 +2653,8 @@ fn read_image_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelC
         blocks("double_blocks.").unwrap_or(0) + blocks("single_blocks.").unwrap_or(0)
     } else if moss {
         blocks("layers.").unwrap_or(0)
+    } else if h3 {
+        blocks("blocks.").unwrap_or(0)
     } else {
         blocks("transformer_blocks.").unwrap_or(0)
     };
