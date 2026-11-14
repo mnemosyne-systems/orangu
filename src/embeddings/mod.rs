@@ -28,7 +28,9 @@
 pub mod chunk;
 pub mod client;
 pub mod index;
+pub mod lexical;
 pub mod sketch;
+pub mod source;
 
 use crate::config::LlmConfiguration;
 use crate::llm::normalized_openai_endpoint;
@@ -40,7 +42,9 @@ pub use sketch::{EllipsoidSketch, SketchMatch};
 /// Shared refresh-before-search implementation for `/search` and LLM tools.
 #[derive(Clone)]
 pub struct SemanticSearch {
-    client: EmbeddingClient,
+    /// `None` means lexical-only mode: no embeddings-capable server was
+    /// detected at startup, or the embedding half failed and was degraded.
+    client: Option<EmbeddingClient>,
     compile_workers: usize,
     budget_tokens: usize,
 }
@@ -49,6 +53,9 @@ pub struct SemanticSearchResult {
     pub indexed_symbols: usize,
     pub hits: Vec<SearchHit>,
     pub cancelled: bool,
+    /// Whether the ranking came from the hybrid/semantic path. `false` means
+    /// lexical-only fallback.
+    pub used_embeddings: bool,
 }
 
 impl SemanticSearch {
@@ -63,10 +70,20 @@ impl SemanticSearch {
             profile.model = "embeddings".to_string();
         }
         Ok(Self {
-            client: EmbeddingClient::from_profile(&profile)?,
+            client: Some(EmbeddingClient::from_profile(&profile)?),
             compile_workers,
             budget_tokens,
         })
+    }
+
+    /// Lexical-only search, for when no embeddings-capable server is available.
+    /// BM25 and graph expansion do not need an embeddings server.
+    pub fn lexical_only(compile_workers: usize, budget_tokens: usize) -> Self {
+        Self {
+            client: None,
+            compile_workers,
+            budget_tokens,
+        }
     }
 
     pub async fn search(
@@ -83,30 +100,109 @@ impl SemanticSearch {
             !query.trim().is_empty(),
             "semantic search query must not be empty"
         );
-        let index = EmbeddingIndex::build_or_update(
+        let Some(client) = &self.client else {
+            // No embeddings-capable server was detected at startup. BM25 and
+            // graph expansion do not need one, so rank lexically instead of
+            // failing the search.
+            let lexical = crate::embeddings::lexical::LexicalIndex::build_or_update_with_progress(
+                workspace,
+                self.compile_workers,
+                Some(progress),
+            )?;
+            let mut result = SemanticSearchResult {
+                indexed_symbols: lexical.len(),
+                hits: Vec::new(),
+                cancelled: cancel.load(Ordering::Relaxed),
+                used_embeddings: false,
+            };
+            if result.cancelled || lexical.is_empty() {
+                return Ok(result);
+            }
+            result.cancelled = cancel.load(Ordering::Relaxed);
+            if !result.cancelled {
+                let guard = graph
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("graph_store mutex poisoned"))?;
+                result.hits =
+                    lexical.search(workspace, query, guard.as_ref(), 10, self.budget_tokens);
+            }
+            return Ok(result);
+        };
+
+        let scan = crate::embeddings::source::scan_workspace(workspace);
+        let lexical = crate::embeddings::lexical::LexicalIndex::build_or_update_from_scan(
             workspace,
-            &self.client,
+            &scan,
+            self.compile_workers,
+            None,
+        )
+        .ok();
+        // Try the embedding half. A server that was available at startup can
+        // disappear later; in that case fall through to lexical-only rather
+        // than failing the whole search.
+        let mut semantic = None;
+        let mut embedding_error = None;
+        match EmbeddingIndex::build_or_update_from_scan(
+            workspace,
+            &scan,
+            client,
             cancel,
             self.compile_workers,
             progress,
             eta,
         )
-        .await?;
+        .await
+        {
+            Ok(index) if !index.is_empty() => match client.embed_one(query).await {
+                Ok(vector) => semantic = Some((index, vector)),
+                Err(err) => embedding_error = Some(err),
+            },
+            Ok(_) => {}
+            Err(err) => embedding_error = Some(err),
+        }
+
         let mut result = SemanticSearchResult {
-            indexed_symbols: index.len(),
+            indexed_symbols: lexical.as_ref().map_or(0, |index| index.len()),
             hits: Vec::new(),
             cancelled: cancel.load(Ordering::Relaxed),
+            used_embeddings: false,
         };
-        if result.cancelled || index.is_empty() {
+        if result.cancelled {
             return Ok(result);
         }
-        let query_vector = self.client.embed_one(query).await?;
-        result.cancelled = cancel.load(Ordering::Relaxed);
-        if !result.cancelled {
-            let guard = graph
-                .lock()
-                .map_err(|_| anyhow::anyhow!("graph_store mutex poisoned"))?;
-            result.hits = index.search(&query_vector, guard.as_ref(), 10, self.budget_tokens);
+
+        let guard = graph
+            .lock()
+            .map_err(|_| anyhow::anyhow!("graph_store mutex poisoned"))?;
+
+        match semantic {
+            Some((index, query_vector)) => {
+                result.indexed_symbols = index.len();
+                result.used_embeddings = true;
+                result.hits = match &lexical {
+                    Some(lexical) => index.hybrid_search(
+                        workspace,
+                        query,
+                        &query_vector,
+                        lexical,
+                        guard.as_ref(),
+                        10,
+                        self.budget_tokens,
+                    ),
+                    None => index.search(&query_vector, guard.as_ref(), 10, self.budget_tokens),
+                };
+            }
+            None => {
+                if let Some(lexical) = &lexical {
+                    result.indexed_symbols = lexical.len();
+                    result.hits =
+                        lexical.search(workspace, query, guard.as_ref(), 10, self.budget_tokens);
+                } else if let Some(err) = embedding_error {
+                    return Err(err);
+                } else {
+                    anyhow::bail!("lexical search index could not be built for this workspace");
+                }
+            }
         }
         Ok(result)
     }
@@ -157,24 +253,32 @@ pub async fn probe_endpoint(profile: &LlmConfiguration) -> Result<(), String> {
 }
 
 /// Render search hits as a human-readable block for the output window, with each
-/// result anchored to its `file:line` so it is clickable.
-pub fn format_hits(query: &str, hits: &[SearchHit]) -> String {
+/// result anchored to its `file:line` so it is clickable. `used_embeddings`
+/// selects the header so a lexical-only fallback does not claim to be semantic.
+pub fn format_hits(query: &str, hits: &[SearchHit], used_embeddings: bool) -> String {
+    let label = if used_embeddings {
+        "Semantic"
+    } else {
+        "Lexical"
+    };
     if hits.is_empty() {
-        return format!("No semantic matches for \"{query}\".");
+        return format!("No matches for \"{query}\".");
     }
-    let mut out = format!("Semantic matches for \"{query}\":\n");
+    let mut out = format!("{label} matches for \"{query}\":\n");
     for (i, hit) in hits.iter().enumerate() {
         let via = match &hit.expanded_from {
             Some(sym) => format!("  (via {sym})"),
             None => String::new(),
         };
+        let exact = if hit.exact { "  (exact)" } else { "" };
         out.push_str(&format!(
-            "{:>2}. {} — [{}:{}]  {:.3}{}\n",
+            "{:>2}. {} — [{}:{}]  {:.3}{}{}\n",
             i + 1,
             hit.symbol,
             hit.file,
             hit.start_line,
             hit.score,
+            exact,
             via,
         ));
     }
