@@ -68,6 +68,11 @@ const EMBED_CONCURRENCY: usize = 8;
 /// result never outranks the semantic hit that surfaced it.
 pub(super) const EXPANSION_DECAY: f32 = 0.6;
 
+/// How many of the strongest semantic candidates the diversity pass considers.
+/// The pass is quadratic in its input, and only the head of the ranking can
+/// become an expansion seed.
+const DIVERSITY_CANDIDATE_LIMIT: usize = 256;
+
 // ── On-disk format ────────────────────────────────────────────────────────────
 
 /// One embedded code chunk: a symbol plus its vector.
@@ -470,6 +475,45 @@ impl EmbeddingIndex {
     /// Hybrid search: rank chunks by cosine similarity to `query_vector`, then,
     /// when a graph is available, expand the strongest hits along their call
     /// edges. Returns up to `top_k` results, most relevant first.
+    /// Pluribus Diversity-Aware Planner: penalise chunks that are near-duplicates
+    /// of a stronger chunk already kept, then re-sort. `scored` must be sorted
+    /// by descending score.
+    ///
+    /// Every chunk is compared with every seed kept before it, so the pass is
+    /// quadratic in the number of candidates: minutes per query on a workspace
+    /// with ~20k symbols. Only the head of the ranking feeds the `top_k * 2`
+    /// expansion seeds, so the pass is bounded to the strongest
+    /// `DIVERSITY_CANDIDATE_LIMIT` candidates.
+    fn diversify(&self, mut scored: Vec<(usize, f32)>) -> Vec<(usize, f32)> {
+        const DIVERSITY_THRESHOLD: f32 = 0.85;
+        const DIVERSITY_PENALTY: f32 = 0.5;
+
+        scored.truncate(DIVERSITY_CANDIDATE_LIMIT);
+        let mut selected_seed_indices: Vec<usize> = Vec::new();
+        let mut penalized_scores: Vec<(usize, f32)> = Vec::with_capacity(scored.len());
+
+        for (idx, original_score) in scored {
+            let chunk = &self.chunks[idx];
+            let mut score = original_score;
+            let mut penalized = false;
+            for &s_idx in &selected_seed_indices {
+                let sim = cosine(&chunk.vector, &self.chunks[s_idx].vector);
+                if sim > DIVERSITY_THRESHOLD {
+                    score *= DIVERSITY_PENALTY;
+                    penalized = true;
+                    break;
+                }
+            }
+            if !penalized {
+                selected_seed_indices.push(idx);
+            }
+            penalized_scores.push((idx, score));
+        }
+
+        penalized_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+        penalized_scores
+    }
+
     pub fn search(
         &self,
         query_vector: &[f32],
@@ -532,34 +576,8 @@ impl EmbeddingIndex {
             .collect();
 
         // Take the strongest semantic hits as seeds for expansion.
-        // Pluribus Diversity-Aware Planner: track selected seeds to penalize redundant semantics
         let seed_count = top_k.saturating_mul(2).max(top_k);
-        let mut selected_seed_indices: Vec<usize> = Vec::new();
-
-        const DIVERSITY_THRESHOLD: f32 = 0.85;
-        const DIVERSITY_PENALTY: f32 = 0.5;
-
-        let mut penalized_scores: Vec<(usize, f32)> = Vec::with_capacity(scored.len());
-
-        for &(idx, original_score) in &scored {
-            let chunk = &self.chunks[idx];
-            let mut score = original_score;
-            let mut penalized = false;
-            for &s_idx in &selected_seed_indices {
-                let sim = cosine(&chunk.vector, &self.chunks[s_idx].vector);
-                if sim > DIVERSITY_THRESHOLD {
-                    score *= DIVERSITY_PENALTY;
-                    penalized = true;
-                    break;
-                }
-            }
-            if !penalized {
-                selected_seed_indices.push(idx);
-            }
-            penalized_scores.push((idx, score));
-        }
-
-        penalized_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let penalized_scores = self.diversify(scored);
 
         for &(idx, score) in penalized_scores.iter().take(seed_count) {
             let chunk = &self.chunks[idx];
@@ -919,5 +937,47 @@ mod tests {
         assert_eq!(hits[0].symbol, "one");
         // "three" should beat "two" due to the diversity penalty
         assert_eq!(hits[1].symbol, "three");
+    }
+
+    #[test]
+    fn diversity_pass_only_scores_the_head_of_the_ranking() {
+        // Chunks evenly spread on the unit circle: most pairs are not
+        // near-duplicates, so the seed list keeps growing (the quadratic worst
+        // case). The pass must stop at the bounded pool.
+        let total = DIVERSITY_CANDIDATE_LIMIT * 2;
+        let chunks: Vec<EmbeddedChunk> = (0..total)
+            .map(|i| {
+                let angle = std::f32::consts::TAU * i as f32 / total as f32;
+                EmbeddedChunk {
+                    id: format!("a::c{i}"),
+                    symbol: format!("c{i}"),
+                    file: "a.rs".into(),
+                    start_line: i + 1,
+                    end_line: i + 1,
+                    vector: vec![angle.cos(), angle.sin()],
+                }
+            })
+            .collect();
+        let index = EmbeddingIndex {
+            version: INDEX_VERSION,
+            file_hashes: HashMap::new(),
+            module_sketches: HashMap::new(),
+            chunks,
+        };
+        let query = [1.0, 0.0];
+        let mut scored: Vec<(usize, f32)> = index
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (i, cosine(&query, &c.vector)))
+            .collect();
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+        let ranked = index.diversify(scored);
+        assert_eq!(ranked.len(), DIVERSITY_CANDIDATE_LIMIT);
+        // Bound the head, not the tail: the closest chunk is still first.
+        assert_eq!(ranked[0].0, 0);
+        assert!(ranked[0].1 > 0.999);
+        assert_eq!(index.search(&query, None, 5, 16384)[0].symbol, "c0");
     }
 }
