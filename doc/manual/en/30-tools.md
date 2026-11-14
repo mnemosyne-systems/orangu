@@ -604,8 +604,11 @@ one, and one left unanswered for two minutes counts as cancelled.
 **Host keys** are always checked, whatever `StrictHostKeyChecking` says. A key
 that differs from the one in `known_hosts`, or one marked `@revoked`, is refused
 without asking. Host certificates are not supported. `known_hosts` entries may
-be hashed, and `UserKnownHostsFile` is honoured; wildcard entries are not
-matched, so such a host counts as unknown.
+be hashed or use wildcards as in `ssh`: `*` matches any run of characters, `?`
+one character, and `!pattern` leaves a host out, so
+`*.example.com,!test.example.com` names every host under `example.com` but
+one. A host on another port is written `[*.example.com]:2222`.
+`UserKnownHostsFile` is honoured.
 
 **`~/.ssh/config`.** `Host`, `HostName`, `User`, `Port`, `IdentityFile`,
 `UserKnownHostsFile` and settings before the first `Host` are read. `Include`,

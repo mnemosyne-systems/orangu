@@ -22,6 +22,7 @@
 
 mod auth;
 mod host;
+mod known_hosts;
 mod transfer;
 
 use anyhow::{Context, Result, anyhow};
@@ -102,22 +103,31 @@ impl HostKeyCheck {
                 self.known_hosts.display()
             ));
         }
+        let changed = |line: usize| {
+            format!(
+                "the host key of {name} CHANGED ({fingerprint} is not the key recorded at \
+                 {}:{line}); refusing to connect, this can be an attack",
+                self.known_hosts.display()
+            )
+        };
         match keys::check_known_hosts_path(&self.host, self.port, key, &self.known_hosts) {
             Ok(true) => return Ok(()),
             Ok(false) => {}
-            Err(keys::Error::KeyChanged { line }) => {
-                return Err(format!(
-                    "the host key of {name} CHANGED ({fingerprint} is not the key recorded at \
-                     {}:{line}); refusing to connect, this can be an attack",
-                    self.known_hosts.display()
-                ));
-            }
+            Err(keys::Error::KeyChanged { line }) => return Err(changed(line)),
             Err(error) => {
                 return Err(format!(
                     "cannot read {} for {name}: {error}",
                     self.known_hosts.display()
                 ));
             }
+        }
+        // russh matches only exact and hashed names; `*.example.com` and the
+        // like are read here.
+        let wildcard = known_hosts::wildcard_host_keys(&self.host, self.port, &self.known_hosts);
+        match known_hosts::compare(key, &wildcard) {
+            known_hosts::Recorded::Matches => return Ok(()),
+            known_hosts::Recorded::Changed(line) => return Err(changed(line)),
+            known_hosts::Recorded::Absent => {}
         }
         if !self.prompts.available() {
             return Err(format!(
@@ -126,8 +136,8 @@ impl HostKeyCheck {
                 self.known_hosts.display()
             ));
         }
-        let known_with_other_type =
-            keys::known_hosts::known_host_keys_path(&self.host, self.port, &self.known_hosts)
+        let known_with_other_type = !wildcard.is_empty()
+            || keys::known_hosts::known_host_keys_path(&self.host, self.port, &self.known_hosts)
                 .is_ok_and(|keys| !keys.is_empty());
         let intro = if known_with_other_type {
             format!("{name} is known with a different key type; it now offers")
