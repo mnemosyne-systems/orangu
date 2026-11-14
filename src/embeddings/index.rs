@@ -34,6 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use super::chunk::chunk_file;
 use super::client::EmbeddingClient;
+use super::lexical::LexicalDoc;
 use super::source::{SourceFile, scan_workspace};
 use crate::graph::extract::GraphExtractor;
 use crate::graph::store::GraphStore;
@@ -65,7 +66,7 @@ const EMBED_CONCURRENCY: usize = 8;
 /// Score multiplier applied to a chunk pulled in only because it neighbours a
 /// strong semantic hit in the knowledge graph. Below `1.0` so a graph-expanded
 /// result never outranks the semantic hit that surfaced it.
-const EXPANSION_DECAY: f32 = 0.6;
+pub(super) const EXPANSION_DECAY: f32 = 0.6;
 
 // ── On-disk format ────────────────────────────────────────────────────────────
 
@@ -604,7 +605,7 @@ impl EmbeddingIndex {
 
 /// Insert `hit` into `best` unless an equal-or-better score for the same id is
 /// already recorded.
-fn insert_hit(best: &mut HashMap<String, SearchHit>, hit: SearchHit) {
+pub(super) fn insert_hit(best: &mut HashMap<String, SearchHit>, hit: SearchHit) {
     match best.get(&hit.id) {
         Some(existing) if existing.score >= hit.score => {}
         _ => {
@@ -623,6 +624,48 @@ fn hit_from(chunk: &EmbeddedChunk, score: f32, expanded_from: Option<String>) ->
         score,
         expanded_from,
     }
+}
+
+/// Build a hit from a lexical document, for chunks that have no embedding
+/// vector (lexical-only search) or for graph neighbours pulled in by id.
+pub(super) fn hit_from_doc(
+    doc: &LexicalDoc,
+    score: f32,
+    expanded_from: Option<String>,
+) -> SearchHit {
+    SearchHit {
+        id: doc.id.clone(),
+        symbol: doc.symbol.clone(),
+        file: doc.file.clone(),
+        start_line: doc.start_line,
+        end_line: doc.end_line,
+        score,
+        expanded_from,
+    }
+}
+
+/// Apply the token budget to an already-ranked list, always keeping at least
+/// one hit so a single large symbol is still returned.
+pub(super) fn budget_cut(
+    hits: Vec<SearchHit>,
+    top_k: usize,
+    semantic_budget_tokens: usize,
+) -> Vec<SearchHit> {
+    let mut total_tokens = 0;
+    let mut final_hits = Vec::new();
+    for hit in hits {
+        let chunk_lines = hit.end_line.saturating_sub(hit.start_line) + 1;
+        let chunk_tokens = chunk_lines * 10;
+        if total_tokens + chunk_tokens > semantic_budget_tokens && !final_hits.is_empty() {
+            break;
+        }
+        total_tokens += chunk_tokens;
+        final_hits.push(hit);
+        if final_hits.len() >= top_k {
+            break;
+        }
+    }
+    final_hits
 }
 
 /// Cosine similarity of two vectors. Returns `0.0` for a length mismatch or a
@@ -735,6 +778,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             text: "x".repeat(chars),
+            body: "x".repeat(chars),
         }
     }
 
