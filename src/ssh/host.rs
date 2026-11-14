@@ -109,10 +109,7 @@ fn normalized_config(contents: &str) -> String {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (keyword, value) = line
-            .split_once(|c: char| c.is_whitespace() || c == '=')
-            .unwrap_or((line, ""));
-        let value = value.trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+        let (keyword, value) = keyword_and_value(line);
         if keyword.eq_ignore_ascii_case("match") {
             normalized.push_str("Host !*\n");
             in_block = true;
@@ -127,20 +124,182 @@ fn normalized_config(contents: &str) -> String {
     normalized
 }
 
-/// The directives the SSH config parser skips, which the file uses.
-fn unparsed_directives(contents: &str) -> Vec<&'static str> {
-    let mut found = Vec::new();
-    for (keyword, name) in [("include", "Include"), ("match", "Match")] {
-        let used = contents.lines().any(|line| {
-            line.split_whitespace()
-                .next()
-                .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
-        });
-        if used {
-            found.push(name);
+/// A trimmed config line split into its keyword and value, which spaces, tabs
+/// or an `=` separate.
+fn keyword_and_value(line: &str) -> (&str, &str) {
+    let (keyword, value) = line
+        .split_once(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or((line, ""));
+    (
+        keyword,
+        value.trim_start_matches(|c: char| c.is_whitespace() || c == '='),
+    )
+}
+
+/// Whether the config uses `Match`, which the SSH config parser skips.
+fn uses_match(contents: &str) -> bool {
+    contents.lines().any(|line| {
+        keyword_and_value(line.trim())
+            .0
+            .eq_ignore_ascii_case("match")
+    })
+}
+
+/// How deep `Include` may nest, as in `ssh`.
+const MAX_INCLUDE_DEPTH: usize = 16;
+
+/// The block a config line sits in.
+#[derive(Clone, Copy)]
+enum Block {
+    /// Before the first `Host` or `Match`: every host.
+    None,
+    Host,
+    Match,
+}
+
+/// `contents` with each `Include` replaced by the files it names, read the way
+/// `ssh` reads them. What cannot be read that way goes to `notes`.
+fn with_includes(contents: &str, directory: &Path, notes: &mut Vec<String>) -> String {
+    let mut expanded = String::new();
+    expand(contents, directory, Block::None, 0, &mut expanded, notes);
+    expanded
+}
+
+/// Appends `contents` to `out`, its includes expanded, starting in `outer`.
+/// Whether it has `Host` or `Match` lines of its own.
+fn expand(
+    contents: &str,
+    directory: &Path,
+    outer: Block,
+    depth: usize,
+    out: &mut String,
+    notes: &mut Vec<String>,
+) -> bool {
+    let mut block = outer;
+    let mut has_blocks = false;
+    for line in contents.lines() {
+        let (keyword, value) = keyword_and_value(line.trim());
+        if keyword.eq_ignore_ascii_case("include") {
+            include(value, directory, block, depth, out, notes);
+            continue;
+        }
+        if keyword.eq_ignore_ascii_case("host") {
+            block = Block::Host;
+            has_blocks = true;
+        } else if keyword.eq_ignore_ascii_case("match") {
+            block = Block::Match;
+            has_blocks = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    has_blocks
+}
+
+/// Appends the files an `Include` in `block` names to `out`.
+fn include(
+    value: &str,
+    directory: &Path,
+    block: Block,
+    depth: usize,
+    out: &mut String,
+    notes: &mut Vec<String>,
+) {
+    // Its condition is not evaluated, so neither its settings nor its
+    // includes reach any host.
+    if matches!(block, Block::Match) {
+        return;
+    }
+    if depth >= MAX_INCLUDE_DEPTH {
+        notes.push(format!(
+            "Include nests more than {MAX_INCLUDE_DEPTH} deep at '{value}', which is not read."
+        ));
+        return;
+    }
+    for path in include_paths(value, directory, notes) {
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                notes.push(format!("{} could not be read: {error}.", path.display()));
+                continue;
+            }
+        };
+        // Inside a `Host` block, `ssh` reads the file only for hosts the
+        // block matches, its own blocks included; that is not evaluated here.
+        if matches!(block, Block::Host)
+            && contents.lines().any(|line| {
+                let keyword = keyword_and_value(line.trim()).0;
+                keyword.eq_ignore_ascii_case("host") || keyword.eq_ignore_ascii_case("match")
+            })
+        {
+            notes.push(format!(
+                "{} is included inside a Host block and has blocks of its own, which is not \
+                 read here, so this host may resolve differently than with ssh.",
+                path.display()
+            ));
+            continue;
+        }
+        // Only a file included before the first block can have blocks of its
+        // own; the lines after the Include apply to every host again.
+        if expand(&contents, directory, block, depth + 1, out, notes) {
+            out.push_str("Host *\n");
         }
     }
-    found
+}
+
+/// The files an `Include` names: a relative path is under `directory`, `~/`
+/// is the home directory, and a file name may hold `*`, `?` or `[...]`, whose
+/// matches are read in order. A missing file is skipped, as `ssh` does.
+fn include_paths(value: &str, directory: &Path, notes: &mut Vec<String>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for word in value.split_whitespace().map(|word| word.trim_matches('"')) {
+        let path = match word.strip_prefix("~/") {
+            Some(rest) => home::home_dir().unwrap_or_default().join(rest),
+            None => directory.join(word),
+        };
+        let is_pattern = |text: &str| text.contains(['*', '?', '[']);
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
+        else {
+            continue;
+        };
+        if !is_pattern(name) {
+            if path.is_file() {
+                paths.push(path);
+            }
+            continue;
+        }
+        if is_pattern(&parent.to_string_lossy()) {
+            notes.push(format!(
+                "Include {word} has a wildcard before the file name, which is not read."
+            ));
+            continue;
+        }
+        let Ok(glob) = globset::Glob::new(name) else {
+            continue;
+        };
+        let matcher = glob.compile_matcher();
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            continue;
+        };
+        let mut found: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|found| {
+                found
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|found_name| {
+                        // As with a shell glob, `*` does not match a hidden file.
+                        matcher.is_match(found_name)
+                            && (!found_name.starts_with('.') || name.starts_with('.'))
+                    })
+            })
+            .filter(|found| found.is_file())
+            .collect();
+        found.sort();
+        paths.extend(found);
+    }
+    paths
 }
 
 /// The login `spec` asks for, under the SSH config in `paths`.
@@ -153,6 +312,8 @@ pub fn resolve(spec: &str, paths: &SshPaths) -> Result<Target> {
             return Err(error).with_context(|| format!("reading {}", paths.config.display()));
         }
     };
+    let mut notes = Vec::new();
+    let contents = with_includes(&contents, &paths.directory, &mut notes);
     let config = russh_config::parse(&normalized_config(&contents), host)
         .with_context(|| format!("parsing {}", paths.config.display()))?;
     if config.host_config.proxy_jump.is_some() || config.host_config.proxy_command.is_some() {
@@ -162,16 +323,13 @@ pub fn resolve(spec: &str, paths: &SshPaths) -> Result<Target> {
             paths.config.display()
         ));
     }
-    let mut notes: Vec<String> = unparsed_directives(&contents)
-        .into_iter()
-        .map(|directive| {
-            format!(
-                "{} uses {directive}, which is not read here, so this host may resolve \
-                 differently than with ssh.",
-                paths.config.display()
-            )
-        })
-        .collect();
+    if uses_match(&contents) {
+        notes.push(format!(
+            "{} or a file it includes uses Match, which is not read here, so this host may \
+             resolve differently than with ssh.",
+            paths.config.display()
+        ));
+    }
     if config.host_config.strict_host_key_checking == Some(false) {
         notes.push(
             "StrictHostKeyChecking no is not honoured here: host keys are always checked."
@@ -282,10 +440,98 @@ mod tests {
 
     #[test]
     fn config_the_parser_cannot_see_is_reported() {
-        let (_directory, paths) = paths("Include conf.d/*\nHost *\n  StrictHostKeyChecking no\n");
+        let (_directory, paths) =
+            paths("Match host x\n  User y\nHost *\n  StrictHostKeyChecking no\n");
         let notes = resolve("box", &paths).unwrap().notes.join("\n");
-        assert!(notes.contains("Include"), "{notes}");
+        assert!(notes.contains("Match"), "{notes}");
         assert!(notes.contains("always checked"), "{notes}");
+    }
+
+    /// A file next to the config, under `~/.ssh` in real use.
+    fn write(directory: &tempfile::TempDir, name: &str, contents: &str) {
+        let path = directory.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn included_files_are_read_in_order_and_the_first_value_wins() {
+        let (directory, paths) = paths("Include conf.d/*\nHost build\n  User late\n  Port 2200\n");
+        write(
+            &directory,
+            "conf.d/b",
+            "Host build\n  User second\n  HostName b.example.com\n",
+        );
+        write(&directory, "conf.d/a", "Host build\n  User first\n");
+        write(&directory, "conf.d/.hidden", "Host build\n  User hidden\n");
+        let target = resolve("build", &paths).unwrap();
+        assert_eq!(target.label(), "first@b.example.com:2200");
+        assert!(target.notes.is_empty(), "{:?}", target.notes);
+    }
+
+    #[test]
+    fn lines_after_an_include_apply_to_every_host_again() {
+        let (directory, paths) = paths("Include extra\nUser everyone\n");
+        write(&directory, "extra", "Host build\n  User deploy\n");
+        assert_eq!(resolve("build", &paths).unwrap().label(), "deploy@build:22");
+        assert_eq!(
+            resolve("other", &paths).unwrap().label(),
+            "everyone@other:22"
+        );
+    }
+
+    #[test]
+    fn an_include_in_a_host_block_applies_to_that_host() {
+        let (directory, paths) = paths("Host build\n  Include build.conf\nHost *\n  User rest\n");
+        write(&directory, "build.conf", "User deploy\nPort 2200\n");
+        assert_eq!(
+            resolve("build", &paths).unwrap().label(),
+            "deploy@build:2200"
+        );
+        assert_eq!(resolve("other", &paths).unwrap().label(), "rest@other:22");
+    }
+
+    /// `ssh` reads it only for the hosts the block matches, blocks and all.
+    #[test]
+    fn a_file_with_blocks_included_in_a_host_block_is_reported_not_read() {
+        let (directory, paths) = paths("Host build\n  Include nested\n");
+        write(&directory, "nested", "Host *\n  User leaked\n");
+        let target = resolve("other", &paths).unwrap();
+        assert_ne!(target.user, "leaked");
+        assert!(target.notes.join("\n").contains("inside a Host block"));
+    }
+
+    #[test]
+    fn an_include_in_a_match_block_is_not_read() {
+        let (directory, paths) = paths("Match host elsewhere\n  Include extra\n");
+        write(&directory, "extra", "Host *\n  User leaked\n");
+        assert_ne!(resolve("box", &paths).unwrap().user, "leaked");
+    }
+
+    #[test]
+    fn a_missing_include_is_skipped_quietly() {
+        let (_directory, paths) = paths("Include missing other/*\nUser deploy\n");
+        let target = resolve("box", &paths).unwrap();
+        assert_eq!(target.label(), "deploy@box:22");
+        assert!(target.notes.is_empty(), "{:?}", target.notes);
+    }
+
+    #[test]
+    fn an_include_that_includes_itself_stops() {
+        let (directory, paths) = paths("Include loop\n");
+        write(&directory, "loop", "Include loop\nUser deploy\n");
+        let target = resolve("box", &paths).unwrap();
+        assert_eq!(target.user, "deploy");
+        assert!(target.notes.join("\n").contains("nests more than"));
+    }
+
+    #[test]
+    fn an_absolute_include_and_equals_signs_are_read() {
+        let (directory, paths) = paths("");
+        write(&directory, "elsewhere/conf", "Host build\n  User deploy\n");
+        let absolute = directory.path().join("elsewhere/conf");
+        std::fs::write(&paths.config, format!("Include={}\n", absolute.display())).unwrap();
+        assert_eq!(resolve("build", &paths).unwrap().label(), "deploy@build:22");
     }
 
     /// As common as a config gets, and the parser alone refuses it.
