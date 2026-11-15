@@ -71,6 +71,10 @@ pub fn read_text(path: &Path) -> Result<String> {
 pub fn decode_text(path: &Path, bytes: &[u8]) -> Result<String> {
     if is_pdf(path, bytes) {
         extract_text(bytes).map_err(|err| anyhow!("{}: {err:#}", path.display()))
+    } else if let Some(format) = crate::office::readable_format(path, bytes) {
+        // A LibreOffice or Office document reads as Markdown.
+        crate::office::extract_text(bytes, &format)
+            .map_err(|err| anyhow!("{}: {err:#}", path.display()))
     } else {
         String::from_utf8(bytes.to_vec()).context("not valid UTF-8")
     }

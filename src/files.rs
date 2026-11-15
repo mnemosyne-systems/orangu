@@ -686,6 +686,11 @@ pub fn modify(workspace: &Path, request: ModifyFileRequest) -> FileResult<Modify
             "PDFs do not support line edits; use create_file to save a new PDF from text".into(),
         ));
     }
+    if let Some(format) = crate::office::document_format_of(&path) {
+        return Err(FileError::BadRequest(format!(
+            "{format} documents do not support line edits; use convert_document to write a new one"
+        )));
+    }
     let original = String::from_utf8(original)
         .map_err(|_| FileError::NotUtf8(format!("{display}: not valid UTF-8")))?;
     let (lines, trailing_newline) = split_lines(&original);
@@ -851,8 +856,12 @@ pub fn show(workspace: &Path, request: ShowFileRequest) -> FileResult<ShowFileRe
                 "Page ranges and query are available only for PDF files".into(),
             ));
         }
-        String::from_utf8(bytes)
-            .map_err(|_| FileError::NotUtf8(format!("{display}: not valid UTF-8")))?
+        match crate::office::readable_format(&path, &bytes) {
+            Some(format) => crate::office::extract_text(&bytes, &format)
+                .map_err(|err| FileError::BadRequest(format!("{display}: {err:#}")))?,
+            None => String::from_utf8(bytes)
+                .map_err(|_| FileError::NotUtf8(format!("{display}: not valid UTF-8")))?,
+        }
     };
     let (lines, _) = split_lines(&content);
 

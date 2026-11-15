@@ -163,6 +163,21 @@ pub fn show_file_output(workspace: &Path, raw_args: &str, virtual_width: usize) 
         ));
     }
 
+    // A LibreOffice or Office document is shown as the Markdown it reads as,
+    // in the workspace or at a ref (`git_show_file_content` decodes it).
+    if orangu::office::document_format_of(&resolved_path).is_some() {
+        if options.show_hash || options.show_author {
+            return Err(anyhow!(
+                "Document text does not have Git blame line metadata"
+            ));
+        }
+        let content = match rev {
+            Some(ref rev) => git_show_file_content(workspace, &resolved_path, rev)?,
+            None => orangu::pdf::read_text(&resolved_path)?,
+        };
+        return render_show_file_content(&resolved_path, &content, None, options);
+    }
+
     if let Some(ref rev) = rev {
         let content = git_show_file_content(workspace, &resolved_path, rev)?;
         let blame = if options.show_hash || options.show_author {

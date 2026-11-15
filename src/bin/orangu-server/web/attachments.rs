@@ -19,8 +19,10 @@
 //! [`compose_content`]); every other attachment reaches the model as text.
 //! This module decodes the browser-supplied bytes and pulls plain text out
 //! of the formats worth supporting:
-//! UTF-8 text/code, PDF, and the OOXML Office trio (Word/Excel/PowerPoint,
-//! plus OpenDocument spreadsheets via the same reader). Anything else is
+//! UTF-8 text/code, PDF, the OOXML Office trio (Word/Excel/PowerPoint,
+//! plus OpenDocument spreadsheets via the same reader), and the other
+//! LibreOffice documents and legacy `.doc`/`.ppt` through
+//! [`orangu::office::extract_text`]. Anything else is
 //! kept as a metadata-only reference — its name/type/size are mentioned to
 //! the model, but there are no bytes to feed it.
 //!
@@ -225,6 +227,9 @@ enum Kind {
     OoxmlRuns,
     /// Excel and OpenDocument spreadsheets — read via calamine.
     Spreadsheet,
+    /// LibreOffice text, presentation and drawing documents, and legacy
+    /// Word/PowerPoint — read as Markdown by `orangu::office`.
+    Document(String),
     Binary,
 }
 
@@ -234,6 +239,11 @@ fn classify(name: &str, mime: &str, bytes: &[u8]) -> Kind {
 
     if ends(".pdf") || mime.eq_ignore_ascii_case("application/pdf") || bytes.starts_with(b"%PDF-") {
         return Kind::Pdf;
+    }
+    if let Some(format) = orangu::office::readable_format(std::path::Path::new(&name), bytes)
+        && matches!(format.as_str(), "odt" | "odp" | "odg" | "doc" | "ppt")
+    {
+        return Kind::Document(format);
     }
     if ends(".docx")
         || ends(".pptx")
@@ -265,6 +275,7 @@ fn extract_text(name: &str, mime: &str, bytes: &[u8]) -> Option<String> {
         Kind::Pdf => extract_pdf(bytes),
         Kind::OoxmlRuns => extract_ooxml_runs(bytes),
         Kind::Spreadsheet => extract_spreadsheet(bytes),
+        Kind::Document(format) => orangu::office::extract_text(bytes, &format).ok(),
         Kind::Binary => None,
     }?;
     let trimmed = raw.trim();
@@ -463,6 +474,40 @@ mod tests {
             assert!(content.contains("What is the ingredient?"));
             assert!(content.contains("secret ingredient is apricot"));
             assert!(!content.contains("%PDF-"));
+        }
+    }
+
+    #[test]
+    fn libreoffice_text_and_presentations_reach_the_query() {
+        let convert = |content: &str, from: &str, to: &str| {
+            orangu::office::convert(content.as_bytes(), from, to, std::path::Path::new("."))
+                .unwrap()
+        };
+        let odt = convert(
+            "# Notes\n\nThe secret ingredient is apricot.\n",
+            "md",
+            "odt",
+        );
+        let odp = convert("# Plan\n- launch on Friday\n", "outline", "odp");
+        for (name, mime, bytes, fact) in [
+            ("notes.odt", "", &odt, "secret ingredient is apricot"),
+            (
+                "upload",
+                "application/octet-stream",
+                &odt,
+                "secret ingredient is apricot",
+            ),
+            (
+                "plan.odp",
+                "application/vnd.oasis.opendocument.presentation",
+                &odp,
+                "launch on Friday",
+            ),
+        ] {
+            let att = extract(&incoming(name, mime, bytes)).unwrap();
+            let content = compose_content("What does it say?", &[att], None);
+            assert!(content.contains(fact), "{name}: {content}");
+            assert!(!content.contains("binary content"), "{name}: {content}");
         }
     }
 
