@@ -167,6 +167,13 @@ debug = 1
 opt-level = 3
 debug = 0
 
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
 [profile.release-with-debug]
 inherits = "release"
 debug = 1
