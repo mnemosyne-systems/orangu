@@ -17,6 +17,7 @@ Bassam Adnan <mailbassam@gmail.com>
 Saleh Enab <salehenab850@gmail.com>
 Tejas Tyagi <tejastyagi.tt@gmail.com>
 Shahmeer Abdullah <shahmeerabdullah83@gmail.com>
+Hardik Kaurani <hardikkaurani1@gmail.com>
 ```
 
 ## Committers
