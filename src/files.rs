@@ -1040,30 +1040,41 @@ fn canonical(path: &Path) -> FileResult<PathBuf> {
 
 /// Split file content into lines, reporting separately whether the file
 /// ended with a newline — so writing the result back can preserve it (or its
-/// absence) instead of silently adding or dropping one.
+/// absence) instead of silently adding or dropping one. Lines are normalized
+/// to use `\n` line endings by stripping any trailing carriage returns.
 fn split_lines(content: &str) -> (Vec<String>, bool) {
     if content.is_empty() {
         return (Vec::new(), true);
     }
-    match content.strip_suffix('\n') {
-        Some(body) => (body.split('\n').map(str::to_string).collect(), true),
-        None => (content.split('\n').map(str::to_string).collect(), false),
-    }
+    let (body, trailing_newline) = match content.strip_suffix("\r\n") {
+        Some(body) => (body, true),
+        None => match content.strip_suffix('\n') {
+            Some(body) => (body, true),
+            None => (content, false),
+        },
+    };
+    let lines = body
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect();
+    (lines, trailing_newline)
 }
 
 /// The lines an edit's `replacement` contributes. An empty replacement
 /// contributes nothing (the range is deleted); a trailing newline is
 /// tolerated rather than turned into a stray empty line, since a caller
-/// sending whole lines will naturally include one.
+/// sending whole lines will naturally include one. Lines are normalized
+/// to use `\n` line endings by stripping any trailing carriage returns.
 fn replacement_lines(replacement: &str) -> Vec<String> {
     if replacement.is_empty() {
         return Vec::new();
     }
-    replacement
-        .strip_suffix('\n')
-        .unwrap_or(replacement)
-        .split('\n')
-        .map(str::to_string)
+    let body = replacement
+        .strip_suffix("\r\n")
+        .or_else(|| replacement.strip_suffix('\n'))
+        .unwrap_or(replacement);
+    body.split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
         .collect()
 }
 
@@ -1713,6 +1724,133 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("without.txt")).unwrap(),
             "A\nb"
+        );
+    }
+
+    #[test]
+    fn modify_normalizes_crlf_to_lf_and_produces_clean_diff() {
+        let dir = workspace_with(&[
+            ("crlf_with.txt", "one\r\ntwo\r\nthree\r\n"),
+            ("crlf_without.txt", "one\r\ntwo\r\nthree"),
+        ]);
+
+        let response_with = modify(
+            dir.path(),
+            modify_request("crlf_with.txt", vec![edit(2, 2, "TWO\n")]),
+        )
+        .expect("modify");
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("crlf_with.txt")).unwrap(),
+            "one\nTWO\nthree\n"
+        );
+        assert!(
+            !fs::read_to_string(dir.path().join("crlf_with.txt"))
+                .unwrap()
+                .contains('\r')
+        );
+        assert_eq!(
+            response_with.diff,
+            "--- a/crlf_with.txt\n+++ b/crlf_with.txt\n@@ -2,1 +2,1 @@\n-two\n+TWO\n"
+        );
+        assert!(!response_with.diff.contains('\r'));
+
+        let response_without = modify(
+            dir.path(),
+            modify_request("crlf_without.txt", vec![edit(2, 2, "TWO")]),
+        )
+        .expect("modify");
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("crlf_without.txt")).unwrap(),
+            "one\nTWO\nthree"
+        );
+        assert!(
+            !fs::read_to_string(dir.path().join("crlf_without.txt"))
+                .unwrap()
+                .contains('\r')
+        );
+        assert_eq!(
+            response_without.diff,
+            "--- a/crlf_without.txt\n+++ b/crlf_without.txt\n@@ -2,1 +2,1 @@\n-two\n+TWO\n"
+        );
+        assert!(!response_without.diff.contains('\r'));
+    }
+
+    #[test]
+    fn modify_strips_carriage_returns_from_crlf_replacements() {
+        let dir = workspace_with(&[("file.txt", "one\ntwo\nthree\n")]);
+
+        let response = modify(
+            dir.path(),
+            modify_request("file.txt", vec![edit(2, 2, "TWO\r\nDOS\r\n")]),
+        )
+        .expect("modify");
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "one\nTWO\nDOS\nthree\n"
+        );
+        assert!(
+            !fs::read_to_string(dir.path().join("file.txt"))
+                .unwrap()
+                .contains('\r')
+        );
+        assert_eq!(
+            response.diff,
+            "--- a/file.txt\n+++ b/file.txt\n@@ -2,1 +2,2 @@\n-two\n+TWO\n+DOS\n"
+        );
+        assert!(!response.diff.contains('\r'));
+    }
+
+    #[test]
+    fn split_lines_normalizes_crlf_and_preserves_trailing_newline_state() {
+        assert_eq!(split_lines(""), (Vec::new(), true));
+        assert_eq!(
+            split_lines("one\ntwo\n"),
+            (vec!["one".to_string(), "two".to_string()], true)
+        );
+        assert_eq!(
+            split_lines("one\ntwo"),
+            (vec!["one".to_string(), "two".to_string()], false)
+        );
+        assert_eq!(
+            split_lines("one\r\ntwo\r\n"),
+            (vec!["one".to_string(), "two".to_string()], true)
+        );
+        assert_eq!(
+            split_lines("one\r\ntwo"),
+            (vec!["one".to_string(), "two".to_string()], false)
+        );
+        assert_eq!(
+            split_lines("one\r\n\r\ntwo\r\n"),
+            (
+                vec!["one".to_string(), "".to_string(), "two".to_string()],
+                true
+            )
+        );
+        assert_eq!(split_lines("\r\n"), (vec!["".to_string()], true));
+        assert_eq!(split_lines("\n"), (vec!["".to_string()], true));
+    }
+
+    #[test]
+    fn replacement_lines_normalizes_crlf_and_lf() {
+        assert_eq!(replacement_lines(""), Vec::<String>::new());
+        assert_eq!(
+            replacement_lines("one\ntwo\n"),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert_eq!(
+            replacement_lines("one\ntwo"),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert_eq!(
+            replacement_lines("one\r\ntwo\r\n"),
+            vec!["one".to_string(), "two".to_string()]
+        );
+        assert_eq!(
+            replacement_lines("one\r\ntwo"),
+            vec!["one".to_string(), "two".to_string()]
         );
     }
 

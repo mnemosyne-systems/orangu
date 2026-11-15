@@ -2162,12 +2162,10 @@ fn cross_check_n_tokens(ggml_type: u32, in_dim: usize, out_dim: usize, n_tokens:
     // random `Q4_K` block's scales put this fixture's outputs near 1e5,
     // and one of them landing at -0.14 was 0.05 off: 4e-6 of the row. A
     // kernel that is wrong (a scale, a nibble, a sub-block) is off by the
-    // magnitude itself.
-    let floor = if on_integer_dot {
-        1e-5 * reference.iter().fold(0f32, |m, v| m.max(v.abs()))
-    } else {
-        0.0
-    };
+    // magnitude itself. Summation order between GPU parallel reduction and
+    // CPU sequential accumulation has the same cancellation floor on the
+    // float path.
+    let floor = 1e-5 * reference.iter().fold(0f32, |m, v| m.max(v.abs()));
     for (i, (a, b)) in reference.iter().zip(gpu_out.iter()).enumerate() {
         let tol = tol_factor * a.abs().max(1.0) + floor;
         assert!(
