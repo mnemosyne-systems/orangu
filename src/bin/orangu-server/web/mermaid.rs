@@ -38,7 +38,7 @@
 //!    stance [`super::render`] takes for every other node kind.
 //! 2. **The SVG has to stand alone.** An `<img>` document gets no HTML
 //!    layout engine, so Mermaid's usual `<foreignObject>` HTML labels would
-//!    render as nothing at all. [`SvgPipeline::resvg_safe`] is the setting
+//!    render as nothing at all. [`SvgPipelinePreset::ResvgSafe`] is the setting
 //!    that turns those into plain SVG `<text>`, which is why it is not
 //!    optional here.
 //!
@@ -47,8 +47,11 @@
 //! matches. The two SVGs are built in one pass and cached together.
 
 use base64::Engine as _;
-use merman::svg::{HostTheme, Presentation, SvgPipeline, ThemeRole};
-use merman::{OperationControl, RenderOutput, RenderRequest, Renderer, SvgRequest};
+use merman::svg::{SvgOutputPolicy, SvgPipelinePreset};
+use merman::{
+    MermaidEngine, OperationControl, RenderOutput, RenderRequest, Renderer,
+    SourcePresentationConfig, SvgRequest,
+};
 use rustc_hash::FxHasher;
 use std::{
     collections::HashMap,
@@ -129,57 +132,75 @@ fn cache() -> &'static Mutex<Cache> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The diagram's root background: `app.css`'s `--assistant-bubble`, so the
+/// picture blends into the message it sits in.
+fn canvas(dark: bool) -> &'static str {
+    if dark { "#23272e" } else { "#ffffff" }
+}
+
 /// Maps the console's CSS custom properties (`app.css` `:root`) onto
-/// Merman's semantic theme roles, so a diagram sits in the transcript as if
-/// it were styled by the same stylesheet as everything around it rather than
-/// arriving in Mermaid's stock lavender.
-fn roles(dark: bool) -> &'static [(ThemeRole, &'static str)] {
+/// Mermaid's `base` theme variables, so a diagram sits in the transcript as
+/// if it were styled by the same stylesheet as everything around it rather
+/// than arriving in Mermaid's stock lavender.
+fn theme_variables(dark: bool) -> serde_json::Value {
     if dark {
-        &[
-            (ThemeRole::Canvas, "#23272e"),       // --assistant-bubble
-            (ThemeRole::Surface, "#2a2f38"),      // --bg-input
-            (ThemeRole::SurfaceAlt, "#2b3a55"),   // --user-bubble
-            (ThemeRole::SurfaceMuted, "#23272e"), // --bg-raised
-            (ThemeRole::Text, "#e6e8eb"),         // --text
-            (ThemeRole::SubtleText, "#9aa3b2"),   // --text-dim
-            (ThemeRole::Border, "#5b9dff"),       // --accent
-            (ThemeRole::Line, "#9aa3b2"),         // --text-dim
-            (ThemeRole::EdgeLabelBackground, "#23272e"),
-            (ThemeRole::ClusterBackground, "#2a2f38"),
-            (ThemeRole::ClusterBorder, "#343a45"), // --border
-            (ThemeRole::NoteBackground, "#2b3a55"),
-            (ThemeRole::NoteBorder, "#5b9dff"),
-            (ThemeRole::NoteText, "#e6e8eb"),
-            (ThemeRole::ActorBackground, "#2a2f38"),
-            (ThemeRole::ActorBorder, "#5b9dff"),
-            (ThemeRole::ActorText, "#e6e8eb"),
-            (ThemeRole::Error, "#ff6b6b"), // --error
-        ]
+        serde_json::json!({
+            "darkMode": true,
+            "background": canvas(true),
+            "primaryColor": "#2a2f38",       // --bg-input
+            "mainBkg": "#2a2f38",            // --bg-input
+            "secondaryColor": "#2b3a55",     // --user-bubble
+            "tertiaryColor": "#23272e",      // --bg-raised
+            "primaryTextColor": "#e6e8eb",   // --text
+            "textColor": "#e6e8eb",          // --text
+            "secondaryTextColor": "#9aa3b2", // --text-dim
+            "tertiaryTextColor": "#9aa3b2",  // --text-dim
+            "primaryBorderColor": "#5b9dff", // --accent
+            "nodeBorder": "#5b9dff",         // --accent
+            "lineColor": "#9aa3b2",          // --text-dim
+            "edgeLabelBackground": "#23272e",
+            "clusterBkg": "#2a2f38",
+            "clusterBorder": "#343a45",      // --border
+            "noteBkgColor": "#2b3a55",
+            "noteBorderColor": "#5b9dff",
+            "noteTextColor": "#e6e8eb",
+            "actorBkg": "#2a2f38",
+            "actorBorder": "#5b9dff",
+            "actorTextColor": "#e6e8eb",
+            "errorBkgColor": "#ff6b6b",      // --error
+            "errorTextColor": "#ff6b6b",     // --error
+        })
     } else {
-        &[
-            (ThemeRole::Canvas, "#ffffff"),       // --assistant-bubble
-            (ThemeRole::Surface, "#eef0f3"),      // --bg-input
-            (ThemeRole::SurfaceAlt, "#dbe6ff"),   // --user-bubble
-            (ThemeRole::SurfaceMuted, "#f5f6f8"), // --bg
-            (ThemeRole::Text, "#1b1e23"),         // --text
-            (ThemeRole::SubtleText, "#62697a"),   // --text-dim
-            (ThemeRole::Border, "#2563eb"),       // --accent
-            (ThemeRole::Line, "#62697a"),         // --text-dim
-            (ThemeRole::EdgeLabelBackground, "#ffffff"),
-            (ThemeRole::ClusterBackground, "#f5f6f8"),
-            (ThemeRole::ClusterBorder, "#d7dbe0"), // --border
-            (ThemeRole::NoteBackground, "#dbe6ff"),
-            (ThemeRole::NoteBorder, "#2563eb"),
-            (ThemeRole::NoteText, "#1b1e23"),
-            (ThemeRole::ActorBackground, "#eef0f3"),
-            (ThemeRole::ActorBorder, "#2563eb"),
-            (ThemeRole::ActorText, "#1b1e23"),
-            (ThemeRole::Error, "#d92d20"), // --error
-        ]
+        serde_json::json!({
+            "darkMode": false,
+            "background": canvas(false),
+            "primaryColor": "#eef0f3",       // --bg-input
+            "mainBkg": "#eef0f3",            // --bg-input
+            "secondaryColor": "#dbe6ff",     // --user-bubble
+            "tertiaryColor": "#f5f6f8",      // --bg
+            "primaryTextColor": "#1b1e23",   // --text
+            "textColor": "#1b1e23",          // --text
+            "secondaryTextColor": "#62697a", // --text-dim
+            "tertiaryTextColor": "#62697a",  // --text-dim
+            "primaryBorderColor": "#2563eb", // --accent
+            "nodeBorder": "#2563eb",         // --accent
+            "lineColor": "#62697a",          // --text-dim
+            "edgeLabelBackground": "#ffffff",
+            "clusterBkg": "#f5f6f8",
+            "clusterBorder": "#d7dbe0",      // --border
+            "noteBkgColor": "#dbe6ff",
+            "noteBorderColor": "#2563eb",
+            "noteTextColor": "#1b1e23",
+            "actorBkg": "#eef0f3",
+            "actorBorder": "#2563eb",
+            "actorTextColor": "#1b1e23",
+            "errorBkgColor": "#d92d20",      // --error
+            "errorTextColor": "#d92d20",     // --error
+        })
     }
 }
 
-/// `resvg_safe` is the load-bearing part — see this module's doc
+/// `ResvgSafe` is the load-bearing part — see this module's doc
 /// comment for why `<foreignObject>` labels can't survive the `<img>`
 /// embedding. The font stack matches `app.css`'s body font so diagram text
 /// looks like transcript text.
@@ -187,23 +208,21 @@ fn renderer(dark: bool) -> &'static (Renderer, SvgRequest) {
     static RENDERERS: OnceLock<[(Renderer, SvgRequest); 2]> = OnceLock::new();
     let renderers = RENDERERS.get_or_init(|| {
         [false, true].map(|dark| {
-            let theme = HostTheme::new()
-                .try_with_font_family(
+            let site_config = SourcePresentationConfig::from_value(serde_json::json!({
+                "theme": "base",
+                "fontFamily":
                     "system-ui, -apple-system, \"Segoe UI\", Roboto, \"Helvetica Neue\", sans-serif",
-                )
-                .and_then(|theme| {
-                    roles(dark).iter().try_fold(theme, |theme, &(role, colour)| {
-                        theme.try_with_role(role, colour)
-                    })
-                });
-            let presentation = Presentation::new()
-                .with_theme(theme.expect("the console theme is valid CSS"))
-                .resolve();
-            let renderer =
-                Renderer::new().with_engine(presentation.materialize_engine(Default::default()));
+                "themeVariables": theme_variables(dark),
+            }));
+            let renderer = Renderer::new()
+                .with_presentation_engine(MermaidEngine::new().with_site_config(site_config));
+            let output = SvgOutputPolicy {
+                preset: SvgPipelinePreset::ResvgSafe,
+                root_background_color: Some(canvas(dark).to_string()),
+                ..SvgOutputPolicy::default()
+            };
             let mut request = SvgRequest {
-                pipeline: Some(SvgPipeline::resvg_safe()),
-                presentation: presentation.render_policy(),
+                pipeline: Some(output.pipeline()),
                 ..SvgRequest::default()
             };
             // Every diagram is its own isolated `<img>` document, so a fixed
