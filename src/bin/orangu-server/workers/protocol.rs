@@ -85,8 +85,40 @@ pub const FEATURE_ROOM: u64 = 64;
 /// list only when the parent's `Hello` advertised this bit. The list is
 /// written at the very end of the message, so older versions of
 /// orangu-server — which stop reading when the message runs out — lose
-/// nothing and never see it.
-pub const FEATURE_METRICS: u64 = 64;
+/// nothing and never see it. A parent that advertises [`FEATURE_ROOM`] but
+/// not this bit is sent the list too: some builds advertised both
+/// extensions under bit 64.
+pub const FEATURE_METRICS: u64 = 128;
+
+/// Every extension bit, each a distinct power of two.
+const ALL_FEATURES: [u64; 8] = [
+    FEATURE_FORK,
+    FEATURE_ROWS,
+    FEATURE_HEAD,
+    FEATURE_ECHO,
+    FEATURE_SWITCH,
+    FEATURE_STATE,
+    FEATURE_ROOM,
+    FEATURE_METRICS,
+];
+
+const _: () = {
+    let mut seen = 0u64;
+    let mut i = 0;
+    while i < ALL_FEATURES.len() {
+        let bit = ALL_FEATURES[i];
+        assert!(bit.is_power_of_two(), "a feature is one bit");
+        assert!(seen & bit == 0, "two features share a bit");
+        seen |= bit;
+        i += 1;
+    }
+};
+
+/// Whether a parent that advertised `features` reads the discovery list
+/// at the end of a `HelloAck`.
+pub fn parent_reads_discovery(features: u64) -> bool {
+    features & (FEATURE_METRICS | FEATURE_ROOM) != 0
+}
 
 /// The extensions `features` advertises, by name, for `/v1/workers`.
 pub fn feature_names(features: u64) -> Vec<&'static str> {
@@ -1409,6 +1441,30 @@ mod tests {
             tokens: vec![5, 6],
             hidden: activations(),
         }
+    }
+
+    /// Clearing one extension leaves every other one advertised.
+    #[test]
+    fn each_feature_has_its_own_bit() {
+        for bit in ALL_FEATURES {
+            let names = feature_names(ALL_FEATURES.iter().fold(0, |all, b| all | b) & !bit);
+            assert_eq!(names.len(), ALL_FEATURES.len() - 1, "{names:?}");
+        }
+        let without_room = feature_names(FEATURES & !FEATURE_ROOM);
+        assert!(!without_room.contains(&"room"));
+        assert!(without_room.contains(&"metrics"));
+    }
+
+    /// A parent that advertised both extensions under bit 64 still gets
+    /// the discovery list; one with neither does not.
+    #[test]
+    fn a_parent_on_the_shared_bit_reads_discovery() {
+        assert!(parent_reads_discovery(FEATURE_ROOM));
+        assert!(parent_reads_discovery(FEATURE_METRICS));
+        assert!(parent_reads_discovery(FEATURES));
+        assert!(!parent_reads_discovery(
+            FEATURES & !FEATURE_ROOM & !FEATURE_METRICS
+        ));
     }
 
     fn result() -> ForwardResult {

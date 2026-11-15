@@ -517,8 +517,9 @@ without. Nodes like that keep each other's cores busy anyway.
   submission, as a whole model does: a Llama-3.2-3B step split in three
   took 67.8 ms against 65.5 ms whole. A prompt chunk still runs layer by
   layer, and so does a Gemma 4 mixture's decode.
-- Each node keeps the whole model file on disk. Fetching only a node's
-  own layers is still to come.
+- Only a node with no workers of its own can fetch just its layers
+  (`download = range`); every other node keeps the whole model file on
+  disk. A model split in shards is refused.
 - A GPU keeps the layers it has uploaded until the process ends. A new plan
   frees their host memory, but not their device memory.
 - Before a parent claims it, a node serves its own clients with the whole

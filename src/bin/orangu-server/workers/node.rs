@@ -39,9 +39,9 @@ use super::metrics::{LinkSnapshot, NodeMetrics};
 use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage, Trace};
 use super::plan;
 use super::protocol::{
-    ActivationFormat, Assign, Capacity, DiscoveryRecord, ErrorCode, FEATURE_METRICS,
-    FEATURE_SWITCH, FEATURES, HelloAck, MAX_DEPTH, Message, NodeSetup, PROTOCOL_VERSION, PlanEntry,
-    WorkerError, check_path, read_frame, read_message, write_message,
+    ActivationFormat, Assign, Capacity, DiscoveryRecord, ErrorCode, FEATURE_SWITCH, FEATURES,
+    HelloAck, MAX_DEPTH, Message, NodeSetup, PROTOCOL_VERSION, PlanEntry, WorkerError, check_path,
+    parent_reads_discovery, read_frame, read_message, write_message,
 };
 use super::session::SessionStore;
 use super::stage::{EncodedStage, MessageStage};
@@ -926,9 +926,9 @@ impl Node {
 
     /// What this handshake sends up: my card first, then the connected
     /// children's, with each child's `worker` rewritten to the dialed
-    /// address; empty when the parent lacks `FEATURE_METRICS`.
+    /// address; empty when the parent does not read the list.
     fn discovery_for_parent(&self, parent_features: u64) -> Vec<DiscoveryRecord> {
-        if parent_features & FEATURE_METRICS == 0 {
+        if !parent_reads_discovery(parent_features) {
             return Vec::new();
         }
         let mut out = vec![self.self_record()];
