@@ -29,7 +29,7 @@ MCP support currently exposes tools only. Resources and prompts are not exposed;
 
 | Tool | Purpose | Key arguments |
 | :-- | :-- | :-- |
-| `show_file` | Show a text file or extract PDF text from the workspace | `path`, optional `start_line`, optional `end_line`, optional `mode` |
+| `show_file` | Show a text file, extract PDF text, or read a LibreOffice or Office document as Markdown | `path`, optional `start_line`, optional `end_line`, optional `mode` |
 | `create_file` | Create a file with content, optionally with its permissions | `path`, optional `content`, `mode`, `overwrite`, `parents`, `git` |
 | `modify_file` | Modify a file, by text replacement or by line ranges | `path`, either `old_text`/`new_text` (+ `replace_all`) or `edits`, optional `git` |
 | `move_file` | Move or rename a file | `from`, `to`, optional `mode`, `overwrite`, `parents`, `git` |
@@ -69,6 +69,39 @@ Scanned pages use local OCR when its models are installed. Pages with a small
 amount of embedded text and an image also try OCR, which handles scans with
 digitally added page numbers. Failed pages are marked unavailable while
 readable pages remain usable.
+
+### LibreOffice and Office documents
+
+`show_file` reads LibreOffice and Office documents as Markdown, so the model
+can answer questions about them the same way. Use `/show_file budget.ods` to
+load one into the conversation. Nothing has to be installed; it uses the same
+pure-Rust [libreoffice-pure](https://crates.io/crates/libreoffice-pure) crate
+as `convert_document`.
+
+| Kind | Formats | Read as |
+| :-- | :-- | :-- |
+| Text | `.odt`, `.docx`, `.doc` | Markdown, with headings, lists and tables; a `.docx` with its tracked changes accepted |
+| Spreadsheet | `.ods`, `.xlsx`, `.xls` | a Markdown table per sheet, under the sheet's name when there are several |
+| Presentation | `.odp`, `.pptx`, `.ppt` | the text of each slide under a heading |
+| Drawing | `.odg` | the text of each page under a heading |
+
+A spreadsheet shows the values the file stores, which for a file saved by
+LibreOffice or Excel are the results of its formulas. An `.ods` written by
+`convert_document` stores the formula itself, so that is what shows for its
+formula cells.
+
+A document is recognised by its extension, or by its content when the name
+has none, but only when the file really is a document package: a text file
+called `notes.doc` still reads as text. Line ranges refer to the lines of
+the Markdown. `fetch_url` reads a document it downloads the same way, and
+the web console reads uploaded `.odt`, `.odp`, `.odg`, `.doc` and `.ppt`
+files with it.
+
+A document cannot be edited as text: `modify_file` refuses one, since
+writing text into the package would break it. Write a new one with
+`convert_document`, from the Markdown or CSV the model has read. Reading is
+not LibreOffice's own either; images, comments and most formatting are left
+out.
 
 Use page ranges or query keywords for larger documents:
 
@@ -326,7 +359,9 @@ Behavior:
 - `url` is required
 - `max_chars` defaults to `20000`
 - HTML responses are converted into readable text
-- Non-HTML responses are returned as plain text
+- PDF responses, and LibreOffice and Office documents, are read the way
+  `show_file` reads them
+- Other responses are returned as plain text
 - Long responses are truncated and end with `[truncated]`
 
 ## `expand_context`

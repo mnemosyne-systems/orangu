@@ -29,9 +29,14 @@
 //!
 //! Any existing document converts the same way, by its extension, which is
 //! how a document becomes a PDF.
+//!
+//! Going the other way, [`extract_text`] reads a document as Markdown, which
+//! is how `show_file`, `fetch_url` and web uploads put its content in front
+//! of the model.
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+use std::io::{Cursor, Read};
 use std::path::Path;
 
 /// Maps a format name or file extension to the name used here.
@@ -153,6 +158,219 @@ fn markdown_to_pdf(markdown: &str, base: &Path) -> Result<Vec<u8>> {
     // images next to it; any file name in `base` gives the same base.
     libreoffice_pure::markdown_to_pdf_bytes(base.join("document.md"), markdown.as_bytes())
         .map_err(|err| anyhow!("md to pdf: {err}"))
+}
+
+/// The document formats [`extract_text`] reads.
+const READABLE: &[&str] = &[
+    "odt", "docx", "doc", "ods", "xlsx", "xls", "odp", "pptx", "ppt", "odg",
+];
+
+/// The start of an OLE compound file, the container of `.doc`, `.xls` and
+/// `.ppt`.
+const COMPOUND_FILE: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
+
+/// The readable document format `path`'s extension names, whatever the file
+/// holds. What an edit is refused for: text written into one would break it.
+pub fn document_format_of(path: &Path) -> Option<String> {
+    format_of(path).filter(|format| READABLE.contains(&format.as_str()))
+}
+
+/// The format to read `bytes` as, when they are a document [`extract_text`]
+/// reads: by `path`'s extension, or by the content when the extension says
+/// nothing, as with a download. Only a zip package or a compound file
+/// counts, so a text file someone named `notes.doc` still reads as text.
+pub fn readable_format(path: &Path, bytes: &[u8]) -> Option<String> {
+    if !bytes.starts_with(b"PK\x03\x04") && !bytes.starts_with(&COMPOUND_FILE) {
+        return None;
+    }
+    if let Some(format) = document_format_of(path) {
+        return Some(format);
+    }
+    // An ODF package stores its mimetype first, uncompressed. The crate's
+    // sniffer knows text, spreadsheets and presentations, not drawings.
+    if bytes
+        .get(..128)
+        .is_some_and(|head| contains(head, b"opendocument.graphics"))
+    {
+        return Some("odg".to_string());
+    }
+    libreoffice_pure::sniff_format_from_bytes(bytes)
+        .filter(|format| READABLE.contains(&format.as_str()))
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Reads a document in `format` (see [`readable_format`]) as Markdown:
+///
+/// - text documents through the Writer importer, a `.docx` with its tracked
+///   changes accepted, which is the text a reader sees
+/// - spreadsheets as one table per sheet, with the values the file stores
+///   for its formulas
+/// - presentations and drawings as their text, page by page; an `.odp` is
+///   read from its XML, since the importer drops the text of its lists
+///
+/// A parser that panics on a damaged file is an error here, not a crash.
+pub fn extract_text(bytes: &[u8], format: &str) -> Result<String> {
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match format {
+        // calamine cannot place the `.ods` libreoffice-pure itself writes,
+        // which the crate's own Calc reader can.
+        "ods" | "xlsx" | "xls" => {
+            spreadsheet_markdown(bytes).or_else(|_| to_markdown(bytes, format))
+        }
+        "odp" | "odg" => odf_page_text(bytes),
+        "docx" => {
+            let accepted = libreoffice_pure::accept_all_tracked_changes_docx_bytes(bytes).ok();
+            to_markdown(accepted.as_deref().unwrap_or(bytes), format)
+        }
+        _ => to_markdown(bytes, format),
+    }));
+    read.map_err(|_| anyhow!("the {format} reader failed on this document"))?
+}
+
+fn to_markdown(bytes: &[u8], format: &str) -> Result<String> {
+    let markdown = libreoffice_pure::convert_bytes(bytes, format, "md")
+        .map_err(|err| anyhow!("{format} to md: {err}"))?;
+    Ok(String::from_utf8_lossy(&markdown).into_owned())
+}
+
+/// Every sheet that has cells, as a Markdown table under its name when there
+/// is more than one. calamine reads the values the file stores, which for a
+/// file from LibreOffice or Excel are its formulas' results.
+fn spreadsheet_markdown(bytes: &[u8]) -> Result<String> {
+    use calamine::Reader;
+
+    let mut workbook = calamine::open_workbook_auto_from_rs(Cursor::new(bytes.to_vec()))?;
+    let names = workbook.sheet_names();
+    let mut out = String::new();
+    for name in &names {
+        let range = workbook.worksheet_range(name)?;
+        if range.is_empty() {
+            continue;
+        }
+        if names.len() > 1 {
+            out.push_str(&format!("## {name}\n\n"));
+        }
+        for (index, row) in range.rows().enumerate() {
+            out.push('|');
+            for cell in row {
+                let text = cell.to_string().replace('|', "\\|").replace('\n', " ");
+                out.push_str(&format!(" {text} |"));
+            }
+            out.push('\n');
+            if index == 0 {
+                out.push('|');
+                out.push_str(&" --- |".repeat(row.len()));
+                out.push('\n');
+            }
+        }
+        out.push('\n');
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// The text of an `.odp` or `.odg`, a `##` heading for each page or slide
+/// with its paragraphs under it, list items marked `- `. Speaker notes are
+/// left out.
+fn odf_page_text(bytes: &[u8]) -> Result<String> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    let mut xml = String::new();
+    archive
+        .by_name("content.xml")
+        .context("no content.xml in the package")?
+        .read_to_string(&mut xml)?;
+    page_text(&xml)
+}
+
+fn page_text(xml: &str) -> Result<String> {
+    use quick_xml::events::{BytesStart, Event};
+
+    fn heading(out: &mut String, page: usize, start: &BytesStart) {
+        let name = start
+            .try_get_attribute("draw:name")
+            .ok()
+            .flatten()
+            .and_then(|attr| {
+                attr.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    .ok()
+                    .map(|name| name.into_owned())
+            })
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| format!("Page {page}"));
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("## {name}\n\n"));
+    }
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut out = String::new();
+    let mut line = String::new();
+    let (mut page, mut lists, mut notes, mut paragraphs) = (0, 0, 0, 0);
+    loop {
+        match reader.read_event()? {
+            Event::Start(start) => match start.name().as_ref() {
+                "draw:page" => {
+                    page += 1;
+                    heading(&mut out, page, &start);
+                }
+                "presentation:notes" => notes += 1,
+                "text:list" => lists += 1,
+                "text:p" | "text:h" => {
+                    paragraphs += 1;
+                    line.clear();
+                }
+                _ => {}
+            },
+            Event::Empty(empty) => match empty.name().as_ref() {
+                "draw:page" => {
+                    page += 1;
+                    heading(&mut out, page, &empty);
+                }
+                "text:s" | "text:line-break" if paragraphs > 0 => line.push(' '),
+                "text:tab" if paragraphs > 0 => line.push('\t'),
+                _ => {}
+            },
+            Event::End(end) => match end.name().as_ref() {
+                "presentation:notes" => notes -= 1,
+                "text:list" => lists -= 1,
+                "text:p" | "text:h" => {
+                    paragraphs -= 1;
+                    let text = line.trim();
+                    if notes == 0 && !text.is_empty() {
+                        if lists > 0 {
+                            out.push_str("- ");
+                        }
+                        out.push_str(text);
+                        out.push('\n');
+                    }
+                    line.clear();
+                }
+                _ => {}
+            },
+            Event::Text(text) if paragraphs > 0 => line.push_str(&text.xml10_content()),
+            Event::GeneralRef(reference) if paragraphs > 0 => {
+                if let Ok(Some(c)) = reference.resolve_char_ref() {
+                    line.push(c);
+                } else if let Some(c) = match reference.as_ref() {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "apos" => Some('\''),
+                    _ => None,
+                } {
+                    line.push(c);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    Ok(out.trim_end().to_string())
 }
 
 /// The `convert_document` tool's request.
@@ -463,6 +681,114 @@ mod tests {
         };
         convert_file(workspace.path(), &to_pdf, Some(&target), &pdf).unwrap();
         assert!(is_pdf(&std::fs::read(&pdf).unwrap()));
+    }
+
+    #[test]
+    fn documents_are_recognised_by_extension_or_content() {
+        let odt = render("# Notes\n", "md", "odt");
+        assert_eq!(
+            readable_format(Path::new("a/notes.ODT"), &odt).as_deref(),
+            Some("odt")
+        );
+        // A download without a useful name, by its content.
+        for (bytes, format) in [
+            (odt.clone(), "odt"),
+            (render("# Notes\n", "md", "docx"), "docx"),
+            (render("A,B\n1,2\n", "csv", "ods"), "ods"),
+            (render("A,B\n1,2\n", "csv", "xlsx"), "xlsx"),
+            (render("# Slide\n- point\n", "outline", "odp"), "odp"),
+            (
+                render(
+                    r#"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20"><rect x="1" y="1" width="5" height="5"/></svg>"#,
+                    "svg",
+                    "odg",
+                ),
+                "odg",
+            ),
+        ] {
+            assert_eq!(
+                readable_format(Path::new("download"), &bytes).as_deref(),
+                Some(format)
+            );
+        }
+        // Text named like a document is still text, and a document's
+        // extension is enough to refuse an edit.
+        assert_eq!(readable_format(Path::new("notes.doc"), b"plain text"), None);
+        assert_eq!(readable_format(Path::new("a.zip"), b"PK\x03\x04"), None);
+        assert_eq!(
+            document_format_of(Path::new("new.Docx")).as_deref(),
+            Some("docx")
+        );
+        assert_eq!(document_format_of(Path::new("notes.md")), None);
+    }
+
+    #[test]
+    fn a_text_document_reads_as_markdown() {
+        let markdown = "# Report\n\nThe codename is *Apricot*.\n\n- one\n- two\n";
+        for format in ["odt", "docx"] {
+            let text = extract_text(&render(markdown, "md", format), format).unwrap();
+            assert!(text.contains("Report"), "{format}: {text}");
+            assert!(text.contains("Apricot"), "{format}: {text}");
+            assert!(text.contains("two"), "{format}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_spreadsheet_reads_as_a_table_with_stored_results() {
+        let csv = "Item,Cost\nA,2\nB,3\nTotal,=SUM(B2:B3)\n";
+        let xlsx = extract_text(&render(csv, "csv", "xlsx"), "xlsx").unwrap();
+        assert!(
+            xlsx.starts_with("| Item | Cost |\n| --- | --- |\n"),
+            "{xlsx}"
+        );
+        assert!(xlsx.contains("| B | 3 |"), "{xlsx}");
+        assert!(xlsx.contains("| Total | 5 |"), "{xlsx}");
+
+        let ods = extract_text(&render(csv, "csv", "ods"), "ods").unwrap();
+        assert!(ods.contains("| A | 2 |"), "{ods}");
+    }
+
+    #[test]
+    fn a_presentation_reads_slide_by_slide_with_its_lists() {
+        let outline = "# Welcome\n- first point\n- second point\n# Next\n- more\n";
+        let odp = extract_text(&render(outline, "outline", "odp"), "odp").unwrap();
+        let welcome = odp.find("## Welcome").expect(&odp);
+        let first = odp.find("first point").expect(&odp);
+        let next = odp.find("## Next").expect(&odp);
+        let more = odp.find("more").expect(&odp);
+        assert!(welcome < first && first < next && next < more, "{odp}");
+        assert!(odp.contains("second point"), "{odp}");
+    }
+
+    #[test]
+    fn a_drawing_reads_its_text() {
+        let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100"><rect x="10" y="10" width="80" height="40" fill="blue"/><text x="20" y="80">Hi there</text></svg>"#;
+        let odg = extract_text(&render(svg, "svg", "odg"), "odg").unwrap();
+        assert!(odg.contains("Hi there"), "{odg}");
+    }
+
+    #[test]
+    fn page_text_skips_notes_and_resolves_spaces_and_entities() {
+        let xml = r#"<office:document-content><office:body><office:drawing>
+            <draw:page draw:name=""><draw:frame><draw:text-box>
+              <text:p>Fish<text:s/>&amp;<text:s/>chips</text:p>
+            </draw:text-box></draw:frame>
+            <presentation:notes><draw:frame><draw:text-box>
+              <text:p>a note</text:p>
+            </draw:text-box></draw:frame></presentation:notes></draw:page>
+            <draw:page draw:name="Second"/>
+            </office:drawing></office:body></office:document-content>"#;
+        assert_eq!(
+            page_text(xml).unwrap(),
+            "## Page 1\n\nFish & chips\n\n## Second"
+        );
+    }
+
+    #[test]
+    fn a_damaged_document_is_an_error() {
+        for format in ["odt", "docx", "ods", "odp"] {
+            assert!(extract_text(b"PK\x03\x04 not a package", format).is_err());
+        }
     }
 
     #[test]

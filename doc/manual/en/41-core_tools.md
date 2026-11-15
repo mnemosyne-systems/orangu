@@ -996,6 +996,12 @@ for a summary. PDF files use the built-in renderer, including at a Git ref;
 correspond to binary Git blame lines. Scanned pages use local OCR when its
 models are installed. The tools chapter documents model setup and limits.
 
+A LibreOffice or Office document (`.odt`, `.docx`, `.ods`, `.xlsx`, `.odp`,
+`.pptx`, `.odg` and the older `.doc`, `.xls`, `.ppt`) is shown as the
+Markdown it reads as, in the workspace or at a Git ref, and is added to the
+conversation the same way. `--hash` and `--author` are unavailable for the
+same reason as for a PDF. The tools chapter lists what each kind reads as.
+
 For workspace PDFs, use `--start-page N` and `--end-page N` to select a range,
 or `--query "search words"` to select relevant pages. For example,
 `/show_file --start-page 21 --end-page 30 report.pdf` reads the next part of a

@@ -491,7 +491,7 @@ impl ToolExecutor {
     pub fn definitions(&self) -> Vec<ToolDefinition> {
         let mut defs = vec![tool(
             "show_file",
-            "Read text/PDF. PDFs support page ranges, query keywords, page references and local OCR. \
+            "Read text/PDF/office documents. PDFs support page ranges, query keywords, page references and local OCR. \
                  Code mode: signatures/map.",
             json!({
                 "type": "object",
@@ -1780,6 +1780,10 @@ impl ToolExecutor {
                 return Ok(Err((kind, bytes.len())));
             }
             let is_pdf = crate::pdf::is_pdf(&read_path, &bytes);
+            // Read as Markdown by `decode_text`, and never cut down to
+            // code signatures.
+            let is_document =
+                !is_pdf && crate::office::readable_format(&read_path, &bytes).is_some();
             let content = if is_pdf {
                 crate::pdf::extract_document(&bytes, &pdf_options)?.context_text()?
             } else {
@@ -1793,10 +1797,10 @@ impl ToolExecutor {
                 }
                 crate::pdf::decode_text(&read_path, &bytes)?
             };
-            Ok(Ok((content, is_pdf)))
+            Ok(Ok((content, is_pdf, is_document)))
         })
         .await??;
-        let (mut content, is_pdf) = match read {
+        let (mut content, is_pdf, is_document) = match read {
             Ok(text) => text,
             Err((kind, len)) => {
                 return Ok(format!(
@@ -1831,6 +1835,7 @@ impl ToolExecutor {
 
         if self.compression_enabled
             && !is_pdf
+            && !is_document
             && args.mode.is_none()
             && args.start_line.is_none()
             && args.end_line.is_none()
@@ -1864,6 +1869,11 @@ impl ToolExecutor {
         if crate::pdf::is_pdf_path(&path) {
             return Err(anyhow!(
                 "PDFs do not support text replacement; use create_file to save a new PDF from text"
+            ));
+        }
+        if let Some(format) = crate::office::document_format_of(&path) {
+            return Err(anyhow!(
+                "{format} documents do not support text replacement; use convert_document to write a new one"
             ));
         }
         let (original, created) = match fs::read_to_string(&path) {
@@ -1994,12 +2004,19 @@ impl ToolExecutor {
             .trim()
             .eq_ignore_ascii_case("application/pdf")
             || response.url().path().to_ascii_lowercase().ends_with(".pdf");
+        let url_path = PathBuf::from(response.url().path());
         let bytes = response.bytes().await?;
         let max_chars = args.max_chars.unwrap_or(20_000);
         if is_pdf || bytes.starts_with(b"%PDF-") {
             let text =
                 tokio::task::spawn_blocking(move || crate::pdf::extract_text(&bytes)).await??;
             return Ok(crate::pdf::truncate_context(&text, max_chars));
+        }
+        if let Some(format) = crate::office::readable_format(&url_path, &bytes) {
+            let text =
+                tokio::task::spawn_blocking(move || crate::office::extract_text(&bytes, &format))
+                    .await??;
+            return Ok(truncate_text(&text, max_chars));
         }
         let body = String::from_utf8_lossy(&bytes);
         if content_type.contains("html") {
@@ -2712,6 +2729,52 @@ mod tests {
                 .unwrap()
                 .starts_with("[cached]")
         );
+    }
+
+    #[tokio::test]
+    async fn a_document_reads_as_markdown_and_refuses_text_edits() {
+        let workspace = tempfile::tempdir().unwrap();
+        let convert = |content: &str, from: &str, to: &str| {
+            crate::office::convert(content.as_bytes(), from, to, workspace.path()).unwrap()
+        };
+        fs::write(
+            workspace.path().join("plan.odt"),
+            convert("# Plan\n\nThe codename is Apricot.\n", "md", "odt"),
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("budget.xlsx"),
+            convert("Item,Cost\nA,2\nB,3\n", "csv", "xlsx"),
+        )
+        .unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+
+        let plan = executor
+            .show_file(json!({"path": "plan.odt"}).as_object().unwrap())
+            .await
+            .unwrap();
+        assert!(plan.contains("The codename is Apricot."), "{plan}");
+        assert!(!plan.contains("PK"), "{plan}");
+        let budget = executor
+            .show_file(
+                json!({"path": "budget.xlsx", "start_line": 4})
+                    .as_object()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(budget.contains("| B | 3 |"), "{budget}");
+        assert!(!budget.contains("Item"), "{budget}");
+
+        for path in ["plan.odt", "new.docx"] {
+            let mut args = Map::new();
+            args.insert("path".into(), json!(path));
+            args.insert("old_text".into(), json!(""));
+            args.insert("new_text".into(), json!("text"));
+            let err = executor.replace_text(&args).unwrap_err().to_string();
+            assert!(err.contains("convert_document"), "{err}");
+        }
+        assert!(!workspace.path().join("new.docx").exists());
     }
 
     #[test]
