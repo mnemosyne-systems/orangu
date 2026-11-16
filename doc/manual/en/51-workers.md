@@ -2,15 +2,22 @@
 
 # Workers: one model over several machines
 
-A model too large for one machine can still be served by several. With a
-`[workers]` section, `orangu-server` nodes form a tree: the node clients
-talk to runs some of the model's layers and hands the rest to its
-workers, and a worker can hand part of its share to workers of its own.
-For every prompt chunk and every generated token, the hidden states travel
-down the tree and back, and the top-level node samples, checks stop
-conditions and streams the reply, exactly as a single server does.
+Several machines on one network can serve as one. Give each
+`orangu-server` the same `[workers].name` — a **channel** — and they find
+each other on their own, then share the work two ways:
 
-This chapter is the practical side: setting up a tree, securing it, and
+- A request goes to the **least busy machine that holds the model**. Each
+  node reports how busy it is, from `0.0` (idle) to `1.0` (fully busy),
+  and a busy node hands a request to a less busy one.
+- A model **too large for any one machine** is split over several. The
+  node a request reaches claims the free nodes of its channel as its
+  workers: it runs some of the model's layers and hands the rest to them.
+  For every prompt chunk and every generated token, the hidden states
+  travel to each worker and back, and the node that claimed them — the
+  top-level node — samples, checks stop conditions and streams the reply,
+  exactly as a single server does.
+
+This chapter is the practical side: setting up a channel, securing it, and
 watching it. The *Inference server* chapter's **The `[workers]` section**
 has the reference for every key.
 
@@ -66,81 +73,87 @@ The 12B, the 31B and the 26B-A4B mixture share no KV and can be cut
 anywhere. Every E2B, E4B and 12B quantization, the 31B and the 26B-A4B were
 checked: split, each answers exactly what the unsplit model does.
 
-## A tree of three machines
+## A channel of three machines
 
-Three machines, `alpha` (clients talk to it), `beta` and `gamma`, each with
-the same model in its models directory. `alpha` hands layers to `beta`, and
-`beta` to `gamma`:
+Three machines, `alpha`, `beta` and `gamma`, on one network, each with the
+same model in its models directory. On every one of them:
+
+```ini
+[workers]
+host = all
+port = 8400
+name = lab
+secret = a-long-random-string
+```
+
+Every node of a channel listens on the same `port`. Start each one with the
+model: `orangu-server unsloth/Qwen3-32B-GGUF:Q4_K_M`. Every minute a node
+scans its IPv4 networks — every address of each, or the /22 around its own
+address on a wider network — on that port, and asks whoever answers whether
+it is on `lab`. The name itself never crosses the network, only a hash of
+it, and a node on another channel does not answer. Each node logs what it
+found:
 
 ```text
-   clients ──▶  alpha  ──▶  beta  ──▶  gamma
-               layers       layers     layers
-                0..9        9..18      18..28
+workers: channel 'lab' has beta:8400 (192.168.1.11:8400, idle), gamma:8400 (192.168.1.12:8400, idle)
 ```
 
-On `gamma`, the leaf:
+Between scans it asks the nodes it found how busy they are every two
+seconds.
 
-```ini
-[workers]
-host = all
-port = 8400
-secret = a-long-random-string
-```
-
-On `beta`, in the middle:
-
-```ini
-[workers]
-host = all
-port = 8400
-workers = gamma:8400
-secret = a-long-random-string
-```
-
-On `alpha`, the top:
-
-```ini
-[workers]
-host = all
-port = 8400
-workers = beta:8400
-secret = a-long-random-string
-```
-
-Start each one with the model, leaves first:
-`orangu-server unsloth/Qwen3-32B-GGUF:Q4_K_M`. The top-level node logs
-its plan:
+**Every node of a channel needs the same model.** A probe's answer names
+the model a node serves — its layout and quantization, and samples of every
+layer's weights — and a node works only with nodes of its own model: a
+request is routed only to a node whose model matches in both, and only a
+node with the same layout is claimed as a worker, its weights compared
+layer by layer when it is. A node with another model stays on the channel
+unused, and the log and `/v1/workers` (`same_model`) say so:
 
 ```text
+workers: channel 'lab' has delta:8400 (192.168.1.13:8400, idle, another model: not used)
+```
+
+**When each machine holds the model**, clients can talk to any of them. A
+node keeps a request unless another node that holds the model is at least
+0.1 less busy, and then sends it there and streams the answer back. A
+request is routed once at most. A node's load is the larger of its slots in
+use and how busy its processors are — the CPU, and a GPU where the driver
+reports its busy time — so a machine busy with something else counts as
+busy too. The requests routed are the ones that run the model:
+`/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/completion`,
+`/infill`, `/embedding` and `/v1/embeddings`. The API key, if any, is
+checked first and passed on, so every node of a channel needs the same.
+
+**When no machine holds the model**, the first node to get a request claims
+every free node it found whose load is at most 0.8, plans the model's layers
+over itself and them, and serves the request:
+
+```text
+   clients ──▶  alpha  ──▶  beta
+               layers  ──▶  gamma
+                0..9        9..18, 18..28
+```
+
+```text
+workers: claiming beta:8400 (192.168.1.11:8400), gamma:8400 (192.168.1.12:8400) on channel 'lab'
 workers plan: alpha:8400 0..9, beta:8400 9..18, gamma:8400 18..28
 ```
 
-A tree need not be deep. The same three machines as one top-level node
-with two workers of its own:
-
-```ini
-# on beta and on gamma
-[workers]
-host = all
-port = 8400
-secret = a-long-random-string
-
-# on alpha
-[workers]
-host = all
-port = 8400
-workers = beta:8400, gamma:8400
-secret = a-long-random-string
-```
+A node that holds the model never claims workers: it routes instead. A tree
+is one level deep: a node that leads workers of its own is not claimed by
+another, and a worker never claims any. Two nodes that get a request at the
+same moment can split the free nodes between them. When `release` seconds
+(`300` by default) pass with no request running on the top-level node, it
+lets its workers go, and they are free for the next node with a request.
 
 `alpha` runs its share and hands the rest to `beta` and then `gamma`, in
-the order listed; a prompt's parts are pipelined through both, so the two
-workers work at the same time. On one board this shape read a 2041-token
-prompt as fast as the chain above.
+the order of their names; a prompt's parts are pipelined through both, so
+the two workers work at the same time.
 
 To check a tree once it is up:
 
-- `curl alpha:8100/v1/workers` shows the plan, what its shares
+- `curl alpha:8100/v1/workers` shows the channel and the nodes it found,
+  each with its load, the plan, what its shares
   followed, each worker's connection and its link's round trip and
   bandwidth (`link`), and every node's processors, measured speed and
   what a forward costs it whatever its layers (`setup`, and `setups`
@@ -171,7 +184,9 @@ both, since a verify pass computes its rows as a prompt does and runs only
 while it pays. On Llama-3.2-3B Q4_K_M that matched exactly for prompts up to
 62 tokens, but not at 112 or more.
 
-Shares follow speed, as far as memory holds. At start each node times the
+Shares follow speed, as far as memory holds, and load: each node's speed
+counts at `1 − load`, never under 5% of it, so a busy machine gets fewer
+layers. At start each node times the
 model's first layers on the processor its layers run on — a decode step
 and a 128-token prompt chunk — and reports that, with its CPU, GPUs and
 NPU, to its parent. A parent gives every node (a worker counting with its
@@ -204,37 +219,6 @@ for 12.4 GiB; the layers over budget will be paged in from disk as they run
 `local_layers = 0` makes a node a pure coordinator that runs no layer
 itself.
 
-A top-level node that holds the whole model and decodes faster than its
-tree takes each sequence back once its prompt is through (`decode = auto`):
-at the first decode step every worker sends its layers' rows back — and,
-for a hybrid model (`qwen35`, `qwen35moe`, `qwen3next`), each recurrent
-layer's state, a fixed size whatever the prompt's length — and the node
-decodes alone on the model's own paths while the workers free theirs.
-The prompt keeps the tree's speed and the answer the node's. On the board
-above: decode 15.2 tok/s with the tree's 58.5 tok/s prompts, where
-decoding through the tree gave 6.2. `decode = tree` keeps every step on the
-tree, `decode = top` hands over whenever the node holds the model, and
-`/v1/workers` says which applies. With `auto` the measured speeds decide
-at first; once requests have decoded through the tree, the step they took
-does, weighed again between requests, and the node runs the whole model
-once before its first sequence decodes alone.
-
-A node with workers does not have to use them. When it holds the whole
-model and its measured speeds say the tree would not take at most 90% of
-its time for a request — a 128-token prompt chunk at the tree's slowest
-stage and an answer as long, its steps through every stage — it serves
-alone and gives its workers nothing (`offload = auto`, the default;
-`always` uses them regardless). The whole model alone is timed at start
-for this, on the paths it would run alone; and once requests have run
-through the tree, what they took goes before the prediction: between
-requests, a tree that turns out not to pay gives way to the node alone. `/v1/workers` then says why
-under `not_worth_offloading`, and every later plan weighs it again. On a
-LAN of this board and two RK3588s with gemma-4-E2B, the node chose to
-serve alone: 261 tok/s on a long prompt, where its tree gave 28. With
-Qwen3.6-35B-A3B the prediction chose the tree; its first requests decoded
-at 2.8 tok/s, where the node alone gives 4.5, and the node then served
-alone.
-
 When sequences decode through the tree, the output head — a matrix as wide
 as the vocabulary, read once a token — can run on the node with the final
 layer instead (`head = last`, or `auto` when that node measured the faster
@@ -249,13 +233,12 @@ than 5% of a decode step or of the slowest stage. Otherwise the plan stays, with
 its conversations, because a worker given other layers has to build and warm
 them, which takes a request behind it about a minute on a board with a large
 model. Workers of about the same speed stay in the order they are in, and start
-in the configured order, so restarting the top-level node does not move layers.
+in the order of their names, so restarting a node does not move layers.
 
 The decisions weigh the links too. A parent times each worker's link when
 it connects — its round trip and bandwidth — so a fast machine on a slow
-network is not mistaken for a fast part of the tree: handing a sequence
-back to decode alone moves every prompt position's keys and values over
-it, and moving the head moves a row of logits a token.
+network is not mistaken for a fast part of the tree: moving the head
+moves a row of logits a token over it.
 
 A node with a `[workers]` section reads and uploads a layer's weights the
 first time the layer runs, not at startup. It skips:
@@ -273,9 +256,10 @@ ranges (`download = range`) skips the timing, since reading the model is a
 download there. When a new plan moves layers away from a node, it lets go
 of their pages.
 
-While `beta` and `gamma` work for their parent, their own APIs are off:
-everything but `/health`, `/ready`, `/metrics` and `/v1/workers` answers
-`503`. When the parent goes away, they serve their own clients again.
+While `beta` and `gamma` work for `alpha`, a request that runs the model
+and reaches one of them is sent on to `alpha`; everything else but
+`/health`, `/ready`, `/metrics` and `/v1/workers` answers `503`. When
+`alpha` lets them go, or goes away, they serve their own clients again.
 
 ## Checks a parent makes
 
@@ -288,12 +272,15 @@ A worker is left out, with a warning naming it and the reason, when it:
   by content, the tensor types and shapes and samples of the weights of
   the layers it would run, so another release of a spec is refused
   whatever the file is called;
-- already works for another parent, or would close a loop in the configs.
+- already works for another node, or leads workers of its own.
 
-The tree then forms without it.
+The tree then forms without it. A node found on the channel only becomes a
+candidate: being found grants nothing, and the handshake still asks for the
+`secret`.
 
-Without a `secret`, anyone who reaches a worker's port can take part, so set
-one on any network you do not fully trust. During the handshake a peer can only
+Without a `secret`, anyone who reaches a worker's port can take part — and a
+channel name is no secret, since any node that asks with it is answered — so
+set one on any network you do not fully trust. During the handshake a peer can only
 send frames of up to 1 MiB, and is closed if it sends a larger one.
 
 A worker assigned **another model** than the one it serves switches to the
@@ -327,29 +314,31 @@ tls_cert = /etc/orangu/workers.pem
 tls_key = /etc/orangu/workers.key
 ```
 
-A node dials its workers with TLS when it trusts a certificate for them:
-`tls_ca`, or its own `tls_cert` when that is not set. So the simplest
-setup is **one certificate shared by every node**, naming every node's
+A node dials its workers, and probes its channel, with TLS when it trusts
+a certificate for them: `tls_ca`, or its own `tls_cert` when that is not
+set. So the simplest setup is **one certificate shared by every node**.
+A channel dials nodes by IP address, so the certificate names every node's
 address:
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -days 365 -subj /CN=orangu-workers \
-  -addext "subjectAltName=DNS:alpha,DNS:beta,DNS:gamma,IP:192.168.1.10" \
+  -addext "subjectAltName=IP:192.168.1.10,IP:192.168.1.11,IP:192.168.1.12" \
   -addext "basicConstraints=critical,CA:FALSE" \
   -keyout workers.key -out workers.pem
 ```
 
-The certificate has to name the address its parent dials, as a DNS name
-or an IP address. It also has to be a server certificate
+The certificate has to name the address its parent dials, as an IP
+address. It also has to be a server certificate
 (`CA:FALSE`): a certificate that is its own authority is refused as a
 server's.
 
 ## Watching a tree
 
-- `GET /v1/workers` on any node: its role, the layers it runs, the plan
-  below it, each configured worker's connection and failures in a row, how
-  long those leave it out, and any worker the plan lost.
+- `GET /v1/workers` on any node: its channel, the nodes it found with
+  their state and load, its own load, its role, the layers it runs, the
+  plan below it, each worker's connection and failures in a row, how long
+  those leave it out, and any worker the plan lost.
 - **Settings › Workers** in the web console: the same, as tables.
 - `GET /ready`: `serving a parent orangu-server` on a worker;
   `a worker was lost` on a node whose plan lost one and has not repaired
@@ -394,24 +383,6 @@ On Llama-3.2-3B Q4_K_M the two differ by up to 0.9 in log-probability among
 a token's 20 likeliest alternatives. A rebuilt conversation holds what one
 prefill of its tokens holds on a single server.
 
-A spare machine makes that cheaper. List it as a standby on the node
-above the worker it should cover:
-
-```ini
-[workers]
-workers = alpha:8400, beta:8400
-standby = spare:8400
-```
-
-The standby connects like a worker and waits. When `alpha` or `beta` is
-lost mid-request, the standby takes its layers, and each conversation is
-rebuilt there from the inputs the node sent into those layers, which it
-keeps while a standby is configured. The other workers keep what they
-have, the request goes on, and `/v1/workers` shows the standby standing in.
-A worker that does not answer when the node plans is filled in for the
-same way. When the lost worker is back, the node takes it back once it
-is quiet, and the standby goes back to serving its own API.
-
 A worker that comes back is taken back by the node above it within about
 30 seconds, once no request has run for two seconds, never in the middle
 of one. A conversation that continues after that is replayed through the
@@ -420,8 +391,7 @@ new plan once, and reuses its rows from then on.
 A worker does the same for its parent. A parent pings every 5 seconds while
 idle and more often with a request out, so a worker that hears nothing for 60
 seconds takes it for gone: it lets go of its layers and sessions, serves its own
-API again and accepts another parent. A node with workers of its own goes on as
-top-level over them. A parent that was only stalled that long finds the worker
+API again and can be claimed by another node. A parent that was only stalled that long finds the worker
 lost, plans again, and takes it back as usual.
 
 A worker that keeps failing is left out for a while, so it does not cost every
@@ -435,8 +405,7 @@ A failure is a connection lost with a request out, or a worker that takes the
 connection and fails the handshake. A worker that cannot be reached, or one
 that refuses (it serves another parent, or its secret differs), is no failure,
 and a machine that restarts comes back as usual. While a worker is left out,
-the node plans without it: a `standby` fills in if there is one, otherwise the
-others take its layers, and any over their budgets are paged in from disk. A
+the node plans without it: the others take its layers, and any over their budgets are paged in from disk. A
 worker you have repaired stays out until its wait ends, or until you restart
 the node above it. `/v1/workers` shows each worker's `failures_in_a_row`
 and `left_out_seconds`.
@@ -517,11 +486,14 @@ without. Nodes like that keep each other's cores busy anyway.
   submission, as a whole model does: a Llama-3.2-3B step split in three
   took 67.8 ms against 65.5 ms whole. A prompt chunk still runs layer by
   layer, and so does a Gemma 4 mixture's decode.
-- Only a node with no workers of its own can fetch just its layers
-  (`download = range`); every other node keeps the whole model file on
-  disk. A model split in shards is refused.
+- A node with `download = range` fetches just its layers, and so only ever
+  works for another node: it never routes, leads or serves alone. Every
+  other node keeps the whole model file on disk. A model split in shards is
+  refused.
+- A channel is found over IPv4 only, on networks this machine has an
+  address on. Nodes behind a router are not found.
 - A GPU keeps the layers it has uploaded until the process ends. A new plan
   frees their host memory, but not their device memory.
-- Before a parent claims it, a node serves its own clients with the whole
-  model, which reads every layer in. The next plan lets go of those
+- Before another node claims it, a node serves its own clients with the
+  whole model, which reads every layer in. The next plan lets go of those
   pages.

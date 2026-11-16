@@ -75,7 +75,7 @@ The wizard asks for every `[orangu-server]` key. Each prompt shows its default i
 | `log_type` | `console` | `console` or `file`; `file` asks for `log_path`. |
 | `Add web console` | `Y` | `n` writes no `[web]` section and serves no console. Accepting asks five more: the console's `host` (defaulting to the API's), `port` (`8200`), `reexec` (may it load a different model), `delete` (may it delete models), and `download` (may it download models). |
 | `Add Prometheus metrics` | `Y` | `n` writes no `[prometheus]` section. Accepting asks for its `host` and `port` (`8300`). |
-| `Add workers` | `Y` | `n` writes no `[workers]` section. Accepting asks for its `host`, `port` (`8400`), `workers`, `standby`, `secret` (`none`, the default, `generate` — shown, to give every node the same — or `type`) and `activations`; with no workers listed the server is a node another can use as a worker. |
+| `Add workers` | `Y` | `n` writes no `[workers]` section. Accepting asks for its `host`, `port` (`8400`), the channel `name` (`orangu`), `secret` (`none`, the default, `generate` — shown, to give every node the same — or `type`) and `activations`; every node with the same `name` finds the others. |
 
 The wizard prints the file before writing it and asks `Write this configuration? [Y/n]`; anything but Enter/`y`/`yes` aborts with nothing written. Only non-defaults are written, so a minimal run yields:
 
@@ -96,6 +96,7 @@ port = 8300
 [workers]
 host = all
 port = 8400
+name = orangu
 ```
 
 `-i` always targets `~/.orangu/orangu-server.conf` and ignores `-c`/`--config`. See the *Inference server* chapter for the full configuration reference.

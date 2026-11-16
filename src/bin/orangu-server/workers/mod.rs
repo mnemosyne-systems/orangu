@@ -18,6 +18,7 @@
 //!
 //! - [`protocol`]: the frames a parent and a worker exchange.
 //! - [`auth`]: proving `[workers].secret` without sending it.
+//! - [`channel`]: finding the other nodes of `[workers].name`.
 //! - [`identity`]: making sure every node has the same model, quantization
 //!   included.
 //! - [`pipeline`]: one node's slice — its own layers, then its workers' —
@@ -26,15 +27,18 @@
 //! - [`session`]: the worker side of a forward.
 //! - [`plan`]: dividing a range of layers by memory.
 //! - [`node`]: one process's place in the tree, both halves.
+//! - [`load`]: how busy a node is, for routing requests and sizing shares.
 //! - [`clock`]: keeping a node's cores at full clock while a request runs.
 //! - [`transport`]: plain TCP or TLS between nodes.
 
 pub mod auth;
+pub mod channel;
 pub mod clock;
 pub mod fetch;
 pub mod guard;
 pub mod identity;
 pub mod link;
+pub mod load;
 pub mod metrics;
 pub mod node;
 pub mod pipeline;

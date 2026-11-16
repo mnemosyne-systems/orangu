@@ -139,24 +139,6 @@ pub fn default_workers_port() -> u16 {
     8400
 }
 
-/// One entry of `[workers].workers`: where a worker is reached.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WorkerAddress {
-    pub host: String,
-    pub port: u16,
-}
-
-impl std::fmt::Display for WorkerAddress {
-    /// `host:port`, with an IPv6 literal bracketed so the pair parses back.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.host.contains(':') {
-            write!(f, "[{}]:{}", self.host, self.port)
-        } else {
-            write!(f, "{}:{}", self.host, self.port)
-        }
-    }
-}
-
 /// The resolved `[workers]` section.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkersConfiguration {
@@ -166,24 +148,25 @@ pub struct WorkersConfiguration {
     pub host: String,
     /// `[workers].port`, [`default_workers_port`] when absent.
     pub port: u16,
-    /// `[workers].workers`, in the order the file lists them.
-    pub workers: Vec<WorkerAddress>,
-    /// `[workers].standby`: spare workers, never planned into a share, one
-    /// of which takes over a lost worker's layers (`workers::guard`).
-    pub standby: Vec<WorkerAddress>,
+    /// `[workers].name`: the channel this node is found on and finds its
+    /// workers on. `None` — the key absent or blank — joins no channel.
+    pub name: Option<String>,
+    /// `[workers].release`: how long a node keeps the workers it claimed
+    /// with no request running.
+    pub release: std::time::Duration,
+    /// `[workers].network`, optional: the IPv4 networks a scan for the
+    /// channel looks at, as `(address, prefix)`. Empty scans this machine's
+    /// own networks.
+    pub network: Vec<(std::net::Ipv4Addr, u8)>,
     /// `[workers].download = range`: a model not on disk is fetched in part —
     /// what building it reads, then the layers a parent assigns — rather
-    /// than whole (`full`, the default). Only for a node with no workers of
-    /// its own, which never runs the whole model.
+    /// than whole (`full`, the default). Such a node only ever works for
+    /// another, since it never holds the whole model.
     pub download_range: bool,
     /// `[workers].shares`: `decode` (the default), `prompt` or `memory`.
     pub shares: Shares,
-    /// `[workers].decode`: `auto` (the default), `tree` or `top`.
-    pub decode: DecodeOn,
     /// `[workers].head`: `auto` (the default), `top` or `last`.
     pub head: HeadOn,
-    /// `[workers].offload`: `auto` (the default) or `always`.
-    pub offload: Offload,
     /// `[workers].secret`: the shared secret parent and worker prove to
     /// each other in the handshake (see `workers::auth`). `None` — the key
     /// absent or blank — authenticates nobody.
@@ -216,18 +199,6 @@ pub struct WorkersConfiguration {
     pub advertise_host: Option<String>,
 }
 
-/// `[workers].offload`: whether a top-level node uses its workers when it
-/// could serve alone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Offload {
-    /// Only when the tree is predicted — then found — clearly faster than
-    /// this node alone at a request, or this node cannot hold the model.
-    #[default]
-    Auto,
-    /// Whenever it has workers.
-    Always,
-}
-
 /// `[workers].head`: which node applies the output head to a tree's
 /// last rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -240,20 +211,6 @@ pub enum HeadOn {
     Top,
     /// Always the node running the final layer.
     Last,
-}
-
-/// `[workers].decode`: where a top-level node's sequences decode once their
-/// prompt is through the tree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum DecodeOn {
-    /// Here alone when this node holds the whole model and its measured
-    /// decode speed beats the tree's; through the tree otherwise.
-    #[default]
-    Auto,
-    /// Always through the tree.
-    Tree,
-    /// Here alone whenever this node holds the whole model.
-    Top,
 }
 
 /// `[workers].shares`: what a node divides its layers by between itself and
@@ -281,6 +238,11 @@ pub enum LocalLayers {
     Count(usize),
 }
 
+/// `[workers].release` when absent.
+pub fn default_workers_release() -> std::time::Duration {
+    std::time::Duration::from_secs(300)
+}
+
 /// `[workers].timeout` when absent: generous, because one forward of a
 /// long prefill chunk through a CPU-only subtree is measured in seconds.
 pub fn default_workers_timeout() -> std::time::Duration {
@@ -302,86 +264,6 @@ fn parse_seconds(key: &str, value: &str) -> Result<std::time::Duration> {
             value.trim()
         )),
     }
-}
-
-/// Whether `host` names this machine's loopback interface.
-fn is_loopback_name(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
-}
-
-/// Refuses a `workers` list that names the same worker twice, or names this
-/// node's own `[workers]` address — a tree with a loop in it. A loop through
-/// another node, or through a spelling of this machine's address that isn't
-/// recognizable here, is caught in the handshake instead.
-///
-/// `workers` is `[workers].workers` followed by `[workers].standby`: a
-/// standby may not also be a worker.
-fn check_workers_list(host: &str, port: u16, workers: &[WorkerAddress]) -> Result<()> {
-    let listens_on_loopback =
-        host.eq_ignore_ascii_case(HOST_ALL) || host == HOST_ALL_ALIAS || is_loopback_name(host);
-    for (i, worker) in workers.iter().enumerate() {
-        if workers[..i].iter().any(|earlier| {
-            earlier.port == worker.port && earlier.host.eq_ignore_ascii_case(&worker.host)
-        }) {
-            bail!("[{WORKERS_SECTION}] lists '{worker}' twice (workers and standby together)");
-        }
-        if worker.port == port
-            && (worker.host.eq_ignore_ascii_case(host)
-                || (listens_on_loopback && is_loopback_name(&worker.host)))
-        {
-            bail!(
-                "[{WORKERS_SECTION}].workers lists '{worker}', which is this node's own \
-                 [{WORKERS_SECTION}] address"
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Parses `[workers].workers`: a comma-separated list of `host:port` pairs
-/// (an IPv6 host written `[::1]:8100`). Blank entries — a trailing comma, an
-/// empty value — are skipped; anything else that is not a `host:port` pair
-/// with a non-zero port is refused, naming the entry.
-pub fn parse_workers_list(value: &str) -> Result<Vec<WorkerAddress>> {
-    value
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| {
-            let invalid = |why: &str| {
-                anyhow!("invalid entry in [{WORKERS_SECTION}].workers: '{entry}' ({why})")
-            };
-            let (host, port) = entry
-                .rsplit_once(':')
-                .ok_or_else(|| invalid("expected host:port"))?;
-            let host = match host.strip_prefix('[') {
-                Some(rest) => rest
-                    .strip_suffix(']')
-                    .ok_or_else(|| invalid("unclosed '['"))?,
-                None if host.contains(':') => {
-                    return Err(invalid("an IPv6 address must be written [address]:port"));
-                }
-                None => host,
-            }
-            .trim();
-            if host.is_empty() {
-                return Err(invalid("missing host"));
-            }
-            let port = port
-                .trim()
-                .parse::<u16>()
-                .ok()
-                .filter(|port| *port != 0)
-                .ok_or_else(|| invalid("port must be 1-65535"))?;
-            Ok(WorkerAddress {
-                host: host.to_string(),
-                port,
-            })
-        })
-        .collect()
 }
 
 /// The address a bundled server binds when it was started with no config
@@ -1646,19 +1528,38 @@ pub fn load_server_configuration(
                 .map(|value| value.trim().to_string())
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| host.clone());
-            let workers = match workers_section.get("workers") {
-                Some(value) => parse_workers_list(value)?,
+            for key in ["workers", "standby"] {
+                if workers_section.contains_key(key) {
+                    bail!(
+                        "[{WORKERS_SECTION}].{key} is not a setting: nodes find each other on a channel. \
+                         Set [{WORKERS_SECTION}].name to the same channel name on every node, \
+                         and remove {key}"
+                    );
+                }
+            }
+            for key in ["decode", "offload"] {
+                if workers_section.contains_key(key) {
+                    bail!(
+                        "[{WORKERS_SECTION}].{key} is not a setting: a node that holds the model serves \
+                         alone and routes requests, and one that does not splits it over its \
+                         channel. Remove {key}"
+                    );
+                }
+            }
+            let name = workers_section
+                .get("name")
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty());
+            let network = match workers_section.get("network") {
+                Some(value) => crate::workers::channel::parse_networks(value).map_err(|err| {
+                    anyhow!("invalid value for [{WORKERS_SECTION}].network: {err}")
+                })?,
                 None => Vec::new(),
             };
-            let standby = match workers_section.get("standby") {
-                Some(value) => parse_workers_list(value)?,
-                None => Vec::new(),
+            let release = match workers_section.get("release") {
+                Some(value) => parse_seconds("release", value)?,
+                None => default_workers_release(),
             };
-            check_workers_list(
-                &workers_host,
-                port,
-                &workers.iter().chain(&standby).cloned().collect::<Vec<_>>(),
-            )?;
             let download_range = match workers_section.get("download").map(|v| v.trim()) {
                 None | Some("") => false,
                 Some(value) if value.eq_ignore_ascii_case("full") => false,
@@ -1668,12 +1569,6 @@ pub fn load_server_configuration(
                      range)"
                 ),
             };
-            if download_range && !workers.is_empty() {
-                bail!(
-                    "[{WORKERS_SECTION}].download = range needs a node with no workers of its \
-                     own: a node with workers may become top-level and run every layer"
-                );
-            }
             let shares = match workers_section
                 .get("shares")
                 .map(|v| v.trim().to_ascii_lowercase())
@@ -1687,19 +1582,6 @@ pub fn load_server_configuration(
                      prompt or memory)"
                 ),
             };
-            let decode = match workers_section
-                .get("decode")
-                .map(|v| v.trim().to_ascii_lowercase())
-            {
-                None => DecodeOn::Auto,
-                Some(v) if v.is_empty() || v == "auto" => DecodeOn::Auto,
-                Some(v) if v == "tree" => DecodeOn::Tree,
-                Some(v) if v == "top" => DecodeOn::Top,
-                Some(value) => bail!(
-                    "invalid value for [{WORKERS_SECTION}].decode: '{value}' (expected auto, tree \
-                     or top)"
-                ),
-            };
             let head = match workers_section
                 .get("head")
                 .map(|v| v.trim().to_ascii_lowercase())
@@ -1711,18 +1593,6 @@ pub fn load_server_configuration(
                 Some(value) => bail!(
                     "invalid value for [{WORKERS_SECTION}].head: '{value}' (expected auto, top \
                      or last)"
-                ),
-            };
-            let offload = match workers_section
-                .get("offload")
-                .map(|v| v.trim().to_ascii_lowercase())
-            {
-                None => Offload::Auto,
-                Some(v) if v.is_empty() || v == "auto" => Offload::Auto,
-                Some(v) if v == "always" => Offload::Always,
-                Some(value) => bail!(
-                    "invalid value for [{WORKERS_SECTION}].offload: '{value}' (expected auto or \
-                     always)"
                 ),
             };
             let secret = workers_section
@@ -1762,13 +1632,12 @@ pub fn load_server_configuration(
             Some(WorkersConfiguration {
                 host: workers_host,
                 port,
-                workers,
-                standby,
+                name,
+                release,
+                network,
                 download_range,
                 shares,
-                decode,
                 head,
-                offload,
                 secret,
                 activations,
                 timeout,
@@ -3066,45 +2935,9 @@ mod tests {
         let workers = conf.workers.unwrap();
         assert_eq!(workers.host, "192.168.1.10");
         assert_eq!(workers.port, default_workers_port());
-        assert!(workers.workers.is_empty());
+        assert_eq!(workers.name, None);
+        assert_eq!(workers.release, default_workers_release());
         assert!(conf.mcp_servers.is_empty());
-    }
-
-    #[test]
-    fn the_workers_section_reads_host_port_and_the_worker_list() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            "[orangu-server]\nmodels = /srv/models\n\n[workers]\nhost = 127.0.0.1\nport = 9000\n\
-             workers = node1:8100, 10.0.0.2:8101,[::1]:8102,\n"
-        )
-        .unwrap();
-        let conf = load_server_configuration(file.path(), None, false).unwrap();
-        let workers = conf.workers.unwrap();
-        assert_eq!(workers.host, "127.0.0.1");
-        assert_eq!(workers.port, 9000);
-        let listed: Vec<String> = workers.workers.iter().map(ToString::to_string).collect();
-        assert_eq!(listed, ["node1:8100", "10.0.0.2:8101", "[::1]:8102"]);
-        assert_eq!(workers.workers[2].host, "::1");
-    }
-
-    #[test]
-    fn rejects_a_malformed_worker_entry() {
-        for bad in [
-            "node1",
-            "node1:",
-            "node1:0",
-            "node1:70000",
-            ":8100",
-            "::1:8100",
-            "[::1:8100",
-        ] {
-            let err = parse_workers_list(&format!("node0:8100, {bad}")).unwrap_err();
-            assert!(
-                err.to_string().contains(&format!("'{bad}'")),
-                "{bad}: {err:#}"
-            );
-        }
     }
 
     fn workers_section(body: &str) -> Result<Option<WorkersConfiguration>> {
@@ -3214,40 +3047,46 @@ mod tests {
         }
     }
 
-    /// A tree with a loop in it is refused where the config can see it: a
-    /// worker listed twice, or this node's own address.
+    /// The worker lists, `decode` and `offload` are refused, saying what
+    /// takes their place.
     #[test]
-    fn rejects_a_workers_list_that_loops() {
-        let err = workers_section("workers = a:8400, b:8400, A:8400\n").unwrap_err();
-        assert!(err.to_string().contains("twice"), "{err:#}");
-        // `host` falls back to `all`, which answers on loopback too.
-        for own in ["127.0.0.1:8400", "localhost:8400", "[::1]:8400"] {
-            let err = workers_section(&format!("workers = a:8400, {own}\n")).unwrap_err();
-            assert!(err.to_string().contains("own"), "{own}: {err:#}");
+    fn the_old_worker_lists_are_refused_for_the_channel() {
+        for key in ["workers", "standby"] {
+            let err = workers_section(&format!("{key} = a:8400\n")).unwrap_err();
+            assert!(err.to_string().contains("[workers].name"), "{key}: {err:#}");
         }
-        let err =
-            workers_section("host = 10.0.0.5\nport = 9000\nworkers = 10.0.0.5:9000\n").unwrap_err();
-        assert!(err.to_string().contains("own"), "{err:#}");
-        // The same machine on another port is another node.
-        workers_section("workers = 127.0.0.1:8401\n").unwrap();
-        workers_section("host = 10.0.0.5\nworkers = 127.0.0.1:8400\n").unwrap();
+        for key in ["decode", "offload"] {
+            let err = workers_section(&format!("{key} = auto\n")).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("[workers].{key} is not a setting")),
+                "{key}: {err:#}"
+            );
+        }
     }
 
-    /// `download` is `full` or `range`, and `range` only on a node with no
-    /// workers of its own.
-    /// `offload` is `auto` (the default) or `always`.
     #[test]
-    fn the_offload_key_reads_and_is_checked() {
-        assert_eq!(workers_section("").unwrap().unwrap().offload, Offload::Auto);
+    fn the_channel_and_release_keys_are_read() {
+        let workers = workers_section("name = lab\nrelease = 30\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(workers.name.as_deref(), Some("lab"));
+        assert_eq!(workers.release, std::time::Duration::from_secs(30));
+        assert_eq!(workers_section("name =  \n").unwrap().unwrap().name, None);
+        let workers = workers_section("network = 192.168.1.0/24, 10.0.0.0/22\n")
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            workers_section("offload = Always\n")
-                .unwrap()
-                .unwrap()
-                .offload,
-            Offload::Always
+            workers.network,
+            [
+                (std::net::Ipv4Addr::new(192, 168, 1, 0), 24),
+                (std::net::Ipv4Addr::new(10, 0, 0, 0), 22)
+            ]
         );
-        let err = workers_section("offload = never\n").unwrap_err();
-        assert!(err.to_string().contains("offload"), "{err:#}");
+        assert!(workers_section("").unwrap().unwrap().network.is_empty());
+        let err = workers_section("network = 10.0.0.0/8\n").unwrap_err();
+        assert!(err.to_string().contains("[workers].network"), "{err:#}");
+        assert!(workers_section("release = soon\n").is_err());
     }
 
     /// `head` is `auto` (the default), `top` or `last`.
@@ -3264,22 +3103,6 @@ mod tests {
         );
         let err = workers_section("head = middle\n").unwrap_err();
         assert!(err.to_string().contains("head"), "{err:#}");
-    }
-
-    /// `decode` is `auto` (the default), `tree` or `top`.
-    #[test]
-    fn the_decode_key_reads_and_is_checked() {
-        assert_eq!(workers_section("").unwrap().unwrap().decode, DecodeOn::Auto);
-        assert_eq!(
-            workers_section("decode = Top\n").unwrap().unwrap().decode,
-            DecodeOn::Top
-        );
-        assert_eq!(
-            workers_section("decode = tree\n").unwrap().unwrap().decode,
-            DecodeOn::Tree
-        );
-        let err = workers_section("decode = here\n").unwrap_err();
-        assert!(err.to_string().contains("decode"), "{err:#}");
     }
 
     /// `shares` is `decode` (the default), `prompt` or `memory`.
@@ -3304,6 +3127,7 @@ mod tests {
         assert!(err.to_string().contains("shares"), "{err:#}");
     }
 
+    /// `download` is `full` or `range`.
     #[test]
     fn the_download_key_reads_and_is_checked() {
         assert!(!workers_section("").unwrap().unwrap().download_range);
@@ -3321,30 +3145,6 @@ mod tests {
         );
         let err = workers_section("download = some\n").unwrap_err();
         assert!(err.to_string().contains("full or range"), "{err:#}");
-        let err = workers_section("workers = a:8400\ndownload = range\n").unwrap_err();
-        assert!(err.to_string().contains("no workers of its own"), "{err:#}");
-    }
-
-    /// `standby` reads like `workers`, and a standby may not also be a
-    /// worker, nor this node.
-    #[test]
-    fn the_standby_list_reads_and_is_checked_with_the_workers() {
-        let conf = workers_section("workers = a:8400\nstandby = s:8400, t:8401\n")
-            .unwrap()
-            .unwrap();
-        let listed: Vec<String> = conf.standby.iter().map(ToString::to_string).collect();
-        assert_eq!(listed, ["s:8400", "t:8401"]);
-        assert!(
-            workers_section("workers = a:8400\n")
-                .unwrap()
-                .unwrap()
-                .standby
-                .is_empty()
-        );
-        let err = workers_section("workers = a:8400\nstandby = A:8400\n").unwrap_err();
-        assert!(err.to_string().contains("twice"), "{err:#}");
-        let err = workers_section("standby = 127.0.0.1:8400\n").unwrap_err();
-        assert!(err.to_string().contains("own"), "{err:#}");
     }
 
     #[test]

@@ -809,6 +809,9 @@ impl Engine {
             ));
             return rx;
         }
+        // A `[workers]` node on a channel may claim workers for this request
+        // first; the request counts as running here until it ends.
+        let workers_request = crate::workers::node::request_started_async().await;
         // Served the other way than the slots' kept conversations were made
         // (a `[workers]` node switching): they cannot serve.
         if let Some(switch) = &self.switch
@@ -848,6 +851,7 @@ impl Engine {
 
         let id_slot = req.id_slot;
         tokio::spawn(async move {
+            let _workers_request = workers_request;
             let guard = match id_slot {
                 // A pinned request is waiting for one specific slot's warm
                 // cache and is not competing for admission, so the queue limit

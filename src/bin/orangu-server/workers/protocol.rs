@@ -768,6 +768,83 @@ pub enum Message {
     Error(WorkerError),
     /// The worker's answer to a proof it accepts: the handshake is done.
     Ready,
+    /// Sent instead of `Hello` by a node scanning its networks: whether the
+    /// node listening here is on the channel that hashes to `channel`
+    /// ([`super::channel::channel_hash`]). Answered with [`Message::ProbeAck`]
+    /// by a node on that channel; any other node closes the connection.
+    Probe {
+        channel: [u8; 32],
+    },
+    ProbeAck {
+        /// The node's id for this run of the process: what a node finds
+        /// itself by.
+        node: String,
+        /// Its `[workers]` name, `host:port`.
+        name: String,
+        state: ProbeState,
+        /// How busy it is, `0.0` (idle) to `1.0` (fully busy)
+        /// ([`super::load`]).
+        load: f32,
+        /// Whether it can serve the model alone: it has the whole model
+        /// and memory for it.
+        whole: bool,
+        /// The port its API answers on, and whether with TLS: where a
+        /// request routed to it goes.
+        api_port: u16,
+        api_tls: bool,
+        /// The model it serves: [`ModelIdentity::header_hash`], and a hash
+        /// of samples of every layer's weights — zeros on a node that has
+        /// only part of the model. Nodes cooperate only on the same model.
+        model: [u8; 32],
+        content: [u8; 32],
+    },
+}
+
+/// What a node on a channel is doing, as a [`Message::ProbeAck`] says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProbeState {
+    /// Serving its own clients, and free to be claimed.
+    Idle,
+    /// Top-level, with workers it claimed.
+    Leading,
+    /// A worker of another node.
+    Serving,
+    /// Free, but it never leads: it has only part of the model.
+    WorkerOnly,
+}
+
+impl ProbeState {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Leading => 1,
+            Self::Serving => 2,
+            Self::WorkerOnly => 3,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::Idle,
+            1 => Self::Leading,
+            3 => Self::WorkerOnly,
+            _ => Self::Serving,
+        }
+    }
+
+    /// Whether a node in this state can be claimed as a worker.
+    pub fn claimable(self) -> bool {
+        matches!(self, Self::Idle | Self::WorkerOnly)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Leading => "leading",
+            Self::Serving => "serving",
+            Self::WorkerOnly => "worker_only",
+        }
+    }
 }
 
 mod tag {
@@ -793,6 +870,8 @@ mod tag {
     pub const ECHO: u8 = 20;
     pub const LAYER_STATE: u8 = 21;
     pub const RESERVE: u8 = 22;
+    pub const PROBE: u8 = 23;
+    pub const PROBE_ACK: u8 = 24;
 }
 
 struct Writer(Vec<u8>);
@@ -1227,6 +1306,32 @@ impl Message {
                 tag::ERROR
             }
             Self::Ready => tag::READY,
+            Self::Probe { channel } => {
+                w.fixed(channel);
+                tag::PROBE
+            }
+            Self::ProbeAck {
+                node,
+                name,
+                state,
+                load,
+                whole,
+                api_port,
+                api_tls,
+                model,
+                content,
+            } => {
+                w.string(node);
+                w.string(name);
+                w.u8(state.to_u8());
+                w.f32(*load);
+                w.u8(u8::from(*whole));
+                w.u16(*api_port);
+                w.u8(u8::from(*api_tls));
+                w.fixed(model);
+                w.fixed(content);
+                tag::PROBE_ACK
+            }
         };
         (tag, w.0)
     }
@@ -1352,6 +1457,20 @@ impl Message {
             tag::PONG => Self::Pong { nonce: r.u64()? },
             tag::ERROR => Self::Error(r.error()?),
             tag::READY => Self::Ready,
+            tag::PROBE => Self::Probe {
+                channel: r.fixed()?,
+            },
+            tag::PROBE_ACK => Self::ProbeAck {
+                node: r.string()?,
+                name: r.string()?,
+                state: ProbeState::from_u8(r.u8()?),
+                load: r.f32()?,
+                whole: r.u8()? != 0,
+                api_port: r.u16()?,
+                api_tls: r.u8()? != 0,
+                model: r.fixed()?,
+                content: r.fixed()?,
+            },
             other => bail!("unknown message type {other}"),
         })
     }
@@ -1624,6 +1743,25 @@ mod tests {
         });
         round_trip(Message::Ping { nonce: 42 });
         round_trip(Message::Pong { nonce: 42 });
+        round_trip(Message::Probe { channel: [7; 32] });
+        for state in [
+            ProbeState::Idle,
+            ProbeState::Leading,
+            ProbeState::Serving,
+            ProbeState::WorkerOnly,
+        ] {
+            round_trip(Message::ProbeAck {
+                node: "00ff".to_string(),
+                name: "beta:8400".to_string(),
+                state,
+                load: 0.25,
+                whole: true,
+                api_port: 8100,
+                api_tls: false,
+                model: [1; 32],
+                content: [2; 32],
+            });
+        }
         round_trip(Message::Error(error()));
         round_trip(Message::Ready);
     }

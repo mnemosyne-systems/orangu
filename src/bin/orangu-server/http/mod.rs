@@ -126,14 +126,45 @@ const OPEN_PATHS: &[&str] = &["/health", "/ready"];
 /// the node's own view of its tree.
 const OPEN_WHILE_WORKING: &[&str] = &["/health", "/ready", "/metrics", "/v1/workers"];
 
-/// Turns the API away while this node's layers belong to a parent's
-/// requests, so the parent's
-/// work has the whole machine. 503 rather than a refusal: the node is
-/// unavailable for a while, not the wrong one.
-async fn pause_while_working_for_a_parent(
+/// The requests a node on a workers channel may serve elsewhere: the ones
+/// that run the model.
+const ROUTED: &[&str] = &[
+    "/completion",
+    "/infill",
+    "/embedding",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/messages",
+    "/v1/embeddings",
+];
+
+/// Marks a request one node routed to another, which serves it whatever
+/// its own load: a request is routed once at most.
+const FORWARDED_HEADER: &str = "x-orangu-forwarded";
+
+/// Sends a request that runs the model to the node of its workers channel
+/// that should serve it (`crate::workers::node::route`): the least busy one
+/// that holds the model, or the parent a working node's layers belong to.
+/// Otherwise turns the API away while this node's layers belong to a
+/// parent's requests, so the parent's work has the whole machine — 503
+/// rather than a refusal: the node is unavailable for a while, not the
+/// wrong one.
+async fn route_or_pause(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    let request = if request.method() == axum::http::Method::POST
+        && ROUTED.contains(&request.uri().path())
+        && let Some(base) =
+            crate::workers::node::route(request.headers().contains_key(FORWARDED_HEADER))
+    {
+        match forward(&base, request).await {
+            Ok(response) => return response,
+            Err(request) => *request,
+        }
+    } else {
+        request
+    };
     if crate::workers::node::api_paused() && !OPEN_WHILE_WORKING.contains(&request.uri().path()) {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -148,6 +179,68 @@ async fn pause_while_working_for_a_parent(
             .into_response();
     }
     next.run(request).await
+}
+
+/// Sends `request` to the API at `base` and streams its answer back. A node
+/// that cannot be reached hands the request back, to be served here.
+async fn forward(
+    base: &str,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, Box<axum::extract::Request>> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let client = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_default()
+    });
+    let (parts, body) = request.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, usize::MAX).await else {
+        return Err(Box::new(axum::extract::Request::from_parts(
+            parts,
+            axum::body::Body::empty(),
+        )));
+    };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map_or(parts.uri.path(), |p| p.as_str());
+    let mut headers = parts.headers.clone();
+    for hop in [
+        axum::http::header::HOST,
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::header::CONNECTION,
+        axum::http::header::TRANSFER_ENCODING,
+    ] {
+        headers.remove(hop);
+    }
+    headers.insert(FORWARDED_HEADER, axum::http::HeaderValue::from_static("1"));
+    let sent = client
+        .post(format!("{base}{path}"))
+        .headers(headers)
+        .body(bytes.clone())
+        .send()
+        .await;
+    let answer = match sent {
+        Ok(answer) => answer,
+        Err(error) => {
+            log::warn!("orangu-server: workers: could not route a request to {base}: {error}");
+            return Err(Box::new(axum::extract::Request::from_parts(
+                parts,
+                axum::body::Body::from(bytes),
+            )));
+        }
+    };
+    log::debug!("orangu-server: workers: routed {path} to {base}");
+    let mut response = axum::response::Response::builder().status(answer.status().as_u16());
+    for (name, value) in answer.headers() {
+        if name != axum::http::header::CONNECTION && name != axum::http::header::TRANSFER_ENCODING {
+            response = response.header(name, value);
+        }
+    }
+    Ok(response
+        .body(axum::body::Body::from_stream(answer.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()))
 }
 
 /// Establishes who is asking, and whether they may.
@@ -676,7 +769,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `orangu-coordinator` mounts too, so both front doors serve the
         // same eight endpoints over the same implementation.
         .merge(orangu::files_http::router::<AppState>())
-        .route_layer(axum::middleware::from_fn(pause_while_working_for_a_parent))
+        .route_layer(axum::middleware::from_fn(route_or_pause))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_api_key,

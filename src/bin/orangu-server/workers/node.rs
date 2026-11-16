@@ -40,13 +40,13 @@ use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage, Tra
 use super::plan;
 use super::protocol::{
     ActivationFormat, Assign, Capacity, DiscoveryRecord, ErrorCode, FEATURE_SWITCH, FEATURES,
-    HelloAck, MAX_DEPTH, Message, NodeSetup, PROTOCOL_VERSION, PlanEntry, WorkerError, check_path,
-    parent_reads_discovery, read_frame, read_message, write_message,
+    HelloAck, MAX_DEPTH, Message, NodeSetup, PROTOCOL_VERSION, PlanEntry, ProbeState, WorkerError,
+    check_path, parent_reads_discovery, read_frame, read_message, write_message,
 };
 use super::session::SessionStore;
 use super::stage::{EncodedStage, MessageStage};
 use super::transport::{self, Tls};
-use crate::config::{DecodeOn, HeadOn, LocalLayers, Offload, Shares};
+use crate::config::{HeadOn, LocalLayers, Shares};
 use crate::engine::arch::ModelForward;
 use crate::engine::loader::LoadedModel;
 use crate::engine::prompt_weights::{self, Decision};
@@ -78,6 +78,19 @@ pub const PARENT_SILENCE: Duration = Duration::from_secs(60);
 /// for a slot's next request live far longer and do not count: a plan made
 /// under them costs that request a rebuild.
 const QUIET: Duration = Duration::from_secs(2);
+
+/// How much less busy another node must be for a request this node could
+/// serve to go there instead.
+const ROUTE_MARGIN: f32 = 0.1;
+
+/// The load above which a node is not claimed as a worker.
+const CLAIM_CUTOFF: f32 = 0.8;
+
+/// The least share of its speed a busy node is planned at.
+const MIN_SPARE: f64 = 0.05;
+
+/// How often the nodes a scan found are asked again how busy they are.
+const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
 /// Decode steps a top-level node observes before it weighs planning again
 /// by the speeds they showed (`Node::calibration_due`).
@@ -130,10 +143,25 @@ pub struct NodeSettings {
     pub name: String,
     /// The address to listen on for a parent; `None` listens nowhere.
     pub listen: Option<String>,
+    /// Workers this node holds from the start, without a scan.
     pub workers: Vec<String>,
     /// Spare workers: never planned into a share, one of them takes a lost
     /// worker's layers (`super::guard`).
     pub standby: Vec<String>,
+    /// `[workers].name`: the channel this node finds its workers on, and
+    /// is found on.
+    pub channel: Option<String>,
+    /// Where a scan of the channel looks.
+    pub scan: Scan,
+    /// How often the channel is scanned.
+    pub scan_every: Duration,
+    /// `[workers].release`: how long a node that claimed workers keeps
+    /// them with no request running.
+    pub release: Duration,
+    /// The port this node's API answers on, and whether with TLS: what a
+    /// probe is told, for requests routed here.
+    pub api_port: u16,
+    pub api_tls: bool,
     pub secret: Option<String>,
     pub activations: ActivationFormat,
     pub timeout: Duration,
@@ -151,18 +179,20 @@ pub struct NodeSettings {
     pub capacity: Capacity,
     /// `[workers].shares`: what shares are sized by.
     pub shares: Shares,
-    /// `[workers].decode`: where sequences decode once their prompt is
-    /// through the tree.
-    pub decode: DecodeOn,
+    /// Tests only: where sequences decode once their prompt is through
+    /// the tree, whatever the measured speeds say.
+    #[cfg(test)]
+    pub decode_pin: Option<DecodePin>,
     /// `[workers].head`: which node applies the output head.
     pub head: HeadOn,
     /// Whether this node serves its model through its tree at all: not a
     /// picture model, whose text encoder is never split. Without it the
     /// node plans nothing for its workers, and serves only as a worker.
     pub split: bool,
-    /// `[workers].offload`: whether the workers are used when this node
-    /// could serve alone.
-    pub offload: Offload,
+    /// Tests only: the workers are used even when this node could serve
+    /// alone faster.
+    #[cfg(test)]
+    pub offload_always: bool,
     /// How often idle workers are pinged.
     pub maintenance: Duration,
     /// How long a parent may say nothing before this node takes it for gone
@@ -181,6 +211,40 @@ pub struct NodeSettings {
     /// `prompt_weights`: how a top-level node decides the copies its tree
     /// runs prompts through (`engine::prompt_weights::decide`).
     pub prompt_weights: prompt_weights::PromptWeights,
+}
+
+/// Tests only: where a top-level node's sequences decode, pinned.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodePin {
+    /// Always through the tree.
+    Tree,
+    /// Here alone whenever this node holds the whole model.
+    Top,
+}
+
+/// Where a node looks for the other nodes of its channel.
+#[derive(Clone, Debug)]
+pub enum Scan {
+    /// Every address of `networks` (`[workers].network`), or of this
+    /// machine's own IPv4 networks when there are none, on `port`.
+    Networks {
+        port: u16,
+        networks: Vec<(std::net::Ipv4Addr, u8)>,
+    },
+    /// These addresses only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Addresses(Vec<SocketAddr>),
+}
+
+/// Held while a request runs on this node ([`request_started`]).
+pub struct RequestGuard(Arc<Node>);
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        *self.0.last_request.lock().unwrap() = Instant::now();
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// A plan of a range over this node and its workers.
@@ -223,9 +287,29 @@ pub struct Node {
     settings: NodeSettings,
     model: Arc<dyn ModelForward>,
     loaded: LoadedModel,
-    links: Vec<Arc<ChildLink>>,
-    /// `[workers].standby`: never planned into a share.
-    standby_links: Vec<Arc<ChildLink>>,
+    /// The workers this node hands layers to: the nodes it claimed on its
+    /// channel, in the order they were found.
+    links: RwLock<Vec<Arc<ChildLink>>>,
+    /// Spare workers: never planned into a share.
+    standby_links: RwLock<Vec<Arc<ChildLink>>>,
+    /// The nodes the last scan of the channel found, and when it ran.
+    found: Mutex<(Vec<super::channel::Found>, Option<Instant>)>,
+    /// Set while this node claims workers on its channel or holds the ones
+    /// it claimed: it then refuses to be claimed itself.
+    leading: AtomicBool,
+    /// Requests running on this node, and when the last one ended: what a
+    /// leading node lets its workers go by.
+    active: AtomicUsize,
+    last_request: Mutex<Instant>,
+    /// Forwards running here for a parent: what this node's load counts
+    /// while it works as a worker.
+    forwards: Arc<AtomicUsize>,
+    /// Whether this node holds the whole model within its memory: it can
+    /// serve requests alone, so it routes rather than splits.
+    fits_alone: bool,
+    /// Samples of every layer's weights, hashed: what tells two releases of
+    /// a model apart in a probe. Zeros on a node with part of the model.
+    content_hash: [u8; 32],
     /// Standbys that took over a lost worker's layers since the last plan:
     /// `(lost worker, standby)`.
     standing_in: Mutex<Vec<(String, String)>>,
@@ -336,6 +420,33 @@ pub fn set_alone(alone: bool) -> Result<(), String> {
     }
 }
 
+/// A request is starting: a node on a channel claims the free nodes it
+/// found, and plans over them, before the request picks how it is served.
+/// The guard counts the request as running until it is dropped.
+pub fn request_started() -> Option<RequestGuard> {
+    Some(NODE.get()?.start_request())
+}
+
+/// Where a request this node's API got is served instead, as the base URL
+/// of another node's API, or `None` to serve it here. `forwarded`: the
+/// request was already routed once, and goes no further.
+pub fn route(forwarded: bool) -> Option<String> {
+    if forwarded {
+        return None;
+    }
+    NODE.get()?.route()
+}
+
+/// A request is starting: [`request_started`], on a blocking thread, since
+/// claiming workers can take a while.
+pub async fn request_started_async() -> Option<RequestGuard> {
+    NODE.get()?;
+    tokio::task::spawn_blocking(request_started)
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Hands the node the way this process loads another model.
 pub fn attach_handover(handover: Arc<crate::reexec::Handover>) {
     if let Some(node) = NODE.get() {
@@ -347,7 +458,9 @@ pub fn attach_handover(handover: Arc<crate::reexec::Handover>) {
 /// told whether its workers are worth it.
 pub fn attach_serving(switch: Arc<crate::engine::generate::ServingSwitch>) {
     if let Some(node) = NODE.get() {
-        switch.set_chosen(node.not_worth.lock().unwrap().is_some());
+        switch.set_chosen(
+            node.not_worth.lock().unwrap().is_some() || node.used.lock().unwrap().is_empty(),
+        );
         let _ = node.serving.set(switch);
     }
 }
@@ -466,8 +579,8 @@ impl Node {
                 settings.tls.clone(),
             ))
         };
-        let links = settings.workers.iter().map(link_to).collect();
-        let standby_links = settings.standby.iter().map(link_to).collect();
+        let links: Vec<Arc<ChildLink>> = settings.workers.iter().map(link_to).collect();
+        let standby_links: Vec<Arc<ChildLink>> = settings.standby.iter().map(link_to).collect();
         let listener = match &settings.listen {
             Some(addr) => Some(
                 TcpListener::bind(addr)
@@ -557,7 +670,6 @@ impl Node {
         // only when it pays).
         let total_bytes: u64 = layer_bytes.iter().sum();
         let alone_ns = (!rates_given
-            && (settings.offload == Offload::Auto || settings.decode == DecodeOn::Auto)
             && settings.split
             && settings.shares != Shares::Memory
             && !settings.workers.is_empty()
@@ -581,6 +693,16 @@ impl Node {
                     None
                 }
             });
+        let fits_alone = model.supports_layer_split()
+            && !super::fetch::incomplete()
+            && settings.capacity.budget_bytes >= total_bytes + non_layer_bytes;
+        // Samples of every layer, for nodes of a channel to compare before
+        // they route to each other: a few KiB of each tensor.
+        let content_hash = if settings.channel.is_some() && !super::fetch::incomplete() {
+            identity::model_identity(&loaded, "", "", 0..n_layer).range_hash
+        } else {
+            [0; 32]
+        };
         // The model this node serves, by its layout: what a parent compares.
         let own_identity =
             identity::model_identity(&loaded, &settings.label, &settings.quant, 0..0);
@@ -589,8 +711,15 @@ impl Node {
             settings,
             model,
             loaded,
-            links,
-            standby_links,
+            links: RwLock::new(links),
+            standby_links: RwLock::new(standby_links),
+            found: Mutex::new((Vec::new(), None)),
+            leading: AtomicBool::new(false),
+            active: AtomicUsize::new(0),
+            last_request: Mutex::new(Instant::now()),
+            forwards: Arc::new(AtomicUsize::new(0)),
+            fits_alone,
+            content_hash,
             standing_in: Mutex::new(Vec::new()),
             this: OnceLock::new(),
             decision: OnceLock::new(),
@@ -638,7 +767,7 @@ impl Node {
         }
         // Before the first plan, which can take minutes: a worker connected
         // early hears nothing else meanwhile.
-        for link in node.links.iter().chain(&node.standby_links) {
+        for link in node.links().iter().chain(&node.standby_links()) {
             let (node, link) = (node.clone(), link.clone());
             std::thread::Builder::new()
                 .name("orangu-workers-ping".to_string())
@@ -646,9 +775,9 @@ impl Node {
         }
         if node.delegates() {
             node.plan_top();
-        } else if !node.links.is_empty() {
+        } else if !node.links().is_empty() || node.settings.channel.is_some() {
             log::warn!(
-                "orangu-server: [workers] lists workers, but the {} architecture cannot be split \
+                "orangu-server: [workers] has workers, but the {} architecture cannot be split \
                  across them yet; serving it here alone",
                 node.model.config().architecture
             );
@@ -658,6 +787,16 @@ impl Node {
             std::thread::Builder::new()
                 .name("orangu-workers-watch".to_string())
                 .spawn(move || node.watch())?;
+        }
+        if node.settings.channel.is_some() {
+            // Tests run many nodes in one process: their loads are their
+            // slots alone.
+            #[cfg(not(test))]
+            super::load::start_sampler();
+            let node = node.clone();
+            std::thread::Builder::new()
+                .name("orangu-workers-scan".to_string())
+                .spawn(move || node.scan_channel())?;
         }
         Ok(node)
     }
@@ -675,7 +814,350 @@ impl Node {
 
     /// Whether this node hands layers to workers when it is top-level.
     fn delegates(&self) -> bool {
-        self.settings.split && !self.links.is_empty() && self.model.supports_layer_split()
+        self.settings.split
+            && self.model.supports_layer_split()
+            && (!self.links().is_empty() || self.can_lead())
+    }
+
+    /// Whether a test pinned sequences to decode through the tree (`tree`)
+    /// or here alone; the measured speeds decide otherwise.
+    #[cfg_attr(not(test), allow(unused_variables))]
+    fn decode_pinned(&self, tree: bool) -> bool {
+        #[cfg(test)]
+        {
+            self.settings.decode_pin
+                == Some(if tree {
+                    DecodePin::Tree
+                } else {
+                    DecodePin::Top
+                })
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// Whether a test pinned the workers to be used even when this node
+    /// could serve alone faster; the measured speeds decide otherwise.
+    fn offload_always(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.settings.offload_always
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+
+    /// The workers this node hands layers to, as they stand.
+    fn links(&self) -> Vec<Arc<ChildLink>> {
+        self.links.read().unwrap().clone()
+    }
+
+    /// The spare workers, as they stand.
+    fn standby_links(&self) -> Vec<Arc<ChildLink>> {
+        self.standby_links.read().unwrap().clone()
+    }
+
+    /// Whether this node can claim workers on its channel and lead them:
+    /// it is on one, and has the whole model to embed and sample with.
+    fn can_lead(&self) -> bool {
+        self.settings.channel.is_some()
+            && self.settings.split
+            && self.model.supports_layer_split()
+            && !super::fetch::incomplete()
+    }
+
+    /// A request is starting here: [`request_started`].
+    fn start_request(self: &Arc<Self>) -> RequestGuard {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        self.claim();
+        RequestGuard(self.clone())
+    }
+
+    /// How busy this node is, `0.0` to `1.0` ([`super::load`]).
+    fn load(&self) -> f32 {
+        super::load::combine(
+            self.active.load(Ordering::Acquire) + self.forwards.load(Ordering::Acquire),
+            self.settings.slots,
+            super::load::busy(),
+        )
+    }
+
+    /// Whether this node serves the model alone: it can lead, and holds the
+    /// whole model.
+    fn whole(&self) -> bool {
+        self.can_lead() && self.fits_alone
+    }
+
+    /// Where a request this node got is served instead ([`route`]). A node
+    /// working for a parent sends its clients to that parent. A node that
+    /// serves the model alone keeps a request unless a free node that can
+    /// serve it too is [`ROUTE_MARGIN`] less busy; one that cannot sends it
+    /// to the least busy free node that can, and splits the model over its
+    /// channel only when there is none.
+    fn route(&self) -> Option<String> {
+        self.settings.channel.as_ref()?;
+        let found = self.found.lock().unwrap().0.clone();
+        if self.is_assigned() {
+            let parent = self.parent.lock().unwrap().as_ref()?.node.clone();
+            return found.into_iter().find(|f| f.node == parent).map(|f| f.api);
+        }
+        let best = found
+            .into_iter()
+            .filter(|f| {
+                f.whole
+                    && f.state == ProbeState::Idle
+                    && f.node != self.id
+                    && self.same_model(f, true)
+            })
+            .min_by(|a, b| a.load.total_cmp(&b.load))?;
+        if !self.whole() || best.load + ROUTE_MARGIN < self.load() {
+            Some(best.api)
+        } else {
+            None
+        }
+    }
+
+    /// Whether a request starting now may claim workers: this node can
+    /// lead but not serve the model alone, serves its own clients, and its
+    /// last scan found someone free that it does not hold yet.
+    fn may_claim(&self) -> bool {
+        self.can_lead()
+            && !self.fits_alone
+            && !self.is_assigned()
+            && !self.alone.load(Ordering::Acquire)
+            && !self.unclaimed().is_empty()
+    }
+
+    /// The free nodes the last scan found that this node does not hold.
+    fn unclaimed(&self) -> Vec<super::channel::Found> {
+        let held: Vec<String> = self
+            .links()
+            .iter()
+            .chain(&self.standby_links())
+            .map(|link| link.addr.clone())
+            .collect();
+        self.found
+            .lock()
+            .unwrap()
+            .0
+            .iter()
+            .filter(|found| {
+                found.state.claimable()
+                    && self.same_model(found, false)
+                    && found.load <= CLAIM_CUTOFF
+                    && found.node != self.id
+                    && !held.contains(&found.addr)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Whether `found` serves this node's model: the same layout, and —
+    /// with `weights`, for a node to route to — the same samples of every
+    /// layer's weights. A worker's weights are compared layer by layer when
+    /// it is claimed, so a node with part of the model can be claimed.
+    fn same_model(&self, found: &super::channel::Found, weights: bool) -> bool {
+        found.model == self.identity.header_hash
+            && (!weights || (found.content != [0; 32] && found.content == self.content_hash))
+    }
+
+    /// What a probe of this node is told it is doing.
+    fn probe_state(&self) -> ProbeState {
+        if self.parent.lock().unwrap().is_some() {
+            ProbeState::Serving
+        } else if self.leading.load(Ordering::Acquire) {
+            ProbeState::Leading
+        } else if self.can_lead() {
+            ProbeState::Idle
+        } else {
+            ProbeState::WorkerOnly
+        }
+    }
+
+    /// Claims the free nodes the last scan found, and plans over them with
+    /// the ones already held. A node another node claimed first refuses
+    /// the handshake and is let go again.
+    fn claim(self: &Arc<Self>) {
+        if !self.may_claim() {
+            return;
+        }
+        let mut last = self.planning.lock().unwrap();
+        // Claimed by a parent, or another request claimed them, while this
+        // one waited.
+        let fresh = self.unclaimed();
+        if fresh.is_empty() || self.is_assigned() {
+            return;
+        }
+        self.leading.store(true, Ordering::Release);
+        log::info!(
+            "orangu-server: workers: claiming {} on channel '{}'",
+            fresh
+                .iter()
+                .map(|f| format!("{} ({})", f.name, f.addr))
+                .collect::<Vec<_>>()
+                .join(", "),
+            self.settings.channel.as_deref().unwrap_or_default()
+        );
+        for found in fresh {
+            let link = Arc::new(ChildLink::with_tls(
+                found.addr.clone(),
+                self.settings.timeout,
+                self.settings.connect_timeout,
+                self.settings.tls.clone(),
+            ));
+            self.links.write().unwrap().push(link.clone());
+            let node = self.clone();
+            let _ = std::thread::Builder::new()
+                .name("orangu-workers-ping".to_string())
+                .spawn(move || node.ping_worker(&link));
+        }
+        self.plan_top_locked();
+        // Nobody answered the handshake: another node has them, or they
+        // went away. They are dropped, and found again by a later scan.
+        let lost: Vec<String> = self
+            .links()
+            .iter()
+            .filter(|link| !link.is_connected())
+            .map(|link| link.addr.clone())
+            .collect();
+        if !lost.is_empty() {
+            self.links
+                .write()
+                .unwrap()
+                .retain(|link| !lost.contains(&link.addr));
+            self.found
+                .lock()
+                .unwrap()
+                .0
+                .retain(|found| !lost.contains(&found.addr));
+            if self.links().is_empty() {
+                self.leading.store(false, Ordering::Release);
+            }
+            self.plan_top_locked();
+        }
+        *last = Instant::now();
+    }
+
+    /// Lets go of every worker this node claimed on its channel: each
+    /// drops its sessions and serves its own clients again, free for the
+    /// next node with a request to claim.
+    fn release_workers(&self) {
+        let mut last = self.planning.lock().unwrap();
+        if !self.leading.load(Ordering::Acquire) || self.active.load(Ordering::Acquire) > 0 {
+            return;
+        }
+        let links: Vec<Arc<ChildLink>> = std::mem::take(&mut *self.links.write().unwrap());
+        let spares: Vec<Arc<ChildLink>> = std::mem::take(&mut *self.standby_links.write().unwrap());
+        for link in links.iter().chain(&spares) {
+            link.disconnect();
+        }
+        self.leading.store(false, Ordering::Release);
+        log::info!(
+            "orangu-server: workers: no request for {} s; {} let go",
+            self.settings.release.as_secs(),
+            links
+                .iter()
+                .map(|link| link.addr.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        self.plan_top_locked();
+        *last = Instant::now();
+    }
+
+    /// Whether a leading node has had no request for `[workers].release`.
+    fn release_due(&self) -> bool {
+        self.leading.load(Ordering::Acquire)
+            && self.active.load(Ordering::Acquire) == 0
+            && self.last_request.lock().unwrap().elapsed() >= self.settings.release
+    }
+
+    /// Scans the channel every `scan_every`, and asks the nodes it found
+    /// how busy they are every [`REFRESH_EVERY`] in between, for as long as
+    /// the node runs.
+    fn scan_channel(self: Arc<Self>) {
+        let Some(channel) = self.settings.channel.clone() else {
+            return;
+        };
+        let hash = super::channel::channel_hash(&channel);
+        let tls = self.settings.tls.clone();
+        let mut scanned: Option<Instant> = None;
+        while !self.stop.load(Ordering::Relaxed) {
+            let full = scanned.is_none_or(|at| at.elapsed() >= self.settings.scan_every);
+            let addrs: Vec<SocketAddr> = match (&self.settings.scan, full) {
+                (Scan::Addresses(addrs), true) => addrs.clone(),
+                (Scan::Networks { .. }, true) => Vec::new(),
+                (_, false) => self
+                    .found
+                    .lock()
+                    .unwrap()
+                    .0
+                    .iter()
+                    .filter_map(|f| f.addr.parse().ok())
+                    .collect(),
+            };
+            let mut found = match (&self.settings.scan, full) {
+                (Scan::Networks { port, networks }, true) => super::channel::scan(
+                    &super::channel::scan_hosts(networks),
+                    *port,
+                    &hash,
+                    tls.as_ref(),
+                ),
+                _ => addrs
+                    .iter()
+                    .filter_map(|addr| super::channel::probe(*addr, &hash, tls.as_ref()))
+                    .collect(),
+            };
+            if full {
+                scanned = Some(Instant::now());
+            }
+            found.retain(|f| f.node != self.id);
+            found.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.addr.cmp(&b.addr)));
+            {
+                let mut slot = self.found.lock().unwrap();
+                let shape = |list: &[super::channel::Found]| {
+                    list.iter()
+                        .map(|f| (f.addr.clone(), f.state))
+                        .collect::<Vec<_>>()
+                };
+                if shape(&slot.0) != shape(&found) {
+                    log::info!(
+                        "orangu-server: workers: channel '{channel}' has {}",
+                        if found.is_empty() {
+                            "no other node".to_string()
+                        } else {
+                            found
+                                .iter()
+                                .map(|f| {
+                                    format!(
+                                        "{} ({}, {}{})",
+                                        f.name,
+                                        f.addr,
+                                        f.state.as_str(),
+                                        if self.same_model(f, false) {
+                                            ""
+                                        } else {
+                                            ", another model: not used"
+                                        }
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    );
+                }
+                *slot = (found, Some(Instant::now()));
+            }
+            let started = Instant::now();
+            let wait = REFRESH_EVERY.min(self.settings.scan_every);
+            while started.elapsed() < wait && !self.stop.load(Ordering::Relaxed) {
+                std::thread::sleep(self.settings.maintenance.min(wait));
+            }
+        }
     }
 
     /// The model this node's own API serves: a [`DelegatingModel`] over
@@ -704,7 +1186,7 @@ impl Node {
         }
         let used = self.used.lock().unwrap();
         let lost = self
-            .links
+            .links()
             .iter()
             .any(|link| !link.is_connected() && used.contains(&link.addr));
         lost.then_some("a worker was lost")
@@ -716,8 +1198,8 @@ impl Node {
     }
 
     fn render_metrics(&self) -> String {
-        let links: Vec<LinkSnapshot<'_>> = self
-            .links
+        let held = self.links();
+        let links: Vec<LinkSnapshot<'_>> = held
             .iter()
             .map(|link| LinkSnapshot {
                 addr: &link.addr,
@@ -741,7 +1223,7 @@ impl Node {
             })
             .collect();
         let workers: Vec<_> = self
-            .links
+            .links()
             .iter()
             .map(|link| {
                 let info = link.info();
@@ -783,9 +1265,31 @@ impl Node {
             "host": record.metrics_host,
             "port": record.metrics_port,
         }));
+        let (found, scanned) = self.found.lock().unwrap().clone();
         serde_json::json!({
             "node": self.id,
             "name": self.settings.name,
+            // The channel, how busy this node is, and the other nodes of the
+            // channel as the last scan found them.
+            "channel": self.settings.channel,
+            "load": self.load(),
+            "holds_model": self.whole(),
+            "leading": self.leading.load(Ordering::Acquire),
+            "scanned_seconds_ago": scanned.map(|at| at.elapsed().as_secs()),
+            "found": found
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "name": f.name,
+                        "address": f.addr,
+                        "state": f.state.as_str(),
+                        "load": f.load,
+                        "holds_model": f.whole,
+                        "same_model": self.same_model(f, false),
+                        "api": f.api,
+                    })
+                })
+                .collect::<Vec<_>>(),
             "role": if assignment.is_some() { "worker" } else { "top" },
             "alone": self.alone.load(Ordering::Acquire),
             "layers": assignment.as_ref().map(|a| [a.layers.start, a.layers.end]),
@@ -815,7 +1319,7 @@ impl Node {
             // Spare workers, and whom each stands in for since the last
             // plan, if anyone.
             "standby": self
-                .standby_links
+                .standby_links()
                 .iter()
                 .map(|link| {
                     let standing = self.standing_in.lock().unwrap();
@@ -838,7 +1342,7 @@ impl Node {
                 .unwrap()
                 .iter()
                 .filter(|addr| {
-                    self.links
+                    self.links()
                         .iter()
                         .any(|link| &link.addr == *addr && !link.is_connected())
                 })
@@ -852,7 +1356,7 @@ impl Node {
     /// This node and every node below it that it is connected to.
     fn subtree_ids(&self) -> Vec<String> {
         let mut ids = vec![self.id.clone()];
-        for link in &self.links {
+        for link in &self.links() {
             if let Some(info) = link.info() {
                 ids.extend(info.subtree);
             }
@@ -869,7 +1373,7 @@ impl Node {
         if record.metrics_port != 0 {
             out.push((record, None));
         }
-        for link in &self.links {
+        for link in &self.links() {
             let Some(info) = link.info() else {
                 continue;
             };
@@ -932,7 +1436,7 @@ impl Node {
             return Vec::new();
         }
         let mut out = vec![self.self_record()];
-        for link in &self.links {
+        for link in &self.links() {
             let Some(info) = link.info() else {
                 continue;
             };
@@ -953,7 +1457,7 @@ impl Node {
         capacity.subtree_device_bytes = capacity.device_bytes;
         capacity.subtree_host_bytes = capacity.host_bytes;
         capacity.subtree_budget_bytes = capacity.budget_bytes;
-        for info in self.links.iter().filter_map(|link| link.info()) {
+        for info in self.links().iter().filter_map(|link| link.info()) {
             capacity.subtree_nodes += info.capacity.subtree_nodes;
             capacity.subtree_device_bytes += info.capacity.subtree_device_bytes;
             capacity.subtree_host_bytes += info.capacity.subtree_host_bytes;
@@ -1074,6 +1578,30 @@ impl Node {
     /// below it — runs at, by `[workers].shares`: their rates added up, as
     /// each takes a part in proportion. `0` when one of them did not measure.
     fn rate(&self, setups: &[NodeSetup]) -> f64 {
+        let spare = setups.first().map_or(1.0, |first| self.spare(&first.name));
+        spare * self.busy_rate(setups)
+    }
+
+    /// The share of a node's speed that is free, by its load: `1 − load`,
+    /// never under [`MIN_SPARE`], so a busy node keeps a small share rather
+    /// than none. `1.0` off a channel.
+    fn spare(&self, name: &str) -> f64 {
+        if self.settings.channel.is_none() {
+            return 1.0;
+        }
+        let load = if *name == self.settings.name {
+            super::load::busy()
+        } else {
+            match self.found.lock().unwrap().0.iter().find(|f| f.name == name) {
+                Some(found) => found.load,
+                None => 0.0,
+            }
+        };
+        (1.0 - f64::from(load)).max(MIN_SPARE)
+    }
+
+    /// A node's speed at what shares follow, its load aside.
+    fn busy_rate(&self, setups: &[NodeSetup]) -> f64 {
         if self.settings.shares == Shares::Decode
             && let Some(first) = setups.first()
             && let Some(observed) = self
@@ -1153,7 +1681,7 @@ impl Node {
             return false;
         }
         let mut candidates = Vec::new();
-        for link in &self.links {
+        for link in &self.links() {
             match link.info() {
                 Some(_) if !used.contains(&link.addr) => return false,
                 Some(info) => candidates.push((link.clone(), info)),
@@ -1235,7 +1763,7 @@ impl Node {
         let mut standing: Vec<(String, String)> = Vec::new();
         if path.len() < MAX_DEPTH {
             let mut missing = Vec::new();
-            for link in &self.links {
+            for link in &self.links() {
                 if let Some(left) = link.out_for() {
                     log::debug!(
                         "orangu-server: worker {} left out for {} s more",
@@ -1260,7 +1788,8 @@ impl Node {
                     }
                 }
             }
-            let mut spares = self.standby_links.iter();
+            let spare_links = self.standby_links();
+            let mut spares = spare_links.iter();
             for lost in missing {
                 for link in spares.by_ref() {
                     if link.out_for().is_some() {
@@ -1407,7 +1936,7 @@ impl Node {
         terms: Terms,
     ) -> Box<dyn Stage> {
         let stage = MessageStage::over(link.clone(), layers.clone(), terms.activations);
-        if self.standby_links.is_empty() {
+        if self.standby_links().is_empty() {
             return Box::new(stage);
         }
         let node = self.this.get().cloned().unwrap_or_default();
@@ -1445,7 +1974,7 @@ impl Node {
     ) -> Result<Arc<dyn EncodedStage>> {
         let secret = self.settings.secret.as_deref();
         let mut standing = self.standing_in.lock().unwrap();
-        for link in &self.standby_links {
+        for link in &self.standby_links() {
             if standing.iter().any(|(_, standby)| *standby == link.addr) || link.out_for().is_some()
             {
                 continue;
@@ -1499,7 +2028,7 @@ impl Node {
             if standing.iter().any(|(_, kept)| *kept == standby) {
                 continue;
             }
-            if let Some(link) = self.standby_links.iter().find(|l| l.addr == standby) {
+            if let Some(link) = self.standby_links().iter().find(|l| l.addr == standby) {
                 link.disconnect();
             }
         }
@@ -1637,7 +2166,8 @@ impl Node {
         };
         let why = self.not_worth.lock().unwrap().clone();
         if let Some(switch) = self.serving.get() {
-            switch.set_chosen(why.is_some());
+            // No worker in the plan: the model's own paths serve.
+            switch.set_chosen(why.is_some() || used.is_empty());
         }
         match &why {
             Some(why) if *self.plan.lock().unwrap() != entries => log::info!(
@@ -1699,9 +2229,9 @@ impl Node {
     }
 
     /// Whether sequences decode on this node alone once their prompt is
-    /// through the tree, by `[workers].decode`: only when the plan
-    /// uses workers, every one of them can send rows back, and this node's
-    /// budget holds the whole model — and, with `auto`, when the decode step
+    /// through the tree: only when the plan uses workers, every one of them
+    /// can send rows back, and this node's budget holds the whole model —
+    /// and when the decode step
     /// it saves (every node's layers at its speed, its fixed cost and the
     /// hops, against this node alone) at least covers bringing one prompt
     /// position's rows over the slowest link: the rows pay for themselves
@@ -1711,13 +2241,13 @@ impl Node {
             .iter()
             .filter(|e| e.layer_start < e.layer_end)
             .collect();
-        if self.settings.decode == DecodeOn::Tree || working.len() < 2 {
+        if self.decode_pinned(true) || working.len() < 2 {
             return false;
         }
         let rows = self.can_hand_back(
-            self.links
+            self.links()
                 .iter()
-                .chain(&self.standby_links)
+                .chain(&self.standby_links())
                 .filter(|link| used.contains(&link.addr))
                 .filter_map(|link| link.info().map(|info| info.features)),
         );
@@ -1725,11 +2255,11 @@ impl Node {
         if !rows || self.settings.capacity.budget_bytes < total + self.non_layer_bytes {
             return false;
         }
-        if self.settings.decode == DecodeOn::Top {
+        if self.decode_pinned(false) {
             return true;
         }
         let mut setups = self.settings.capacity.setups.clone();
-        for link in &self.links {
+        for link in &self.links() {
             if let Some(info) = link.info() {
                 setups.extend(info.capacity.setups);
             }
@@ -1801,9 +2331,9 @@ impl Node {
     /// The slowest link to the workers `used`: the longest round trip and
     /// the least bandwidth among them. `None` when none was timed.
     fn slowest_link(&self, used: &[String]) -> Option<(Duration, f64)> {
-        self.links
+        self.links()
             .iter()
-            .chain(&self.standby_links)
+            .chain(&self.standby_links())
             .filter(|link| used.contains(&link.addr))
             .filter_map(|link| link.info().and_then(|info| info.link))
             .reduce(|a, b| (a.0.max(b.0), a.1.min(b.1)))
@@ -1811,7 +2341,7 @@ impl Node {
 
     /// Why this node should serve alone rather than hand `shares` to its
     /// workers, or `None` when the tree pays — or must be used: this
-    /// node cannot hold the model, `offload = always`, or a node did not
+    /// node cannot hold the model, a test pinned it, or a node did not
     /// measure its speed. Predicted from the measured rates: a long
     /// prompt runs at the pace of the tree's slowest stage (its parts
     /// overlap), a decode step through every stage in turn — or here alone
@@ -1824,7 +2354,7 @@ impl Node {
         shares: &[Range<usize>],
         candidates: &[(Arc<ChildLink>, ChildInfo)],
     ) -> Option<String> {
-        if self.settings.offload == Offload::Always || shares.iter().all(Range::is_empty) {
+        if self.offload_always() || shares.iter().all(Range::is_empty) {
             return None;
         }
         let total = plan::bytes_of(range, &self.layer_bytes) as f64;
@@ -1894,7 +2424,7 @@ impl Node {
                 .filter(|(_, share)| !share.is_empty())
                 .map(|((_, info), _)| info.features),
         );
-        let mut tree_decode = if self.settings.decode == DecodeOn::Tree || !hands_back {
+        let mut tree_decode = if self.decode_pinned(true) || !hands_back {
             decode_steps
         } else {
             alone_decode
@@ -1949,12 +2479,16 @@ impl Node {
         if self.settings.head == HeadOn::Top || last.node == self.settings.name {
             return false;
         }
-        let head = self.links.iter().chain(&self.standby_links).all(|link| {
-            !used.contains(&link.addr)
-                || link
-                    .info()
-                    .is_some_and(|info| info.features & super::protocol::FEATURE_HEAD != 0)
-        });
+        let head = self
+            .links()
+            .iter()
+            .chain(&self.standby_links())
+            .all(|link| {
+                !used.contains(&link.addr)
+                    || link
+                        .info()
+                        .is_some_and(|info| info.features & super::protocol::FEATURE_HEAD != 0)
+            });
         if !head {
             return false;
         }
@@ -1962,7 +2496,7 @@ impl Node {
             return true;
         }
         let mut setups = self.settings.capacity.setups.clone();
-        for link in &self.links {
+        for link in &self.links() {
             if let Some(info) = link.info() {
                 setups.extend(info.capacity.setups);
             }
@@ -2018,7 +2552,7 @@ impl Node {
         *top = (Arc::new(local), top.1 + 1);
         drop(top);
         // Let go: each worker drops its sessions and serves its own API.
-        for link in self.links.iter().chain(&self.standby_links) {
+        for link in self.links().iter().chain(&self.standby_links()) {
             link.disconnect();
         }
         self.set_standing(Vec::new());
@@ -2376,9 +2910,18 @@ impl Node {
                     // other — its parent waits for each before the next.
                     let writer = writer.clone();
                     let tcp = tcp.clone();
+                    let forwards = self.forwards.clone();
+                    forwards.fetch_add(1, Ordering::AcqRel);
                     let spawned = std::thread::Builder::new()
                         .name("orangu-workers-forward".to_string())
                         .spawn(move || {
+                            struct Running(Arc<AtomicUsize>);
+                            impl Drop for Running {
+                                fn drop(&mut self) {
+                                    self.0.fetch_sub(1, Ordering::AcqRel);
+                                }
+                            }
+                            let _running = Running(forwards);
                             super::clock::hold();
                             // In the request pool, as a request at the top
                             // runs: parallel regions split from a pool
@@ -2395,6 +2938,7 @@ impl Node {
                             }
                         });
                     if spawned.is_err() {
+                        self.forwards.fetch_sub(1, Ordering::AcqRel);
                         break;
                     }
                     continue;
@@ -2429,6 +2973,29 @@ impl Node {
         };
         let hello = match read_message(reader) {
             Ok(Message::Hello(hello)) => hello,
+            // A node scanning for its channel: answered only on this one.
+            Ok(Message::Probe { channel }) => {
+                if let Some(own) = self.settings.channel.as_deref()
+                    && super::channel::channel_hash(own) == channel
+                {
+                    let _ = write_message(
+                        writer,
+                        0,
+                        &Message::ProbeAck {
+                            node: self.id.clone(),
+                            name: self.settings.name.clone(),
+                            state: self.probe_state(),
+                            load: self.load(),
+                            whole: self.whole(),
+                            api_port: self.settings.api_port,
+                            api_tls: self.settings.api_tls,
+                            model: self.identity.header_hash,
+                            content: self.content_hash,
+                        },
+                    );
+                }
+                return None;
+            }
             _ => return None,
         };
         if hello.version != PROTOCOL_VERSION {
@@ -2445,6 +3012,13 @@ impl Node {
             );
         }
         let parent_node = hello.path.last().cloned().unwrap_or_default();
+        // Leading a tree of its own: a tree on a channel is one level deep.
+        if self.leading.load(Ordering::Acquire) {
+            return refuse(
+                writer,
+                WorkerError::new(ErrorCode::Busy, "leading workers of its own"),
+            );
+        }
         if let Some(parent) = self.parent.lock().unwrap().as_ref()
             && parent.node != parent_node
         {
@@ -2520,6 +3094,15 @@ impl Node {
     fn ping_worker(&self, link: &ChildLink) {
         while !self.stop.load(Ordering::Relaxed) {
             std::thread::sleep(self.settings.maintenance);
+            // Let go of: the link is the next scan's to find again.
+            let held = self
+                .links()
+                .iter()
+                .chain(&self.standby_links())
+                .any(|held| std::ptr::eq(Arc::as_ptr(held), link));
+            if !held {
+                break;
+            }
             link.ping_if_idle();
         }
     }
@@ -2542,6 +3125,10 @@ impl Node {
                 }
                 continue;
             }
+            if self.release_due() {
+                self.release_workers();
+                continue;
+            }
             if !self.delegates() || self.alone.load(Ordering::Acquire) {
                 continue;
             }
@@ -2561,11 +3148,12 @@ impl Node {
         }
     }
 
-    /// With `decode = auto`, once requests have shown a decode step through
+    /// Once requests have shown a decode step through
     /// the tree ([`CALIBRATE_TOKENS`] of them), weighs again whether
     /// sequences decode here alone — the plan stays as it is.
     fn decide_decode_again(&self) {
-        if self.settings.decode != DecodeOn::Auto
+        if self.decode_pinned(true)
+            || self.decode_pinned(false)
             || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
             || self
                 .tree_seen_in_force()
@@ -2631,12 +3219,12 @@ impl Node {
     }
 
     /// Why the tree in force should give way to this node alone: with
-    /// `offload = auto` and the model held here, once requests found the
+    /// With the model held here, once requests found the
     /// tree not to pay against the model alone — as timed, or at this
     /// node's rates — by [`tree_pays`], after [`CALIBRATE_TOKENS`] decode
     /// steps since the plan. `None` otherwise.
     fn tree_seen_slower(&self) -> Option<String> {
-        if self.settings.offload != Offload::Auto
+        if self.offload_always()
             || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
         {
             return None;
@@ -2765,7 +3353,7 @@ impl Node {
         let secret = self.settings.secret.as_deref();
         let used = self.used.lock().unwrap().clone();
         let mut tried = false;
-        let due = self.links.iter().any(|link| {
+        let due = self.links().iter().any(|link| {
             if link.is_connected() {
                 return false;
             }
@@ -2849,7 +3437,7 @@ impl Node {
         if let Some(parent) = self.parent.lock().unwrap().take() {
             let _ = parent.stream.shutdown(std::net::Shutdown::Both);
         }
-        for link in &self.links {
+        for link in &self.links() {
             link.disconnect();
         }
     }
@@ -2884,7 +3472,7 @@ impl PipelineSource for Node {
 
     fn served_whole(&self) {
         let used = self.used.lock().unwrap();
-        for link in self.links.iter().chain(&self.standby_links) {
+        for link in self.links().iter().chain(&self.standby_links()) {
             if link.is_connected() && used.contains(&link.addr) {
                 link.forgive();
             }
@@ -2914,7 +3502,7 @@ impl PipelineSource for Node {
                 vec![part.clone()]
             } else {
                 match self
-                    .links
+                    .links()
                     .iter()
                     .find(|l| l.addr == *part)
                     .and_then(|l| l.info())
@@ -3047,6 +3635,12 @@ mod tests {
             listen: Some("127.0.0.1:0".to_string()),
             workers,
             standby: Vec::new(),
+            channel: None,
+            scan: Scan::Addresses(Vec::new()),
+            scan_every: Duration::from_millis(100),
+            release: Duration::from_secs(300),
+            api_port: 0,
+            api_tls: false,
             secret: secret.map(str::to_string),
             activations: ActivationFormat::F32,
             timeout: Duration::from_secs(10),
@@ -3063,9 +3657,9 @@ mod tests {
                 ..Capacity::default()
             },
             shares: Shares::Memory,
-            decode: DecodeOn::Tree,
+            decode_pin: Some(DecodePin::Tree),
             head: HeadOn::Top,
-            offload: Offload::Always,
+            offload_always: true,
             split: true,
             maintenance: Duration::from_millis(50),
             parent_silence: Duration::from_secs(30),
@@ -3106,6 +3700,227 @@ mod tests {
             out.push(model.forward(&mut cache, &[*token], pos, 0).unwrap());
         }
         out
+    }
+
+    /// A node on `channel` that probes only `peers`, holding the model alone
+    /// when `fits`.
+    fn on_channel(name: &str, channel: &str, peers: &[&Arc<Node>], fits: bool) -> NodeSettings {
+        let mut settings = settings(name, Vec::new(), None);
+        settings.channel = Some(channel.to_string());
+        settings.scan = Scan::Addresses(peers.iter().map(|p| p.local_addr().unwrap()).collect());
+        settings.release = Duration::from_millis(300);
+        if !fits {
+            settings.capacity.budget_bytes = 1;
+        }
+        settings
+    }
+
+    /// Waits until `node`'s scans have found `n` nodes.
+    fn found(node: &Node, n: usize) -> Vec<super::super::channel::Found> {
+        for _ in 0..100 {
+            let found = node.found.lock().unwrap().0.clone();
+            if found.len() == n {
+                return found;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "{} found {:?}",
+            node.settings.name,
+            node.found.lock().unwrap().0
+        );
+    }
+
+    fn probe_of(node: &Node, channel: &str) -> Option<super::super::channel::Found> {
+        super::super::channel::probe(
+            node.local_addr().unwrap(),
+            &super::super::channel::channel_hash(channel),
+            None,
+        )
+    }
+
+    /// A probe is answered on the node's own channel only, with what the
+    /// node is doing and whether it holds the model.
+    #[test]
+    fn a_probe_is_answered_on_its_channel_only() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let found = probe_of(&beta, "lab").expect("on the channel");
+        assert_eq!(found.name, "beta");
+        assert_eq!(found.state, ProbeState::Idle);
+        assert!(found.whole);
+        assert_eq!(found.load, 0.0);
+        assert!(probe_of(&beta, "other").is_none());
+        let off = node("off", &[], Variant::default());
+        assert!(probe_of(&off, "lab").is_none());
+    }
+
+    /// A node that cannot hold the model claims the free nodes of its
+    /// channel when a request starts, plans over them, and lets them go
+    /// once it has had no request for `release`.
+    #[test]
+    fn a_node_that_cannot_hold_the_model_claims_its_channel_and_lets_go() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
+        let alpha = node_with(
+            on_channel("alpha", "lab", &[&beta, &gamma], false),
+            Variant::default(),
+        );
+        assert!(alpha.delegates());
+        assert_eq!(found(&alpha, 2).len(), 2);
+        // Nothing is claimed before a request.
+        assert!(!beta.is_assigned() && !gamma.is_assigned());
+
+        let request = alpha.start_request();
+        assert!(alpha.leading.load(Ordering::Acquire));
+        assert_eq!(covered(&alpha.plan()), N_LAYER);
+        let used = alpha.used.lock().unwrap().clone();
+        assert!(!used.is_empty(), "{:?}", alpha.plan());
+        assert!(beta.is_assigned() || gamma.is_assigned());
+        // The tree is one level deep: a leading node is not claimed.
+        let refused = ChildLink::new(
+            alpha.local_addr().unwrap().to_string(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+        .connect(None, &["someone".to_string()])
+        .unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Busy, "{refused}");
+        assert_eq!(probe_of(&alpha, "lab").unwrap().state, ProbeState::Leading);
+
+        // Kept while the request runs, let go after it.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(alpha.leading.load(Ordering::Acquire));
+        drop(request);
+        for _ in 0..100 {
+            if !alpha.leading.load(Ordering::Acquire) && !beta.is_assigned() && !gamma.is_assigned()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alpha.leading.load(Ordering::Acquire));
+        assert!(alpha.links().is_empty());
+        assert!(!beta.is_assigned() && !gamma.is_assigned());
+    }
+
+    /// A node that holds the model never claims workers: it routes instead.
+    #[test]
+    fn a_node_that_holds_the_model_does_not_claim() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let alpha = node_with(
+            on_channel("alpha", "lab", &[&beta], true),
+            Variant::default(),
+        );
+        found(&alpha, 1);
+        assert!(!alpha.may_claim());
+        let _request = alpha.start_request();
+        assert!(!beta.is_assigned());
+        assert!(alpha.links().is_empty());
+    }
+
+    /// A busy node that holds the model sends a request to a less busy one
+    /// that holds it too; a node that does not hold the model sends it to
+    /// whichever free node does.
+    #[test]
+    fn a_request_goes_to_the_least_busy_node_that_holds_the_model() {
+        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
+        let beta = node_with(
+            on_channel("beta", "lab", &[&gamma], true),
+            Variant::default(),
+        );
+        found(&beta, 1);
+        // Equally idle: served here.
+        assert_eq!(beta.route(), None);
+        // Busy: both slots in use.
+        beta.active.store(2, Ordering::Release);
+        assert_eq!(beta.route().as_deref(), Some("http://127.0.0.1:0"));
+        beta.active.store(0, Ordering::Release);
+
+        let alpha = node_with(
+            on_channel("alpha", "lab", &[&gamma], false),
+            Variant::default(),
+        );
+        found(&alpha, 1);
+        assert_eq!(alpha.route().as_deref(), Some("http://127.0.0.1:0"));
+        // A request already routed once stays.
+        assert!(route(true).is_none());
+    }
+
+    /// Nodes cooperate only on the same model: one with another
+    /// quantization is neither routed to nor claimed, and one with other
+    /// weights in the same layout is not routed to.
+    #[test]
+    fn a_node_with_another_model_is_not_used() {
+        let other = node_with(
+            on_channel("other", "lab", &[], true),
+            Variant {
+                f16_ffn_down: true,
+                ..Variant::default()
+            },
+        );
+        let nudged = node_with(
+            on_channel("nudged", "lab", &[], true),
+            Variant {
+                nudge_layer: Some(1),
+                ..Variant::default()
+            },
+        );
+        let alpha = node_with(
+            on_channel("alpha", "lab", &[&other, &nudged], false),
+            Variant::default(),
+        );
+        let found = found(&alpha, 2);
+        let by_name = |name: &str| found.iter().find(|f| f.name == name).unwrap().clone();
+        assert!(!alpha.same_model(&by_name("other"), false));
+        assert!(alpha.same_model(&by_name("nudged"), false));
+        assert!(!alpha.same_model(&by_name("nudged"), true));
+        // Neither serves a request routed here.
+        assert_eq!(alpha.route(), None);
+        // Only the one with the same layout is a candidate worker; its
+        // weights are compared when it is claimed.
+        let unclaimed: Vec<String> = alpha.unclaimed().into_iter().map(|f| f.name).collect();
+        assert_eq!(unclaimed, ["nudged"]);
+        assert_eq!(
+            alpha.status()["found"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|f| f["same_model"] == false)
+                .count(),
+            1
+        );
+    }
+
+    /// A busy node is not claimed, and a less busy one is planned a larger
+    /// share for its speed.
+    #[test]
+    fn load_sizes_what_a_node_is_given() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let alpha = node_with(
+            on_channel("alpha", "lab", &[&beta], false),
+            Variant::default(),
+        );
+        found(&alpha, 1);
+        // No more scans: the loads below are set by hand.
+        alpha.stop.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let mut found = alpha.found.lock().unwrap();
+            found.0[0].load = 0.9;
+        }
+        assert!(alpha.unclaimed().is_empty());
+        assert!(!alpha.may_claim());
+        {
+            let mut found = alpha.found.lock().unwrap();
+            found.0[0].load = 0.75;
+        }
+        assert!((alpha.spare("beta") - 0.25).abs() < 1e-6);
+        assert_eq!(alpha.spare("nobody"), 1.0);
+        {
+            let mut found = alpha.found.lock().unwrap();
+            found.0[0].load = 1.0;
+        }
+        assert_eq!(alpha.spare("beta"), MIN_SPARE);
     }
 
     fn covered(plan: &[PlanEntry]) -> usize {
@@ -3291,7 +4106,7 @@ mod tests {
         };
         let worker = node("worker", &[], hybrid);
         let mut s = settings("top", vec![worker.local_addr().unwrap().to_string()], None);
-        s.decode = DecodeOn::Top;
+        s.decode_pin = Some(DecodePin::Top);
         let top = node_with(s, hybrid);
         let split = top.delegating_model().unwrap();
         assert!(top.plan().iter().any(|e| e.node == "worker"));
@@ -3336,10 +4151,10 @@ mod tests {
         assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
         // Found by the handshake, not by an assignment it refused: the link
         // stays up, and planning again leaves it out again, quietly.
-        assert!(top.links[0].is_connected());
+        assert!(top.links()[0].is_connected());
         top.plan_top();
         assert!(!other.is_assigned());
-        assert!(top.links[0].is_connected());
+        assert!(top.links()[0].is_connected());
         other.stop();
         top.stop();
     }
@@ -3639,7 +4454,7 @@ mod tests {
         let with_rate = |name: &str, workers: Vec<String>| {
             let mut s = settings(name, workers, None);
             s.shares = Shares::Decode;
-            s.decode = DecodeOn::Tree;
+            s.decode_pin = Some(DecodePin::Tree);
             s.capacity.setups = vec![NodeSetup {
                 name: name.to_string(),
                 decode_rate: 1.0,
@@ -3691,7 +4506,7 @@ mod tests {
         let with_rate = |name: &str, workers: Vec<String>, rate: f32| {
             let mut s = settings(name, workers, None);
             s.shares = Shares::Decode;
-            s.decode = DecodeOn::Tree;
+            s.decode_pin = Some(DecodePin::Tree);
             s.capacity.setups = vec![NodeSetup {
                 name: name.to_string(),
                 decode_rate: rate,
@@ -3760,7 +4575,7 @@ mod tests {
         let with_rate = |name: &str, workers: Vec<String>| {
             let mut s = settings(name, workers, None);
             s.shares = Shares::Decode;
-            s.decode = DecodeOn::Tree;
+            s.decode_pin = Some(DecodePin::Tree);
             s.capacity.setups = vec![NodeSetup {
                 name: name.to_string(),
                 decode_rate: 1.0,
@@ -3797,8 +4612,8 @@ mod tests {
         let with_rate = |name: &str, workers: Vec<String>, rate: f32| {
             let mut s = settings(name, workers, None);
             s.shares = Shares::Decode;
-            s.offload = Offload::Auto;
-            s.decode = DecodeOn::Tree;
+            s.offload_always = false;
+            s.decode_pin = Some(DecodePin::Tree);
             s.capacity.setups = vec![NodeSetup {
                 name: name.to_string(),
                 decode_rate: rate,
@@ -3870,7 +4685,7 @@ mod tests {
         let with_rate = |name: &str, workers: Vec<String>, rate: f32| {
             let mut s = settings(name, workers, None);
             s.shares = Shares::Decode;
-            s.decode = DecodeOn::Auto;
+            s.decode_pin = None;
             s.capacity.setups = vec![NodeSetup {
                 name: name.to_string(),
                 decode_rate: rate,
@@ -4635,7 +5450,7 @@ mod tests {
         let worker = node("worker", &[], hybrid);
         let proxy = flaky(&worker, 1);
         let mut with = settings("top", vec![proxy.addr.clone()], None);
-        with.decode = DecodeOn::Top;
+        with.decode_pin = Some(DecodePin::Top);
         let top = node_with(with, hybrid);
         let tokens = fixture::tokens();
         let split = top.delegating_model().unwrap();
@@ -4660,7 +5475,7 @@ mod tests {
         request(&split, &tokens);
         assert!(worker_status(&top)["left_out_seconds"].is_u64());
 
-        top.links[0].end_wait();
+        top.links()[0].end_wait();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !top.plan().iter().any(|e| e.node == "worker") {
             assert!(Instant::now() < deadline, "not taken back");
@@ -4674,7 +5489,7 @@ mod tests {
 
         // Healthy by the next try: it serves, and that forgives it.
         proxy.cuts.store(0, Ordering::Relaxed);
-        top.links[0].end_wait();
+        top.links()[0].end_wait();
         let deadline = Instant::now() + Duration::from_secs(10);
         while !top.plan().iter().any(|e| e.node == "worker") {
             assert!(Instant::now() < deadline, "not taken back");
@@ -4693,9 +5508,9 @@ mod tests {
         let worker = node("worker", &[], Variant::default());
         let top = node("top", &[&worker], Variant::default());
         assert!(top.plan().iter().any(|e| e.node == "worker"));
-        top.links[0].count_failure();
-        top.links[0].count_failure();
-        top.links[0].disconnect();
+        top.links()[0].count_failure();
+        top.links()[0].count_failure();
+        top.links()[0].disconnect();
         assert!(top.unready().is_some());
         let deadline = Instant::now() + Duration::from_secs(10);
         while top.unready().is_some() {

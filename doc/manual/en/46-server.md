@@ -2137,18 +2137,17 @@ shown.
 | :-------------------- | :----------------------------- | :--------------------------------------------------------------------------------------------------- |
 | `host`                | follows `[orangu-server].host` | address this server binds for its parent                                                             |
 | `port`                | `8400`                         | port this server binds for its parent                                                                |
-| `workers`             | empty                          | comma-separated `host:port` list of workers (`[v6-address]:port` for IPv6)                           |
+| `name`                | none                           | the channel this node is found on and finds other nodes on; the same on every node                   |
+| `network`             | this machine's networks        | optional: IPv4 networks to scan, `address/prefix`, comma-separated, none wider than /16              |
+| `release`             | `300`                          | seconds a node keeps the workers it claimed with no request running                                  |
 | `secret`              | none                           | shared secret parent and worker prove to each other                                                  |
 | `activations`         | `f16`                          | hidden-state encoding between nodes: `f32`, `f16` or `q8_0`                                          |
 | `timeout`             | `60`                           | seconds one decode step may take on a worker's subtree; a prompt's forward gets four times this or more |
 | `connect_timeout`     | `10`                           | seconds reaching a worker may take                                                                   |
 | `local_layers`        | `auto`                         | layers this node runs itself; `0` = pure coordinator                                                 |
-| `standby`             | empty                          | spare workers, `host:port` like `workers`, given layers only when a worker is lost                   |
-| `download`            | `full`                         | `range` fetches only the layers a parent assigns; only for a node with no workers of its own         |
+| `download`            | `full`                         | `range` fetches only the layers a parent assigns; such a node only works for others                  |
 | `shares`              | `decode`                       | what layers are divided by: measured `decode` or `prompt` speed, or `memory` alone                   |
-| `decode`              | `auto`                         | where a top-level node decodes after the prompt: `auto`, `tree`, or `top`                            |
 | `head`                | `auto`                         | which node applies the output head while a tree decodes: `auto`, `top`, or `last`                    |
-| `offload`             | `auto`                         | `auto` uses workers only when the tree measures at least 10% faster; `always` whenever there are any |
 | `tls_cert`, `tls_key` | none                           | certificate and key the worker listener serves TLS with                                              |
 | `tls_ca`              | `tls_cert`                     | certificates trusted when dialing workers, which is then over TLS                                    |
 
@@ -2639,56 +2638,82 @@ port = 8300
 
 ### The `[workers]` section
 
-Spreads one model's layers over several machines: a tree of
-`orangu-server` nodes, each running a contiguous range of layers and
-handing the rest to the workers it lists (which may list workers of their
-own). Clients talk to the top-level node, which tokenizes, samples and
-streams; the hidden states travel down the tree and back for every
-prefill chunk and every generated token.
+Lets the `orangu-server` nodes of one network serve as one. Nodes with
+the same `name` — a channel — find each other by scanning their networks
+on the same `port`. A request that runs the model goes to the least busy
+node that holds the model alone; a model no node holds alone is split: the
+node a request reaches claims the free nodes of its channel, runs a
+contiguous range of the layers and hands the rest to them. It tokenizes,
+samples and streams; the hidden states travel to each worker and back for
+every prefill chunk and every generated token.
 
 Like `[web]` and `[prometheus]`, a config with no `[workers]` section has
 none. `-i`/`--init` asks `Add workers` (default yes), then `host`, `port`,
-`workers`, `secret` and `activations`, or writes no section at all. `secret`
-is `none` (the default), `generate` — a random one, shown so the same can
-be given to every node — or `type`.
+the channel `name` (`orangu`), `secret` and `activations`, or writes no
+section at all. `secret` is `none` (the default), `generate` — a random
+one, shown so the same can be given to every node — or `type`.
 
 ```ini
 [workers]
 host = all
 port = 8400
-workers = node1:8400, node2:8400, [fd00::3]:8400
+name = lab
 secret = a-long-random-string
 activations = f16
 ```
 
-**Roles follow from the section.** A node with a `[workers]` section
-listens on `host`:`port` for a parent; a node whose `workers` list is not
-empty hands layers to those workers. The node clients talk to — the
-top-level node — is the one no other node lists. A worker in the middle of
-the tree does both. A listener on an address reachable from other
-machines without a `secret` is warned about at startup.
+**Roles follow from requests.** A node with a `[workers]` section listens
+on `host`:`port` for probes and for a node that claims it. Every node of a
+channel can take requests: one that holds the model serves or routes them,
+and one that does not claims workers for them and becomes top-level until
+it lets them go. A listener on an address reachable from other machines
+without a `secret` is warned about at startup. A `workers` or `standby`
+key is refused at startup with a message pointing to `name`.
 
 - `host` — the address this server binds for its parent. **When the key
   is absent it falls back to `[orangu-server].host`.**
 - `port` — the port it binds, alongside `[orangu-server].port`. Defaults to
   `8400` when the section is present but says nothing.
-- `workers` — a comma-separated list of `host:port` pairs, one per worker,
-  in layer order: each worker's own `[workers]` address. An IPv6 address is
-  bracketed (`[fd00::3]:8400`); blank entries are ignored, and anything
-  else that isn't a `host:port` pair with a port of 1–65535 is rejected at
-  startup, naming the entry — every worker needs both its host and its
-  port. A worker listed twice, or this node's own `host`:`port` (including
-  a loopback address when `host` is `all`), is refused as a loop. Workers
-  usually share `[workers].port`, so `-i`/`--init` takes that port for any
-  entry typed as a bare host and writes it out in full; it re-prompts until
-  the list parses, and an empty answer writes an empty list to fill in
-  later.
+- `name` — the channel. Every minute the node probes `port` on every
+  address of its IPv4 networks (`network`, or each of this machine's
+  networks other than loopback and link-local, cut to the /22 around its
+  own address when wider), at most 64 at a time with a 300 ms connect
+  timeout, sending a hash of the name; a node on the same channel answers
+  with its name, what it is doing (`idle`, `leading`, `serving` or
+  `worker_only`), its load, whether it holds the model alone, its API
+  port, and its model — the layout's hash, and a hash of samples of every
+  layer's weights. Nodes work together only on the same model: a request
+  is routed only to a node whose model matches in both, and only a node
+  with the same layout is claimed, its weights then compared layer by
+  layer. The nodes found are asked again every two seconds. Blank or absent
+  joins no channel: the node serves alone.
+- `network` — optional: the networks a scan looks at, as comma-separated
+  `address/prefix` IPv4 networks (`192.168.1.0/24, 10.0.0.0/22`), each
+  scanned whole. None may be wider than /16. Without it the node scans its
+  own interfaces' networks.
+- `release` — seconds a node keeps the workers it claimed with no request
+  running on it (default `300`); then it lets them go, free for another
+  node to claim.
+- **Load.** A node's load is the larger of its slots in use (its own
+  requests and the forwards it runs for another node, over `slots`) and how
+  busy its processors are: the CPU, and the busiest GPU where the driver
+  reports `gpu_busy_percent`. A node that holds the model keeps a request
+  unless another node of its channel that holds it too, and is free, is
+  at least 0.1 less busy; a node that does not hold it sends the request
+  to the least busy one that does. The routed requests are
+  `/v1/chat/completions`, `/v1/completions`, `/v1/messages`,
+  `/completion`, `/infill`, `/embedding` and `/v1/embeddings`; a routed
+  request carries `x-orangu-forwarded` and is not routed again, and the
+  API key is checked before routing and passed on. A node that cannot be
+  reached serves the request here. When it claims workers, a node leaves
+  out any with a load above 0.8, and counts each node's speed at
+  `1 − load` (at least 5%) when it sizes their shares.
 - `secret` — a shared secret that parent and worker prove to each other
   when they connect (HMAC-SHA256 over fresh random nonces; the secret
   itself never crosses the network). A node with a secret refuses a peer
   that cannot prove it; blank or absent authenticates nobody, and
   `-i`/`--init` says so when `host` is reachable off this machine. Use the
-  same value on every node of a tree.
+  same value on every node of a channel.
 - `activations` — how hidden states travel between nodes: `f16` (the
   default), `f32` (exact: a split model computes bit for bit what an
   unsplit one does, at twice the traffic), or `q8_0` (a quarter of `f32`,
@@ -2716,16 +2741,6 @@ machines without a `secret` is warned about at startup.
   only part of the model on disk (`download = range`) does not time, and a
   tree with such a node shares by memory. `GET /v1/workers` shows what a
   plan followed, and each node's processors (CPU, GPUs, NPU) and speeds.
-- `decode` — where a top-level node's sequences decode once their prompt
-  is through the tree: `auto` (the default), `tree` or `top`. With `auto`
-  or `top`, the node takes every layer's rows back from the workers at the
-  first decode step and decodes alone on the model's own paths — with
-  `auto` only when its measured decode speed beats the tree's, and with
-  either only when it holds the whole model (it then keeps every layer's
-  weights). A chat's next turn goes on there from the kept rows, unless
-  less than half the prompt is reused. On one board, a Mali top-level node
-  with two CPU workers decoded Llama-3.2-3B at 15.2 tok/s this way, against
-  6.2 through the tree, with prompts still read 1.45× faster than alone.
 - `head` — which node applies the output head while a tree decodes
   through its nodes: `auto` (the default), `top` or `last`. `last` has the
   node with the final layer send logits back instead of its layers'
@@ -2733,19 +2748,6 @@ machines without a `secret` is warned about at startup.
   it for a weak top-level node and a large vocabulary; `auto` does so when
   that node measured the faster decode. That node then keeps the output
   head in memory.
-- `offload` — `auto` (the default) or `always`. With `auto` a top-level
-  node that holds the whole model uses its workers only when its measured
-  speeds say the tree is at least 10% faster — at a long prompt (its
-  slowest stage) or a decode step — and otherwise serves alone on the
-  model's own paths, its workers connected but given nothing;
-  `/v1/workers` says why (`not_worth_offloading`). `always` uses them
-  whenever it has any.
-- `standby` — spare workers, `host:port` like `workers`, never given layers
-  until a worker is lost or does not answer when the node plans. Then one
-  takes that worker's layers, and each conversation is rebuilt on it from
-  what the node sent into them — the rest of the tree is untouched. The
-  node keeps those inputs while a standby is configured: `n_embd` values a
-  position per worker, 6 KiB for a 3072-wide model in `f16`.
 - `local_layers` — how many of this node's layers it runs itself rather
   than handing to its workers: `auto` (the default, a share sized from its
   own capacity like any worker's) or a number; `0` makes the node a pure
@@ -2768,27 +2770,25 @@ machines without a `secret` is warned about at startup.
   same model. A parent checks, by content, that each child's copy is the
   same file, quantization included (see below), and leaves out a child
   that differs, cannot be reached, or fails the `secret`.
-- **A node with workers is top-level until claimed.** At startup it dials
-  them and divides the layers by memory (see **Memory** below).
-  `local_layers` overrides this node's own share. The plan is logged, e.g.
+- **A node that cannot hold the model claims workers for a request.** When
+  a request starts and its last scan found free nodes it does not hold yet,
+  it dials them and divides the layers (see **Memory** below), in the order
+  of the nodes' names. `local_layers` overrides this node's own share. The
+  plan is logged, e.g.
   `workers plan: a:8400 0..8, b:8400 8..16, c:8400 16..24`.
-- **Claimed by a parent, a node becomes a worker.** When a parent assigns
-  it a range, it plans that range over itself and its own workers the same
-  way, and answers its parent's forwards. Meanwhile **its own API is off**:
-  every endpoint except `/health`, `/ready`, `/metrics` and `/v1/workers`
-  answers `503`, and `/ready` says `serving a parent orangu-server`. When
-  the parent disconnects, it serves its own API again.
-- **A worker serves one parent at a time.** A second parent is turned
-  away. Nodes that list each other (a loop) refuse the connection.
+- **Claimed by another node, a node becomes a worker.** It runs the range
+  it is assigned and answers the forwards. Meanwhile a request that runs
+  the model and reaches it is sent to the node that claimed it, and every
+  other endpoint except `/health`, `/ready`, `/metrics` and `/v1/workers`
+  answers `503`; `/ready` says `serving a parent orangu-server`. When that
+  node lets it go or disconnects, it serves its own API again.
+- **A tree is one level deep.** A worker serves one node at a time, and a
+  node leading workers of its own refuses to be claimed.
 
 **When a worker is lost.**
 
-- A request in flight is not lost with it. With a `standby` configured,
-  the node directly above the lost worker hands its layers to a standby
-  and rebuilds each sequence there from what it sent into them; nothing
-  above that node notices, and no other worker redoes anything
-  (`orangu_server_workers_takeovers_total`). Without one, the top-level
-  node plans again over the workers that answer, rebuilds the sequence on
+- A request in flight is not lost with it. The top-level node plans again
+  over the workers that answer, rebuilds the sequence on
   the new plan by running its tokens through again, and carries on. Tokens
   already sent stay sent.
 - The rebuilt cache comes from one prefill rather than token-by-token
@@ -2950,9 +2950,8 @@ writes no `[prometheus]` section at all; accepting prompts for a `host`
 (defaulting to the API's) and a `port` (suggesting `8300`) and writes a `[prometheus]` section.
 Then `Add workers` (default yes) — declining writes no `[workers]` section;
 accepting prompts for a `host` (defaulting to the API's), a `port`
-(suggesting `8400`), the comma-separated `host:port` list of `workers`
-— an entry without a port takes that `port` — re-prompting until the list
-parses, then `secret` (`none`, the default, writes none; `generate` writes
+(suggesting `8400`), the channel `name` (suggesting `orangu`), then
+`secret` (`none`, the default, writes none; `generate` writes
 a random one and shows it; `type` asks for it) and `activations` (TAB-completing
 `f32`/`f16`/`q8_0`, written only when not `f16`). A `models`
 directory that doesn't exist yet is created, parents included, rather than

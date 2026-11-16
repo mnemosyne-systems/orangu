@@ -3239,6 +3239,7 @@ fn prepare(args: Args) -> Result<Prepared> {
                     &backend_label,
                     metrics_host,
                     metrics_port,
+                    (args.listen.port.unwrap_or(conf.port), conf.tls.is_some()),
                     // A picture or video model's text encoder is not split:
                     // such a node serves only as a worker.
                     image.is_none() && video.is_none(),
@@ -4683,6 +4684,7 @@ fn start_workers_node(
     backend_label: &str,
     metrics_host: &str,
     metrics_port: u16,
+    (api_port, api_tls): (u16, bool),
     split: bool,
 ) -> Result<Arc<workers::node::Node>> {
     let host = config::resolve_bind_host(&workers_conf.host);
@@ -4720,16 +4722,17 @@ fn start_workers_node(
     let settings = workers::node::NodeSettings {
         name: format!("{hostname}:{}", workers_conf.port),
         listen: Some(format!("{host}:{}", workers_conf.port)),
-        workers: workers_conf
-            .workers
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-        standby: workers_conf
-            .standby
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
+        workers: Vec::new(),
+        standby: Vec::new(),
+        channel: workers_conf.name.clone(),
+        scan: workers::node::Scan::Networks {
+            port: workers_conf.port,
+            networks: workers_conf.network.clone(),
+        },
+        scan_every: std::time::Duration::from_secs(60),
+        release: workers_conf.release,
+        api_port,
+        api_tls,
         secret: workers_conf.secret.clone(),
         activations: workers_conf.activations,
         timeout: workers_conf.timeout,
@@ -4766,9 +4769,7 @@ fn start_workers_node(
             }
         },
         shares: workers_conf.shares,
-        decode: workers_conf.decode,
         head: workers_conf.head,
-        offload: workers_conf.offload,
         split,
         maintenance: std::time::Duration::from_secs(5),
         parent_silence: workers::node::PARENT_SILENCE,
