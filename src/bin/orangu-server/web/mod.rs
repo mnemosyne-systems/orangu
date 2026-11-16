@@ -1245,7 +1245,7 @@ async fn send_message(
     // (`workers::node::route`), as an API request would. The prompt goes as
     // tokens, since that node holds the same model. A turn with pictures
     // stays here: its tokens point at this node's own image embeddings.
-    let routed = match crate::workers::node::route(false) {
+    let routed = match crate::workers::node::route_async(false).await {
         Some(base) if pictures.is_empty() => {
             let peer = crate::http::peer::PeerGenerate {
                 prompt_tokens: tokens.clone(),

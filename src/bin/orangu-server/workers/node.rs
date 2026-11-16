@@ -92,6 +92,10 @@ const MIN_SPARE: f64 = 0.05;
 /// How often the nodes a scan found are asked again how busy they are.
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
+/// How long a free node stays promised to a node about to claim it
+/// ([`Message::Lease`]): long enough for the claim's handshakes.
+const LEASE_FOR: Duration = Duration::from_secs(10);
+
 /// Decode steps a top-level node observes before it weighs planning again
 /// by the speeds they showed (`Node::calibration_due`).
 const CALIBRATE_TOKENS: usize = 32;
@@ -296,6 +300,9 @@ pub struct Node {
     /// The node id behind each address this node claimed: what keeps one
     /// node reachable at two addresses from being claimed twice.
     claimed: Mutex<HashMap<String, String>>,
+    /// Who this node is promised to ([`Message::Lease`]) and until when:
+    /// a node about to claim it, or this node itself while it claims.
+    lease: Mutex<Option<(String, Instant)>>,
     /// Nodes of the channel that probed this one before any scan found
     /// them: probed back at the scan's next turn.
     probed_by: Mutex<Vec<SocketAddr>>,
@@ -445,6 +452,39 @@ fn last_crash() -> serde_json::Value {
     serde_json::json!({ "reason": reason, "at": at })
 }
 
+/// How a node's bid to claim the free nodes of its channel ended
+/// ([`Node::contend`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Contest {
+    Won,
+    /// To this node, which claims them instead.
+    Lost(String),
+}
+
+/// The node `me` loses its claim to, given what the free nodes answered:
+/// one that already leads any of them, else the lowest id one of them is
+/// promised to, if lower than `me`.
+fn contest_winner(
+    me: &str,
+    answers: impl IntoIterator<Item = super::channel::LeaseAnswer>,
+) -> Option<String> {
+    use super::channel::LeaseAnswer;
+    let mut lowest: Option<String> = None;
+    for answer in answers {
+        match answer {
+            LeaseAnswer::Granted => {}
+            LeaseAnswer::Committed(leader) if leader != me => return Some(leader),
+            LeaseAnswer::Committed(_) => {}
+            LeaseAnswer::Promised(holder) => {
+                if holder.as_str() < me && lowest.as_ref().is_none_or(|l| holder < *l) {
+                    lowest = Some(holder);
+                }
+            }
+        }
+    }
+    lowest
+}
+
 /// Where a request this node's API got is served instead, as the base URL
 /// of another node's API, or `None` to serve it here. `forwarded`: the
 /// request was already routed once, and goes no further.
@@ -453,6 +493,19 @@ pub fn route(forwarded: bool) -> Option<String> {
         return None;
     }
     NODE.get()?.route()
+}
+
+/// [`route`], on a blocking thread: deciding can ask the channel's free
+/// nodes for a lease ([`Node::contend`]).
+pub async fn route_async(forwarded: bool) -> Option<String> {
+    if forwarded {
+        return None;
+    }
+    NODE.get()?;
+    tokio::task::spawn_blocking(move || route(false))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// A request is starting: [`request_started`], on a blocking thread, since
@@ -733,6 +786,7 @@ impl Node {
             standby_links: RwLock::new(standby_links),
             found: Mutex::new((Vec::new(), None)),
             claimed: Mutex::new(HashMap::new()),
+            lease: Mutex::new(None),
             probed_by: Mutex::new(Vec::new()),
             leading: AtomicBool::new(false),
             active: AtomicUsize::new(0),
@@ -915,9 +969,11 @@ impl Node {
     /// Where a request this node got is served instead ([`route`]). A node
     /// working for a parent sends its clients to that parent. A node that
     /// serves the model alone keeps a request unless a free node that can
-    /// serve it too is [`ROUTE_MARGIN`] less busy; one that cannot sends it
-    /// to the least busy free node that can, and splits the model over its
-    /// channel only when there is none.
+    /// serve it too is [`ROUTE_MARGIN`] less busy. One that cannot sends it
+    /// to the least busy free node that can; else to a node that leads a
+    /// tree of the model and is not fully busy; else it splits the model
+    /// over its channel, unless another node about to do the same wins
+    /// the free nodes ([`Self::contend`]), and then sends it there.
     fn route(&self) -> Option<String> {
         self.settings.channel.as_ref()?;
         let found = self.found.lock().unwrap().0.clone();
@@ -925,20 +981,166 @@ impl Node {
             let parent = self.parent.lock().unwrap().as_ref()?.node.clone();
             return found.into_iter().find(|f| f.node == parent).map(|f| f.api);
         }
+        let api_of = |node: &str| found.iter().find(|f| f.node == node).map(|f| f.api.clone());
         let best = found
-            .into_iter()
+            .iter()
             .filter(|f| {
                 f.whole
                     && f.state == ProbeState::Idle
                     && f.node != self.id
                     && self.same_model(f, true)
             })
-            .min_by(|a, b| a.load.total_cmp(&b.load))?;
-        if !self.whole() || best.load + ROUTE_MARGIN < self.load() {
-            Some(best.api)
-        } else {
-            None
+            .min_by(|a, b| a.load.total_cmp(&b.load));
+        if let Some(best) = best {
+            return (!self.whole() || best.load + ROUTE_MARGIN < self.load())
+                .then(|| best.api.clone());
         }
+        if self.whole() || self.leading.load(Ordering::Acquire) {
+            return None;
+        }
+        let leader = found
+            .iter()
+            .filter(|f| {
+                f.state == ProbeState::Leading
+                    && f.node != self.id
+                    && f.load < 1.0
+                    && self.same_model(f, true)
+            })
+            .min_by(|a, b| a.load.total_cmp(&b.load));
+        if let Some(leader) = leader {
+            return Some(leader.api.clone());
+        }
+        if !self.may_claim() {
+            return None;
+        }
+        match self.contend() {
+            Contest::Won => None,
+            Contest::Lost(winner) => api_of(&winner),
+        }
+    }
+
+    /// How many workers this node holds while it leads, `0` otherwise.
+    fn workers_held(&self) -> u32 {
+        if self.leading.load(Ordering::Acquire) {
+            self.links().len() as u32
+        } else {
+            0
+        }
+    }
+
+    /// Who this node is promised to now, if anyone.
+    fn lease_holder(&self) -> Option<String> {
+        let lease = self.lease.lock().unwrap();
+        lease
+            .as_ref()
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(holder, _)| holder.clone())
+    }
+
+    /// This node's answer to `candidate` asking for it ([`Message::Lease`]).
+    /// A node already working for a parent, or leading, is that parent's;
+    /// otherwise it is promised to the lowest id that asked within
+    /// [`LEASE_FOR`] — itself included, while it claims — so two nodes that
+    /// claim at once end with the same winner on every node.
+    fn answer_lease(&self, candidate: &str) -> Message {
+        let refused = |holder: String, committed: bool| Message::LeaseAck {
+            granted: false,
+            holder,
+            committed,
+        };
+        if let Some(parent) = self.parent.lock().unwrap().as_ref() {
+            return refused(parent.node.clone(), true);
+        }
+        if self.leading.load(Ordering::Acquire) {
+            return refused(self.id.clone(), true);
+        }
+        let mut lease = self.lease.lock().unwrap();
+        let now = Instant::now();
+        match lease.as_ref() {
+            Some((holder, until))
+                if now < *until && holder != candidate && holder.as_str() < candidate =>
+            {
+                refused(holder.clone(), false)
+            }
+            _ => {
+                *lease = Some((candidate.to_string(), now + LEASE_FOR));
+                Message::LeaseAck {
+                    granted: true,
+                    holder: candidate.to_string(),
+                    committed: false,
+                }
+            }
+        }
+    }
+
+    /// Before this node claims the free nodes it found, asks each of them
+    /// to promise itself to it ([`Message::Lease`]), having promised itself
+    /// first. It loses to a node that already leads one of them, or that
+    /// has a lower id and asked too — on any node, this one included —
+    /// and the request then goes to that node, which claims the rest.
+    fn contend(&self) -> Contest {
+        let Some(channel) = self.settings.channel.as_deref() else {
+            return Contest::Won;
+        };
+        {
+            let mut lease = self.lease.lock().unwrap();
+            let now = Instant::now();
+            match lease.as_ref() {
+                Some((holder, until))
+                    if now < *until && holder != &self.id && *holder < self.id =>
+                {
+                    return Contest::Lost(holder.clone());
+                }
+                _ => *lease = Some((self.id.clone(), now + LEASE_FOR)),
+            }
+        }
+        let hash = super::channel::channel_hash(channel);
+        let tls = self.settings.tls.clone();
+        let free = self.unclaimed();
+        let answers: Vec<Option<super::channel::LeaseAnswer>> = std::thread::scope(|scope| {
+            let asks: Vec<_> = free
+                .iter()
+                .map(|found| {
+                    let (hash, tls, id) = (&hash, tls.as_ref(), &self.id);
+                    scope.spawn(move || {
+                        let addr = found.addr.parse().ok()?;
+                        super::channel::lease(addr, hash, id, tls)
+                    })
+                })
+                .collect();
+            asks.into_iter()
+                .map(|ask| ask.join().ok().flatten())
+                .collect()
+        });
+        if let Some(winner) = contest_winner(&self.id, answers.into_iter().flatten()) {
+            log::info!(
+                "orangu-server: workers: another node claims channel '{channel}' at the same \
+                 time; this request goes to it ({winner})"
+            );
+            return Contest::Lost(winner);
+        }
+        // A lower id may have asked this node while it asked the others.
+        match self.lease_holder() {
+            Some(holder) if holder != self.id => Contest::Lost(holder),
+            _ => Contest::Won,
+        }
+    }
+
+    /// Whether this node leads a smaller tree of the same model than
+    /// another node does — fewer workers, or as many and a higher id —
+    /// and should let its workers go as soon as it is idle, so that one
+    /// channel forms one tree.
+    fn yields_to_larger(&self) -> bool {
+        if !self.leading.load(Ordering::Acquire) || self.active.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        let mine = self.workers_held();
+        self.found.lock().unwrap().0.iter().any(|f| {
+            f.state == ProbeState::Leading
+                && f.node != self.id
+                && self.same_model(f, true)
+                && (f.workers > mine || (f.workers == mine && f.node < self.id))
+        })
     }
 
     /// Whether a request starting now may claim workers: this node can
@@ -3097,9 +3299,19 @@ impl Node {
                             api_tls: self.settings.api_tls,
                             model: self.identity.header_hash,
                             content: self.content_hash,
+                            workers: self.workers_held(),
                         },
                     );
                     self.note_prober(&tcp);
+                }
+                return None;
+            }
+            // A node about to claim workers on this channel.
+            Ok(Message::Lease { channel, node }) => {
+                if let Some(own) = self.settings.channel.as_deref()
+                    && super::channel::channel_hash(own) == channel
+                {
+                    let _ = write_message(writer, 0, &self.answer_lease(&node));
                 }
                 return None;
             }
@@ -3166,6 +3378,15 @@ impl Node {
                 ),
             );
         }
+        // Promised to another node about to claim it.
+        if let Some(holder) = self.lease_holder()
+            && holder != parent_node
+        {
+            return refuse(
+                writer,
+                WorkerError::new(ErrorCode::Busy, format!("promised to {holder}")),
+            );
+        }
         {
             let mut parent = self.parent.lock().unwrap();
             // The same parent coming back — its old connection is dead —
@@ -3189,6 +3410,7 @@ impl Node {
                 stream: tcp,
             });
         }
+        *self.lease.lock().unwrap() = None;
         write_message(writer, 0, &Message::Ready).ok()?;
         Some(hello.path)
     }
@@ -3233,6 +3455,14 @@ impl Node {
                 continue;
             }
             if self.release_due() {
+                self.release_workers();
+                continue;
+            }
+            if self.yields_to_larger() {
+                log::info!(
+                    "orangu-server: workers: another node leads a larger tree of this model; \
+                     this one gives way"
+                );
                 self.release_workers();
                 continue;
             }
@@ -3930,6 +4160,177 @@ mod tests {
         assert!(beta.is_assigned());
         // Claimed already: not a candidate at either address.
         assert!(alpha.unclaimed().is_empty());
+    }
+
+    /// A claimer loses to a node that already leads one of the free nodes,
+    /// whatever its id, else to the lowest lower id one is promised to.
+    #[test]
+    fn a_contest_goes_to_a_leader_then_to_the_lowest_id() {
+        use super::super::channel::LeaseAnswer::{Committed, Granted, Promised};
+        assert_eq!(contest_winner("m", [Granted, Granted]), None);
+        assert_eq!(contest_winner("m", [Promised("z".into())]), None);
+        assert_eq!(
+            contest_winner("m", [Promised("k".into()), Granted, Promised("c".into())]).as_deref(),
+            Some("c")
+        );
+        assert_eq!(
+            contest_winner("m", [Promised("c".into()), Committed("z".into())]).as_deref(),
+            Some("z")
+        );
+        assert_eq!(contest_winner("m", [Committed("m".into())]), None);
+    }
+
+    /// A free node is promised to the lowest id that asks within the
+    /// lease, turns away the handshake of anyone else, and answers a
+    /// node that leads it with that leader.
+    #[test]
+    fn a_free_node_is_promised_to_the_lowest_id() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let granted = |message: Message| matches!(message, Message::LeaseAck { granted: true, .. });
+        assert!(granted(beta.answer_lease("m")));
+        assert!(granted(beta.answer_lease("c")));
+        assert_eq!(
+            beta.answer_lease("k"),
+            Message::LeaseAck {
+                granted: false,
+                holder: "c".to_string(),
+                committed: false,
+            }
+        );
+        // Asked over the channel's port, as a claimer does.
+        let addr = beta.local_addr().unwrap();
+        let hash = super::super::channel::channel_hash("lab");
+        assert_eq!(
+            super::super::channel::lease(addr, &hash, "x", None),
+            Some(super::super::channel::LeaseAnswer::Promised(
+                "c".to_string()
+            ))
+        );
+        assert_eq!(
+            super::super::channel::lease(
+                addr,
+                &super::super::channel::channel_hash("no"),
+                "a",
+                None
+            ),
+            None
+        );
+        // Promised to "c": another parent's handshake is refused.
+        let link = ChildLink::new(
+            addr.to_string(),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        );
+        let refused = link.connect(None, &["k".to_string()]).unwrap_err();
+        assert_eq!(refused.code, ErrorCode::Busy, "{refused}");
+        assert!(refused.to_string().contains("promised to c"), "{refused}");
+        // "c" itself is taken, and from then on beta answers as its worker.
+        link.connect(None, &["c".to_string()]).unwrap();
+        assert!(beta.lease_holder().is_none());
+        assert_eq!(
+            beta.answer_lease("a"),
+            Message::LeaseAck {
+                granted: false,
+                holder: "c".to_string(),
+                committed: true,
+            }
+        );
+    }
+
+    /// Two nodes that cannot hold the model and claim at the same moment:
+    /// whichever asks first, every free node ends promised to the lower
+    /// id, and the other node loses to it.
+    #[test]
+    fn two_claimers_end_with_one_winner() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
+        let one = node_with(
+            on_channel("one", "lab", &[&beta, &gamma], false),
+            Variant::default(),
+        );
+        let two = node_with(
+            on_channel("two", "lab", &[&beta, &gamma], false),
+            Variant::default(),
+        );
+        found(&one, 2);
+        found(&two, 2);
+        let (low, high) = if one.id < two.id {
+            (&one, &two)
+        } else {
+            (&two, &one)
+        };
+        // The higher id asks first, and gets them, until the lower asks.
+        assert_eq!(high.contend(), Contest::Won);
+        assert_eq!(low.contend(), Contest::Won);
+        for free in [&beta, &gamma] {
+            assert_eq!(free.lease_holder().as_deref(), Some(low.id.as_str()));
+        }
+        assert_eq!(high.contend(), Contest::Lost(low.id.clone()));
+        // The winner claims both; the loser's handshakes would be refused.
+        let _request = low.start_request();
+        assert_eq!(low.links().len(), 2);
+        assert!(beta.is_assigned() && gamma.is_assigned());
+    }
+
+    /// A node that cannot hold the model, with no free node that can,
+    /// sends a request to a node that leads a tree of the model.
+    #[test]
+    fn a_request_goes_to_a_node_leading_the_model() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let mut s = on_channel("alpha", "lab", &[&beta], false);
+        s.api_port = 1111;
+        s.release = Duration::from_secs(60);
+        let alpha = node_with(s, Variant::default());
+        found(&alpha, 1);
+        let _request = alpha.start_request();
+        assert!(alpha.leading.load(Ordering::Acquire));
+        assert_eq!(probe_of(&alpha, "lab").unwrap().workers, 1);
+
+        let delta = node_with(
+            on_channel("delta", "lab", &[&alpha, &beta], false),
+            Variant::default(),
+        );
+        let found = found(&delta, 2);
+        assert!(
+            found.iter().any(|f| f.state == ProbeState::Leading),
+            "{found:?}"
+        );
+        assert_eq!(delta.route().as_deref(), Some("http://127.0.0.1:1111"));
+    }
+
+    /// Of two nodes that lead trees of the same model, the one with fewer
+    /// workers gives way once it is idle.
+    #[test]
+    fn the_smaller_of_two_trees_gives_way() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
+        let epsilon = node_with(on_channel("epsilon", "lab", &[], true), Variant::default());
+        let mut s = on_channel("alpha", "lab", &[&beta, &gamma], false);
+        s.release = Duration::from_secs(60);
+        let alpha = node_with(s, Variant::default());
+        found(&alpha, 2);
+        let _larger = alpha.start_request();
+        assert_eq!(alpha.links().len(), 2);
+
+        let mut s = on_channel("delta", "lab", &[&alpha, &epsilon], false);
+        s.release = Duration::from_secs(60);
+        let delta = node_with(s, Variant::default());
+        found(&delta, 2);
+        let smaller = delta.start_request();
+        assert_eq!(delta.links().len(), 1);
+        // Not while its own request runs.
+        assert!(!delta.yields_to_larger());
+        assert!(!alpha.yields_to_larger());
+        drop(smaller);
+        for _ in 0..100 {
+            if !delta.leading.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!delta.leading.load(Ordering::Acquire));
+        assert!(!epsilon.is_assigned());
+        assert!(alpha.leading.load(Ordering::Acquire));
     }
 
     /// A node that holds the model never claims workers: it routes instead.

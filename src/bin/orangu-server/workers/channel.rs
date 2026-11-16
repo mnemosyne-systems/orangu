@@ -68,6 +68,8 @@ pub struct Found {
     /// (zeros when it has only part of the model).
     pub model: [u8; 32],
     pub content: [u8; 32],
+    /// How many workers it holds while it leads, `0` otherwise.
+    pub workers: u32,
     /// How long the probe took at `addr`, dialing included.
     pub rtt: Duration,
     /// Its other addresses on this machine's networks, where it answered
@@ -251,6 +253,7 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             api_tls,
             model,
             content,
+            workers,
         } => Some(Found {
             addr: shown,
             node,
@@ -265,9 +268,58 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             api: Found::api_url(addr.ip(), api_port, api_tls),
             model,
             content,
+            workers,
             rtt: started.elapsed(),
             alternates: Vec::new(),
         }),
+        _ => None,
+    }
+}
+
+/// What a node asked for a lease ([`lease`]) answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaseAnswer {
+    /// It is promised to the asking node.
+    Granted,
+    /// It is promised to `0`, a node with a lower id that asked first or
+    /// asked too.
+    Promised(String),
+    /// `0` leads it already, or is it, leading a tree of its own.
+    Committed(String),
+}
+
+/// Asks the node listening at `addr` to promise itself to candidate
+/// `node` for a few seconds ([`Message::Lease`]). `None` when it does not
+/// answer, or does not know the question: such a node is claimed as
+/// before, first come first served.
+pub fn lease(
+    addr: SocketAddr,
+    channel: &[u8; 32],
+    node: &str,
+    tls: Option<&Tls>,
+) -> Option<LeaseAnswer> {
+    let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok()?;
+    tcp.set_read_timeout(Some(ANSWER_TIMEOUT)).ok()?;
+    tcp.set_write_timeout(Some(ANSWER_TIMEOUT)).ok()?;
+    let _ = tcp.set_nodelay(true);
+    let split = transport::client(tls, tcp, &addr.to_string()).ok()?;
+    let mut writer = split.writer;
+    let mut reader = split.reader;
+    let asked = Message::Lease {
+        channel: *channel,
+        node: node.to_string(),
+    };
+    write_message(&mut *writer, 0, &asked).ok()?;
+    let answer = read_message(&mut *reader).ok();
+    let _ = split.tcp.shutdown(std::net::Shutdown::Both);
+    match answer? {
+        Message::LeaseAck { granted: true, .. } => Some(LeaseAnswer::Granted),
+        Message::LeaseAck {
+            holder,
+            committed: true,
+            ..
+        } => Some(LeaseAnswer::Committed(holder)),
+        Message::LeaseAck { holder, .. } => Some(LeaseAnswer::Promised(holder)),
         _ => None,
     }
 }
@@ -362,6 +414,7 @@ mod tests {
             api: String::new(),
             model: [0; 32],
             content: [0; 32],
+            workers: 0,
             rtt: Duration::from_millis(rtt_ms),
             alternates: Vec::new(),
         }
@@ -444,6 +497,7 @@ mod tests {
                             api_tls: false,
                             model: [1; 32],
                             content: [2; 32],
+                            workers: 0,
                         },
                     );
                 }

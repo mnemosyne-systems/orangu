@@ -797,6 +797,29 @@ pub enum Message {
         /// only part of the model. Nodes cooperate only on the same model.
         model: [u8; 32],
         content: [u8; 32],
+        /// How many workers it holds while it leads, `0` otherwise: when
+        /// two nodes lead the same model, the smaller tree gives way.
+        /// Appended; `0` from a node that does not send it.
+        workers: u32,
+    },
+    /// Sent instead of `Hello` by a node about to claim workers on the
+    /// channel that hashes to `channel`: asks the listener to promise
+    /// itself to candidate `node` for a few seconds, so two nodes that get
+    /// a request at the same moment do not split the free nodes between
+    /// them. Answered with [`Message::LeaseAck`]; a node that does not
+    /// know the message closes the connection.
+    Lease {
+        channel: [u8; 32],
+        node: String,
+    },
+    LeaseAck {
+        /// Whether the listener is now promised to the candidate.
+        granted: bool,
+        /// Who it is promised to, or works for, when not granted.
+        holder: String,
+        /// `holder` already leads it (or is it, leading a tree of its
+        /// own), rather than holding a promise.
+        committed: bool,
     },
 }
 
@@ -872,6 +895,8 @@ mod tag {
     pub const RESERVE: u8 = 22;
     pub const PROBE: u8 = 23;
     pub const PROBE_ACK: u8 = 24;
+    pub const LEASE: u8 = 25;
+    pub const LEASE_ACK: u8 = 26;
 }
 
 struct Writer(Vec<u8>);
@@ -1320,6 +1345,7 @@ impl Message {
                 api_tls,
                 model,
                 content,
+                workers,
             } => {
                 w.string(node);
                 w.string(name);
@@ -1330,7 +1356,23 @@ impl Message {
                 w.u8(u8::from(*api_tls));
                 w.fixed(model);
                 w.fixed(content);
+                w.u32(*workers);
                 tag::PROBE_ACK
+            }
+            Self::Lease { channel, node } => {
+                w.fixed(channel);
+                w.string(node);
+                tag::LEASE
+            }
+            Self::LeaseAck {
+                granted,
+                holder,
+                committed,
+            } => {
+                w.u8(u8::from(*granted));
+                w.string(holder);
+                w.u8(u8::from(*committed));
+                tag::LEASE_ACK
             }
         };
         (tag, w.0)
@@ -1470,6 +1512,16 @@ impl Message {
                 api_tls: r.u8()? != 0,
                 model: r.fixed()?,
                 content: r.fixed()?,
+                workers: if r.0.is_empty() { 0 } else { r.u32()? },
+            },
+            tag::LEASE => Self::Lease {
+                channel: r.fixed()?,
+                node: r.string()?,
+            },
+            tag::LEASE_ACK => Self::LeaseAck {
+                granted: r.u8()? != 0,
+                holder: r.string()?,
+                committed: r.u8()? != 0,
             },
             other => bail!("unknown message type {other}"),
         })
@@ -1760,6 +1812,18 @@ mod tests {
                 api_tls: false,
                 model: [1; 32],
                 content: [2; 32],
+                workers: 3,
+            });
+        }
+        round_trip(Message::Lease {
+            channel: [5; 32],
+            node: "00aa".to_string(),
+        });
+        for (granted, committed) in [(true, false), (false, false), (false, true)] {
+            round_trip(Message::LeaseAck {
+                granted,
+                holder: "0011".to_string(),
+                committed,
             });
         }
         round_trip(Message::Error(error()));
@@ -1804,6 +1868,30 @@ mod tests {
         assert_eq!(Rows::AllLogits.count(5), 5);
         assert_eq!(Rows::LastLogits.count(5), 1);
         assert!(Rows::LastLogits.logits() && !Rows::Last.logits());
+    }
+
+    /// A probe answer from a node that does not send `workers` reads as
+    /// a node that leads nobody.
+    #[test]
+    fn a_probe_ack_without_workers_decodes_to_none() {
+        let (tag, payload) = Message::ProbeAck {
+            node: "n".to_string(),
+            name: "n:8400".to_string(),
+            state: ProbeState::Leading,
+            load: 0.5,
+            whole: false,
+            api_port: 8100,
+            api_tls: false,
+            model: [1; 32],
+            content: [2; 32],
+            workers: 7,
+        }
+        .encode();
+        let older = &payload[..payload.len() - 4];
+        let Message::ProbeAck { workers, state, .. } = Message::decode(tag, older).unwrap() else {
+            panic!("not a probe answer");
+        };
+        assert_eq!((workers, state), (0, ProbeState::Leading));
     }
 
     #[test]

@@ -154,10 +154,31 @@ workers plan: alpha:8400 0..9, beta:8400 9..18, gamma:8400 18..28
 
 A node that holds the model never claims workers: it routes instead. A tree
 is one level deep: a node that leads workers of its own is not claimed by
-another, and a worker never claims any. Two nodes that get a request at the
-same moment can split the free nodes between them. When `release` seconds
+another, and a worker never claims any. When `release` seconds
 (`300` by default) pass with no request running on the top-level node, it
 lets its workers go, and they are free for the next node with a request.
+
+A channel forms one tree for its model:
+
+- **A node that already leads one serves the others.** A node that cannot
+  hold the model, and finds no free node that can, sends its request to a
+  node that leads a tree of the model and is not fully busy, instead of
+  claiming what is left.
+- **Two claims at once have one winner.** Before it claims, a node asks
+  each free node to promise itself to it for 10 seconds. A free node is
+  promised to the lowest node id that asks in that time, the asking nodes
+  included, so two nodes that get a request at the same moment agree on
+  the winner; the other sends its request there:
+
+  ```text
+  workers: another node claims channel 'lab' at the same time; this request goes to it (3f0c9a17d2b46e81)
+  ```
+
+  A node that already leads one of them wins, whatever its id.
+- **The smaller of two trees gives way.** If two trees of the model form
+  anyway, the leader with fewer workers (or as many and the higher id)
+  lets its workers go as soon as it has no request running, rather than
+  after `release`; its next request goes to the larger tree.
 
 `alpha` runs its share and hands the rest to `beta` and then `gamma`, in
 the order of their names; a prompt's parts are pipelined through both, so

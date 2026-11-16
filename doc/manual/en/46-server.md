@@ -2717,9 +2717,16 @@ key is refused at startup with a message pointing to `name`.
   API key is checked before routing and passed on. A web console chat turn
   without pictures is routed too: its node sends the prompt's tokens to
   the other node's `POST /v1/workers/generate` with its own API key. A
-  node that cannot be reached serves the request here. When it claims workers, a node leaves
-  out any with a load above 0.8, and counts each node's speed at
-  `1 − load` (at least 5%) when it sizes their shares.
+  node that cannot be reached serves the request here. A node that does
+  not hold the model, with no free node that does, sends the request to a
+  node that leads a tree of the model and is not fully busy. When it
+  claims workers, a node leaves out any with a load above 0.8, and counts
+  each node's speed at `1 − load` (at least 5%) when it sizes their
+  shares. Before claiming, it asks each free node to promise itself to it
+  for 10 seconds; a free node is promised to the lowest node id that asks,
+  so of two nodes that claim at once one wins and the other routes to it.
+  Of two trees of the same model, the one with fewer workers lets them go
+  as soon as it is idle.
 - `secret` — a shared secret that parent and worker prove to each other
   when they connect (HMAC-SHA256 over fresh random nonces; the secret
   itself never crosses the network). A node with a secret refuses a peer

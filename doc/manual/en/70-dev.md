@@ -48,7 +48,8 @@ checks what clients get while a node is killed (`SIGKILL`), frozen
   it, and the workers are let go after `release`;
 - a worker killed, frozen or cut off mid-answer: the answer runs to its
   last token on the nodes left;
-- two nodes that get a request at the same moment both answer.
+- two nodes that get a request at the same moment form one tree: one leads,
+  the other sends its request there, and both answer.
 
 They need a model, so they are ignored by default:
 

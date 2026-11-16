@@ -171,10 +171,9 @@ debug = 0
 opt-level = "s"
 lto = true
 codegen-units = 1
-strip = "symbols"
-panic = "abort"
+strip = "debuginfo"
 
 [profile.release-with-debug]
 inherits = "release"
 debug = 1
-panic = "unwind"
+strip = "none"

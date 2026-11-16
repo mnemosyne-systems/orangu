@@ -160,7 +160,8 @@ async fn route_or_pause(
     let request = if request.method() == axum::http::Method::POST
         && ROUTED.contains(&request.uri().path())
         && let Some(base) =
-            crate::workers::node::route(request.headers().contains_key(FORWARDED_HEADER))
+            crate::workers::node::route_async(request.headers().contains_key(FORWARDED_HEADER))
+                .await
     {
         match forward(&base, request).await {
             Ok(response) => return response,

@@ -30,6 +30,15 @@
 // remedy and costs nothing but a deeper proof search.
 #![recursion_limit = "256"]
 
+// Each request runs under `catch_unwind` (`engine::generate`), as do the
+// document, cache and device paths: a panic ends that request with an
+// error and the server keeps serving. With `panic = "abort"` none of them
+// catch anything, and one bad request ends every request in the process.
+#[cfg(panic = "abort")]
+compile_error!(
+    "orangu-server needs `panic = \"unwind\"`: its requests are isolated by catch_unwind"
+);
+
 mod best;
 mod bundle;
 mod config;
