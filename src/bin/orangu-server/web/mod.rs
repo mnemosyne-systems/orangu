@@ -180,6 +180,9 @@ const MAX_TOKENS: usize = 32768;
 
 pub struct WebState {
     pub engine: Arc<Engine>,
+    /// `[orangu-server].api_key`: what a chat sent on to another node of
+    /// the workers channel shows that node's API (`http::peer`).
+    pub api_key: Option<String>,
     /// The model as named to a human — `MODEL:QUANT` (see `serve`) — for the
     /// topbar and the debug report. Deliberately *not* the API's model id:
     /// nothing the web UI sends back is keyed by it, both uses here are
@@ -1238,30 +1241,65 @@ async fn send_message(
     };
     let max_tokens = session.settings.max_tokens.unwrap_or(MAX_TOKENS);
 
-    let mut rx = state
-        .engine
-        .generate(GenerateRequest {
-            // These endpoints have no structured-output field of their own.
-            json_output: false,
-            json_schema: None,
-            prompt_tokens: tokens,
-            sampling,
-            max_tokens,
-            stop_token_ids,
-            // The console is served by this process and has no coordinator
-            // in front of it, so it is this server's own role.
-            role: None,
-            cache_point,
-            background: false,
-            reasoning_budget: None,
-            cache_prompt: true,
-            // The web console keeps one conversation per session but has no
-            // notion of a slot; any free one is right.
-            id_slot: None,
-            timings_per_token: false,
-            ..Default::default()
-        })
-        .await;
+    // On a workers channel the turn runs on the node that should serve it
+    // (`workers::node::route`), as an API request would. The prompt goes as
+    // tokens, since that node holds the same model. A turn with pictures
+    // stays here: its tokens point at this node's own image embeddings.
+    let routed = match crate::workers::node::route(false) {
+        Some(base) if pictures.is_empty() => {
+            let peer = crate::http::peer::PeerGenerate {
+                prompt_tokens: tokens.clone(),
+                temperature: sampling.temperature,
+                top_p: sampling.top_p,
+                min_p: sampling.min_p,
+                max_tokens,
+                cache_point,
+            };
+            match crate::http::peer::generate_on(&base, state.api_key.as_deref(), &peer).await {
+                Ok(rx) => {
+                    log::debug!("orangu-server: workers: routed a console turn to {base}");
+                    Some(rx)
+                }
+                Err(err) => {
+                    log::warn!(
+                        "orangu-server: workers: could not route a console turn to {base}: {err}"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let mut rx = match routed {
+        Some(rx) => rx,
+        None => {
+            state
+                .engine
+                .generate(GenerateRequest {
+                    // These endpoints have no structured-output field of their own.
+                    json_output: false,
+                    json_schema: None,
+                    prompt_tokens: tokens,
+                    sampling,
+                    max_tokens,
+                    stop_token_ids,
+                    // The console is served by this process and has no
+                    // coordinator in front of it, so it is this server's own
+                    // role.
+                    role: None,
+                    cache_point,
+                    background: false,
+                    reasoning_budget: None,
+                    cache_prompt: true,
+                    // The web console keeps one conversation per session but
+                    // has no notion of a slot; any free one is right.
+                    id_slot: None,
+                    timings_per_token: false,
+                    ..Default::default()
+                })
+                .await
+        }
+    };
 
     let user_message = req.content;
     let user_attachments = extracted;

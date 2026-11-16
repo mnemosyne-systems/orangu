@@ -97,6 +97,8 @@ GPU
 Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (llama arch, CPU/AVX2, 26 layers, 8192 ctx)
 UI         disabled
 API        http://0.0.0.0:8100
+Metrics    disabled
+Workers    primary @ http://0.0.0.0:8400
 API key    No
 TLS        No
 Workspace  /home/user/src/orangu
@@ -116,7 +118,10 @@ ran on: `CPU`/`CPU/AVX2`, or `Vulkan/<adapter name>`, `Metal/<device name>`,
 `OpenCL/<device name>`, `ROCm/<device name>` when the matching GPU backend
 was used (see **GPU backend** below). Above the banner, a GPU backend also
 lists every device it saw and marks the one it took — see **Choosing a
-device**. The workspace line is the directory
+device**. The `Workers` line names the channel this node joins
+(`[workers].name`) and the address its worker listener binds
+(`[workers].host` and `port`); without a `[workers]` section it reads
+`disabled`. The workspace line is the directory
 tree this server operates in (see **Workspace** below).
 
 `API key` and `TLS` are the two deployment gates, each simply `Yes` or `No`,
@@ -1384,6 +1389,8 @@ Model      unsloth/gemma-4-E2B-it-GGUF:Q4_K_M (gemma4 arch, CPU/AVX2, 30 layers,
 Bundled    2.89 GiB embedded in /home/you/orangu-server-bundle-x86_64
 UI         http://127.0.0.1:8200
 API        http://127.0.0.1:8100
+Metrics    disabled
+Workers    disabled
 API key    No
 TLS        No
 Workspace  /home/you
@@ -2707,8 +2714,10 @@ key is refused at startup with a message pointing to `name`.
   `/v1/chat/completions`, `/v1/completions`, `/v1/messages`,
   `/completion`, `/infill`, `/embedding` and `/v1/embeddings`; a routed
   request carries `x-orangu-forwarded` and is not routed again, and the
-  API key is checked before routing and passed on. A node that cannot be
-  reached serves the request here. When it claims workers, a node leaves
+  API key is checked before routing and passed on. A web console chat turn
+  without pictures is routed too: its node sends the prompt's tokens to
+  the other node's `POST /v1/workers/generate` with its own API key. A
+  node that cannot be reached serves the request here. When it claims workers, a node leaves
   out any with a load above 0.8, and counts each node's speed at
   `1 − load` (at least 5%) when it sizes their shares.
 - `secret` — a shared secret that parent and worker prove to each other

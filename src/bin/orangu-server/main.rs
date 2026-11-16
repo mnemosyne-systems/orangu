@@ -913,6 +913,9 @@ struct Prepared {
     /// Bound when `[prometheus].port` (or `--metrics`) names a
     /// non-zero port; `None` — the default — otherwise.
     metrics_listener: Option<std::net::TcpListener>,
+    /// The banner's `Workers` row (see [`workers_banner`]); `None` when this
+    /// server runs no worker listener.
+    workers_banner: Option<String>,
 }
 
 /// Which model this process is about to serve, and where its bytes are.
@@ -3442,6 +3445,7 @@ fn prepare(args: Args) -> Result<Prepared> {
     }
 
     Ok(Prepared {
+        workers_banner: workers_banner(&conf),
         api_key: conf.api_key.clone(),
         api_data: conf.api_data.clone(),
         web_search: conf.web_search.clone(),
@@ -3607,6 +3611,7 @@ fn prepare_audio(start: AudioStart<'_>) -> Result<Prepared> {
         log::warn!("warning: could not update ~/.orangu/models: {err:#}");
     }
     Ok(Prepared {
+        workers_banner: None,
         api_key: conf.api_key.clone(),
         api_data: conf.api_data.clone(),
         web_search: conf.web_search.clone(),
@@ -4673,6 +4678,27 @@ fn is_npu(backend_label: &str) -> bool {
 /// Where a node looks for the rest of its channel: `[workers].network`,
 /// or — `ORANGU_WORKERS_PEERS`, a comma-separated `host:port` list — just
 /// those addresses, for nodes that share one machine on different ports.
+/// The banner's `Workers` row: the channel (`[workers].name`) and the
+/// address the worker listener binds (`[workers].host`/`port`), as
+/// `primary @ http://0.0.0.0:8400`. Without a channel only the address.
+fn workers_banner(conf: &config::ServerConfiguration) -> Option<String> {
+    let workers = conf.workers.as_ref()?;
+    let scheme = if workers.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let address = format!(
+        "{scheme}://{}:{}",
+        config::resolve_bind_host(&workers.host),
+        workers.port
+    );
+    Some(match &workers.name {
+        Some(name) => format!("{name} @ {address}"),
+        None => address,
+    })
+}
+
 fn workers_scan(workers_conf: &config::WorkersConfiguration) -> Result<workers::node::Scan> {
     use std::net::ToSocketAddrs;
     let Some(peers) = std::env::var("ORANGU_WORKERS_PEERS")
@@ -4879,6 +4905,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         api_listener,
         web_listener,
         metrics_listener,
+        workers_banner,
     } = prepared;
 
     // A handle to the pool taken before `engine` is moved into the router's
@@ -4932,6 +4959,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
     // Captured before `api_key` moves into `AppState`, for the exposure note
     // further down.
     let has_api_key = api_key.is_some();
+    let web_api_key = api_key.clone();
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     let state = Arc::new(http::AppState {
         engine: engine.clone(),
@@ -5048,6 +5076,10 @@ async fn serve(prepared: Prepared) -> Result<()> {
             Some(l) => println!("Metrics    http://{}/metrics", l.local_addr()?),
             None => println!("Metrics    disabled"),
         }
+        match &workers_banner {
+            Some(row) => log::info!("Workers    {row}"),
+            None => log::info!("Workers    disabled"),
+        }
         // The two deployment gates, on the two lines under the address they
         // are gates on, and printed on *every* start rather than only on the
         // ones where they are missing. A row that always has a value is a
@@ -5138,6 +5170,7 @@ async fn serve(prepared: Prepared) -> Result<()> {
         let project_licence = orangu::license::Project::detect(&workspace);
         let web_state = Arc::new(web::WebState {
             engine,
+            api_key: web_api_key,
             project_licence,
             model_display,
             architecture,

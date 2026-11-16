@@ -132,6 +132,10 @@ busy too. The requests routed are the ones that run the model:
 `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/completion`,
 `/infill`, `/embedding` and `/v1/embeddings`. The API key, if any, is
 checked first and passed on, so every node of a channel needs the same.
+A chat turn in the web console is routed the same way: its prompt goes to
+the other node as tokens, and the answer streams back into the console
+of the node it was typed on. A turn with pictures attached is served
+where it was typed.
 
 **When no machine holds the model**, the first node to get a request claims
 every free node it found whose load is at most 0.8, plans the model's layers
