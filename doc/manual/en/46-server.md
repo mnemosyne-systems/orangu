@@ -2674,7 +2674,7 @@ key is refused at startup with a message pointing to `name`.
   is absent it falls back to `[orangu-server].host`.**
 - `port` — the port it binds, alongside `[orangu-server].port`. Defaults to
   `8400` when the section is present but says nothing.
-- `name` — the channel. Every minute the node probes `port` on every
+- `name` — the channel. At start and every 10 minutes the node probes `port` on every
   address of its IPv4 networks (`network`, or each of this machine's
   networks other than loopback and link-local, cut to the /22 around its
   own address when wider), at most 64 at a time with a 300 ms connect
@@ -2682,7 +2682,10 @@ key is refused at startup with a message pointing to `name`.
   with its name, what it is doing (`idle`, `leading`, `serving` or
   `worker_only`), its load, whether it holds the model alone, its API
   port, and its model — the layout's hash, and a hash of samples of every
-  layer's weights. Nodes work together only on the same model: a request
+  layer's weights. A node that answers at several addresses is one node,
+  reached at the one that answered faster; the others are its alternates,
+  probed with it, and it moves to one only when it answers at least twice
+  as fast or its own address stops answering. Nodes work together only on the same model: a request
   is routed only to a node whose model matches in both, and only a node
   with the same layout is claimed, its weights then compared layer by
   layer. The nodes found are asked again every two seconds. Blank or absent
@@ -2900,6 +2903,14 @@ another node computes on (118 ms a token without, 237 with).
 `ORANGU_WORKERS_TRACE=1` makes every worker log its own share of each
 request as the request ends.
 
+**Testing a channel on one machine.** `ORANGU_WORKERS_PEERS`, a
+comma-separated `host:port` list, makes a node probe just those addresses,
+every two seconds, instead of scanning its networks: several nodes on one
+machine, each on its own `[workers].port`, then find each other.
+`ORANGU_WORKERS_BUDGET_MIB` caps a node's memory budget for weights, so a
+model it could hold is split as on smaller machines. A routed request's
+answer carries `x-orangu-routed-to`, the API of the node that served it.
+
 **Every node needs the same model installed, quantization included.**
 Each worker resolves the parent's model spec in its own `models`
 directory. When it connects, the parent compares the child's copy with its
@@ -2971,7 +2982,14 @@ to the invoking terminal rather than silently lost. The command returns
 once the server is listening, with status 0, or with the error and a
 non-zero status. A daemon with the
 console as its log logs nothing at all — set `log_type = file` to keep its
-output. `-h`/`--help` and `-V`/`--version` are also available. `-s`/
+output. A daemon runs under a small watchdog process, which starts the
+server again when it ends after it was listening in any way but a clean
+exit or `SIGTERM`/`SIGINT` — a panic, the OOM killer's `SIGKILL`, a lost
+GPU's exit 75 — after 1, 2, 4 … seconds, at most a minute, the wait
+starting over once a run lasted ten minutes. The new server logs why the
+last one ended, and a `[workers]` node shows it as `last_crash` in
+`/v1/workers`; on a channel, the next scan finds it again. `SIGTERM` or
+`SIGINT` sent to the watchdog stops the server with it. `-h`/`--help` and `-V`/`--version` are also available. `-s`/
 `--shell-completions` prints a bash/zsh/fish/PowerShell completion script for the
 shell detected from `$SHELL` (or, with no `$SHELL` as on Windows, from
 `$PSModulePath` — see the Shell completions chapter) — covering every flag above, the

@@ -232,8 +232,7 @@ pub enum Scan {
         port: u16,
         networks: Vec<(std::net::Ipv4Addr, u8)>,
     },
-    /// These addresses only.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// These addresses only (`ORANGU_WORKERS_PEERS`).
     Addresses(Vec<SocketAddr>),
 }
 
@@ -294,6 +293,12 @@ pub struct Node {
     standby_links: RwLock<Vec<Arc<ChildLink>>>,
     /// The nodes the last scan of the channel found, and when it ran.
     found: Mutex<(Vec<super::channel::Found>, Option<Instant>)>,
+    /// The node id behind each address this node claimed: what keeps one
+    /// node reachable at two addresses from being claimed twice.
+    claimed: Mutex<HashMap<String, String>>,
+    /// Nodes of the channel that probed this one before any scan found
+    /// them: probed back at the scan's next turn.
+    probed_by: Mutex<Vec<SocketAddr>>,
     /// Set while this node claims workers on its channel or holds the ones
     /// it claimed: it then refuses to be claimed itself.
     leading: AtomicBool,
@@ -425,6 +430,19 @@ pub fn set_alone(alone: bool) -> Result<(), String> {
 /// The guard counts the request as running until it is dropped.
 pub fn request_started() -> Option<RequestGuard> {
     Some(NODE.get()?.start_request())
+}
+
+/// Why this process's predecessor ended and when (seconds since the
+/// epoch), as a `--daemon` watchdog that started this one again tells it
+/// (`crate::daemon`). `null` on a first start.
+fn last_crash() -> serde_json::Value {
+    let Ok(reason) = std::env::var("ORANGU_LAST_CRASH") else {
+        return serde_json::Value::Null;
+    };
+    let at = std::env::var("ORANGU_LAST_CRASH_AT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    serde_json::json!({ "reason": reason, "at": at })
 }
 
 /// Where a request this node's API got is served instead, as the base URL
@@ -714,6 +732,8 @@ impl Node {
             links: RwLock::new(links),
             standby_links: RwLock::new(standby_links),
             found: Mutex::new((Vec::new(), None)),
+            claimed: Mutex::new(HashMap::new()),
+            probed_by: Mutex::new(Vec::new()),
             leading: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             last_request: Mutex::new(Instant::now()),
@@ -934,11 +954,19 @@ impl Node {
 
     /// The free nodes the last scan found that this node does not hold.
     fn unclaimed(&self) -> Vec<super::channel::Found> {
-        let held: Vec<String> = self
+        let links: Vec<Arc<ChildLink>> = self
             .links()
+            .into_iter()
+            .chain(self.standby_links())
+            .collect();
+        let held: Vec<String> = links.iter().map(|link| link.addr.clone()).collect();
+        // A node held at one address is not claimed again at another; one
+        // whose link went down is, where it answers now.
+        let claimed = self.claimed.lock().unwrap();
+        let held_nodes: Vec<&String> = links
             .iter()
-            .chain(&self.standby_links())
-            .map(|link| link.addr.clone())
+            .filter(|link| link.is_connected())
+            .filter_map(|link| claimed.get(&link.addr))
             .collect();
         self.found
             .lock()
@@ -951,6 +979,7 @@ impl Node {
                     && found.load <= CLAIM_CUTOFF
                     && found.node != self.id
                     && !held.contains(&found.addr)
+                    && !held_nodes.contains(&&found.node)
             })
             .cloned()
             .collect()
@@ -963,6 +992,32 @@ impl Node {
     fn same_model(&self, found: &super::channel::Found, weights: bool) -> bool {
         found.model == self.identity.header_hash
             && (!weights || (found.content != [0; 32] && found.content == self.content_hash))
+    }
+
+    /// A node of this channel probed this one from `tcp`'s far end: if it
+    /// is not known yet, it is probed back on the channel's port at the
+    /// next turn of the scan, rather than at the next full scan — a node
+    /// that starts after this one is found within seconds.
+    fn note_prober(&self, tcp: &TcpStream) {
+        let Scan::Networks { port, .. } = &self.settings.scan else {
+            return;
+        };
+        let Ok(peer) = tcp.peer_addr() else {
+            return;
+        };
+        let addr = SocketAddr::new(peer.ip(), *port);
+        let shown = addr.to_string();
+        let known = self
+            .found
+            .lock()
+            .unwrap()
+            .0
+            .iter()
+            .any(|f| f.addr == shown || f.alternates.contains(&shown));
+        let mut pending = self.probed_by.lock().unwrap();
+        if !known && !pending.contains(&addr) && Some(addr) != self.local_addr {
+            pending.push(addr);
+        }
     }
 
     /// What a probe of this node is told it is doing.
@@ -1003,6 +1058,30 @@ impl Node {
             self.settings.channel.as_deref().unwrap_or_default()
         );
         for found in fresh {
+            // The same node at an address that stopped answering: that
+            // link goes, this one takes its place.
+            let stale: Vec<String> = {
+                let claimed = self.claimed.lock().unwrap();
+                claimed
+                    .iter()
+                    .filter(|(addr, node)| **node == found.node && **addr != found.addr)
+                    .map(|(addr, _)| addr.clone())
+                    .collect()
+            };
+            if !stale.is_empty() {
+                self.links
+                    .write()
+                    .unwrap()
+                    .retain(|link| !stale.contains(&link.addr));
+                let mut claimed = self.claimed.lock().unwrap();
+                for addr in &stale {
+                    claimed.remove(addr);
+                }
+            }
+            self.claimed
+                .lock()
+                .unwrap()
+                .insert(found.addr.clone(), found.node.clone());
             let link = Arc::new(ChildLink::with_tls(
                 found.addr.clone(),
                 self.settings.timeout,
@@ -1029,6 +1108,10 @@ impl Node {
                 .write()
                 .unwrap()
                 .retain(|link| !lost.contains(&link.addr));
+            self.claimed
+                .lock()
+                .unwrap()
+                .retain(|addr, _| !lost.contains(addr));
             self.found
                 .lock()
                 .unwrap()
@@ -1052,6 +1135,7 @@ impl Node {
         }
         let links: Vec<Arc<ChildLink>> = std::mem::take(&mut *self.links.write().unwrap());
         let spares: Vec<Arc<ChildLink>> = std::mem::take(&mut *self.standby_links.write().unwrap());
+        self.claimed.lock().unwrap().clear();
         for link in links.iter().chain(&spares) {
             link.disconnect();
         }
@@ -1087,17 +1171,24 @@ impl Node {
         let tls = self.settings.tls.clone();
         let mut scanned: Option<Instant> = None;
         while !self.stop.load(Ordering::Relaxed) {
-            let full = scanned.is_none_or(|at| at.elapsed() >= self.settings.scan_every);
+            // A short list of addresses is probed whole every time.
+            let full = scanned.is_none_or(|at| at.elapsed() >= self.settings.scan_every)
+                || matches!(self.settings.scan, Scan::Addresses(_));
+            let probed_by: Vec<SocketAddr> = std::mem::take(&mut *self.probed_by.lock().unwrap());
             let addrs: Vec<SocketAddr> = match (&self.settings.scan, full) {
                 (Scan::Addresses(addrs), true) => addrs.clone(),
                 (Scan::Networks { .. }, true) => Vec::new(),
+                // A node's alternates too: one whose address stopped
+                // answering moves to another within a refresh.
                 (_, false) => self
                     .found
                     .lock()
                     .unwrap()
                     .0
                     .iter()
-                    .filter_map(|f| f.addr.parse().ok())
+                    .flat_map(|f| std::iter::once(&f.addr).chain(&f.alternates))
+                    .filter_map(|addr| addr.parse().ok())
+                    .chain(probed_by.iter().copied())
                     .collect(),
             };
             let mut found = match (&self.settings.scan, full) {
@@ -1114,11 +1205,18 @@ impl Node {
             };
             if full {
                 scanned = Some(Instant::now());
+                if matches!(self.settings.scan, Scan::Networks { .. }) {
+                    found.extend(
+                        probed_by
+                            .iter()
+                            .filter_map(|addr| super::channel::probe(*addr, &hash, tls.as_ref())),
+                    );
+                }
             }
             found.retain(|f| f.node != self.id);
-            found.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.addr.cmp(&b.addr)));
             {
                 let mut slot = self.found.lock().unwrap();
+                let found = super::channel::one_per_node(found, &slot.0);
                 let shape = |list: &[super::channel::Found]| {
                     list.iter()
                         .map(|f| (f.addr.clone(), f.state))
@@ -1154,7 +1252,10 @@ impl Node {
             }
             let started = Instant::now();
             let wait = REFRESH_EVERY.min(self.settings.scan_every);
-            while started.elapsed() < wait && !self.stop.load(Ordering::Relaxed) {
+            while started.elapsed() < wait
+                && !self.stop.load(Ordering::Relaxed)
+                && self.probed_by.lock().unwrap().is_empty()
+            {
                 std::thread::sleep(self.settings.maintenance.min(wait));
             }
         }
@@ -1272,6 +1373,9 @@ impl Node {
             // The channel, how busy this node is, and the other nodes of the
             // channel as the last scan found them.
             "channel": self.settings.channel,
+            // Why the server before this one ended, when a `--daemon`
+            // watchdog started this one after it.
+            "last_crash": last_crash(),
             "load": self.load(),
             "holds_model": self.whole(),
             "leading": self.leading.load(Ordering::Acquire),
@@ -1282,6 +1386,8 @@ impl Node {
                     serde_json::json!({
                         "name": f.name,
                         "address": f.addr,
+                        "alternates": f.alternates,
+                        "probe_ms": f.rtt.as_secs_f64() * 1e3,
                         "state": f.state.as_str(),
                         "load": f.load,
                         "holds_model": f.whole,
@@ -2993,6 +3099,7 @@ impl Node {
                             content: self.content_hash,
                         },
                     );
+                    self.note_prober(&tcp);
                 }
                 return None;
             }
@@ -3801,6 +3908,28 @@ mod tests {
         assert!(!alpha.leading.load(Ordering::Acquire));
         assert!(alpha.links().is_empty());
         assert!(!beta.is_assigned() && !gamma.is_assigned());
+    }
+
+    /// A node that answers at two addresses is found once, and claimed once.
+    #[test]
+    fn a_node_at_two_addresses_is_claimed_once() {
+        let mut s = on_channel("beta", "lab", &[], true);
+        s.listen = Some("0.0.0.0:0".to_string());
+        let beta = node_with(s, Variant::default());
+        let port = beta.local_addr().unwrap().port();
+        let mut s = on_channel("alpha", "lab", &[], false);
+        s.scan = Scan::Addresses(vec![
+            format!("127.0.0.1:{port}").parse().unwrap(),
+            format!("127.0.0.2:{port}").parse().unwrap(),
+        ]);
+        let alpha = node_with(s, Variant::default());
+        let found = found(&alpha, 1);
+        assert_eq!(found[0].alternates.len(), 1, "{found:?}");
+        let _request = alpha.start_request();
+        assert_eq!(alpha.links().len(), 1);
+        assert!(beta.is_assigned());
+        // Claimed already: not a candidate at either address.
+        assert!(alpha.unclaimed().is_empty());
     }
 
     /// A node that holds the model never claims workers: it routes instead.

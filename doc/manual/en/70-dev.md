@@ -34,6 +34,34 @@ cargo fmt
 cargo test
 ```
 
+### Testing a workers channel
+
+`tests/workers_channel.rs` starts several real `orangu-server` processes
+on one machine — each on the CPU, with its own API port and
+`[workers].port`, finding the others through `ORANGU_WORKERS_PEERS` — and
+checks what clients get while a node is killed (`SIGKILL`), frozen
+(`SIGSTOP`), or cut off by a proxy between two nodes. The scenarios:
+
+- a busy node routes a request to an idle one (`x-orangu-routed-to`);
+- a model no node holds alone (`ORANGU_WORKERS_BUDGET_MIB`) is split over
+  three nodes, a worker's own client is sent on to the node that claimed
+  it, and the workers are let go after `release`;
+- a worker killed, frozen or cut off mid-answer: the answer runs to its
+  last token on the nodes left;
+- two nodes that get a request at the same moment both answer.
+
+They need a model, so they are ignored by default:
+
+```sh
+ORANGU_HARNESS_MODELS=/path/to/models \
+ORANGU_HARNESS_MODEL=bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M \
+  cargo test --profile release-with-debug --test workers_channel -- --ignored --test-threads 1
+```
+
+`ORANGU_HARNESS_MODELS` defaults to `models` in
+`~/.orangu/orangu-server.conf`. A failed scenario prints the end of every
+node's log.
+
 ## Documentation workflow
 
 The manual and the cheat sheet are built by **orangu itself**: the same

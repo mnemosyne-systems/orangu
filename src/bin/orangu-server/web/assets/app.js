@@ -2598,6 +2598,7 @@
   const workersPlan = document.getElementById("workers-plan");
   const workersList = document.getElementById("workers-list");
   const workersHardware = document.getElementById("workers-hardware");
+  const workersChannel = document.getElementById("workers-channel");
   document.getElementById("workers-refresh-btn").addEventListener("click", () => {
     openWorkers().catch((err) => { workersSummary.textContent = err.message; });
   });
@@ -2640,6 +2641,7 @@
     workersPlan.replaceChildren();
     workersList.replaceChildren();
     workersHardware.replaceChildren();
+    workersChannel.replaceChildren();
     if (status.role === "none") {
       workersRole.textContent = "";
       workersSummary.textContent = "This server has no [workers] section; it runs every layer itself.";
@@ -2654,6 +2656,7 @@
     if (status.role === "worker") parts.push(`layers ${layerSpan(status.layers)} for a parent`);
     if (status.lost && status.lost.length) parts.push(`lost: ${status.lost.join(", ")}`);
     workersSummary.textContent = parts.join(" — ");
+    renderChannel(status);
     if (status.plan && status.plan.length) {
       workersPlan.appendChild(workersTable(
         ["Node", "Layers", "Count"],
@@ -2683,7 +2686,9 @@
         ]).concat(standby),
       ));
     } else {
-      workersList.textContent = "No workers are configured.";
+      workersList.textContent = status.channel
+        ? "No workers claimed: a node claims them only for a model it cannot hold alone."
+        : "No workers.";
     }
     // Every node's processors and measured speed: this one, then each
     // worker's subtree.
@@ -2708,6 +2713,48 @@
         ]),
       ));
     }
+  }
+
+  // The channel this node is on, how busy it is, and every other node the
+  // last scan found: where requests go, and which nodes can be claimed.
+  function renderChannel(status) {
+    if (!status.channel) {
+      workersChannel.textContent = "Not on a channel: set [workers].name to find other nodes.";
+      return;
+    }
+    const load = (value) => (value == null ? "—" : `${Math.round(value * 100)}%`);
+    const own = [`channel '${status.channel}'`, `load ${load(status.load)}`];
+    own.push(status.holds_model ? "holds the model" : "does not hold the model alone");
+    if (status.leading) own.push("leading workers");
+    if (status.scanned_seconds_ago != null) own.push(`scanned ${status.scanned_seconds_ago} s ago`);
+    const note = document.createElement("p");
+    note.className = "mcps-note";
+    note.textContent = own.join(" — ");
+    workersChannel.appendChild(note);
+    const found = status.found || [];
+    if (!found.length) {
+      workersChannel.appendChild(document.createTextNode("No other node found on the channel yet."));
+      return;
+    }
+    const states = {
+      idle: "Idle",
+      leading: "Leading workers",
+      serving: "Working for another node",
+      worker_only: "Worker only (part of the model)",
+    };
+    workersChannel.appendChild(workersTable(
+      ["Node", "Address", "State", "Load", "Model", "Probe"],
+      found.map((f) => [
+        f.name,
+        f.alternates && f.alternates.length
+          ? `${f.address} (also ${f.alternates.join(", ")})`
+          : f.address,
+        states[f.state] || f.state,
+        load(f.load),
+        !f.same_model ? "Another model — not used" : (f.holds_model ? "Same, whole" : "Same"),
+        f.probe_ms == null ? "—" : `${f.probe_ms.toFixed(1)} ms`,
+      ]),
+    ));
   }
 
   async function openWorkers() {

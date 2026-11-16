@@ -142,6 +142,9 @@ const ROUTED: &[&str] = &[
 /// its own load: a request is routed once at most.
 const FORWARDED_HEADER: &str = "x-orangu-forwarded";
 
+/// On a routed request's answer: the API of the node that served it.
+const ROUTED_TO_HEADER: &str = "x-orangu-routed-to";
+
 /// Sends a request that runs the model to the node of its workers channel
 /// that should serve it (`crate::workers::node::route`): the least busy one
 /// that holds the model, or the parent a working node's layers belong to.
@@ -232,7 +235,9 @@ async fn forward(
         }
     };
     log::debug!("orangu-server: workers: routed {path} to {base}");
-    let mut response = axum::response::Response::builder().status(answer.status().as_u16());
+    let mut response = axum::response::Response::builder()
+        .status(answer.status().as_u16())
+        .header(ROUTED_TO_HEADER, base);
     for (name, value) in answer.headers() {
         if name != axum::http::header::CONNECTION && name != axum::http::header::TRANSFER_ENCODING {
             response = response.header(name, value);

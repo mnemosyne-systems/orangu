@@ -4670,6 +4670,53 @@ fn is_npu(backend_label: &str) -> bool {
     backend_label.starts_with("NPU/")
 }
 
+/// Where a node looks for the rest of its channel: `[workers].network`,
+/// or — `ORANGU_WORKERS_PEERS`, a comma-separated `host:port` list — just
+/// those addresses, for nodes that share one machine on different ports.
+fn workers_scan(workers_conf: &config::WorkersConfiguration) -> Result<workers::node::Scan> {
+    use std::net::ToSocketAddrs;
+    let Some(peers) = std::env::var("ORANGU_WORKERS_PEERS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    else {
+        return Ok(workers::node::Scan::Networks {
+            port: workers_conf.port,
+            networks: workers_conf.network.clone(),
+        });
+    };
+    let mut addrs = Vec::new();
+    for peer in peers.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let addr = peer
+            .to_socket_addrs()
+            .with_context(|| format!("ORANGU_WORKERS_PEERS: '{peer}' is not host:port"))?
+            .next()
+            .with_context(|| format!("ORANGU_WORKERS_PEERS: '{peer}' has no address"))?;
+        addrs.push(addr);
+    }
+    log::info!("orangu-server: [workers] probing only ORANGU_WORKERS_PEERS: {peers}");
+    Ok(workers::node::Scan::Addresses(addrs))
+}
+
+/// This node's memory budget for weights, capped by
+/// `ORANGU_WORKERS_BUDGET_MIB` when set — to have a node that could hold a
+/// model behave as one that cannot.
+fn workers_budget_cap(budget: u64) -> Result<u64> {
+    match std::env::var("ORANGU_WORKERS_BUDGET_MIB") {
+        Ok(value) if !value.trim().is_empty() && value.trim() != "0" => {
+            let mib: u64 = value
+                .trim()
+                .parse()
+                .with_context(|| format!("ORANGU_WORKERS_BUDGET_MIB: '{value}' is not a number"))?;
+            let capped = budget.min(mib << 20);
+            log::info!(
+                "orangu-server: [workers] budget capped at {mib} MiB (ORANGU_WORKERS_BUDGET_MIB)"
+            );
+            Ok(capped)
+        }
+        _ => Ok(budget),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn start_workers_node(
     workers_conf: &config::WorkersConfiguration,
@@ -4725,11 +4772,8 @@ fn start_workers_node(
         workers: Vec::new(),
         standby: Vec::new(),
         channel: workers_conf.name.clone(),
-        scan: workers::node::Scan::Networks {
-            port: workers_conf.port,
-            networks: workers_conf.network.clone(),
-        },
-        scan_every: std::time::Duration::from_secs(60),
+        scan: workers_scan(workers_conf)?,
+        scan_every: std::time::Duration::from_secs(600),
         release: workers_conf.release,
         api_port,
         api_tls,
@@ -4759,7 +4803,7 @@ fn start_workers_node(
                 .to_string(),
                 device_bytes,
                 host_bytes,
-                budget_bytes: workers::plan::budget(device_bytes, host_bytes),
+                budget_bytes: workers_budget_cap(workers::plan::budget(device_bytes, host_bytes))?,
                 setups: vec![workers::protocol::NodeSetup {
                     name: format!("{hostname}:{}", workers_conf.port),
                     devices: node_devices(backend, backend_label),
@@ -4770,6 +4814,10 @@ fn start_workers_node(
         },
         shares: workers_conf.shares,
         head: workers_conf.head,
+        #[cfg(test)]
+        decode_pin: None,
+        #[cfg(test)]
+        offload_always: false,
         split,
         maintenance: std::time::Duration::from_secs(5),
         parent_silence: workers::node::PARENT_SILENCE,
@@ -4796,6 +4844,11 @@ fn start_workers_node(
 }
 
 async fn serve(prepared: Prepared) -> Result<()> {
+    // A `--daemon` watchdog started this server after the last one ended
+    // (`daemon`): said in the log, where a detached server can be read.
+    if let Ok(reason) = std::env::var("ORANGU_LAST_CRASH") {
+        log::warn!("orangu-server: started again by its watchdog; the last server {reason}");
+    }
     let Prepared {
         api_key,
         api_data,

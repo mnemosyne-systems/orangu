@@ -68,6 +68,49 @@ pub struct Found {
     /// (zeros when it has only part of the model).
     pub model: [u8; 32],
     pub content: [u8; 32],
+    /// How long the probe took at `addr`, dialing included.
+    pub rtt: Duration,
+    /// Its other addresses on this machine's networks, where it answered
+    /// too: what takes over when `addr` stops answering.
+    pub alternates: Vec<String>,
+}
+
+/// How much faster another address must answer for a node to be reached
+/// there instead of where it was: jitter alone moves nothing.
+const SWITCH_FACTOR: u32 = 2;
+
+/// One entry per node of `found`, which may hold a node more than once —
+/// one reachable over two networks answers on both. Each node keeps the
+/// address `previous` had for it unless another answered [`SWITCH_FACTOR`]
+/// times faster, else the fastest; the rest become its alternates. Ordered
+/// by name, then address.
+pub fn one_per_node(found: Vec<Found>, previous: &[Found]) -> Vec<Found> {
+    let mut by_node: Vec<Vec<Found>> = Vec::new();
+    for f in found {
+        match by_node.iter_mut().find(|group| group[0].node == f.node) {
+            Some(group) => group.push(f),
+            None => by_node.push(vec![f]),
+        }
+    }
+    let mut out: Vec<Found> = by_node
+        .into_iter()
+        .map(|mut group| {
+            group.sort_by(|a, b| a.rtt.cmp(&b.rtt).then_with(|| a.addr.cmp(&b.addr)));
+            let kept = previous
+                .iter()
+                .find(|p| p.node == group[0].node)
+                .and_then(|p| group.iter().position(|f| f.addr == p.addr))
+                .filter(|&i| group[i].rtt < group[0].rtt * SWITCH_FACTOR)
+                .unwrap_or(0);
+            let mut chosen = group.remove(kept);
+            let mut alternates: Vec<String> = group.into_iter().map(|f| f.addr).collect();
+            alternates.sort();
+            chosen.alternates = alternates;
+            chosen
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.addr.cmp(&b.addr)));
+    out
 }
 
 impl Found {
@@ -185,6 +228,7 @@ pub fn local_hosts() -> Vec<Ipv4Addr> {
 /// nothing listens there, it is on another channel, or it does not
 /// understand the question.
 pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<Found> {
+    let started = std::time::Instant::now();
     let tcp = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT).ok()?;
     tcp.set_read_timeout(Some(ANSWER_TIMEOUT)).ok()?;
     tcp.set_write_timeout(Some(ANSWER_TIMEOUT)).ok()?;
@@ -221,14 +265,16 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             api: Found::api_url(addr.ip(), api_port, api_tls),
             model,
             content,
+            rtt: started.elapsed(),
+            alternates: Vec::new(),
         }),
         _ => None,
     }
 }
 
 /// Probes `port` on every one of `hosts`, [`IN_FLIGHT`] at a time, and
-/// returns the nodes on `channel` ordered by name, then address: an order
-/// that does not change when a node restarts.
+/// returns every answer from a node on `channel`: a node reachable at
+/// several addresses answers at each ([`one_per_node`] merges them).
 pub fn scan(hosts: &[Ipv4Addr], port: u16, channel: &[u8; 32], tls: Option<&Tls>) -> Vec<Found> {
     let next = AtomicUsize::new(0);
     let found = Mutex::new(Vec::new());
@@ -246,9 +292,7 @@ pub fn scan(hosts: &[Ipv4Addr], port: u16, channel: &[u8; 32], tls: Option<&Tls>
             });
         }
     });
-    let mut found = found.into_inner().unwrap();
-    found.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.addr.cmp(&b.addr)));
-    found
+    found.into_inner().unwrap()
 }
 
 #[cfg(test)]
@@ -305,6 +349,67 @@ mod tests {
             assert!(parse_networks(bad).is_err(), "{bad}");
         }
         assert!(parse_networks(" ").unwrap().is_empty());
+    }
+
+    fn answer(node: &str, addr: &str, rtt_ms: u64) -> Found {
+        Found {
+            addr: addr.to_string(),
+            node: node.to_string(),
+            name: format!("{node}:8400"),
+            state: ProbeState::Idle,
+            load: 0.0,
+            whole: true,
+            api: String::new(),
+            model: [0; 32],
+            content: [0; 32],
+            rtt: Duration::from_millis(rtt_ms),
+            alternates: Vec::new(),
+        }
+    }
+
+    /// A node that answers on two networks is one entry, at the faster
+    /// address, with the other as its alternate.
+    #[test]
+    fn a_node_on_two_networks_is_found_once() {
+        let found = one_per_node(
+            vec![
+                answer("b", "192.168.1.11:8400", 8),
+                answer("a", "10.0.0.1:8400", 1),
+                answer("b", "10.0.0.2:8400", 1),
+            ],
+            &[],
+        );
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[1].node, "b");
+        assert_eq!(found[1].addr, "10.0.0.2:8400");
+        assert_eq!(found[1].alternates, ["192.168.1.11:8400"]);
+        assert!(found[0].alternates.is_empty());
+    }
+
+    /// A node stays where it is reached unless another address answers
+    /// twice as fast, and moves when its address stops answering.
+    #[test]
+    fn a_node_moves_only_for_a_much_faster_address_or_a_lost_one() {
+        let previous = one_per_node(vec![answer("b", "192.168.1.11:8400", 3)], &[]);
+        let jitter = one_per_node(
+            vec![
+                answer("b", "192.168.1.11:8400", 3),
+                answer("b", "10.0.0.2:8400", 2),
+            ],
+            &previous,
+        );
+        assert_eq!(jitter[0].addr, "192.168.1.11:8400");
+        let faster = one_per_node(
+            vec![
+                answer("b", "192.168.1.11:8400", 9),
+                answer("b", "10.0.0.2:8400", 2),
+            ],
+            &previous,
+        );
+        assert_eq!(faster[0].addr, "10.0.0.2:8400");
+        let lost = one_per_node(vec![answer("b", "10.0.0.2:8400", 5)], &previous);
+        assert_eq!(lost[0].addr, "10.0.0.2:8400");
+        assert!(lost[0].alternates.is_empty());
     }
 
     #[test]

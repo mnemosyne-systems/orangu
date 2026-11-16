@@ -87,8 +87,8 @@ secret = a-long-random-string
 ```
 
 Every node of a channel listens on the same `port`. Start each one with the
-model: `orangu-server unsloth/Qwen3-32B-GGUF:Q4_K_M`. Every minute a node
-scans its IPv4 networks — every address of each, or the /22 around its own
+model: `orangu-server unsloth/Qwen3-32B-GGUF:Q4_K_M`. At start and every
+10 minutes a node scans its IPv4 networks — every address of each, or the /22 around its own
 address on a wider network — on that port, and asks whoever answers whether
 it is on `lab`. The name itself never crosses the network, only a hash of
 it, and a node on another channel does not answer. Each node logs what it
@@ -99,7 +99,16 @@ workers: channel 'lab' has beta:8400 (192.168.1.11:8400, idle), gamma:8400 (192.
 ```
 
 Between scans it asks the nodes it found how busy they are every two
-seconds.
+seconds. A node that starts later is found sooner than the next scan: the
+nodes its own first scan probes probe it back within seconds.
+
+A machine on two networks — Wi-Fi and a cable, say — answers on both, and
+is still one node: it is reached at the address that answered faster, and
+the other is kept as its alternate (`alternates` in `/v1/workers`, with
+each probe's time as `probe_ms`). It moves to another address only when
+that one answers at least twice as fast, or when its own stops answering;
+a worker whose link went down is then claimed again at the address that
+answers.
 
 **Every node of a channel needs the same model.** A probe's answer names
 the model a node serves — its layout and quantization, and samples of every
@@ -339,7 +348,10 @@ server's.
   their state and load, its own load, its role, the layers it runs, the
   plan below it, each worker's connection and failures in a row, how long
   those leave it out, and any worker the plan lost.
-- **Settings › Workers** in the web console: the same, as tables.
+- **Settings › Workers** in the web console: the same, as tables — the
+  channel with this node's load, every node found with its address and
+  alternates, state, load and whether it serves the same model, then the
+  plan, the workers and their hardware.
 - `GET /ready`: `serving a parent orangu-server` on a worker;
   `a worker was lost` on a node whose plan lost one and has not repaired
   it yet.
