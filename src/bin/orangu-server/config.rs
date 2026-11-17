@@ -158,6 +158,9 @@ pub struct WorkersConfiguration {
     /// channel looks at, as `(address, prefix)`. Empty scans this machine's
     /// own networks.
     pub network: Vec<(std::net::Ipv4Addr, u8)>,
+    /// `[workers].scan`: how often this node scans its networks for the
+    /// nodes of its channel.
+    pub scan: std::time::Duration,
     /// `[workers].download = range`: a model not on disk is fetched in part —
     /// what building it reads, then the layers a parent assigns — rather
     /// than whole (`full`, the default). Such a node only ever works for
@@ -241,6 +244,12 @@ pub enum LocalLayers {
 /// `[workers].release` when absent.
 pub fn default_workers_release() -> std::time::Duration {
     std::time::Duration::from_secs(300)
+}
+
+/// `[workers].scan`'s default: a scan of the channel's networks every 10
+/// minutes.
+pub fn default_workers_scan() -> std::time::Duration {
+    std::time::Duration::from_secs(600)
 }
 
 /// `[workers].timeout` when absent: generous, because one forward of a
@@ -1556,6 +1565,10 @@ pub fn load_server_configuration(
                 })?,
                 None => Vec::new(),
             };
+            let scan = match workers_section.get("scan") {
+                Some(value) => parse_seconds("scan", value)?,
+                None => default_workers_scan(),
+            };
             let release = match workers_section.get("release") {
                 Some(value) => parse_seconds("release", value)?,
                 None => default_workers_release(),
@@ -1635,6 +1648,7 @@ pub fn load_server_configuration(
                 name,
                 release,
                 network,
+                scan,
                 download_range,
                 shares,
                 head,
@@ -3062,6 +3076,18 @@ mod tests {
                     .contains(&format!("[workers].{key} is not a setting")),
                 "{key}: {err:#}"
             );
+        }
+    }
+
+    #[test]
+    fn the_scan_key_is_read() {
+        let workers = workers_section("").unwrap().unwrap();
+        assert_eq!(workers.scan, std::time::Duration::from_secs(600));
+        let workers = workers_section("scan = 60\n").unwrap().unwrap();
+        assert_eq!(workers.scan, std::time::Duration::from_secs(60));
+        for bad in ["scan = 0\n", "scan = off\n"] {
+            let err = workers_section(bad).unwrap_err();
+            assert!(err.to_string().contains("[workers].scan"), "{err:#}");
         }
     }
 

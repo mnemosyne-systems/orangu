@@ -204,6 +204,26 @@ pub struct ChildInfo {
     pub link: Option<(Duration, f64)>,
     /// The model it serves, as its handshake said.
     pub model: Option<super::protocol::ModelIdentity>,
+    /// How it is configured to hold sequences, as its handshake said;
+    /// `None` from a worker that does not say.
+    pub sessions: Option<super::protocol::SessionTerms>,
+    /// The prefixes it holds on its disk, as its handshake listed them
+    /// ([`super::protocol::FEATURE_PREFIXES`]).
+    pub saved: Vec<super::protocol::SavedPrefix>,
+}
+
+impl ChildInfo {
+    /// The sessions it keeps for this node's prefix pool: none from a worker
+    /// that cannot keep them ([`super::protocol::FEATURE_RETAIN`]) or does not
+    /// say how many.
+    pub fn pool_reserve(&self) -> usize {
+        match self.sessions {
+            Some(terms) if self.features & super::protocol::FEATURE_RETAIN != 0 => {
+                terms.pool_reserve as usize
+            }
+            _ => 0,
+        }
+    }
 }
 
 type Answer = Result<(Message, usize), WorkerError>;
@@ -486,7 +506,7 @@ impl ChildLink {
             path: path.to_vec(),
         }))?;
         let ack = match reply {
-            Message::HelloAck(ack) => ack,
+            Message::HelloAck(ack) => *ack,
             Message::Error(error) => return Err(self.refused(error)),
             other => return Err(self.lost(format!("unexpected handshake reply {other:?}"))),
         };
@@ -554,6 +574,8 @@ impl ChildLink {
             features: ack.features,
             link: None,
             model: ack.model,
+            sessions: ack.sessions,
+            saved: ack.saved,
         };
         *self.connection.lock().unwrap() = Some(connection);
         if info.features & super::protocol::FEATURE_ECHO != 0 {
@@ -758,6 +780,14 @@ impl Exchange for std::sync::Arc<ChildLink> {
     fn features(&self) -> u64 {
         self.info().map_or(0, |info| info.features)
     }
+
+    fn pool_reserve(&self) -> usize {
+        self.info().map_or(0, |info| info.pool_reserve())
+    }
+
+    fn saved(&self) -> Vec<super::protocol::SavedPrefix> {
+        self.info().map_or_else(Vec::new, |info| info.saved)
+    }
 }
 
 #[cfg(test)]
@@ -778,7 +808,7 @@ mod tests {
             let mut writer = stream.try_clone().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             read_message(&mut reader).unwrap();
-            let ack = Message::HelloAck(super::super::protocol::HelloAck {
+            let ack = Message::HelloAck(Box::new(super::super::protocol::HelloAck {
                 version: PROTOCOL_VERSION,
                 features: 0,
                 nonce: [0; 32],
@@ -788,7 +818,9 @@ mod tests {
                 capacity: Capacity::default(),
                 model: None,
                 discovery: Vec::new(),
-            });
+                sessions: None,
+                saved: Vec::new(),
+            }));
             write_message(&mut writer, 0, &ack).unwrap();
             read_message(&mut reader).unwrap();
             write_message(&mut writer, 0, &Message::Ready).unwrap();

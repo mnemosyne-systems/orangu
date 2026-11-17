@@ -27,13 +27,14 @@ use super::protocol::{ErrorCode, Rows, WorkerError};
 use super::room::{self, KvRoom};
 use crate::engine::arch::{DecodeRow, ModelForward};
 use crate::engine::generate::NoRoomForPrompt;
-use crate::engine::kv_cache::{KvCache, LayerHold, RemoteLayers, RemoteSession};
+use crate::engine::kv_cache::{KvCache, RemoteLayers, RemoteSession};
 use crate::engine::loader::ModelConfig;
+use crate::engine::prefix_cache::PrefixCache;
 use anyhow::{Result, ensure};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 /// A consecutive range of layers run somewhere else.
@@ -77,12 +78,51 @@ pub trait Stage: Send + Sync {
         anyhow::bail!("{} cannot copy a session", self.name())
     }
 
-    /// What layer `layer` holds of `session`'s first `len` positions — its
-    /// rows, or a recurrent layer's state — from whichever node at or below
-    /// this stage runs it. A stage that cannot says so.
-    fn layer_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold> {
-        let _ = (session, layer, len);
-        anyhow::bail!("{} cannot send rows back", self.name())
+    /// Keeps `session` here and below until it is released (`held`), or
+    /// returns it to ordinary eviction. A stage that cannot does nothing:
+    /// the session may then be evicted, and is rebuilt if it is used again.
+    fn retain(&self, session: u64, held: bool) {
+        let _ = (session, held);
+    }
+
+    /// The sessions this stage, and every node below it, keeps for this
+    /// node's prefix pool, as their handshakes said. A stage that cannot say
+    /// keeps none.
+    fn pool_reserve(&self) -> usize {
+        0
+    }
+
+    /// Whether this stage's node writes a session's rows to its disk and
+    /// opens one from them again ([`super::protocol::FEATURE_PREFIXES`]).
+    fn saves_prefixes(&self) -> bool {
+        false
+    }
+
+    /// The prefixes this stage's node holds on its disk, as its handshake
+    /// listed them.
+    fn saved_prefixes(&self) -> Vec<super::protocol::SavedPrefix> {
+        Vec::new()
+    }
+
+    /// Writes `session`'s rows to disk under `key`, here and below. A stage
+    /// that cannot says so.
+    fn save(&self, session: u64, key: &str) -> Result<()> {
+        let _ = (session, key);
+        anyhow::bail!("{} cannot save a session", self.name())
+    }
+
+    /// Opens `session`, held, from the first `len` positions saved under
+    /// `key`, here and below. A stage that cannot, or whose node did not list
+    /// `key`, says so and sends nothing.
+    fn load(&self, session: u64, key: &str, len: usize) -> Result<()> {
+        let _ = (session, key, len);
+        anyhow::bail!("{} cannot open a saved session", self.name())
+    }
+
+    /// Deletes what is saved under `key`, here and below. A stage that
+    /// cannot does nothing.
+    fn forget(&self, key: &str) {
+        let _ = key;
     }
 
     /// Several sessions' forwards at once — one decode step of every slot —
@@ -838,16 +878,69 @@ impl LayerPipeline {
         Ok(())
     }
 
-    /// Layer `layer`'s first `len` positions of `session`, from the stage
-    /// that runs it, once what the sequence has queued is through.
-    pub fn stage_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold> {
-        self.drain(session);
-        let stage = self
-            .stages
+    /// Keeps `session` on every stage until it is released, or returns it to
+    /// their ordinary eviction ([`Stage::retain`]).
+    pub fn retain(&self, session: u64, held: bool) {
+        for stage in &self.stages {
+            stage.retain(session, held);
+        }
+    }
+
+    /// The fewest sessions any stage keeps for this node's prefix pool
+    /// ([`Stage::pool_reserve`]): a pool entry holds one on each. Unbounded
+    /// with no stage below.
+    pub fn pool_reserve(&self) -> usize {
+        self.stages
             .iter()
-            .find(|stage| stage.layers().contains(&layer))
-            .ok_or_else(|| anyhow::anyhow!("no stage runs layer {layer}"))?;
-        stage.layer_rows(session, layer, len)
+            .map(|stage| stage.pool_reserve())
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+
+    /// The stages, in the order the layers pass through them.
+    pub fn stages(&self) -> &[Arc<dyn Stage>] {
+        &self.stages
+    }
+
+    /// Whether every stage saves prefixes ([`Stage::saves_prefixes`]).
+    pub fn saves_prefixes(&self) -> bool {
+        self.stages.iter().all(|stage| stage.saves_prefixes())
+    }
+
+    /// Writes `session`'s rows under `key` on every stage — after whatever
+    /// `session` still has queued. One that fails has the others forget it.
+    pub fn save(&self, session: u64, key: &str) -> Result<()> {
+        self.drain(session);
+        for (i, stage) in self.stages.iter().enumerate() {
+            if let Err(error) = stage.save(session, key) {
+                for saved in &self.stages[..=i] {
+                    saved.forget(key);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens `session` from `key`'s first `len` positions on every stage. One
+    /// that fails has the others release it.
+    pub fn load(&self, session: u64, key: &str, len: usize) -> Result<()> {
+        for (i, stage) in self.stages.iter().enumerate() {
+            if let Err(error) = stage.load(session, key, len) {
+                for loaded in &self.stages[..i] {
+                    loaded.release(session);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Deletes what every stage saved under `key`.
+    pub fn forget(&self, key: &str) {
+        for stage in &self.stages {
+            stage.forget(key);
+        }
     }
 }
 
@@ -892,28 +985,11 @@ pub trait PipelineSource: Send + Sync {
     /// whether there is a newer pipeline to retry on.
     fn recover(&self, generation: u64) -> bool;
 
-    /// Whether a sequence decodes on this node alone once its prompt is
-    /// through the tree: its rows come back from the workers at the
-    /// first decode step, and the model runs every later forward here.
-    fn decode_alone(&self) -> bool {
-        false
-    }
-
-    /// A handover failed: sequences go on decoding through the tree, until
-    /// a new plan decides again.
-    fn handover_failed(&self) {}
-
     /// A finished request's decode steps took `parts` — per node, its
     /// subtree included — over `tokens` steps: what the plan's nodes really
     /// run at.
     fn observed_decode(&self, parts: &[(String, Duration)], tokens: usize) {
         let _ = (parts, tokens);
-    }
-
-    /// A finished request's prompt and decode, each a [`Trace`] of the
-    /// tree as a whole: how fast the tree really is at both.
-    fn observed_request(&self, prefill: &Trace, decode: &Trace) {
-        let _ = (prefill, decode);
     }
 
     /// Whether the node running the model's final layer applies the output
@@ -950,8 +1026,6 @@ impl PipelineSource for FixedPipeline {
 struct SessionState {
     generation: u64,
     tokens: Vec<u32>,
-    /// Its cache has room for every layer's rows, to decode here alone.
-    full: bool,
     /// Replayed onto a new pipeline since the last request finished: the
     /// request running now did not go through in one piece.
     rebuilt: bool,
@@ -963,12 +1037,54 @@ struct SessionState {
 
 type Sessions = Arc<Mutex<HashMap<u64, SessionState>>>;
 
+/// Sessions held on the workers for the prefix pool.
+type Held = Arc<Mutex<std::collections::HashSet<u64>>>;
+
+/// The prefix pool's entries saved on every node's disk
+/// ([`super::prefixes`]): where this node keeps its own files, and the key
+/// each saved entry's session was saved under.
+#[derive(Default)]
+struct Saved {
+    files: OnceLock<Arc<super::prefixes::PrefixFiles>>,
+    keys: Mutex<HashMap<u64, String>>,
+    /// Entries put back in the pool at the last claim.
+    loaded: AtomicUsize,
+}
+
+impl Saved {
+    /// `session`'s entry left the pool: what it was saved under is deleted
+    /// on every node, this one included.
+    fn forget(&self, session: u64, pipeline: &LayerPipeline) {
+        let key = self.keys.lock().unwrap().remove(&session);
+        if let Some(key) = key {
+            pipeline.forget(&key);
+            if let Some(files) = self.files.get() {
+                files.forget_lead(&key);
+            }
+        }
+    }
+}
+
+/// What a save or a load of the prefix pool did: entries, and the positions
+/// they hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixesMoved {
+    pub entries: usize,
+    pub tokens: usize,
+}
+
 /// The owner of a top-level cache's remote rows: passes rollbacks and the
 /// release on to the pipeline the cache was made for, and forgets the
 /// session's tokens when it ends.
 struct SessionOwner {
     pipeline: Arc<LayerPipeline>,
     sessions: Sessions,
+    /// Where a session made by [`RemoteLayers::fork_new`] takes its id.
+    next_session: Arc<AtomicU64>,
+    /// The sessions held for the prefix pool ([`RemoteLayers::hold`]).
+    held: Held,
+    /// The pool entries saved on disk.
+    saved: Arc<Saved>,
     /// Told where each finished request's decode time went.
     source: Arc<dyn PipelineSource>,
 }
@@ -1002,7 +1118,58 @@ impl RemoteLayers for SessionOwner {
         true
     }
 
+    /// A new session, registered with `from`'s generation and first `len`
+    /// tokens, holding a copy of `from`'s rows on every worker. Not asked
+    /// of the workers at all when the pool already holds as many sessions as
+    /// one of them said it keeps: it would be refused.
+    fn fork_new(&self, from: u64, len: usize) -> Option<u64> {
+        if self.held.lock().unwrap().len() >= self.pipeline.pool_reserve() {
+            return None;
+        }
+        let to = self.next_session.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            let source = sessions.get(&from).filter(|s| s.tokens.len() >= len)?;
+            let state = SessionState {
+                generation: source.generation,
+                tokens: source.tokens[..len].to_vec(),
+                rebuilt: false,
+                promised: 0,
+                prefill: Trace::default(),
+                decode: Trace::default(),
+            };
+            sessions.insert(to, state);
+        }
+        if let Err(error) = self.pipeline.fork(from, to, len) {
+            log::debug!("orangu-server: workers: no copy of session {from}: {error:#}");
+            self.sessions.lock().unwrap().remove(&to);
+            self.pipeline.release(to);
+            return None;
+        }
+        Some(to)
+    }
+
+    /// Out of the pool — taken by a request, which goes on from it — an
+    /// entry saved on disk is deleted there: the pool saves what it holds
+    /// next time.
+    fn hold(&self, session: u64, held: bool) {
+        match held {
+            true => self.held.lock().unwrap().insert(session),
+            false => self.held.lock().unwrap().remove(&session),
+        };
+        if !held {
+            self.saved.forget(session, &self.pipeline);
+        }
+        self.pipeline.retain(session, held);
+    }
+
+    fn pool_reserve(&self) -> usize {
+        self.pipeline.pool_reserve()
+    }
+
     fn release(&self, session: u64) {
+        self.held.lock().unwrap().remove(&session);
+        self.saved.forget(session, &self.pipeline);
         let state = self.sessions.lock().unwrap().remove(&session);
         self.pipeline.release(session);
         if let Some(mut state) = state {
@@ -1032,7 +1199,6 @@ impl RemoteLayers for SessionOwner {
         if decode.tokens > 0 {
             self.source.observed_decode(&decode.parts, decode.tokens);
         }
-        self.source.observed_request(&prefill, &decode);
         parts
     }
 }
@@ -1119,8 +1285,16 @@ pub struct DelegatingModel {
     source: Arc<dyn PipelineSource>,
     /// The part width pipelined prefill cuts a chunk into ([`sub_chunk`]).
     sub_chunk: usize,
-    next_session: AtomicU64,
+    next_session: Arc<AtomicU64>,
     sessions: Sessions,
+    held: Held,
+    saved: Arc<Saved>,
+    /// The engine's prefix pool, whose entries each keep a session on the
+    /// workers: dropped oldest first when a node has no room for a prompt
+    /// ([`Self::attach_prefix_cache`]).
+    prefix_cache: OnceLock<Weak<PrefixCache>>,
+    /// Sequences replayed onto a pipeline to rebuild them.
+    rebuilds: AtomicUsize,
     /// Forwards running now, and when the last one ended: whether the tree
     /// is in use ([`Self::quiet`]).
     in_flight: Arc<AtomicUsize>,
@@ -1173,11 +1347,233 @@ impl DelegatingModel {
             sub_chunk: sub_chunk(),
             // Session ids are only unique per top-level node, which is all
             // they need to be: a worker serves one parent.
-            next_session: AtomicU64::new(1),
+            next_session: Arc::new(AtomicU64::new(1)),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            held: Arc::default(),
+            saved: Arc::default(),
+            prefix_cache: OnceLock::new(),
+            rebuilds: AtomicUsize::new(0),
             in_flight: Arc::new(AtomicUsize::new(0)),
             last_forward: Arc::new(Mutex::new(Instant::now())),
         }
+    }
+
+    /// Gives this model the engine's prefix pool, to drop entries from when
+    /// a node has no room for a prompt. Set once; later calls change nothing.
+    pub fn attach_prefix_cache(&self, pool: &Arc<PrefixCache>) {
+        let _ = self.prefix_cache.set(Arc::downgrade(pool));
+    }
+
+    /// Sessions each worker holds for the prefix pool.
+    pub fn pool_sessions(&self) -> usize {
+        self.held.lock().unwrap().len()
+    }
+
+    /// The engine's prefix pool, if one was attached and still exists.
+    pub fn prefix_cache(&self) -> Option<Arc<PrefixCache>> {
+        self.prefix_cache.get().and_then(Weak::upgrade)
+    }
+
+    /// Where this node keeps its own files of the pool's saved entries
+    /// ([`Self::save_prefixes`]). Set once.
+    pub fn attach_prefix_files(&self, files: Arc<super::prefixes::PrefixFiles>) {
+        let _ = self.saved.files.set(files);
+    }
+
+    /// Entries saved on disk, as this node's manifest lists them, and
+    /// entries put back in the pool at the last claim
+    /// ([`Self::load_prefixes`]).
+    pub fn prefixes_saved(&self) -> (usize, usize) {
+        let saved = self
+            .saved
+            .files
+            .get()
+            .and_then(|files| files.manifest())
+            .map_or(0, |m| m.entries.len());
+        (saved, self.saved.loaded.load(Ordering::Relaxed))
+    }
+
+    /// Sequences replayed onto a pipeline to rebuild them, since the start.
+    #[cfg(test)]
+    pub fn rebuilds(&self) -> usize {
+        self.rebuilds.load(Ordering::Relaxed)
+    }
+
+    /// Saves every entry of the prefix pool on every node of the current
+    /// pipeline — each worker its own layers' rows ([`Stage::save`]), this
+    /// node its own and the tokens — and empties the pool: what a node does
+    /// as it lets its workers go, or stops. `base` is the split the entries
+    /// were made on; it is written with them as the manifest a later claim
+    /// plans and loads by.
+    ///
+    /// An entry is saved only when every stage advertised the bit and its
+    /// session is on the current pipeline. One a node refuses is deleted wherever it was written. An
+    /// entry put back from disk and not used since is on disk already.
+    /// Whatever the last manifest named and this one does not is deleted on
+    /// every node.
+    pub fn save_prefixes(&self, base: super::prefixes::Manifest) -> PrefixesMoved {
+        let mut moved = PrefixesMoved::default();
+        let Some(files) = self.saved.files.get().cloned() else {
+            return moved;
+        };
+        let Some(pool) = self.prefix_cache() else {
+            return moved;
+        };
+        let (pipeline, generation) = self.source.current();
+        let entries = pool.take_all();
+        let saves = pipeline.saves_prefixes();
+        let mut manifest = base;
+        for entry in &entries {
+            let Some(remote) = entry.cache.remote.as_ref() else {
+                continue;
+            };
+            let session = remote.id;
+            let current = self
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&session)
+                .is_some_and(|state| state.generation == generation);
+            let len = entry.reusable_prefix_len(&entry.tokens);
+            let capacity = remote.capacity;
+            if !saves || !current || len == 0 {
+                continue;
+            }
+            let known = self.saved.keys.lock().unwrap().get(&session).cloned();
+            let key = match known {
+                Some(key) => key,
+                None => {
+                    let key = super::prefixes::new_key();
+                    if let Err(error) = pipeline.save(session, &key) {
+                        log::warn!("orangu-server: workers: a prefix not saved: {error:#}");
+                        continue;
+                    }
+                    if let Err(error) = files.write(
+                        &key,
+                        true,
+                        pipeline.local_layers(),
+                        capacity,
+                        len,
+                        &entry.tokens[..len],
+                        &entry.cache,
+                    ) {
+                        log::warn!("orangu-server: workers: a prefix not saved: {error:#}");
+                        pipeline.forget(&key);
+                        continue;
+                    }
+                    key
+                }
+            };
+            manifest
+                .entries
+                .push(super::prefixes::SavedEntry { key, len, capacity });
+            moved.entries += 1;
+            moved.tokens += len;
+        }
+        // In the last manifest and not this one: an entry let go of while no node
+        // listened, or saved under another split.
+        if let Some(old) = files.manifest() {
+            for stale in old
+                .entries
+                .iter()
+                .filter(|e| !manifest.entries.iter().any(|kept| kept.key == e.key))
+            {
+                pipeline.forget(&stale.key);
+                files.remove(&stale.key, true);
+            }
+        }
+        if let Err(error) = files.write_manifest(&manifest) {
+            log::warn!("orangu-server: workers: the saved prefixes' manifest: {error:#}");
+        }
+        // On disk: dropping the entries deletes nothing there.
+        self.saved.keys.lock().unwrap().clear();
+        drop(entries);
+        if moved.entries > 0 {
+            log::info!(
+                "orangu-server: workers: {} prefix{} of {} tokens saved on every node",
+                moved.entries,
+                if moved.entries == 1 { "" } else { "es" },
+                moved.tokens
+            );
+        }
+        moved
+    }
+
+    /// Puts the entries of `manifest` named in `keys` back in the prefix
+    /// pool, on the current pipeline: a session opened from its file on every
+    /// worker ([`Stage::load`]), this node's own rows from its file, held as
+    /// any pool entry. An entry any node refuses is deleted on every node.
+    pub fn load_prefixes(
+        &self,
+        manifest: &super::prefixes::Manifest,
+        keys: &[String],
+    ) -> PrefixesMoved {
+        let mut moved = PrefixesMoved::default();
+        self.saved.loaded.store(0, Ordering::Relaxed);
+        let (Some(files), Some(pool)) = (self.saved.files.get().cloned(), self.prefix_cache())
+        else {
+            return moved;
+        };
+        let (pipeline, generation) = self.source.current();
+        for entry in manifest.entries.iter().filter(|e| keys.contains(&e.key)) {
+            let key = &entry.key;
+            let capacity = match entry.capacity {
+                0 => manifest.n_ctx,
+                capacity => capacity,
+            };
+            let mut cache = self.cache_on(&pipeline, generation, capacity, Vec::new());
+            let session = cache.remote.as_ref().map_or(0, |r| r.id);
+            let shape = cache.structure_tag();
+            let expect = super::prefixes::Expect {
+                layers: pipeline.local_layers(),
+                shape: &shape,
+                n_ctx: capacity,
+                len: entry.len,
+            };
+            let opened = files.read(key, true, &expect).and_then(|(tokens, saved)| {
+                ensure!(
+                    tokens.len() == entry.len,
+                    "prefix {key} holds {} tokens, not {}",
+                    tokens.len(),
+                    entry.len
+                );
+                cache.copy_prefix_from(&saved, entry.len);
+                pipeline.load(session, key, entry.len)?;
+                Ok(tokens)
+            });
+            let tokens = match opened {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    log::warn!(
+                        "orangu-server: workers: a saved prefix is dropped on every node:                          {error:#}"
+                    );
+                    drop(cache);
+                    pipeline.forget(key);
+                    files.forget_lead(key);
+                    continue;
+                }
+            };
+            if let Some(remote) = cache.remote.as_mut() {
+                remote.len = entry.len;
+            }
+            if let Some(state) = self.sessions.lock().unwrap().get_mut(&session) {
+                state.tokens = tokens.clone();
+            }
+            pool.store(tokens, cache);
+            self.saved.keys.lock().unwrap().insert(session, key.clone());
+            moved.entries += 1;
+            moved.tokens += entry.len;
+        }
+        self.saved.loaded.store(moved.entries, Ordering::Relaxed);
+        if moved.entries > 0 {
+            log::info!(
+                "orangu-server: workers: {} saved prefix{} of {} tokens put back in the pool",
+                moved.entries,
+                if moved.entries == 1 { "" } else { "es" },
+                moved.tokens
+            );
+        }
+        moved
     }
 
     /// Cuts pipelined prompt chunks into `width`-token parts instead of
@@ -1209,7 +1605,6 @@ impl DelegatingModel {
         generation: u64,
         capacity: usize,
         tokens: Vec<u32>,
-        full: bool,
     ) -> KvCache {
         let session = self.next_session.fetch_add(1, Ordering::Relaxed);
         self.sessions.lock().unwrap().insert(
@@ -1217,7 +1612,6 @@ impl DelegatingModel {
             SessionState {
                 generation,
                 tokens,
-                full,
                 rebuilt: false,
                 promised: 0,
                 prefill: Trace::default(),
@@ -1227,128 +1621,22 @@ impl DelegatingModel {
         let owner: Arc<dyn RemoteLayers> = Arc::new(SessionOwner {
             pipeline: pipeline.clone(),
             sessions: self.sessions.clone(),
+            next_session: self.next_session.clone(),
+            held: self.held.clone(),
+            saved: self.saved.clone(),
             source: self.source.clone(),
         });
-        let mut cache = pipeline.new_cache_owned_by(session, capacity, owner);
-        if full {
-            let mut every = self.model.new_kv_cache(capacity);
-            every.remote = cache.remote.take();
-            cache = every;
-        }
-        cache
-    }
-
-    /// Whether `cache` is served by the model here alone rather than through
-    /// the tree:
-    /// - its rows came back from the workers already ([`Self::hand_over`]);
-    /// - it is a slot's conversation that was, taken up again: every layer
-    ///   holds it here and the workers hold none of it;
-    /// - or it is `decode`'s first step after a prompt the tree ran, and this
-    ///   node decodes alone: its rows are brought back now.
-    ///
-    /// A handover that fails leaves the sequence on the tree.
-    fn alone(&self, cache: &mut KvCache, start_pos: usize, decode: bool) -> bool {
-        let Some(remote) = cache.remote.as_ref() else {
-            return cache.whole;
-        };
-        let (full, fresh) = {
-            let generation = self.source.current().1;
-            let sessions = self.sessions.lock().unwrap();
-            match sessions.get(&remote.id) {
-                Some(state) => (state.full, state.generation == generation),
-                None => return false,
-            }
-        };
-        if cache.whole && remote.len < start_pos && cache.holds_every_layer(start_pos) {
-            cache.remote = None;
-            return true;
-        }
-        if !full {
-            return false;
-        }
-        if !(decode
-            && fresh
-            && start_pos > 0
-            && remote.len == start_pos
-            && self.source.decode_alone())
-        {
-            return false;
-        }
-        match self.hand_over(cache, start_pos) {
-            Ok(()) => true,
-            Err(error) => {
-                log::warn!(
-                    "orangu-server: workers: could not bring a sequence's rows back to decode \
-                     here, decoding through the tree: {error:#}"
-                );
-                self.source.handover_failed();
-                false
-            }
-        }
-    }
-
-    /// Brings what every layer the workers run holds of `cache`'s sequence —
-    /// its rows, or a recurrent layer's state — into `cache`, which has room
-    /// for them ([`SessionState::full`]), and lets the workers' session go.
-    fn hand_over(&self, cache: &mut KvCache, len: usize) -> Result<()> {
-        let started = Instant::now();
-        let session = cache.remote.as_ref().map_or(0, |r| r.id);
-        let (pipeline, _) = self.source.current();
-        let local = pipeline.local_layers();
-        let n_layer = self.model.config().n_layer;
-        let mut moved = Vec::new();
-        let result = (|| {
-            let mut bytes = 0usize;
-            for layer in (0..n_layer).filter(|l| !local.contains(l)) {
-                let hold = pipeline.stage_rows(session, layer, len)?;
-                bytes += hold.bytes();
-                let slot = self.model.cache_slot(layer);
-                cache.set_layer_hold(slot, hold)?;
-                moved.push(slot);
-            }
-            ensure!(
-                cache.holds_every_layer(len),
-                "this node does not hold {len} positions of its own layers"
-            );
-            Ok(bytes)
-        })();
-        match result {
-            Ok(bytes) => {
-                // The tree's part of the request is over, and no finish will
-                // be reported for a cache with no remote rows.
-                let generation = self.source.current().1;
-                let whole = self
-                    .sessions
-                    .lock()
-                    .unwrap()
-                    .get(&session)
-                    .is_some_and(|state| !state.rebuilt && state.generation == generation);
-                if whole {
-                    self.source.served_whole();
-                }
-                cache.remote = None;
-                cache.whole = true;
-                log::debug!(
-                    "orangu-server: workers: {len} positions of {} layers ({}) brought back in \
-                     {:.0} ms to decode here",
-                    moved.len(),
-                    orangu::format::format_bytes(bytes as u64),
-                    started.elapsed().as_secs_f64() * 1e3
-                );
-                Ok(())
-            }
-            Err(error) => {
-                for slot in moved {
-                    cache.clear_layer(slot);
-                }
-                Err(error)
-            }
-        }
+        pipeline.new_cache_owned_by(session, capacity, owner)
     }
 
     /// Asks this node and every node below for `positions` of `session`. Only
     /// a node saying it has no room is an answer: one that fails to reply
     /// fails the forward that follows, which recovers as usual.
+    ///
+    /// A node with no room is given some by this node: the prefix pool's
+    /// oldest entry is dropped, releasing its session on every node, and the
+    /// question is asked again, until the pool is empty. Workers do not
+    /// evict what the pool holds; this node does.
     fn ask_for_room(
         &self,
         pipeline: &LayerPipeline,
@@ -1356,21 +1644,40 @@ impl DelegatingModel {
         session: u64,
         positions: usize,
     ) -> Result<()> {
+        loop {
+            let Err(refusal) = Self::ask_once(pipeline, cache, session, positions) else {
+                return Ok(());
+            };
+            let evicted = self.prefix_cache().is_some_and(|pool| pool.evict_oldest());
+            if !evicted {
+                room::note_refused();
+                return Err(anyhow::Error::new(NoRoomForPrompt(refusal)));
+            }
+            log::info!(
+                "orangu-server: workers: a prefix-pool entry let go to make room for a prompt"
+            );
+        }
+    }
+
+    /// One round of [`Self::ask_for_room`]: the refusal, if any node has no
+    /// room.
+    fn ask_once(
+        pipeline: &LayerPipeline,
+        cache: &KvCache,
+        session: u64,
+        positions: usize,
+    ) -> Result<(), String> {
         // A paged cache was admitted by the pool its rows live in.
         if !cache.is_paged()
             && let Err(short) = pipeline.room().reserve(session, positions)
         {
             let name = &pipeline.name;
-            room::note_refused();
-            return Err(anyhow::Error::new(NoRoomForPrompt(format!(
-                "OutOfMemory: {short} (at {name})"
-            ))));
+            return Err(format!("OutOfMemory: {short} (at {name})"));
         }
         match pipeline.reserve_below(session, positions) {
             Err(error) if out_of_memory(&error) => {
                 pipeline.room().forget(session);
-                room::note_refused();
-                Err(anyhow::Error::new(NoRoomForPrompt(format!("{error:#}"))))
+                Err(format!("{error:#}"))
             }
             Err(error) => {
                 log::debug!("orangu-server: workers: no answer on memory: {error:#}");
@@ -1394,7 +1701,7 @@ impl DelegatingModel {
             .as_ref()
             .map(|r| (r.id, r.capacity))
             .ok_or_else(|| anyhow::anyhow!("a cache this model did not make"))?;
-        let (tokens, full, promised) = {
+        let (tokens, promised) = {
             let sessions = self.sessions.lock().unwrap();
             let state = sessions
                 .get(&old)
@@ -1404,13 +1711,10 @@ impl DelegatingModel {
                 "the sequence holds {} tokens, and the forward starts at {start_pos}",
                 state.tokens.len()
             );
-            (
-                state.tokens[..start_pos].to_vec(),
-                state.full,
-                state.promised,
-            )
+            (state.tokens[..start_pos].to_vec(), state.promised)
         };
-        *cache = self.cache_on(pipeline, generation, capacity, tokens.clone(), full);
+        *cache = self.cache_on(pipeline, generation, capacity, tokens.clone());
+        self.rebuilds.fetch_add(1, Ordering::Relaxed);
         let session = cache.remote.as_ref().map_or(0, |r| r.id);
         if let Some(state) = self.sessions.lock().unwrap().get_mut(&session) {
             state.rebuilt = true;
@@ -1578,19 +1882,13 @@ impl ModelForward for DelegatingModel {
         self.ask_for_room(&pipeline, cache, session, positions)
     }
 
-    /// Handed over, the model's own batch samples as it would; on the tree
-    /// every row comes back as logits.
+    /// Every row comes back from the tree as logits.
     fn forward_decode_batch_sampling(
         &self,
         rows: &mut [DecodeRow<'_>],
         tokens: &[u32],
-        samples: &[Option<crate::engine::arch::GreedySampleParams<'_>>],
+        _samples: &[Option<crate::engine::arch::GreedySampleParams<'_>>],
     ) -> Result<Option<Vec<crate::engine::arch::ForwardOutcome>>> {
-        if rows.iter().all(|row| row.cache.whole) {
-            return self
-                .model
-                .forward_decode_batch_sampling(rows, tokens, samples);
-        }
         Ok(self.forward_decode_batch(rows, tokens)?.map(|logits| {
             logits
                 .into_iter()
@@ -1610,14 +1908,6 @@ impl ModelForward for DelegatingModel {
         rows: &mut [DecodeRow<'_>],
         tokens: &[u32],
     ) -> Result<Option<Vec<Vec<f32>>>> {
-        // Handed over: the model's own batch. One still on the tree when
-        // this node decodes alone goes one by one, to be handed over.
-        if rows.iter().all(|row| row.cache.whole) {
-            return self.model.forward_decode_batch(rows, tokens);
-        }
-        if self.source.decode_alone() || rows.iter().any(|row| row.cache.whole) {
-            return Ok(None);
-        }
         super::clock::hold();
         let _running = InFlight::new(self);
         let (pipeline, generation) = self.source.current();
@@ -1695,8 +1985,7 @@ impl ModelForward for DelegatingModel {
 
     fn new_kv_cache(&self, capacity: usize) -> KvCache {
         let (pipeline, generation) = self.source.current();
-        let full = self.source.decode_alone();
-        self.cache_on(&pipeline, generation, capacity, Vec::new(), full)
+        self.cache_on(&pipeline, generation, capacity, Vec::new())
     }
 
     fn forward(
@@ -1704,11 +1993,8 @@ impl ModelForward for DelegatingModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        slot_id: usize,
+        _slot_id: usize,
     ) -> Result<Vec<f32>> {
-        if self.alone(cache, start_pos, tokens.len() == 1) {
-            return self.model.forward(cache, tokens, start_pos, slot_id);
-        }
         if self.source.head_on_last() {
             return self.run(cache, tokens, start_pos, Rows::LastLogits);
         }
@@ -1726,13 +2012,8 @@ impl ModelForward for DelegatingModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        slot_id: usize,
+        _slot_id: usize,
     ) -> Result<()> {
-        if self.alone(cache, start_pos, false) {
-            return self
-                .model
-                .forward_no_logits(cache, tokens, start_pos, slot_id);
-        }
         self.run(cache, tokens, start_pos, Rows::None).map(|_| ())
     }
 
@@ -1741,13 +2022,8 @@ impl ModelForward for DelegatingModel {
         cache: &mut KvCache,
         tokens: &[u32],
         start_pos: usize,
-        slot_id: usize,
+        _slot_id: usize,
     ) -> Result<Vec<Vec<f32>>> {
-        if self.alone(cache, start_pos, false) {
-            return self
-                .model
-                .forward_all_logits(cache, tokens, start_pos, slot_id);
-        }
         if self.source.head_on_last() {
             let n_vocab = self.model.config().n_vocab;
             let all = self.run(cache, tokens, start_pos, Rows::AllLogits)?;
@@ -1772,11 +2048,6 @@ impl ModelForward for DelegatingModel {
         tokens: &[u32],
         start_pos: usize,
     ) -> Result<Vec<f32>> {
-        if self.alone(cache, start_pos, false) {
-            return self
-                .model
-                .forward_hidden_states_at(cache, tokens, start_pos);
-        }
         let mut x = self.run(cache, tokens, start_pos, Rows::All)?;
         self.model.final_norm(&mut x, tokens.len())?;
         Ok(x)
@@ -1799,7 +2070,6 @@ impl ModelForward for DelegatingModel {
 pub(crate) mod fixture {
     use crate::engine::arch::ModelForward;
     use crate::engine::arch::llama::LlamaModel;
-    use crate::engine::arch::qwen35::Qwen35Model;
     use crate::engine::backend::CpuBackend;
     use crate::engine::loader::LoadedModel;
     use std::sync::Arc;
@@ -1839,24 +2109,9 @@ pub(crate) mod fixture {
         /// One weight of this layer's `attn_q` changed: the same layout
         /// with different weights, like another release of a model.
         pub nudge_layer: Option<usize>,
-        /// A `qwen35` model instead: gated-DeltaNet layers, each keeping a
-        /// recurrent state, and an attention layer every
-        /// [`HYBRID_INTERVAL`]-th.
-        pub hybrid: bool,
     }
 
-    /// The hybrid fixture's attention layers: every second one.
-    const HYBRID_INTERVAL: usize = 2;
-    /// Its attention head size.
-    const HYBRID_HEAD_DIM: usize = 16;
-    /// Its gated-DeltaNet layers: conv window, state size per head, key
-    /// heads and value heads.
-    const SSM_CONV: usize = 4;
-    const SSM_STATE: usize = 8;
-    const SSM_GROUPS: usize = 2;
-    const SSM_V_HEADS: usize = 4;
-
-    /// The GGUF bytes: `llama` (or `qwen35`) metadata and every tensor in
+    /// The GGUF bytes: `llama` metadata and every tensor in
     /// `F32`, filled from a fixed-seed generator so every run builds the
     /// same model.
     fn gguf(variant: Variant) -> Vec<u8> {
@@ -1875,54 +2130,20 @@ pub(crate) mod fixture {
             ("ffn_down.weight", vec![N_FF as u64, e], false),
         ];
         for i in 0..N_LAYER {
-            let layer: Vec<(&str, Vec<u64>, bool)> = if !variant.hybrid {
-                vec![
-                    ("attn_norm.weight", vec![e], true),
-                    ("attn_q.weight", vec![e, e], false),
-                    ("attn_k.weight", vec![e, kv_dim as u64], false),
-                    ("attn_v.weight", vec![e, kv_dim as u64], false),
-                    ("attn_output.weight", vec![e, e], false),
-                    ("ffn_norm.weight", vec![e], true),
-                ]
-            } else if (i + 1) % HYBRID_INTERVAL == 0 {
-                // A gated attention layer: each head's query and gate
-                // interleaved in `attn_q`.
-                let hd = HYBRID_HEAD_DIM as u64;
-                vec![
-                    ("attn_norm.weight", vec![e], true),
-                    ("post_attention_norm.weight", vec![e], true),
-                    ("attn_q.weight", vec![e, 2 * N_HEAD as u64 * hd], false),
-                    ("attn_q_norm.weight", vec![hd], true),
-                    ("attn_k.weight", vec![e, N_HEAD_KV as u64 * hd], false),
-                    ("attn_k_norm.weight", vec![hd], true),
-                    ("attn_v.weight", vec![e, N_HEAD_KV as u64 * hd], false),
-                    ("attn_output.weight", vec![N_HEAD as u64 * hd, e], false),
-                ]
-            } else {
-                // A gated-DeltaNet layer.
-                let key = (SSM_STATE * SSM_GROUPS) as u64;
-                let value = (SSM_STATE * SSM_V_HEADS) as u64;
-                let conv = 2 * key + value;
-                vec![
-                    ("attn_norm.weight", vec![e], true),
-                    ("post_attention_norm.weight", vec![e], true),
-                    ("attn_qkv.weight", vec![e, conv], false),
-                    ("attn_gate.weight", vec![e, value], false),
-                    ("ssm_beta.weight", vec![e, SSM_V_HEADS as u64], false),
-                    ("ssm_alpha.weight", vec![e, SSM_V_HEADS as u64], false),
-                    ("ssm_conv1d.weight", vec![SSM_CONV as u64, conv], false),
-                    ("ssm_dt.bias", vec![SSM_V_HEADS as u64], false),
-                    ("ssm_a", vec![SSM_V_HEADS as u64], false),
-                    ("ssm_norm.weight", vec![SSM_STATE as u64], true),
-                    ("ssm_out.weight", vec![value, e], false),
-                ]
-            };
+            let layer: Vec<(&str, Vec<u64>, bool)> = vec![
+                ("attn_norm.weight", vec![e], true),
+                ("attn_q.weight", vec![e, e], false),
+                ("attn_k.weight", vec![e, kv_dim as u64], false),
+                ("attn_v.weight", vec![e, kv_dim as u64], false),
+                ("attn_output.weight", vec![e, e], false),
+                ("ffn_norm.weight", vec![e], true),
+            ];
             for (suffix, dims, norm) in layer.into_iter().chain(ffn.iter().cloned()) {
                 tensors.push((format!("blk.{i}.{suffix}"), dims, norm));
             }
         }
 
-        let arch = if variant.hybrid { "qwen35" } else { "llama" };
+        let arch = "llama";
         let mut meta = Vec::new();
         let mut n_meta = 1u64;
         let mut u32_kv = |key: &str, value: u32| {
@@ -1935,17 +2156,6 @@ pub(crate) mod fixture {
         u32_kv("attention.head_count_kv", N_HEAD_KV as u32);
         u32_kv("context_length", N_CTX as u32);
         u32_kv("vocab_size", N_VOCAB as u32);
-        if variant.hybrid {
-            u32_kv("attention.key_length", HYBRID_HEAD_DIM as u32);
-            u32_kv("attention.value_length", HYBRID_HEAD_DIM as u32);
-            u32_kv("rope.dimension_count", HYBRID_HEAD_DIM as u32);
-            u32_kv("full_attention_interval", HYBRID_INTERVAL as u32);
-            u32_kv("ssm.conv_kernel", SSM_CONV as u32);
-            u32_kv("ssm.state_size", SSM_STATE as u32);
-            u32_kv("ssm.group_count", SSM_GROUPS as u32);
-            u32_kv("ssm.time_step_rank", SSM_V_HEADS as u32);
-            u32_kv("ssm.inner_size", (SSM_STATE * SSM_V_HEADS) as u32);
-        }
         meta_f32(&mut meta, &format!("{arch}.rope.freq_base"), 10000.0);
         meta_f32(
             &mut meta,
@@ -1986,10 +2196,6 @@ pub(crate) mod fixture {
                 state ^= state << 17;
                 let unit = (state >> 40) as f32 / (1u64 << 24) as f32 - 0.5;
                 let mut value = if *norm { 1.0 + unit * 0.2 } else { unit * 0.4 };
-                // A recurrent state decays: its `A` is negative.
-                if name.ends_with("ssm_a") {
-                    value = -0.5 - unit.abs();
-                }
                 if nudged && i == n / 2 {
                     value += 0.01;
                 }
@@ -2056,12 +2262,6 @@ pub(crate) mod fixture {
     /// The fixture model of `variant` on the CPU backend.
     pub fn model_for(variant: Variant) -> Arc<dyn ModelForward> {
         let loaded = loaded(variant);
-        if variant.hybrid {
-            return Arc::new(
-                Qwen35Model::load_with_backend(&loaded, Arc::new(CpuBackend))
-                    .expect("build the hybrid fixture model"),
-            );
-        }
         Arc::new(
             LlamaModel::load_with_backend(&loaded, Arc::new(CpuBackend))
                 .expect("build the fixture model"),
@@ -2415,23 +2615,6 @@ mod tests {
         assert_eq!(leaf.len(), 0);
     }
 
-    /// A source that decodes on the top-level node alone.
-    struct HandingOver(Arc<LayerPipeline>);
-
-    impl PipelineSource for HandingOver {
-        fn current(&self) -> (Arc<LayerPipeline>, u64) {
-            (self.0.clone(), 0)
-        }
-
-        fn recover(&self, _generation: u64) -> bool {
-            false
-        }
-
-        fn decode_alone(&self) -> bool {
-            true
-        }
-    }
-
     const MIB: u64 = 1 << 20;
 
     fn room_of(free: u64) -> KvRoom {
@@ -2654,160 +2837,6 @@ mod tests {
         assert!(err.to_string().contains("do not end the model"), "{err:#}");
     }
 
-    /// Decoding alone: the prompt runs through a two-level tree, the
-    /// first decode step brings every layer's rows back from the workers —
-    /// the one below the worker too — and lets them go, and every logit is
-    /// the model's alone. The slot's next turn goes on here, from its rows.
-    #[test]
-    fn a_sequence_decodes_alone_once_its_prompt_is_through_the_tree() {
-        use crate::engine::slot_store::SlotStore;
-        let model = fixture::model();
-        let leaf = Arc::new(SessionStore::new(
-            Arc::new(LayerPipeline::new(model.clone(), 3..4, vec![]).unwrap()),
-            N_CTX,
-            8,
-        ));
-        let middle = Arc::new(SessionStore::new(
-            Arc::new(
-                LayerPipeline::new(
-                    model.clone(),
-                    1..3,
-                    vec![Box::new(LoopbackStage::new(
-                        leaf.clone(),
-                        ActivationFormat::F32,
-                    ))],
-                )
-                .unwrap(),
-            ),
-            N_CTX,
-            8,
-        ));
-        let pipeline = Arc::new(
-            LayerPipeline::new(
-                model.clone(),
-                0..1,
-                vec![Box::new(LoopbackStage::new(
-                    middle.clone(),
-                    ActivationFormat::F32,
-                ))],
-            )
-            .unwrap(),
-        );
-        let split = DelegatingModel::with_source(model.clone(), Arc::new(HandingOver(pipeline)));
-        let tokens = fixture::tokens();
-        assert_eq!(run(&split, &tokens, 5), run(model.as_ref(), &tokens, 5));
-
-        let store = SlotStore::at(std::path::PathBuf::new(), String::new(), 1);
-        let mut cache = split.new_kv_cache(N_CTX);
-        split.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
-        assert!(cache.remote.is_some());
-        assert_eq!((middle.len(), leaf.len()), (1, 1));
-        for pos in 5..7 {
-            split
-                .forward(&mut cache, &tokens[pos..pos + 1], pos, 0)
-                .unwrap();
-        }
-        assert!(cache.remote.is_none(), "handed over");
-        assert_eq!((middle.len(), leaf.len()), (0, 0), "the workers let it go");
-        store.retain(0, tokens[..7].to_vec(), cache);
-
-        let mut prompt = tokens[..7].to_vec();
-        prompt.extend([11, 12, 13]);
-        let mut next = split.new_kv_cache(N_CTX);
-        assert_eq!(store.reuse_into(0, &prompt, &mut next), 7);
-        let logits = split.forward(&mut next, &prompt[7..], 7, 0).unwrap();
-        assert!(next.remote.is_none(), "went on here");
-        assert_eq!((middle.len(), leaf.len()), (0, 0));
-        let mut reference = model.new_kv_cache(N_CTX);
-        first_turn(model.as_ref(), &mut reference);
-        assert_eq!(
-            logits,
-            model.forward(&mut reference, &prompt[7..], 7, 0).unwrap()
-        );
-        store.retain(0, prompt.clone(), next);
-
-        // Less than half of a prompt reused: the whole of it goes through the
-        // tree, which reads prompts faster.
-        let mut long = prompt[..7].to_vec();
-        long.extend(30..40);
-        let mut fresh = split.new_kv_cache(N_CTX);
-        assert_eq!(store.reuse_into(0, &long, &mut fresh), 0);
-        split.forward(&mut fresh, &long, 0, 0).unwrap();
-        assert_eq!((middle.len(), leaf.len()), (1, 1), "through the tree");
-    }
-
-    /// A hybrid model decodes alone too: its recurrent layers' states come
-    /// back with the attention layers' rows, from both levels of the tree,
-    /// and every logit after is the model's alone. Its layers alternate,
-    /// so each node holds both kinds — or, at the leaf, only attention.
-    #[test]
-    fn a_hybrid_sequence_decodes_alone_with_its_states_brought_back() {
-        let model = fixture::model_for(fixture::Variant {
-            hybrid: true,
-            ..fixture::Variant::default()
-        });
-        let leaf = Arc::new(SessionStore::new(
-            Arc::new(LayerPipeline::new(model.clone(), 3..4, vec![]).unwrap()),
-            N_CTX,
-            8,
-        ));
-        let middle = Arc::new(SessionStore::new(
-            Arc::new(
-                LayerPipeline::new(
-                    model.clone(),
-                    1..3,
-                    vec![Box::new(LoopbackStage::new(
-                        leaf.clone(),
-                        ActivationFormat::F32,
-                    ))],
-                )
-                .unwrap(),
-            ),
-            N_CTX,
-            8,
-        ));
-        let pipeline = Arc::new(
-            LayerPipeline::new(
-                model.clone(),
-                0..1,
-                vec![Box::new(LoopbackStage::new(
-                    middle.clone(),
-                    ActivationFormat::F32,
-                ))],
-            )
-            .unwrap(),
-        );
-        let split = DelegatingModel::with_source(model.clone(), Arc::new(HandingOver(pipeline)));
-        let tokens = fixture::tokens();
-        let mut cache = split.new_kv_cache(N_CTX);
-        let mut reference = model.new_kv_cache(N_CTX);
-        let mut worst = 0f32;
-        let mut compare = |a: Vec<f32>, b: Vec<f32>| {
-            assert_eq!(a.len(), b.len());
-            for (x, y) in a.iter().zip(&b) {
-                worst = worst.max((x - y).abs());
-            }
-        };
-        compare(
-            split.forward(&mut cache, &tokens[..5], 0, 0).unwrap(),
-            model.forward(&mut reference, &tokens[..5], 0, 0).unwrap(),
-        );
-        assert_eq!((middle.len(), leaf.len()), (1, 1));
-        for pos in 5..tokens.len() {
-            compare(
-                split
-                    .forward(&mut cache, &tokens[pos..pos + 1], pos, 0)
-                    .unwrap(),
-                model
-                    .forward(&mut reference, &tokens[pos..pos + 1], pos, 0)
-                    .unwrap(),
-            );
-        }
-        assert!(cache.remote.is_none(), "handed over");
-        assert_eq!((middle.len(), leaf.len()), (0, 0), "the workers let it go");
-        assert!(worst < 1e-4, "{worst}");
-    }
-
     /// The end of a request answers where its time went, per node and in
     /// pipeline order, and starts counting afresh for the next request on
     /// the same session.
@@ -2889,6 +2918,181 @@ mod tests {
         assert_eq!(slots.reuse_into(0, &prompt, &mut request), 0);
     }
 
+    /// A finished conversation kept the way a request's end keeps it, with
+    /// both the slot store and the prefix pool on.
+    fn finish_first_turn(
+        split: &DelegatingModel,
+        pool: &PrefixCache,
+        slots: &crate::engine::slot_store::SlotStore,
+    ) -> Vec<u32> {
+        let history = fixture::tokens()[..7].to_vec();
+        let mut cache = split.new_kv_cache(N_CTX);
+        first_turn(split, &mut cache);
+        crate::engine::generate::keep_finished(
+            Some(pool),
+            Some(slots),
+            0,
+            false,
+            history.clone(),
+            cache,
+        );
+        history
+    }
+
+    /// What a model alone answers for `prompt[7..]` after the first turn.
+    fn alone_after_first_turn(prompt: &[u32]) -> Vec<f32> {
+        let alone = fixture::model();
+        let mut reference = alone.new_kv_cache(N_CTX);
+        first_turn(alone.as_ref(), &mut reference);
+        alone.forward(&mut reference, &prompt[7..], 7, 0).unwrap()
+    }
+
+    /// A finished conversation's pool entry keeps a session of its own on
+    /// the worker, held there; a new prompt sharing its prefix takes it over
+    /// and gets the answer a model alone gives.
+    #[test]
+    fn a_pool_entry_serves_a_shared_prefix_from_the_workers() {
+        use crate::engine::slot_store::SlotStore;
+        let (leaf, split) = one_worker_tree();
+        let pool = PrefixCache::new(crate::engine::prefix_cache::ENTRIES);
+        let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 2);
+        let history = finish_first_turn(&split, &pool, &slots);
+        assert_eq!(leaf.len(), 2, "the slot's session and the pool's copy");
+        assert_eq!(leaf.retained().0, 1, "the pool's copy is held");
+        assert_eq!(pool.stats().entries, 1);
+        assert_eq!(pool.stats().tokens_held, 7);
+
+        let mut prompt = history.clone();
+        prompt.extend([11, 12, 13]);
+        let mut next = split.new_kv_cache(N_CTX);
+        let reused = crate::engine::generate::reuse_from_pool(&pool, &prompt, &mut next);
+        assert_eq!(reused, 7);
+        assert_eq!(leaf.retained().0, 0, "out of the pool, no longer held");
+        assert_eq!(pool.stats().hits, 1);
+        let logits = split.forward(&mut next, &prompt[7..], 7, 0).unwrap();
+        assert_eq!(logits, alone_after_first_turn(&prompt));
+        assert_eq!(leaf.len(), 2, "taken over, not copied again");
+
+        drop(next);
+        slots.clear();
+        assert_eq!(leaf.len(), 0);
+    }
+
+    /// With the pool on, the slot store keeps the conversation itself — rows
+    /// on the workers included — and still serves the slot's next turn.
+    #[test]
+    fn the_slot_keeps_its_own_conversation_beside_the_pool() {
+        use crate::engine::slot_store::SlotStore;
+        let (leaf, split) = one_worker_tree();
+        let pool = PrefixCache::new(crate::engine::prefix_cache::ENTRIES);
+        let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 1);
+        let history = finish_first_turn(&split, &pool, &slots);
+
+        let mut prompt = history.clone();
+        prompt.extend([11, 12, 13]);
+        let mut next = split.new_kv_cache(N_CTX);
+        assert_eq!(slots.reuse_into(0, &prompt, &mut next), 7);
+        let logits = split.forward(&mut next, &prompt[7..], 7, 0).unwrap();
+        assert_eq!(logits, alone_after_first_turn(&prompt));
+        assert_eq!(pool.stats().entries, 1, "the pool keeps its copy");
+        assert_eq!(leaf.len(), 2);
+
+        // The slot's next end replaces its conversation, and the pool's
+        // oldest entry gives way rather than a session past the worker's.
+        crate::engine::generate::keep_finished(
+            Some(&pool),
+            Some(&slots),
+            0,
+            false,
+            prompt.clone(),
+            next,
+        );
+        assert_eq!(pool.stats().entries, 2);
+        assert_eq!(leaf.len(), 3, "the slot's one and the pool's two");
+    }
+
+    /// The pool keeps no more sessions on a worker than it said it keeps,
+    /// and sends a worker that keeps none no copy at all.
+    #[test]
+    fn the_pool_keeps_to_what_each_worker_reserves() {
+        use crate::engine::slot_store::SlotStore;
+        for reserve in [0, 1, 2] {
+            let leaf = Arc::new(
+                SessionStore::new(
+                    Arc::new(LayerPipeline::new(fixture::model(), 2..4, vec![]).unwrap()),
+                    N_CTX,
+                    16,
+                )
+                .with_pool_reserve(reserve),
+            );
+            let split = delegating(0..2, vec![over(&leaf)]);
+            let pool = PrefixCache::new(crate::engine::prefix_cache::ENTRIES);
+            let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 4);
+            for (slot, start) in [(0usize, 1u32), (1, 20), (2, 40), (3, 50)] {
+                let history: Vec<u32> = (start..start + 6).collect();
+                let mut cache = split.new_kv_cache(N_CTX);
+                split.forward(&mut cache, &history, 0, 0).unwrap();
+                crate::engine::generate::keep_finished(
+                    Some(&pool),
+                    Some(&slots),
+                    slot,
+                    false,
+                    history,
+                    cache,
+                );
+                assert!(leaf.retained().0 <= reserve, "reserve {reserve}");
+            }
+            assert_eq!(pool.stats().entries, reserve, "reserve {reserve}");
+            assert_eq!(leaf.retained().0, reserve);
+            assert_eq!(leaf.len(), 4 + reserve, "four slots and the pool's copies");
+        }
+    }
+
+    /// A worker without room for a prompt makes this node drop its pool's
+    /// oldest entry, which releases the entry's session there; the prompt is
+    /// then admitted.
+    #[test]
+    fn a_worker_short_of_room_costs_the_pool_an_entry() {
+        use crate::engine::slot_store::SlotStore;
+        let handle: Arc<OnceLock<Weak<SessionStore>>> = Arc::new(OnceLock::new());
+        let reading = handle.clone();
+        // 20 MiB, less 7 MiB for every session held: 6 MiB free with the
+        // slot's conversation and the pool's copy, 13 MiB with one.
+        let free = move || {
+            let held = reading
+                .get()
+                .and_then(Weak::upgrade)
+                .map_or(0, |store| store.len() as u64);
+            (20 * MIB).saturating_sub(held * 7 * MIB)
+        };
+        let pipeline = LayerPipeline::new(fixture::model(), 2..4, vec![])
+            .unwrap()
+            .with_room(KvRoom::with_free_memory(MIB, Box::new(free)));
+        let leaf = Arc::new(SessionStore::new(Arc::new(pipeline), N_CTX, 8).named("w1:8400"));
+        handle.set(Arc::downgrade(&leaf)).ok().unwrap();
+        let split = DelegatingModel::new(Arc::new(
+            LayerPipeline::new(fixture::model(), 0..2, vec![over(&leaf)])
+                .unwrap()
+                .with_room(room_of(u64::MAX)),
+        ))
+        .unwrap();
+        let pool = Arc::new(PrefixCache::new(crate::engine::prefix_cache::ENTRIES));
+        split.attach_prefix_cache(&pool);
+        let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 1);
+        finish_first_turn(&split, &pool, &slots);
+        assert_eq!((leaf.len(), pool.stats().entries), (2, 1));
+
+        let cache = split.new_kv_cache(N_CTX);
+        split.admit_prompt(&cache, 10).unwrap();
+        assert_eq!(pool.stats().entries, 0, "the entry gave way");
+        assert_eq!(leaf.len(), 1, "the slot's conversation stays");
+
+        // Nothing left to drop: refused as without a pool.
+        let cache = split.new_kv_cache(N_CTX);
+        let error = split.admit_prompt(&cache, 15).unwrap_err();
+        assert!(error.downcast::<NoRoomForPrompt>().is_ok());
+    }
+
     /// A slot whose snapshot has no rows on the workers — read back from a
     /// file, say — gives a spread model nothing, and cannot be saved while
     /// it holds rows there.
@@ -2908,6 +3112,352 @@ mod tests {
 
         store.retain(0, history, cache);
         assert!(store.save(0, "slot.bin").is_err());
+    }
+
+    /// Saved-prefix files under a fresh directory of their own, named
+    /// `node`.
+    fn prefix_files(tag: &str, node: &str) -> Arc<super::super::prefixes::PrefixFiles> {
+        let root = std::env::temp_dir().join(format!(
+            "orangu-saved-pool-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let files = super::super::prefixes::PrefixFiles::under(&root, [3; 32], node);
+        let _ = std::fs::remove_dir_all(files.dir());
+        Arc::new(files)
+    }
+
+    /// A worker over `layers` saving into `files`.
+    fn saving_store(
+        layers: Range<usize>,
+        files: &Arc<super::super::prefixes::PrefixFiles>,
+    ) -> Arc<SessionStore> {
+        Arc::new(
+            SessionStore::new(
+                Arc::new(LayerPipeline::new(fixture::model(), layers, vec![]).unwrap()),
+                N_CTX,
+                8,
+            )
+            .with_prefixes(Some(files.clone())),
+        )
+    }
+
+    /// A top-level node over `stages`, its own layers `local`, with a prefix
+    /// pool and its own saved-prefix files.
+    fn saving_top(
+        local: Range<usize>,
+        stages: Vec<Box<dyn Stage>>,
+        files: &Arc<super::super::prefixes::PrefixFiles>,
+    ) -> (DelegatingModel, Arc<PrefixCache>) {
+        let split = delegating(local, stages);
+        let pool = Arc::new(PrefixCache::new(crate::engine::prefix_cache::ENTRIES));
+        split.attach_prefix_cache(&pool);
+        split.attach_prefix_files(files.clone());
+        (split, pool)
+    }
+
+    /// The manifest a top-level node over `local` and `workers` saves under.
+    fn base(
+        local: Range<usize>,
+        workers: &[(&str, Range<usize>)],
+    ) -> super::super::prefixes::Manifest {
+        use super::super::prefixes::SavedNode;
+        let node = |name: &str, layers: &Range<usize>| SavedNode {
+            name: name.to_string(),
+            layers: (layers.start, layers.end),
+            budget: 0,
+        };
+        super::super::prefixes::Manifest {
+            n_ctx: N_CTX,
+            local: (local.start, local.end),
+            local_budget: 0,
+            workers: workers.iter().map(|(n, l)| node(n, l)).collect(),
+            plan: std::iter::once(node("top", &local))
+                .chain(workers.iter().map(|(n, l)| node(n, l)))
+                .collect(),
+            entries: Vec::new(),
+        }
+    }
+
+    /// A conversation of `history`, finished and kept as a request's end
+    /// keeps it.
+    fn keep_conversation(
+        split: &DelegatingModel,
+        pool: &PrefixCache,
+        slots: &crate::engine::slot_store::SlotStore,
+        slot: usize,
+        history: &[u32],
+    ) {
+        let mut cache = split.new_kv_cache(N_CTX);
+        split.forward(&mut cache, history, 0, 0).unwrap();
+        crate::engine::generate::keep_finished(
+            Some(pool),
+            Some(slots),
+            slot,
+            false,
+            history.to_vec(),
+            cache,
+        );
+    }
+
+    /// The pool saved on every node as the tree is let go, and put back on a
+    /// tree formed again of the same nodes, serves a prompt sharing its
+    /// prefix with no replay of the prefix: the answer a model alone gives.
+    /// The entry taken out of the pool is deleted from every disk.
+    #[test]
+    fn a_saved_pool_is_put_back_and_serves_its_prefix_without_a_replay() {
+        use crate::engine::slot_store::SlotStore;
+        let worker_files = prefix_files("roundtrip", "leaf");
+        let top_files = prefix_files("roundtrip", "top");
+        let manifest = {
+            let leaf = saving_store(2..4, &worker_files);
+            let (split, pool) = saving_top(0..2, vec![over(&leaf)], &top_files);
+            let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 2);
+            finish_first_turn(&split, &pool, &slots);
+            let moved = split.save_prefixes(base(0..2, &[("leaf", 2..4)]));
+            assert_eq!((moved.entries, moved.tokens), (1, 7));
+            assert_eq!(pool.stats().entries, 0, "the pool is emptied");
+            assert_eq!(split.prefixes_saved().0, 1);
+            slots.clear();
+            assert_eq!(leaf.len(), 0, "the saved session is let go of");
+            top_files.manifest().expect("a manifest")
+        };
+        let listed = worker_files.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (listed[0].layer_start, listed[0].layer_end, listed[0].len),
+            (2, 4, 7)
+        );
+        assert_eq!(manifest.entries[0].key, listed[0].key);
+
+        // The same nodes, started again.
+        let leaf = saving_store(2..4, &worker_files);
+        let (split, pool) = saving_top(0..2, vec![over(&leaf)], &top_files);
+        let keys: Vec<String> = manifest.entries.iter().map(|e| e.key.clone()).collect();
+        let moved = split.load_prefixes(&manifest, &keys);
+        assert_eq!((moved.entries, moved.tokens), (1, 7));
+        assert_eq!(split.prefixes_saved(), (1, 1));
+        assert_eq!(pool.stats().entries, 1);
+        assert_eq!(leaf.retained().0, 1, "opened held");
+
+        let mut prompt = fixture::tokens()[..7].to_vec();
+        prompt.extend([11, 12, 13]);
+        let mut next = split.new_kv_cache(N_CTX);
+        let reused = crate::engine::generate::reuse_from_pool(&pool, &prompt, &mut next);
+        assert_eq!(reused, 7);
+        let logits = split.forward(&mut next, &prompt[7..], 7, 0).unwrap();
+        assert_eq!(logits, alone_after_first_turn(&prompt));
+        assert_eq!(split.rebuilds(), 0, "the prefix was not replayed");
+        assert!(worker_files.list().is_empty(), "taken out of the pool");
+        assert_eq!(top_files.manifest(), None);
+    }
+
+    /// An entry whose file one node finds damaged, or made for other layers,
+    /// is dropped on every node, the others' copies deleted; an entry every
+    /// node opens is put back.
+    #[test]
+    fn a_damaged_or_mismatched_file_drops_the_entry_everywhere() {
+        use crate::engine::slot_store::SlotStore;
+        let first_files = prefix_files("damaged", "w1");
+        let second_files = prefix_files("damaged", "w2");
+        let top_files = prefix_files("damaged", "top");
+        let conversations: [Vec<u32>; 2] = [(1..9).collect(), (20..30).collect()];
+        let manifest = {
+            let w1 = saving_store(1..2, &first_files);
+            let w2 = saving_store(2..4, &second_files);
+            let (split, pool) = saving_top(0..1, vec![over(&w1), over(&w2)], &top_files);
+            let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 2);
+            for (slot, history) in conversations.iter().enumerate() {
+                keep_conversation(&split, &pool, &slots, slot, history);
+            }
+            let moved = split.save_prefixes(base(0..1, &[("w1", 1..2), ("w2", 2..4)]));
+            assert_eq!(moved.entries, 2);
+            top_files.manifest().unwrap()
+        };
+        let (damaged, kept) = (&manifest.entries[0].key, &manifest.entries[1].key);
+        let path = second_files.dir().join(format!("{damaged}.bin"));
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+
+        let w1 = saving_store(1..2, &first_files);
+        let w2 = saving_store(2..4, &second_files);
+        let (split, pool) = saving_top(0..1, vec![over(&w1), over(&w2)], &top_files);
+        let keys = vec![damaged.clone(), kept.clone()];
+        let moved = split.load_prefixes(&manifest, &keys);
+        assert_eq!(moved.entries, 1);
+        assert_eq!(pool.stats().entries, 1);
+        let on = |files: &super::super::prefixes::PrefixFiles| -> Vec<String> {
+            files.list().into_iter().map(|s| s.key).collect()
+        };
+        assert_eq!(
+            on(&first_files),
+            vec![kept.clone()],
+            "the damaged entry's copy"
+        );
+        assert_eq!(on(&second_files), vec![kept.clone()]);
+        assert_eq!(top_files.manifest().unwrap().entries.len(), 1);
+        assert_eq!((w1.len(), w2.len()), (1, 1), "only the kept entry is open");
+        let mut prompt = conversations[1].clone();
+        prompt.push(5);
+        let mut next = split.new_kv_cache(N_CTX);
+        assert_eq!(
+            crate::engine::generate::reuse_from_pool(&pool, &prompt, &mut next),
+            conversations[1].len()
+        );
+        let logits = split
+            .forward(
+                &mut next,
+                &prompt[conversations[1].len()..],
+                conversations[1].len(),
+                0,
+            )
+            .unwrap();
+        let alone = fixture::model();
+        let mut reference = alone.new_kv_cache(N_CTX);
+        let held = conversations[1].len();
+        alone
+            .forward(&mut reference, &prompt[..held], 0, 0)
+            .unwrap();
+        let expected = alone
+            .forward(&mut reference, &prompt[held..], held, 0)
+            .unwrap();
+        assert_eq!(logits, expected);
+        drop((next, split, pool));
+
+        // The same nodes cut differently: their files are of other layers.
+        let manifest = {
+            let w1 = saving_store(1..2, &first_files);
+            let w2 = saving_store(2..4, &second_files);
+            let (split, pool) = saving_top(0..1, vec![over(&w1), over(&w2)], &top_files);
+            let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 1);
+            keep_conversation(&split, &pool, &slots, 0, &conversations[0]);
+            split.save_prefixes(base(0..1, &[("w1", 1..2), ("w2", 2..4)]));
+            top_files.manifest().unwrap()
+        };
+        let w1 = saving_store(1..3, &first_files);
+        let w2 = saving_store(3..4, &second_files);
+        let (split, pool) = saving_top(0..1, vec![over(&w1), over(&w2)], &top_files);
+        let keys: Vec<String> = manifest.entries.iter().map(|e| e.key.clone()).collect();
+        assert_eq!(split.load_prefixes(&manifest, &keys).entries, 0);
+        assert_eq!(pool.stats().entries, 0);
+        assert!(on(&first_files).is_empty() && on(&second_files).is_empty());
+        assert_eq!(top_files.manifest(), None);
+        assert_eq!((w1.len(), w2.len()), (0, 0));
+    }
+
+    /// A worker as the tests' loopback, minus [`FEATURE_PREFIXES`], noting
+    /// every message it is sent.
+    use super::super::protocol::Message;
+
+    struct WithoutPrefixes {
+        inner: super::super::stage::Loopback,
+        sent: Mutex<Vec<String>>,
+    }
+
+    impl super::super::stage::Exchange for WithoutPrefixes {
+        fn exchange(&self, message: &Message) -> Result<Message> {
+            let kind = format!("{message:?}");
+            self.sent.lock().unwrap().push(
+                kind.split([' ', '(', '{'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+            self.inner.exchange(message)
+        }
+
+        fn name(&self) -> String {
+            "old".to_string()
+        }
+
+        fn features(&self) -> u64 {
+            super::super::protocol::FEATURES & !super::super::protocol::FEATURE_PREFIXES
+        }
+
+        fn pool_reserve(&self) -> usize {
+            self.inner.pool_reserve()
+        }
+
+        fn saved(&self) -> Vec<super::super::protocol::SavedPrefix> {
+            self.inner.saved()
+        }
+    }
+
+    impl super::super::stage::Exchange for Arc<WithoutPrefixes> {
+        fn exchange(&self, message: &Message) -> Result<Message> {
+            self.as_ref().exchange(message)
+        }
+
+        fn name(&self) -> String {
+            self.as_ref().name()
+        }
+
+        fn features(&self) -> u64 {
+            self.as_ref().features()
+        }
+
+        fn pool_reserve(&self) -> usize {
+            self.as_ref().pool_reserve()
+        }
+
+        fn saved(&self) -> Vec<super::super::protocol::SavedPrefix> {
+            self.as_ref().saved()
+        }
+    }
+
+    /// A worker that did not advertise the bit is sent no Save, Load or
+    /// Forget, and an entry it would hold a part of is not saved anywhere.
+    #[test]
+    fn a_node_without_the_bit_is_never_sent_save_or_load() {
+        use super::super::stage::{Loopback, MessageStage};
+        use crate::engine::slot_store::SlotStore;
+        let worker_files = prefix_files("nobit", "old");
+        let top_files = prefix_files("nobit", "top");
+        let leaf = saving_store(2..4, &worker_files);
+        let old = Arc::new(WithoutPrefixes {
+            inner: Loopback(leaf.clone()),
+            sent: Mutex::new(Vec::new()),
+        });
+        let stage = MessageStage::over(old.clone(), 2..4, ActivationFormat::F32);
+        let (split, pool) = saving_top(0..2, vec![Box::new(stage)], &top_files);
+        let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 1);
+        finish_first_turn(&split, &pool, &slots);
+        assert_eq!(pool.stats().entries, 1);
+        assert_eq!(split.save_prefixes(base(0..2, &[("old", 2..4)])).entries, 0);
+        assert_eq!(top_files.manifest(), None);
+        assert!(worker_files.list().is_empty());
+
+        // A manifest naming it, from elsewhere, and this node's own file of
+        // the entry: nothing is asked of the worker.
+        let key = super::super::prefixes::new_key();
+        let mut own = fixture::model().new_kv_cache_for_layers(0..2, N_CTX);
+        for layer in &mut own.layers[..2] {
+            let width = layer.kv_dim();
+            for _ in 0..7 {
+                layer.push(&vec![0.5; width], &vec![0.5; width]);
+            }
+        }
+        top_files
+            .write(&key, true, 0..2, N_CTX, 7, &fixture::tokens()[..7], &own)
+            .unwrap();
+        let manifest = super::super::prefixes::Manifest {
+            entries: vec![super::super::prefixes::SavedEntry {
+                key: key.clone(),
+                len: 7,
+                capacity: N_CTX,
+            }],
+            ..base(0..2, &[("old", 2..4)])
+        };
+        let keys = vec![key];
+        assert_eq!(split.load_prefixes(&manifest, &keys).entries, 0);
+        let sent = old.sent.lock().unwrap().clone();
+        assert!(
+            !sent
+                .iter()
+                .any(|m| m == "Save" || m == "Load" || m == "Forget"),
+            "{sent:?}"
+        );
+        assert!(sent.iter().any(|m| m == "Forward"), "{sent:?}");
     }
 
     /// A worker that let go of an idle session — as it does after

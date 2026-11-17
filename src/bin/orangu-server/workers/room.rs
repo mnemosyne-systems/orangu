@@ -153,6 +153,11 @@ impl KvRoom {
         }
     }
 
+    /// What `positions` of a sequence take on this node's layers.
+    pub fn bytes_for(&self, positions: usize) -> u64 {
+        self.per_position.saturating_mul(positions as u64)
+    }
+
     pub fn forget(&self, session: u64) {
         self.promises.lock().unwrap().remove(&session);
     }

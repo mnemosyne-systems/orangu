@@ -42,7 +42,6 @@
 use super::pipeline::{BatchItem, Stage};
 use super::protocol::{ActivationFormat, Activations, ErrorCode, Rows, WorkerError};
 use super::stage::EncodedStage;
-use crate::engine::kv_cache::LayerHold;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::ops::Range;
@@ -261,12 +260,46 @@ impl Stage for GuardedStage {
         self.current().0.release(session);
     }
 
-    fn layer_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold> {
-        self.current().0.layer_rows(session, layer, len)
-    }
-
     fn reserve(&self, session: u64, positions: usize) -> Result<()> {
         self.current().0.reserve(session, positions)
+    }
+
+    fn retain(&self, session: u64, held: bool) {
+        self.current().0.retain(session, held);
+    }
+
+    fn pool_reserve(&self) -> usize {
+        self.current().0.pool_reserve()
+    }
+
+    fn saves_prefixes(&self) -> bool {
+        self.current().0.saves_prefixes()
+    }
+
+    fn saved_prefixes(&self) -> Vec<super::protocol::SavedPrefix> {
+        self.current().0.saved_prefixes()
+    }
+
+    fn save(&self, session: u64, key: &str) -> Result<()> {
+        self.current().0.save(session, key)
+    }
+
+    /// A session opened from disk went by without its rows: a standby cannot
+    /// be given them, and it is rebuilt from the top instead.
+    fn load(&self, session: u64, key: &str, len: usize) -> Result<()> {
+        self.current().0.load(session, key, len)?;
+        self.kept.lock().unwrap().insert(
+            session,
+            Kept {
+                gap: true,
+                ..Kept::default()
+            },
+        );
+        Ok(())
+    }
+
+    fn forget(&self, key: &str) {
+        self.current().0.forget(key);
     }
 
     fn fork(&self, from: u64, to: u64, len: usize) -> Result<()> {

@@ -125,15 +125,6 @@ fn usable_len(entry: &CachedPrefill, prompt: &[u32]) -> usize {
     }
 }
 
-/// Whether reusing `len` positions of a conversation a tree's top-level node
-/// went on with alone (`KvCache::whole`) saves too little: the rest of
-/// the prompt would run here alone, and a tree reads a prompt faster than
-/// its top-level node — about 1.45 times on the board measured — so less
-/// than half the prompt reused is better sent through the tree whole.
-fn too_little_to_go_on_alone(src: &KvCache, dst: &KvCache, len: usize, prompt: &[u32]) -> bool {
-    src.whole && dst.remote.is_some() && len * 2 < prompt.len()
-}
-
 impl SlotStore {
     /// A stable hash of everything that must match for a saved KV cache to be
     /// safely reusable: the architecture, the model label (`general.name` /
@@ -210,6 +201,14 @@ impl SlotStore {
             }
         }
         released
+    }
+
+    /// Drops slot `slot_id`'s retained snapshot, if any.
+    pub fn forget(&self, slot_id: usize) {
+        if let Some(cell) = self.retained.get(slot_id) {
+            let dropped = retained(cell).take();
+            drop(dropped);
+        }
     }
 
     /// Drops every slot's retained snapshot: a `[workers]` node switching
@@ -293,7 +292,7 @@ impl SlotStore {
             return 0;
         };
         let len = usable_len(entry, prompt);
-        if len == 0 || too_little_to_go_on_alone(&entry.cache, dst, len, prompt) {
+        if len == 0 {
             return 0;
         }
         let remote = dst.remote.is_some();
@@ -340,10 +339,7 @@ impl SlotStore {
             return 0;
         };
         let len = usable_len(entry, prompt);
-        if len == 0
-            || too_little_to_go_on_alone(&entry.cache, dst, len, prompt)
-            || !dst.fork_remote_prefix(&entry.cache, len)
-        {
+        if len == 0 || !dst.fork_remote_prefix(&entry.cache, len) {
             return 0;
         }
         dst.copy_prefix_from(&entry.cache, len);

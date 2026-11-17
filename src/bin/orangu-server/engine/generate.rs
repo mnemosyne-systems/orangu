@@ -611,7 +611,7 @@ pub struct ServingSwitch {
     pub alone: Serving,
     /// Switched off through `POST /props`.
     off: std::sync::atomic::AtomicBool,
-    /// The node judged its workers not worth it.
+    /// The node's plan uses no worker.
     chosen: std::sync::atomic::AtomicBool,
     /// Which way serves changed since a request last looked: the slots'
     /// kept conversations were made the other way, and cannot serve.
@@ -645,7 +645,7 @@ impl ServingSwitch {
         self.note_change(before);
     }
 
-    /// The node's own judgement of its workers.
+    /// Whether the node's plan uses no worker.
     pub fn set_chosen(&self, alone: bool) {
         let before = self.is_alone();
         self.chosen
@@ -1341,6 +1341,86 @@ fn rebuild_on_pool(
     Ok(Some(cache))
 }
 
+/// Moves the prefix pool's best match for `prompt` into `dst`: how many
+/// positions it reused, `0` when no entry matched or its rows on other nodes
+/// could not be taken over. Always leaves one prompt token for a forward.
+pub(crate) fn reuse_from_pool(pool: &PrefixCache, prompt: &[u32], dst: &mut KvCache) -> usize {
+    let Some((matched, mut entry)) = pool.take_best_match(prompt) else {
+        return 0;
+    };
+    let matched = matched.min(prompt.len().saturating_sub(1));
+    if matched == 0 || !dst.take_remote_prefix(&mut entry.cache, matched) {
+        return 0;
+    }
+    // Moved, not copied: `take_best_match` removed this entry from the pool,
+    // so nothing else can still be reading it and its buffers can become this
+    // request's own. The slot store cannot do the same — it keeps its
+    // snapshot for the slot's next request.
+    dst.adopt_prefix(entry.cache, matched);
+    matched
+}
+
+/// Keeps a finished request's conversation for the requests after it: in
+/// the prefix pool, in slot `slot`'s store, or both, each then with a copy of
+/// its own. A background request fills an empty slot and replaces nothing.
+///
+/// With rows on other nodes (`KvCache::remote`), the slot keeps the cache
+/// itself and the pool gets a copy with a session of its own on every node
+/// (`KvCache::share`); when the nodes cannot make one, the pool is passed
+/// over. The slot's previous conversation, which this one replaces, and the
+/// pool's oldest entries, down to one fewer than the sessions every node said
+/// it keeps for the pool (`KvCache::pool_reserve`), are let go first, so the
+/// copy does not need a session beyond what the nodes make room for. A node
+/// that keeps none is sent no copy at all.
+pub(crate) fn keep_finished(
+    prefix_cache: Option<&PrefixCache>,
+    slot_store: Option<&super::slot_store::SlotStore>,
+    slot: usize,
+    background: bool,
+    history: Vec<u32>,
+    final_cache: KvCache,
+) {
+    match (prefix_cache, slot_store) {
+        (Some(pool), Some(store)) if final_cache.remote.is_some() => {
+            let reserve = final_cache.pool_reserve();
+            if reserve > 0 {
+                pool.make_room(reserve);
+            }
+            if !background {
+                store.forget(slot);
+            }
+            let len = history.len();
+            let copy = (reserve > 0).then(|| final_cache.share(len)).flatten();
+            if background {
+                store.fill_if_empty(slot, history.clone(), final_cache);
+            } else {
+                store.retain(slot, history.clone(), final_cache);
+            }
+            if let Some(copy) = copy {
+                pool.store(history, copy);
+            }
+        }
+        (Some(pool), Some(store)) => {
+            if background {
+                store.fill_if_empty(slot, history.clone(), final_cache.duplicate());
+            } else {
+                store.retain(slot, history.clone(), final_cache.duplicate());
+            };
+            pool.store(history, final_cache);
+        }
+        (Some(pool), None) => {
+            let reserve = final_cache.pool_reserve();
+            if reserve > 0 {
+                pool.make_room(reserve);
+                pool.store(history, final_cache);
+            }
+        }
+        (None, Some(store)) if background => store.fill_if_empty(slot, history, final_cache),
+        (None, Some(store)) => store.retain(slot, history, final_cache),
+        (None, None) => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run(
     model: &dyn ModelForward,
@@ -1615,18 +1695,8 @@ fn run_leg(
     if paged_kv.is_none()
         && req.cache_prompt
         && let Some(pool) = prefix_cache
-        && let Some((matched, entry)) = pool.take_best_match(&req.prompt_tokens)
     {
-        let mut entry = entry;
-        let matched = matched.min(req.prompt_tokens.len().saturating_sub(1));
-        if matched > 0 && new_cache.take_remote_prefix(&mut entry.cache, matched) {
-            // Moved, not copied: `take_best_match` removed this entry from the
-            // pool, so nothing else can still be reading it and its buffers
-            // can become this request's own. The slot store below cannot do
-            // the same — it keeps its snapshot for the slot's next request.
-            new_cache.adopt_prefix(entry.cache, matched);
-            reused_len = matched;
-        }
+        reused_len = reuse_from_pool(pool, &req.prompt_tokens, &mut new_cache);
     }
     // The cross-slot pool (above) has first claim; only if it found nothing
     // does this slot's own durably-retained cache (`engine::slot_store`, the
@@ -2698,9 +2768,8 @@ fn run_leg(
     // obviously the same conversation's following turn, whose prompt will
     // be exactly `history` plus a short new suffix). The same completed
     // cache is also retained as this slot's durable snapshot (`slot_store`)
-    // so a later `save` can persist it; when both features are on, the pool
-    // gets a `duplicate()` and the slot keeps the original, since each needs
-    // to own its copy.
+    // so a later `save` can persist it; when both features are on, each
+    // keeps a copy of its own (`keep_finished`).
     let mut workers = Vec::new();
     // `ORANGU_TRACE_TOKENS=1`: the exact token ids a request ran and emitted,
     // so a reply can be teacher-forced through another path without
@@ -2747,22 +2816,14 @@ fn run_leg(
                 // rows reach; the reply's are on the device.
                 final_cache.pull_decoded_rows(vulkan);
             }
-            match (prefix_cache, slot_store) {
-                (Some(pool), Some(store)) => {
-                    if req.background {
-                        store.fill_if_empty(guard.id(), history.clone(), final_cache.duplicate());
-                    } else {
-                        store.retain(guard.id(), history.clone(), final_cache.duplicate());
-                    };
-                    pool.store(history, final_cache);
-                }
-                (Some(pool), None) => pool.store(history, final_cache),
-                (None, Some(store)) if req.background => {
-                    store.fill_if_empty(guard.id(), history, final_cache)
-                }
-                (None, Some(store)) => store.retain(guard.id(), history, final_cache),
-                (None, None) => {}
-            }
+            keep_finished(
+                prefix_cache,
+                slot_store,
+                guard.id(),
+                req.background,
+                history,
+                final_cache,
+            );
         }
     }
 

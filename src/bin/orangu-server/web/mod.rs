@@ -1264,6 +1264,7 @@ async fn send_message(
                     log::warn!(
                         "orangu-server: workers: could not route a console turn to {base}: {err}"
                     );
+                    crate::workers::node::forward_failed(&base);
                     None
                 }
             }

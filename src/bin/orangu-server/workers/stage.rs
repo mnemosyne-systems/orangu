@@ -27,7 +27,6 @@ use super::protocol::{
 };
 #[cfg(test)]
 use super::session::SessionStore;
-use crate::engine::kv_cache::LayerHold;
 use anyhow::{Result, anyhow, bail, ensure};
 use std::collections::HashMap;
 use std::ops::Range;
@@ -46,6 +45,18 @@ pub trait Exchange: Send + Sync {
     /// The extensions the other end advertised (`protocol::FEATURES`).
     fn features(&self) -> u64 {
         0
+    }
+
+    /// The sessions the other end keeps for this node's prefix pool, as its
+    /// handshake said; none from one that did not say.
+    fn pool_reserve(&self) -> usize {
+        0
+    }
+
+    /// The prefixes the other end holds on its disk, as its handshake listed
+    /// them; none from one that did not list them.
+    fn saved(&self) -> Vec<super::protocol::SavedPrefix> {
+        Vec::new()
     }
 }
 
@@ -68,6 +79,14 @@ impl Exchange for Loopback {
 
     fn features(&self) -> u64 {
         super::protocol::FEATURES
+    }
+
+    fn pool_reserve(&self) -> usize {
+        self.0.pool_reserve()
+    }
+
+    fn saved(&self) -> Vec<super::protocol::SavedPrefix> {
+        self.0.saved()
     }
 }
 
@@ -321,62 +340,82 @@ impl<E: Exchange> Stage for MessageStage<E> {
         }
     }
 
-    fn layer_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold> {
-        ensure!(
-            self.exchange.features() & super::protocol::FEATURE_ROWS != 0,
-            "{} cannot send rows back",
-            self.exchange.name()
-        );
-        let message = Message::Rows {
-            session,
-            layer: u32::try_from(layer)?,
-            len: u32::try_from(len)?,
-        };
-        match self.exchange.exchange(&message)? {
-            Message::LayerRows {
-                kv_dim,
-                len: n,
-                data,
-            } => {
-                let (kv_dim, n) = (kv_dim as usize, n as usize);
-                ensure!(
-                    n == len && data.len() == 2 * 4 * n * kv_dim,
-                    "{} sent {} bytes for {n} of {len} rows of {kv_dim}",
-                    self.exchange.name(),
-                    data.len()
-                );
-                let floats = floats_of(&data);
-                let (k, v) = floats.split_at(n * kv_dim);
-                Ok(LayerHold::Rows {
-                    kv_dim,
-                    k: k.to_vec(),
-                    v: v.to_vec(),
-                })
-            }
-            Message::LayerState { conv, state } => {
-                ensure!(
-                    conv.len() % 4 == 0 && state.len() % 4 == 0,
-                    "{} sent a state of {} and {} bytes",
-                    self.exchange.name(),
-                    conv.len(),
-                    state.len()
-                );
-                Ok(LayerHold::State {
-                    conv: floats_of(&conv),
-                    state: floats_of(&state),
-                })
-            }
-            Message::Error(error) => Err(anyhow!(error)),
-            other => bail!("unexpected reply to a rows request: {other:?}"),
+    fn pool_reserve(&self) -> usize {
+        if self.exchange.features() & super::protocol::FEATURE_RETAIN == 0 {
+            return 0;
+        }
+        self.exchange.pool_reserve()
+    }
+
+    fn retain(&self, session: u64, held: bool) {
+        if self.exchange.features() & super::protocol::FEATURE_RETAIN == 0 {
+            return;
+        }
+        // Nothing to do with a failure: a session the worker evicts after all
+        // is rebuilt when it is used again.
+        match self.exchange.exchange(&Message::Retain { session, held }) {
+            Ok(Message::Retain { .. }) => {}
+            Ok(other) => log::debug!("orangu-server: workers: a retain answered {other:?}"),
+            Err(error) => log::debug!("orangu-server: workers: a retain failed: {error:#}"),
         }
     }
-}
 
-/// `f32` little-endian bytes as the values they are.
-fn floats_of(data: &[u8]) -> Vec<f32> {
-    data.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect()
+    fn saves_prefixes(&self) -> bool {
+        self.exchange.features() & super::protocol::FEATURE_PREFIXES != 0
+    }
+
+    fn saved_prefixes(&self) -> Vec<super::protocol::SavedPrefix> {
+        if !self.saves_prefixes() {
+            return Vec::new();
+        }
+        self.exchange.saved()
+    }
+
+    fn save(&self, session: u64, key: &str) -> Result<()> {
+        ensure!(
+            self.saves_prefixes(),
+            "{} cannot save a session",
+            self.exchange.name()
+        );
+        let key = key.to_string();
+        match self.exchange.exchange(&Message::Save { session, key })? {
+            Message::Save { .. } => Ok(()),
+            Message::Error(error) => Err(anyhow!(error)),
+            other => bail!("unexpected reply to a save: {other:?}"),
+        }
+    }
+
+    /// Sent only to a node whose handshake listed `key`: one that did not has
+    /// nothing to open it from.
+    fn load(&self, session: u64, key: &str, len: usize) -> Result<()> {
+        ensure!(
+            self.saved_prefixes().iter().any(|saved| saved.key == key),
+            "{} did not list prefix {key}",
+            self.exchange.name()
+        );
+        let len = u32::try_from(len)?;
+        let key = key.to_string();
+        match self
+            .exchange
+            .exchange(&Message::Load { session, key, len })?
+        {
+            Message::Load { .. } => Ok(()),
+            Message::Error(error) => Err(anyhow!(error)),
+            other => bail!("unexpected reply to a load: {other:?}"),
+        }
+    }
+
+    fn forget(&self, key: &str) {
+        if !self.saves_prefixes() {
+            return;
+        }
+        // Nothing to do with a failure: a node keeps no more files than a pool
+        // holds entries, and drops its oldest past that.
+        let key = key.to_string();
+        match self.exchange.exchange(&Message::Forget { key }) {
+            Ok(Message::Forget { .. }) => {}
+            Ok(other) => log::debug!("orangu-server: workers: a forget answered {other:?}"),
+            Err(error) => log::debug!("orangu-server: workers: a forget failed: {error:#}"),
+        }
+    }
 }

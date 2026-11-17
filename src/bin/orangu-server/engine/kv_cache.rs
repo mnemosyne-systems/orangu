@@ -2980,32 +2980,6 @@ pub enum CacheSlot {
     State(usize),
 }
 
-/// What one layer holds of a sequence, as it travels between the nodes
-/// of a tree of workers (`crate::workers`): an attention layer's first
-/// positions, or a recurrent layer's state after them.
-#[derive(Clone, Debug, PartialEq)]
-pub enum LayerHold {
-    /// `k.len() / kv_dim` rows of `kv_dim` keys, and as many values.
-    Rows {
-        kv_dim: usize,
-        k: Vec<f32>,
-        v: Vec<f32>,
-    },
-    /// The conv window and the state matrices, laid out as
-    /// [`RecurrentLayerState`] keeps them.
-    State { conv: Vec<f32>, state: Vec<f32> },
-}
-
-impl LayerHold {
-    /// Its size in `f32`, as it travels.
-    pub fn bytes(&self) -> usize {
-        4 * match self {
-            Self::Rows { k, v, .. } => k.len() + v.len(),
-            Self::State { conv, state } => conv.len() + state.len(),
-        }
-    }
-}
-
 pub struct KvCache {
     pub layers: Vec<LayerCache>,
     /// Recurrent (SSM / gated-delta-net) layer state, for architectures
@@ -3057,10 +3031,6 @@ pub struct KvCache {
     /// Boxed: only a top-level node of a tree has one, and every cache
     /// carries the slot.
     pub remote: Option<Box<RemoteSession>>,
-    /// Every layer's rows are here: a tree's top-level node took them over
-    /// from its workers to decode alone (`crate::workers`), and the
-    /// sequence goes on here. `false` for every other cache.
-    pub whole: bool,
     /// A recurrent model's state where the conversation's shared part ends —
     /// the system prompt and tools, which other conversations repeat — kept
     /// so a cache can be reused that far by a conversation that agrees with
@@ -3085,6 +3055,20 @@ pub trait RemoteLayers: Send + Sync {
     /// and nothing may then be taken from `from`.
     fn fork(&self, _from: u64, _to: u64, _len: usize) -> bool {
         false
+    }
+    /// A new session, under an id this owner gives it, holding a copy of
+    /// `from`'s first `len` positions on every node that holds them. `None`
+    /// when it cannot, and no session was made.
+    fn fork_new(&self, _from: u64, _len: usize) -> Option<u64> {
+        None
+    }
+    /// Every node is to keep `session` until it is released (`held`), past
+    /// its own eviction — or may evict it again as any other (`!held`).
+    fn hold(&self, _session: u64, _held: bool) {}
+    /// The sessions every node keeps for a prefix pool, as each said: the
+    /// fewest of them. A pool holds no more entries than this.
+    fn pool_reserve(&self) -> usize {
+        0
     }
     /// The request `session` served has ended; its rows may yet serve the
     /// next one (a slot's retained conversation). Answers where the
@@ -3155,7 +3139,6 @@ impl KvCache {
             recent_tokens: Vec::new(),
             deferred_fill: None,
             remote: None,
-            whole: false,
             shared_checkpoint: None,
         }
     }
@@ -3923,53 +3906,7 @@ impl KvCache {
         self.recent_tokens = std::mem::take(&mut src.recent_tokens);
     }
 
-    /// What layer `slot` holds of a sequence's first `len` positions as the
-    /// host holds them, for a tree's top-level node taking a sequence over
-    /// from its workers (`crate::workers`): an attention layer's rows —
-    /// its `kv_dim`, keys and values — or a recurrent layer's state, which
-    /// must then be at exactly `len` positions. `None` when the host does
-    /// not hold them, the layer keeps more than one position a row, or the
-    /// slot was left empty here. A layer that stores nothing (`kv_dim` 0)
-    /// gives nothing.
-    pub fn layer_hold(&self, slot: CacheSlot, len: usize) -> Option<LayerHold> {
-        match slot {
-            CacheSlot::Rows(i) => {
-                let l = self.layers.get(i)?;
-                if l.kv_dim == 0 {
-                    return Some(LayerHold::Rows {
-                        kv_dim: 0,
-                        k: Vec::new(),
-                        v: Vec::new(),
-                    });
-                }
-                if l.stride != 1 || l.len.min(l.host_len()) < len {
-                    return None;
-                }
-                let (k, v) = l.flatten(len);
-                Some(LayerHold::Rows {
-                    kv_dim: l.kv_dim,
-                    k,
-                    v,
-                })
-            }
-            CacheSlot::State(i) => {
-                let r = self.recurrent.get(i)?;
-                // A state is of every position so far: only one at `len`
-                // will do. A cache with no rows of its own cannot tell.
-                let held = self.committed_len();
-                if r.is_empty() || (held != 0 && held != len) {
-                    return None;
-                }
-                let snapshot = r.host_snapshot();
-                Some(LayerHold::State {
-                    conv: snapshot.conv.into_owned(),
-                    state: snapshot.state.into_owned(),
-                })
-            }
-        }
-    }
-
-    /// What layer `slot`'s [`LayerHold`] costs to carry, in bytes as `f32`:
+    /// What layer `slot` holds of a sequence, in bytes as `f32`:
     /// `(a position, once)` — rows by the position, a state once whatever
     /// the length.
     pub fn hold_bytes(&self, slot: CacheSlot) -> (u64, u64) {
@@ -3984,83 +3921,6 @@ impl KvCache {
         }
     }
 
-    /// Whether `src` holds every layer's first `len` positions here
-    /// ([`Self::whole`]) and this cache is laid out for all of them: a
-    /// conversation a tree's top-level node went on with alone, taken up
-    /// again. The workers hold nothing of it; the model goes on here.
-    fn takes_whole(&self, src: &KvCache, len: usize) -> bool {
-        src.remote.is_none()
-            && src.whole
-            && src.holds_every_layer(len)
-            && self.layers.len() == src.layers.len()
-            && self.layers.iter().zip(&src.layers).all(|(mine, theirs)| {
-                theirs.kv_dim == 0 || (mine.kv_dim == theirs.kv_dim && mine.capacity >= len)
-            })
-    }
-
-    /// Whether every layer that stores rows holds its first `len` positions
-    /// on the host: a cache the model can go on with here alone.
-    pub fn holds_every_layer(&self, len: usize) -> bool {
-        self.layers
-            .iter()
-            .all(|l| l.kv_dim == 0 || (l.stride == 1 && l.len.min(l.host_len()) >= len))
-    }
-
-    /// Writes what [`Self::layer_hold`] gave into layer `slot`: rows as its
-    /// first positions, in a layer that holds none yet, or a recurrent
-    /// state in place of the one here.
-    pub fn set_layer_hold(&mut self, slot: CacheSlot, hold: LayerHold) -> anyhow::Result<()> {
-        match (slot, hold) {
-            (CacheSlot::Rows(layer), LayerHold::Rows { kv_dim, k, v }) => {
-                let dst = self
-                    .layers
-                    .get_mut(layer)
-                    .ok_or_else(|| anyhow::anyhow!("no rows {layer} in this cache"))?;
-                if kv_dim == 0 && dst.kv_dim == 0 {
-                    return Ok(());
-                }
-                let len = k.len() / kv_dim.max(1);
-                anyhow::ensure!(
-                    dst.kv_dim == kv_dim
-                        && dst.stride == 1
-                        && dst.paged.is_none()
-                        && dst.len == 0
-                        && k.len() == len * kv_dim
-                        && v.len() == k.len()
-                        && len <= dst.capacity,
-                    "rows {layer}: {len} rows of {kv_dim} do not fit a layer of {} with room for {}",
-                    dst.kv_dim,
-                    dst.capacity
-                );
-                dst.copy_prefix_from(&LayerCache::from_parts(kv_dim, len, k, v), len);
-                Ok(())
-            }
-            (CacheSlot::State(i), LayerHold::State { conv, state }) => self
-                .recurrent
-                .get_mut(i)
-                .ok_or_else(|| anyhow::anyhow!("no recurrent state {i} in this cache"))?
-                .set_parts(conv, state),
-            (slot, _) => anyhow::bail!("{slot:?} cannot take what another kind of layer holds"),
-        }
-    }
-
-    /// Empties layer `slot` again — a handover that failed part way: rows
-    /// rolled back to none, a state to its start.
-    pub fn clear_layer(&mut self, slot: CacheSlot) {
-        match slot {
-            CacheSlot::Rows(i) => {
-                if let Some(l) = self.layers.get_mut(i) {
-                    l.truncate(0);
-                }
-            }
-            CacheSlot::State(i) => {
-                if let Some(r) = self.recurrent.get_mut(i) {
-                    r.reset();
-                }
-            }
-        }
-    }
-
     /// Tells the owner of this cache's remote rows, if any, that the request
     /// it served has ended ([`RemoteLayers::request_finished`]), and answers
     /// where its time went — nothing for a cache with no remote rows.
@@ -4071,6 +3931,44 @@ impl KvCache {
         }
     }
 
+    /// A copy of this cache that owns its rows everywhere: [`Self::duplicate`]
+    /// plus, for a cache with remote rows, a new session on the workers
+    /// holding a copy of the first `len` of them ([`RemoteLayers::fork_new`]).
+    /// `None` when the workers cannot make one — their sessions are full, or
+    /// they cannot copy. A cache with no remote rows always copies.
+    pub fn share(&self, len: usize) -> Option<Self> {
+        let mut copy = self.duplicate();
+        if let Some(remote) = &self.remote {
+            let len = len.min(remote.len);
+            let id = remote.owner.fork_new(remote.id, len)?;
+            copy.remote = Some(Box::new(RemoteSession {
+                id,
+                len,
+                capacity: remote.capacity,
+                owner: remote.owner.clone(),
+            }));
+        }
+        Some(copy)
+    }
+
+    /// How many copies of a cache like this one a prefix pool may hold
+    /// ([`RemoteLayers::pool_reserve`]): unbounded for a cache with no remote
+    /// rows.
+    pub fn pool_reserve(&self) -> usize {
+        self.remote
+            .as_ref()
+            .map_or(usize::MAX, |remote| remote.owner.pool_reserve())
+    }
+
+    /// Asks every node holding this cache's remote rows to keep them until
+    /// the cache is dropped (`held`), or to evict them as any other
+    /// ([`RemoteLayers::hold`]). Nothing for a cache with no remote rows.
+    pub fn hold_remote(&self, held: bool) {
+        if let Some(remote) = &self.remote {
+            remote.owner.hold(remote.id, held);
+        }
+    }
+
     /// The remote half of copying `src`'s first `len` positions — the local
     /// half is [`Self::copy_prefix_from`] — for a source that is kept: the
     /// workers copy `src`'s rows into this cache's own session
@@ -4078,10 +3976,6 @@ impl KvCache {
     /// cache with no remote rows, `false` when `src` has none, holds fewer
     /// than `len` there, or the workers cannot copy.
     pub fn fork_remote_prefix(&mut self, src: &KvCache, len: usize) -> bool {
-        if self.remote.is_some() && self.takes_whole(src, len) {
-            self.whole = true;
-            return true;
-        }
         let Some(mine) = self.remote.as_mut() else {
             return true;
         };
@@ -4116,11 +4010,6 @@ impl KvCache {
         let Some(capacity) = self.remote.as_ref().map(|mine| mine.capacity) else {
             return true;
         };
-        // A conversation that went on here alone.
-        if self.takes_whole(src, len) {
-            self.whole = true;
-            return true;
-        }
         let Some(mut theirs) = src.remote.take() else {
             return false;
         };
@@ -4405,7 +4294,8 @@ impl KvCache {
     /// A CPU-only deep copy (no GPU mirror) of the whole cache — the
     /// [`crate::engine::slot_store`] uses it to snapshot a slot's completed
     /// cache when that same cache is also being handed to the
-    /// [`crate::engine::prefix_cache`] pool.
+    /// [`crate::engine::prefix_cache`] pool. Rows on other nodes are not
+    /// copied; [`Self::share`] copies those too.
     pub fn duplicate(&self) -> Self {
         Self {
             layers: self.layers.iter().map(LayerCache::duplicate).collect(),
@@ -4422,7 +4312,6 @@ impl KvCache {
             // workers, and sharing this one would let either copy roll the
             // other back.
             remote: None,
-            whole: self.whole,
             shared_checkpoint: self.shared_checkpoint.as_deref().map(|(at, state)| {
                 Box::new((
                     *at,
@@ -4591,7 +4480,6 @@ impl KvCache {
             recent_tokens,
             deferred_fill: None,
             remote: None,
-            whole: false,
             shared_checkpoint: None,
         })
     }
@@ -5033,36 +4921,6 @@ impl RecurrentLayerState {
         {
             rows.push((self.conv_history.clone(), self.delta_state.clone()));
         }
-    }
-
-    /// Whether this state holds nothing: a layer another node of a tree
-    /// runs, in a cache for some layers only.
-    fn is_empty(&self) -> bool {
-        self.conv_history.is_empty() && self.delta_state.is_empty()
-    }
-
-    /// Takes another node's state of this layer — [`LayerHold::State`] —
-    /// as this one's own.
-    fn set_parts(&mut self, conv: Vec<f32>, state: Vec<f32>) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            conv.len() == self.conv_history.len() && state.len() == self.delta_state.len(),
-            "a state of {} and {} values does not fit one of {} and {}",
-            conv.len(),
-            state.len(),
-            self.conv_history.len(),
-            self.delta_state.len()
-        );
-        self.conv_history = conv;
-        self.delta_state = state;
-        self.fresh = Fresh::Host;
-        Ok(())
-    }
-
-    /// Back to the state before any position.
-    fn reset(&mut self) {
-        self.conv_history.fill(0.0);
-        self.delta_state.fill(0.0);
-        self.fresh = Fresh::Host;
     }
 
     /// One timestep of causal depthwise conv1d: convolves `input`

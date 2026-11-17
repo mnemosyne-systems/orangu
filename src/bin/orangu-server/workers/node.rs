@@ -36,12 +36,14 @@ use super::guard::{GuardedStage, TakeStandby};
 use super::identity;
 use super::link::{ChildInfo, ChildLink};
 use super::metrics::{LinkSnapshot, NodeMetrics};
-use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage, Trace};
+use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage};
 use super::plan;
+use super::prefixes::{Manifest, PrefixFiles, SavedNode};
 use super::protocol::{
-    ActivationFormat, Assign, Capacity, DiscoveryRecord, ErrorCode, FEATURE_SWITCH, FEATURES,
-    HelloAck, MAX_DEPTH, Message, NodeSetup, PROTOCOL_VERSION, PlanEntry, ProbeState, WorkerError,
-    check_path, parent_reads_discovery, read_frame, read_message, write_message,
+    ActivationFormat, Assign, Capacity, DiscoveryRecord, ErrorCode, FEATURE_PREFIXES,
+    FEATURE_SWITCH, FEATURES, HelloAck, MAX_DEPTH, Message, NodeSetup, PROTOCOL_VERSION, PlanEntry,
+    ProbeState, SessionTerms, WorkerError, check_path, parent_reads_discovery, read_frame,
+    read_message, write_message,
 };
 use super::session::SessionStore;
 use super::stage::{EncodedStage, MessageStage};
@@ -62,6 +64,12 @@ use std::time::{Duration, Instant};
 /// How long a session may sit unused on a worker before it is reclaimed: a
 /// parent that went away without releasing it leaves it behind.
 const SESSION_IDLE: Duration = Duration::from_secs(600);
+
+/// The sessions a node keeps for its parent's prefix pool, as its own
+/// configuration has it: one a slot of its own, up to the pool's size.
+fn pool_reserve(own_slots: usize) -> usize {
+    own_slots.clamp(1, crate::engine::prefix_cache::ENTRIES)
+}
 
 /// How long a worker may take to answer an assignment: its layers may have
 /// to be downloaded first (`[workers].download = range`).
@@ -96,6 +104,11 @@ const REFRESH_EVERY: Duration = Duration::from_secs(2);
 /// ([`Message::Lease`]): long enough for the claim's handshakes.
 const LEASE_FOR: Duration = Duration::from_secs(10);
 
+/// Probes in a row a parent seen on the channel may leave unanswered, with
+/// its connection quiet for a quarter of [`NodeSettings::parent_silence`],
+/// before this node takes it for gone without waiting out the silence.
+const PARENT_MISSES: u32 = 3;
+
 /// Decode steps a top-level node observes before it weighs planning again
 /// by the speeds they showed (`Node::calibration_due`).
 const CALIBRATE_TOKENS: usize = 32;
@@ -104,42 +117,6 @@ const CALIBRATE_TOKENS: usize = 32;
 /// to save. A worker given other layers has to build and warm them, a minute on
 /// a board with a large model, and every conversation is rebuilt.
 const WORTH_MOVING: f64 = 0.05;
-
-/// Prompt tokens a request needs before its prompt counts toward the
-/// tree's prompt speed: fewer weigh the fixed costs of a forward too much.
-const SEEN_PROMPT_TOKENS: usize = 64;
-
-/// The tree's speeds as requests found them (`Node::tree_seen`).
-#[derive(Clone, Debug, Default)]
-struct TreeSeen {
-    used: Vec<String>,
-    prompt_ns: Option<(f64, usize)>,
-    decode_ns: Option<(f64, usize)>,
-}
-
-/// Whether a tree that takes `tree` — a 128-token prompt chunk and a decode
-/// step, in nanoseconds — pays against this node `alone`: a request of a
-/// chunk of prompt and an answer as long takes it at most 90% of the time.
-fn tree_pays(tree: (f64, f64), alone: (f64, f64)) -> bool {
-    let request =
-        |(prompt, decode): (f64, f64)| prompt + decode * super::speed::PROMPT_TOKENS as f64;
-    request(tree) <= 0.9 * request(alone)
-}
-
-/// `old` over its tokens and `value` over `tokens`, weighted by tokens —
-/// the old capped so a change shows.
-fn weigh(old: Option<(f64, usize)>, value: f64, tokens: usize) -> (f64, usize) {
-    match old {
-        None => (value, tokens),
-        Some((mean, seen)) => {
-            let w = seen.min(256) as f64;
-            (
-                (mean * w + value * tokens as f64) / (w + tokens as f64),
-                seen + tokens,
-            )
-        }
-    }
-}
 
 pub struct NodeSettings {
     /// How this node is named in plans and error paths: its `[workers]`
@@ -183,20 +160,12 @@ pub struct NodeSettings {
     pub capacity: Capacity,
     /// `[workers].shares`: what shares are sized by.
     pub shares: Shares,
-    /// Tests only: where sequences decode once their prompt is through
-    /// the tree, whatever the measured speeds say.
-    #[cfg(test)]
-    pub decode_pin: Option<DecodePin>,
     /// `[workers].head`: which node applies the output head.
     pub head: HeadOn,
     /// Whether this node serves its model through its tree at all: not a
     /// picture model, whose text encoder is never split. Without it the
     /// node plans nothing for its workers, and serves only as a worker.
     pub split: bool,
-    /// Tests only: the workers are used even when this node could serve
-    /// alone faster.
-    #[cfg(test)]
-    pub offload_always: bool,
     /// How often idle workers are pinged.
     pub maintenance: Duration,
     /// How long a parent may say nothing before this node takes it for gone
@@ -215,29 +184,25 @@ pub struct NodeSettings {
     /// `prompt_weights`: how a top-level node decides the copies its tree
     /// runs prompts through (`engine::prompt_weights::decide`).
     pub prompt_weights: prompt_weights::PromptWeights,
-}
-
-/// Tests only: where a top-level node's sequences decode, pinned.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DecodePin {
-    /// Always through the tree.
-    Tree,
-    /// Here alone whenever this node holds the whole model.
-    Top,
+    /// Where the prefix pool's entries are saved (`~/.orangu/server`), under
+    /// the model and this node's name ([`super::prefixes`]); `None` saves
+    /// nothing.
+    pub prefix_root: Option<std::path::PathBuf>,
 }
 
 /// Where a node looks for the other nodes of its channel.
-#[derive(Clone, Debug)]
-pub enum Scan {
-    /// Every address of `networks` (`[workers].network`), or of this
-    /// machine's own IPv4 networks when there are none, on `port`.
-    Networks {
-        port: u16,
-        networks: Vec<(std::net::Ipv4Addr, u8)>,
-    },
-    /// These addresses only (`ORANGU_WORKERS_PEERS`).
-    Addresses(Vec<SocketAddr>),
+/// Where a node looks for the rest of its channel.
+#[derive(Clone, Debug, Default)]
+pub struct Scan {
+    /// The channel's port: where a node that probed this one, and is not
+    /// known yet, is probed back.
+    pub port: u16,
+    /// Every address of these networks (`[workers].network`), or of this
+    /// machine's own IPv4 networks when empty, on `port`; `None` scans no
+    /// network (`ORANGU_WORKERS_PEERS`).
+    pub networks: Option<Vec<(std::net::Ipv4Addr, u8)>>,
+    /// `host:port` entries asked at every turn (`ORANGU_WORKERS_PEERS`).
+    pub peers: Vec<String>,
 }
 
 /// Held while a request runs on this node ([`request_started`]).
@@ -283,6 +248,15 @@ struct Parent {
     connection: u64,
     node: String,
     stream: TcpStream,
+    /// When its connection last carried a frame.
+    heard: Instant,
+    /// Its `[workers]` name and the addresses it answered the channel at,
+    /// once a scan found it there: what [`Node::check_parent`] probes.
+    seen: Option<(String, Vec<String>)>,
+    /// Probes in a row it has not answered since it was seen.
+    missed: u32,
+    /// A probe went unanswered, or a request forwarded to it failed.
+    suspect: bool,
 }
 
 pub struct Node {
@@ -306,6 +280,8 @@ pub struct Node {
     /// Nodes of the channel that probed this one before any scan found
     /// them: probed back at the scan's next turn.
     probed_by: Mutex<Vec<SocketAddr>>,
+    /// Set to have the channel asked again at once, not at the next refresh.
+    refresh_now: AtomicBool,
     /// Set while this node claims workers on its channel or holds the ones
     /// it claimed: it then refuses to be claimed itself.
     leading: AtomicBool,
@@ -332,30 +308,14 @@ pub struct Node {
     /// Switched to serve alone through `POST /props`: its workers
     /// let go, no plan made until switched back.
     alone: AtomicBool,
-    /// Whether the current plan's sequences decode on this node alone once
-    /// their prompt is through the tree.
-    decode_alone: AtomicBool,
     /// Whether the node running the final layer applies the output head.
     head_on_last: AtomicBool,
-    /// Whether the whole model has run here once, for sequences decoded
-    /// alone ([`super::speed::warm_whole`]).
-    warmed_whole: AtomicBool,
-    /// Why the last plan used no worker though there were some, or
-    /// `None` when it used them.
-    not_worth: Mutex<Option<String>>,
     /// Each node's decode speed as requests found it, by its own name: the
     /// bytes it ran over its time a token (its subtree, its link and its
     /// fixed costs included), and over how many tokens.
     observed: Mutex<HashMap<String, (f64, usize)>>,
     /// Decode tokens observed since the last plan.
     observed_since_plan: AtomicUsize,
-    /// The tree as requests found it, with the workers it used: a
-    /// 128-token prompt chunk at its slowest stage and a decode step, in
-    /// nanoseconds, each `None` until enough was seen.
-    tree_seen: Mutex<Option<TreeSeen>>,
-    /// The tree's prompt chunk as the last plan predicted it, in
-    /// nanoseconds: what a tree seen only on short prompts goes by.
-    predicted_prompt: Mutex<Option<f64>>,
     /// The rates the plan in progress uses: the observed ones when every
     /// node has one, the measured ones otherwise (`None`).
     observed_now: Mutex<Option<HashMap<String, f64>>>,
@@ -393,19 +353,20 @@ pub struct Node {
     identity: super::protocol::ModelIdentity,
     /// The output head's bytes: the matrix as wide as the vocabulary.
     head_bytes: u64,
-    /// Each layer's keys and values of one position, in bytes as `f32`.
-    kv_row_bytes: Vec<u64>,
-    /// Each layer's recurrent state, in bytes as `f32`: what it costs to
-    /// bring back once, whatever the length. `0` for an attention layer.
-    state_bytes: Vec<u64>,
-    /// The whole model here alone, in nanoseconds — a 128-token prompt chunk
-    /// and a decode step on its own paths — for a node that could serve
-    /// alone to weigh its tree against (`speed::measure_whole`).
-    alone_ns: Option<(f64, f64)>,
     local_addr: Option<SocketAddr>,
     metrics: NodeMetrics,
     next_connection: AtomicU64,
     stop: AtomicBool,
+    /// This node's saved prefixes ([`super::prefixes`]).
+    prefix_files: Option<Arc<PrefixFiles>>,
+    /// The saved split the next top-level plan keeps, while each node still
+    /// holds its share: set by a claim, for the plan it makes.
+    saved_plan: Mutex<Option<Manifest>>,
+    /// Whether the last top-level plan kept [`Self::saved_plan`]'s split.
+    saved_split_kept: AtomicBool,
+    /// The saved prefixes a claim planned for, and whether it kept their
+    /// split: put back in the pool, or deleted, at the next request.
+    pending_prefixes: Mutex<Option<(Manifest, bool)>>,
 }
 
 static NODE: OnceLock<Arc<Node>> = OnceLock::new();
@@ -526,12 +487,10 @@ pub fn attach_handover(handover: Arc<crate::reexec::Handover>) {
 }
 
 /// Hands the node the engine's way of serving alone, which it then keeps
-/// told whether its workers are worth it.
+/// told whether its plan uses any worker.
 pub fn attach_serving(switch: Arc<crate::engine::generate::ServingSwitch>) {
     if let Some(node) = NODE.get() {
-        switch.set_chosen(
-            node.not_worth.lock().unwrap().is_some() || node.used.lock().unwrap().is_empty(),
-        );
+        switch.set_chosen(node.used.lock().unwrap().is_empty());
         let _ = node.serving.set(switch);
     }
 }
@@ -551,6 +510,19 @@ pub fn props_json() -> Option<serde_json::Value> {
 }
 
 /// Why this process should not be routed to, if a worker tree says so.
+/// A request routed to `base` could not be forwarded there
+/// ([`Node::forward_failed`]).
+pub fn forward_failed(base: &str) {
+    if let Some(node) = NODE.get() {
+        node.forward_failed(base);
+    }
+}
+
+/// Whether this process works for a parent that does not answer.
+pub fn parent_suspect() -> bool {
+    NODE.get().is_some_and(|node| node.parent_suspect())
+}
+
 pub fn readiness() -> Option<&'static str> {
     NODE.get().and_then(|node| node.unready())
 }
@@ -587,6 +559,15 @@ fn setups_json(setups: &[NodeSetup]) -> serde_json::Value {
 }
 
 /// This process's place in its tree, for `GET /v1/workers`.
+/// Saves the prefix pool's entries on every node of this process's tree, as
+/// the process stops.
+pub fn save_prefixes_on_exit() {
+    if let Some(node) = NODE.get() {
+        let _planning = node.planning.lock().unwrap();
+        node.save_prefixes();
+    }
+}
+
 pub fn status_json() -> serde_json::Value {
     match NODE.get() {
         Some(node) => node.status(),
@@ -679,21 +660,12 @@ impl Node {
         if head_bytes == 0 {
             head_bytes = embd_bytes;
         }
-        // What a sequence costs to bring back to the top-level node, per
-        // layer: keys and values of one position, or a recurrent state once.
-        let probe = model.new_kv_cache(1);
-        let (kv_row_bytes, state_bytes): (Vec<u64>, Vec<u64>) = (0..n_layer)
-            .map(|il| probe.hold_bytes(model.cache_slot(il)))
-            .unzip();
-        drop(probe);
         if settings.capacity.setups.is_empty() {
             settings.capacity.setups.push(NodeSetup {
                 name: settings.name.clone(),
                 ..NodeSetup::default()
             });
         }
-        // Speeds a caller already knows (tests) are not measured.
-        let rates_given = settings.capacity.setups[0].decode_rate > 0.0;
         // Measured before a parent can ask: not for a node sharing by
         // memory, nor for one that has only part of the model on disk and
         // does not know yet which layers it will have.
@@ -736,34 +708,7 @@ impl Node {
             // and refuses every assignment.
             LayerPipeline::unchecked(model.clone(), 0..n_layer)
         };
-        // A node that could serve alone times the whole model on its own
-        // paths, to set its tree against (offloading, or decoding alone,
-        // only when it pays).
         let total_bytes: u64 = layer_bytes.iter().sum();
-        let alone_ns = (!rates_given
-            && settings.split
-            && settings.shares != Shares::Memory
-            && !settings.workers.is_empty()
-            && model.supports_layer_split()
-            && !super::fetch::incomplete()
-            && settings.capacity.budget_bytes >= total_bytes + non_layer_bytes)
-            .then(|| super::speed::measure_whole(model.as_ref()))
-            .and_then(|measured| match measured {
-                Ok((prompt, decode)) => {
-                    log::info!(
-                        "orangu-server: [workers] the whole model here alone: {:.0} ms a {}-token \
-                         prompt chunk, {:.1} ms a decode step",
-                        prompt.as_secs_f64() * 1e3,
-                        super::speed::PROMPT_TOKENS,
-                        decode.as_secs_f64() * 1e3
-                    );
-                    Some((prompt.as_nanos() as f64, decode.as_nanos() as f64))
-                }
-                Err(e) => {
-                    log::warn!("orangu-server: [workers] could not time the model alone: {e:#}");
-                    None
-                }
-            });
         let fits_alone = model.supports_layer_split()
             && !super::fetch::incomplete()
             && settings.capacity.budget_bytes >= total_bytes + non_layer_bytes;
@@ -777,6 +722,13 @@ impl Node {
         // The model this node serves, by its layout: what a parent compares.
         let own_identity =
             identity::model_identity(&loaded, &settings.label, &settings.quant, 0..0);
+        let prefix_files = settings.prefix_root.as_ref().map(|root| {
+            Arc::new(PrefixFiles::under(
+                root,
+                own_identity.header_hash,
+                &settings.name,
+            ))
+        });
         let node = Arc::new(Self {
             id: format!("{:016x}", rand::random::<u64>()),
             settings,
@@ -788,6 +740,7 @@ impl Node {
             claimed: Mutex::new(HashMap::new()),
             lease: Mutex::new(None),
             probed_by: Mutex::new(Vec::new()),
+            refresh_now: AtomicBool::new(false),
             leading: AtomicBool::new(false),
             active: AtomicUsize::new(0),
             last_request: Mutex::new(Instant::now()),
@@ -799,14 +752,9 @@ impl Node {
             decision: OnceLock::new(),
             shares_by: Mutex::new("memory"),
             alone: AtomicBool::new(false),
-            decode_alone: AtomicBool::new(false),
             head_on_last: AtomicBool::new(false),
-            warmed_whole: AtomicBool::new(false),
-            not_worth: Mutex::new(None),
             observed: Mutex::new(HashMap::new()),
             observed_since_plan: AtomicUsize::new(0),
-            tree_seen: Mutex::new(None),
-            predicted_prompt: Mutex::new(None),
             observed_now: Mutex::new(None),
             planned_rates: Mutex::new(HashMap::new()),
             handover: OnceLock::new(),
@@ -823,14 +771,15 @@ impl Node {
             layer_bytes,
             non_layer_bytes,
             head_bytes,
-            kv_row_bytes,
-            state_bytes,
-            alone_ns,
             identity: own_identity,
             local_addr,
             metrics: NodeMetrics::default(),
             next_connection: AtomicU64::new(1),
             stop: AtomicBool::new(false),
+            prefix_files,
+            saved_plan: Mutex::new(None),
+            saved_split_kept: AtomicBool::new(false),
+            pending_prefixes: Mutex::new(None),
         });
         let _ = node.this.set(Arc::downgrade(&node));
         if let Some(listener) = listener {
@@ -893,38 +842,6 @@ impl Node {
             && (!self.links().is_empty() || self.can_lead())
     }
 
-    /// Whether a test pinned sequences to decode through the tree (`tree`)
-    /// or here alone; the measured speeds decide otherwise.
-    #[cfg_attr(not(test), allow(unused_variables))]
-    fn decode_pinned(&self, tree: bool) -> bool {
-        #[cfg(test)]
-        {
-            self.settings.decode_pin
-                == Some(if tree {
-                    DecodePin::Tree
-                } else {
-                    DecodePin::Top
-                })
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
-    }
-
-    /// Whether a test pinned the workers to be used even when this node
-    /// could serve alone faster; the measured speeds decide otherwise.
-    fn offload_always(&self) -> bool {
-        #[cfg(test)]
-        {
-            self.settings.offload_always
-        }
-        #[cfg(not(test))]
-        {
-            false
-        }
-    }
-
     /// The workers this node hands layers to, as they stand.
     fn links(&self) -> Vec<Arc<ChildLink>> {
         self.links.read().unwrap().clone()
@@ -948,6 +865,7 @@ impl Node {
     fn start_request(self: &Arc<Self>) -> RequestGuard {
         self.active.fetch_add(1, Ordering::AcqRel);
         self.claim();
+        self.load_pending_prefixes();
         RequestGuard(self.clone())
     }
 
@@ -1019,10 +937,11 @@ impl Node {
         }
     }
 
-    /// How many workers this node holds while it leads, `0` otherwise.
+    /// How many workers this node holds while it leads, its standby
+    /// included, `0` otherwise.
     fn workers_held(&self) -> u32 {
         if self.leading.load(Ordering::Acquire) {
-            self.links().len() as u32
+            (self.links().len() + self.standby_links().len()) as u32
         } else {
             0
         }
@@ -1094,7 +1013,7 @@ impl Node {
                 _ => *lease = Some((self.id.clone(), now + LEASE_FOR)),
             }
         }
-        let hash = super::channel::channel_hash(channel);
+        let hash = super::channel::channel_hash(channel, self.settings.secret.as_deref());
         let tls = self.settings.tls.clone();
         let free = self.unclaimed();
         let answers: Vec<Option<super::channel::LeaseAnswer>> = std::thread::scope(|scope| {
@@ -1155,7 +1074,25 @@ impl Node {
     }
 
     /// The free nodes the last scan found that this node does not hold.
+    ///
+    /// A node busier than [`CLAIM_CUTOFF`] is left alone, except, for a node
+    /// not leading yet, one its saved prefixes' split names: claimed whatever
+    /// its load, so a busy moment does not cost the saved entries.
     fn unclaimed(&self) -> Vec<super::channel::Found> {
+        let busy = self
+            .found
+            .lock()
+            .unwrap()
+            .0
+            .iter()
+            .any(|found| found.load > CLAIM_CUTOFF);
+        let saved: Vec<String> = if busy && !self.leading.load(Ordering::Acquire) {
+            self.prefix_manifest()
+                .map(|m| m.workers.into_iter().map(|w| w.name).collect())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let links: Vec<Arc<ChildLink>> = self
             .links()
             .into_iter()
@@ -1178,7 +1115,7 @@ impl Node {
             .filter(|found| {
                 found.state.claimable()
                     && self.same_model(found, false)
-                    && found.load <= CLAIM_CUTOFF
+                    && (found.load <= CLAIM_CUTOFF || saved.contains(&found.name))
                     && found.node != self.id
                     && !held.contains(&found.addr)
                     && !held_nodes.contains(&&found.node)
@@ -1201,9 +1138,10 @@ impl Node {
     /// next turn of the scan, rather than at the next full scan — a node
     /// that starts after this one is found within seconds.
     fn note_prober(&self, tcp: &TcpStream) {
-        let Scan::Networks { port, .. } = &self.settings.scan else {
+        let port = &self.settings.scan.port;
+        if *port == 0 {
             return;
-        };
+        }
         let Ok(peer) = tcp.peer_addr() else {
             return;
         };
@@ -1249,7 +1187,16 @@ impl Node {
         if fresh.is_empty() || self.is_assigned() {
             return;
         }
-        self.leading.store(true, Ordering::Release);
+        let was_leading = self.leading.swap(true, Ordering::AcqRel);
+        // A tree formed again: planned on the split its saved prefixes were
+        // made on, when every node still holds its share.
+        let offered = if was_leading {
+            None
+        } else {
+            self.prefix_manifest()
+        };
+        *self.saved_plan.lock().unwrap() = offered.clone();
+        self.saved_split_kept.store(false, Ordering::Release);
         log::info!(
             "orangu-server: workers: claiming {} on channel '{}'",
             fresh
@@ -1296,6 +1243,7 @@ impl Node {
                 .name("orangu-workers-ping".to_string())
                 .spawn(move || node.ping_worker(&link));
         }
+        self.keep_a_standby(offered.as_ref());
         self.plan_top_locked();
         // Nobody answered the handshake: another node has them, or they
         // went away. They are dropped, and found again by a later scan.
@@ -1324,7 +1272,322 @@ impl Node {
             }
             self.plan_top_locked();
         }
+        *self.saved_plan.lock().unwrap() = None;
+        if let Some(manifest) = offered {
+            let kept = self.saved_split_kept.load(Ordering::Acquire);
+            *self.pending_prefixes.lock().unwrap() = Some((manifest, kept));
+        }
         *last = Instant::now();
+    }
+
+    /// The manifest of this node's saved prefixes, when it serves through a
+    /// tree with a prefix pool.
+    fn prefix_manifest(&self) -> Option<Manifest> {
+        let model = self.delegating.get().and_then(Weak::upgrade)?;
+        model.prefix_cache()?;
+        self.prefix_files.as_ref()?.manifest()
+    }
+
+    /// The node name of the worker behind the stage named `stage`, as its
+    /// handshake said, and what it said.
+    fn worker_named(&self, stage: &str) -> Option<(String, super::link::ChildInfo)> {
+        let link = self
+            .links()
+            .into_iter()
+            .chain(self.standby_links())
+            .find(|link| link.addr == stage)?;
+        let info = link.info()?;
+        let name = info.capacity.setups.first()?.name.clone();
+        Some((name, info))
+    }
+
+    /// `manifest`'s split of `range` over this node and `candidates` — the
+    /// candidates in its order — when it still stands: every worker it names
+    /// is a candidate and no other, the context is the same, the cuts are
+    /// still allowed, and every node holds its share: within the budget it
+    /// reports now, or with no less a budget than when the entries were saved
+    /// (a share the plan gave past its budget then, paged in as it runs).
+    /// Every node is different, and a node's memory or load can change
+    /// between claims; a split one of them cannot hold is cut afresh. Says
+    /// why it does not stand.
+    #[allow(clippy::type_complexity)]
+    fn saved_cut(
+        &self,
+        manifest: &Manifest,
+        range: &Range<usize>,
+        own_budget: u64,
+        candidates: &[(Arc<ChildLink>, ChildInfo)],
+    ) -> Result<
+        (
+            Vec<(Arc<ChildLink>, ChildInfo)>,
+            Range<usize>,
+            Vec<Range<usize>>,
+        ),
+        String,
+    > {
+        if manifest.n_ctx != self.settings.n_ctx {
+            return Err(format!(
+                "they were saved for a context of {}, not {}",
+                manifest.n_ctx, self.settings.n_ctx
+            ));
+        }
+        if candidates.len() != manifest.workers.len() {
+            return Err(format!(
+                "they were saved on {} workers, and {} are here",
+                manifest.workers.len(),
+                candidates.len()
+            ));
+        }
+        let name_of = |info: &ChildInfo| info.capacity.setups.first().map(|s| s.name.clone());
+        let mut ordered = Vec::new();
+        for worker in &manifest.workers {
+            let found = candidates
+                .iter()
+                .find(|(_, info)| name_of(info).as_deref() == Some(worker.name.as_str()))
+                .ok_or_else(|| format!("{} is not here", worker.name))?;
+            ordered.push(found.clone());
+        }
+        let local = manifest.local();
+        let shares: Vec<Range<usize>> = manifest.workers.iter().map(SavedNode::layers).collect();
+        let n_layer = self.model.config().n_layer;
+        let mut end = local.start;
+        for part in std::iter::once(&local).chain(&shares) {
+            let allowed = |at: usize| at == 0 || at == n_layer || self.model.split_allowed(at);
+            if part.start != end || part.start > part.end || !allowed(part.end) {
+                return Err(format!("layers {part:?} do not follow on from {end}"));
+            }
+            end = part.end;
+        }
+        if local.start != range.start || end != range.end {
+            return Err(format!("they cover {}..{end}, not {range:?}", local.start));
+        }
+        let holds = |share: &Range<usize>, budget: u64, then: u64| {
+            plan::bytes_of(share, &self.layer_bytes) <= budget || budget >= then
+        };
+        if !holds(&local, own_budget, manifest.local_budget) {
+            return Err(format!("this node cannot hold layers {local:?}"));
+        }
+        for (((_, info), share), worker) in ordered.iter().zip(&shares).zip(&manifest.workers) {
+            if !holds(share, plan::subtree_budget(&info.capacity), worker.budget) {
+                return Err(format!("{} cannot hold layers {share:?}", worker.name));
+            }
+        }
+        Ok((ordered, local, shares))
+    }
+
+    /// The prefixes a claim planned for, at the request that made it: put
+    /// back in the pool when the claim kept their split — each entry only
+    /// when every worker listed it in its handshake, for the layers it runs
+    /// now — and deleted on every node otherwise.
+    fn load_pending_prefixes(&self) {
+        let Some((manifest, kept)) = self.pending_prefixes.lock().unwrap().take() else {
+            return;
+        };
+        let _planning = self.planning.lock().unwrap();
+        let (Some(model), Some(files)) = (
+            self.delegating.get().and_then(Weak::upgrade),
+            self.prefix_files.as_ref(),
+        ) else {
+            return;
+        };
+        let pipeline = self.top.read().unwrap().0.clone();
+        if !kept {
+            for entry in &manifest.entries {
+                pipeline.forget(&entry.key);
+            }
+            files.clear_lead();
+            model.load_prefixes(&manifest, &[]);
+            log::info!(
+                "orangu-server: workers: {} saved prefix{} dropped on every node: the tree is                  split differently from when they were saved",
+                manifest.entries.len(),
+                if manifest.entries.len() == 1 {
+                    ""
+                } else {
+                    "es"
+                }
+            );
+            return;
+        }
+        let plan = self.plan();
+        let listed = |stage: &Arc<dyn Stage>, key: &str| -> bool {
+            let Some((name, info)) = self.worker_named(&stage.name()) else {
+                return false;
+            };
+            let Some(now) = plan.iter().find(|e| e.node == name) else {
+                return false;
+            };
+            let then = manifest.plan.iter().find(|e| e.name == name);
+            stage.saves_prefixes()
+                && info.features & FEATURE_PREFIXES != 0
+                && then.is_some_and(|then| {
+                    then.layers == (now.layer_start as usize, now.layer_end as usize)
+                })
+                && info.saved.iter().any(|saved| {
+                    saved.key == key
+                        && saved.layer_start == now.layer_start
+                        && saved.layer_end == now.layer_end
+                })
+        };
+        let mut keys = Vec::new();
+        for entry in &manifest.entries {
+            if pipeline
+                .stages()
+                .iter()
+                .all(|stage| listed(stage, &entry.key))
+            {
+                keys.push(entry.key.clone());
+            } else {
+                log::info!(
+                    "orangu-server: workers: saved prefix {} dropped on every node: a worker did                      not list it for its layers",
+                    entry.key
+                );
+                pipeline.forget(&entry.key);
+                files.forget_lead(&entry.key);
+            }
+        }
+        model.load_prefixes(&manifest, &keys);
+    }
+
+    /// Saves the prefix pool's entries on every node of the current plan,
+    /// and empties the pool ([`DelegatingModel::save_prefixes`]), with the
+    /// plan's split as the manifest: what a top-level node does as it lets
+    /// its workers go and as it stops. Called with the planning lock held.
+    fn save_prefixes(&self) {
+        if self.is_assigned() || self.prefix_files.is_none() {
+            return;
+        }
+        let Some(model) = self.delegating.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        if model.prefix_cache().is_none() {
+            return;
+        }
+        let pipeline = self.top.read().unwrap().0.clone();
+        let local = pipeline.local_layers();
+        let workers = pipeline
+            .stages()
+            .iter()
+            .map(|stage| {
+                let named = self.worker_named(&stage.name());
+                SavedNode {
+                    budget: named
+                        .as_ref()
+                        .map_or(0, |(_, info)| plan::subtree_budget(&info.capacity)),
+                    name: named.map_or_else(|| stage.name(), |(name, _)| name),
+                    layers: (stage.layers().start, stage.layers().end),
+                }
+            })
+            .collect();
+        let plan = self
+            .plan()
+            .into_iter()
+            .map(|e| SavedNode {
+                name: e.node,
+                layers: (e.layer_start as usize, e.layer_end as usize),
+                budget: 0,
+            })
+            .collect();
+        model.save_prefixes(Manifest {
+            n_ctx: self.settings.n_ctx,
+            local: (local.start, local.end),
+            local_budget: self.own_budget(true),
+            workers,
+            plan,
+            entries: Vec::new(),
+        });
+    }
+
+    /// Of the nodes this node claimed, holds back as a standby the one with
+    /// the most memory that the model does not need: this node and the
+    /// others hold every layer without it. A worker lost mid-request is
+    /// then replaced by it in place (`super::guard`), rather than its
+    /// layers spread over the others. One standby at a time; none when
+    /// every node is needed. A worker of `saved`'s split is kept out of
+    /// standby while another node will do, so the split can stand.
+    fn keep_a_standby(&self, saved: Option<&Manifest>) {
+        if self.settings.channel.is_none() || !self.standby_links().is_empty() {
+            return;
+        }
+        let links = self.links();
+        if links.len() < 2 {
+            return;
+        }
+        let secret = self.settings.secret.as_deref();
+        let path = std::slice::from_ref(&self.id);
+        let budgets: Vec<(Arc<ChildLink>, u64, bool, bool)> = links
+            .iter()
+            .filter_map(|link| {
+                let info = link.ensure_connected(secret, path).ok()?;
+                let same = info
+                    .model
+                    .as_ref()
+                    .is_none_or(|m| m.header_hash == self.identity.header_hash);
+                let name = info.capacity.setups.first().map(|s| s.name.as_str());
+                let in_saved = saved.is_some_and(|manifest| {
+                    manifest
+                        .workers
+                        .iter()
+                        .any(|w| Some(w.name.as_str()) == name)
+                });
+                Some((
+                    link.clone(),
+                    plan::subtree_budget(&info.capacity),
+                    same,
+                    in_saved,
+                ))
+            })
+            .collect();
+        let need = self.layer_bytes.iter().sum::<u64>() + self.non_layer_bytes;
+        let total = self.settings.capacity.budget_bytes
+            + budgets.iter().map(|(_, budget, _, _)| *budget).sum::<u64>();
+        let Some((link, _, _, _)) = budgets
+            .into_iter()
+            .filter(|(_, budget, same, _)| *same && total.saturating_sub(*budget) >= need)
+            .max_by_key(|(_, budget, _, in_saved)| (!*in_saved, *budget))
+        else {
+            return;
+        };
+        self.links
+            .write()
+            .unwrap()
+            .retain(|held| !Arc::ptr_eq(held, &link));
+        self.standby_links.write().unwrap().push(link.clone());
+        log::info!(
+            "orangu-server: workers: {} stands by, to take the layers of a worker that is lost",
+            link.addr
+        );
+    }
+
+    /// Claims a free node of the channel as a standby, for a worker that is
+    /// missing when no standby is held: it takes the worker's layers rather
+    /// than the nodes left sharing them. `None` when the channel has none.
+    fn claim_spare(&self) -> Option<Arc<ChildLink>> {
+        self.settings.channel.as_ref()?;
+        let found = self.unclaimed().into_iter().next()?;
+        let link = Arc::new(ChildLink::with_tls(
+            found.addr.clone(),
+            self.settings.timeout,
+            self.settings.connect_timeout,
+            self.settings.tls.clone(),
+        ));
+        self.claimed
+            .lock()
+            .unwrap()
+            .insert(found.addr.clone(), found.node.clone());
+        self.standby_links.write().unwrap().push(link.clone());
+        if let Some(node) = self.this.get().and_then(Weak::upgrade) {
+            let held = link.clone();
+            let _ = std::thread::Builder::new()
+                .name("orangu-workers-ping".to_string())
+                .spawn(move || node.ping_worker(&held));
+        }
+        log::info!(
+            "orangu-server: workers: claiming {} ({}) on channel '{}' to stand in for a lost worker",
+            found.name,
+            found.addr,
+            self.settings.channel.as_deref().unwrap_or_default()
+        );
+        Some(link)
     }
 
     /// Lets go of every worker this node claimed on its channel: each
@@ -1335,6 +1598,7 @@ impl Node {
         if !self.leading.load(Ordering::Acquire) || self.active.load(Ordering::Acquire) > 0 {
             return;
         }
+        self.save_prefixes();
         let links: Vec<Arc<ChildLink>> = std::mem::take(&mut *self.links.write().unwrap());
         let spares: Vec<Arc<ChildLink>> = std::mem::take(&mut *self.standby_links.write().unwrap());
         self.claimed.lock().unwrap().clear();
@@ -1362,6 +1626,89 @@ impl Node {
             && self.last_request.lock().unwrap().elapsed() >= self.settings.release
     }
 
+    /// The addresses the parent answered the channel at, once seen there.
+    fn parent_addrs(&self) -> Vec<SocketAddr> {
+        self.parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|p| p.seen.as_ref())
+            .map(|(_, addrs)| addrs.iter().filter_map(|a| a.parse().ok()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Weighs what a turn of the channel scan found against the parent. A
+    /// parent that answers is in good health. One seen on the channel that
+    /// stops answering is suspect, and once it leaves [`PARENT_MISSES`]
+    /// probes in a row unanswered with its connection quiet too, it is
+    /// taken for gone: its connection is closed, which lets go of it as a
+    /// closed connection does. A parent never seen on the channel is left
+    /// to [`NodeSettings::parent_silence`].
+    fn check_parent(&self, found: &[super::channel::Found]) {
+        let mut slot = self.parent.lock().unwrap();
+        let Some(parent) = slot.as_mut() else {
+            return;
+        };
+        if let Some(f) = found.iter().find(|f| f.node == parent.node) {
+            let addrs = std::iter::once(&f.addr)
+                .chain(&f.alternates)
+                .cloned()
+                .collect();
+            parent.seen = Some((f.name.clone(), addrs));
+            parent.missed = 0;
+            parent.suspect = false;
+            return;
+        }
+        let Some((name, _)) = parent.seen.as_ref() else {
+            return;
+        };
+        parent.missed += 1;
+        parent.suspect = true;
+        let quiet = parent.heard.elapsed();
+        if parent.missed >= PARENT_MISSES && quiet >= self.settings.parent_silence / 4 {
+            log::warn!(
+                "orangu-server: the parent {name} has answered neither the channel ({} probes) \
+                 nor its connection ({} s); it is taken for gone",
+                parent.missed,
+                quiet.as_secs()
+            );
+            let _ = parent.stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// A request forwarded to `base` failed. When that is the parent's API,
+    /// the parent is suspect and the channel is asked about it at once.
+    fn forward_failed(&self, base: &str) {
+        let api = {
+            let found = self.found.lock().unwrap();
+            let parent = self.parent.lock().unwrap();
+            let Some(parent) = parent.as_ref() else {
+                return;
+            };
+            found
+                .0
+                .iter()
+                .find(|f| f.node == parent.node)
+                .map(|f| f.api.clone())
+        };
+        if api.as_deref() != Some(base) {
+            return;
+        }
+        if let Some(parent) = self.parent.lock().unwrap().as_mut() {
+            parent.suspect = true;
+        }
+        self.refresh_now.store(true, Ordering::Release);
+    }
+
+    /// Whether the parent this node works for is suspect.
+    fn parent_suspect(&self) -> bool {
+        self.parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|p| p.suspect)
+    }
+
     /// Scans the channel every `scan_every`, and asks the nodes it found
     /// how busy they are every [`REFRESH_EVERY`] in between, for as long as
     /// the node runs.
@@ -1369,53 +1716,55 @@ impl Node {
         let Some(channel) = self.settings.channel.clone() else {
             return;
         };
-        let hash = super::channel::channel_hash(&channel);
+        let hash = super::channel::channel_hash(&channel, self.settings.secret.as_deref());
         let tls = self.settings.tls.clone();
+        let scan = self.settings.scan.clone();
         let mut scanned: Option<Instant> = None;
+        let mut peers: Vec<SocketAddr> = Vec::new();
         while !self.stop.load(Ordering::Relaxed) {
-            // A short list of addresses is probed whole every time.
-            let full = scanned.is_none_or(|at| at.elapsed() >= self.settings.scan_every)
-                || matches!(self.settings.scan, Scan::Addresses(_));
+            let full = scanned.is_none_or(|at| at.elapsed() >= self.settings.scan_every);
+            // Names are looked up again at each full scan, not every turn.
+            if full {
+                peers = super::channel::resolve_peers(&scan.peers);
+            }
             let probed_by: Vec<SocketAddr> = std::mem::take(&mut *self.probed_by.lock().unwrap());
-            let addrs: Vec<SocketAddr> = match (&self.settings.scan, full) {
-                (Scan::Addresses(addrs), true) => addrs.clone(),
-                (Scan::Networks { .. }, true) => Vec::new(),
-                // A node's alternates too: one whose address stopped
-                // answering moves to another within a refresh.
-                (_, false) => self
-                    .found
+            // Asked at every turn: the peers, the nodes found and their
+            // alternates (one whose address stopped answering moves to
+            // another within a turn), nodes that probed this one, and the
+            // parent.
+            let mut addrs: Vec<SocketAddr> = peers.clone();
+            addrs.extend(
+                self.found
                     .lock()
                     .unwrap()
                     .0
                     .iter()
                     .flat_map(|f| std::iter::once(&f.addr).chain(&f.alternates))
-                    .filter_map(|addr| addr.parse().ok())
-                    .chain(probed_by.iter().copied())
-                    .collect(),
-            };
-            let mut found = match (&self.settings.scan, full) {
-                (Scan::Networks { port, networks }, true) => super::channel::scan(
+                    .filter_map(|addr| addr.parse::<SocketAddr>().ok()),
+            );
+            addrs.extend(probed_by);
+            addrs.extend(self.parent_addrs());
+            let mut found = match (&scan.networks, full) {
+                (Some(networks), true) => super::channel::scan(
                     &super::channel::scan_hosts(networks),
-                    *port,
+                    scan.port,
                     &hash,
                     tls.as_ref(),
                 ),
-                _ => addrs
-                    .iter()
-                    .filter_map(|addr| super::channel::probe(*addr, &hash, tls.as_ref()))
-                    .collect(),
+                _ => Vec::new(),
             };
             if full {
                 scanned = Some(Instant::now());
-                if matches!(self.settings.scan, Scan::Networks { .. }) {
-                    found.extend(
-                        probed_by
-                            .iter()
-                            .filter_map(|addr| super::channel::probe(*addr, &hash, tls.as_ref())),
-                    );
+            }
+            let mut rest: Vec<SocketAddr> = Vec::new();
+            for addr in addrs {
+                if !rest.contains(&addr) && !found.iter().any(|f| f.addr == addr.to_string()) {
+                    rest.push(addr);
                 }
             }
+            found.extend(super::channel::probe_all(&rest, &hash, tls.as_ref()));
             found.retain(|f| f.node != self.id);
+            self.check_parent(&found);
             {
                 let mut slot = self.found.lock().unwrap();
                 let found = super::channel::one_per_node(found, &slot.0);
@@ -1457,6 +1806,7 @@ impl Node {
             while started.elapsed() < wait
                 && !self.stop.load(Ordering::Relaxed)
                 && self.probed_by.lock().unwrap().is_empty()
+                && !self.refresh_now.swap(false, Ordering::AcqRel)
             {
                 std::thread::sleep(self.settings.maintenance.min(wait));
             }
@@ -1472,6 +1822,9 @@ impl Node {
         }
         let source: Arc<dyn PipelineSource> = self.clone();
         let model = Arc::new(DelegatingModel::with_source(self.model.clone(), source));
+        if let Some(files) = &self.prefix_files {
+            model.attach_prefix_files(files.clone());
+        }
         let _ = self.delegating.set(Arc::downgrade(&model));
         Some(model)
     }
@@ -1482,7 +1835,11 @@ impl Node {
 
     fn unready(&self) -> Option<&'static str> {
         if self.is_assigned() {
-            return Some("serving a parent orangu-server");
+            return Some(if self.parent_suspect() {
+                "serving a parent orangu-server that does not answer"
+            } else {
+                "serving a parent orangu-server"
+            });
         }
         if super::fetch::incomplete() {
             return Some("the model is only partly downloaded; this node serves only as a worker");
@@ -1510,10 +1867,64 @@ impl Node {
                 metrics: &link.metrics,
             })
             .collect();
-        super::metrics::render(&self.metrics, self.is_assigned(), &links)
+        let mut out = super::metrics::render(&self.metrics, self.is_assigned(), &links);
+        if let Some(pool) = self.prefix_cache() {
+            out.push_str(&super::metrics::render_prefix_cache(&pool.stats()));
+        }
+        out
+    }
+
+    /// The store for a parent's sequences: two sessions a parent's slot —
+    /// the request running and the conversation kept for its next turn — and
+    /// what this node keeps for the parent's prefix pool.
+    fn session_store(&self, pipeline: Arc<LayerPipeline>, terms: Terms) -> SessionStore {
+        let reserve = pool_reserve(self.settings.slots);
+        let own = SessionTerms {
+            pool_reserve: reserve as u32,
+            ..SessionTerms::default()
+        };
+        SessionStore::new(pipeline, terms.n_ctx, own.session_limit(terms.slots))
+            .with_pool_reserve(reserve)
+            .with_prefixes(self.prefix_files.clone())
+            .named(&self.settings.name)
+    }
+
+    /// How this node is configured to hold sequences, for its parent's
+    /// handshake: its own slots and context, and the sessions it — and every
+    /// worker below it — keeps for the parent's prefix pool.
+    fn session_terms(&self) -> SessionTerms {
+        let reserve = self
+            .links()
+            .iter()
+            .filter_map(|link| link.info())
+            .map(|info| info.pool_reserve())
+            .fold(pool_reserve(self.settings.slots), usize::min);
+        SessionTerms {
+            slots: self.settings.slots as u32,
+            n_ctx: self.settings.n_ctx as u32,
+            pool_reserve: reserve as u32,
+        }
+    }
+
+    /// The prefix pool of the model this node serves through its tree.
+    fn prefix_cache(&self) -> Option<Arc<crate::engine::prefix_cache::PrefixCache>> {
+        self.delegating
+            .get()
+            .and_then(Weak::upgrade)
+            .and_then(|model| model.prefix_cache())
     }
 
     fn status(&self) -> serde_json::Value {
+        // The parent this node works for, and whether it still answers.
+        let parent = self.parent.lock().unwrap().as_ref().map(|p| {
+            serde_json::json!({
+                "node": p.node,
+                "name": p.seen.as_ref().map(|(name, _)| name.clone()),
+                "suspect": p.suspect,
+                "missed_probes": p.missed,
+                "last_heard_seconds": p.heard.elapsed().as_secs(),
+            })
+        });
         let assignment = self.assignment.lock().unwrap();
         let plan: Vec<_> = self
             .plan()
@@ -1525,11 +1936,32 @@ impl Node {
                 })
             })
             .collect();
+        // Sessions each worker of the plan holds for the prefix pool: one an
+        // entry, on every worker the plan uses.
+        let pool_sessions = self
+            .delegating
+            .get()
+            .and_then(Weak::upgrade)
+            .map_or(0, |model| model.pool_sessions());
+        let used = self.used.lock().unwrap().clone();
         let workers: Vec<_> = self
             .links()
             .iter()
             .map(|link| {
                 let info = link.info();
+                // How it is configured to hold sequences, as its handshake
+                // said, and what this node's pool holds there.
+                let sessions = info.as_ref().and_then(|i| {
+                    i.sessions.map(|terms| {
+                        serde_json::json!({
+                            "slots": terms.slots,
+                            "n_ctx": terms.n_ctx,
+                            "session_limit": terms.session_limit(self.settings.slots),
+                            "pool_reserve": i.pool_reserve(),
+                            "retained_sessions": if used.contains(&link.addr) { pool_sessions } else { 0 },
+                        })
+                    })
+                });
                 // The child's own record is always first (see
                 // anything after it is a grandchild. An empty
                 // address means its metrics listener is disabled.
@@ -1553,6 +1985,7 @@ impl Node {
                     "metrics": metrics,
                     "subtree_nodes": info.as_ref().map(|i| i.capacity.subtree_nodes),
                     "features": info.as_ref().map(|i| super::protocol::feature_names(i.features)),
+                    "sessions": sessions,
                     "setups": info.as_ref().map(|i| setups_json(&i.capacity.setups)),
                     "link": info.as_ref().and_then(|i| i.link).map(|(rtt, bandwidth)| serde_json::json!({
                         "rtt_ms": rtt.as_secs_f64() * 1e3,
@@ -1569,6 +2002,35 @@ impl Node {
             "port": record.metrics_port,
         }));
         let (found, scanned) = self.found.lock().unwrap().clone();
+        // What the prefix pool holds and served, on a node serving through
+        // its tree; the sessions a worker keeps for its parent's pool.
+        let prefix_cache = self.prefix_cache().map(|pool| {
+            let stats = pool.stats();
+            let (saved, loaded) = self
+                .delegating
+                .get()
+                .and_then(Weak::upgrade)
+                .map_or((0, 0), |model| model.prefixes_saved());
+            serde_json::json!({
+                "entries": stats.entries,
+                "hits": stats.hits,
+                "misses": stats.misses,
+                "tokens_held": stats.tokens_held,
+                // Entries saved on every node's disk, and entries put back in
+                // the pool from there at the last claim.
+                "saved": saved,
+                "loaded": loaded,
+            })
+        });
+        // What this node holds on its disk for a parent's prefix pool.
+        let saved_prefixes = self.prefix_files.as_ref().map(|files| {
+            let (entries, bytes) = files.usage();
+            serde_json::json!({ "entries": entries, "bytes": bytes })
+        });
+        let retained = assignment.as_ref().map(|a| {
+            let (sessions, bytes) = a.store.retained();
+            serde_json::json!({ "sessions": sessions, "bytes": bytes })
+        });
         serde_json::json!({
             "node": self.id,
             "name": self.settings.name,
@@ -1599,6 +2061,7 @@ impl Node {
                 })
                 .collect::<Vec<_>>(),
             "role": if assignment.is_some() { "worker" } else { "top" },
+            "parent": parent,
             "alone": self.alone.load(Ordering::Acquire),
             "layers": assignment.as_ref().map(|a| [a.layers.start, a.layers.end]),
             "listen": self.local_addr.map(|a| a.to_string()),
@@ -1610,14 +2073,13 @@ impl Node {
             // prompts its tree refused for lack of it.
             "kv_promised_bytes": self.top.read().unwrap().0.room().promised_bytes(),
             "kv_refusals": super::room::refused(),
+            "prefix_cache": prefix_cache,
+            "retained_sessions": retained,
+            "saved_prefixes": saved_prefixes,
             // This node's processors and speed, and what the last
             // plan's shares followed.
             "setup": setups_json(&self.settings.capacity.setups[..1])[0],
             "shares": *self.shares_by.lock().unwrap(),
-            // Where sequences decode once their prompt is through the tree.
-            "decode": if self.decode_alone.load(Ordering::Acquire) { "here alone" } else { "through the tree" },
-            // Why the plan uses no worker though there are some.
-            "not_worth_offloading": self.not_worth.lock().unwrap().clone(),
             // Each node's decode speed as requests found it (gigabytes of its
             // layers a second, and over how many tokens), and the speed the
             // plan went by.
@@ -2048,12 +2510,6 @@ impl Node {
 
         let proposed = self.best_order(&range, own_budget, candidates);
         let (local, shares, _) = self.cut(&range, own_budget, &proposed);
-        if self
-            .not_worth_offloading(&range, &local, &shares, &proposed)
-            .is_some()
-        {
-            return false;
-        }
         let then = costs(&local, &shares, &proposed);
         let saves = |now: f64, then: f64| then < now * (1.0 - WORTH_MOVING);
         !saves(now.0, then.0) && !saves(now.1, then.1)
@@ -2099,6 +2555,7 @@ impl Node {
             let spare_links = self.standby_links();
             let mut spares = spare_links.iter();
             for lost in missing {
+                let mut filled = false;
                 for link in spares.by_ref() {
                     if link.out_for().is_some() {
                         continue;
@@ -2106,8 +2563,22 @@ impl Node {
                     match link.ensure_connected(secret, path) {
                         Ok(info) => {
                             candidates.push((link.clone(), info));
-                            standing.push((lost, link.addr.clone()));
+                            standing.push((lost.clone(), link.addr.clone()));
+                            filled = true;
                             break;
+                        }
+                        Err(error) => log::warn!("orangu-server: standby left out: {error}"),
+                    }
+                }
+                // No standby held: a free node of the channel, if any.
+                if !filled
+                    && path.len() == 1
+                    && let Some(link) = self.claim_spare()
+                {
+                    match link.ensure_connected(secret, path) {
+                        Ok(info) => {
+                            candidates.push((link.clone(), info));
+                            standing.push((lost, link.addr.clone()));
                         }
                         Err(error) => log::warn!("orangu-server: standby left out: {error}"),
                     }
@@ -2143,30 +2614,36 @@ impl Node {
             self.note_rates(&candidates);
         }
         candidates = self.best_order(&range, own_budget, candidates);
+        // The split a claim's saved prefixes were made on ([`Self::claim`]).
+        let offered = if top {
+            self.saved_plan.lock().unwrap().clone()
+        } else {
+            None
+        };
+        let mut said = false;
         loop {
-            let (local, shares, by) = self.cut(&range, own_budget, &candidates);
-            *self.shares_by.lock().unwrap() = by;
-            if top {
-                let why = self.not_worth_offloading(&range, &local, &shares, &candidates);
-                let alone = why.is_some();
-                *self.not_worth.lock().unwrap() = why;
-                if alone {
-                    return Ok(Planned {
-                        pipeline: Arc::new(LayerPipeline::new(
-                            self.model.clone(),
-                            range.clone(),
-                            Vec::new(),
-                        )?),
-                        entries: vec![PlanEntry {
-                            node: self.settings.name.clone(),
-                            layer_start: range.start as u32,
-                            layer_end: range.end as u32,
-                        }],
-                        used: Vec::new(),
-                        standing: Vec::new(),
-                    });
+            let saved = offered.as_ref().and_then(|manifest| {
+                match self.saved_cut(manifest, &range, own_budget, &candidates) {
+                    Ok(cut) => Some(cut),
+                    Err(why) => {
+                        if !std::mem::replace(&mut said, true) {
+                            log::info!(
+                                "orangu-server: workers: the split the saved prefixes were made                                  on does not stand ({why}); cutting afresh"
+                            );
+                        }
+                        None
+                    }
                 }
-            }
+            });
+            let kept = saved.is_some();
+            let (local, shares, by) = match saved {
+                Some((ordered, local, shares)) => {
+                    candidates = ordered;
+                    (local, shares, "the saved split")
+                }
+                None => self.cut(&range, own_budget, &candidates),
+            };
+            *self.shares_by.lock().unwrap() = by;
             let mut entries = vec![PlanEntry {
                 node: self.settings.name.clone(),
                 layer_start: local.start as u32,
@@ -2213,6 +2690,9 @@ impl Node {
                     let pipeline = LayerPipeline::new(self.model.clone(), local, stages)?
                         .named(&self.settings.name);
                     standing.retain(|(_, standby)| used.contains(standby));
+                    if top {
+                        self.saved_split_kept.store(kept, Ordering::Release);
+                    }
                     if !standing.is_empty() {
                         log::warn!(
                             "orangu-server: standing in for workers that do not answer: {}",
@@ -2472,40 +2952,12 @@ impl Node {
                 (Arc::new(local), vec![entry], Vec::new(), Vec::new())
             }
         };
-        let why = self.not_worth.lock().unwrap().clone();
         if let Some(switch) = self.serving.get() {
             // No worker in the plan: the model's own paths serve.
-            switch.set_chosen(why.is_some() || used.is_empty());
+            switch.set_chosen(used.is_empty());
         }
-        match &why {
-            Some(why) if *self.plan.lock().unwrap() != entries => log::info!(
-                "orangu-server: workers: serving alone, the workers are not worth it: {why}"
-            ),
-            _ if *self.plan.lock().unwrap() != entries => {
-                log::info!("orangu-server: workers plan: {}", describe(&entries))
-            }
-            _ => {}
-        }
-        let decode_alone = self.decides_to_decode_alone(&entries, &used);
-        if decode_alone {
-            self.warm_whole_once();
-        }
-        let working = entries
-            .iter()
-            .filter(|e| e.layer_start < e.layer_end)
-            .count();
-        if working > 1
-            && (decode_alone != self.decode_alone.swap(decode_alone, Ordering::AcqRel)
-                || *self.plan.lock().unwrap() != entries)
-        {
-            log::info!(
-                "orangu-server: workers: sequences decode {} once their prompt is through the tree",
-                if decode_alone {
-                    "on this node alone"
-                } else {
-                    "through the tree"
-                }
-            );
+        if *self.plan.lock().unwrap() != entries {
+            log::info!("orangu-server: workers plan: {}", describe(&entries));
         }
         let head_on_last = self.decides_head_on_last(&entries, &used);
         if head_on_last != self.head_on_last.swap(head_on_last, Ordering::AcqRel) {
@@ -2518,15 +2970,7 @@ impl Node {
                 }
             );
         }
-        // Decoding here alone keeps every layer's weights at hand.
-        self.release_unused(
-            &if decode_alone {
-                0..n_layer
-            } else {
-                pipeline.local_layers()
-            },
-            true,
-        );
+        self.release_unused(&pipeline.local_layers(), true);
         self.copy_prompt_weights(&pipeline.local_layers(), terms.weights);
         let mut top = self.top.write().unwrap();
         *top = (pipeline, top.1 + 1);
@@ -2534,106 +2978,6 @@ impl Node {
         self.set_standing(standing);
         *self.plan.lock().unwrap() = entries;
         *self.used.lock().unwrap() = used;
-    }
-
-    /// Whether sequences decode on this node alone once their prompt is
-    /// through the tree: only when the plan uses workers, every one of them
-    /// can send rows back, and this node's budget holds the whole model —
-    /// and when the decode step
-    /// it saves (every node's layers at its speed, its fixed cost and the
-    /// hops, against this node alone) at least covers bringing one prompt
-    /// position's rows over the slowest link: the rows pay for themselves
-    /// within an answer as long as the prompt.
-    fn decides_to_decode_alone(&self, entries: &[PlanEntry], used: &[String]) -> bool {
-        let working: Vec<&PlanEntry> = entries
-            .iter()
-            .filter(|e| e.layer_start < e.layer_end)
-            .collect();
-        if self.decode_pinned(true) || working.len() < 2 {
-            return false;
-        }
-        let rows = self.can_hand_back(
-            self.links()
-                .iter()
-                .chain(&self.standby_links())
-                .filter(|link| used.contains(&link.addr))
-                .filter_map(|link| link.info().map(|info| info.features)),
-        );
-        let total: u64 = self.layer_bytes.iter().sum();
-        if !rows || self.settings.capacity.budget_bytes < total + self.non_layer_bytes {
-            return false;
-        }
-        if self.decode_pinned(false) {
-            return true;
-        }
-        let mut setups = self.settings.capacity.setups.clone();
-        for link in &self.links() {
-            if let Some(info) = link.info() {
-                setups.extend(info.capacity.setups);
-            }
-        }
-        // A node's rate, and what each forward costs it whatever its layers,
-        // in nanoseconds (bytes over gigabytes a second are).
-        let measured = |name: &str| {
-            setups
-                .iter()
-                .find(|s| s.name == name)
-                .filter(|s| s.decode_rate > 0.0)
-                .map(|s| (s.decode_rate as f64, s.decode_fixed_ms as f64 * 1e6))
-        };
-        let Some((own, own_fixed)) = measured(&self.settings.name) else {
-            return false;
-        };
-        let link = self.slowest_link(used);
-        let mut tree = 0.0;
-        let mut remote_rows = 0.0;
-        let mut remote_states = 0.0;
-        for (i, entry) in working.iter().enumerate() {
-            let Some((r, fixed)) = measured(&entry.node) else {
-                return false;
-            };
-            let layers = entry.layer_start as usize..entry.layer_end as usize;
-            tree += plan::bytes_of(&layers, &self.layer_bytes) as f64 / r + fixed;
-            if i > 0 {
-                tree += link.map_or(0.0, |(rtt, _)| rtt.as_nanos() as f64);
-                remote_rows += layers
-                    .clone()
-                    .map(|il| self.kv_row_bytes.get(il).copied().unwrap_or(0) as f64)
-                    .sum::<f64>();
-                remote_states += layers
-                    .map(|il| self.state_bytes.get(il).copied().unwrap_or(0) as f64)
-                    .sum::<f64>();
-            }
-        }
-        // What requests found a decode step through these nodes to take
-        // goes before the prediction.
-        let names: Vec<String> = working.iter().map(|e| e.node.clone()).collect();
-        if let Some((seen, _)) = self.tree_seen_with(&names).and_then(|s| s.decode_ns) {
-            tree = seen;
-        }
-        let alone = self
-            .alone_ns
-            .map_or(total as f64 / own + own_fixed, |(_, decode)| decode);
-        // Each prompt position's rows cross the link once, and a recurrent
-        // layer's state once a sequence; each generated token saves `tree -
-        // alone`. Worth it when an answer as long as its prompt pays the rows
-        // back, and a 128-token answer the states — on a slow link, a slow
-        // worker, or both.
-        let carry = |bytes: f64| link.map_or(0.0, |(_, bandwidth)| bytes / bandwidth * 1e9);
-        let states_per_token = carry(remote_states) / super::speed::PROMPT_TOKENS as f64;
-        tree - alone > 0.0 && tree - alone >= carry(remote_rows) + states_per_token
-    }
-
-    /// Whether workers with `features` can bring a sequence back here:
-    /// send rows, and a recurrent layer's state when the model keeps one.
-    fn can_hand_back(&self, mut features: impl Iterator<Item = u64>) -> bool {
-        let state = if self.state_bytes.iter().any(|b| *b > 0) {
-            super::protocol::FEATURE_STATE
-        } else {
-            0
-        };
-        let needed = super::protocol::FEATURE_ROWS | state;
-        features.all(|f| f & needed == needed)
     }
 
     /// The slowest link to the workers `used`: the longest round trip and
@@ -2645,128 +2989,6 @@ impl Node {
             .filter(|link| used.contains(&link.addr))
             .filter_map(|link| link.info().and_then(|info| info.link))
             .reduce(|a, b| (a.0.max(b.0), a.1.min(b.1)))
-    }
-
-    /// Why this node should serve alone rather than hand `shares` to its
-    /// workers, or `None` when the tree pays — or must be used: this
-    /// node cannot hold the model, a test pinned it, or a node did not
-    /// measure its speed. Predicted from the measured rates: a long
-    /// prompt runs at the pace of the tree's slowest stage (its parts
-    /// overlap), a decode step through every stage in turn — or here alone
-    /// after a handover. The tree must take at most 90% of this node's
-    /// time for a request of both (`tree_pays`).
-    fn not_worth_offloading(
-        &self,
-        range: &Range<usize>,
-        local: &Range<usize>,
-        shares: &[Range<usize>],
-        candidates: &[(Arc<ChildLink>, ChildInfo)],
-    ) -> Option<String> {
-        if self.offload_always() || shares.iter().all(Range::is_empty) {
-            return None;
-        }
-        let total = plan::bytes_of(range, &self.layer_bytes) as f64;
-        if (self.settings.capacity.budget_bytes as f64) < total + self.non_layer_bytes as f64 {
-            return None;
-        }
-        let own = self.settings.capacity.setups.first()?;
-        let (own_prompt, own_decode) = (own.prompt_rate as f64, own.decode_rate as f64);
-        if own_prompt <= 0.0 || own_decode <= 0.0 {
-            return None;
-        }
-        let bytes = |layers: &Range<usize>| plan::bytes_of(layers, &self.layer_bytes) as f64;
-        // In nanoseconds, as bytes over gigabytes a second are.
-        let ns = |ms: f32| ms as f64 * 1e6;
-        let (own_prompt_fixed, own_decode_fixed) =
-            (ns(own.prompt_fixed_ms), ns(own.decode_fixed_ms));
-        let mut prompt_stage = bytes(local) / own_prompt + own_prompt_fixed;
-        let mut decode_steps = bytes(local) / own_decode + own_decode_fixed;
-        for ((_, info), share) in candidates.iter().zip(shares) {
-            if share.is_empty() {
-                continue;
-            }
-            let setups = &info.capacity.setups;
-            if setups.is_empty()
-                || setups
-                    .iter()
-                    .any(|s| s.prompt_rate <= 0.0 || s.decode_rate <= 0.0)
-            {
-                return None;
-            }
-            let prompt: f64 = setups.iter().map(|s| s.prompt_rate as f64).sum();
-            let decode: f64 = setups.iter().map(|s| s.decode_rate as f64).sum();
-            // Beside its layers: what each forward costs a node whatever its
-            // layers — the slowest node's for a prompt stage, every node's in
-            // turn for a decode step — and the hop to the worker and back.
-            let prompt_fixed = setups
-                .iter()
-                .map(|s| ns(s.prompt_fixed_ms))
-                .fold(0.0, f64::max);
-            let decode_fixed: f64 = setups.iter().map(|s| ns(s.decode_fixed_ms)).sum();
-            let hop = info.link.map_or(0.0, |(rtt, _)| rtt.as_nanos() as f64);
-            // A prompt chunk's activations over the link, as they travel.
-            let chunk = super::protocol::Activations::bytes_per_row(
-                self.settings.activations,
-                self.model.config().n_embd,
-            )
-            .unwrap_or(4 * self.model.config().n_embd) as f64
-                * super::speed::PROMPT_TOKENS as f64;
-            let carry = info
-                .link
-                .map_or(0.0, |(_, bandwidth)| chunk / bandwidth * 1e9);
-            prompt_stage = prompt_stage.max(bytes(share) / prompt + prompt_fixed + carry);
-            decode_steps += bytes(share) / decode + decode_fixed + hop;
-        }
-        // The model alone as timed on its own paths when it was; else its
-        // layers at this node's rates.
-        let (alone_prompt, alone_decode) = self.alone_ns.unwrap_or((
-            total / own_prompt + own_prompt_fixed,
-            total / own_decode + own_decode_fixed,
-        ));
-        // Decoded here after a handover — unless the tree is asked to, or
-        // a worker cannot send back what it holds.
-        let hands_back = self.can_hand_back(
-            candidates
-                .iter()
-                .zip(shares)
-                .filter(|(_, share)| !share.is_empty())
-                .map(|((_, info), _)| info.features),
-        );
-        let mut tree_decode = if self.decode_pinned(true) || !hands_back {
-            decode_steps
-        } else {
-            alone_decode
-        };
-        // What requests found a tree of these nodes to take goes before
-        // what was predicted of it.
-        let mut used = vec![self.settings.name.clone()];
-        for ((_, info), share) in candidates.iter().zip(shares) {
-            if !share.is_empty() {
-                used.extend(info.capacity.setups.iter().map(|s| s.name.clone()));
-            }
-        }
-        *self.predicted_prompt.lock().unwrap() = Some(prompt_stage);
-        if let Some(seen) = self.tree_seen_with(&used) {
-            if let Some((prompt, _)) = seen.prompt_ns {
-                prompt_stage = prompt;
-            }
-            if let Some((decode, _)) = seen.decode_ns {
-                tree_decode = decode;
-            }
-        }
-        if tree_pays((prompt_stage, tree_decode), (alone_prompt, alone_decode)) {
-            return None;
-        }
-        // Bytes over gigabytes a second: nanoseconds.
-        let ms = |ns: f64| ns / 1e6;
-        Some(format!(
-            "a 128-token prompt chunk takes {:.0} ms here alone and {:.0} at the tree's slowest \
-             stage; a decode step {:.1} ms alone and {:.1} through the tree",
-            ms(alone_prompt),
-            ms(prompt_stage),
-            ms(alone_decode),
-            ms(tree_decode)
-        ))
     }
 
     /// Whether the node running the model's final layer applies the output
@@ -3076,9 +3298,7 @@ impl Node {
         let local = pipeline.local_layers();
         self.release_unused(&local, !local.is_empty() && local.end == n_layer);
         self.copy_prompt_weights(&pipeline.local_layers(), terms.weights);
-        let store = Arc::new(
-            SessionStore::new(pipeline, terms.n_ctx, terms.slots * 2).named(&self.settings.name),
-        );
+        let store = Arc::new(self.session_store(pipeline, terms));
         *self.assignment.lock().unwrap() = Some(Assignment {
             store,
             layers: layers.clone(),
@@ -3174,7 +3394,14 @@ impl Node {
         };
         loop {
             let (id, message) = match read_frame(&mut reader) {
-                Ok((id, message, _)) => (id, message),
+                Ok((id, message, _)) => {
+                    if let Some(parent) = self.parent.lock().unwrap().as_mut()
+                        && parent.connection == connection
+                    {
+                        parent.heard = Instant::now();
+                    }
+                    (id, message)
+                }
                 Err(error) => {
                     if timed_out(&error) {
                         log::warn!(
@@ -3284,7 +3511,7 @@ impl Node {
             // A node scanning for its channel: answered only on this one.
             Ok(Message::Probe { channel }) => {
                 if let Some(own) = self.settings.channel.as_deref()
-                    && super::channel::channel_hash(own) == channel
+                    && super::channel::channel_hash(own, self.settings.secret.as_deref()) == channel
                 {
                     let _ = write_message(
                         writer,
@@ -3309,7 +3536,7 @@ impl Node {
             // A node about to claim workers on this channel.
             Ok(Message::Lease { channel, node }) => {
                 if let Some(own) = self.settings.channel.as_deref()
-                    && super::channel::channel_hash(own) == channel
+                    && super::channel::channel_hash(own, self.settings.secret.as_deref()) == channel
                 {
                     let _ = write_message(writer, 0, &self.answer_lease(&node));
                 }
@@ -3353,7 +3580,7 @@ impl Node {
         let nonce = auth::nonce();
         // Whether it would switch to a parent's other model (`switch_to`).
         let switches = self.handover.get().is_some();
-        let ack = Message::HelloAck(HelloAck {
+        let ack = Message::HelloAck(Box::new(HelloAck {
             version: PROTOCOL_VERSION,
             features: FEATURES | if switches { FEATURE_SWITCH } else { 0 },
             nonce,
@@ -3363,7 +3590,14 @@ impl Node {
             capacity: self.subtree_capacity(),
             model: Some(self.identity.clone()),
             discovery: self.discovery_for_parent(hello.features),
-        });
+            sessions: Some(self.session_terms()),
+            // What this node holds on its disk, for a parent to know before
+            // it asks for any of it.
+            saved: match &self.prefix_files {
+                Some(files) if hello.features & FEATURE_PREFIXES != 0 => files.list(),
+                _ => Vec::new(),
+            },
+        }));
         write_message(writer, 0, &ack).ok()?;
         let proof = match read_message(reader) {
             Ok(Message::Auth { proof }) => proof,
@@ -3408,6 +3642,10 @@ impl Node {
                 connection,
                 node: parent_node,
                 stream: tcp,
+                heard: Instant::now(),
+                seen: None,
+                missed: 0,
+                suspect: false,
             });
         }
         *self.lease.lock().unwrap() = None;
@@ -3485,137 +3723,12 @@ impl Node {
         }
     }
 
-    /// Once requests have shown a decode step through
-    /// the tree ([`CALIBRATE_TOKENS`] of them), weighs again whether
-    /// sequences decode here alone — the plan stays as it is.
-    fn decide_decode_again(&self) {
-        if self.decode_pinned(true)
-            || self.decode_pinned(false)
-            || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
-            || self
-                .tree_seen_in_force()
-                .and_then(|seen| seen.decode_ns)
-                .is_none_or(|(_, tokens)| tokens < CALIBRATE_TOKENS)
-        {
-            return;
-        }
-        let plan = self.plan();
-        let used = self.used.lock().unwrap().clone();
-        let alone = self.decides_to_decode_alone(&plan, &used);
-        if alone {
-            self.warm_whole_once();
-        }
-        if alone != self.decode_alone.swap(alone, Ordering::AcqRel) {
-            log::info!(
-                "orangu-server: workers: by the decode steps requests found, sequences decode {} \
-                 once their prompt is through the tree",
-                if alone {
-                    "on this node alone"
-                } else {
-                    "through the tree"
-                }
-            );
-        }
-    }
-
-    /// Runs the whole model once on its own paths before the first sequence
-    /// decodes here alone: its own layers are warm from the plan, the rest
-    /// would be read in by a request.
-    fn warm_whole_once(&self) {
-        if self.warmed_whole.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        match super::speed::warm_whole(self.model.as_ref()) {
-            Ok(took) => log::info!(
-                "orangu-server: [workers] the whole model warmed in {:.1} s, to decode alone",
-                took.as_secs_f64()
-            ),
-            Err(e) => log::warn!("orangu-server: [workers] could not warm the whole model: {e:#}"),
-        }
-    }
-
-    /// What requests found of the tree in force.
-    fn tree_seen_in_force(&self) -> Option<TreeSeen> {
-        let used: Vec<String> = self
-            .plan()
-            .into_iter()
-            .filter(|e| e.layer_start < e.layer_end)
-            .map(|e| e.node)
-            .collect();
-        self.tree_seen_with(&used)
-    }
-
-    /// What requests found of a tree of the nodes `used`, in any order.
-    fn tree_seen_with(&self, used: &[String]) -> Option<TreeSeen> {
-        let seen = self.tree_seen.lock().unwrap().clone()?;
-        let mut a = seen.used.clone();
-        let mut b = used.to_vec();
-        a.sort();
-        b.sort();
-        (a == b).then_some(seen)
-    }
-
-    /// Why the tree in force should give way to this node alone: with
-    /// With the model held here, once requests found the
-    /// tree not to pay against the model alone — as timed, or at this
-    /// node's rates — by [`tree_pays`], after [`CALIBRATE_TOKENS`] decode
-    /// steps since the plan. `None` otherwise.
-    fn tree_seen_slower(&self) -> Option<String> {
-        if self.offload_always()
-            || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
-        {
-            return None;
-        }
-        let (alone_prompt, alone_decode) = self.alone_ns.or_else(|| {
-            // Not timed alone: its layers at this node's rates.
-            let own = self.settings.capacity.setups.first()?;
-            let total = plan::bytes_of(&(0..self.layer_bytes.len()), &self.layer_bytes) as f64;
-            (own.prompt_rate > 0.0 && own.decode_rate > 0.0).then(|| {
-                (
-                    total / own.prompt_rate as f64 + own.prompt_fixed_ms as f64 * 1e6,
-                    total / own.decode_rate as f64 + own.decode_fixed_ms as f64 * 1e6,
-                )
-            })
-        })?;
-        // Only a node that holds the model can serve alone.
-        let total = plan::bytes_of(&(0..self.layer_bytes.len()), &self.layer_bytes);
-        if self.settings.capacity.budget_bytes < total + self.non_layer_bytes {
-            return None;
-        }
-        let seen = self.tree_seen_in_force()?;
-        let (decode, tokens) = seen.decode_ns?;
-        if tokens < CALIBRATE_TOKENS {
-            return None;
-        }
-        // A prompt too short to time the tree by goes by the prediction.
-        let (prompt, how) = match seen.prompt_ns {
-            Some((prompt, _)) => (prompt, "found"),
-            None => ((*self.predicted_prompt.lock().unwrap())?, "predicted"),
-        };
-        if tree_pays((prompt, decode), (alone_prompt, alone_decode)) {
-            return None;
-        }
-        let ms = |ns: f64| ns / 1e6;
-        Some(format!(
-            "requests found the tree no faster: a decode step {:.1} ms against {:.1} alone, a \
-             128-token prompt chunk {:.0} ms at its slowest stage ({how}) against {:.0} alone",
-            ms(decode),
-            ms(alone_decode),
-            ms(prompt),
-            ms(alone_prompt)
-        ))
-    }
-
     /// Whether the speeds requests found tell the plan apart from the speeds
     /// it was made by — some node more than 20% off, set against this
     /// node's own — after enough decode steps to tell ([`CALIBRATE_TOKENS`]).
     /// Says which, for the log. Only for shares by decode speed, and only
     /// when every node the plan uses has been seen.
     fn calibration_due(&self) -> Option<String> {
-        if let Some(why) = self.tree_seen_slower() {
-            return Some(why);
-        }
-        self.decide_decode_again();
         if self.settings.shares != Shares::Decode
             || self.observed_since_plan.load(Ordering::Relaxed) < CALIBRATE_TOKENS
         {
@@ -3632,15 +3745,6 @@ impl Node {
         let own = &self.settings.name;
         let (&own_planned, &(own_observed, _)) = (planned.get(own)?, observed.get(own)?);
         let mut off = Vec::new();
-        // Set against the model alone, speeds count as they are, not only
-        // against each other: a tree slower than planned all through may
-        // now lose to this node alone.
-        let own_ratio = own_observed / own_planned;
-        if self.alone_ns.is_some() && !(1.0 / 1.2..=1.2).contains(&own_ratio) {
-            off.push(format!(
-                "this node runs at {own_ratio:.2} of what it was planned at"
-            ));
-        }
         for (name, planned_rate) in &planned {
             if name == own || !in_plan.contains(name) {
                 continue;
@@ -3739,10 +3843,7 @@ impl Node {
                 let n_layer = self.model.config().n_layer;
                 self.release_unused(&local, !local.is_empty() && local.end == n_layer);
                 self.copy_prompt_weights(&pipeline.local_layers(), terms.weights);
-                let store = Arc::new(
-                    SessionStore::new(pipeline, terms.n_ctx, terms.slots * 2)
-                        .named(&self.settings.name),
-                );
+                let store = Arc::new(self.session_store(pipeline, terms));
                 if let Some(assignment) = self.assignment.lock().unwrap().as_mut() {
                     assignment.store = store;
                 }
@@ -3797,10 +3898,6 @@ impl PipelineSource for Node {
         self.plan_top_locked();
         *last = Instant::now();
         true
-    }
-
-    fn decode_alone(&self) -> bool {
-        self.decode_alone.load(Ordering::Acquire)
     }
 
     fn head_on_last(&self) -> bool {
@@ -3870,57 +3967,6 @@ impl PipelineSource for Node {
         self.observed_since_plan
             .fetch_add(tokens, Ordering::Relaxed);
     }
-
-    fn handover_failed(&self) {
-        if self.decode_alone.swap(false, Ordering::AcqRel) {
-            log::warn!(
-                "orangu-server: workers: sequences decode through the tree until the next plan"
-            );
-        }
-    }
-
-    fn observed_request(&self, prefill: &Trace, decode: &Trace) {
-        let used: Vec<String> = self
-            .plan()
-            .into_iter()
-            .filter(|e| e.layer_start < e.layer_end)
-            .map(|e| e.node)
-            .collect();
-        if used.len() < 2 {
-            return;
-        }
-        let mut seen = self.tree_seen.lock().unwrap();
-        let tree = match &mut *seen {
-            Some(tree) if tree.used == used => tree,
-            _ => seen.insert(TreeSeen {
-                used,
-                ..TreeSeen::default()
-            }),
-        };
-        // A prompt's stages overlap: a chunk takes as long as the slowest.
-        if prefill.tokens >= SEEN_PROMPT_TOKENS
-            && let Some(slowest) = prefill.parts.iter().map(|(_, t)| *t).max()
-        {
-            let chunk = slowest.as_nanos() as f64 / prefill.tokens as f64
-                * super::speed::PROMPT_TOKENS as f64;
-            tree.prompt_ns = Some(weigh(tree.prompt_ns, chunk, prefill.tokens));
-        }
-        // A decode step runs through every stage in turn. One decoded here
-        // alone after a handover is no step of the tree's.
-        let through_workers = decode
-            .parts
-            .iter()
-            .any(|(name, _)| *name != self.settings.name);
-        if decode.tokens > 0 && through_workers {
-            let step = decode
-                .parts
-                .iter()
-                .map(|(_, t)| t.as_nanos() as f64)
-                .sum::<f64>()
-                / decode.tokens as f64;
-            tree.decode_ns = Some(weigh(tree.decode_ns, step, decode.tokens));
-        }
-    }
 }
 
 fn error(code: ErrorCode, message: impl Into<String>) -> Message {
@@ -3973,7 +4019,7 @@ mod tests {
             workers,
             standby: Vec::new(),
             channel: None,
-            scan: Scan::Addresses(Vec::new()),
+            scan: Scan::default(),
             scan_every: Duration::from_millis(100),
             release: Duration::from_secs(300),
             api_port: 0,
@@ -3994,9 +4040,7 @@ mod tests {
                 ..Capacity::default()
             },
             shares: Shares::Memory,
-            decode_pin: Some(DecodePin::Tree),
             head: HeadOn::Top,
-            offload_always: true,
             split: true,
             maintenance: Duration::from_millis(50),
             parent_silence: Duration::from_secs(30),
@@ -4004,6 +4048,7 @@ mod tests {
             tls: None,
             metrics_endpoint: None,
             prompt_weights: prompt_weights::PromptWeights::File,
+            prefix_root: None,
         }
     }
 
@@ -4044,7 +4089,10 @@ mod tests {
     fn on_channel(name: &str, channel: &str, peers: &[&Arc<Node>], fits: bool) -> NodeSettings {
         let mut settings = settings(name, Vec::new(), None);
         settings.channel = Some(channel.to_string());
-        settings.scan = Scan::Addresses(peers.iter().map(|p| p.local_addr().unwrap()).collect());
+        settings.scan.peers = peers
+            .iter()
+            .map(|p| p.local_addr().unwrap().to_string())
+            .collect();
         settings.release = Duration::from_millis(300);
         if !fits {
             settings.capacity.budget_bytes = 1;
@@ -4071,7 +4119,7 @@ mod tests {
     fn probe_of(node: &Node, channel: &str) -> Option<super::super::channel::Found> {
         super::super::channel::probe(
             node.local_addr().unwrap(),
-            &super::super::channel::channel_hash(channel),
+            &super::super::channel::channel_hash(channel, None),
             None,
         )
     }
@@ -4089,6 +4137,39 @@ mod tests {
         assert!(probe_of(&beta, "other").is_none());
         let off = node("off", &[], Variant::default());
         assert!(probe_of(&off, "lab").is_none());
+    }
+
+    /// With a secret, a probe is answered only by a node that shares it:
+    /// one that knows the channel's name alone finds nothing, and two
+    /// nodes with another secret each never see each other.
+    #[test]
+    fn a_secret_keys_the_channel() {
+        let mut s = on_channel("beta", "lab", &[], true);
+        s.secret = Some("s1".to_string());
+        let beta = node_with(s, Variant::default());
+        let addr = beta.local_addr().unwrap();
+        let ask = |secret: Option<&str>| {
+            super::super::channel::probe(
+                addr,
+                &super::super::channel::channel_hash("lab", secret),
+                None,
+            )
+        };
+        assert!(ask(Some("s1")).is_some());
+        assert!(ask(None).is_none());
+        assert!(ask(Some("s2")).is_none());
+        let mut s = on_channel("gamma", "lab", &[&beta], true);
+        s.secret = Some("s2".to_string());
+        let gamma = node_with(s, Variant::default());
+        let mut s = on_channel("delta", "lab", &[&beta], true);
+        s.secret = Some("s1".to_string());
+        let delta = node_with(s, Variant::default());
+        assert_eq!(found(&delta, 1)[0].name, "beta");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(gamma.found.lock().unwrap().0.is_empty());
+        for n in [&beta, &gamma, &delta] {
+            n.stop();
+        }
     }
 
     /// A node that cannot hold the model claims the free nodes of its
@@ -4140,6 +4221,119 @@ mod tests {
         assert!(!beta.is_assigned() && !gamma.is_assigned());
     }
 
+    /// Of two free nodes that each hold the model, one is enough: the other
+    /// stands by, and takes the first one's layers in place when it is lost.
+    #[test]
+    fn a_claimed_node_the_model_does_not_need_stands_by() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
+        let alpha = node_with(
+            on_channel("alpha", "lab", &[&beta, &gamma], false),
+            Variant::default(),
+        );
+        found(&alpha, 2);
+        let request = alpha.start_request();
+        assert_eq!(alpha.links().len(), 1);
+        assert_eq!(alpha.standby_links().len(), 1);
+        assert_eq!(alpha.workers_held(), 2);
+        let (worker, standby) = if beta.is_assigned() {
+            (&beta, &gamma)
+        } else {
+            (&gamma, &beta)
+        };
+        assert!(worker.is_assigned());
+        assert!(!standby.is_assigned(), "a standby waits");
+        assert_eq!(probe_of(standby, "lab").unwrap().state, ProbeState::Serving);
+
+        let tokens = fixture::tokens();
+        let whole = run(fixture::model().as_ref(), &tokens, 5);
+        let split = alpha.delegating_model().unwrap();
+        let mut cache = split.new_kv_cache(N_CTX);
+        split.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
+        worker.stop();
+        let mut worst = 0f32;
+        for (pos, token) in tokens.iter().enumerate().skip(5) {
+            let got = split.forward(&mut cache, &[*token], pos, 0).unwrap();
+            for (a, b) in got.iter().zip(&whole[pos - 4]) {
+                worst = worst.max((a - b).abs());
+            }
+        }
+        assert!(worst < 1e-3, "{worst}");
+        assert!(standby.is_assigned());
+        assert_eq!(alpha.metrics.takeovers.load(Ordering::Relaxed), 1);
+        assert_eq!(alpha.metrics.recoveries.load(Ordering::Relaxed), 0);
+        drop(cache);
+        drop(request);
+        for n in [&alpha, &beta, &gamma] {
+            n.stop();
+        }
+    }
+
+    /// A node needed for memory is not held back: with one free node, there
+    /// is no standby.
+    #[test]
+    fn a_node_the_model_needs_does_not_stand_by() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let alpha = node_with(
+            on_channel("alpha", "lab", &[&beta], false),
+            Variant::default(),
+        );
+        found(&alpha, 1);
+        let _request = alpha.start_request();
+        assert_eq!(alpha.links().len(), 1);
+        assert!(alpha.standby_links().is_empty());
+        assert!(beta.is_assigned());
+        alpha.stop();
+        beta.stop();
+    }
+
+    /// With no standby held, a worker lost mid-sequence is replaced by a
+    /// free node of the channel rather than its layers spread over the
+    /// nodes left.
+    #[test]
+    fn a_lost_worker_is_replaced_by_a_free_node_of_the_channel() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let later = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut s = on_channel("alpha", "lab", &[&beta], false);
+        s.scan.peers.push(later.to_string());
+        let alpha = node_with(s, Variant::default());
+        found(&alpha, 1);
+        let request = alpha.start_request();
+        assert!(alpha.standby_links().is_empty());
+        assert!(beta.is_assigned());
+        let mut s = on_channel("gamma", "lab", &[], true);
+        s.listen = Some(later.to_string());
+        let gamma = node_with(s, Variant::default());
+        found(&alpha, 2);
+
+        let tokens = fixture::tokens();
+        let split = alpha.delegating_model().unwrap();
+        let mut cache = split.new_kv_cache(N_CTX);
+        split.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
+        beta.stop();
+        for (pos, token) in tokens.iter().enumerate().skip(5) {
+            split.forward(&mut cache, &[*token], pos, 0).unwrap();
+        }
+        assert!(gamma.is_assigned());
+        assert!(
+            alpha.plan().iter().any(|e| e.node == "gamma"),
+            "{}",
+            describe(&alpha.plan())
+        );
+        assert_eq!(
+            alpha.status()["standby"][0]["standing_in_for"],
+            beta.local_addr().unwrap().to_string()
+        );
+        drop(cache);
+        drop(request);
+        for n in [&alpha, &gamma] {
+            n.stop();
+        }
+    }
+
     /// A node that answers at two addresses is found once, and claimed once.
     #[test]
     fn a_node_at_two_addresses_is_claimed_once() {
@@ -4148,10 +4342,7 @@ mod tests {
         let beta = node_with(s, Variant::default());
         let port = beta.local_addr().unwrap().port();
         let mut s = on_channel("alpha", "lab", &[], false);
-        s.scan = Scan::Addresses(vec![
-            format!("127.0.0.1:{port}").parse().unwrap(),
-            format!("127.0.0.2:{port}").parse().unwrap(),
-        ]);
+        s.scan.peers = vec![format!("127.0.0.1:{port}"), format!("127.0.0.2:{port}")];
         let alpha = node_with(s, Variant::default());
         let found = found(&alpha, 1);
         assert_eq!(found[0].alternates.len(), 1, "{found:?}");
@@ -4199,7 +4390,7 @@ mod tests {
         );
         // Asked over the channel's port, as a claimer does.
         let addr = beta.local_addr().unwrap();
-        let hash = super::super::channel::channel_hash("lab");
+        let hash = super::super::channel::channel_hash("lab", None);
         assert_eq!(
             super::super::channel::lease(addr, &hash, "x", None),
             Some(super::super::channel::LeaseAnswer::Promised(
@@ -4209,7 +4400,7 @@ mod tests {
         assert_eq!(
             super::super::channel::lease(
                 addr,
-                &super::super::channel::channel_hash("no"),
+                &super::super::channel::channel_hash("no", None),
                 "a",
                 None
             ),
@@ -4266,10 +4457,14 @@ mod tests {
             assert_eq!(free.lease_holder().as_deref(), Some(low.id.as_str()));
         }
         assert_eq!(high.contend(), Contest::Lost(low.id.clone()));
-        // The winner claims both; the loser's handshakes would be refused.
+        // The winner holds both, one as a worker and one standing by; the
+        // loser's handshakes would be refused.
         let _request = low.start_request();
-        assert_eq!(low.links().len(), 2);
-        assert!(beta.is_assigned() && gamma.is_assigned());
+        assert_eq!(low.workers_held(), 2);
+        assert!(beta.is_assigned() != gamma.is_assigned());
+        for free in [&beta, &gamma] {
+            assert_eq!(probe_of(free, "lab").unwrap().state, ProbeState::Serving);
+        }
     }
 
     /// A node that cannot hold the model, with no free node that can,
@@ -4310,7 +4505,7 @@ mod tests {
         let alpha = node_with(s, Variant::default());
         found(&alpha, 2);
         let _larger = alpha.start_request();
-        assert_eq!(alpha.links().len(), 2);
+        assert_eq!(alpha.workers_held(), 2);
 
         let mut s = on_channel("delta", "lab", &[&alpha, &epsilon], false);
         s.release = Duration::from_secs(60);
@@ -4485,6 +4680,225 @@ mod tests {
         }
     }
 
+    /// A worker configured with fewer slots than its parent says so in its
+    /// handshake, and the parent's prefix pool keeps no more sessions there
+    /// than it said — whatever the parent's own pool size. `/v1/workers`
+    /// shows what the worker reported and what the pool holds.
+    #[test]
+    fn a_worker_with_fewer_slots_gets_no_more_pool_sessions_than_it_reported() {
+        use crate::engine::prefix_cache::{ENTRIES, PrefixCache};
+        use crate::engine::slot_store::SlotStore;
+        let mut small = settings("small", vec![], None);
+        small.slots = 1;
+        let worker = node_with(small, Variant::default());
+        let mut big = settings("top", vec![worker.local_addr().unwrap().to_string()], None);
+        big.slots = 4;
+        let top = node_with(big, Variant::default());
+        assert!(worker.is_assigned());
+
+        let info = top.links()[0].info().unwrap();
+        let terms = info
+            .sessions
+            .expect("the worker said how it holds sequences");
+        assert_eq!((terms.slots, terms.n_ctx as usize), (1, N_CTX));
+        assert_eq!(info.pool_reserve(), 1);
+
+        let split = top.delegating_model().unwrap();
+        let pool = Arc::new(PrefixCache::new(ENTRIES));
+        split.attach_prefix_cache(&pool);
+        let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 4);
+        let retained = || {
+            worker
+                .assignment
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or((0, 0), |a| a.store.retained())
+                .0
+        };
+        for (slot, start) in [(0usize, 1u32), (1, 20), (2, 40)] {
+            let history: Vec<u32> = (start..start + 6).collect();
+            let mut cache = split.new_kv_cache(N_CTX);
+            split.forward(&mut cache, &history, 0, 0).unwrap();
+            crate::engine::generate::keep_finished(
+                Some(&pool),
+                Some(&slots),
+                slot,
+                false,
+                history,
+                cache,
+            );
+            assert_eq!(retained(), 1, "after the conversation on slot {slot}");
+        }
+        assert_eq!(pool.stats().entries, 1);
+        assert_eq!(split.pool_sessions(), 1);
+
+        let status = top.status();
+        let entry = &status["workers"][0]["sessions"];
+        assert_eq!(entry["slots"], 1);
+        assert_eq!(entry["pool_reserve"], 1);
+        assert_eq!(entry["session_limit"], 4 * 2 + 1);
+        assert_eq!(entry["retained_sessions"], 1);
+        assert_eq!(status["prefix_cache"]["entries"], 1);
+        assert_eq!(worker.status()["retained_sessions"]["sessions"], 1);
+
+        drop((pool, slots));
+        for n in [&top, &worker] {
+            n.stop();
+        }
+    }
+
+    /// A node of channel `channel` named `name` saving prefixes under
+    /// `root`, with `budget` bytes for layers.
+    fn saving(
+        name: &str,
+        channel: &str,
+        peers: &[&Arc<Node>],
+        root: &std::path::Path,
+        budget: u64,
+    ) -> Arc<Node> {
+        let mut settings = on_channel(name, channel, peers, true);
+        settings.capacity.budget_bytes = budget;
+        settings.prefix_root = Some(root.to_path_buf());
+        node_with(settings, Variant::default())
+    }
+
+    /// Two workers, neither of which holds the model alone, and a node that
+    /// holds none of it and claims them both: every node saves prefixes
+    /// under `root`.
+    fn saving_tree(tag: &str) -> (Arc<Node>, Arc<Node>, Arc<Node>, std::path::PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("orangu-node-prefixes-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let need: u64 = fixture::loaded(Variant::default())
+            .tensor_sizes()
+            .map(|(_, bytes)| bytes)
+            .sum();
+        let beta = saving("beta", tag, &[], &root, need * 6 / 10);
+        let gamma = saving("gamma", tag, &[], &root, need * 6 / 10);
+        let alpha = saving("alpha", tag, &[&beta, &gamma], &root, 1);
+        assert_eq!(found(&alpha, 2).len(), 2);
+        (alpha, beta, gamma, root)
+    }
+
+    /// A first conversation on `alpha`'s tree, kept in `pool`; the tree is
+    /// let go of after it.
+    fn converse_and_let_go(
+        alpha: &Arc<Node>,
+        workers: &[&Arc<Node>],
+        split: &DelegatingModel,
+        pool: &crate::engine::prefix_cache::PrefixCache,
+        history: &[u32],
+    ) {
+        use crate::engine::slot_store::SlotStore;
+        let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 2);
+        let request = alpha.start_request();
+        assert_eq!(alpha.used.lock().unwrap().len(), 2, "{:?}", alpha.plan());
+        let mut cache = split.new_kv_cache(N_CTX);
+        split.forward(&mut cache, history, 0, 0).unwrap();
+        crate::engine::generate::keep_finished(
+            Some(pool),
+            Some(&slots),
+            0,
+            false,
+            history.to_vec(),
+            cache,
+        );
+        assert_eq!(pool.stats().entries, 1);
+        slots.clear();
+        drop(request);
+        until("the workers are let go", || {
+            !alpha.leading.load(Ordering::Acquire) && workers.iter().all(|w| !w.is_assigned())
+        });
+        until("the channel finds them free", || {
+            alpha.unclaimed().len() == workers.len()
+        });
+    }
+
+    fn files_of(node: &Node) -> Vec<super::super::protocol::SavedPrefix> {
+        node.prefix_files.as_ref().unwrap().list()
+    }
+
+    /// The pool is saved on every node as the tree is let go; the next claim
+    /// of the same nodes keeps the split it was saved on, puts the entry back
+    /// in the pool, and a prompt sharing its prefix runs only what is new —
+    /// with the answer the model gives alone.
+    #[test]
+    fn a_saved_prefix_survives_a_release_and_a_new_claim() {
+        use crate::engine::prefix_cache::{ENTRIES, PrefixCache};
+        let (alpha, beta, gamma, root) = saving_tree("survives");
+        let split = alpha.delegating_model().unwrap();
+        let pool = Arc::new(PrefixCache::new(ENTRIES));
+        split.attach_prefix_cache(&pool);
+        let history = fixture::tokens()[..7].to_vec();
+        converse_and_let_go(&alpha, &[&beta, &gamma], &split, &pool, &history);
+        let manifest = alpha.prefix_files.as_ref().unwrap().manifest().unwrap();
+        assert_eq!(manifest.entries.len(), 1);
+        assert_eq!(manifest.workers.len(), 2);
+        for worker in [&beta, &gamma] {
+            let saved = files_of(worker);
+            assert_eq!(saved.len(), 1, "{}", worker.settings.name);
+            assert_eq!(saved[0].key, manifest.entries[0].key);
+        }
+        assert_eq!(beta.status()["saved_prefixes"]["entries"], 1);
+        assert_eq!(pool.stats().entries, 0);
+
+        let request = alpha.start_request();
+        assert_eq!(*alpha.shares_by.lock().unwrap(), "the saved split");
+        let status = alpha.status();
+        assert_eq!(status["prefix_cache"]["loaded"], 1, "{status}");
+        assert_eq!(status["prefix_cache"]["saved"], 1, "{status}");
+        let mut prompt = history.clone();
+        prompt.extend([11, 12, 13]);
+        let mut next = split.new_kv_cache(N_CTX);
+        assert_eq!(
+            crate::engine::generate::reuse_from_pool(&pool, &prompt, &mut next),
+            7
+        );
+        let logits = split.forward(&mut next, &prompt[7..], 7, 0).unwrap();
+        let alone = fixture::model();
+        let mut reference = alone.new_kv_cache(N_CTX);
+        alone.forward(&mut reference, &history, 0, 0).unwrap();
+        let expected = alone.forward(&mut reference, &prompt[7..], 7, 0).unwrap();
+        assert_eq!(logits, expected);
+        assert_eq!(split.rebuilds(), 0, "the prefix was not replayed");
+        drop((next, request));
+        for n in [&alpha, &beta, &gamma] {
+            n.stop();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A node of the saved split gone: the tree is cut afresh, and the saved
+    /// prefixes are deleted on every node of it and on the top-level node.
+    #[test]
+    fn a_tree_split_differently_drops_its_saved_prefixes() {
+        use crate::engine::prefix_cache::{ENTRIES, PrefixCache};
+        let (alpha, beta, gamma, root) = saving_tree("resplit");
+        let split = alpha.delegating_model().unwrap();
+        let pool = Arc::new(PrefixCache::new(ENTRIES));
+        split.attach_prefix_cache(&pool);
+        let history = fixture::tokens()[..7].to_vec();
+        converse_and_let_go(&alpha, &[&beta, &gamma], &split, &pool, &history);
+        assert_eq!(files_of(&beta).len(), 1);
+        gamma.stop();
+        until("gamma is gone from the channel", || {
+            alpha.found.lock().unwrap().0.len() == 1 && alpha.unclaimed().len() == 1
+        });
+
+        let request = alpha.start_request();
+        assert_ne!(*alpha.shares_by.lock().unwrap(), "the saved split");
+        assert_eq!(pool.stats().entries, 0);
+        assert_eq!(split.prefixes_saved(), (0, 0));
+        assert!(files_of(&beta).is_empty(), "beta was told to forget");
+        assert_eq!(alpha.prefix_files.as_ref().unwrap().manifest(), None);
+        drop(request);
+        for n in [&alpha, &beta] {
+            n.stop();
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// A tree of three nodes exposes every node through the top node's
     /// Prometheus metrics, each tagged with the branch it came through.
     #[test]
@@ -4623,45 +5037,6 @@ mod tests {
         for n in [&top, &middle, &leaf] {
             n.stop();
         }
-    }
-
-    /// Over TCP, a hybrid model's top-level node decodes alone: its
-    /// worker sends back each recurrent layer's state with the attention
-    /// layers' rows, and the answer is the model's alone.
-    #[test]
-    fn a_hybrid_tree_hands_its_states_back() {
-        let hybrid = Variant {
-            hybrid: true,
-            ..Variant::default()
-        };
-        let worker = node("worker", &[], hybrid);
-        let mut s = settings("top", vec![worker.local_addr().unwrap().to_string()], None);
-        s.decode_pin = Some(DecodePin::Top);
-        let top = node_with(s, hybrid);
-        let split = top.delegating_model().unwrap();
-        assert!(top.plan().iter().any(|e| e.node == "worker"));
-        assert!(top.decode_alone(), "{}", top.status());
-        let tokens = fixture::tokens();
-        let model = fixture::model_for(hybrid);
-        let mut cache = split.new_kv_cache(N_CTX);
-        let mut reference = model.new_kv_cache(N_CTX);
-        let mut worst = 0f32;
-        for (start, end) in [(0, 5), (5, 6), (6, 7), (7, 8)] {
-            let a = split
-                .forward(&mut cache, &tokens[start..end], start, 0)
-                .unwrap();
-            let b = model
-                .forward(&mut reference, &tokens[start..end], start, 0)
-                .unwrap();
-            for (x, y) in a.iter().zip(&b) {
-                worst = worst.max((x - y).abs());
-            }
-        }
-        assert!(cache.remote.is_none(), "handed over");
-        assert!(worst < 1e-4, "{worst}");
-        drop(cache);
-        top.stop();
-        worker.stop();
     }
 
     /// A worker with another quantization is left out, and the top serves
@@ -4984,7 +5359,6 @@ mod tests {
         let with_rate = |name: &str, workers: Vec<String>| {
             let mut s = settings(name, workers, None);
             s.shares = Shares::Decode;
-            s.decode_pin = Some(DecodePin::Tree);
             s.capacity.setups = vec![NodeSetup {
                 name: name.to_string(),
                 decode_rate: 1.0,
@@ -5036,7 +5410,6 @@ mod tests {
         let with_rate = |name: &str, workers: Vec<String>, rate: f32| {
             let mut s = settings(name, workers, None);
             s.shares = Shares::Decode;
-            s.decode_pin = Some(DecodePin::Tree);
             s.capacity.setups = vec![NodeSetup {
                 name: name.to_string(),
                 decode_rate: rate,
@@ -5105,7 +5478,6 @@ mod tests {
         let with_rate = |name: &str, workers: Vec<String>| {
             let mut s = settings(name, workers, None);
             s.shares = Shares::Decode;
-            s.decode_pin = Some(DecodePin::Tree);
             s.capacity.setups = vec![NodeSetup {
                 name: name.to_string(),
                 decode_rate: 1.0,
@@ -5132,123 +5504,6 @@ mod tests {
         top.stop();
         a.stop();
         b.stop();
-    }
-
-    /// A node that holds the model and would run it faster alone serves
-    /// alone and gives its workers nothing; one whose worker is much
-    /// faster uses it.
-    #[test]
-    fn a_node_uses_its_workers_only_when_they_pay() {
-        let with_rate = |name: &str, workers: Vec<String>, rate: f32| {
-            let mut s = settings(name, workers, None);
-            s.shares = Shares::Decode;
-            s.offload_always = false;
-            s.decode_pin = Some(DecodePin::Tree);
-            s.capacity.setups = vec![NodeSetup {
-                name: name.to_string(),
-                decode_rate: rate,
-                prompt_rate: rate,
-                ..NodeSetup::default()
-            }];
-            node_with(s, Variant::default())
-        };
-        // Rates slow enough (a megabyte a second) that the fixture's small
-        // layers, not a round trip on the loopback, decide.
-        let slow = with_rate("slow", vec![], 0.0001);
-        let top = with_rate("top", vec![slow.local_addr().unwrap().to_string()], 0.001);
-        let _model = top.delegating_model().unwrap();
-        assert_eq!(describe(&top.plan()), format!("top 0..{N_LAYER}"));
-        assert!(!slow.is_assigned());
-        let why = top.status()["not_worth_offloading"]
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert!(why.contains("decode step"), "{why}");
-
-        let fast = with_rate("fast", vec![], 0.01);
-        let other = with_rate("other", vec![fast.local_addr().unwrap().to_string()], 0.001);
-        let _model = other.delegating_model().unwrap();
-        assert!(
-            other.plan().iter().any(|e| e.node == "fast"),
-            "{}",
-            describe(&other.plan())
-        );
-        assert!(other.status()["not_worth_offloading"].is_null());
-
-        // Requests find that tree slower than this node alone: it gives
-        // way, and stays alone when planned again.
-        assert!(other.calibration_due().is_none(), "nothing observed yet");
-        let slow_step = Trace {
-            forwards: 40,
-            tokens: 40,
-            parts: vec![
-                ("other".to_string(), Duration::from_secs(40 * 1800)),
-                ("fast".to_string(), Duration::from_secs(40 * 1800)),
-            ],
-        };
-        let short_prompt = Trace {
-            forwards: 1,
-            tokens: 33,
-            parts: vec![("other".to_string(), Duration::from_secs(3600))],
-        };
-        other.observed_request(&short_prompt, &slow_step);
-        other.observed_decode(&slow_step.parts, slow_step.tokens);
-        let why = other
-            .calibration_due()
-            .expect("the tree is slower than alone");
-        assert!(why.contains("no faster"), "{why}");
-        other.plan_top();
-        assert_eq!(describe(&other.plan()), format!("other 0..{N_LAYER}"));
-        assert!(other.status()["not_worth_offloading"].is_string());
-        other.plan_top();
-        assert_eq!(describe(&other.plan()), format!("other 0..{N_LAYER}"));
-        for n in [&top, &slow, &other, &fast] {
-            n.stop();
-        }
-    }
-
-    /// A node whose measured speeds say its tree decodes faster goes by
-    /// what requests found instead: a tree slower than this node alone
-    /// has its sequences decode here, with the plan left as it is.
-    #[test]
-    fn a_node_decodes_alone_once_requests_find_the_tree_slower() {
-        let with_rate = |name: &str, workers: Vec<String>, rate: f32| {
-            let mut s = settings(name, workers, None);
-            s.shares = Shares::Decode;
-            s.decode_pin = None;
-            s.capacity.setups = vec![NodeSetup {
-                name: name.to_string(),
-                decode_rate: rate,
-                prompt_rate: rate,
-                ..NodeSetup::default()
-            }];
-            node_with(s, Variant::default())
-        };
-        let fast = with_rate("fast", vec![], 1.0);
-        let top = with_rate("top", vec![fast.local_addr().unwrap().to_string()], 0.001);
-        let _model = top.delegating_model().unwrap();
-        let before = top.plan();
-        assert!(
-            before.iter().any(|e| e.node == "fast"),
-            "{}",
-            describe(&before)
-        );
-        assert!(!top.decode_alone(), "predicted: the tree decodes faster");
-        let slow_step = Trace {
-            forwards: 40,
-            tokens: 40,
-            parts: vec![
-                ("top".to_string(), Duration::from_secs(40)),
-                ("fast".to_string(), Duration::from_secs(40 * 3600)),
-            ],
-        };
-        top.observed_request(&Trace::default(), &slow_step);
-        top.observed_decode(&slow_step.parts, slow_step.tokens);
-        let _ = top.calibration_due();
-        assert!(top.decode_alone(), "found: the tree decodes slower");
-        assert_eq!(top.plan(), before, "the plan stays");
-        top.stop();
-        fast.stop();
     }
 
     /// Shares follow the nodes' speeds when they differ, and each
@@ -5969,30 +6224,6 @@ mod tests {
         worker.stop();
     }
 
-    /// Decoding here alone, a request's part on the tree ends with its
-    /// prompt, and no finish is reported for the cache that comes back.
-    #[test]
-    fn a_prompt_handed_over_whole_forgives() {
-        let hybrid = Variant {
-            hybrid: true,
-            ..Variant::default()
-        };
-        let worker = node("worker", &[], hybrid);
-        let proxy = flaky(&worker, 1);
-        let mut with = settings("top", vec![proxy.addr.clone()], None);
-        with.decode_pin = Some(DecodePin::Top);
-        let top = node_with(with, hybrid);
-        let tokens = fixture::tokens();
-        let split = top.delegating_model().unwrap();
-        assert!(top.decode_alone(), "{}", top.status());
-        request(&split, &tokens);
-        assert_eq!(worker_status(&top)["failures_in_a_row"], 1);
-        request(&split, &tokens);
-        assert_eq!(worker_status(&top)["failures_in_a_row"], 0);
-        top.stop();
-        worker.stop();
-    }
-
     /// Its wait over, a worker is taken back between requests; failing again
     /// it is left out for longer, its failures still counted.
     #[test]
@@ -6215,6 +6446,121 @@ mod tests {
         worker.stop();
     }
 
+    /// `node` as a channel probe finds it at `addr`.
+    fn answered(node: &str, addr: &str) -> super::super::channel::Found {
+        super::super::channel::Found {
+            addr: addr.to_string(),
+            node: node.to_string(),
+            name: node.to_string(),
+            state: ProbeState::Leading,
+            load: 0.0,
+            whole: false,
+            api: format!("http://{addr}"),
+            model: [0; 32],
+            content: [0; 32],
+            workers: 1,
+            rtt: Duration::from_millis(1),
+            alternates: Vec::new(),
+        }
+    }
+
+    /// Makes the parent's connection look quiet for `for_`.
+    fn quiet_parent(worker: &Node, for_: Duration) {
+        let mut parent = worker.parent.lock().unwrap();
+        let parent = parent.as_mut().unwrap();
+        parent.heard = Instant::now().checked_sub(for_).unwrap();
+    }
+
+    fn held_by(worker: &Node) -> Option<String> {
+        worker
+            .parent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.node.clone())
+    }
+
+    /// A parent seen on the channel that stops answering probes, with its
+    /// connection quiet too, is let go after [`PARENT_MISSES`] probes rather
+    /// than after the whole silence.
+    #[test]
+    fn a_parent_the_channel_stops_finding_is_let_go_early() {
+        let worker = node("worker", &[], Variant::default());
+        let first = parent_link(&worker);
+        first.connect(None, &["first".to_string()]).unwrap();
+        worker.check_parent(&[answered("first", "10.0.0.1:8400")]);
+        assert_eq!(
+            worker.parent_addrs(),
+            vec!["10.0.0.1:8400".parse().unwrap()]
+        );
+        quiet_parent(&worker, Duration::from_secs(29));
+        worker.check_parent(&[]);
+        let status = worker.status();
+        assert_eq!(status["parent"]["suspect"], true);
+        assert_eq!(status["parent"]["missed_probes"], 1);
+        assert_eq!(status["parent"]["name"], "first");
+        for _ in 1..PARENT_MISSES {
+            assert_eq!(held_by(&worker).as_deref(), Some("first"));
+            worker.check_parent(&[]);
+        }
+        until("still held by the first", || held_by(&worker).is_none());
+        let second = parent_link(&worker);
+        second.connect(None, &["second".to_string()]).unwrap();
+        worker.stop();
+    }
+
+    /// Unanswered probes alone keep a parent that still talks on its
+    /// connection, and one answer clears the suspicion.
+    #[test]
+    fn a_parent_heard_on_its_connection_is_kept() {
+        let worker = node("worker", &[], Variant::default());
+        let first = parent_link(&worker);
+        first.connect(None, &["first".to_string()]).unwrap();
+        worker.check_parent(&[answered("first", "10.0.0.1:8400")]);
+        for _ in 0..PARENT_MISSES * 2 {
+            worker.check_parent(&[]);
+        }
+        assert!(worker.parent_suspect());
+        assert_eq!(first.ping_if_idle(), Some(true));
+        assert_eq!(held_by(&worker).as_deref(), Some("first"));
+        worker.check_parent(&[answered("first", "10.0.0.1:8400")]);
+        assert!(!worker.parent_suspect());
+        worker.stop();
+    }
+
+    /// A parent never seen on the channel is left to the silence, however
+    /// many scans miss it.
+    #[test]
+    fn a_parent_off_the_channel_is_left_to_the_silence() {
+        let worker = node("worker", &[], Variant::default());
+        let first = parent_link(&worker);
+        first.connect(None, &["first".to_string()]).unwrap();
+        quiet_parent(&worker, Duration::from_secs(29));
+        for _ in 0..PARENT_MISSES * 2 {
+            worker.check_parent(&[answered("other", "10.0.0.2:8400")]);
+        }
+        assert!(!worker.parent_suspect());
+        assert_eq!(held_by(&worker).as_deref(), Some("first"));
+        worker.stop();
+    }
+
+    /// A request that could not be forwarded to the parent's API makes it
+    /// suspect and asks the channel again at once; one sent elsewhere does
+    /// not.
+    #[test]
+    fn a_failed_forward_to_the_parent_makes_it_suspect() {
+        let worker = node("worker", &[], Variant::default());
+        let first = parent_link(&worker);
+        first.connect(None, &["first".to_string()]).unwrap();
+        worker.found.lock().unwrap().0 = vec![answered("first", "10.0.0.1:8400")];
+        worker.forward_failed("http://10.0.0.9:8400");
+        assert!(!worker.parent_suspect());
+        worker.forward_failed("http://10.0.0.1:8400");
+        assert!(worker.parent_suspect());
+        assert!(worker.refresh_now.load(Ordering::Acquire));
+        worker.stop();
+    }
+
     /// Nothing closes when a parent loses power. The worker gives up its
     /// layers and serves its own API again.
     #[test]
@@ -6267,7 +6613,7 @@ mod tests {
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             read_message(&mut reader).unwrap();
             let budget = 1u64 << 30;
-            let ack = Message::HelloAck(HelloAck {
+            let ack = Message::HelloAck(Box::new(HelloAck {
                 version: PROTOCOL_VERSION,
                 features: 0,
                 nonce: [0; 32],
@@ -6281,7 +6627,9 @@ mod tests {
                 },
                 model: None,
                 discovery: Vec::new(),
-            });
+                sessions: None,
+                saved: Vec::new(),
+            }));
             write_message(&mut writer, 0, &ack).unwrap();
             read_message(&mut reader).unwrap();
             write_message(&mut writer, 0, &Message::Ready).unwrap();

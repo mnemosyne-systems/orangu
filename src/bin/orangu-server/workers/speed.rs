@@ -33,9 +33,6 @@ use std::time::{Duration, Instant};
 /// The prompt chunk timed: the parts a tree's prompts travel in.
 pub const PROMPT_TOKENS: usize = 128;
 
-/// The prompt chunk the whole model alone is timed on ([`measure_whole`]).
-const WHOLE_PROMPT_TOKENS: usize = 512;
-
 /// Decode steps timed, after two that are not.
 const DECODE_STEPS: usize = 16;
 
@@ -143,50 +140,6 @@ fn cuts(model: &dyn ModelForward, layer_bytes: &[u64]) -> (usize, Option<usize>)
         .rev()
         .find(|at| cut(*at) && plan::bytes_of(&(0..*at), layer_bytes) <= MEASURE_BYTES);
     (short, long)
-}
-
-/// What the whole model costs here alone — a 128-token prompt chunk and a
-/// decode step (the fastest of [`DECODE_STEPS`]) through `ModelForward::
-/// forward`, the model's own paths — each after an untimed run. What a
-/// node that could serve alone sets its tree against: the rates of a range
-/// run inside a tree understate the model alone, whose fused paths a range
-/// does not take.
-pub fn measure_whole(model: &dyn ModelForward) -> Result<(Duration, Duration)> {
-    // Alone, a prompt runs in the engine's wide chunks, which a mixture's
-    // experts batch far better than the tree's 128-token parts: timed at
-    // [`WHOLE_PROMPT_TOKENS`] and given per [`PROMPT_TOKENS`].
-    let wide = WHOLE_PROMPT_TOKENS;
-    let mut cache = model.new_kv_cache(PROMPT_TOKENS + wide + 2 + DECODE_STEPS);
-    let vocab = model.config().n_vocab.clamp(2, 1000) as u32;
-    let tokens: Vec<u32> = (0..wide as u32).map(|i| 1 + i * 7 % (vocab - 1)).collect();
-    model.forward(&mut cache, &tokens[..PROMPT_TOKENS], 0, 0)?;
-    let at = Instant::now();
-    model.forward(&mut cache, &tokens, PROMPT_TOKENS, 0)?;
-    let prompt = at.elapsed() * PROMPT_TOKENS as u32 / wide as u32;
-    let mut pos = PROMPT_TOKENS + wide;
-    for _ in 0..2 {
-        model.forward(&mut cache, &tokens[..1], pos, 0)?;
-        pos += 1;
-    }
-    let mut decode = Duration::MAX;
-    for _ in 0..DECODE_STEPS {
-        let at = Instant::now();
-        model.forward(&mut cache, &tokens[..1], pos, 0)?;
-        decode = decode.min(at.elapsed());
-        pos += 1;
-    }
-    Ok((prompt, decode))
-}
-
-/// Runs the whole model once on its own paths — a token, then one decode
-/// step — so that a node about to decode alone has every layer read in
-/// and its device prepared before a request does. Answers how long it took.
-pub fn warm_whole(model: &dyn ModelForward) -> Result<Duration> {
-    let started = Instant::now();
-    let mut cache = model.new_kv_cache(2);
-    model.forward(&mut cache, &[1], 0, 0)?;
-    model.forward(&mut cache, &[1], 1, 0)?;
-    Ok(started.elapsed())
 }
 
 /// Runs `layers` once, untimed — a 128-token prompt chunk and a decode

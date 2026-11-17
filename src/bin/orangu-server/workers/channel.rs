@@ -43,9 +43,87 @@ pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(2);
 /// Addresses dialed at once.
 pub const IN_FLIGHT: usize = 64;
 
-/// What a node sends and compares instead of its channel's name.
-pub fn channel_hash(name: &str) -> [u8; 32] {
-    super::auth::hmac_sha256(b"orangu-workers-channel", name.as_bytes())
+/// What a node sends and compares instead of its channel's name. With a
+/// `[workers].secret` the secret keys it, so only nodes that share the
+/// secret recognise each other's probes; without one anybody who knows the
+/// name does.
+pub fn channel_hash(name: &str, secret: Option<&str>) -> [u8; 32] {
+    match secret {
+        Some(secret) => {
+            let mut message = b"orangu-workers-channel\0".to_vec();
+            message.extend_from_slice(name.as_bytes());
+            super::auth::hmac_sha256(secret.as_bytes(), &message)
+        }
+        None => super::auth::hmac_sha256(b"orangu-workers-channel", name.as_bytes()),
+    }
+}
+
+/// Parses `ORANGU_WORKERS_PEERS`: comma-separated `host:port` entries. A
+/// host may be a name, an IPv4 address or a bracketed IPv6 one
+/// (`[fd00::1]:8400`); one without a port gets `port`, `[workers].port`.
+/// Returned as `host:port`, resolved when the channel is asked.
+pub fn parse_peers(value: &str, port: u16) -> anyhow::Result<Vec<String>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            if let Ok(ip) = entry.parse::<std::net::IpAddr>() {
+                return Ok(SocketAddr::new(ip, port).to_string());
+            }
+            if let Ok(addr) = entry.parse::<SocketAddr>() {
+                return Ok(addr.to_string());
+            }
+            if let Some(v6) = entry.strip_prefix('[').and_then(|e| e.strip_suffix(']')) {
+                let ip: std::net::Ipv6Addr = v6
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("'{entry}' is not an IPv6 address"))?;
+                return Ok(SocketAddr::new(ip.into(), port).to_string());
+            }
+            let (host, with_port) = match entry.rsplit_once(':') {
+                Some((host, p)) => {
+                    let p: u16 = p
+                        .parse()
+                        .ok()
+                        .filter(|p| *p != 0)
+                        .ok_or_else(|| anyhow::anyhow!("'{entry}' has no port of 1-65535"))?;
+                    (host, p)
+                }
+                None => (entry, port),
+            };
+            anyhow::ensure!(
+                !host.is_empty()
+                    && !host.contains(':')
+                    && host
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_'),
+                "'{entry}' is not host:port (an IPv6 address goes in brackets)"
+            );
+            Ok(format!("{host}:{with_port}"))
+        })
+        .collect()
+}
+
+/// Every address `peers` (`host:port`) resolve to; a name that does not
+/// resolve is logged and left out until it does.
+pub fn resolve_peers(peers: &[String]) -> Vec<SocketAddr> {
+    use std::net::ToSocketAddrs;
+    let mut out = Vec::new();
+    for peer in peers {
+        match peer.to_socket_addrs() {
+            Ok(addrs) => {
+                for addr in addrs {
+                    if !out.contains(&addr) {
+                        out.push(addr);
+                    }
+                }
+            }
+            Err(error) => {
+                log::warn!("orangu-server: workers: '{peer}' does not resolve: {error}");
+            }
+        }
+    }
+    out
 }
 
 /// A node on the channel, as its answer to a probe described it.
@@ -327,24 +405,31 @@ pub fn lease(
 /// Probes `port` on every one of `hosts`, [`IN_FLIGHT`] at a time, and
 /// returns every answer from a node on `channel`: a node reachable at
 /// several addresses answers at each ([`one_per_node`] merges them).
-pub fn scan(hosts: &[Ipv4Addr], port: u16, channel: &[u8; 32], tls: Option<&Tls>) -> Vec<Found> {
+/// Probes `addrs`, [`IN_FLIGHT`] at a time: the nodes of the channel among
+/// them.
+pub fn probe_all(addrs: &[SocketAddr], channel: &[u8; 32], tls: Option<&Tls>) -> Vec<Found> {
     let next = AtomicUsize::new(0);
     let found = Mutex::new(Vec::new());
     std::thread::scope(|scope| {
-        for _ in 0..IN_FLIGHT.min(hosts.len()) {
+        for _ in 0..IN_FLIGHT.min(addrs.len()) {
             scope.spawn(|| {
-                loop {
-                    let i = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(&ip) = hosts.get(i) else { break };
-                    let addr = SocketAddr::V4(SocketAddrV4::new(ip, port));
-                    if let Some(node) = probe(addr, channel, tls) {
-                        found.lock().unwrap().push(node);
+                while let Some(addr) = addrs.get(next.fetch_add(1, Ordering::Relaxed)) {
+                    if let Some(f) = probe(*addr, channel, tls) {
+                        found.lock().unwrap().push(f);
                     }
                 }
             });
         }
     });
     found.into_inner().unwrap()
+}
+
+pub fn scan(hosts: &[Ipv4Addr], port: u16, channel: &[u8; 32], tls: Option<&Tls>) -> Vec<Found> {
+    let addrs: Vec<SocketAddr> = hosts
+        .iter()
+        .map(|&ip| SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        .collect();
+    probe_all(&addrs, channel, tls)
 }
 
 #[cfg(test)]
@@ -467,8 +552,18 @@ mod tests {
 
     #[test]
     fn channels_hash_apart() {
-        assert_ne!(channel_hash("lab"), channel_hash("lab2"));
-        assert_eq!(channel_hash("lab"), channel_hash("lab"));
+        assert_ne!(channel_hash("lab", None), channel_hash("lab2", None));
+        assert_eq!(channel_hash("lab", None), channel_hash("lab", None));
+        // A secret keys it: another secret, or none, is another channel.
+        assert_ne!(channel_hash("lab", Some("s1")), channel_hash("lab", None));
+        assert_ne!(
+            channel_hash("lab", Some("s1")),
+            channel_hash("lab", Some("s2"))
+        );
+        assert_eq!(
+            channel_hash("lab", Some("s1")),
+            channel_hash("lab", Some("s1"))
+        );
     }
 
     /// A listener that answers one probe for `channel` as `name`, and
@@ -482,7 +577,7 @@ mod tests {
                 let mut writer = stream.try_clone().unwrap();
                 let mut reader = BufReader::new(stream);
                 if let Ok(Message::Probe { channel: asked }) = read_message(&mut reader)
-                    && asked == channel_hash(channel)
+                    && asked == channel_hash(channel, None)
                 {
                     let _ = write_message(
                         &mut writer,
@@ -510,13 +605,24 @@ mod tests {
     fn a_node_on_the_channel_is_found_and_one_on_another_is_not() {
         let port = answering("lab", "beta:8400");
         let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let found = probe(addr, &channel_hash("lab"), None).expect("on the channel");
+        let found = probe(addr, &channel_hash("lab", None), None).expect("on the channel");
         assert_eq!(found.name, "beta:8400");
         assert_eq!(found.state, ProbeState::Idle);
         assert_eq!(found.load, 0.5);
         assert!(found.whole);
         assert_eq!(found.api, "http://127.0.0.1:8100");
-        assert!(probe(addr, &channel_hash("other"), None).is_none());
+        assert!(probe(addr, &channel_hash("other", None), None).is_none());
+    }
+
+    #[test]
+    fn peers_resolve_names_and_addresses() {
+        let peers = parse_peers("127.0.0.1, localhost:9400, [::1]:9401", 8400).unwrap();
+        assert_eq!(peers, ["127.0.0.1:8400", "localhost:9400", "[::1]:9401"]);
+        let resolved = resolve_peers(&peers);
+        assert!(resolved.contains(&"127.0.0.1:8400".parse().unwrap()));
+        assert!(resolved.contains(&"[::1]:9401".parse().unwrap()));
+        assert!(resolved.iter().any(|a| a.port() == 9400));
+        assert!(resolve_peers(&["no-such-host.invalid:8400".to_string()]).is_empty());
     }
 
     #[test]
@@ -524,14 +630,24 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let found = scan(&[Ipv4Addr::LOCALHOST], port, &channel_hash("lab"), None);
+        let found = scan(
+            &[Ipv4Addr::LOCALHOST],
+            port,
+            &channel_hash("lab", None),
+            None,
+        );
         assert!(found.is_empty());
     }
 
     #[test]
     fn a_scan_finds_the_listener() {
         let port = answering("lab", "gamma:8400");
-        let found = scan(&[Ipv4Addr::LOCALHOST], port, &channel_hash("lab"), None);
+        let found = scan(
+            &[Ipv4Addr::LOCALHOST],
+            port,
+            &channel_hash("lab", None),
+            None,
+        );
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].addr, format!("127.0.0.1:{port}"));
     }

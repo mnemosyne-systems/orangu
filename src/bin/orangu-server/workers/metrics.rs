@@ -187,9 +187,48 @@ pub fn render(node: &NodeMetrics, assigned: bool, links: &[LinkSnapshot<'_>]) ->
     out
 }
 
+/// The `orangu_server_workers_prefix_cache*` families of a node serving
+/// through its tree: how often its prefix pool served a prompt, and what it
+/// holds.
+pub fn render_prefix_cache(stats: &crate::engine::prefix_cache::PrefixCacheStats) -> String {
+    format!(
+        "# HELP orangu_server_workers_prefix_cache_hits_total Prompts the prefix pool served a \
+         prefix to.\n\
+         # TYPE orangu_server_workers_prefix_cache_hits_total counter\n\
+         orangu_server_workers_prefix_cache_hits_total {}\n\
+         # HELP orangu_server_workers_prefix_cache_misses_total Prompts the prefix pool had no \
+         prefix for.\n\
+         # TYPE orangu_server_workers_prefix_cache_misses_total counter\n\
+         orangu_server_workers_prefix_cache_misses_total {}\n\
+         # HELP orangu_server_workers_prefix_cache_entries Conversations the prefix pool holds.\n\
+         # TYPE orangu_server_workers_prefix_cache_entries gauge\n\
+         orangu_server_workers_prefix_cache_entries {}\n",
+        stats.hits, stats.misses, stats.entries
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_prefix_pool_renders_its_counters_and_gauge() {
+        let text = render_prefix_cache(&crate::engine::prefix_cache::PrefixCacheStats {
+            entries: 3,
+            hits: 5,
+            misses: 2,
+            tokens_held: 100,
+        });
+        for line in [
+            "# TYPE orangu_server_workers_prefix_cache_hits_total counter",
+            "orangu_server_workers_prefix_cache_hits_total 5",
+            "orangu_server_workers_prefix_cache_misses_total 2",
+            "# TYPE orangu_server_workers_prefix_cache_entries gauge",
+            "orangu_server_workers_prefix_cache_entries 3",
+        ] {
+            assert!(text.contains(line), "missing {line} in\n{text}");
+        }
+    }
 
     #[test]
     fn a_worker_s_figures_render_with_its_label() {

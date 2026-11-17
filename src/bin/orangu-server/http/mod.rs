@@ -165,18 +165,27 @@ async fn route_or_pause(
     {
         match forward(&base, request).await {
             Ok(response) => return response,
-            Err(request) => *request,
+            Err(request) => {
+                crate::workers::node::forward_failed(&base);
+                *request
+            }
         }
     } else {
         request
     };
     if crate::workers::node::api_paused() && !OPEN_WHILE_WORKING.contains(&request.uri().path()) {
+        let message = if crate::workers::node::parent_suspect() {
+            "this orangu-server is working for a parent node that does not answer; its own API \
+             comes back once the parent is taken for gone"
+        } else {
+            "this orangu-server is working for a parent node; its own API is off until the \
+             parent lets go"
+        };
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
                 "error": {
-                    "message": "this orangu-server is working for a parent node; its own API \
-                                is off until the parent lets go",
+                    "message": message,
                     "type": "unavailable",
                 }
             })),

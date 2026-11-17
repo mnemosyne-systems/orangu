@@ -45,19 +45,17 @@ pub const PROTOCOL_VERSION: u16 = 2;
 /// sends a child a message of an extension only when the child's
 /// `HelloAck` advertised its bit, so peers without it still talk.
 pub const FEATURES: u64 = FEATURE_FORK
-    | FEATURE_ROWS
     | FEATURE_HEAD
     | FEATURE_ECHO
-    | FEATURE_STATE
     | FEATURE_ROOM
-    | FEATURE_METRICS;
+    | FEATURE_METRICS
+    | FEATURE_RETAIN
+    | FEATURE_PREFIXES;
 
 /// [`Message::Fork`]: a worker copies one session's rows into another.
 pub const FEATURE_FORK: u64 = 1;
 
-/// [`Message::Rows`]: a worker sends back one layer's keys and values for a
-/// session, so the top-level node can decode alone.
-pub const FEATURE_ROWS: u64 = 2;
+// Bits 2 and 32, and message tags 18, 19 and 21, are unused: never reuse them.
 
 /// [`Rows::LastLogits`] and [`Rows::AllLogits`]: the node running the final
 /// layer sends back logits.
@@ -72,11 +70,6 @@ pub const FEATURE_ECHO: u64 = 8;
 /// cut. Advertised per node, not in [`FEATURES`].
 pub const FEATURE_SWITCH: u64 = 16;
 
-/// [`Message::LayerState`]: asked for a recurrent layer's rows, a worker
-/// sends back its state, so a hybrid model's top-level node can decode
-/// alone too.
-pub const FEATURE_STATE: u64 = 32;
-
 /// It answers [`Message::Reserve`]. Without it a prompt goes down unasked.
 pub const FEATURE_ROOM: u64 = 64;
 
@@ -90,16 +83,28 @@ pub const FEATURE_ROOM: u64 = 64;
 /// extensions under bit 64.
 pub const FEATURE_METRICS: u64 = 128;
 
+/// [`Message::Retain`]: a worker keeps a session its parent's prefix pool
+/// holds until the parent releases it, past its own idle and shortfall
+/// eviction.
+pub const FEATURE_RETAIN: u64 = 256;
+
+/// [`Message::Save`], [`Message::Load`] and [`Message::Forget`]: a worker
+/// writes a session's rows to its own disk under a key its parent chose,
+/// opens a session from them again, and deletes them. A `HelloAck` sent to a
+/// parent that advertised this bit ends with the [`SavedPrefix`]es the node
+/// holds.
+pub const FEATURE_PREFIXES: u64 = 512;
+
 /// Every extension bit, each a distinct power of two.
 const ALL_FEATURES: [u64; 8] = [
     FEATURE_FORK,
-    FEATURE_ROWS,
     FEATURE_HEAD,
     FEATURE_ECHO,
     FEATURE_SWITCH,
-    FEATURE_STATE,
     FEATURE_ROOM,
     FEATURE_METRICS,
+    FEATURE_RETAIN,
+    FEATURE_PREFIXES,
 ];
 
 const _: () = {
@@ -124,13 +129,13 @@ pub fn parent_reads_discovery(features: u64) -> bool {
 pub fn feature_names(features: u64) -> Vec<&'static str> {
     [
         (FEATURE_FORK, "fork"),
-        (FEATURE_ROWS, "rows"),
         (FEATURE_HEAD, "head"),
         (FEATURE_ECHO, "echo"),
         (FEATURE_SWITCH, "switch"),
-        (FEATURE_STATE, "state"),
         (FEATURE_ROOM, "room"),
         (FEATURE_METRICS, "metrics"),
+        (FEATURE_RETAIN, "retain"),
+        (FEATURE_PREFIXES, "prefixes"),
     ]
     .into_iter()
     .filter(|(bit, _)| features & bit != 0)
@@ -478,6 +483,47 @@ pub struct HelloAck {
     /// list. Written at the very end of the message, so a reader that
     /// does not know it just ignores it.
     pub discovery: Vec<DiscoveryRecord>,
+    /// How this node is configured to hold sequences. Appended after
+    /// `discovery` (written, empty, when there are no records), so a reader
+    /// that does not know it ignores it; `None` from a node that does not
+    /// say. Sent only with a `model`.
+    pub sessions: Option<SessionTerms>,
+    /// The prefixes this node holds on its disk ([`FEATURE_PREFIXES`]):
+    /// appended after `sessions`, and sent only with them, to a parent that
+    /// advertised the bit. Empty from a node that does not say.
+    pub saved: Vec<SavedPrefix>,
+}
+
+/// One prefix a node holds on its disk ([`Message::Save`]): its key, the
+/// layers its rows are of, and the positions they hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedPrefix {
+    pub key: String,
+    pub layer_start: u32,
+    pub layer_end: u32,
+    pub len: u32,
+}
+
+/// What a node is configured to hold, as its own settings decide: what its
+/// parent needs to know before sending it a session to keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct SessionTerms {
+    /// Its own `slots`.
+    pub slots: u32,
+    /// Its own context length.
+    pub n_ctx: u32,
+    /// Sessions it keeps for its parent's prefix pool ([`Message::Retain`]),
+    /// beside the two per slot of the parent's: the fewest of this node and
+    /// every node below it, since a pool entry holds a session on each.
+    pub pool_reserve: u32,
+}
+
+impl SessionTerms {
+    /// The sessions this node holds at most for a parent with
+    /// `parent_slots` slots.
+    pub fn session_limit(&self, parent_slots: usize) -> usize {
+        parent_slots * 2 + self.pool_reserve as usize
+    }
 }
 
 /// One entry in the tree's phone book: a node's name and the address
@@ -682,7 +728,7 @@ pub fn check_path(path: &[String], subtree: &[String]) -> Result<(), WorkerError
 #[derive(Clone, Debug, PartialEq)]
 pub enum Message {
     Hello(Hello),
-    HelloAck(HelloAck),
+    HelloAck(Box<HelloAck>),
     /// The parent's proof that it knows the secret, answering the worker's
     /// nonce — see `super::auth`.
     Auth {
@@ -727,33 +773,44 @@ pub enum Message {
         to: u64,
         len: u32,
     },
-    /// Send back layer `layer`'s first `len` positions of `session`, from
-    /// this worker or whichever node below it runs that layer. Answered with
-    /// [`Message::LayerRows`] — or, for a recurrent layer, by
-    /// [`Message::LayerState`]. Only sent to a child that advertised
-    /// [`FEATURE_ROWS`].
-    Rows {
+    /// `held`: keep `session` on this worker and every worker below it until
+    /// a [`Message::Release`] for it, exempt from idle and shortfall
+    /// eviction — a session the parent's prefix pool holds. `!held` returns
+    /// it to ordinary eviction. Answered with the same message. Only sent to
+    /// a child that advertised [`FEATURE_RETAIN`].
+    Retain {
         session: u64,
-        layer: u32,
+        held: bool,
+    },
+    /// Write `session`'s rows on this worker's own layers to its disk under
+    /// `key` (32 hex digits), and have every worker below do the same.
+    /// Answered with the same message. Only sent to a child that advertised
+    /// [`FEATURE_PREFIXES`].
+    Save {
+        session: u64,
+        key: String,
+    },
+    /// Open `session`, held as by [`Message::Retain`], from the rows saved
+    /// under `key`, its first `len` positions, here and on every worker
+    /// below. Answered with the same message, or an error — the session
+    /// opened nowhere — when a node has no such rows, or rows that are
+    /// damaged or do not match its model, layers, shape or context. Only sent
+    /// to a child that listed `key` in its handshake.
+    Load {
+        session: u64,
+        key: String,
         len: u32,
+    },
+    /// Delete the rows saved under `key` here and on every worker below.
+    /// Answered with the same message. Only sent to a child that advertised
+    /// [`FEATURE_PREFIXES`].
+    Forget {
+        key: String,
     },
     /// Answered with the same bytes: what a parent times a link's bandwidth
     /// by. Only sent to a child that advertised [`FEATURE_ECHO`].
     Echo {
         data: Vec<u8>,
-    },
-    /// One layer's rows: `len` rows of `kv_dim` keys, then as many values,
-    /// `f32` little-endian in `data`.
-    LayerRows {
-        kv_dim: u32,
-        len: u32,
-        data: Vec<u8>,
-    },
-    /// One recurrent layer's state: its conv window, then its state
-    /// matrices, each `f32` little-endian.
-    LayerState {
-        conv: Vec<u8>,
-        state: Vec<u8>,
     },
     Cancel {
         session: u64,
@@ -888,15 +945,16 @@ mod tag {
     pub const ERROR: u8 = 15;
     pub const READY: u8 = 16;
     pub const FORK: u8 = 17;
-    pub const ROWS: u8 = 18;
-    pub const LAYER_ROWS: u8 = 19;
     pub const ECHO: u8 = 20;
-    pub const LAYER_STATE: u8 = 21;
     pub const RESERVE: u8 = 22;
     pub const PROBE: u8 = 23;
     pub const PROBE_ACK: u8 = 24;
     pub const LEASE: u8 = 25;
     pub const LEASE_ACK: u8 = 26;
+    pub const RETAIN: u8 = 27;
+    pub const SAVE: u8 = 28;
+    pub const LOAD: u8 = 29;
+    pub const FORGET: u8 = 30;
 }
 
 struct Writer(Vec<u8>);
@@ -1204,8 +1262,23 @@ impl Message {
                 if let Some(model) = &h.model {
                     w.identity(model);
                 }
-                if !h.discovery.is_empty() {
+                let sessions = h.sessions.filter(|_| h.model.is_some());
+                if !h.discovery.is_empty() || sessions.is_some() {
                     w.discovery(&h.discovery);
+                }
+                if let Some(terms) = sessions {
+                    w.u32(terms.slots);
+                    w.u32(terms.n_ctx);
+                    w.u32(terms.pool_reserve);
+                    if !h.saved.is_empty() {
+                        w.u32(h.saved.len() as u32);
+                        for saved in &h.saved {
+                            w.string(&saved.key);
+                            w.u32(saved.layer_start);
+                            w.u32(saved.layer_end);
+                            w.u32(saved.len);
+                        }
+                    }
                 }
                 tag::HELLO_ACK
             }
@@ -1288,30 +1361,29 @@ impl Message {
                 w.u32(*len);
                 tag::FORK
             }
-            Self::Rows {
-                session,
-                layer,
-                len,
-            } => {
+            Self::Retain { session, held } => {
                 w.u64(*session);
-                w.u32(*layer);
+                w.u8(u8::from(*held));
+                tag::RETAIN
+            }
+            Self::Save { session, key } => {
+                w.u64(*session);
+                w.string(key);
+                tag::SAVE
+            }
+            Self::Load { session, key, len } => {
+                w.u64(*session);
+                w.string(key);
                 w.u32(*len);
-                tag::ROWS
+                tag::LOAD
+            }
+            Self::Forget { key } => {
+                w.string(key);
+                tag::FORGET
             }
             Self::Echo { data } => {
                 w.bytes(data);
                 tag::ECHO
-            }
-            Self::LayerRows { kv_dim, len, data } => {
-                w.u32(*kv_dim);
-                w.u32(*len);
-                w.bytes(data);
-                tag::LAYER_ROWS
-            }
-            Self::LayerState { conv, state } => {
-                w.bytes(conv);
-                w.bytes(state);
-                tag::LAYER_STATE
             }
             Self::Cancel { session, step } => {
                 w.u64(*session);
@@ -1389,7 +1461,7 @@ impl Message {
                 nonce: r.fixed()?,
                 path: r.strings()?,
             }),
-            tag::HELLO_ACK => Self::HelloAck(HelloAck {
+            tag::HELLO_ACK => Self::HelloAck(Box::new(HelloAck {
                 version: r.u16()?,
                 features: r.u64()?,
                 nonce: r.fixed()?,
@@ -1417,7 +1489,31 @@ impl Message {
                 } else {
                     r.discovery()?
                 },
-            }),
+                sessions: if r.0.is_empty() {
+                    None
+                } else {
+                    Some(SessionTerms {
+                        slots: r.u32()?,
+                        n_ctx: r.u32()?,
+                        pool_reserve: r.u32()?,
+                    })
+                },
+                saved: if r.0.is_empty() {
+                    Vec::new()
+                } else {
+                    let n = r.count(16)?;
+                    (0..n)
+                        .map(|_| {
+                            Ok(SavedPrefix {
+                                key: r.string()?,
+                                layer_start: r.u32()?,
+                                layer_end: r.u32()?,
+                                len: r.u32()?,
+                            })
+                        })
+                        .collect::<Result<_>>()?
+                },
+            })),
             tag::AUTH => Self::Auth { proof: r.fixed()? },
             tag::ASSIGN => Self::Assign(Assign {
                 model: r.string()?,
@@ -1476,21 +1572,21 @@ impl Message {
                 to: r.u64()?,
                 len: r.u32()?,
             },
-            tag::ROWS => Self::Rows {
+            tag::RETAIN => Self::Retain {
                 session: r.u64()?,
-                layer: r.u32()?,
+                held: r.u8()? != 0,
+            },
+            tag::SAVE => Self::Save {
+                session: r.u64()?,
+                key: r.string()?,
+            },
+            tag::LOAD => Self::Load {
+                session: r.u64()?,
+                key: r.string()?,
                 len: r.u32()?,
             },
+            tag::FORGET => Self::Forget { key: r.string()? },
             tag::ECHO => Self::Echo { data: r.bytes()? },
-            tag::LAYER_ROWS => Self::LayerRows {
-                kv_dim: r.u32()?,
-                len: r.u32()?,
-                data: r.bytes()?,
-            },
-            tag::LAYER_STATE => Self::LayerState {
-                conv: r.bytes()?,
-                state: r.bytes()?,
-            },
             tag::CANCEL => Self::Cancel {
                 session: r.u64()?,
                 step: r.u64()?,
@@ -1624,6 +1720,14 @@ mod tests {
         let without_room = feature_names(FEATURES & !FEATURE_ROOM);
         assert!(!without_room.contains(&"room"));
         assert!(without_room.contains(&"metrics"));
+        assert_eq!(FEATURE_RETAIN, 256);
+        assert!(ALL_FEATURES.contains(&FEATURE_RETAIN));
+        assert!(feature_names(FEATURES).contains(&"retain"));
+        assert!(!feature_names(FEATURES & !FEATURE_RETAIN).contains(&"retain"));
+        assert_eq!(FEATURE_PREFIXES, 512);
+        assert!(ALL_FEATURES.contains(&FEATURE_PREFIXES));
+        assert!(feature_names(FEATURES).contains(&"prefixes"));
+        assert!(!feature_names(FEATURES & !FEATURE_PREFIXES).contains(&"prefixes"));
     }
 
     /// A parent that advertised both extensions under bit 64 still gets
@@ -1673,7 +1777,7 @@ mod tests {
             nonce: [3; 32],
             path: vec!["root:8400".to_string()],
         }));
-        round_trip(Message::HelloAck(HelloAck {
+        round_trip(Message::HelloAck(Box::new(HelloAck {
             version: PROTOCOL_VERSION,
             features: 5,
             nonce: [4; 32],
@@ -1728,7 +1832,26 @@ mod tests {
                     metrics_port: 8102,
                 },
             ],
-        }));
+            sessions: Some(SessionTerms {
+                slots: 2,
+                n_ctx: 4096,
+                pool_reserve: 2,
+            }),
+            saved: vec![
+                SavedPrefix {
+                    key: "0123456789abcdef0123456789abcdef".to_string(),
+                    layer_start: 4,
+                    layer_end: 9,
+                    len: 300,
+                },
+                SavedPrefix {
+                    key: "fedcba9876543210fedcba9876543210".to_string(),
+                    layer_start: 4,
+                    layer_end: 9,
+                    len: 12,
+                },
+            ],
+        })));
         round_trip(Message::Auth { proof: [1; 32] });
         round_trip(Message::Assign(Assign {
             model: "org/model:Q4_K_M".to_string(),
@@ -1762,22 +1885,8 @@ mod tests {
             Err(error()),
         ]));
         round_trip(Message::Truncate { session: 1, len: 2 });
-        round_trip(Message::Rows {
-            session: 7,
-            layer: 12,
-            len: 440,
-        });
         round_trip(Message::Echo {
             data: vec![1, 2, 3],
-        });
-        round_trip(Message::LayerState {
-            conv: vec![1, 2, 3, 4],
-            state: vec![5, 6, 7, 8, 9, 10, 11, 12],
-        });
-        round_trip(Message::LayerRows {
-            kv_dim: 2,
-            len: 1,
-            data: vec![0, 0, 128, 63, 0, 0, 0, 64, 0, 0, 64, 64, 0, 0, 128, 64],
         });
         round_trip(Message::Reserve {
             session: 1,
@@ -1789,6 +1898,26 @@ mod tests {
             len: 5,
         });
         round_trip(Message::Release { session: 1 });
+        round_trip(Message::Retain {
+            session: 6,
+            held: true,
+        });
+        round_trip(Message::Retain {
+            session: 6,
+            held: false,
+        });
+        round_trip(Message::Save {
+            session: 6,
+            key: "0123456789abcdef0123456789abcdef".to_string(),
+        });
+        round_trip(Message::Load {
+            session: 7,
+            key: "0123456789abcdef0123456789abcdef".to_string(),
+            len: 300,
+        });
+        round_trip(Message::Forget {
+            key: "0123456789abcdef0123456789abcdef".to_string(),
+        });
         round_trip(Message::Cancel {
             session: 1,
             step: 2,
@@ -1919,8 +2048,35 @@ mod tests {
             capacity: Capacity::default(),
             model: None,
             discovery: Vec::new(),
+            sessions: None,
+            saved: Vec::new(),
         };
-        round_trip(Message::HelloAck(ack));
+        round_trip(Message::HelloAck(Box::new(ack)));
+    }
+
+    /// The session terms ride after an empty discovery list, and a reader
+    /// that stops before them — an older one — still reads the rest.
+    #[test]
+    fn session_terms_follow_an_empty_discovery_list() {
+        let ack = HelloAck {
+            version: PROTOCOL_VERSION,
+            features: FEATURES,
+            nonce: [4; 32],
+            proof: [9; 32],
+            node: "n1".to_string(),
+            subtree: vec!["n1".to_string()],
+            capacity: Capacity::default(),
+            model: Some(identity()),
+            discovery: Vec::new(),
+            sessions: Some(SessionTerms {
+                slots: 1,
+                n_ctx: 512,
+                pool_reserve: 1,
+            }),
+            saved: Vec::new(),
+        };
+        round_trip(Message::HelloAck(Box::new(ack.clone())));
+        assert_eq!(ack.sessions.unwrap().session_limit(4), 9);
     }
 
     #[test]
@@ -1982,7 +2138,7 @@ mod tests {
             };
             256
         ];
-        let ack = Message::HelloAck(HelloAck {
+        let ack = Message::HelloAck(Box::new(HelloAck {
             version: PROTOCOL_VERSION,
             features: FEATURES,
             nonce: [1; 32],
@@ -1995,7 +2151,13 @@ mod tests {
             },
             model: Some(identity()),
             discovery,
-        });
+            sessions: Some(SessionTerms {
+                slots: 1,
+                n_ctx: 2048,
+                pool_reserve: 1,
+            }),
+            saved: Vec::new(),
+        }));
         let frame = ack.to_frame(0);
         assert!(frame.len() < MAX_HANDSHAKE_FRAME, "{} bytes", frame.len());
         assert_eq!(read_message(&mut frame.as_slice()).unwrap(), ack);
@@ -2125,11 +2287,6 @@ mod tests {
                     layer_start: 0,
                     layer_end: 4,
                 }],
-            },
-            Message::LayerRows {
-                kv_dim: 2,
-                len: 1,
-                data: vec![0; 16],
             },
             Message::Error(error()),
         ];

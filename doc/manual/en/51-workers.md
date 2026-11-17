@@ -88,11 +88,11 @@ secret = a-long-random-string
 
 Every node of a channel listens on the same `port`. Start each one with the
 model: `orangu-server unsloth/Qwen3-32B-GGUF:Q4_K_M`. At start and every
-10 minutes a node scans its IPv4 networks — every address of each, or the /22 around its own
+`scan` seconds (10 minutes by default) a node scans its IPv4 networks — every address of each, or the /22 around its own
 address on a wider network — on that port, and asks whoever answers whether
 it is on `lab`. The name itself never crosses the network, only a hash of
-it, and a node on another channel does not answer. Each node logs what it
-found:
+it keyed by the `secret`, and a node on another channel, or with another
+secret, does not answer. Each node logs what it found:
 
 ```text
 workers: channel 'lab' has beta:8400 (192.168.1.11:8400, idle), gamma:8400 (192.168.1.12:8400, idle)
@@ -253,9 +253,8 @@ for 12.4 GiB; the layers over budget will be paged in from disk as they run
 `local_layers = 0` makes a node a pure coordinator that runs no layer
 itself.
 
-When sequences decode through the tree, the output head — a matrix as wide
-as the vocabulary, read once a token — can run on the node with the final
-layer instead (`head = last`, or `auto` when that node measured the faster
+The output head — a matrix as wide as the vocabulary, read once a token —
+can run on the node with the final layer instead (`head = last`, or `auto` when that node measured the faster
 decode): it sends logits back rather than its layers' output. That spares a
 weak top-level node the model's largest read.
 
@@ -281,7 +280,8 @@ first time the layer runs, not at startup. It skips:
 - the host preload;
 - the NPU's precompile of every block;
 - the automatic split of a model too big for its GPU;
-- the prefix warm-up.
+- the prefix warm-up: a top-level node's prefix cache fills from the
+  requests it serves.
 
 It still chooses its GPU kernels as any server does. A choice an earlier
 start kept in the probe cache is taken as it is; one that was not kept is
@@ -312,9 +312,11 @@ The tree then forms without it. A node found on the channel only becomes a
 candidate: being found grants nothing, and the handshake still asks for the
 `secret`.
 
-Without a `secret`, anyone who reaches a worker's port can take part — and a
-channel name is no secret, since any node that asks with it is answered — so
-set one on any network you do not fully trust. During the handshake a peer can only
+Without a `secret`, anyone who reaches a worker's port can take part, and
+anyone who knows or guesses the channel name is answered with a node's
+state, load, API address and model. With one, the secret keys the hash a
+probe carries, so a node answers only probes from nodes that share it; set
+one on any network you do not fully trust. During the handshake a peer can only
 send frames of up to 1 MiB, and is closed if it sends a larger one.
 
 A worker assigned **another model** than the one it serves switches to the
@@ -370,20 +372,34 @@ server's.
 ## Watching a tree
 
 - `GET /v1/workers` on any node: its channel, the nodes it found with
-  their state and load, its own load, its role, the layers it runs, the
+  their state and load, its own load, its role, on a worker its `parent`
+  (id, name, whether it is suspect, probes it missed in a row and seconds
+  since its connection last carried anything), the layers it runs, the
   plan below it, each worker's connection and failures in a row, how long
-  those leave it out, and any worker the plan lost.
+  those leave it out, the extensions it advertised under `features`
+  (`fork`, `head`, `echo`, `switch`, `room`, `metrics`, `retain`), and any
+  worker the plan lost. Each worker's `sessions` shows what its handshake
+  reported — its `slots`, `n_ctx` and `pool_reserve` — with the
+  `session_limit` it holds for this node and the `retained_sessions` this
+  node's prefix cache keeps there. A top-level node adds `prefix_cache`:
+  the entries its prefix cache holds, its `hits` and `misses`, and
+  `tokens_held`. A worker adds `retained_sessions`: how many sessions it keeps for its
+  parent's prefix cache, and their bytes.
 - **Settings › Workers** in the web console: the same, as tables — the
   channel with this node's load, every node found with its address and
   alternates, state, load and whether it serves the same model, then the
   plan, the workers and their hardware.
-- `GET /ready`: `serving a parent orangu-server` on a worker;
-  `a worker was lost` on a node whose plan lost one and has not repaired
+- `GET /ready`: `serving a parent orangu-server` on a worker, or
+  `serving a parent orangu-server that does not answer` while its parent is
+  suspect; `a worker was lost` on a node whose plan lost one and has not repaired
   it yet.
 - `GET /metrics` adds, per worker, the round trip of a forward
   (`orangu_server_worker_forward_seconds`), bytes each way, failures and
   whether it is up; per node, how often it planned and how often a lost
-  worker made it plan again mid-request.
+  worker made it plan again mid-request. A top-level node adds its prefix
+  cache's `orangu_server_workers_prefix_cache_hits_total`,
+  `orangu_server_workers_prefix_cache_misses_total` and
+  `orangu_server_workers_prefix_cache_entries`.
 - When a request finishes, the top-level node logs where its time went:
 
   ```text
@@ -408,8 +424,21 @@ is out a node pings the worker below it. A worker that says nothing for 15
 seconds counts as lost. A worker that is only slow goes on answering, and has
 until `timeout` for a decode step, and longer for a prompt's forward.
 
-A request in flight is not lost with a worker. The top-level node plans
-again over the workers that still answer, rebuilds the conversation on the
+**A standby takes a lost worker's place.** When a node claims its channel
+and the model fits without one of the nodes it found — the one with the most
+memory that this node and the others can do without — that node stands by
+instead of taking layers. It is held like a worker, so no other node claims
+it, and it serves its own API meanwhile. When a worker is lost mid-answer, the
+standby takes the same layers, is brought up to date with the conversation's
+rows, and the answer goes on with every other node keeping its share. With no
+standby held, the plan made after the loss gives the lost worker's layers to
+a free node of the channel when there is one, rather than spreading them over
+the nodes left. Either way the log says so (`… stands by …`, `claiming … to
+stand in for a lost worker`), and `/v1/workers` lists the standby under
+`standby`, with the worker it stands in for.
+
+Without a standby, a request in flight is still not lost with a worker. The
+top-level node plans again over the workers that still answer, rebuilds the conversation on the
 new plan by running its tokens through again, and carries on. Tokens
 already sent stay sent. The rebuilt cache comes from one prefill rather
 than token by token, so a greedy continuation can pick a different
@@ -425,11 +454,29 @@ A worker that comes back is taken back by the node above it within about
 of one. A conversation that continues after that is replayed through the
 new plan once, and reuses its rows from then on.
 
-A worker does the same for its parent. A parent pings every 5 seconds while
-idle and more often with a request out, so a worker that hears nothing for 60
-seconds takes it for gone: it lets go of its layers and sessions, serves its own
-API again and can be claimed by another node. A parent that was only stalled that long finds the worker
-lost, plans again, and takes it back as usual.
+A worker does the same for its parent. A parent whose process ends closes
+its connections, and the worker lets go at once. One whose machine loses power
+or its network closes nothing; the worker then takes it for gone on the first
+of two signs:
+
+- **The channel stops finding it.** A worker on a channel asks the nodes there
+  how busy they are every 2 seconds, its parent included. A parent that leaves
+  3 of those in a row unanswered, while nothing has come over its connection
+  for 15 seconds, is gone: about 15 seconds after it went.
+- **Its connection stays silent.** A parent pings every 5 seconds while idle
+  and more often with a request out, so a worker that hears nothing for 60
+  seconds takes it for gone. This is the only sign for a parent the channel
+  never found, such as one that names the worker in `[workers].workers`.
+
+Either way the worker lets go of its layers and sessions, serves its own API
+again and can be claimed by another node. A parent that was only stalled that
+long finds the worker lost, plans again, and takes it back as usual.
+
+A parent that misses one of those probes, or whose API a request sent on to it
+could not reach, is *suspect*: the worker asks the channel about it again at
+once, `/v1/workers` shows it under `parent` with `"suspect": true`, and
+`/ready` says `serving a parent orangu-server that does not answer`. The next
+answer from the parent clears it.
 
 A worker that keeps failing is left out for a while, so it does not cost every
 request a new plan and a replay. Two failures in a row leave it out for 2
@@ -500,12 +547,92 @@ spinners then take the cores another node computes on: three nodes on one
 board, each using every core, decoded at 237 ms a token with it and 118 ms
 without. Nodes like that keep each other's cores busy anyway.
 
+## The prefix cache on a tree
+
+A top-level node with workers keeps its last four finished conversations
+in a prefix cache, as a single server does with `ORANGU_PREFIX_CACHE=1`. It
+is on by default there; `ORANGU_PREFIX_CACHE=0` turns it off. A new prompt
+that starts like one of them takes that conversation's rows over and
+computes only what is new, whichever slot it runs in.
+
+Each entry keeps a session of its own on every worker: a copy of the
+conversation's rows, made as the request ends, while the slot keeps the
+original for its next turn. A worker keeps one such session per slot of its
+own `slots`, up to four, beside the two sessions each of the top-level
+node's slots takes, and says so in its handshake, together with its own
+`slots` and context; a node in the middle of a tree reports the fewest of
+itself and the workers below it. The top-level node holds no more entries
+than the fewest any worker reported, and sends a worker no copy it did not
+say it keeps. A worker that does not list `retain` under `features`, or
+does not report its configuration, keeps none, and the cache stays empty.
+
+A worker that lists `retain` keeps an entry's session until the top-level
+node drops the entry, past its own idle and memory eviction.
+
+The top-level node decides what goes. When a worker has no room for a
+prompt, the node drops its oldest entry, which frees the entry's session on
+every worker, and asks again, until the cache is empty; only then is the
+prompt refused. When the workers cannot make a copy, the conversation is not
+added to the cache, and its slot still keeps it.
+
+### Saved across a release
+
+When a top-level node lets its workers go (`release`) and when it stops, it
+saves its prefix cache on every node of the tree: each worker writes the
+rows its own layers hold of each entry to its own disk, and the top-level
+node writes its own layers' rows and the entry's tokens beside a
+`manifest.json` that records each entry and the split of the tree — every
+node's name and layers — the entries were made on. A worker never saves on
+its own. The files are under
+
+```
+~/.orangu/server/<model header hash>/tree-prefixes/<node name>/
+```
+
+on each node, one `<key>.bin` per entry, under a random 128-bit key the
+top-level node chooses; the top-level node's own files and its manifest are
+in `lead/` there. Each file records the model, the node's layers, the shape
+of its cache, the context it was saved for and the positions it holds.
+
+The nodes of a tree differ in memory, processors and load, so a new plan
+can cut the same nodes differently every time. When the top-level node
+claims the nodes named in its manifest again, it keeps the saved split as
+long as the context is the same and every node still holds its saved share:
+within the budget it reports now, or with a budget no smaller than when the
+entries were saved. The manifest records each node's budget for this. A
+node the saved split names is claimed whatever its load, so a busy moment
+does not cost the saved entries. Each entry is then opened as a session on
+every worker from its file and put back in the cache, and a prompt that
+starts like it computes only what is new. When a node of the saved split is
+missing, another one takes part, or a node cannot hold its share, the
+tree is cut afresh and the saved entries are deleted on every node.
+
+The top-level node knows what every node holds before it sends anything:
+a worker lists `prefixes` under `features` and, in its handshake, the keys
+it holds with the layers each covers. An entry is only saved when every
+worker of the plan lists `prefixes`, and only opened on a worker that listed
+its key for the layers it runs now. Each node checks a file field by field
+before it uses it; a file that is missing, damaged, or saved for another
+model, other layers, another cache shape or another context is refused, and
+the entry is dropped on every node.
+
+An entry taken out of the cache by a prompt, or dropped from it, is deleted
+on every node; the next save writes what the cache holds then. A node keeps
+at most four saved entries, as many as the cache holds, and deletes its
+oldest beyond that.
+
+`GET /v1/workers` on the top-level node shows `saved` (entries on disk) and
+`loaded` (entries put back at the last claim) under `prefix_cache`, and on
+every node `saved_prefixes` with the entries and bytes it holds on its disk.
+The log has one line for each save and each load, with the entries and their
+tokens.
+
 ## Limits
 
 - A slot's next turn reuses its conversation's rows on the workers, and a
   new conversation copies a prompt prefix another slot's conversation has
-  in common, on every worker. The prefix cache, paged KV, MTP heads and
-  slot save/restore are off on a top-level node with workers.
+  in common, on every worker. Paged KV, MTP heads and slot save/restore are
+  off on a top-level node with workers.
 - One request runs through the machines one after another, so a single
   request is not faster than on one machine. What a tree adds is
   concurrency: with several `slots`, each machine works on a different

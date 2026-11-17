@@ -19,10 +19,11 @@
 //! through the node's [`LayerPipeline`].
 
 use super::pipeline::{BatchRow, LayerPipeline, Trace};
+use super::prefixes::{Expect, PrefixFiles};
 use super::protocol::{
     ActivationFormat, Activations, ErrorCode, Forward, ForwardResult, Message, WorkerError,
 };
-use crate::engine::kv_cache::{KvCache, LayerHold};
+use crate::engine::kv_cache::KvCache;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::ops::Range;
@@ -32,6 +33,10 @@ use std::time::{Duration, Instant};
 struct Session {
     cache: KvCache,
     last_used: Instant,
+    /// Held for the parent's prefix pool ([`Message::Retain`]): kept until
+    /// the parent releases it, whatever its idleness or a prompt's
+    /// shortfall.
+    held: bool,
     /// Where this node's time for the session went, kept only under
     /// `ORANGU_WORKERS_TRACE` and logged when the session ends.
     trace: Option<Trace>,
@@ -64,7 +69,7 @@ pub struct SessionStore {
     pipeline: Arc<LayerPipeline>,
     /// Positions one session may hold: the `n_ctx` the parent assigned.
     capacity: usize,
-    /// Sessions held at once: the parent's slot count.
+    /// Sessions held at once: two a parent's slot, and the pool reserve.
     max_sessions: usize,
     /// This node's address, prefixed to the path of every error that passes
     /// through it.
@@ -73,6 +78,12 @@ pub struct SessionStore {
     /// How long a session has gone unused before a prompt with no room may
     /// take its place. Shorter would catch a session between two forwards.
     evictable_after: Duration,
+    /// Sessions this node keeps for its parent's prefix pool, as its own
+    /// configuration sets it.
+    pool_reserve: usize,
+    /// Where this node saves sessions its parent asks it to
+    /// ([`Message::Save`]); `None` saves nothing.
+    files: Option<Arc<PrefixFiles>>,
 }
 
 /// [`SessionStore::evictable_after`].
@@ -87,7 +98,35 @@ impl SessionStore {
             node: "loopback".to_string(),
             sessions: Mutex::new(HashMap::new()),
             evictable_after: EVICTABLE_AFTER,
+            pool_reserve: crate::engine::prefix_cache::ENTRIES,
+            files: None,
         }
+    }
+
+    /// Saves and opens sessions in `files` when the parent asks.
+    pub fn with_prefixes(mut self, files: Option<Arc<PrefixFiles>>) -> Self {
+        self.files = files;
+        self
+    }
+
+    /// The prefixes this node holds on its disk.
+    #[cfg(test)]
+    pub fn saved(&self) -> Vec<super::protocol::SavedPrefix> {
+        self.files.as_ref().map_or_else(Vec::new, |f| f.list())
+    }
+
+    /// Keeps `reserve` sessions for the parent's prefix pool rather than the
+    /// pool's whole size.
+    pub fn with_pool_reserve(mut self, reserve: usize) -> Self {
+        self.pool_reserve = reserve;
+        self
+    }
+
+    /// The sessions this node and every node below it keep for the parent's
+    /// prefix pool: the fewest of them.
+    #[cfg(test)]
+    pub fn pool_reserve(&self) -> usize {
+        self.pool_reserve.min(self.pipeline.pool_reserve())
     }
 
     #[cfg(test)]
@@ -177,25 +216,25 @@ impl SessionStore {
                 Ok(()) => Message::Fork { from, to, len },
                 Err(error) => Message::Error(error),
             },
-            Message::Rows {
-                session,
-                layer,
-                len,
-            } => match self.layer_rows(session, layer as usize, len as usize) {
-                Ok(LayerHold::Rows { kv_dim, k, v }) => Message::LayerRows {
-                    kv_dim: kv_dim as u32,
-                    len,
-                    data: bytes_of(k.iter().chain(&v)),
-                },
-                Ok(LayerHold::State { conv, state }) => Message::LayerState {
-                    conv: bytes_of(&conv),
-                    state: bytes_of(&state),
-                },
-                Err(error) => Message::Error(error),
-            },
             // A forward runs to completion once started; there is nothing
             // in flight here to stop. Acknowledged so a parent need not
             // special-case it.
+            Message::Retain { session, held } => match self.retain(session, held) {
+                Ok(()) => Message::Retain { session, held },
+                Err(error) => Message::Error(error),
+            },
+            Message::Save { session, key } => match self.save(session, &key) {
+                Ok(()) => Message::Save { session, key },
+                Err(error) => Message::Error(error),
+            },
+            Message::Load { session, key, len } => match self.load(session, &key, len as usize) {
+                Ok(()) => Message::Load { session, key, len },
+                Err(error) => Message::Error(error),
+            },
+            Message::Forget { key } => {
+                self.forget(&key);
+                Message::Forget { key }
+            }
             Message::Cancel { session, step } => Message::Cancel { session, step },
             Message::Ping { nonce } => Message::Pong { nonce },
             other => Message::Error(self.error(
@@ -247,8 +286,10 @@ impl SessionStore {
             .iter()
             .filter(|(id, _)| **id != keep && !self.pipeline.room().owes(**id))
             .filter_map(|(id, session)| {
-                let used = session.try_lock().ok()?.last_used;
-                (now.duration_since(used) >= self.evictable_after).then_some((*id, used))
+                let session = session.try_lock().ok()?;
+                let used = session.last_used;
+                (!session.held && now.duration_since(used) >= self.evictable_after)
+                    .then_some((*id, used))
             })
             .min_by_key(|(_, used)| *used)
             .map(|(id, _)| id);
@@ -312,41 +353,164 @@ impl SessionStore {
         let entry = Arc::new(Mutex::new(Session {
             cache,
             last_used: Instant::now(),
+            held: false,
             trace: tracing().then(Trace::default),
         }));
         self.sessions.lock().unwrap().insert(to, entry);
         Ok(())
     }
 
-    /// What layer `layer` holds of `session`'s first `len` positions: from
-    /// this node's cache when it runs the layer, else from the worker below
-    /// that does.
-    fn layer_rows(&self, session: u64, layer: usize, len: usize) -> Result<LayerHold, WorkerError> {
+    /// Frees `session` here and, through its cache, on every worker below.
+    /// Marks `session` held for the parent's prefix pool, or returns it to
+    /// ordinary eviction, here and on every node below. Unknown here: an
+    /// error when it was to be held, nothing to do when it was not.
+    pub fn retain(&self, session: u64, held: bool) -> Result<(), WorkerError> {
+        let entry = self.sessions.lock().unwrap().get(&session).cloned();
+        match entry {
+            Some(entry) => entry.lock().unwrap().held = held,
+            None if held => {
+                return Err(self.error(
+                    ErrorCode::UnknownSession,
+                    format!("no session {session} to keep"),
+                ));
+            }
+            None => return Ok(()),
+        }
+        self.pipeline.retain(session, held);
+        Ok(())
+    }
+
+    fn files(&self) -> Result<&PrefixFiles, WorkerError> {
+        self.files
+            .as_deref()
+            .ok_or_else(|| self.error(ErrorCode::Unsupported, "this node saves no sessions"))
+    }
+
+    /// Writes `session`'s rows on this node's own layers under `key`, then
+    /// has the workers below do the same; keeps no more files than the
+    /// parent's pool holds entries, the oldest deleted first.
+    pub fn save(&self, session: u64, key: &str) -> Result<(), WorkerError> {
+        let files = self.files()?;
+        if !super::prefixes::valid_key(key) {
+            return Err(self.error(ErrorCode::Internal, format!("{key:?} is not a key")));
+        }
         let entry = self.sessions.lock().unwrap().get(&session).cloned();
         let Some(entry) = entry else {
             return Err(self.error(
                 ErrorCode::UnknownSession,
-                format!("no session {session} to send rows of"),
+                format!("no session {session} to save"),
             ));
         };
-        if self.pipeline.local_layers().contains(&layer) {
-            let entry = entry.lock().unwrap();
-            let slot = self.pipeline.model().cache_slot(layer);
-            return entry.cache.layer_hold(slot, len).ok_or_else(|| {
-                self.error(
-                    ErrorCode::PositionMismatch,
-                    format!(
-                        "session {session} does not hold {len} positions of layer {layer} here"
-                    ),
+        let has_below = {
+            let state = entry.lock().unwrap();
+            let cache = &state.cache;
+            let held = if cache.layers.iter().all(|l| l.len == 0) {
+                cache.committed_len()
+            } else {
+                cache.host_committed_len()
+            };
+            files
+                .write(
+                    key,
+                    false,
+                    self.pipeline.local_layers(),
+                    self.capacity,
+                    held,
+                    &[],
+                    cache,
                 )
-            });
+                .map_err(|e| self.error(ErrorCode::Internal, format!("{e:#}")))?;
+            cache.remote.is_some()
+        };
+        if has_below && let Err(error) = self.pipeline.save(session, key) {
+            files.remove(key, false);
+            return Err(
+                self.with_this_node(super::pipeline::worker_error(error, ErrorCode::Internal))
+            );
         }
-        self.pipeline
-            .stage_rows(session, layer, len)
-            .map_err(|e| self.error(ErrorCode::Internal, format!("{e:#}")))
+        files.keep_newest(crate::engine::prefix_cache::ENTRIES);
+        Ok(())
     }
 
-    /// Frees `session` here and, through its cache, on every worker below.
+    /// Opens `session`, held for the parent's pool, from the first `len`
+    /// positions saved under `key` on this node's own layers, then has the
+    /// workers below do the same. Refused, with no session opened, when the
+    /// file is missing, damaged, or not of this model, these layers, this
+    /// cache's shape or this context.
+    pub fn load(&self, session: u64, key: &str, len: usize) -> Result<(), WorkerError> {
+        let files = self.files()?;
+        {
+            let sessions = self.sessions.lock().unwrap();
+            if sessions.contains_key(&session) {
+                return Err(self.error(
+                    ErrorCode::Internal,
+                    format!("session {session} already exists"),
+                ));
+            }
+            if sessions.len() >= self.max_sessions {
+                return Err(self.error(
+                    ErrorCode::Busy,
+                    format!("already holding {} sessions", self.max_sessions),
+                ));
+            }
+        }
+        let mut cache = self.pipeline.new_cache(session, self.capacity);
+        let shape = cache.structure_tag();
+        let expect = Expect {
+            layers: self.pipeline.local_layers(),
+            shape: &shape,
+            n_ctx: self.capacity,
+            len,
+        };
+        let (_, saved) = files
+            .read(key, false, &expect)
+            .map_err(|e| self.error(ErrorCode::ModelMismatch, format!("{e:#}")))?;
+        cache.copy_prefix_from(&saved, len);
+        drop(saved);
+        if cache.remote.is_some() {
+            if let Err(error) = self.pipeline.load(session, key, len) {
+                // Nothing opened below: the cache's release has nothing to
+                // let go of there.
+                return Err(
+                    self.with_this_node(super::pipeline::worker_error(error, ErrorCode::Internal))
+                );
+            }
+            if let Some(remote) = cache.remote.as_mut() {
+                remote.len = len;
+            }
+        }
+        let entry = Arc::new(Mutex::new(Session {
+            cache,
+            last_used: Instant::now(),
+            held: true,
+            trace: tracing().then(Trace::default),
+        }));
+        self.sessions.lock().unwrap().insert(session, entry);
+        Ok(())
+    }
+
+    /// Deletes what is saved under `key` here and below.
+    pub fn forget(&self, key: &str) {
+        if let Some(files) = &self.files {
+            files.remove(key, false);
+        }
+        self.pipeline.forget(key);
+    }
+
+    /// Sessions held for the parent's prefix pool, and the bytes their
+    /// positions take on this node's layers.
+    pub fn retained(&self) -> (usize, u64) {
+        let sessions = self.sessions.lock().unwrap();
+        let room = self.pipeline.room();
+        sessions
+            .values()
+            .filter_map(|s| {
+                let s = s.try_lock().ok()?;
+                s.held.then(|| room.bytes_for(s.cache.committed_len()))
+            })
+            .fold((0, 0), |(n, bytes), b| (n + 1, bytes + b))
+    }
+
     pub fn release(&self, session: u64) {
         self.pipeline.room().forget(session);
         let removed = self.sessions.lock().unwrap().remove(&session);
@@ -365,7 +529,7 @@ impl SessionStore {
             .iter()
             .filter(|(_, s)| {
                 s.try_lock()
-                    .is_ok_and(|s| now.duration_since(s.last_used) >= idle)
+                    .is_ok_and(|s| !s.held && now.duration_since(s.last_used) >= idle)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -425,6 +589,7 @@ impl SessionStore {
                 let entry = Arc::new(Mutex::new(Session {
                     cache: self.pipeline.new_cache(session, self.capacity),
                     last_used: Instant::now(),
+                    held: false,
                     trace: tracing().then(Trace::default),
                 }));
                 sessions.insert(session, entry.clone());
@@ -573,11 +738,6 @@ impl SessionStore {
             .map(|a| a.expect("every forward is answered"))
             .collect()
     }
-}
-
-/// Values as `f32` little-endian bytes, the way they travel.
-fn bytes_of<'a>(values: impl IntoIterator<Item = &'a f32>) -> Vec<u8> {
-    values.into_iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
 #[cfg(test)]
@@ -858,6 +1018,202 @@ mod tests {
         let held = store.sessions.lock().unwrap();
         assert!(!held.contains_key(&1), "the oldest goes first");
         assert!(held.contains_key(&2), "and no more than it takes");
+    }
+
+    /// A session held for the parent's prefix pool outlives both of the
+    /// worker's own evictions; one beside it that is not held does not, and
+    /// a session let go of the hold is evicted as any other.
+    #[test]
+    fn a_retained_session_outlives_idle_and_shortfall_eviction() {
+        let store = with_room(|| 0).evictable_after(Duration::ZERO);
+        store.forward(forward(1, 0, &[1, 2])).unwrap();
+        store.forward(forward(2, 0, &[1])).unwrap();
+        assert_eq!(
+            store.handle(Message::Retain {
+                session: 1,
+                held: true
+            }),
+            Message::Retain {
+                session: 1,
+                held: true
+            }
+        );
+        assert_eq!(store.retained(), (1, 2 * MIB));
+
+        // The shortfall evicts what it may — session 2 — and refuses then.
+        assert!(matches!(reserve(&store, 3, 1), Message::Error(_)));
+        let held: Vec<u64> = store.sessions.lock().unwrap().keys().copied().collect();
+        assert_eq!(held, vec![1]);
+
+        store.forward(forward(2, 0, &[1])).unwrap();
+        assert_eq!(store.evict_idle(Duration::ZERO), 1, "only the unheld one");
+        assert_eq!(store.len(), 1);
+
+        // Let go of the hold, it goes as any session does.
+        store.retain(1, false).unwrap();
+        assert_eq!(store.retained(), (0, 0));
+        assert_eq!(store.evict_idle(Duration::ZERO), 1);
+        assert_eq!(store.len(), 0);
+
+        // Held only once it exists; letting go of an unknown one is nothing.
+        assert!(matches!(
+            store.handle(Message::Retain {
+                session: 9,
+                held: true
+            }),
+            Message::Error(WorkerError {
+                code: ErrorCode::UnknownSession,
+                ..
+            })
+        ));
+        assert!(store.retain(9, false).is_ok());
+    }
+
+    /// The hold reaches every node below, as a fork does.
+    #[test]
+    fn a_retain_reaches_the_nodes_below() {
+        let leaf = Arc::new(
+            SessionStore::new(
+                Arc::new(
+                    LayerPipeline::new(fixture::model(), 3..fixture::N_LAYER, vec![]).unwrap(),
+                ),
+                N_CTX,
+                4,
+            )
+            .named("leaf"),
+        );
+        let stage = LoopbackStage::new(leaf.clone(), ActivationFormat::F32);
+        let middle = SessionStore::new(
+            Arc::new(LayerPipeline::new(fixture::model(), 1..3, vec![Box::new(stage)]).unwrap()),
+            N_CTX,
+            4,
+        )
+        .named("middle");
+        middle.forward(forward(1, 0, &[1])).unwrap();
+        middle.retain(1, true).unwrap();
+        assert_eq!(middle.retained().0, 1);
+        assert_eq!(leaf.retained().0, 1);
+        assert_eq!(leaf.evict_idle(Duration::ZERO), 0);
+        middle.release(1);
+        assert_eq!((middle.len(), leaf.len()), (0, 0));
+    }
+
+    fn prefix_files(tag: &str, node: &str) -> Arc<PrefixFiles> {
+        let root = std::env::temp_dir().join(format!(
+            "orangu-session-prefixes-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let files = PrefixFiles::under(&root, [5; 32], node);
+        let _ = std::fs::remove_dir_all(files.dir());
+        Arc::new(files)
+    }
+
+    fn saving(
+        layers: Range<usize>,
+        files: &Arc<PrefixFiles>,
+        children: Vec<Box<dyn super::super::pipeline::Stage>>,
+    ) -> Arc<SessionStore> {
+        Arc::new(
+            SessionStore::new(
+                Arc::new(LayerPipeline::new(fixture::model(), layers, children).unwrap()),
+                N_CTX,
+                8,
+            )
+            .with_prefixes(Some(files.clone())),
+        )
+    }
+
+    /// Save, Load and Forget each reach the node below, as a fork does; a
+    /// session opened from disk is held, and continues where it was saved.
+    #[test]
+    fn a_saved_session_opens_again_here_and_below() {
+        let leaf_files = prefix_files("below", "leaf");
+        let middle_files = prefix_files("below", "middle");
+        let leaf = saving(3..fixture::N_LAYER, &leaf_files, vec![]);
+        let stage = LoopbackStage::new(leaf.clone(), ActivationFormat::F32);
+        let middle = saving(1..3, &middle_files, vec![Box::new(stage)]);
+        middle.forward(forward(1, 0, &[1, 2, 3])).unwrap();
+        let key = super::super::prefixes::new_key();
+        let save = Message::Save {
+            session: 1,
+            key: key.clone(),
+        };
+        assert_eq!(middle.handle(save.clone()), save);
+        assert_eq!(middle.saved().len(), 1);
+        assert_eq!(leaf.saved()[0].layer_start, 3);
+        assert_eq!(leaf.saved()[0].len, 3);
+
+        let load = Message::Load {
+            session: 2,
+            key: key.clone(),
+            len: 3,
+        };
+        assert_eq!(middle.handle(load.clone()), load);
+        assert_eq!((middle.retained().0, leaf.retained().0), (1, 1));
+        let resumed = middle.forward(forward(2, 3, &[4])).unwrap();
+        let along = middle.forward(forward(1, 3, &[4])).unwrap();
+        assert_eq!(resumed.hidden, along.hidden);
+
+        // Opened once: a second session of the same id is refused.
+        assert!(matches!(middle.handle(load), Message::Error(_)));
+        assert_eq!(
+            middle.handle(Message::Forget { key: key.clone() }),
+            Message::Forget { key: key.clone() }
+        );
+        assert!(middle.saved().is_empty() && leaf.saved().is_empty());
+        let Message::Error(error) = middle.handle(Message::Load {
+            session: 3,
+            key,
+            len: 3,
+        }) else {
+            panic!("a forgotten prefix opened");
+        };
+        assert_eq!(error.code, ErrorCode::ModelMismatch);
+        assert_eq!(middle.len(), 2, "nothing opened for the refusal");
+    }
+
+    /// Rows of more positions than saved, a key that is not one, or a node
+    /// that saves nothing: refused, and nothing written.
+    #[test]
+    fn what_cannot_be_saved_or_opened_is_refused() {
+        let files = prefix_files("refused", "w1");
+        let store = saving(1..3, &files, vec![]);
+        store.forward(forward(1, 0, &[1, 2])).unwrap();
+        let key = super::super::prefixes::new_key();
+        assert!(store.save(1, "../../escape").is_err());
+        assert!(store.save(9, &key).is_err());
+        store.save(1, &key).unwrap();
+        assert_eq!(
+            store.load(2, &key, 3).unwrap_err().code,
+            ErrorCode::ModelMismatch
+        );
+        assert_eq!(store.len(), 1);
+        let plain = self::store(4);
+        plain.forward(forward(1, 0, &[1])).unwrap();
+        assert_eq!(
+            plain.save(1, &key).unwrap_err().code,
+            ErrorCode::Unsupported
+        );
+    }
+
+    /// A node keeps no more saved sessions than a pool holds entries: the
+    /// oldest go first.
+    #[test]
+    fn a_node_keeps_no_more_saved_sessions_than_a_pool_holds() {
+        use crate::engine::prefix_cache::ENTRIES;
+        let files = prefix_files("cap", "w1");
+        let store = saving(1..3, &files, vec![]);
+        store.forward(forward(1, 0, &[1, 2])).unwrap();
+        let keys: Vec<String> = (0..ENTRIES + 2)
+            .map(|_| super::super::prefixes::new_key())
+            .collect();
+        for key in &keys {
+            store.save(1, key).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let held: Vec<String> = store.saved().into_iter().map(|s| s.key).collect();
+        assert_eq!(held, keys[2..].to_vec());
     }
 
     #[test]

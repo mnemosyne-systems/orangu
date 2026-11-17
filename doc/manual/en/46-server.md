@@ -2146,6 +2146,7 @@ shown.
 | `port`                | `8400`                         | port this server binds for its parent                                                                |
 | `name`                | none                           | the channel this node is found on and finds other nodes on; the same on every node                   |
 | `network`             | this machine's networks        | optional: IPv4 networks to scan, `address/prefix`, comma-separated, none wider than /16              |
+| `scan`                | `600`                          | seconds between scans of the networks for the nodes of the channel                                   |
 | `release`             | `300`                          | seconds a node keeps the workers it claimed with no request running                                  |
 | `secret`              | none                           | shared secret parent and worker prove to each other                                                  |
 | `activations`         | `f16`                          | hidden-state encoding between nodes: `f32`, `f16` or `q8_0`                                          |
@@ -2681,11 +2682,12 @@ key is refused at startup with a message pointing to `name`.
   is absent it falls back to `[orangu-server].host`.**
 - `port` — the port it binds, alongside `[orangu-server].port`. Defaults to
   `8400` when the section is present but says nothing.
-- `name` — the channel. At start and every 10 minutes the node probes `port` on every
+- `name` — the channel. At start and every `scan` seconds the node probes `port` on every
   address of its IPv4 networks (`network`, or each of this machine's
   networks other than loopback and link-local, cut to the /22 around its
   own address when wider), at most 64 at a time with a 300 ms connect
-  timeout, sending a hash of the name; a node on the same channel answers
+  timeout, sending a hash of the name (keyed by `secret` when one is set);
+  a node on the same channel answers
   with its name, what it is doing (`idle`, `leading`, `serving` or
   `worker_only`), its load, whether it holds the model alone, its API
   port, and its model — the layout's hash, and a hash of samples of every
@@ -2701,6 +2703,9 @@ key is refused at startup with a message pointing to `name`.
   `address/prefix` IPv4 networks (`192.168.1.0/24, 10.0.0.0/22`), each
   scanned whole. None may be wider than /16. Without it the node scans its
   own interfaces' networks.
+- `scan` — seconds between two scans of the networks for the nodes of the
+  channel (default `600`). A node that starts between two scans is found
+  sooner: its own scan probes this node, which probes it back on `port`.
 - `release` — seconds a node keeps the workers it claimed with no request
   running on it (default `300`); then it lets them go, free for another
   node to claim.
@@ -2730,7 +2735,9 @@ key is refused at startup with a message pointing to `name`.
 - `secret` — a shared secret that parent and worker prove to each other
   when they connect (HMAC-SHA256 over fresh random nonces; the secret
   itself never crosses the network). A node with a secret refuses a peer
-  that cannot prove it; blank or absent authenticates nobody, and
+  that cannot prove it. The secret also keys the channel's hash, so only
+  nodes that share it answer each other's probes, and a node that knows
+  just the name learns nothing. Blank or absent authenticates nobody, and
   `-i`/`--init` says so when `host` is reachable off this machine. Use the
   same value on every node of a channel.
 - `activations` — how hidden states travel between nodes: `f16` (the
@@ -2760,8 +2767,8 @@ key is refused at startup with a message pointing to `name`.
   only part of the model on disk (`download = range`) does not time, and a
   tree with such a node shares by memory. `GET /v1/workers` shows what a
   plan followed, and each node's processors (CPU, GPUs, NPU) and speeds.
-- `head` — which node applies the output head while a tree decodes
-  through its nodes: `auto` (the default), `top` or `last`. `last` has the
+- `head` — which node applies the output head: `auto` (the default),
+  `top` or `last`. `last` has the
   node with the final layer send logits back instead of its layers'
   output, so the top-level node skips the model's largest matrix — worth
   it for a weak top-level node and a large vocabulary; `auto` does so when
@@ -2806,7 +2813,11 @@ key is refused at startup with a message pointing to `name`.
 
 **When a worker is lost.**
 
-- A request in flight is not lost with it. The top-level node plans again
+- A standby takes its place: when claiming, a node holds back as a standby
+  the node with the most memory that the model does not need, and that node
+  takes a lost worker's layers in place, mid-answer. With no standby held,
+  the next plan gives the layers to a free node of the channel, if any.
+- Otherwise a request in flight is still not lost with it. The top-level node plans again
   over the workers that answer, rebuilds the sequence on
   the new plan by running its tokens through again, and carries on. Tokens
   already sent stay sent.
@@ -2825,8 +2836,14 @@ key is refused at startup with a message pointing to `name`.
   `failures_in_a_row` and `left_out_seconds`.
 - Until the plan is repaired, `/ready` answers `503` with
   `a worker was lost`.
-- A worker that hears nothing from its parent for 60 seconds takes it for gone,
-  lets go of its layers and serves its own API again.
+- A worker takes its parent for gone, lets go of its layers and serves its own
+  API again when the parent's connection closes; when the parent, found on the
+  channel, answers none of 3 probes in a row (2 seconds apart) and its
+  connection has been quiet for 15 seconds; or when the connection carries
+  nothing for 60 seconds. A parent that misses a probe, or whose API a request
+  sent on to it could not reach, is suspect: `/ready` says `serving a parent
+  orangu-server that does not answer` and `/v1/workers` shows `"suspect": true`
+  under `parent`.
 
 **A prompt a node cannot hold is refused before it runs.** The top-level node
 asks every node for room for the whole prompt and one answer token. A node
@@ -2849,8 +2866,23 @@ instead of computing it, and the other conversation keeps its own. In a
 tree every worker copies its own rows. A single server without paged KV
 shares the same way.
 
-**Off while delegating.** The prefix cache (`ORANGU_PREFIX_CACHE`), paged
-KV and MTP heads are switched off on a top-level node with workers. Slot
+**The prefix cache on a tree.** A top-level node with workers has a prefix
+cache of its own, on unless `ORANGU_PREFIX_CACHE=0`: each entry keeps a
+session on every worker, held there until the node drops the entry, oldest
+first when a worker has no room for a prompt (see the workers chapter).
+When the node lets its workers go and when it stops, every node saves its
+part of each entry under `~/.orangu/server/<model header hash>/tree-prefixes/`,
+at most four entries a node, the oldest deleted first. A later claim of the
+same nodes keeps the split the entries were saved on while every node still
+holds its share, and puts the entries back in the cache; otherwise the tree
+is cut afresh and the saved entries are deleted. The top-level node sends a
+worker nothing to save or open unless its handshake listed the `prefixes`
+feature and, to open one, that entry for the layers it runs; every node
+checks a file against its model, layers, cache shape and context before it
+uses it.
+
+**Off while delegating.** Paged KV and MTP heads are switched off on a
+top-level node with workers. Slot
 save refuses a slot whose rows are on the workers, and a restored slot is
 not reused there: a file holds only this node's rows.
 

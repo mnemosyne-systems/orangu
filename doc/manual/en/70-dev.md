@@ -49,7 +49,16 @@ checks what clients get while a node is killed (`SIGKILL`), frozen
 - a worker killed, frozen or cut off mid-answer: the answer runs to its
   last token on the nodes left;
 - two nodes that get a request at the same moment form one tree: one leads,
-  the other sends its request there, and both answer.
+  the other sends its request there, and both answer;
+- a leader frozen between requests is let go by its workers through the
+  channel, within 40 seconds, and the nodes left answer again;
+- of two free nodes the model needs one: the other stands by, and takes the
+  worker's place when it is killed mid-answer;
+- two prompts sharing a long prefix on a split model: the second reuses the
+  prefix from the lead's pool, its workers' rows kept on the workers;
+- a prefix in the lead's pool survives `release`: saved on every node as the
+  workers are let go, it is put back when the lead claims them again, and a
+  second prompt sharing it reports it as cached.
 
 They need a model, so they are ignored by default:
 

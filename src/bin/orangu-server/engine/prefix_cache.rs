@@ -28,6 +28,7 @@
 
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::kv_cache::KvCache;
 #[cfg(test)]
@@ -130,6 +131,23 @@ impl CachedPrefill {
 pub struct PrefixCache {
     entries: Mutex<Vec<CachedPrefill>>,
     max_entries: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+/// The pool's entry count: a fixed small number, see [`PrefixCache`]. A
+/// worker of a tree makes room for this many sessions of its parent's pool
+/// beside the two per slot.
+pub const ENTRIES: usize = 4;
+
+/// What the pool holds and how often it served, for status and metrics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrefixCacheStats {
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    /// Positions the entries can serve, summed.
+    pub tokens_held: usize,
 }
 
 impl PrefixCache {
@@ -137,7 +155,55 @@ impl PrefixCache {
         Self {
             entries: Mutex::new(Vec::new()),
             max_entries,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
+    }
+
+    pub fn stats(&self) -> PrefixCacheStats {
+        let entries = self.entries.lock().unwrap();
+        PrefixCacheStats {
+            entries: entries.len(),
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            tokens_held: entries
+                .iter()
+                .map(|e| e.reusable_prefix_len(&e.tokens))
+                .sum(),
+        }
+    }
+
+    /// Drops the oldest entry — and with it whatever it holds on other
+    /// nodes. `false` when the pool is empty.
+    pub fn evict_oldest(&self) -> bool {
+        let removed = {
+            let mut entries = self.entries.lock().unwrap();
+            (!entries.is_empty()).then(|| entries.remove(0))
+        };
+        removed.is_some()
+    }
+
+    /// Removes every entry and hands them over, oldest first, without
+    /// counting a hit or a miss.
+    pub fn take_all(&self) -> Vec<CachedPrefill> {
+        std::mem::take(&mut *self.entries.lock().unwrap())
+    }
+
+    /// Drops the oldest entries until fewer than `limit` remain and the
+    /// pool is not full, so the next [`Self::store`] evicts nothing: what a
+    /// caller does before making the copy it stores, when the copy takes a
+    /// session on other nodes, which keep at most `limit` of them.
+    pub fn make_room(&self, limit: usize) {
+        if self.max_entries == 0 {
+            return;
+        }
+        let limit = limit.min(self.max_entries);
+        let removed: Vec<CachedPrefill> = {
+            let mut entries = self.entries.lock().unwrap();
+            let over = (entries.len() + 1).saturating_sub(limit).min(entries.len());
+            entries.drain(..over).collect()
+        };
+        drop(removed);
     }
 
     /// Removes and returns whichever pool entry shares the longest token
@@ -189,23 +255,39 @@ impl PrefixCache {
                 best = Some((i, prefix_len));
             }
         }
-        let (index, prefix_len) = best?;
-        Some((prefix_len, entries.remove(index)))
+        let Some((index, prefix_len)) = best else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        let entry = entries.remove(index);
+        drop(entries);
+        // Out of the pool, its rows on other nodes are evicted as any
+        // request's are.
+        entry.cache.hold_remote(false);
+        Some((prefix_len, entry))
     }
 
     /// Stores a finished request's own (full token sequence, resulting KV
     /// cache) for a later request to reuse, evicting the oldest entry
     /// first if the pool is already at `max_entries`. A no-op when the
     /// feature is disabled (`max_entries == 0`).
+    ///
+    /// Rows the cache holds on other nodes are kept there until the entry is
+    /// dropped ([`KvCache::hold_remote`]): the pool, not the nodes, decides
+    /// what goes.
     pub fn store(&self, tokens: Vec<u32>, cache: KvCache) {
         if self.max_entries == 0 {
             return;
         }
-        let mut entries = self.entries.lock().unwrap();
-        if entries.len() >= self.max_entries {
-            entries.remove(0);
-        }
-        entries.push(CachedPrefill { tokens, cache });
+        cache.hold_remote(true);
+        let evicted = {
+            let mut entries = self.entries.lock().unwrap();
+            let evicted = (entries.len() >= self.max_entries).then(|| entries.remove(0));
+            entries.push(CachedPrefill { tokens, cache });
+            evicted
+        };
+        drop(evicted);
     }
 
     /// Writes the pool to `dir`, one file per entry, so a restart can reopen

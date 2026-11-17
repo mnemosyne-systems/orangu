@@ -2809,8 +2809,10 @@ fn prepare(args: Args) -> Result<Prepared> {
     // per-deployment tuning knobs — each entry holds a whole `KvCache`'s
     // worth of `f32` K/V buffers (easily hundreds of MB at real context
     // lengths), so this is sized to stay well within ordinary system RAM,
-    // not tuned per-deployment.
-    const PREFIX_CACHE_ENTRIES: usize = 4;
+    // not tuned per-deployment. A `[workers]` top-level node serving through
+    // its tree has a pool of its own, on unless `ORANGU_PREFIX_CACHE=0` (see
+    // below).
+    const PREFIX_CACHE_ENTRIES: usize = engine::prefix_cache::ENTRIES;
     let prefix_cache = crate::engine::env::flag_on("ORANGU_PREFIX_CACHE")
         .then(|| Arc::new(engine::prefix_cache::PrefixCache::new(PREFIX_CACHE_ENTRIES)));
 
@@ -3213,112 +3215,124 @@ fn prepare(args: Args) -> Result<Prepared> {
     // layers over them and serves through a `DelegatingModel`. The slot
     // store stays: a slot's retained conversation hands its session on the
     // workers to the slot's next request (`KvCache::take_remote_prefix`),
-    // so a chat's next turn prefills only what is new. The prefix pool and
-    // paged KV are off: the pool's entries would each keep a session on
-    // every worker, past the two per slot a worker makes room for, and the
-    // pages are this process's alone. A draft model stays: its rollbacks go
-    // through the cache, which reaches the workers.
-    let (model, prefix_cache, slot_store, paged_kv, mtp, draft, warm_prefixes, switch) =
-        match &conf.workers {
-            Some(workers_conf) => {
-                let quant = quantization
-                    .clone()
-                    .or_else(|| model_label.rsplit_once(':').map(|(_, tag)| tag.to_string()))
-                    .unwrap_or_else(|| workers::identity::quantization_of(weights_source.path()));
-                let n_ctx = requested_context(args.context, conf.context)
-                    .unwrap_or(model.config().n_ctx_train)
-                    .min(model.config().n_ctx_train);
-                // The metrics listener's effective address, as `main` binds
-                // it below: what this node reports as its scrape target.
-                let metrics_host = match conf.metrics_host_explicit {
-                    true => conf.metrics_host.as_str(),
-                    false => args.listen.host.as_deref().unwrap_or(&conf.host),
-                };
-                let metrics_port = args.listen.metrics.unwrap_or(conf.metrics);
-                let node = start_workers_node(
-                    workers_conf,
-                    &model,
-                    // The very mapping the model reads through: the node lets go
-                    // of the pages of layers its plan moves elsewhere, which a
-                    // second mapping of the same file could not do for this one.
-                    loaded,
-                    &backend,
-                    &model_label,
-                    &quant,
-                    n_ctx,
-                    slots.total(),
-                    conf.prompt_weights,
-                    &backend_label,
-                    metrics_host,
-                    metrics_port,
-                    (args.listen.port.unwrap_or(conf.port), conf.tls.is_some()),
-                    // A picture or video model's text encoder is not split:
-                    // such a node serves only as a worker.
-                    image.is_none() && video.is_none(),
-                )?;
-                workers::node::set_global(node.clone());
-                match node.delegating_model() {
-                    // Generation and embeddings both; a picture or video
-                    // model's text encoder is not split.
-                    Some(delegating) if image.is_none() && video.is_none() => {
-                        // A draft model runs here, beside the embedding and the
-                        // head, and its guesses are checked in one multi-position
-                        // forward through the tree, rolled back where they miss —
-                        // both of which reach the workers. An MTP head reads the
-                        // last layer's hidden state at every position, which a
-                        // tree does not bring back.
-                        if mtp.is_some() {
-                            log::warn!(
-                                "orangu-server: the multi-token-prediction head is not used while \
+    // so a chat's next turn prefills only what is new. The prefix pool is
+    // on unless `ORANGU_PREFIX_CACHE=0`: each entry keeps a session of its
+    // own on every worker, which a worker makes room for beside the two per
+    // slot and keeps until this node drops the entry — oldest first, when a
+    // worker has no room for a prompt (`DelegatingModel::attach_prefix_cache`).
+    // Paged KV is off: the pages are this process's alone. A draft model
+    // stays: its rollbacks go through the cache, which reaches the workers.
+    let (model, prefix_cache, slot_store, paged_kv, mtp, draft, warm_prefixes, switch) = match &conf
+        .workers
+    {
+        Some(workers_conf) => {
+            let quant = quantization
+                .clone()
+                .or_else(|| model_label.rsplit_once(':').map(|(_, tag)| tag.to_string()))
+                .unwrap_or_else(|| workers::identity::quantization_of(weights_source.path()));
+            let n_ctx = requested_context(args.context, conf.context)
+                .unwrap_or(model.config().n_ctx_train)
+                .min(model.config().n_ctx_train);
+            // The metrics listener's effective address, as `main` binds
+            // it below: what this node reports as its scrape target.
+            let metrics_host = match conf.metrics_host_explicit {
+                true => conf.metrics_host.as_str(),
+                false => args.listen.host.as_deref().unwrap_or(&conf.host),
+            };
+            let metrics_port = args.listen.metrics.unwrap_or(conf.metrics);
+            let node = start_workers_node(
+                workers_conf,
+                &model,
+                // The very mapping the model reads through: the node lets go
+                // of the pages of layers its plan moves elsewhere, which a
+                // second mapping of the same file could not do for this one.
+                loaded,
+                &backend,
+                &model_label,
+                &quant,
+                n_ctx,
+                slots.total(),
+                conf.prompt_weights,
+                &backend_label,
+                metrics_host,
+                metrics_port,
+                (args.listen.port.unwrap_or(conf.port), conf.tls.is_some()),
+                // A picture or video model's text encoder is not split:
+                // such a node serves only as a worker.
+                image.is_none() && video.is_none(),
+            )?;
+            workers::node::set_global(node.clone());
+            match node.delegating_model() {
+                // Generation and embeddings both; a picture or video
+                // model's text encoder is not split.
+                Some(delegating) if image.is_none() && video.is_none() => {
+                    // A draft model runs here, beside the embedding and the
+                    // head, and its guesses are checked in one multi-position
+                    // forward through the tree, rolled back where they miss —
+                    // both of which reach the workers. An MTP head reads the
+                    // last layer's hidden state at every position, which a
+                    // tree does not bring back.
+                    if mtp.is_some() {
+                        log::warn!(
+                            "orangu-server: the multi-token-prediction head is not used while \
                              [workers] spreads the model; a draft_model is"
-                            );
-                        }
-                        // The model alone, with what the tree turns off, for `POST
-                        // /props` to switch to.
-                        let switch = Arc::new(engine::generate::ServingSwitch::new(
-                            engine::generate::Serving {
-                                model,
-                                mtp,
-                                prefix_cache,
-                                paged_kv,
-                            },
-                        ));
-                        workers::node::attach_serving(switch.clone());
-                        let delegating: Arc<dyn ModelForward> = delegating;
-                        (
-                            delegating,
-                            None,
-                            slot_store,
-                            None,
-                            None,
-                            draft,
-                            None,
-                            Some(switch),
-                        )
+                        );
                     }
-                    _ => (
-                        model,
-                        prefix_cache,
+                    // The model alone, with what the tree turns off, for `POST
+                    // /props` to switch to.
+                    let switch = Arc::new(engine::generate::ServingSwitch::new(
+                        engine::generate::Serving {
+                            model,
+                            mtp,
+                            prefix_cache,
+                            paged_kv,
+                        },
+                    ));
+                    workers::node::attach_serving(switch.clone());
+                    let tree_prefix_cache = crate::engine::env::flag_on_unless_disabled(
+                        "ORANGU_PREFIX_CACHE",
+                    )
+                    .then(|| {
+                        Arc::new(engine::prefix_cache::PrefixCache::new(PREFIX_CACHE_ENTRIES))
+                    });
+                    if let Some(pool) = &tree_prefix_cache {
+                        delegating.attach_prefix_cache(pool);
+                    }
+                    let delegating: Arc<dyn ModelForward> = delegating;
+                    (
+                        delegating,
+                        tree_prefix_cache,
                         slot_store,
-                        paged_kv,
-                        mtp,
-                        draft,
-                        warm_prefixes,
                         None,
-                    ),
+                        None,
+                        draft,
+                        None,
+                        Some(switch),
+                    )
                 }
+                _ => (
+                    model,
+                    prefix_cache,
+                    slot_store,
+                    paged_kv,
+                    mtp,
+                    draft,
+                    warm_prefixes,
+                    None,
+                ),
             }
-            None => (
-                model,
-                prefix_cache,
-                slot_store,
-                paged_kv,
-                mtp,
-                draft,
-                warm_prefixes,
-                None,
-            ),
-        };
+        }
+        None => (
+            model,
+            prefix_cache,
+            slot_store,
+            paged_kv,
+            mtp,
+            draft,
+            warm_prefixes,
+            None,
+        ),
+    };
 
     // Slots a coordinator saved when it swapped this model out, back before
     // the prefix warm-up starts: the warm-up then fills its prefix from the
@@ -3353,6 +3367,7 @@ fn prepare(args: Args) -> Result<Prepared> {
         }
     }
     let recurrent = model.new_kv_cache(1).has_recurrent();
+    let delegates = switch.is_some();
     let vision = load_vision(
         &source,
         &conf,
@@ -3461,7 +3476,11 @@ fn prepare(args: Args) -> Result<Prepared> {
         code_execution: conf.code_execution.clone(),
         tls: conf.tls.clone(),
         engine,
-        prefix_cache_snapshot: prefix_cache_dir.map(|dir| (dir, prefix_fingerprint)),
+        // The tree's pool holds rows on the workers, which a snapshot
+        // cannot carry.
+        prefix_cache_snapshot: prefix_cache_dir
+            .filter(|_| !delegates)
+            .map(|dir| (dir, prefix_fingerprint)),
         warm_prefixes,
         model_label,
         quantization,
@@ -4684,9 +4703,6 @@ fn is_npu(backend_label: &str) -> bool {
     backend_label.starts_with("NPU/")
 }
 
-/// Where a node looks for the rest of its channel: `[workers].network`,
-/// or — `ORANGU_WORKERS_PEERS`, a comma-separated `host:port` list — just
-/// those addresses, for nodes that share one machine on different ports.
 /// The banner's `Workers` row: the channel (`[workers].name`) and the
 /// address the worker listener binds (`[workers].host`/`port`), as
 /// `primary @ http://0.0.0.0:8400`. Without a channel only the address.
@@ -4708,28 +4724,31 @@ fn workers_banner(conf: &config::ServerConfiguration) -> Option<String> {
     })
 }
 
+/// Where a node looks for the rest of its channel: `[workers].network`. Or —
+/// `ORANGU_WORKERS_PEERS`, a comma-separated `host:port` list — just those
+/// addresses, for nodes that share one machine on different ports.
 fn workers_scan(workers_conf: &config::WorkersConfiguration) -> Result<workers::node::Scan> {
-    use std::net::ToSocketAddrs;
     let Some(peers) = std::env::var("ORANGU_WORKERS_PEERS")
         .ok()
         .filter(|v| !v.trim().is_empty())
     else {
-        return Ok(workers::node::Scan::Networks {
+        return Ok(workers::node::Scan {
             port: workers_conf.port,
-            networks: workers_conf.network.clone(),
+            networks: Some(workers_conf.network.clone()),
+            peers: Vec::new(),
         });
     };
-    let mut addrs = Vec::new();
-    for peer in peers.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-        let addr = peer
-            .to_socket_addrs()
-            .with_context(|| format!("ORANGU_WORKERS_PEERS: '{peer}' is not host:port"))?
-            .next()
-            .with_context(|| format!("ORANGU_WORKERS_PEERS: '{peer}' has no address"))?;
-        addrs.push(addr);
-    }
-    log::info!("orangu-server: [workers] probing only ORANGU_WORKERS_PEERS: {peers}");
-    Ok(workers::node::Scan::Addresses(addrs))
+    let peers = workers::channel::parse_peers(&peers, workers_conf.port)
+        .with_context(|| format!("ORANGU_WORKERS_PEERS: '{peers}'"))?;
+    log::info!(
+        "orangu-server: [workers] probing only ORANGU_WORKERS_PEERS: {}",
+        peers.join(", ")
+    );
+    Ok(workers::node::Scan {
+        port: workers_conf.port,
+        networks: None,
+        peers,
+    })
 }
 
 /// This node's memory budget for weights, capped by
@@ -4808,7 +4827,7 @@ fn start_workers_node(
         standby: Vec::new(),
         channel: workers_conf.name.clone(),
         scan: workers_scan(workers_conf)?,
-        scan_every: std::time::Duration::from_secs(600),
+        scan_every: workers_conf.scan,
         release: workers_conf.release,
         api_port,
         api_tls,
@@ -4849,10 +4868,6 @@ fn start_workers_node(
         },
         shares: workers_conf.shares,
         head: workers_conf.head,
-        #[cfg(test)]
-        decode_pin: None,
-        #[cfg(test)]
-        offload_always: false,
         split,
         maintenance: std::time::Duration::from_secs(5),
         parent_silence: workers::node::PARENT_SILENCE,
@@ -4867,6 +4882,7 @@ fn start_workers_node(
         .context("setting up TLS for [workers]")?,
         metrics_endpoint,
         prompt_weights,
+        prefix_root: home::home_dir().map(|home| home.join(".orangu/server")),
     };
     let held = workers::clock::start();
     if held > 0 {
@@ -5304,6 +5320,8 @@ async fn serve(prepared: Prepared) -> Result<()> {
             Err(err) => log::warn!("orangu-server: prefix cache not saved: {err}"),
         }
     }
+    // A `[workers]` tree's prefix pool, saved on every node of the tree.
+    workers::node::save_prefixes_on_exit();
 
     Ok(())
 }
