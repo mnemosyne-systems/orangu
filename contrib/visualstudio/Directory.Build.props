@@ -1,0 +1,13 @@
+<Project>
+  <!-- Shared by every project here: the extension, its core and the tests. -->
+  <PropertyGroup>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <Deterministic>true</Deterministic>
+    <!-- The extension targets net8.0-windows; this lets the dotnet SDK on
+         Linux and macOS build it too. -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+</Project>

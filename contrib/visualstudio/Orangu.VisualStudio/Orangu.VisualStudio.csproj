@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The extension itself, on the VisualStudio.Extensibility SDK: it runs out
+       of process, in Visual Studio 2022 17.14 and later and Visual Studio 2026. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows8.0</TargetFramework>
+    <RootNamespace>Orangu.VisualStudio</RootNamespace>
+  </PropertyGroup>
+  <PropertyGroup Condition="!$([MSBuild]::IsOSPlatform('Windows'))">
+    <!-- The .vsix is packed by the Visual Studio SDK's targets, whose tools
+         are Windows programs. Away from Windows they are left out, so the
+         build compiles the extension and writes its manifest, and stops
+         there. (On a case-insensitive file system, as on macOS, they would
+         otherwise be found and fail.) -->
+    <VSToolsPath>$(MSBuildProjectDirectory)/obj/no-vssdk</VSToolsPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.VisualStudio.Extensibility.Sdk" Version="17.14.40608" />
+    <PackageReference Include="Microsoft.VisualStudio.Extensibility.Build" Version="17.14.40608" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Remote UI reads the window's XAML from the assembly at run time, by
+         the content class's full name. -->
+    <EmbeddedResource Include="ToolWindow\OranguToolWindowContent.xaml" LogicalName="Orangu.VisualStudio.ToolWindow.OranguToolWindowContent.xaml" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Orangu.Core\Orangu.Core.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Orangu.VisualStudio.Tests" />
+  </ItemGroup>
+</Project>

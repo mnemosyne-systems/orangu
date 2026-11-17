@@ -233,6 +233,7 @@ Additional documentation and guides:
 - [Image Generation Manual](doc/manual/en/48-image.md) · [Video Generation Manual](doc/manual/en/49-video.md) · [Speech Generation Manual](doc/manual/en/50-audio.md)
 - [Coordinator Guide](doc/COORDINATOR.md) · [Coordinator Manual](doc/manual/en/44-coordinator.md) · [Coordinator Internals](doc/manual/en/76-coordinator.md)
 - [Container Image Manual](doc/manual/en/52-container.md): the coordinator, the server and your models in one Podman or Docker image
+- [IDE Manual](doc/manual/en/53-ide.md): orangu in Visual Studio
 - [Model Building & Quantization](doc/BUILD_MODEL.md) · [GGUF Manual](doc/manual/en/47-gguf.md) · [Corpus Manifest](contrib/orangu-model/README.md)
 - [Core Tools Reference](doc/manual/en/41-core_tools.md) · [Git Tools](doc/manual/en/42-git_tools.md) · [Workspaces](doc/manual/en/31-workspaces.md)
 - [Context Compression Details](doc/manual/en/75-compression.md)

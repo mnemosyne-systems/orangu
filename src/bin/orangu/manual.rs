@@ -59,6 +59,7 @@ const MANUAL_SOURCES: &[&str] = &[
     include_str!("../../../doc/manual/en/44-coordinator.md"),
     include_str!("../../../doc/manual/en/46-server.md"),
     include_str!("../../../doc/manual/en/52-container.md"),
+    include_str!("../../../doc/manual/en/53-ide.md"),
     include_str!("../../../doc/manual/en/70-dev.md"),
     include_str!("../../../doc/manual/en/71-git.md"),
     include_str!("../../../doc/manual/en/72-extra.md"),
