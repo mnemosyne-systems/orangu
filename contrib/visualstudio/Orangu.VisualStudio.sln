@@ -1,0 +1,40 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Orangu.Core", "Orangu.Core\Orangu.Core.csproj", "{744974AA-9FC9-4DDA-A283-A9514DFBDD2F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Orangu.Core.Tests", "Orangu.Core.Tests\Orangu.Core.Tests.csproj", "{149680B2-B95C-4840-8076-1C18F41BF386}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Orangu.VisualStudio", "Orangu.VisualStudio\Orangu.VisualStudio.csproj", "{5FA2CCBF-A0B3-4BC2-ABFF-A720DAACD5BE}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Orangu.VisualStudio.Tests", "Orangu.VisualStudio.Tests\Orangu.VisualStudio.Tests.csproj", "{4C407745-671B-425B-8FFC-F3542E7E157F}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{744974AA-9FC9-4DDA-A283-A9514DFBDD2F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{744974AA-9FC9-4DDA-A283-A9514DFBDD2F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{744974AA-9FC9-4DDA-A283-A9514DFBDD2F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{744974AA-9FC9-4DDA-A283-A9514DFBDD2F}.Release|Any CPU.Build.0 = Release|Any CPU
+		{149680B2-B95C-4840-8076-1C18F41BF386}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{149680B2-B95C-4840-8076-1C18F41BF386}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{149680B2-B95C-4840-8076-1C18F41BF386}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{149680B2-B95C-4840-8076-1C18F41BF386}.Release|Any CPU.Build.0 = Release|Any CPU
+		{5FA2CCBF-A0B3-4BC2-ABFF-A720DAACD5BE}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{5FA2CCBF-A0B3-4BC2-ABFF-A720DAACD5BE}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{5FA2CCBF-A0B3-4BC2-ABFF-A720DAACD5BE}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{5FA2CCBF-A0B3-4BC2-ABFF-A720DAACD5BE}.Release|Any CPU.Build.0 = Release|Any CPU
+		{4C407745-671B-425B-8FFC-F3542E7E157F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{4C407745-671B-425B-8FFC-F3542E7E157F}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{4C407745-671B-425B-8FFC-F3542E7E157F}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{4C407745-671B-425B-8FFC-F3542E7E157F}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

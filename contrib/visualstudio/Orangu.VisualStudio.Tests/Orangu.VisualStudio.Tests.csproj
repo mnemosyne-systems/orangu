@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- The extension's parts that run without Visual Studio: the tool window's
+       state, and the XAML and strings that are only read at run time. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows8.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- Run on whichever newer .NET is installed when 8 is not. -->
+    <RollForward>Major</RollForward>
+    <!-- The Extensibility packages ask for the Windows desktop runtime, which
+         nothing tested here uses. Without it the tests run wherever the
+         dotnet SDK does, Linux and macOS included. -->
+    <DisableTransitiveFrameworkReferences>true</DisableTransitiveFrameworkReferences>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Orangu.VisualStudio\Orangu.VisualStudio.csproj" />
+  </ItemGroup>
+
+  <!-- The extension's packages come with the generator that writes its
+       manifest. Here it would take the tests for a second extension. -->
+  <Target Name="DropExtensionGenerators" BeforeTargets="CoreCompile">
+    <ItemGroup>
+      <Analyzer Remove="@(Analyzer)" Condition="$([System.String]::Copy('%(Analyzer.Filename)').StartsWith('Microsoft.VisualStudio.Extensibility'))" />
+    </ItemGroup>
+  </Target>
+</Project>

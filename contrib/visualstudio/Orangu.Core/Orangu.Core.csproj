@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- What the extension does that has nothing to do with Visual Studio:
+       finding orangu, building its command lines, running a one-shot and
+       writing the prompts. Kept apart so `dotnet test` covers it anywhere. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>Orangu.Core</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="Orangu.Core.Tests" />
+  </ItemGroup>
+</Project>

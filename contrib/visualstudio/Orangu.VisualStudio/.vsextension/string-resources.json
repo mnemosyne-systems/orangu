@@ -1,0 +1,10 @@
+{
+  "Orangu.OpenCommand.DisplayName": "Open orangu",
+  "Orangu.OpenCommand.Tooltip": "Start orangu in its own window, in the solution folder",
+  "Orangu.ShowWindowCommand.DisplayName": "orangu",
+  "Orangu.AskCommand.DisplayName": "Ask orangu About This Selection",
+  "Orangu.ReviewCommand.DisplayName": "Review This File with orangu",
+  "Orangu.Settings.Category": "orangu",
+  "Orangu.Settings.BinaryPath": "orangu binary",
+  "Orangu.Settings.BinaryPath.Description": "The path of orangu.exe, or the folder it is in. Leave it empty to use orangu from the PATH, or from .cargo\\bin in your user folder. The server, the model and everything else come from orangu.conf."
+}

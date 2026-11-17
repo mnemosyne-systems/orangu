@@ -210,3 +210,40 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.ref_name }}" "$BUNDLE" "${BUNDLE}.sha256" --clobber
+
+  visualstudio:
+    name: Visual Studio extension
+    needs: create-release
+    # The .vsix is packed by the Visual Studio SDK's tools, which only run on
+    # Windows; the runner's Visual Studio brings them.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      # The extension carries the release's version, so Visual Studio offers a
+      # newer release as an update. A VSIX version is numbers only, so a tag
+      # that is not one keeps the default.
+      - name: Test and pack the extension
+        shell: pwsh
+        working-directory: contrib/visualstudio
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          $properties = @('-c', 'Release')
+          if ($version -match '^\d+(\.\d+){1,3}$') { $properties += "-p:Version=$version" }
+          dotnet test @properties
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $vsix = "orangu-$env:TAG-visualstudio.vsix"
+          Copy-Item Orangu.VisualStudio\bin\Release\net8.0-windows8.0\Orangu.VisualStudio.vsix "..\..\$vsix"
+          "VSIX=$vsix" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "$VSIX" --clobber
