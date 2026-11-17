@@ -40,10 +40,10 @@ use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage};
 use super::plan;
 use super::prefixes::{Manifest, PrefixFiles, SavedNode};
 use super::protocol::{
-    ActivationFormat, Assign, Capacity, DiscoveryRecord, ErrorCode, FEATURE_PREFIXES,
-    FEATURE_SWITCH, FEATURES, HelloAck, MAX_DEPTH, Message, NodeSetup, PROTOCOL_VERSION, PlanEntry,
-    ProbeState, SessionTerms, WorkerError, check_path, parent_reads_discovery, read_frame,
-    read_message, write_message,
+    ActivationFormat, Assign, Capacity, DiscoveryRecord, ErrorCode, FEATURE_FETCH,
+    FEATURE_PREFIXES, FEATURE_SWITCH, FEATURES, HelloAck, MAX_DEPTH, Message, NodeSetup,
+    PROTOCOL_VERSION, PlanEntry, ProbeState, SessionTerms, WorkerError, check_path,
+    parent_reads_discovery, read_frame, read_message, write_message,
 };
 use super::session::SessionStore;
 use super::stage::{EncodedStage, MessageStage};
@@ -188,6 +188,10 @@ pub struct NodeSettings {
     /// the model and this node's name ([`super::prefixes`]); `None` saves
     /// nothing.
     pub prefix_root: Option<std::path::PathBuf>,
+    /// The model file this node serves by range to the nodes of its channel
+    /// that fetch it in part ([`super::share`]): the file it runs, when that
+    /// is a whole model in a single file.
+    pub serve_file: Option<std::path::PathBuf>,
 }
 
 /// Where a node looks for the other nodes of its channel.
@@ -351,6 +355,9 @@ pub struct Node {
     non_layer_bytes: u64,
     /// The model this node serves, as its handshake tells a parent.
     identity: super::protocol::ModelIdentity,
+    /// The file it serves by range, and how fast while it runs requests.
+    served: Option<super::share::ServedFile>,
+    fetch_pace: super::share::Pace,
     /// The output head's bytes: the matrix as wide as the vocabulary.
     head_bytes: u64,
     local_addr: Option<SocketAddr>,
@@ -778,6 +785,12 @@ impl Node {
         // The model this node serves, by its layout: what a parent compares.
         let own_identity =
             identity::model_identity(&loaded, &settings.label, &settings.quant, 0..0);
+        // Only a file this node holds whole: a partial one has holes.
+        let served = settings
+            .serve_file
+            .as_deref()
+            .filter(|_| super::fetch::partial().is_none())
+            .and_then(super::share::ServedFile::new);
         let prefix_files = settings.prefix_root.as_ref().map(|root| {
             Arc::new(PrefixFiles::under(
                 root,
@@ -828,6 +841,8 @@ impl Node {
             non_layer_bytes,
             head_bytes,
             identity: own_identity,
+            served,
+            fetch_pace: super::share::Pace::default(),
             local_addr,
             metrics: NodeMetrics::default(),
             next_connection: AtomicU64::new(1),
@@ -2962,7 +2977,8 @@ impl Node {
             layers.clone(),
         );
         // An assignment may fetch its layers first (`super::fetch`): gigabytes,
-        // at whatever the worker's link to the Hub gives.
+        // at whatever the worker's link to this node, another node or the Hub
+        // gives.
         let reply = link.request_within(
             &Message::Assign(Assign {
                 model: self.settings.label.clone(),
@@ -3334,7 +3350,17 @@ impl Node {
             }
         }
         // A partly downloaded model fetches the layers first: the check
-        // below reads them.
+        // below reads them. The parent first, when it serves the file.
+        if super::fetch::partial().is_some() {
+            let parent = self.parent.lock().unwrap().as_ref().map(|p| p.node.clone());
+            super::fetch::prefer(
+                &self.found.lock().unwrap().0,
+                parent.as_deref(),
+                self.identity.header_hash,
+                self.settings.secret.as_deref(),
+                self.settings.tls.as_ref(),
+            );
+        }
         if let Err(e) = super::fetch::layers(&layers) {
             log::warn!("orangu-server: could not fetch layers {layers:?}: {e:#}");
             return error(
@@ -3342,12 +3368,31 @@ impl Node {
                 format!("fetching layers {}..{}: {e:#}", layers.start, layers.end),
             );
         }
-        let own = identity::model_identity(
+        let mut own = identity::model_identity(
             &self.loaded,
             &self.settings.label,
             &self.settings.quant,
             layers.clone(),
         );
+        // Weights fetched in part that do not match a parent of the same
+        // layout came wrong from their source: fetched again, from the next.
+        if super::fetch::partial().is_some() && own.header_hash == assign.identity.header_hash {
+            for _ in 0..super::fetch::REFETCHES {
+                if identity::check(&assign.identity, &own, &layers).is_ok() {
+                    break;
+                }
+                if let Err(e) = super::fetch::refetch(&layers) {
+                    log::warn!("orangu-server: could not fetch layers {layers:?} again: {e:#}");
+                    break;
+                }
+                own = identity::model_identity(
+                    &self.loaded,
+                    &self.settings.label,
+                    &self.settings.quant,
+                    layers.clone(),
+                );
+            }
+        }
         if let Err(error) = identity::check(&assign.identity, &own, &layers) {
             if let Some(switch) = self.switch_to(&assign.model) {
                 return switch;
@@ -3612,10 +3657,28 @@ impl Node {
                             workers: self.workers_held(),
                             label: self.settings.label.clone(),
                             quant: self.settings.quant.clone(),
+                            features: if self.served.is_some() {
+                                FEATURE_FETCH
+                            } else {
+                                0
+                            },
                         },
                     );
                     self.note_prober(&tcp);
                 }
+                return None;
+            }
+            // A node fetching the model in part: served bytes of the file,
+            // once it proves the secret, whoever claimed this node.
+            Ok(Message::FetchHello { nonce }) => {
+                let offer = self.served.as_ref().map(|file| super::share::Offer {
+                    file,
+                    model: self.identity.header_hash,
+                    secret: self.settings.secret.as_deref(),
+                });
+                super::share::serve(reader, writer, nonce, offer, &self.fetch_pace, &|| {
+                    self.active.load(Ordering::Acquire) + self.forwards.load(Ordering::Acquire) > 0
+                });
                 return None;
             }
             // A node about to claim workers on this channel.
@@ -4134,6 +4197,7 @@ mod tests {
             metrics_endpoint: None,
             prompt_weights: prompt_weights::PromptWeights::File,
             prefix_root: None,
+            serve_file: None,
         }
     }
 
@@ -4222,6 +4286,76 @@ mod tests {
         assert!(probe_of(&beta, "other").is_none());
         let off = node("off", &[], Variant::default());
         assert!(probe_of(&off, "lab").is_none());
+    }
+
+    /// A node holding its model in one file serves its bytes to any node
+    /// that proves the secret, says so when probed, and refuses a range
+    /// outside the file; a node with no file to serve says so too, and is
+    /// never named a source by its probe.
+    #[test]
+    fn a_node_serves_its_model_file_by_range() {
+        use crate::workers::share::PeerSource;
+        use orangu::model_download::RangeSource;
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot = dir.path().join("models--u--m/snapshots/feed");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        let path = snapshot.join("m-F32.gguf");
+        let body: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &body).unwrap();
+        let mut s = on_channel("beta", "lab", &[], true);
+        s.secret = Some("s1".to_string());
+        s.serve_file = Some(path);
+        let beta = node_with(s, Variant::default());
+        let addr = beta.local_addr().unwrap();
+        let found = super::super::channel::probe(
+            addr,
+            &super::super::channel::channel_hash("lab", Some("s1")),
+            None,
+        )
+        .expect("on the channel");
+        assert_eq!(found.features & FEATURE_FETCH, FEATURE_FETCH);
+        assert_eq!(found.model, beta.identity.header_hash);
+
+        let peer = PeerSource::new("beta".into(), addr.to_string(), Some("s1".into()), None);
+        let info = peer.info().unwrap();
+        assert_eq!(
+            (info.size, info.file.as_str(), info.commit.as_str()),
+            (body.len() as u64, "m-F32.gguf", "feed")
+        );
+        assert_eq!(info.model, beta.identity.header_hash);
+        assert_eq!(peer.read(1000, 20_000).unwrap(), body[1000..21_000]);
+        assert!(peer.read(49_990, 11).is_err());
+        assert_eq!(peer.read(49_990, 10).unwrap(), body[49_990..]);
+        // Fetching claims nothing: the node is still free.
+        assert!(beta.parent.lock().unwrap().is_none());
+        assert_eq!(probe_of_secret(&beta, "lab", "s1").state, ProbeState::Idle);
+
+        let stranger = PeerSource::new("beta".into(), addr.to_string(), Some("s2".into()), None);
+        assert!(stranger.read(0, 10).is_err());
+        let anonymous = PeerSource::new("beta".into(), addr.to_string(), None, None);
+        assert!(anonymous.read(0, 10).is_err());
+
+        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
+        let found = probe_of(&gamma, "lab").expect("on the channel");
+        assert_eq!(found.features & FEATURE_FETCH, 0);
+        let refused = PeerSource::new(
+            "gamma".into(),
+            gamma.local_addr().unwrap().to_string(),
+            None,
+            None,
+        );
+        assert!(refused.info().is_err());
+        beta.stop();
+        gamma.stop();
+    }
+
+    fn probe_of_secret(node: &Node, channel: &str, secret: &str) -> super::super::channel::Found {
+        super::super::channel::probe(
+            node.local_addr().unwrap(),
+            &super::super::channel::channel_hash(channel, Some(secret)),
+            None,
+        )
+        .expect("on the channel")
     }
 
     /// With a secret, a probe is answered only by a node that shares it:
@@ -6633,6 +6767,7 @@ mod tests {
             workers: 1,
             label: String::new(),
             quant: String::new(),
+            features: 0,
             rtt: Duration::from_millis(1),
             alternates: Vec::new(),
         }

@@ -84,7 +84,8 @@ pub fn same_layout(loaded: &LoadedModel, expected: &ModelIdentity) -> bool {
     header_hash(loaded) == expected.header_hash
 }
 
-fn header_hash(loaded: &LoadedModel) -> [u8; 32] {
+/// [`ModelIdentity::header_hash`] of `loaded`.
+pub fn header_hash(loaded: &LoadedModel) -> [u8; 32] {
     let mut hash = Sha256::new();
     let prefix = format!("{}.", loaded.config.architecture);
     hash.update(loaded.config.architecture.as_bytes());
@@ -122,16 +123,51 @@ fn range_hash(loaded: &LoadedModel, layers: Range<usize>) -> [u8; 32] {
         };
         field(&mut hash, name.as_bytes());
         hash.update((data.len() as u64).to_le_bytes());
-        if data.len() <= 3 * SAMPLE_BYTES {
-            hash.update(data);
-        } else {
-            let middle = data.len() / 2 - SAMPLE_BYTES / 2;
-            hash.update(&data[..SAMPLE_BYTES]);
-            hash.update(&data[middle..middle + SAMPLE_BYTES]);
-            hash.update(&data[data.len() - SAMPLE_BYTES..]);
+        for sample in samples(data) {
+            hash.update(sample);
         }
     }
     hash.finalize().into()
+}
+
+/// The parts of a tensor's `data` [`ModelIdentity::range_hash`] reads: all
+/// of it when small, else its first, middle and last [`SAMPLE_BYTES`].
+fn samples(data: &[u8]) -> Vec<&[u8]> {
+    if data.len() <= 3 * SAMPLE_BYTES {
+        return vec![data];
+    }
+    let middle = data.len() / 2 - SAMPLE_BYTES / 2;
+    vec![
+        &data[..SAMPLE_BYTES],
+        &data[middle..middle + SAMPLE_BYTES],
+        &data[data.len() - SAMPLE_BYTES..],
+    ]
+}
+
+/// Every slice of `loaded`'s mapped file that [`ModelIdentity::range_hash`]
+/// reads for `layers`, as `(offset, len)` in the file: what a node fetching
+/// the model in part fetches to check the weights it was sent against a
+/// peer's hash before it needs them whole. A tensor that is not read
+/// through the mapping (a rewritten repack) has none.
+pub fn sampled_ranges(loaded: &LoadedModel, layers: Range<usize>) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for (name, _, _) in loaded.tensor_directory() {
+        if !block_index(name).is_some_and(|il| layers.contains(&il)) {
+            continue;
+        }
+        let Some(data) = loaded.tensor_data(name) else {
+            continue;
+        };
+        for sample in samples(data) {
+            if let Some((_, at)) =
+                crate::engine::page_cache::locate(sample.as_ptr() as usize, sample.len())
+            {
+                out.push((at, sample.len() as u64));
+            }
+        }
+    }
+    out.sort_unstable();
+    out
 }
 
 /// A length-prefixed field, so no two sequences of fields hash alike.

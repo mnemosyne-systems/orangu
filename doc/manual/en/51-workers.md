@@ -65,6 +65,38 @@ set). It fetches only what building the model reads, and the layers a
 parent assigns when it does — a third of a model and a little more in a
 tree of three. It serves only as a worker: its own API stays off.
 
+It fetches from the other nodes of its channel before Hugging Face, so a
+channel with no internet needs the model on one node's disk only. Every
+node that holds its whole model in a single file serves byte ranges of
+it on its `[workers]` port, to any node that proves the channel's
+`secret` (over TLS when the channel uses it), and says so when probed. A
+fetching node asks, in order:
+
+1. the node that claimed it, for the layers that node assigns;
+2. the other nodes whose probe names its model (`label` and quantization,
+   with the whole file), least busy first;
+3. Hugging Face.
+
+At start, with a node of the channel serving its model, it fetches the
+header from that node and needs no Hugging Face at all. With none yet,
+and Hugging Face out of reach, it looks again every few seconds for ten
+minutes before it gives up.
+
+Nothing it is sent runs unchecked. The header must have the layout the
+serving node's probe named; every layer's vectors, and samples of every
+layer's weights, must hash to the probe's content hash before the model is
+built; and each range a parent assigns must match the parent's own weights
+before it runs. Bytes that fail are fetched again from the next source, and
+the source that sent them is not asked again. Every source must also serve
+the header already in place, byte for byte, before any of its weights are
+taken.
+
+A node serves ranges at full speed while it runs no request. While it
+serves requests, or leads a tree with requests in flight, all of its
+fetching nodes together get 8 MiB a second, so a download does not take the
+link and the disk from the requests. A node that fetches in part serves
+nothing itself.
+
 The small Gemma 4 models limit where they can be cut. Their last layers
 reuse an earlier layer's KV cache, so they stay on the node that has that
 layer. On `gemma-4-E2B` that keeps layers 13–34 together, so the other
@@ -727,9 +759,13 @@ tokens.
   took 67.8 ms against 65.5 ms whole. A prompt chunk still runs layer by
   layer, and so does a Gemma 4 mixture's decode.
 - A node with `download = range` fetches just its layers, and so only ever
-  works for another node: it never routes, leads or serves alone. Every
-  other node keeps the whole model file on disk. A model split in shards is
-  refused.
+  works for another node: it never routes, leads or serves alone. At least
+  one node of the channel, or Hugging Face, has to have the whole model file.
+  A model split in shards is refused, and only a single-file model is
+  served to other nodes. The tensors outside the layer blocks — the
+  embedding, the output head and the final norm — are covered by no
+  fingerprint: they are taken as the first source that serves the right
+  header sends them.
 - A channel is found over IPv4 only, on networks this machine has an
   address on. Nodes behind a router are not found.
 - A GPU keeps the layers it has uploaded until the process ends. A new plan

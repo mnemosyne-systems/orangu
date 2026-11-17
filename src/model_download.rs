@@ -2497,11 +2497,195 @@ fn link_or_copy(blob: &Path, link: &Path, oid: &str, file_path: &str) -> Result<
         .with_context(|| format!("failed to place {}", link.display()))
 }
 
+/// Where a [`PartialModel`]'s bytes come from: the Hub, or another machine
+/// that holds the whole file. The library knows the Hub; any other source
+/// is supplied by its caller.
+pub trait RangeSource: Send + Sync {
+    /// What the source is called in messages, and what it is remembered by
+    /// once it has been dropped for bad data.
+    fn key(&self) -> String;
+
+    /// Bytes `offset..offset + len` of the file: exactly `len` of them, or
+    /// an error.
+    fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>>;
+
+    /// The most one [`Self::read`] is asked for.
+    fn chunk(&self) -> u64 {
+        8 << 20
+    }
+}
+
+/// The Hub's copy of a model file, by HTTP byte range.
+struct HubSource {
+    client: reqwest::blocking::Client,
+    token: Option<String>,
+    /// The file's URL, once `spec` has been resolved on the Hub. A source
+    /// built from a spec alone resolves it on first use, so a Hub that
+    /// cannot be reached costs nothing until every other source failed.
+    url: Mutex<Option<String>>,
+    spec: String,
+    /// The size the file must have: the one every other source serves.
+    size: u64,
+}
+
+impl HubSource {
+    /// A source for `url`, already resolved.
+    fn resolved(url: String, size: u64, client: reqwest::blocking::Client) -> Self {
+        Self {
+            client,
+            token: std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()),
+            url: Mutex::new(Some(url)),
+            spec: String::new(),
+            size,
+        }
+    }
+
+    /// A source for `spec`, resolved on first use, whose file must hold
+    /// `size` bytes.
+    fn lazy(spec: &str, size: u64) -> Result<Self> {
+        Ok(Self {
+            client: partial_client()?,
+            token: std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty()),
+            url: Mutex::new(None),
+            spec: spec.to_string(),
+            size,
+        })
+    }
+
+    fn url(&self) -> Result<String> {
+        let mut url = self.url.lock().unwrap();
+        if let Some(url) = url.as_ref() {
+            return Ok(url.clone());
+        }
+        let found = resolve_single_file(&self.client, &self.spec, self.token.as_deref())?;
+        if found.size != self.size {
+            bail!(
+                "the Hub's {} holds {} bytes, the file being fetched {}",
+                found.file_path,
+                found.size,
+                self.size
+            );
+        }
+        *url = Some(found.url.clone());
+        Ok(found.url)
+    }
+}
+
+impl RangeSource for HubSource {
+    fn key(&self) -> String {
+        "the Hub".to_string()
+    }
+
+    fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let url = self.url()?;
+        let mut out = Vec::with_capacity(len as usize);
+        ranged(
+            &self.client,
+            &url,
+            self.token.as_deref(),
+            Some((offset, len)),
+        )?
+        .take(len)
+        .read_to_end(&mut out)
+        .with_context(|| format!("failed reading {url}"))?;
+        if out.len() as u64 != len {
+            bail!("{url} ended {} bytes early", len - out.len() as u64);
+        }
+        Ok(out)
+    }
+
+    /// Larger than a peer's: every read is a request of its own.
+    fn chunk(&self) -> u64 {
+        64 << 20
+    }
+}
+
+/// The HTTP client of a partial model's Hub source. A node fetching in part
+/// may have no way out at all, and then the Hub is the last of its sources:
+/// a connection that cannot be made fails within a bounded time, and the
+/// node goes back to looking for a peer.
+fn partial_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .user_agent(concat!("orangu-server/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .build()
+        .context("failed to build HTTP client")
+}
+
+/// A single-file model on the Hub, as `spec` names it.
+struct HubFile {
+    repo: String,
+    commit: String,
+    file_path: String,
+    size: u64,
+    url: String,
+}
+
+/// Resolves `spec` (`<user>/<model>[:quant]`) on the Hub to its one file;
+/// a model split in shards is refused.
+fn resolve_single_file(
+    client: &reqwest::blocking::Client,
+    spec: &str,
+    token: Option<&str>,
+) -> Result<HubFile> {
+    let (repo, tag) = split_repo_tag(spec)?;
+    let commit = resolve_commit(client, &repo, token)?;
+    let files = list_repo_files(client, &repo, &commit, token)?;
+    let selected = select_files_to_download(&files, tag.as_deref())
+        .with_context(|| format!("no matching GGUF file in {repo}"))?;
+    if selected.len() != 1 {
+        bail!(
+            "{spec} is split in {} shards; a range download takes a single-file model",
+            selected.len()
+        );
+    }
+    let file = selected[0];
+    let url = format!(
+        "{HUB_ENDPOINT}/{repo}/resolve/{commit}/{}",
+        urlencode_path(&file.path)
+    );
+    Ok(HubFile {
+        repo,
+        commit,
+        file_path: file.path.clone(),
+        size: file.size,
+        url,
+    })
+}
+
+/// What a source other than the Hub says of the file it serves: where the
+/// partial copy goes, and how large it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileOffer {
+    /// The file's name, without any directory.
+    pub name: String,
+    /// The snapshot it belongs to: the Hub commit its directory is named
+    /// after, when the source knows it.
+    pub commit: String,
+    pub size: u64,
+}
+
+/// Whether `name` is a model file a peer may serve whole: a `.gguf` that is
+/// not one shard of several.
+pub fn single_file_model(name: &str) -> bool {
+    name.ends_with(".gguf") && shard_info(name).is_none()
+}
+
+/// Checks a header just put in place: the file at the path holds it, and
+/// holes where the tensors go. An error drops the source it came from.
+pub type HeaderCheck<'a> = &'a dyn Fn(&Path) -> Result<()>;
+
 /// A model file fetched in part: its header and whichever tensors a
 /// caller asks for, written where they belong in a sparse file of the full
 /// size, the rest left as holes. A worker of a `[workers]` tree runs a range
 /// of layers and needs little of the rest: it fetches what building the
 /// model reads, then its own layers when a parent assigns them.
+///
+/// The bytes come from a list of [`RangeSource`]s, tried in order: another
+/// machine that holds the file, then the Hub. A source that fails is
+/// skipped for the rest of that fetch; one that serves another header than
+/// the one in place, or whose tensors a caller finds wrong
+/// ([`Self::forget`]), is dropped for good.
 ///
 /// The file is `<snapshot>/<name>.gguf.partial`, beside where the whole file
 /// would go and never mistaken for it — `list` and a plain start look for
@@ -2511,13 +2695,21 @@ fn link_or_copy(blob: &Path, link: &Path, oid: &str, file_path: &str) -> Result<
 pub struct PartialModel {
     path: PathBuf,
     record: PathBuf,
-    url: String,
-    client: reqwest::blocking::Client,
-    token: Option<String>,
+    /// Where the tensor data begins, and a hash of every byte before it:
+    /// what a source must serve before any of its tensors are taken.
+    data_offset: u64,
+    header_digest: [u8; 32],
+    sources: Mutex<Vec<Arc<dyn RangeSource>>>,
+    /// The keys of sources dropped for bad data.
+    rejected: Mutex<std::collections::HashSet<String>>,
+    /// The keys of sources whose header matched the one in place.
+    vouched: Mutex<std::collections::HashSet<String>>,
     /// Each tensor's absolute byte range in the file, padding included, and
     /// its dimensions.
     extents: Vec<(String, u64, u64, Vec<u64>)>,
-    fetched: Mutex<std::collections::HashSet<String>>,
+    /// The tensors in place, each with the key of the source it came from;
+    /// `None` for one an earlier run fetched.
+    fetched: Mutex<std::collections::HashMap<String, Option<String>>>,
 }
 
 impl PartialModel {
@@ -2525,93 +2717,118 @@ impl PartialModel {
     /// Hub, and fetches its header into a new sparse file — or reopens the
     /// one an earlier run left, keeping what it fetched.
     pub fn open(models_dir: &Path, spec: &str) -> Result<Self> {
-        let (repo, tag) = split_repo_tag(spec)?;
-        let client = build_client(None)?;
+        let client = partial_client()?;
         let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
-        let commit = resolve_commit(&client, &repo, token.as_deref())?;
-        let files = list_repo_files(&client, &repo, &commit, token.as_deref())?;
-        let selected = select_files_to_download(&files, tag.as_deref())
-            .with_context(|| format!("no matching GGUF file in {repo}"))?;
-        if selected.len() != 1 {
-            bail!(
-                "{spec} is split in {} shards; a range download takes a single-file model",
-                selected.len()
-            );
-        }
-        let file = selected[0].clone();
-        let snapshot_dir = models_dir
-            .join(repo_folder_name(&repo))
-            .join("snapshots")
-            .join(&commit);
-        fs::create_dir_all(&snapshot_dir)
-            .with_context(|| format!("failed to create {}", snapshot_dir.display()))?;
-        let name = Path::new(&file.path)
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| file.path.clone());
-        let path = snapshot_dir.join(format!("{name}.partial"));
-        let record = snapshot_dir.join(format!("{name}.partial.fetched"));
-        let url = format!(
-            "{HUB_ENDPOINT}/{repo}/resolve/{commit}/{}",
-            urlencode_path(&file.path)
-        );
-        Self::start(path, record, url, file.size, client, token)
+        let file = resolve_single_file(&client, spec, token.as_deref())?;
+        let (path, record) = partial_paths(models_dir, &file.repo, &file.commit, &file.file_path)?;
+        let hub: Arc<dyn RangeSource> = Arc::new(HubSource::resolved(file.url, file.size, client));
+        Self::start(path, record, file.size, vec![hub], None)
     }
 
-    /// [`Self::open`] once the file is known: `url` holds `size` bytes, to
-    /// be fetched in part into `path`.
+    /// Opens `spec` in part from `sources` — other machines that hold the
+    /// file `offer` describes — and then the Hub, when `hub` is set, resolved
+    /// only if every other source fails. `check` vets the header each source
+    /// gives before it is kept, and the one an earlier run left.
+    pub fn open_offered(
+        models_dir: &Path,
+        spec: &str,
+        offer: &FileOffer,
+        mut sources: Vec<Arc<dyn RangeSource>>,
+        hub: bool,
+        check: HeaderCheck<'_>,
+    ) -> Result<Self> {
+        let (repo, _) = split_repo_tag(spec)?;
+        let commit = if offer.commit.is_empty() {
+            "peer"
+        } else {
+            offer.commit.as_str()
+        };
+        if !single_file_model(&offer.name)
+            || offer.name.contains(['/', '\\'])
+            || commit.contains(['/', '\\', '.'])
+        {
+            bail!(
+                "a peer offers '{}' at '{commit}': not a single model file",
+                offer.name
+            );
+        }
+        let (path, record) = partial_paths(models_dir, &repo, commit, &offer.name)?;
+        if hub {
+            sources.push(Arc::new(HubSource::lazy(spec, offer.size)?));
+        }
+        Self::start(path, record, offer.size, sources, Some(check))
+    }
+
+    /// Fetches the header of a `size`-byte file into `path` from the first
+    /// of `sources` that serves one `check` accepts — or reopens the one an
+    /// earlier run left there.
     fn start(
         path: PathBuf,
         record: PathBuf,
-        url: String,
         size: u64,
-        client: reqwest::blocking::Client,
-        token: Option<String>,
+        sources: Vec<Arc<dyn RangeSource>>,
+        check: Option<HeaderCheck<'_>>,
     ) -> Result<Self> {
-        let reuse = path.metadata().is_ok_and(|m| m.len() == size) && record.exists();
+        let mut rejected = std::collections::HashSet::new();
+        let mut vouched = std::collections::HashSet::new();
+        let reuse = path.metadata().is_ok_and(|m| m.len() == size)
+            && record.exists()
+            && match check.map(|check| check(&path)) {
+                Some(Err(error)) => {
+                    log::warn!(
+                        "orangu: the partial model {} is set aside: {error:#}",
+                        path.display()
+                    );
+                    false
+                }
+                _ => true,
+            };
         let header = if reuse {
             GgufFile::open(&path)
                 .with_context(|| format!("failed to read the header of {}", path.display()))?
         } else {
             let _ = fs::remove_file(&record);
-            // The front of the file in growing slices until the tensor table
-            // parses — a large vocabulary makes a header of many megabytes —
-            // then written where it came from.
-            let mut want = (8u64 << 20).min(size);
-            let (header, front) = loop {
-                let mut front = Vec::new();
-                ranged(&client, &url, token.as_deref(), Some((0, want)))?
-                    .read_to_end(&mut front)
-                    .with_context(|| format!("failed reading {url}"))?;
-                match GgufFile::read_from(std::io::Cursor::new(&front)) {
-                    Ok(header) if header.data_offset <= front.len() as u64 => {
-                        break (header, front);
+            let mut failure = None;
+            let mut header = None;
+            for source in &sources {
+                match fetch_header(source.as_ref(), size, &path).and_then(|header| {
+                    if let Some(check) = check {
+                        check(&path)?;
                     }
-                    Ok(_) | Err(_) if want < size => want = (want * 4).min(size),
-                    Ok(_) => bail!("{url}: the tensor data starts past the end of the file"),
+                    Ok(header)
+                }) {
+                    Ok(fetched) => {
+                        vouched.insert(source.key());
+                        header = Some(fetched);
+                        break;
+                    }
                     Err(error) => {
-                        return Err(error)
-                            .with_context(|| format!("failed to parse the GGUF header of {url}"));
+                        log::warn!(
+                            "orangu: {} did not serve the model's header: {error:#}",
+                            source.key()
+                        );
+                        rejected.insert(source.key());
+                        failure = Some(error);
                     }
                 }
+            }
+            let Some(header) = header else {
+                return Err(failure.unwrap_or_else(|| anyhow!("nowhere to fetch the model from")));
             };
-            let mut out = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&path)
-                .with_context(|| format!("failed to create {}", path.display()))?;
-            out.set_len(size)
-                .with_context(|| format!("failed to size {}", path.display()))?;
-            out.write_all(&front[..header.data_offset as usize])
-                .with_context(|| format!("failed to write {}", path.display()))?;
             fs::write(&record, "")
                 .with_context(|| format!("failed to create {}", record.display()))?;
             header
         };
+        let header_digest = {
+            use sha2::{Digest, Sha256};
+            let mut front = vec![0u8; header.data_offset as usize];
+            fs::File::open(&path)
+                .and_then(|mut file| file.read_exact(&mut front))
+                .with_context(|| format!("failed to read {}", path.display()))?;
+            Sha256::digest(&front).into()
+        };
         let mut by_offset: Vec<_> = header.tensors.iter().collect();
         by_offset.sort_by_key(|t| t.offset);
-        let data_end = size;
         let extents = by_offset
             .iter()
             .enumerate()
@@ -2619,7 +2836,7 @@ impl PartialModel {
                 let start = header.data_offset + t.offset;
                 let end = by_offset
                     .get(i + 1)
-                    .map_or(data_end, |next| header.data_offset + next.offset);
+                    .map_or(size, |next| header.data_offset + next.offset);
                 (
                     t.name.clone(),
                     start,
@@ -2632,14 +2849,16 @@ impl PartialModel {
             .unwrap_or_default()
             .lines()
             .filter(|l| !l.is_empty())
-            .map(str::to_string)
+            .map(|name| (name.to_string(), None))
             .collect();
         Ok(Self {
             path,
             record,
-            url,
-            client,
-            token,
+            data_offset: header.data_offset,
+            header_digest,
+            sources: Mutex::new(sources),
+            rejected: Mutex::new(rejected),
+            vouched: Mutex::new(vouched),
             extents,
             fetched: Mutex::new(fetched),
         })
@@ -2655,12 +2874,31 @@ impl PartialModel {
         let fetched = self.fetched.lock().unwrap();
         self.extents
             .iter()
-            .all(|(name, _, len, _)| *len == 0 || fetched.contains(name))
+            .all(|(name, _, len, _)| *len == 0 || fetched.contains_key(name))
+    }
+
+    /// Puts `sources` first, in their order, ahead of the ones already
+    /// known; a source already known by the same key keeps its place among
+    /// them instead. A dropped source stays dropped.
+    pub fn prefer(&self, preferred: Vec<Arc<dyn RangeSource>>) {
+        let mut sources = self.sources.lock().unwrap();
+        let mut ordered: Vec<Arc<dyn RangeSource>> = Vec::new();
+        for source in preferred.into_iter().chain(sources.drain(..)) {
+            if !ordered.iter().any(|known| known.key() == source.key()) {
+                ordered.push(source);
+            }
+        }
+        *sources = ordered;
+    }
+
+    /// Drops the source named `key` for good.
+    pub fn reject(&self, key: &str) {
+        self.rejected.lock().unwrap().insert(key.to_string());
     }
 
     /// Fetches every tensor `wanted` picks (by name and dimensions) that is
     /// not in place yet, and answers how many bytes that took. Neighbouring
-    /// tensors go in one request. Each is recorded as fetched once its bytes
+    /// tensors go in one run. Each is recorded as fetched once its bytes
     /// are written.
     pub fn fetch(&self, wanted: impl Fn(&str, &[u64]) -> bool) -> Result<u64> {
         let missing: Vec<(String, u64, u64)> = {
@@ -2668,7 +2906,7 @@ impl PartialModel {
             self.extents
                 .iter()
                 .filter(|(name, _, len, dims)| {
-                    *len > 0 && wanted(name, dims) && !fetched.contains(name)
+                    *len > 0 && wanted(name, dims) && !fetched.contains_key(name)
                 })
                 .map(|(name, start, len, _)| (name.clone(), *start, *len))
                 .collect()
@@ -2687,22 +2925,10 @@ impl PartialModel {
                 _ => runs.push((start, len, vec![name])),
             }
         }
-        let out = OpenOptions::new()
-            .write(true)
-            .open(&self.path)
-            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        let out = self.open_for_writing()?;
         let mut total = 0u64;
         for (start, len, names) in runs {
-            copy_range(
-                &self.client,
-                &self.url,
-                self.token.as_deref(),
-                &out,
-                start,
-                len,
-            )?;
-            out.sync_data()
-                .with_context(|| format!("failed to write {}", self.path.display()))?;
+            let key = self.copy_in(&out, start, len)?;
             total += len;
             let mut record = OpenOptions::new()
                 .append(true)
@@ -2712,11 +2938,221 @@ impl PartialModel {
             for name in names {
                 writeln!(record, "{name}")
                     .with_context(|| format!("failed to write {}", self.record.display()))?;
-                fetched.insert(name);
+                fetched.insert(name, Some(key.clone()));
             }
         }
         Ok(total)
     }
+
+    /// Fetches the byte ranges `ranges` (`(offset, len)`) into place
+    /// without recording any tensor as fetched — samples of tensors, for a
+    /// caller to check before the tensors are needed whole — and answers
+    /// the keys of the sources they came from.
+    pub fn fetch_bytes(&self, ranges: &[(u64, u64)]) -> Result<Vec<String>> {
+        let out = self.open_for_writing()?;
+        let mut used: Vec<String> = Vec::new();
+        for &(start, len) in ranges {
+            if len == 0 {
+                continue;
+            }
+            let key = self.copy_in(&out, start, len)?;
+            if !used.contains(&key) {
+                used.push(key);
+            }
+        }
+        Ok(used)
+    }
+
+    /// Takes every tensor `wanted` picks out of the record, to be fetched
+    /// again — what a caller does when the bytes fail its check — and, with
+    /// `drop_sources`, drops for good the sources they came from. Answers
+    /// those sources' keys; a tensor an earlier run fetched names none.
+    pub fn forget(
+        &self,
+        wanted: impl Fn(&str, &[u64]) -> bool,
+        drop_sources: bool,
+    ) -> Result<Vec<String>> {
+        let mut dropped: Vec<String> = Vec::new();
+        let mut fetched = self.fetched.lock().unwrap();
+        for (name, _, _, dims) in &self.extents {
+            if !wanted(name, dims) {
+                continue;
+            }
+            if let Some(Some(key)) = fetched.remove(name)
+                && !dropped.contains(&key)
+            {
+                dropped.push(key);
+            }
+        }
+        let mut names: Vec<&String> = fetched.keys().collect();
+        names.sort();
+        let mut listing = String::new();
+        for name in names {
+            listing.push_str(name);
+            listing.push('\n');
+        }
+        fs::write(&self.record, listing)
+            .with_context(|| format!("failed to write {}", self.record.display()))?;
+        drop(fetched);
+        if drop_sources {
+            let mut rejected = self.rejected.lock().unwrap();
+            for key in &dropped {
+                rejected.insert(key.clone());
+            }
+        }
+        Ok(dropped)
+    }
+
+    fn open_for_writing(&self) -> Result<fs::File> {
+        OpenOptions::new()
+            .write(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))
+    }
+
+    /// Copies bytes `start..start + len` into place from the first source
+    /// that serves them, and answers its key. A source is asked for tensor
+    /// bytes only once it has served the header in place, byte for byte.
+    fn copy_in(&self, out: &fs::File, start: u64, len: u64) -> Result<String> {
+        let sources = self.sources.lock().unwrap().clone();
+        let mut failure = None;
+        for source in sources {
+            let key = source.key();
+            if self.rejected.lock().unwrap().contains(&key) {
+                continue;
+            }
+            let copied = self
+                .vouch(source.as_ref())
+                .and_then(|()| copy_from(source.as_ref(), out, start, len));
+            match copied {
+                Ok(()) => {
+                    out.sync_data()
+                        .with_context(|| format!("failed to write {}", self.path.display()))?;
+                    return Ok(key);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "orangu: {key} could not serve bytes {start}..{} of the model; trying \
+                         the next source: {error:#}",
+                        start + len
+                    );
+                    failure = Some(error);
+                }
+            }
+        }
+        Err(failure
+            .unwrap_or_else(|| anyhow!("no source is left to serve the model from"))
+            .context(format!(
+                "no source served bytes {start}..{} of the model",
+                start + len
+            )))
+    }
+
+    /// Makes sure `source` serves the header in place, dropping it for good
+    /// when it serves another.
+    fn vouch(&self, source: &dyn RangeSource) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let key = source.key();
+        if self.vouched.lock().unwrap().contains(&key) {
+            return Ok(());
+        }
+        let mut hash = Sha256::new();
+        let mut at = 0u64;
+        while at < self.data_offset {
+            let n = source.chunk().max(1).min(self.data_offset - at);
+            hash.update(source.read(at, n)?);
+            at += n;
+        }
+        let digest: [u8; 32] = hash.finalize().into();
+        if digest != self.header_digest {
+            self.reject(&key);
+            bail!("{key} serves another model file");
+        }
+        self.vouched.lock().unwrap().insert(key);
+        Ok(())
+    }
+}
+
+/// Where the partial copy of `file_path` of `repo` at `commit` goes, and its
+/// record.
+fn partial_paths(
+    models_dir: &Path,
+    repo: &str,
+    commit: &str,
+    file_path: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let snapshot_dir = models_dir
+        .join(repo_folder_name(repo))
+        .join("snapshots")
+        .join(commit);
+    fs::create_dir_all(&snapshot_dir)
+        .with_context(|| format!("failed to create {}", snapshot_dir.display()))?;
+    let name = Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_path.to_string());
+    Ok((
+        snapshot_dir.join(format!("{name}.partial")),
+        snapshot_dir.join(format!("{name}.partial.fetched")),
+    ))
+}
+
+/// Fetches the front of a `size`-byte file from `source` in growing slices
+/// until the tensor table parses — a large vocabulary makes a header of
+/// many megabytes — and writes it into a new sparse file at `path`.
+fn fetch_header(source: &dyn RangeSource, size: u64, path: &Path) -> Result<GgufFile> {
+    let key = source.key();
+    let mut want = (8u64 << 20).min(size);
+    let mut front: Vec<u8> = Vec::new();
+    let header = loop {
+        while (front.len() as u64) < want {
+            let at = front.len() as u64;
+            let n = source.chunk().max(1).min(want - at);
+            front.extend(source.read(at, n)?);
+        }
+        match GgufFile::read_from(std::io::Cursor::new(&front)) {
+            Ok(header) if header.data_offset <= front.len() as u64 => break header,
+            Ok(_) | Err(_) if want < size => want = (want * 4).min(size),
+            Ok(_) => bail!("{key}: the tensor data starts past the end of the file"),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to parse the GGUF header from {key}"));
+            }
+        }
+    };
+    let mut out = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    out.set_len(size)
+        .with_context(|| format!("failed to size {}", path.display()))?;
+    out.write_all(&front[..header.data_offset as usize])
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(header)
+}
+
+/// Copies bytes `start..start + len` of `source`'s file to the same place in
+/// `out`, a chunk at a time.
+fn copy_from(source: &dyn RangeSource, out: &fs::File, start: u64, len: u64) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+    let mut out = out;
+    out.seek(SeekFrom::Start(start))
+        .context("failed to seek in the partial model")?;
+    let mut at = start;
+    let end = start + len;
+    while at < end {
+        let n = source.chunk().max(1).min(end - at);
+        let bytes = source.read(at, n)?;
+        if bytes.len() as u64 != n {
+            bail!("{} sent {} bytes for {n}", source.key(), bytes.len());
+        }
+        out.write_all(&bytes)
+            .context("failed to write a fetched range")?;
+        at += n;
+    }
+    Ok(())
 }
 
 /// `GET url`, of `bytes` when given, as a stream.
@@ -2742,40 +3178,6 @@ fn ranged(
         bail!("{url} does not answer range requests");
     }
     Ok(response)
-}
-
-/// Copies bytes `start..start + len` of `url` to the same place in `out`.
-fn copy_range(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    token: Option<&str>,
-    out: &fs::File,
-    start: u64,
-    len: u64,
-) -> Result<()> {
-    use std::io::{Seek, SeekFrom};
-    if len == 0 {
-        return Ok(());
-    }
-    let mut response = ranged(client, url, token, Some((start, len)))?;
-    let mut out = out;
-    out.seek(SeekFrom::Start(start))
-        .context("failed to seek in the partial model")?;
-    let mut buf = vec![0u8; 1 << 20];
-    let mut left = len;
-    while left > 0 {
-        let n = response
-            .read(&mut buf)
-            .with_context(|| format!("failed reading {url}"))?;
-        if n == 0 {
-            bail!("{url} ended {left} bytes early");
-        }
-        let n = n.min(left as usize);
-        out.write_all(&buf[..n])
-            .context("failed to write a fetched range")?;
-        left -= n as u64;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2986,12 +3388,16 @@ mod tests {
         let path = dir.path().join("m.gguf.partial");
         let record = dir.path().join("m.gguf.partial.fetched");
         let open = || {
-            PartialModel::start(
-                path.clone(),
-                record.clone(),
+            let hub: Arc<dyn RangeSource> = Arc::new(HubSource::resolved(
                 url.clone(),
                 body.len() as u64,
                 build_client(None).unwrap(),
+            ));
+            PartialModel::start(
+                path.clone(),
+                record.clone(),
+                body.len() as u64,
+                vec![hub],
                 None,
             )
             .unwrap()
@@ -3034,6 +3440,317 @@ mod tests {
         partial.fetch(|_, _| true).unwrap();
         assert!(partial.complete());
         assert_eq!(fs::read(&path).unwrap(), body);
+    }
+
+    /// A model file in memory, served a few bytes a read: wrong from
+    /// `corrupt_from` on, or failing every read.
+    struct Memory {
+        key: &'static str,
+        body: Vec<u8>,
+        corrupt_from: Option<usize>,
+        fail: bool,
+        served: AtomicU64,
+    }
+
+    impl Memory {
+        fn new(key: &'static str, body: &[u8]) -> Arc<Self> {
+            Arc::new(Self {
+                key,
+                body: body.to_vec(),
+                corrupt_from: None,
+                fail: false,
+                served: AtomicU64::new(0),
+            })
+        }
+
+        fn corrupt(key: &'static str, body: &[u8], from: usize) -> Arc<Self> {
+            Arc::new(Self {
+                corrupt_from: Some(from),
+                ..Arc::into_inner(Self::new(key, body)).unwrap()
+            })
+        }
+
+        fn failing(key: &'static str, body: &[u8]) -> Arc<Self> {
+            Arc::new(Self {
+                fail: true,
+                ..Arc::into_inner(Self::new(key, body)).unwrap()
+            })
+        }
+
+        fn served(&self) -> u64 {
+            self.served.load(Ordering::Relaxed)
+        }
+    }
+
+    impl RangeSource for Memory {
+        fn key(&self) -> String {
+            self.key.to_string()
+        }
+
+        fn read(&self, offset: u64, len: u64) -> Result<Vec<u8>> {
+            if self.fail {
+                bail!("{} is unreachable", self.key);
+            }
+            let (offset, len) = (offset as usize, len as usize);
+            let mut out = self.body[offset..offset + len].to_vec();
+            if let Some(from) = self.corrupt_from {
+                for (i, byte) in out.iter_mut().enumerate() {
+                    if offset + i >= from {
+                        *byte ^= 0xff;
+                    }
+                }
+            }
+            self.served.fetch_add(len as u64, Ordering::Relaxed);
+            Ok(out)
+        }
+
+        fn chunk(&self) -> u64 {
+            100
+        }
+    }
+
+    fn layered_body() -> Vec<u8> {
+        tiny_gguf(&[
+            ("token_embd.weight", vec![1.0f32; 100]),
+            ("blk.0.attn_norm.weight", vec![2.0; 8]),
+            ("blk.0.ffn_down.weight", vec![3.0; 200]),
+            ("blk.1.ffn_down.weight", vec![4.0; 200]),
+            ("output_norm.weight", vec![5.0; 8]),
+        ])
+    }
+
+    fn offer(body: &[u8]) -> FileOffer {
+        FileOffer {
+            name: "m-Q4_K_M.gguf".to_string(),
+            commit: "abc123".to_string(),
+            size: body.len() as u64,
+        }
+    }
+
+    fn sources(list: &[&Arc<Memory>]) -> Vec<Arc<dyn RangeSource>> {
+        list.iter()
+            .map(|m| (*m).clone() as Arc<dyn RangeSource>)
+            .collect()
+    }
+
+    /// A model a peer serves arrives whole from it, with no Hub at all,
+    /// where the Hub's copy would go.
+    #[test]
+    fn a_partial_model_fetches_from_a_peer() {
+        let body = layered_body();
+        let peer = Memory::new("peer", &body);
+        let dir = tempfile::tempdir().unwrap();
+        let partial = PartialModel::open_offered(
+            dir.path(),
+            "user/model:Q4_K_M",
+            &offer(&body),
+            sources(&[&peer]),
+            false,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            partial.path(),
+            dir.path()
+                .join("models--user--model/snapshots/abc123/m-Q4_K_M.gguf.partial")
+        );
+        partial.fetch(|_, _| true).unwrap();
+        assert!(partial.complete());
+        assert_eq!(fs::read(partial.path()).unwrap(), body);
+        // The header's first read takes up to 8 MiB, here the whole file;
+        // the tensors come after it.
+        let header = GgufFile::read_from(std::io::Cursor::new(&body)).unwrap();
+        assert_eq!(peer.served(), 2 * body.len() as u64 - header.data_offset);
+    }
+
+    /// A source that fails is passed over for the next, for the header and
+    /// for every tensor; one whose header the caller refuses is never asked
+    /// again.
+    #[test]
+    fn a_failing_source_falls_through_to_the_next() {
+        let body = layered_body();
+        let down = Memory::failing("down", &body);
+        let refused = Memory::new("refused", &body);
+        let good = Memory::new("good", &body);
+        let dir = tempfile::tempdir().unwrap();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let partial = PartialModel::open_offered(
+            dir.path(),
+            "user/model",
+            &offer(&body),
+            sources(&[&down, &refused, &good]),
+            false,
+            &|_| {
+                // The first header to arrive — `refused`'s — is refused.
+                if asked.fetch_add(1, Ordering::Relaxed) == 0 {
+                    bail!("not the model the channel serves");
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let refused_before = refused.served();
+        partial.fetch(|_, _| true).unwrap();
+        assert_eq!(fs::read(partial.path()).unwrap(), body);
+        assert_eq!(
+            refused.served(),
+            refused_before,
+            "refused is never asked again"
+        );
+        assert!(good.served() >= body.len() as u64 - 1);
+
+        // Every source down: the fetch fails, and nothing is recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let only = Memory::new("only", &body);
+        let partial = PartialModel::open_offered(
+            dir.path(),
+            "user/model",
+            &offer(&body),
+            sources(&[&only]),
+            false,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        partial.prefer(sources(&[&down]));
+        partial.reject("only");
+        assert!(partial.fetch(|_, _| true).is_err());
+        assert!(!partial.complete());
+    }
+
+    /// Bytes the caller finds wrong are fetched again from the next source,
+    /// and the source that sent them is never asked again.
+    #[test]
+    fn a_corrupt_source_is_replaced() {
+        let body = layered_body();
+        let header = GgufFile::read_from(std::io::Cursor::new(&body)).unwrap();
+        // Right header, wrong weights.
+        let liar = Memory::corrupt("liar", &body, header.data_offset as usize);
+        let honest = Memory::new("honest", &body);
+        let dir = tempfile::tempdir().unwrap();
+        let partial = PartialModel::open_offered(
+            dir.path(),
+            "user/model",
+            &offer(&body),
+            sources(&[&liar, &honest]),
+            false,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        let layer_one = |name: &str, _: &[u64]| name.starts_with("blk.1.");
+        partial.fetch(layer_one).unwrap();
+        let tensor = header
+            .tensors
+            .iter()
+            .find(|t| t.name == "blk.1.ffn_down.weight")
+            .unwrap();
+        let at = (header.data_offset + tensor.offset) as usize;
+        let read = |path: &Path| fs::read(path).unwrap()[at..at + 800].to_vec();
+        assert_ne!(read(partial.path()), body[at..at + 800], "the liar's bytes");
+        assert_eq!(partial.forget(layer_one, true).unwrap(), ["liar"]);
+        let honest_before = honest.served();
+        partial.fetch(layer_one).unwrap();
+        assert_eq!(read(partial.path()), body[at..at + 800]);
+        assert!(honest.served() > honest_before);
+        let liar_before = liar.served();
+        partial.fetch(|_, _| true).unwrap();
+        assert_eq!(liar.served(), liar_before);
+        assert_eq!(fs::read(partial.path()).unwrap(), body);
+    }
+
+    /// A source serving another file than the one whose header is in place
+    /// is dropped before any of its tensors are taken.
+    #[test]
+    fn a_source_with_another_header_is_never_used() {
+        let body = layered_body();
+        let other = tiny_gguf(&[
+            ("token_embd.weight", vec![9.0f32; 100]),
+            ("blk.0.attn_norm.weight", vec![9.0; 8]),
+            ("blk.0.ffn_down.weight", vec![9.0; 200]),
+            ("blk.1.ffn_down.weight", vec![9.0; 200]),
+            ("output_nrom.weight", vec![9.0; 8]),
+        ]);
+        assert_eq!(other.len(), body.len());
+        let right = Memory::new("right", &body);
+        let wrong = Memory::new("wrong", &other);
+        let dir = tempfile::tempdir().unwrap();
+        let partial = PartialModel::open_offered(
+            dir.path(),
+            "user/model",
+            &offer(&body),
+            sources(&[&right]),
+            false,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        partial.prefer(sources(&[&wrong]));
+        partial.fetch(|_, _| true).unwrap();
+        assert_eq!(fs::read(partial.path()).unwrap(), body);
+        let header = GgufFile::read_from(std::io::Cursor::new(&body)).unwrap();
+        assert!(
+            wrong.served() <= header.data_offset,
+            "only its header was read"
+        );
+    }
+
+    /// Samples of tensors are fetched without the tensors counting as in
+    /// place.
+    #[test]
+    fn fetched_bytes_are_not_recorded() {
+        let body = layered_body();
+        let peer = Memory::new("peer", &body);
+        let dir = tempfile::tempdir().unwrap();
+        let partial = PartialModel::open_offered(
+            dir.path(),
+            "user/model",
+            &offer(&body),
+            sources(&[&peer]),
+            false,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        let header = GgufFile::read_from(std::io::Cursor::new(&body)).unwrap();
+        let at = header.data_offset;
+        assert_eq!(partial.fetch_bytes(&[(at, 16)]).unwrap(), ["peer"]);
+        let on_disk = fs::read(partial.path()).unwrap();
+        assert_eq!(
+            on_disk[at as usize..at as usize + 16],
+            body[at as usize..at as usize + 16]
+        );
+        assert!(partial.fetch(|_, _| true).unwrap() > 0);
+        assert!(partial.complete());
+    }
+
+    /// A peer may offer only a plain single-file name.
+    #[test]
+    fn an_offer_names_one_file() {
+        let body = layered_body();
+        let peer = Memory::new("peer", &body);
+        let dir = tempfile::tempdir().unwrap();
+        for (name, commit) in [
+            ("../m.gguf", "abc"),
+            ("m-00001-of-00002.gguf", "abc"),
+            ("m.bin", "abc"),
+            ("m.gguf", ".."),
+        ] {
+            let offer = FileOffer {
+                name: name.to_string(),
+                commit: commit.to_string(),
+                size: body.len() as u64,
+            };
+            assert!(
+                PartialModel::open_offered(
+                    dir.path(),
+                    "user/model",
+                    &offer,
+                    sources(&[&peer]),
+                    false,
+                    &|_| Ok(()),
+                )
+                .is_err(),
+                "{name} at {commit}"
+            );
+        }
+        assert!(single_file_model("m-Q4_K_M.gguf"));
     }
     use super::*;
 

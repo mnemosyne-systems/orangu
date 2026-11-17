@@ -1017,7 +1017,8 @@ fn resolve_worker_model(
     if conf.workers.as_ref().is_some_and(|w| w.download_range)
         && orangu::model_spec::resolve_show_target(&conf.models, spec).is_err()
     {
-        let partial = workers::fetch::open(&conf.models, spec)
+        let reach = workers_reach(conf.workers.as_ref().expect("a [workers] section"))?;
+        let partial = workers::fetch::open(&conf.models, spec, &reach)
             .with_context(|| format!("fetching '{spec}' in part ([workers].download = range)"))?;
         let path = partial.path().to_path_buf();
         workers::fetch::set(partial);
@@ -3260,6 +3261,14 @@ fn prepare(args: Args) -> Result<Prepared> {
                 // A picture or video model's text encoder is not split:
                 // such a node serves only as a worker.
                 image.is_none() && video.is_none(),
+                // The file it runs, for nodes of its channel that fetch the
+                // model in part: not a picture or video model's encoder.
+                match &weights_source {
+                    ModelSource::File(path) if image.is_none() && video.is_none() => {
+                        Some(path.as_path())
+                    }
+                    _ => None,
+                },
             )?;
             workers::node::set_global(node.clone());
             match node.delegating_model() {
@@ -4751,6 +4760,31 @@ fn workers_scan(workers_conf: &config::WorkersConfiguration) -> Result<workers::
     })
 }
 
+/// TLS for `[workers]`, when configured.
+fn workers_tls(
+    workers_conf: &config::WorkersConfiguration,
+) -> Result<Option<workers::transport::Tls>> {
+    workers::transport::Tls::from_paths(
+        workers_conf
+            .tls
+            .as_ref()
+            .map(|(cert, key)| (cert.as_path(), key.as_path())),
+        workers_conf.tls_ca.as_deref(),
+    )
+    .context("setting up TLS for [workers]")
+}
+
+/// How a node fetching its model in part reaches its channel before its
+/// node starts: as the node will.
+fn workers_reach(workers_conf: &config::WorkersConfiguration) -> Result<workers::fetch::Reach> {
+    Ok(workers::fetch::Reach {
+        channel: workers_conf.name.clone(),
+        secret: workers_conf.secret.clone(),
+        tls: workers_tls(workers_conf)?,
+        scan: workers_scan(workers_conf)?,
+    })
+}
+
 /// This node's memory budget for weights, capped by
 /// `ORANGU_WORKERS_BUDGET_MIB` when set — to have a node that could hold a
 /// model behave as one that cannot.
@@ -4787,6 +4821,7 @@ fn start_workers_node(
     metrics_port: u16,
     (api_port, api_tls): (u16, bool),
     split: bool,
+    serve_file: Option<&Path>,
 ) -> Result<Arc<workers::node::Node>> {
     let host = config::resolve_bind_host(&workers_conf.host);
     if workers_conf.secret.is_none()
@@ -4872,17 +4907,11 @@ fn start_workers_node(
         maintenance: std::time::Duration::from_secs(5),
         parent_silence: workers::node::PARENT_SILENCE,
         readmit: std::time::Duration::from_secs(30),
-        tls: workers::transport::Tls::from_paths(
-            workers_conf
-                .tls
-                .as_ref()
-                .map(|(cert, key)| (cert.as_path(), key.as_path())),
-            workers_conf.tls_ca.as_deref(),
-        )
-        .context("setting up TLS for [workers]")?,
+        tls: workers_tls(workers_conf)?,
         metrics_endpoint,
         prompt_weights,
         prefix_root: home::home_dir().map(|home| home.join(".orangu/server")),
+        serve_file: serve_file.map(Path::to_path_buf),
     };
     let held = workers::clock::start();
     if held > 0 {

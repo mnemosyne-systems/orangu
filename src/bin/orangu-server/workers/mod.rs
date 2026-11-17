@@ -31,6 +31,8 @@
 //! - [`load`]: how busy a node is, for routing requests and sizing shares.
 //! - [`clock`]: keeping a node's cores at full clock while a request runs.
 //! - [`transport`]: plain TCP or TLS between nodes.
+//! - [`fetch`]: a node that downloads only what it runs; [`share`]: byte
+//!   ranges of a node's model file, served to such a node.
 
 pub mod auth;
 pub mod channel;
@@ -48,6 +50,7 @@ pub mod prefixes;
 pub mod protocol;
 pub mod room;
 pub mod session;
+pub mod share;
 pub mod speed;
 pub mod stage;
 pub mod transport;

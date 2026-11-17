@@ -95,8 +95,19 @@ pub const FEATURE_RETAIN: u64 = 256;
 /// holds.
 pub const FEATURE_PREFIXES: u64 = 512;
 
+/// This node serves byte ranges of its model file ([`Message::FetchHello`],
+/// [`Message::FetchRange`]) to a node of `[workers].download = range`: it
+/// holds the whole file, a single one. Advertised per node, in a
+/// [`Message::ProbeAck`] and a [`Message::FetchAck`], not in [`FEATURES`]; a
+/// node that did not advertise it is never asked for bytes.
+pub const FEATURE_FETCH: u64 = 1024;
+
+/// The most bytes one [`Message::FetchRange`] may ask for: a larger range
+/// is asked for in pieces.
+pub const MAX_FETCH_BYTES: u64 = 8 << 20;
+
 /// Every extension bit, each a distinct power of two.
-const ALL_FEATURES: [u64; 8] = [
+const ALL_FEATURES: [u64; 9] = [
     FEATURE_FORK,
     FEATURE_HEAD,
     FEATURE_ECHO,
@@ -105,6 +116,7 @@ const ALL_FEATURES: [u64; 8] = [
     FEATURE_METRICS,
     FEATURE_RETAIN,
     FEATURE_PREFIXES,
+    FEATURE_FETCH,
 ];
 
 const _: () = {
@@ -136,6 +148,7 @@ pub fn feature_names(features: u64) -> Vec<&'static str> {
         (FEATURE_METRICS, "metrics"),
         (FEATURE_RETAIN, "retain"),
         (FEATURE_PREFIXES, "prefixes"),
+        (FEATURE_FETCH, "fetch"),
     ]
     .into_iter()
     .filter(|(bit, _)| features & bit != 0)
@@ -864,6 +877,47 @@ pub enum Message {
         /// request names.
         label: String,
         quant: String,
+        /// The extensions it serves to any node of the channel, not only
+        /// its parent: [`FEATURE_FETCH`]. Appended; `0` from a node that
+        /// does not send it.
+        features: u64,
+    },
+    /// Sent instead of `Hello` by a node that fetches a model in part
+    /// (`[workers].download = range`) from a node holding the whole file.
+    /// Authenticated as a parent is ([`super::auth`]): answered with
+    /// [`Message::FetchAck`] and its proof, then the fetcher's
+    /// [`Message::Auth`] is answered with [`Message::Ready`], after which
+    /// the connection carries [`Message::FetchRange`]s. A node that serves
+    /// no file answers with an error, and an older one closes the
+    /// connection.
+    FetchHello {
+        nonce: [u8; 32],
+    },
+    FetchAck {
+        /// The serving node's [`FEATURE_FETCH`], and anything else it
+        /// serves a fetcher.
+        features: u64,
+        nonce: [u8; 32],
+        proof: [u8; 32],
+        /// [`ModelIdentity::header_hash`] of the file it serves, which its
+        /// probe answer names too.
+        model: [u8; 32],
+        /// The file: its size, its name, and the snapshot (Hub commit) its
+        /// directory is named after, empty when it is in none.
+        size: u64,
+        file: String,
+        commit: String,
+    },
+    /// Bytes `offset..offset + len` of the served file, `len` at most
+    /// [`MAX_FETCH_BYTES`]. Answered with [`Message::FetchData`], or an
+    /// error for a range outside the file.
+    FetchRange {
+        offset: u64,
+        len: u64,
+    },
+    FetchData {
+        offset: u64,
+        data: Vec<u8>,
     },
     /// Sent instead of `Hello` by a node about to claim workers on the
     /// channel that hashes to `channel`: asks the listener to promise
@@ -961,6 +1015,10 @@ mod tag {
     pub const SAVE: u8 = 28;
     pub const LOAD: u8 = 29;
     pub const FORGET: u8 = 30;
+    pub const FETCH_HELLO: u8 = 31;
+    pub const FETCH_ACK: u8 = 32;
+    pub const FETCH_RANGE: u8 = 33;
+    pub const FETCH_DATA: u8 = 34;
 }
 
 struct Writer(Vec<u8>);
@@ -1426,6 +1484,7 @@ impl Message {
                 workers,
                 label,
                 quant,
+                features,
             } => {
                 w.string(node);
                 w.string(name);
@@ -1439,7 +1498,40 @@ impl Message {
                 w.u32(*workers);
                 w.string(label);
                 w.string(quant);
+                w.u64(*features);
                 tag::PROBE_ACK
+            }
+            Self::FetchHello { nonce } => {
+                w.fixed(nonce);
+                tag::FETCH_HELLO
+            }
+            Self::FetchAck {
+                features,
+                nonce,
+                proof,
+                model,
+                size,
+                file,
+                commit,
+            } => {
+                w.u64(*features);
+                w.fixed(nonce);
+                w.fixed(proof);
+                w.fixed(model);
+                w.u64(*size);
+                w.string(file);
+                w.string(commit);
+                tag::FETCH_ACK
+            }
+            Self::FetchRange { offset, len } => {
+                w.u64(*offset);
+                w.u64(*len);
+                tag::FETCH_RANGE
+            }
+            Self::FetchData { offset, data } => {
+                w.u64(*offset);
+                w.bytes(data);
+                tag::FETCH_DATA
             }
             Self::Lease { channel, node } => {
                 w.fixed(channel);
@@ -1629,6 +1721,25 @@ impl Message {
                 } else {
                     r.string()?
                 },
+                features: if r.0.is_empty() { 0 } else { r.u64()? },
+            },
+            tag::FETCH_HELLO => Self::FetchHello { nonce: r.fixed()? },
+            tag::FETCH_ACK => Self::FetchAck {
+                features: r.u64()?,
+                nonce: r.fixed()?,
+                proof: r.fixed()?,
+                model: r.fixed()?,
+                size: r.u64()?,
+                file: r.string()?,
+                commit: r.string()?,
+            },
+            tag::FETCH_RANGE => Self::FetchRange {
+                offset: r.u64()?,
+                len: r.u64()?,
+            },
+            tag::FETCH_DATA => Self::FetchData {
+                offset: r.u64()?,
+                data: r.bytes()?,
             },
             tag::LEASE => Self::Lease {
                 channel: r.fixed()?,
@@ -1748,6 +1859,41 @@ mod tests {
         assert!(ALL_FEATURES.contains(&FEATURE_PREFIXES));
         assert!(feature_names(FEATURES).contains(&"prefixes"));
         assert!(!feature_names(FEATURES & !FEATURE_PREFIXES).contains(&"prefixes"));
+        assert_eq!(FEATURE_FETCH, 1024);
+        assert!(ALL_FEATURES.contains(&FEATURE_FETCH));
+        assert!(feature_names(FEATURE_FETCH).contains(&"fetch"));
+        // Advertised per node, by a node that holds its whole file.
+        assert_eq!(FEATURES & FEATURE_FETCH, 0);
+    }
+
+    /// A probe answer from a node that does not send its features reads as
+    /// a node that serves no bytes.
+    #[test]
+    fn a_probe_ack_without_features_serves_nothing() {
+        let (tag, payload) = Message::ProbeAck {
+            node: "n".to_string(),
+            name: "n:8400".to_string(),
+            state: ProbeState::Idle,
+            load: 0.0,
+            whole: true,
+            api_port: 8100,
+            api_tls: false,
+            model: [1; 32],
+            content: [2; 32],
+            workers: 0,
+            label: "m".to_string(),
+            quant: "Q8_0".to_string(),
+            features: FEATURE_FETCH,
+        }
+        .encode();
+        let older = &payload[..payload.len() - 8];
+        let Message::ProbeAck {
+            features, label, ..
+        } = Message::decode(tag, older).unwrap()
+        else {
+            panic!("not a probe answer");
+        };
+        assert_eq!((features, label.as_str()), (0, "m"));
     }
 
     /// A parent that advertised both extensions under bit 64 still gets
@@ -1964,8 +2110,27 @@ mod tests {
                 workers: 3,
                 label: "unsloth/model-GGUF".to_string(),
                 quant: "Q4_K_M".to_string(),
+                features: FEATURE_FETCH,
             });
         }
+        round_trip(Message::FetchHello { nonce: [3; 32] });
+        round_trip(Message::FetchAck {
+            features: FEATURE_FETCH,
+            nonce: [4; 32],
+            proof: [5; 32],
+            model: [6; 32],
+            size: 1 << 33,
+            file: "model-Q4_K_M.gguf".to_string(),
+            commit: "0123abcd".to_string(),
+        });
+        round_trip(Message::FetchRange {
+            offset: 1 << 32,
+            len: MAX_FETCH_BYTES,
+        });
+        round_trip(Message::FetchData {
+            offset: 7,
+            data: vec![1, 2, 3],
+        });
         round_trip(Message::Lease {
             channel: [5; 32],
             node: "00aa".to_string(),
@@ -2038,10 +2203,12 @@ mod tests {
             workers: 7,
             label: String::new(),
             quant: String::new(),
+            features: 0,
         }
         .encode();
-        // The two empty names take eight bytes, the workers count four more.
-        let older = &payload[..payload.len() - 12];
+        // The two empty names take eight bytes, the workers count four
+        // more, the features eight.
+        let older = &payload[..payload.len() - 20];
         let Message::ProbeAck { workers, state, .. } = Message::decode(tag, older).unwrap() else {
             panic!("not a probe answer");
         };
@@ -2065,9 +2232,10 @@ mod tests {
             workers: 2,
             label: "m".to_string(),
             quant: "Q8_0".to_string(),
+            features: FEATURE_FETCH,
         }
         .encode();
-        let label_bytes = 4 + 1 + 4 + 4;
+        let label_bytes = 4 + 1 + 4 + 4 + 8;
         let older = &payload[..payload.len() - label_bytes];
         let Message::ProbeAck {
             workers,

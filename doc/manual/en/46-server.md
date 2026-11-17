@@ -2759,8 +2759,11 @@ key is refused at startup with a message pointing to `name`.
 - `download` — `full` (the default) or `range`. With `range`, on a node with
   no workers of its own and no copy of the model, the model is fetched in
   part: at start what building it reads, then the layers each assignment
-  hands it, into a sparse `<name>.gguf.partial`. Such a node serves only as
-  a worker. A model split in shards is refused.
+  hands it, into a sparse `<name>.gguf.partial`. The bytes come from the
+  nodes of its channel that hold the whole file — the node that claimed it
+  first — and from Hugging Face only when none of them can serve them, so a
+  channel without internet needs just one node with the model on disk.
+  Such a node serves only as a worker. A model split in shards is refused.
 - `shares` — what a node divides its layers by between itself and its
   workers: `decode` (the default), `prompt` or `memory`. With `decode` or
   `prompt`, each node times the model's first layers at start, on the

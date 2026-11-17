@@ -152,6 +152,10 @@ pub struct Found {
     /// quantization; empty from a node that does not say.
     pub label: String,
     pub quant: String,
+    /// The extensions it serves any node of the channel
+    /// ([`super::protocol::FEATURE_FETCH`]); `0` from a node that does not
+    /// say.
+    pub features: u64,
     /// How long the probe took at `addr`, dialing included.
     pub rtt: Duration,
     /// Its other addresses on this machine's networks, where it answered
@@ -383,6 +387,7 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             workers,
             label,
             quant,
+            features,
         } => Some(Found {
             addr: shown,
             node,
@@ -400,6 +405,7 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             workers,
             label,
             quant,
+            features,
             rtt: started.elapsed(),
             alternates: Vec::new(),
         }),
@@ -555,6 +561,7 @@ mod tests {
             workers: 0,
             label: String::new(),
             quant: String::new(),
+            features: 0,
             rtt: Duration::from_millis(rtt_ms),
             alternates: Vec::new(),
         }
@@ -650,6 +657,7 @@ mod tests {
                             workers: 0,
                             label: "unsloth/model-GGUF".to_string(),
                             quant: "Q4_K_M".to_string(),
+                            features: 0,
                         },
                     );
                 }
