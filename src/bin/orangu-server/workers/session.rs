@@ -327,14 +327,9 @@ impl SessionStore {
                 )
             })?
         };
-        let source = source.lock().unwrap();
-        // Rows only the device holds (a fused decode's) cannot be copied.
+        let mut source = source.lock().unwrap();
+        let held = self.host_rows(&mut source.cache);
         let local = &source.cache;
-        let held = if local.layers.iter().all(|l| l.len == 0) {
-            local.committed_len()
-        } else {
-            local.host_committed_len()
-        };
         if len > held || len > self.capacity {
             return Err(self.error(
                 ErrorCode::PositionMismatch,
@@ -358,6 +353,19 @@ impl SessionStore {
         }));
         self.sessions.lock().unwrap().insert(to, entry);
         Ok(())
+    }
+
+    /// The positions `cache` holds on the host, where a copy or a file is
+    /// made from: a decode on the device keeps its rows there, so they are
+    /// read back first.
+    fn host_rows(&self, cache: &mut KvCache) -> usize {
+        if cache.layers.iter().all(|l| l.len == 0) {
+            return cache.committed_len();
+        }
+        if let Some(vulkan) = self.pipeline.model().vulkan_backend() {
+            cache.pull_decoded_rows(vulkan);
+        }
+        cache.host_committed_len()
     }
 
     /// Frees `session` here and, through its cache, on every worker below.
@@ -402,13 +410,9 @@ impl SessionStore {
             ));
         };
         let has_below = {
-            let state = entry.lock().unwrap();
+            let mut state = entry.lock().unwrap();
+            let held = self.host_rows(&mut state.cache);
             let cache = &state.cache;
-            let held = if cache.layers.iter().all(|l| l.len == 0) {
-                cache.committed_len()
-            } else {
-                cache.host_committed_len()
-            };
             files
                 .write(
                     key,

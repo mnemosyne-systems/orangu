@@ -1123,13 +1123,28 @@ impl RemoteLayers for SessionOwner {
     /// of the workers at all when the pool already holds as many sessions as
     /// one of them said it keeps: it would be refused.
     fn fork_new(&self, from: u64, len: usize) -> Option<u64> {
-        if self.held.lock().unwrap().len() >= self.pipeline.pool_reserve() {
+        let (held, reserve) = (
+            self.held.lock().unwrap().len(),
+            self.pipeline.pool_reserve(),
+        );
+        if held >= reserve {
+            log::info!(
+                "orangu-server: workers: the prefix pool keeps no copy: the workers keep {reserve} \
+                 sessions for it, and {held} are held"
+            );
             return None;
         }
         let to = self.next_session.fetch_add(1, Ordering::Relaxed);
         {
             let mut sessions = self.sessions.lock().unwrap();
-            let source = sessions.get(&from).filter(|s| s.tokens.len() >= len)?;
+            let Some(source) = sessions.get(&from).filter(|s| s.tokens.len() >= len) else {
+                log::info!(
+                    "orangu-server: workers: the prefix pool keeps no copy: session {from} holds {} \
+                     of the {len} positions",
+                    sessions.get(&from).map_or(0, |s| s.tokens.len())
+                );
+                return None;
+            };
             let state = SessionState {
                 generation: source.generation,
                 tokens: source.tokens[..len].to_vec(),
@@ -1141,7 +1156,7 @@ impl RemoteLayers for SessionOwner {
             sessions.insert(to, state);
         }
         if let Err(error) = self.pipeline.fork(from, to, len) {
-            log::debug!("orangu-server: workers: no copy of session {from}: {error:#}");
+            log::info!("orangu-server: workers: the prefix pool keeps no copy: {error:#}");
             self.sessions.lock().unwrap().remove(&to);
             self.pipeline.release(to);
             return None;

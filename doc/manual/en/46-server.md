@@ -2648,10 +2648,9 @@ port = 8300
 
 Lets the `orangu-server` nodes of one network serve as one. Nodes with
 the same `name` — a channel — find each other by scanning their networks
-on the same `port`. A request that runs the model goes to the least busy
-node that holds the model alone; a model no node holds alone is split: the
-node a request reaches claims the free nodes of its channel, runs a
-contiguous range of the layers and hands the rest to them. It tokenizes,
+on the same `port`. The model is divided over every free node, whatever
+its size: the node a request reaches claims the free nodes of its channel,
+runs a contiguous range of the layers and hands the rest to them. It tokenizes,
 samples and streams; the hidden states travel to each worker and back for
 every prefill chunk and every generated token.
 
@@ -2813,10 +2812,9 @@ key is refused at startup with a message pointing to `name`.
 
 **When a worker is lost.**
 
-- A standby takes its place: when claiming, a node holds back as a standby
-  the node with the most memory that the model does not need, and that node
-  takes a lost worker's layers in place, mid-answer. With no standby held,
-  the next plan gives the layers to a free node of the channel, if any.
+- A free node takes its place: the next plan gives the lost worker's layers
+  to a free node of the channel, if any — every free node takes a share when
+  the tree forms, so this is one that joined since or was too busy to claim.
 - Otherwise a request in flight is still not lost with it. The top-level node plans again
   over the workers that answer, rebuilds the sequence on
   the new plan by running its tokens through again, and carries on. Tokens

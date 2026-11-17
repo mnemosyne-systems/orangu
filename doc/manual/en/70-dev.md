@@ -42,7 +42,8 @@ on one machine — each on the CPU, with its own API port and
 checks what clients get while a node is killed (`SIGKILL`), frozen
 (`SIGSTOP`), or cut off by a proxy between two nodes. The scenarios:
 
-- a busy node routes a request to an idle one (`x-orangu-routed-to`);
+- a model every node holds is divided over all three, and a worker's own
+  client is sent on to the lead (`x-orangu-routed-to`);
 - a model no node holds alone (`ORANGU_WORKERS_BUDGET_MIB`) is split over
   three nodes, a worker's own client is sent on to the node that claimed
   it, and the workers are let go after `release`;
@@ -52,8 +53,6 @@ checks what clients get while a node is killed (`SIGKILL`), frozen
   the other sends its request there, and both answer;
 - a leader frozen between requests is let go by its workers through the
   channel, within 40 seconds, and the nodes left answer again;
-- of two free nodes the model needs one: the other stands by, and takes the
-  worker's place when it is killed mid-answer;
 - two prompts sharing a long prefix on a split model: the second reuses the
   prefix from the lead's pool, its workers' rows kept on the workers;
 - a prefix in the lead's pool survives `release`: saved on every node as the

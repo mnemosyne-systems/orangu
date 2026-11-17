@@ -6,12 +6,14 @@ Several machines on one network can serve as one. Give each
 `orangu-server` the same `[workers].name` — a **channel** — and they find
 each other on their own, then share the work two ways:
 
-- A request goes to the **least busy machine that holds the model**. Each
-  node reports how busy it is, from `0.0` (idle) to `1.0` (fully busy),
-  and a busy node hands a request to a less busy one.
-- A model **too large for any one machine** is split over several. The
+- The model is **divided over every free machine**, whatever its size. The
   node a request reaches claims the free nodes of its channel as its
-  workers: it runs some of the model's layers and hands the rest to them.
+  workers: it runs some of the model's layers and hands the rest to them,
+  each node's share sized by its speed and memory.
+- A request reaching a node that works for another is sent on to that
+  node. Each node reports how busy it is, from `0.0` (idle) to `1.0`
+  (fully busy); with no node free, a busy node that holds the model hands
+  a request to a less busy one.
   For every prompt chunk and every generated token, the hidden states
   travel to each worker and back, and the node that claimed them — the
   top-level node — samples, checks stop conditions and streams the reply,
@@ -424,20 +426,15 @@ is out a node pings the worker below it. A worker that says nothing for 15
 seconds counts as lost. A worker that is only slow goes on answering, and has
 until `timeout` for a decode step, and longer for a prompt's forward.
 
-**A standby takes a lost worker's place.** When a node claims its channel
-and the model fits without one of the nodes it found — the one with the most
-memory that this node and the others can do without — that node stands by
-instead of taking layers. It is held like a worker, so no other node claims
-it, and it serves its own API meanwhile. When a worker is lost mid-answer, the
-standby takes the same layers, is brought up to date with the conversation's
-rows, and the answer goes on with every other node keeping its share. With no
-standby held, the plan made after the loss gives the lost worker's layers to
-a free node of the channel when there is one, rather than spreading them over
-the nodes left. Either way the log says so (`… stands by …`, `claiming … to
-stand in for a lost worker`), and `/v1/workers` lists the standby under
-`standby`, with the worker it stands in for.
+**A free node takes a lost worker's place.** Every free node takes a share
+when the tree forms, so none waits in reserve. When a worker is lost, the
+plan made after the loss gives its layers to a free node of the channel when
+there is one — a node that joined since, or was too busy to claim — rather
+than spreading them over the nodes left. The log says so (`claiming … to
+stand in for a lost worker`), and `/v1/workers` lists it under `standby`,
+with the worker it stands in for.
 
-Without a standby, a request in flight is still not lost with a worker. The
+With no free node, a request in flight is still not lost with a worker. The
 top-level node plans again over the workers that still answer, rebuilds the conversation on the
 new plan by running its tokens through again, and carries on. Tokens
 already sent stay sent. The rebuilt cache comes from one prefill rather

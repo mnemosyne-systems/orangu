@@ -885,13 +885,15 @@ impl Node {
     }
 
     /// Where a request this node got is served instead ([`route`]). A node
-    /// working for a parent sends its clients to that parent. A node that
-    /// serves the model alone keeps a request unless a free node that can
-    /// serve it too is [`ROUTE_MARGIN`] less busy. One that cannot sends it
-    /// to the least busy free node that can; else to a node that leads a
-    /// tree of the model and is not fully busy; else it splits the model
-    /// over its channel, unless another node about to do the same wins
-    /// the free nodes ([`Self::contend`]), and then sends it there.
+    /// working for a parent sends its clients to that parent; a node that
+    /// leads keeps them. Otherwise a request goes to a node that leads a
+    /// tree of the model and is not fully busy; else this node divides the
+    /// model over the free nodes of its channel, whatever the model's size,
+    /// unless another node about to do the same wins them
+    /// ([`Self::contend`]), and then it goes there. With no one free, a
+    /// node that holds the model keeps a request unless a node that can
+    /// serve it too is [`ROUTE_MARGIN`] less busy; one that does not sends
+    /// it to the least busy that can.
     fn route(&self) -> Option<String> {
         self.settings.channel.as_ref()?;
         let found = self.found.lock().unwrap().0.clone();
@@ -900,20 +902,7 @@ impl Node {
             return found.into_iter().find(|f| f.node == parent).map(|f| f.api);
         }
         let api_of = |node: &str| found.iter().find(|f| f.node == node).map(|f| f.api.clone());
-        let best = found
-            .iter()
-            .filter(|f| {
-                f.whole
-                    && f.state == ProbeState::Idle
-                    && f.node != self.id
-                    && self.same_model(f, true)
-            })
-            .min_by(|a, b| a.load.total_cmp(&b.load));
-        if let Some(best) = best {
-            return (!self.whole() || best.load + ROUTE_MARGIN < self.load())
-                .then(|| best.api.clone());
-        }
-        if self.whole() || self.leading.load(Ordering::Acquire) {
+        if self.leading.load(Ordering::Acquire) {
             return None;
         }
         let leader = found
@@ -928,13 +917,22 @@ impl Node {
         if let Some(leader) = leader {
             return Some(leader.api.clone());
         }
-        if !self.may_claim() {
-            return None;
+        if self.may_claim() {
+            return match self.contend() {
+                Contest::Won => None,
+                Contest::Lost(winner) => api_of(&winner),
+            };
         }
-        match self.contend() {
-            Contest::Won => None,
-            Contest::Lost(winner) => api_of(&winner),
-        }
+        let best = found
+            .iter()
+            .filter(|f| {
+                f.whole
+                    && f.state == ProbeState::Idle
+                    && f.node != self.id
+                    && self.same_model(f, true)
+            })
+            .min_by(|a, b| a.load.total_cmp(&b.load))?;
+        (!self.whole() || best.load + ROUTE_MARGIN < self.load()).then(|| best.api.clone())
     }
 
     /// How many workers this node holds while it leads, its standby
@@ -1063,11 +1061,11 @@ impl Node {
     }
 
     /// Whether a request starting now may claim workers: this node can
-    /// lead but not serve the model alone, serves its own clients, and its
-    /// last scan found someone free that it does not hold yet.
+    /// lead, serves its own clients, and its last scan found someone free
+    /// that it does not hold yet. A model this node could hold alone is
+    /// divided too: every free node takes a share.
     fn may_claim(&self) -> bool {
         self.can_lead()
-            && !self.fits_alone
             && !self.is_assigned()
             && !self.alone.load(Ordering::Acquire)
             && !self.unclaimed().is_empty()
@@ -1243,7 +1241,6 @@ impl Node {
                 .name("orangu-workers-ping".to_string())
                 .spawn(move || node.ping_worker(&link));
         }
-        self.keep_a_standby(offered.as_ref());
         self.plan_top_locked();
         // Nobody answered the handshake: another node has them, or they
         // went away. They are dropped, and found again by a later scan.
@@ -1495,67 +1492,6 @@ impl Node {
             plan,
             entries: Vec::new(),
         });
-    }
-
-    /// Of the nodes this node claimed, holds back as a standby the one with
-    /// the most memory that the model does not need: this node and the
-    /// others hold every layer without it. A worker lost mid-request is
-    /// then replaced by it in place (`super::guard`), rather than its
-    /// layers spread over the others. One standby at a time; none when
-    /// every node is needed. A worker of `saved`'s split is kept out of
-    /// standby while another node will do, so the split can stand.
-    fn keep_a_standby(&self, saved: Option<&Manifest>) {
-        if self.settings.channel.is_none() || !self.standby_links().is_empty() {
-            return;
-        }
-        let links = self.links();
-        if links.len() < 2 {
-            return;
-        }
-        let secret = self.settings.secret.as_deref();
-        let path = std::slice::from_ref(&self.id);
-        let budgets: Vec<(Arc<ChildLink>, u64, bool, bool)> = links
-            .iter()
-            .filter_map(|link| {
-                let info = link.ensure_connected(secret, path).ok()?;
-                let same = info
-                    .model
-                    .as_ref()
-                    .is_none_or(|m| m.header_hash == self.identity.header_hash);
-                let name = info.capacity.setups.first().map(|s| s.name.as_str());
-                let in_saved = saved.is_some_and(|manifest| {
-                    manifest
-                        .workers
-                        .iter()
-                        .any(|w| Some(w.name.as_str()) == name)
-                });
-                Some((
-                    link.clone(),
-                    plan::subtree_budget(&info.capacity),
-                    same,
-                    in_saved,
-                ))
-            })
-            .collect();
-        let need = self.layer_bytes.iter().sum::<u64>() + self.non_layer_bytes;
-        let total = self.settings.capacity.budget_bytes
-            + budgets.iter().map(|(_, budget, _, _)| *budget).sum::<u64>();
-        let Some((link, _, _, _)) = budgets
-            .into_iter()
-            .filter(|(_, budget, same, _)| *same && total.saturating_sub(*budget) >= need)
-            .max_by_key(|(_, budget, _, in_saved)| (!*in_saved, *budget))
-        else {
-            return;
-        };
-        self.links
-            .write()
-            .unwrap()
-            .retain(|held| !Arc::ptr_eq(held, &link));
-        self.standby_links.write().unwrap().push(link.clone());
-        log::info!(
-            "orangu-server: workers: {} stands by, to take the layers of a worker that is lost",
-            link.addr
-        );
     }
 
     /// Claims a free node of the channel as a standby, for a worker that is
@@ -4221,36 +4157,33 @@ mod tests {
         assert!(!beta.is_assigned() && !gamma.is_assigned());
     }
 
-    /// Of two free nodes that each hold the model, one is enough: the other
-    /// stands by, and takes the first one's layers in place when it is lost.
+    /// A model the node with the request could hold alone is divided all
+    /// the same: every free node of the channel takes a share, none is held
+    /// back, and the answer is the unsplit model's.
     #[test]
-    fn a_claimed_node_the_model_does_not_need_stands_by() {
+    fn every_free_node_takes_a_share_of_a_model_that_fits_alone() {
         let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
         let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
         let alpha = node_with(
-            on_channel("alpha", "lab", &[&beta, &gamma], false),
+            on_channel("alpha", "lab", &[&beta, &gamma], true),
             Variant::default(),
         );
+        assert!(alpha.whole());
         found(&alpha, 2);
+        assert_eq!(alpha.route(), None, "the node with the request leads");
         let request = alpha.start_request();
-        assert_eq!(alpha.links().len(), 1);
-        assert_eq!(alpha.standby_links().len(), 1);
-        assert_eq!(alpha.workers_held(), 2);
-        let (worker, standby) = if beta.is_assigned() {
-            (&beta, &gamma)
-        } else {
-            (&gamma, &beta)
-        };
-        assert!(worker.is_assigned());
-        assert!(!standby.is_assigned(), "a standby waits");
-        assert_eq!(probe_of(standby, "lab").unwrap().state, ProbeState::Serving);
+        assert_eq!(alpha.links().len(), 2);
+        assert!(alpha.standby_links().is_empty());
+        assert!(beta.is_assigned() && gamma.is_assigned());
+        let plan = alpha.plan();
+        assert_eq!(plan.len(), 3, "{plan:?}");
+        assert!(plan.iter().all(|e| e.layer_end > e.layer_start), "{plan:?}");
 
         let tokens = fixture::tokens();
         let whole = run(fixture::model().as_ref(), &tokens, 5);
         let split = alpha.delegating_model().unwrap();
         let mut cache = split.new_kv_cache(N_CTX);
         split.forward(&mut cache, &tokens[..5], 0, 0).unwrap();
-        worker.stop();
         let mut worst = 0f32;
         for (pos, token) in tokens.iter().enumerate().skip(5) {
             let got = split.forward(&mut cache, &[*token], pos, 0).unwrap();
@@ -4259,32 +4192,11 @@ mod tests {
             }
         }
         assert!(worst < 1e-3, "{worst}");
-        assert!(standby.is_assigned());
-        assert_eq!(alpha.metrics.takeovers.load(Ordering::Relaxed), 1);
-        assert_eq!(alpha.metrics.recoveries.load(Ordering::Relaxed), 0);
         drop(cache);
         drop(request);
         for n in [&alpha, &beta, &gamma] {
             n.stop();
         }
-    }
-
-    /// A node needed for memory is not held back: with one free node, there
-    /// is no standby.
-    #[test]
-    fn a_node_the_model_needs_does_not_stand_by() {
-        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
-        let alpha = node_with(
-            on_channel("alpha", "lab", &[&beta], false),
-            Variant::default(),
-        );
-        found(&alpha, 1);
-        let _request = alpha.start_request();
-        assert_eq!(alpha.links().len(), 1);
-        assert!(alpha.standby_links().is_empty());
-        assert!(beta.is_assigned());
-        alpha.stop();
-        beta.stop();
     }
 
     /// With no standby held, a worker lost mid-sequence is replaced by a
@@ -4457,11 +4369,11 @@ mod tests {
             assert_eq!(free.lease_holder().as_deref(), Some(low.id.as_str()));
         }
         assert_eq!(high.contend(), Contest::Lost(low.id.clone()));
-        // The winner holds both, one as a worker and one standing by; the
-        // loser's handshakes would be refused.
+        // The winner holds both as workers; the loser's handshakes would be
+        // refused.
         let _request = low.start_request();
         assert_eq!(low.workers_held(), 2);
-        assert!(beta.is_assigned() != gamma.is_assigned());
+        assert!(beta.is_assigned() && gamma.is_assigned());
         for free in [&beta, &gamma] {
             assert_eq!(probe_of(free, "lab").unwrap().state, ProbeState::Serving);
         }
@@ -4528,47 +4440,31 @@ mod tests {
         assert!(alpha.leading.load(Ordering::Acquire));
     }
 
-    /// A node that holds the model never claims workers: it routes instead.
+    /// A node that cannot divide the model (`split` off) sends a request
+    /// to the least busy free node that holds it; one that can keeps the
+    /// request and divides the model over the free nodes.
     #[test]
-    fn a_node_that_holds_the_model_does_not_claim() {
-        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
-        let alpha = node_with(
-            on_channel("alpha", "lab", &[&beta], true),
-            Variant::default(),
-        );
+    fn a_node_that_cannot_divide_routes_to_one_that_holds_the_model() {
+        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
+        let mut s = on_channel("alpha", "lab", &[&gamma], true);
+        s.split = false;
+        let alpha = node_with(s, Variant::default());
         found(&alpha, 1);
         assert!(!alpha.may_claim());
-        let _request = alpha.start_request();
-        assert!(!beta.is_assigned());
-        assert!(alpha.links().is_empty());
-    }
+        assert_eq!(alpha.route().as_deref(), Some("http://127.0.0.1:0"));
+        // A request already routed once stays.
+        assert!(route(true).is_none());
 
-    /// A busy node that holds the model sends a request to a less busy one
-    /// that holds it too; a node that does not hold the model sends it to
-    /// whichever free node does.
-    #[test]
-    fn a_request_goes_to_the_least_busy_node_that_holds_the_model() {
-        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
         let beta = node_with(
             on_channel("beta", "lab", &[&gamma], true),
             Variant::default(),
         );
         found(&beta, 1);
-        // Equally idle: served here.
+        assert!(beta.may_claim());
         assert_eq!(beta.route(), None);
-        // Busy: both slots in use.
-        beta.active.store(2, Ordering::Release);
-        assert_eq!(beta.route().as_deref(), Some("http://127.0.0.1:0"));
-        beta.active.store(0, Ordering::Release);
-
-        let alpha = node_with(
-            on_channel("alpha", "lab", &[&gamma], false),
-            Variant::default(),
-        );
-        found(&alpha, 1);
-        assert_eq!(alpha.route().as_deref(), Some("http://127.0.0.1:0"));
-        // A request already routed once stays.
-        assert!(route(true).is_none());
+        let _request = beta.start_request();
+        assert!(gamma.is_assigned());
+        assert_eq!(beta.links().len(), 1);
     }
 
     /// Nodes cooperate only on the same model: one with another
