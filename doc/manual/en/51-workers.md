@@ -18,6 +18,9 @@ each other on their own, then share the work two ways:
   travel to each worker and back, and the node that claimed them — the
   top-level node — samples, checks stop conditions and streams the reply,
   exactly as a single server does.
+- A channel can serve **several models**. Nodes work together only on the
+  same model; a request whose `model` field names another model that a node
+  of the channel serves is sent to that node.
 
 This chapter is the practical side: setting up a channel, securing it, and
 watching it. The *Inference server* chapter's **The `[workers]` section**
@@ -112,13 +115,14 @@ that one answers at least twice as fast, or when its own stops answering;
 a worker whose link went down is then claimed again at the address that
 answers.
 
-**Every node of a channel needs the same model.** A probe's answer names
+**Nodes work together only on the same model.** A probe's answer names
 the model a node serves — its layout and quantization, and samples of every
 layer's weights — and a node works only with nodes of its own model: a
 request is routed only to a node whose model matches in both, and only a
 node with the same layout is claimed as a worker, its weights compared
-layer by layer when it is. A node with another model stays on the channel
-unused, and the log and `/v1/workers` (`same_model`) say so:
+layer by layer when it is. A node with another model is never claimed, and
+the log and `/v1/workers` (`same_model`) say so; it serves its own model,
+and the requests that name it (see **Several models on one channel**):
 
 ```text
 workers: channel 'lab' has delta:8400 (192.168.1.13:8400, idle, another model: not used)
@@ -296,6 +300,52 @@ While `beta` and `gamma` work for `alpha`, a request that runs the model
 and reaches one of them is sent on to `alpha`; everything else but
 `/health`, `/ready`, `/metrics` and `/v1/workers` answers `503`. When
 `alpha` lets them go, or goes away, they serve their own clients again.
+
+## Several models on one channel
+
+One channel can hold nodes with different models. Each node's answer to a
+probe carries its model's name as its `/v1/models` lists it, and its
+quantization; `/v1/workers` shows them under each found node as
+`model_name` and `model_quant`. A node learns what another serves only from
+that answer: a node that does not send a name is never chosen by one.
+
+Each model forms its own tree. A node divides its model over the free nodes
+with the same model only, and a node with another model is never claimed.
+
+A request's `model` field picks the model. When a request that runs the
+model names one that this node does not serve and another node of the
+channel does, it is sent there and its answer streamed back, with
+`x-orangu-routed-to` naming that node. A name matches a node's label in any
+case, with or without its `:QUANT` tag: `unsloth/gemma-4-E2B-it-GGUF`,
+`unsloth/gemma-4-e2b-it-gguf` and `unsloth/gemma-4-E2B-it-GGUF:Q4_K_M` all
+name a node serving that label at `Q4_K_M`. Of the nodes that serve it, the
+request goes to the least busy one leading a tree of it that is not fully
+busy, else the least busy free one, else the least busy of them. A node
+working for another, or one with only part of a model, is never chosen. The
+node it reaches serves it as it serves any request: it may route it on to a
+node of its model that holds it, or divide its model over the free nodes of
+its model.
+
+A request that names this node's own model, names none, or names a model no
+node of the channel serves is served as it would be without the field, so a
+client that sends any name, such as one of another provider's models, keeps
+working. A request is routed once at most.
+
+`GET /v1/models` lists this node's model first, then each other model the
+channel serves, once per name and quantization. Each of those has
+`owned_by: "orangu-server channel"`, its `quant`, and `served_by`, the
+`[workers]` names of the nodes serving it; its `id` is the name a request
+uses, with the quantization's tag. Only a node that holds a whole model and
+serves its own clients is listed, as the last scan found it.
+
+```text
+$ curl -s alpha:8100/v1/models | jq -r '.data[] | "\(.id)  \(.owned_by)"'
+unsloth/gemma-4-E2B-it-GGUF            orangu-server
+unsloth/Qwen3-8B-GGUF:Q4_K_M           orangu-server channel
+```
+
+A chat turn in the web console names no model: it is served by the
+console's own model, routed as described above.
 
 ## Checks a parent makes
 

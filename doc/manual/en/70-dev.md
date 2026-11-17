@@ -57,7 +57,13 @@ checks what clients get while a node is killed (`SIGKILL`), frozen
   prefix from the lead's pool, its workers' rows kept on the workers;
 - a prefix in the lead's pool survives `release`: saved on every node as the
   workers are let go, it is put back when the lead claims them again, and a
-  second prompt sharing it reports it as cached.
+  second prompt sharing it reports it as cached;
+- a channel with two models, two nodes on the first and one on the second:
+  each node's `/v1/models` lists the other model, a request naming a model
+  goes to a node serving it, a name no node serves stays where it was sent,
+  and the node with the second model is never claimed. It runs only when
+  `ORANGU_HARNESS_MODEL2` names the second model, in the same models
+  directory.
 
 They need a model, so they are ignored by default:
 

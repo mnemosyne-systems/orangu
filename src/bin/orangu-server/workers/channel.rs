@@ -148,6 +148,10 @@ pub struct Found {
     pub content: [u8; 32],
     /// How many workers it holds while it leads, `0` otherwise.
     pub workers: u32,
+    /// The model it serves by name, as its `/v1/models` lists it, and its
+    /// quantization; empty from a node that does not say.
+    pub label: String,
+    pub quant: String,
     /// How long the probe took at `addr`, dialing included.
     pub rtt: Duration,
     /// Its other addresses on this machine's networks, where it answered
@@ -193,7 +197,52 @@ pub fn one_per_node(found: Vec<Found>, previous: &[Found]) -> Vec<Found> {
     out
 }
 
+/// Whether a request's `model` field, `asked`, names the model served as
+/// `label` at `quant`: the label itself, or the label with or without its
+/// `:QUANT` tag, ignoring case. A model with no label is named by nothing,
+/// so a node that does not say what it serves is never chosen by name.
+pub fn names_model(asked: &str, label: &str, quant: &str) -> bool {
+    let asked = asked.trim();
+    if asked.is_empty() || label.is_empty() {
+        return false;
+    }
+    if asked.eq_ignore_ascii_case(label) {
+        return true;
+    }
+    if quant.is_empty() {
+        return false;
+    }
+    // The label without its tag, when it carries this quantization as one.
+    let bare = label
+        .len()
+        .checked_sub(quant.len() + 1)
+        .filter(|&cut| {
+            label.is_char_boundary(cut)
+                && label[cut..].starts_with(':')
+                && label[cut + 1..].eq_ignore_ascii_case(quant)
+        })
+        .map_or(label, |cut| &label[..cut]);
+    if asked.eq_ignore_ascii_case(bare) {
+        return true;
+    }
+    asked
+        .len()
+        .checked_sub(quant.len() + 1)
+        .filter(|&cut| asked.is_char_boundary(cut))
+        .is_some_and(|cut| {
+            asked[cut..].starts_with(':')
+                && asked[cut + 1..].eq_ignore_ascii_case(quant)
+                && asked[..cut].eq_ignore_ascii_case(bare)
+        })
+}
+
 impl Found {
+    /// Whether a request's `model` field names the model this node serves
+    /// ([`names_model`]).
+    pub fn serves_named(&self, asked: &str) -> bool {
+        names_model(asked, &self.label, &self.quant)
+    }
+
     /// Its API's base URL, `http://ip:port` or `https://ip:port`.
     fn api_url(ip: std::net::IpAddr, port: u16, tls: bool) -> String {
         let scheme = if tls { "https" } else { "http" };
@@ -332,6 +381,8 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             model,
             content,
             workers,
+            label,
+            quant,
         } => Some(Found {
             addr: shown,
             node,
@@ -347,6 +398,8 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             model,
             content,
             workers,
+            label,
+            quant,
             rtt: started.elapsed(),
             alternates: Vec::new(),
         }),
@@ -500,6 +553,8 @@ mod tests {
             model: [0; 32],
             content: [0; 32],
             workers: 0,
+            label: String::new(),
+            quant: String::new(),
             rtt: Duration::from_millis(rtt_ms),
             alternates: Vec::new(),
         }
@@ -593,6 +648,8 @@ mod tests {
                             model: [1; 32],
                             content: [2; 32],
                             workers: 0,
+                            label: "unsloth/model-GGUF".to_string(),
+                            quant: "Q4_K_M".to_string(),
                         },
                     );
                 }
@@ -611,7 +668,49 @@ mod tests {
         assert_eq!(found.load, 0.5);
         assert!(found.whole);
         assert_eq!(found.api, "http://127.0.0.1:8100");
+        assert_eq!(
+            (found.label.as_str(), found.quant.as_str()),
+            ("unsloth/model-GGUF", "Q4_K_M")
+        );
         assert!(probe(addr, &channel_hash("other", None), None).is_none());
+    }
+
+    /// A model is named by its label, with or without its quantization's
+    /// tag, in any case; anything else, and a node with no label, is not.
+    #[test]
+    fn a_model_is_named_by_its_label_with_or_without_its_tag() {
+        let (label, quant) = ("unsloth/gemma-4-E2B-it-GGUF", "Q4_K_M");
+        for asked in [
+            "unsloth/gemma-4-E2B-it-GGUF",
+            "UNSLOTH/gemma-4-e2b-it-gguf",
+            "unsloth/gemma-4-E2B-it-GGUF:Q4_K_M",
+            " unsloth/gemma-4-E2B-it-GGUF:q4_k_m ",
+        ] {
+            assert!(names_model(asked, label, quant), "{asked}");
+        }
+        for asked in [
+            "",
+            "gpt-4",
+            "unsloth/gemma-4-E2B-it-GGUF:Q8_0",
+            "unsloth/gemma-4-E2B-it",
+            "gemma-4-E2B-it-GGUF",
+        ] {
+            assert!(!names_model(asked, label, quant), "{asked}");
+        }
+        // A label that carries its tag is named without it too.
+        let tagged = "unsloth/gemma-4-E2B-it-GGUF:Q4_K_M";
+        assert!(names_model("unsloth/gemma-4-E2B-it-GGUF", tagged, quant));
+        assert!(names_model(tagged, tagged, quant));
+        assert!(!names_model(
+            "unsloth/gemma-4-E2B-it-GGUF:Q8_0",
+            tagged,
+            quant
+        ));
+        // Without a quantization only the label itself names it.
+        assert!(names_model("m", "m", ""));
+        assert!(!names_model("m:Q4_K_M", "m", ""));
+        // A node that does not say what it serves is named by nothing.
+        assert!(!names_model("m", "", "Q4_K_M"));
     }
 
     #[test]

@@ -469,6 +469,62 @@ pub async fn route_async(forwarded: bool) -> Option<String> {
         .flatten()
 }
 
+/// Whether a request's `model` field can send it to another node: this
+/// node's channel has a node serving another model by name. Only then is a
+/// request's body read before it is served.
+pub fn routes_by_model() -> bool {
+    NODE.get()
+        .is_some_and(|node| !node.other_models().is_empty())
+}
+
+/// Where a request whose `model` field is `asked` is served instead, as the
+/// base URL of another node's API: the request names a model this node does
+/// not serve and another node of its channel does
+/// ([`Node::route_by_model`]). `None` serves it as [`route`] decides.
+/// `forwarded`: the request was already routed once, and goes no further.
+pub fn route_by_model(asked: &str, forwarded: bool) -> Option<String> {
+    if forwarded {
+        return None;
+    }
+    NODE.get()?.route_by_model(asked)
+}
+
+/// A model another node of the channel serves, for `/v1/models`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelModel {
+    /// What a request names it by: its label, with its quantization's tag
+    /// when the label does not carry it.
+    pub id: String,
+    pub label: String,
+    pub quant: String,
+    /// The `[workers]` names of the nodes that serve it.
+    pub nodes: Vec<String>,
+}
+
+/// The models the other nodes of this node's channel serve, other than its
+/// own ([`Node::channel_models`]); empty without a channel.
+pub fn channel_models() -> Vec<ChannelModel> {
+    NODE.get()
+        .map_or_else(Vec::new, |node| node.channel_models())
+}
+
+/// A model's name with its quantization's tag: `label:quant`, or the label
+/// alone when it carries the tag already or there is none.
+fn model_id(label: &str, quant: &str) -> String {
+    let tagged = label
+        .len()
+        .checked_sub(quant.len() + 1)
+        .filter(|&cut| label.is_char_boundary(cut))
+        .is_some_and(|cut| {
+            label[cut..].starts_with(':') && label[cut + 1..].eq_ignore_ascii_case(quant)
+        });
+    if quant.is_empty() || tagged {
+        label.to_string()
+    } else {
+        format!("{label}:{quant}")
+    }
+}
+
 /// A request is starting: [`request_started`], on a blocking thread, since
 /// claiming workers can take a while.
 pub async fn request_started_async() -> Option<RequestGuard> {
@@ -933,6 +989,89 @@ impl Node {
             })
             .min_by(|a, b| a.load.total_cmp(&b.load))?;
         (!self.whole() || best.load + ROUTE_MARGIN < self.load()).then(|| best.api.clone())
+    }
+
+    /// Whether `asked`, a request's `model` field, names the model this node
+    /// serves ([`super::channel::names_model`]).
+    fn serves_named(&self, asked: &str) -> bool {
+        super::channel::names_model(asked, &self.settings.label, &self.settings.quant)
+    }
+
+    /// The nodes of the channel that serve another model under a name, as
+    /// the last scan found them: each holds the whole of it and serves its
+    /// own clients. A node working for another serves nobody's requests,
+    /// and one with part of a model serves none alone; a node that does not
+    /// say what it serves is never chosen by name. A node with this node's
+    /// own model is left to [`Self::route`], whatever it calls it.
+    fn other_models(&self) -> Vec<super::channel::Found> {
+        if self.settings.channel.is_none() {
+            return Vec::new();
+        }
+        self.found
+            .lock()
+            .unwrap()
+            .0
+            .iter()
+            .filter(|f| {
+                f.node != self.id
+                    && !f.label.is_empty()
+                    && f.content != [0; 32]
+                    && matches!(f.state, ProbeState::Idle | ProbeState::Leading)
+                    && !self.same_model(f, true)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Where a request whose `model` field is `asked` is served instead
+    /// ([`route_by_model`]), when it names a model this node does not serve
+    /// and another node of the channel does: the least busy of those that
+    /// lead a tree of it and are not fully busy, else the least busy free
+    /// one, else the least busy of all. `None` when it names this node's
+    /// model, or one no node of the channel serves: the request is served
+    /// as any other is.
+    fn route_by_model(&self, asked: &str) -> Option<String> {
+        if self.serves_named(asked) {
+            return None;
+        }
+        let preference = |f: &super::channel::Found| match f.state {
+            ProbeState::Leading if f.load < 1.0 => 0,
+            ProbeState::Idle => 1,
+            _ => 2,
+        };
+        self.other_models()
+            .into_iter()
+            .filter(|f| f.serves_named(asked))
+            .min_by(|a, b| {
+                preference(a)
+                    .cmp(&preference(b))
+                    .then_with(|| a.load.total_cmp(&b.load))
+            })
+            .map(|f| f.api)
+    }
+
+    /// The other models the channel serves ([`channel_models`]), one entry
+    /// per name and quantization, in the order the scan found them. A name
+    /// a request would find this node's own model by is left out: such a
+    /// request is served here.
+    fn channel_models(&self) -> Vec<ChannelModel> {
+        let mut out: Vec<ChannelModel> = Vec::new();
+        for f in self.other_models() {
+            let id = model_id(&f.label, &f.quant);
+            if self.serves_named(&id) {
+                continue;
+            }
+            match out.iter_mut().find(|m| m.id.eq_ignore_ascii_case(&id)) {
+                Some(model) => model.nodes.push(f.name),
+                None => out.push(ChannelModel {
+                    id,
+                    label: f.label,
+                    quant: f.quant,
+                    nodes: vec![f.name],
+                }),
+            }
+        }
+        out
     }
 
     /// How many workers this node holds while it leads, its standby
@@ -1996,6 +2135,10 @@ impl Node {
                         "load": f.load,
                         "holds_model": f.whole,
                         "same_model": self.same_model(f, false),
+                        // The model it serves by name, as a request names
+                        // it; empty from a node that does not say.
+                        "model_name": f.label,
+                        "model_quant": f.quant,
                         "api": f.api,
                     })
                 })
@@ -3467,6 +3610,8 @@ impl Node {
                             model: self.identity.header_hash,
                             content: self.content_hash,
                             workers: self.workers_held(),
+                            label: self.settings.label.clone(),
+                            quant: self.settings.quant.clone(),
                         },
                     );
                     self.note_prober(&tcp);
@@ -4518,6 +4663,122 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// One channel, two models: a node divides its own model over the free
+    /// nodes with that model only, and a request naming the other model goes
+    /// to a node that serves it, from either side.
+    #[test]
+    fn a_channel_with_two_models_routes_each_by_name() {
+        let second = |name: &str, peers: &[&Arc<Node>], api_port: u16| {
+            let mut s = on_channel(name, "lab", peers, true);
+            s.label = "second-model".to_string();
+            s.quant = "F16".to_string();
+            s.api_port = api_port;
+            node_with(
+                s,
+                Variant {
+                    f16_ffn_down: true,
+                    ..Variant::default()
+                },
+            )
+        };
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let other = second("other", &[], 2222);
+        let mut s = on_channel("alpha", "lab", &[&beta, &other], true);
+        s.api_port = 1111;
+        s.release = Duration::from_secs(60);
+        let alpha = node_with(s, Variant::default());
+        let seen = found(&alpha, 2);
+        let named = seen.iter().find(|f| f.name == "other").unwrap();
+        assert_eq!(
+            (named.label.as_str(), named.quant.as_str()),
+            ("second-model", "F16")
+        );
+        let status = alpha.status();
+        let shown = status["found"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == "other")
+            .unwrap();
+        assert_eq!(shown["model_name"], "second-model");
+        assert_eq!(shown["model_quant"], "F16");
+
+        // A request naming the other model, by any of its names, goes to the
+        // node that serves it; one naming this node's model, or a model
+        // nobody serves, is left to the ordinary routing.
+        for asked in ["second-model", "SECOND-MODEL", "second-model:f16"] {
+            assert_eq!(
+                alpha.route_by_model(asked).as_deref(),
+                Some("http://127.0.0.1:2222"),
+                "{asked}"
+            );
+        }
+        for asked in ["fixture", "FIXTURE:f32", "gpt-4", "second-model:Q8_0", ""] {
+            assert_eq!(alpha.route_by_model(asked), None, "{asked}");
+        }
+        assert_eq!(
+            alpha.channel_models(),
+            [ChannelModel {
+                id: "second-model:F16".to_string(),
+                label: "second-model".to_string(),
+                quant: "F16".to_string(),
+                nodes: vec!["other".to_string()],
+            }]
+        );
+
+        // Only the node with the same model is claimed.
+        let unclaimed: Vec<String> = alpha.unclaimed().into_iter().map(|f| f.name).collect();
+        assert_eq!(unclaimed, ["beta"]);
+        let _request = alpha.start_request();
+        assert_eq!(alpha.links().len(), 1);
+        assert!(beta.is_assigned());
+        assert!(!other.is_assigned());
+        assert_eq!(probe_of(&other, "lab").unwrap().state, ProbeState::Idle);
+        assert_eq!(other.route_by_model("second-model"), None);
+
+        // From a node with the second model: a request for the first goes to
+        // the node leading a tree of it, never to that tree's worker; the
+        // node claims only the free node with its own model.
+        let delta = second("delta", &[&alpha, &beta, &other], 3333);
+        found(&delta, 3);
+        until("delta sees alpha leading", || {
+            delta
+                .found
+                .lock()
+                .unwrap()
+                .0
+                .iter()
+                .any(|f| f.name == "alpha" && f.state == ProbeState::Leading)
+        });
+        for asked in ["fixture", "fixture:F32"] {
+            assert_eq!(
+                delta.route_by_model(asked).as_deref(),
+                Some("http://127.0.0.1:1111"),
+                "{asked}"
+            );
+        }
+        assert_eq!(delta.route_by_model("second-model"), None);
+        let unclaimed: Vec<String> = delta.unclaimed().into_iter().map(|f| f.name).collect();
+        assert_eq!(unclaimed, ["other"]);
+        assert_eq!(
+            delta
+                .channel_models()
+                .into_iter()
+                .map(|m| (m.id, m.nodes))
+                .collect::<Vec<_>>(),
+            [("fixture:F32".to_string(), vec!["alpha".to_string()])]
+        );
+    }
+
+    /// A model's name for `/v1/models` carries its quantization once.
+    #[test]
+    fn a_model_id_carries_its_tag_once() {
+        assert_eq!(model_id("m", "Q4_K_M"), "m:Q4_K_M");
+        assert_eq!(model_id("m:Q4_K_M", "Q4_K_M"), "m:Q4_K_M");
+        assert_eq!(model_id("m:q4_k_m", "Q4_K_M"), "m:q4_k_m");
+        assert_eq!(model_id("m", ""), "m");
     }
 
     /// A busy node is not claimed, and a less busy one is planned a larger
@@ -6370,6 +6631,8 @@ mod tests {
             model: [0; 32],
             content: [0; 32],
             workers: 1,
+            label: String::new(),
+            quant: String::new(),
             rtt: Duration::from_millis(1),
             alternates: Vec::new(),
         }

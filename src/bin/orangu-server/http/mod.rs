@@ -147,32 +147,46 @@ const FORWARDED_HEADER: &str = "x-orangu-forwarded";
 const ROUTED_TO_HEADER: &str = "x-orangu-routed-to";
 
 /// Sends a request that runs the model to the node of its workers channel
-/// that should serve it (`crate::workers::node::route`): the least busy one
-/// that holds the model, or the parent a working node's layers belong to.
+/// that should serve it: one serving the model its `model` field names,
+/// when that is not this node's and another node of the channel serves it
+/// (`crate::workers::node::route_by_model`); otherwise the least busy one
+/// that holds this node's model, or the parent a working node's layers
+/// belong to (`crate::workers::node::route`).
 /// Otherwise turns the API away while this node's layers belong to a
 /// parent's requests, so the parent's work has the whole machine — 503
 /// rather than a refusal: the node is unavailable for a while, not the
 /// wrong one.
 async fn route_or_pause(
+    State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let request = if request.method() == axum::http::Method::POST
-        && ROUTED.contains(&request.uri().path())
-        && let Some(base) =
-            crate::workers::node::route_async(request.headers().contains_key(FORWARDED_HEADER))
-                .await
-    {
-        match forward(&base, request).await {
-            Ok(response) => return response,
-            Err(request) => {
-                crate::workers::node::forward_failed(&base);
-                *request
-            }
+    let mut request = request;
+    if request.method() == axum::http::Method::POST && ROUTED.contains(&request.uri().path()) {
+        let forwarded = request.headers().contains_key(FORWARDED_HEADER);
+        let mut base = None;
+        if !forwarded && crate::workers::node::routes_by_model() {
+            let limit = routed_body_limit(&state, request.uri().path());
+            let (named, read) = model_named(request, limit).await;
+            request = match read {
+                Ok(request) => request,
+                Err(response) => return *response,
+            };
+            base = named.and_then(|asked| crate::workers::node::route_by_model(&asked, false));
         }
-    } else {
-        request
-    };
+        if base.is_none() {
+            base = crate::workers::node::route_async(forwarded).await;
+        }
+        if let Some(base) = base {
+            request = match forward(&base, request).await {
+                Ok(response) => return response,
+                Err(request) => {
+                    crate::workers::node::forward_failed(&base);
+                    *request
+                }
+            };
+        }
+    }
     if crate::workers::node::api_paused() && !OPEN_WHILE_WORKING.contains(&request.uri().path()) {
         let message = if crate::workers::node::parent_suspect() {
             "this orangu-server is working for a parent node that does not answer; its own API \
@@ -193,6 +207,70 @@ async fn route_or_pause(
             .into_response();
     }
     next.run(request).await
+}
+
+/// The most a routed request's body may hold on `path`: what its handler
+/// accepts (see [`build_router`]), so reading the body to find the model
+/// it names refuses nothing the handler would take.
+fn routed_body_limit(state: &AppState, path: &str) -> usize {
+    if path == "/v1/messages" {
+        anthropic::REQUEST_BODY_LIMIT
+    } else {
+        api_body_limit(state)
+    }
+}
+
+/// The model a request's JSON body names in its `model` field, and the
+/// request with its body read once and put back intact. A body that says
+/// it is larger than `limit` is not read — the handler refuses it as it
+/// would any other — and one that turns out larger is answered with 413
+/// here, as the handler would.
+async fn model_named(
+    request: axum::extract::Request,
+    limit: usize,
+) -> (
+    Option<String>,
+    Result<axum::extract::Request, Box<axum::response::Response>>,
+) {
+    let declared = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|len| len > limit) {
+        return (None, Ok(request));
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                None,
+                Err(Box::new(
+                    (
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "Failed to buffer the body: length limit exceeded",
+                    )
+                        .into_response(),
+                )),
+            );
+        }
+    };
+    #[derive(serde::Deserialize)]
+    struct Named {
+        model: Option<serde_json::Value>,
+    }
+    let named = serde_json::from_slice::<Named>(&bytes)
+        .ok()
+        .and_then(|n| n.model)
+        .and_then(|m| m.as_str().map(str::to_string));
+    (
+        named,
+        Ok(axum::extract::Request::from_parts(
+            parts,
+            axum::body::Body::from(bytes),
+        )),
+    )
 }
 
 /// Sends `request` to the API at `base` and streams its answer back. A node
@@ -461,20 +539,23 @@ pub fn reject_oversized_context(state: &AppState, prompt_tokens: usize) -> Optio
     )))
 }
 
+/// The most a request's body may hold on a route that sets no limit of its
+/// own. An image server takes a picture to start from as base64 in the
+/// JSON, which axum's default 2 MB body cap would refuse long before
+/// `images::MAX_IMAGE_BYTES`; a model with a vision tower takes a
+/// conversation's pictures the same way. Everything else keeps that
+/// default.
+fn api_body_limit(state: &AppState) -> usize {
+    if state.engine.image.is_some() || state.engine.vision.is_some() {
+        images::IMAGE_BODY_LIMIT
+    } else {
+        2 * 1024 * 1024
+    }
+}
+
 pub fn build_router(state: Arc<AppState>) -> Router {
     let metrics = state.process_metrics.clone();
-    // An image server takes a picture to start from as base64 in the JSON,
-    // which axum's default 2 MB body cap would refuse long before
-    // `images::MAX_IMAGE_BYTES`; a model with a vision tower takes a
-    // conversation's pictures the same way. Everything else keeps that
-    // default.
-    let body_limit = axum::extract::DefaultBodyLimit::max(
-        if state.engine.image.is_some() || state.engine.vision.is_some() {
-            images::IMAGE_BODY_LIMIT
-        } else {
-            2 * 1024 * 1024
-        },
-    );
+    let body_limit = axum::extract::DefaultBodyLimit::max(api_body_limit(&state));
     let router = Router::new()
         .route("/health", get(native::health))
         .route("/ready", get(native::ready))
@@ -786,7 +867,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // `orangu-coordinator` mounts too, so both front doors serve the
         // same eight endpoints over the same implementation.
         .merge(orangu::files_http::router::<AppState>())
-        .route_layer(axum::middleware::from_fn(route_or_pause))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            route_or_pause,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -886,6 +970,61 @@ async fn shutdown(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn posted(body: &'static str, declared: Option<usize>) -> axum::extract::Request {
+        let mut request = axum::extract::Request::post("/v1/chat/completions");
+        if let Some(len) = declared {
+            request = request.header(axum::http::header::CONTENT_LENGTH, len);
+        }
+        request.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    /// The model a body names is read, and the body goes on intact; a body
+    /// without one, or that is not JSON, names nothing.
+    #[tokio::test]
+    async fn a_routed_body_is_read_for_its_model_and_passed_on_intact() {
+        let body = r#"{"messages":[],"model":"second-model:Q4_K_M","stream":true}"#;
+        let (named, request) = model_named(posted(body, Some(body.len())), 1024).await;
+        assert_eq!(named.as_deref(), Some("second-model:Q4_K_M"));
+        let request = request.unwrap();
+        assert_eq!(
+            request.headers()[axum::http::header::CONTENT_LENGTH],
+            body.len().to_string()
+        );
+        let read = axum::body::to_bytes(request.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(read, body.as_bytes());
+        for unnamed in [r#"{"messages":[]}"#, r#"{"model":7}"#, "not json"] {
+            let (named, request) = model_named(posted(unnamed, None), 1024).await;
+            assert_eq!(named, None, "{unnamed}");
+            let read = axum::body::to_bytes(request.unwrap().into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(read, unnamed.as_bytes());
+        }
+    }
+
+    /// A body over the limit is not read when it says so up front, and is
+    /// refused as the handler would refuse it when it does not.
+    #[tokio::test]
+    async fn a_routed_body_over_the_limit_is_left_to_the_limit() {
+        let body = r#"{"model":"second-model","prompt":"a long prompt"}"#;
+        let (named, request) = model_named(posted(body, Some(body.len())), 8).await;
+        assert_eq!(named, None);
+        let read = axum::body::to_bytes(request.unwrap().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(read, body.as_bytes());
+        let streamed = axum::extract::Request::post("/v1/completions")
+            .body(axum::body::Body::from_stream(
+                tokio_util::io::ReaderStream::new(std::io::Cursor::new(body.as_bytes())),
+            ))
+            .unwrap();
+        let (named, refused) = model_named(streamed, 8).await;
+        assert_eq!(named, None);
+        assert_eq!(refused.unwrap_err().status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 
     /// Requests through a counted router show up in the figures, whichever
     /// status they get, and none is left in flight once it has been answered.

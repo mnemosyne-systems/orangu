@@ -858,6 +858,12 @@ pub enum Message {
         /// two nodes lead the same model, the smaller tree gives way.
         /// Appended; `0` from a node that does not send it.
         workers: u32,
+        /// The model it serves by name, as its `/v1/models` lists it, and its
+        /// quantization: what a request naming a model is routed by.
+        /// Appended; empty from a node that does not send them, which no
+        /// request names.
+        label: String,
+        quant: String,
     },
     /// Sent instead of `Hello` by a node about to claim workers on the
     /// channel that hashes to `channel`: asks the listener to promise
@@ -1418,6 +1424,8 @@ impl Message {
                 model,
                 content,
                 workers,
+                label,
+                quant,
             } => {
                 w.string(node);
                 w.string(name);
@@ -1429,6 +1437,8 @@ impl Message {
                 w.fixed(model);
                 w.fixed(content);
                 w.u32(*workers);
+                w.string(label);
+                w.string(quant);
                 tag::PROBE_ACK
             }
             Self::Lease { channel, node } => {
@@ -1609,6 +1619,16 @@ impl Message {
                 model: r.fixed()?,
                 content: r.fixed()?,
                 workers: if r.0.is_empty() { 0 } else { r.u32()? },
+                label: if r.0.is_empty() {
+                    String::new()
+                } else {
+                    r.string()?
+                },
+                quant: if r.0.is_empty() {
+                    String::new()
+                } else {
+                    r.string()?
+                },
             },
             tag::LEASE => Self::Lease {
                 channel: r.fixed()?,
@@ -1942,6 +1962,8 @@ mod tests {
                 model: [1; 32],
                 content: [2; 32],
                 workers: 3,
+                label: "unsloth/model-GGUF".to_string(),
+                quant: "Q4_K_M".to_string(),
             });
         }
         round_trip(Message::Lease {
@@ -2014,13 +2036,49 @@ mod tests {
             model: [1; 32],
             content: [2; 32],
             workers: 7,
+            label: String::new(),
+            quant: String::new(),
         }
         .encode();
-        let older = &payload[..payload.len() - 4];
+        // The two empty names take eight bytes, the workers count four more.
+        let older = &payload[..payload.len() - 12];
         let Message::ProbeAck { workers, state, .. } = Message::decode(tag, older).unwrap() else {
             panic!("not a probe answer");
         };
         assert_eq!((workers, state), (0, ProbeState::Leading));
+    }
+
+    /// A probe answer from a node that sends `workers` but not its model's
+    /// name reads as a node no request names.
+    #[test]
+    fn a_probe_ack_without_a_model_name_decodes_to_empty() {
+        let (tag, payload) = Message::ProbeAck {
+            node: "n".to_string(),
+            name: "n:8400".to_string(),
+            state: ProbeState::Idle,
+            load: 0.0,
+            whole: true,
+            api_port: 8100,
+            api_tls: false,
+            model: [1; 32],
+            content: [2; 32],
+            workers: 2,
+            label: "m".to_string(),
+            quant: "Q8_0".to_string(),
+        }
+        .encode();
+        let label_bytes = 4 + 1 + 4 + 4;
+        let older = &payload[..payload.len() - label_bytes];
+        let Message::ProbeAck {
+            workers,
+            label,
+            quant,
+            ..
+        } = Message::decode(tag, older).unwrap()
+        else {
+            panic!("not a probe answer");
+        };
+        assert_eq!((workers, label.as_str(), quant.as_str()), (2, "", ""));
     }
 
     #[test]

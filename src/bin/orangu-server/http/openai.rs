@@ -212,33 +212,75 @@ fn reasons_apart(tokenizer: &crate::engine::tokenizer::Tokenizer) -> bool {
         || tokenizer.content_kinds().is_some()
 }
 
+/// A model another node of this node's workers channel serves
+/// (`crate::workers::node::channel_models`), in the shape [`model_json`]
+/// gives this node's own, marked as the channel's: a request naming it here
+/// is served there. Its context and capabilities are that node's to say.
+fn channel_model_json(model: &crate::workers::node::ChannelModel) -> serde_json::Value {
+    let created = unix_now();
+    let created_at = chrono::DateTime::from_timestamp(created as i64, 0)
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    json!({
+        "id": model.id,
+        "object": "model",
+        "created": created,
+        "owned_by": "orangu-server channel",
+        "type": "model",
+        "display_name": model.id,
+        "created_at": created_at,
+        "quant": model.quant,
+        "served_by": model.nodes,
+    })
+}
+
 /// `GET /v1/models`, with Anthropic's pagination fields beside OpenAI's
-/// `object: "list"` — there is one model, so there is never a next page.
+/// `object: "list"`: the served model first, then the other models the
+/// nodes of its workers channel serve, each once — every one is listed, so
+/// there is never a next page.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut data = vec![model_json(&state)];
+    data.extend(
+        crate::workers::node::channel_models()
+            .iter()
+            .map(channel_model_json),
+    );
+    let last_id = data
+        .last()
+        .and_then(|m| m["id"].as_str())
+        .unwrap_or(&state.model_label)
+        .to_string();
     Json(json!({
         "object": "list",
-        "data": [model_json(&state)],
+        "data": data,
         "has_more": false,
         "first_id": state.model_label,
-        "last_id": state.model_label,
+        "last_id": last_id,
     }))
 }
 
-/// `GET /v1/models/{id}`: the served model when `id` names it.
+/// `GET /v1/models/{id}`: the served model when `id` names it, or a model
+/// another node of the workers channel serves.
 pub async fn retrieve_model(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    if id != state.model_label {
-        return super::anthropic::error_response(
-            StatusCode::NOT_FOUND,
-            format!(
-                "model '{id}' is not served here; this server serves '{}'",
-                state.model_label
-            ),
-        );
+    if id == state.model_label {
+        return Json(model_json(&state)).into_response();
     }
-    Json(model_json(&state)).into_response()
+    if let Some(model) = crate::workers::node::channel_models()
+        .iter()
+        .find(|m| m.id == id)
+    {
+        return Json(channel_model_json(model)).into_response();
+    }
+    super::anthropic::error_response(
+        StatusCode::NOT_FOUND,
+        format!(
+            "model '{id}' is not served here; this server serves '{}'",
+            state.model_label
+        ),
+    )
 }
 
 pub(crate) fn unix_now() -> u64 {

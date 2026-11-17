@@ -2693,10 +2693,14 @@ key is refused at startup with a message pointing to `name`.
   layer's weights. A node that answers at several addresses is one node,
   reached at the one that answered faster; the others are its alternates,
   probed with it, and it moves to one only when it answers at least twice
-  as fast or its own address stops answering. Nodes work together only on the same model: a request
-  is routed only to a node whose model matches in both, and only a node
-  with the same layout is claimed, its weights then compared layer by
-  layer. The nodes found are asked again every two seconds. Blank or absent
+  as fast or its own address stops answering. The answer also names the
+  model as its `/v1/models` lists it, with its quantization. Nodes work
+  together only on the same model: a request is routed only to a node whose
+  model matches in both, and only a node with the same layout is claimed,
+  its weights then compared layer by layer. A request whose `model` field
+  names another model that a node of the channel serves goes to that node,
+  and `/v1/models` lists the channel's other models too (*Workers* chapter,
+  **Several models on one channel**). The nodes found are asked again every two seconds. Blank or absent
   joins no channel: the node serves alone.
 - `network` — optional: the networks a scan looks at, as comma-separated
   `address/prefix` IPv4 networks (`192.168.1.0/24, 10.0.0.0/22`), each
@@ -2961,9 +2965,10 @@ machine, each on its own `[workers].port`, then find each other.
 model it could hold is split as on smaller machines. A routed request's
 answer carries `x-orangu-routed-to`, the API of the node that served it.
 
-**Every node needs the same model installed, quantization included.**
-Each worker resolves the parent's model spec in its own `models`
-directory. When it connects, the parent compares the child's copy with its
+**Every node of one tree needs the same model installed, quantization
+included.** A channel can hold several models, each with its own tree; a
+node is claimed only by a node of its own model. Each worker resolves the
+parent's model spec in its own `models` directory. When it connects, the parent compares the child's copy with its
 own by content, not by file name: the tensor types and shapes, and samples
 of the weights in the layers the child will run. A different quantization,
 or the same one from another release, is refused with a message naming
