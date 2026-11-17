@@ -781,14 +781,14 @@ curl -s localhost:8100/v1/images/generations -H 'Content-Type: application/json'
 | :-- | :-- | :-- |
 | `prompt` | *required* | what to draw |
 | `negative_prompt` | `image_negative_prompt` | what to draw away from; read only when `cfg_scale > 1` |
-| `size` | `image_size` | `WIDTHxHEIGHT`, both multiples of 16; `auto` is the default, or the attached `image`'s own proportions when there is one |
+| `size` | `image_size` | `WIDTHxHEIGHT`, both multiples of 16; `auto` is the default, or the (first) attached `image`'s own proportions when there is one |
 | `n` | `1` | pictures to make, `1` to `10`, in turn; a `seed` seeds the set, each one `seed + i` |
-| `output_format` | `image_format` (`png`) | `png`, `jpeg`, `gif`, `webp` (lossless) or `svg` (an SVG document carrying the picture as PNG); an attached picture defaults to its own format |
+| `output_format` | `image_format` (`png`) | `png`, `jpeg`, `gif`, `webp` (lossless) or `svg` (an SVG document carrying the picture as PNG); an attached picture defaults to its own format (the first one's, when there are several) |
 | `response_format` | `b64_json` | the only value — there are no files to return a `url` to |
 | `seed` | drawn | reproduces a picture on the same build; the reply reports the one used |
 | `steps` | `image_steps` | denoising steps |
 | `cfg_scale` | `image_cfg_scale` | classifier-free guidance; `1` runs the prompt alone, half the work |
-| `image` | — | a picture to start from — a `data:image/…;base64,…` URL or bare base64 of a PNG, JPEG, GIF, WebP or SVG. Resized to `size`. On a `qwen_image_2_1` server with a vision projector (`/props`' `image.vision`), the picture is **edited** by the prompt instead: read by the text encoder and kept wherever the prompt does not ask for a change |
+| `image` | — | a picture to start from — a `data:image/…;base64,…` URL or bare base64 of a PNG, JPEG, GIF, WebP or SVG — or an array of them. Resized to `size`. On a `qwen_image_2_1` server with a vision projector (`/props`' `image.vision`), the pictures are **edited** by the prompt instead: each read by the text encoder, in order (*picture 1*, *picture 2*, …), and kept wherever the prompt does not ask for a change. Only an edit reads several; any other model refuses more than one with `400` |
 | `strength` | `image_strength` | with `image`: how much of the schedule to run, `0` (unchanged) to `1` (the picture's content is ignored). Not read for an edit |
 | `stream` | `false` | server-sent events instead of one body |
 
@@ -821,9 +821,10 @@ as `token_passes_per_second` (at the defaults' size) and
 and the rate model itself — see **`GET /props`** below.
 
 `POST /v1/chat/completions` on the same server draws from the last user
-message: its text is the prompt, and the last `image_url` part of an
+message: its text is the prompt, and the `image_url` parts of an
 array-shaped `content` (`{"type": "image_url", "image_url": {"url":
-"data:image/png;base64,…"}}`) is the picture to start from. Every knob is
+"data:image/png;base64,…"}}`), in order, are the pictures to edit or
+start from — several only for an edit, as for `image` above. Every knob is
 the server's `image_*` default except `seed`. The assistant's `content` is
 the picture as a markdown image over a `data:` URL, which a markdown-rendering
 chat client shows inline; `message.images` carries the same picture as

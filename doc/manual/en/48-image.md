@@ -204,6 +204,24 @@ upsampling it adds nothing to read. `image_reference_size = output`
 reads every attachment at the picture's size, as diffusers does. *Strength* does not apply — the whole schedule is run, the
 attachment guiding it rather than being noised over.
 
+#### Several pictures
+
+Attach more than one picture and the edit reads **all of them**, in the
+order they were attached: the prompt can name them as *picture 1*,
+*picture 2* and so on — *put the person from picture 1 and the person
+from picture 2 side by side in one portrait*. Each is read on its own at
+the picture's size (as above), so they may differ in size and
+proportions; the result takes the **first** attachment's proportions and
+format unless the request names its own `size`. Every extra picture adds
+its own read before the first step and its tokens to every step, so two
+references cost roughly twice the encode of one.
+
+Only an edit reads several pictures. A model that starts from an
+attachment (Qwen-Image 2512, Qwen-Image 2.1 without its vision
+projector, FLUX.2 [klein], MOSS-Image) starts from one, and a request
+with more is refused with a message saying so rather than silently using
+one of them; MiniMax-H3-Image takes none.
+
 Without the vision projector (or with `vision = none` in the
 configuration) an attachment is a starting point instead, as for
 Qwen-Image 2512: see **Drawing** below.
@@ -476,12 +494,13 @@ session and come back through **History**.
 
 **Attach** a picture (the **+** menu's *Image* item; PNG, JPEG, GIF,
 WebP and SVG are read) and, with Qwen-Image 2.1 and its vision projector,
-the prompt edits it — see **Editing a picture** above. With Qwen-Image
-2512, or 2.1 without the projector, the model instead starts from the
-attachment rather than from noise, running *Strength* of the schedule — a
-rough sketch redrawn as a painting, or a photograph in another style.
-Either way the picture keeps the attachment's proportions and comes back
-in its format.
+the prompt edits it — see **Editing a picture** above; attach several
+and the edit reads them all, in order. With Qwen-Image 2512, or 2.1
+without the projector, the model instead starts from the one attachment
+rather than from noise, running *Strength* of the schedule — a rough
+sketch redrawn as a painting, or a photograph in another style. Either
+way the picture keeps the (first) attachment's proportions and comes
+back in its format.
 
 A long picture can be stopped with the console's Stop button, or by
 closing the tab: the work ends within seconds, at the next transformer
@@ -501,12 +520,13 @@ Everything the console does, a client can:
 
 - `POST /v1/images/generations` is OpenAI's Images API with the local
   model's knobs added (`size`, `steps`, `cfg_scale`, `negative_prompt`,
-  `seed`, `output_format`, and an `image` with `strength` to start
-  from). `stream: true` sends a progress event per step, the first one
+  `seed`, `output_format`, and an `image` — one picture or an array of
+  them — with `strength` to start from). `stream: true` sends a progress event per step, the first one
   — step 0 — carrying the estimate before any work.
 - `POST /v1/chat/completions` on the same server treats the last user
-  message as the prompt, and its last `image_url` part as the picture to
-  start from; the answer is the picture as a markdown image.
+  message as the prompt, and its `image_url` parts, in order, as the
+  pictures to edit or start from; the answer is the picture as a markdown
+  image.
 - `GET /props` reports the companions, the adapter, the defaults, the
   measured rate and what a picture costs at it; `POST /props` sets the
   defaults — it is what the Image pane's Save calls.

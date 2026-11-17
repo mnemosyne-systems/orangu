@@ -81,13 +81,47 @@ pub struct ImageGenerationRequest {
     steps: Option<usize>,
     #[serde(default)]
     cfg_scale: Option<f32>,
-    /// A picture to start from: a `data:` URL or bare base64.
+    /// Pictures to start from: a `data:` URL or bare base64, or an array of them.
     #[serde(default)]
-    image: Option<String>,
+    image: Option<OneOrMany>,
     #[serde(default)]
     strength: Option<f32>,
     #[serde(default)]
     stream: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum OneOrMany {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl OneOrMany {
+    pub fn as_slice(&self) -> &[String] {
+        match self {
+            OneOrMany::One(one) => std::slice::from_ref(one),
+            OneOrMany::Many(many) => many,
+        }
+    }
+}
+
+pub fn decode_image_payloads<S: AsRef<str>>(
+    payloads: &[S],
+) -> Result<Vec<(String, Vec<u8>)>, String> {
+    payloads
+        .iter()
+        .enumerate()
+        .map(|(i, payload)| {
+            decode_image_payload(payload.as_ref()).map_err(|err| {
+                if payloads.len() > 1 {
+                    format!("attached picture {}: {err}", i + 1)
+                } else {
+                    err
+                }
+            })
+        })
+        .collect()
 }
 
 /// The `image` object of `/props` (and the console's `/api/props`): the
@@ -235,8 +269,8 @@ pub struct ImageParams<'a> {
     pub seed: Option<u64>,
     pub steps: Option<usize>,
     pub cfg_scale: Option<f32>,
-    /// A picture to start from, already decoded from its transport.
-    pub init: Option<(String, Vec<u8>)>,
+    /// Pictures to start from, already decoded from their transport.
+    pub init: Vec<(String, Vec<u8>)>,
     pub strength: Option<f32>,
 }
 
@@ -288,27 +322,44 @@ pub fn decode_image_payload(payload: &str) -> Result<(String, Vec<u8>), String> 
 pub fn build_request(
     defaults: &ImageDefaults,
     unit: usize,
+    max_pictures: usize,
     params: ImageParams<'_>,
 ) -> Result<ImageRequest, String> {
     if params.prompt.trim().is_empty() {
         return Err("prompt is required".to_string());
+    }
+    if params.init.len() > max_pictures {
+        return Err(crate::engine::image::too_many_pictures(
+            params.init.len(),
+            max_pictures,
+        ));
+    }
+    let several = params.init.len() > 1;
+    let mut dimensions = Vec::with_capacity(params.init.len());
+    for (i, (_, bytes)) in params.init.iter().enumerate() {
+        let dims = codec::dimensions(bytes).map_err(|err| {
+            if several {
+                format!("attached picture {}: {err:#}", i + 1)
+            } else {
+                format!("{err:#}")
+            }
+        })?;
+        dimensions.push(dims);
     }
     let format = match params.output_format {
         Some(name) => ImageFormat::parse(name)
             .ok_or_else(|| format!("output_format '{name}' is not png, jpeg, gif or webp"))?,
         None => params
             .init
-            .as_ref()
+            .first()
             .and_then(|(mime, _)| ImageFormat::from_mime(mime))
             .unwrap_or(defaults.format),
     };
-    let init = match &params.init {
-        Some((_, bytes)) => Some(InitImage {
-            bytes: bytes.clone(),
-            strength: params.strength.unwrap_or(defaults.strength),
-        }),
-        None => None,
-    };
+    let first_dims = dimensions.first().copied();
+    let init = (!params.init.is_empty()).then(|| InitImage {
+        pictures: params.init.into_iter().map(|(_, bytes)| bytes).collect(),
+        strength: params.strength.unwrap_or(defaults.strength),
+    });
     if let Some(strength) = params.strength
         && !(0.0..=1.0).contains(&strength)
     {
@@ -322,14 +373,12 @@ pub fn build_request(
                     format!("size '{size}' is not WIDTHxHEIGHT in multiples of {unit}")
                 })?
         }
-        _ => match &init {
-            // A picture to start from sets the proportions; the server's
+        _ => match first_dims {
+            // The first picture sets the proportions; the server's
             // configured size bounds the longer side.
-            Some(init) => codec::dimensions(&init.bytes)
-                .map(|dims| {
-                    codec::fit_generation_size(dims, defaults.width.max(defaults.height), unit)
-                })
-                .map_err(|err| format!("{err:#}"))?,
+            Some(dims) => {
+                codec::fit_generation_size(dims, defaults.width.max(defaults.height), unit)
+            }
             None => (defaults.width, defaults.height),
         },
     };
@@ -440,16 +489,14 @@ pub async fn generations(
     if n == 0 || n > 10 {
         return (StatusCode::BAD_REQUEST, "n must be between 1 and 10").into_response();
     }
-    let init = match req.image.as_deref() {
-        Some(payload) => match decode_image_payload(payload) {
-            Ok(init) => Some(init),
-            Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
-        },
-        None => None,
+    let init = match decode_image_payloads(req.image.as_ref().map_or(&[], OneOrMany::as_slice)) {
+        Ok(init) => init,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
     let request = match build_request(
         &pipeline.defaults(),
         pipeline.size_unit(),
+        pipeline.max_pictures(),
         ImageParams {
             prompt: &req.prompt,
             negative_prompt: req.negative_prompt.as_deref(),
@@ -604,7 +651,7 @@ mod tests {
             seed: None,
             steps: None,
             cfg_scale: None,
-            init: None,
+            init: Vec::new(),
             strength: None,
         }
     }
@@ -620,7 +667,7 @@ mod tests {
             strength: 0.7,
             format: ImageFormat::Webp,
         };
-        let request = build_request(&defaults, 16, params("a cat")).unwrap();
+        let request = build_request(&defaults, 16, 1, params("a cat")).unwrap();
         assert_eq!((request.width, request.height), (512, 256));
         assert_eq!(request.steps, 8);
         assert_eq!(request.cfg_scale, 2.5);
@@ -633,7 +680,7 @@ mod tests {
         p.size = Some("768x512");
         p.steps = Some(4);
         p.output_format = Some("jpeg");
-        let request = build_request(&defaults, 16, p).unwrap();
+        let request = build_request(&defaults, 16, 1, p).unwrap();
         assert_eq!((request.width, request.height), (768, 512));
         assert_eq!(request.steps, 4);
         assert_eq!(request.format, ImageFormat::Jpeg);
@@ -642,25 +689,25 @@ mod tests {
     #[test]
     fn bad_parameters_are_named() {
         let defaults = ImageDefaults::default();
-        assert!(build_request(&defaults, 16, params("  ")).is_err());
+        assert!(build_request(&defaults, 16, 1, params("  ")).is_err());
         let mut p = params("x");
         p.size = Some("100x100");
         assert!(
-            build_request(&defaults, 16, p)
+            build_request(&defaults, 16, 1, p)
                 .unwrap_err()
                 .contains("size")
         );
         let mut p = params("x");
         p.steps = Some(0);
         assert!(
-            build_request(&defaults, 16, p)
+            build_request(&defaults, 16, 1, p)
                 .unwrap_err()
                 .contains("steps")
         );
         let mut p = params("x");
         p.output_format = Some("bmp");
         assert!(
-            build_request(&defaults, 16, p)
+            build_request(&defaults, 16, 1, p)
                 .unwrap_err()
                 .contains("output_format")
         );
@@ -680,8 +727,8 @@ mod tests {
             crate::engine::image::vae::Feature::new(200, 400, 3, vec![0.0; 200 * 400 * 3]);
         let jpeg = codec::encode(&feature, ImageFormat::Jpeg).unwrap();
         let mut p = params("brighter");
-        p.init = Some(("image/jpeg".into(), jpeg));
-        let request = build_request(&defaults, 16, p).unwrap();
+        p.init = vec![("image/jpeg".into(), jpeg)];
+        let request = build_request(&defaults, 16, 1, p).unwrap();
         assert_eq!(request.format, ImageFormat::Jpeg);
         assert_eq!((request.width, request.height), (400, 208));
         assert_eq!(request.init.as_ref().unwrap().strength, defaults.strength);
@@ -690,10 +737,88 @@ mod tests {
             crate::engine::image::vae::Feature::new(600, 1200, 3, vec![0.0; 600 * 1200 * 3]);
         let png = codec::encode(&feature, ImageFormat::Png).unwrap();
         let mut p = params("brighter");
-        p.init = Some(("image/png".into(), png));
-        let request = build_request(&defaults, 16, p).unwrap();
+        p.init = vec![("image/png".into(), png)];
+        let request = build_request(&defaults, 16, 1, p).unwrap();
         assert_eq!(request.format, ImageFormat::Png);
         assert_eq!((request.width, request.height), (512, 256));
+    }
+
+    fn picture(width: usize, height: usize, format: ImageFormat) -> Vec<u8> {
+        let feature = crate::engine::image::vae::Feature::new(
+            height,
+            width,
+            3,
+            vec![0.0; width * height * 3],
+        );
+        codec::encode(&feature, format).unwrap()
+    }
+
+    #[test]
+    fn several_pictures_are_kept_in_order_and_the_first_sets_the_size() {
+        let defaults = ImageDefaults {
+            width: 512,
+            height: 512,
+            ..ImageDefaults::default()
+        };
+        let first = picture(256, 384, ImageFormat::Jpeg);
+        let second = picture(320, 320, ImageFormat::Png);
+        let mut p = params("the two of them side by side");
+        p.init = vec![
+            ("image/jpeg".into(), first.clone()),
+            ("image/png".into(), second.clone()),
+        ];
+        let request = build_request(&defaults, 16, usize::MAX, p).unwrap();
+        let init = request.init.unwrap();
+        assert_eq!(init.pictures, vec![first.clone(), second]);
+        assert_eq!(init.first(), first.as_slice());
+        assert_eq!(request.format, ImageFormat::Jpeg);
+        assert_eq!((request.width, request.height), (256, 384));
+    }
+
+    #[test]
+    fn more_pictures_than_the_model_reads_are_refused() {
+        let defaults = ImageDefaults::default();
+        let png = picture(64, 64, ImageFormat::Png);
+        let mut p = params("x");
+        p.init = vec![
+            ("image/png".into(), png.clone()),
+            ("image/png".into(), png.clone()),
+        ];
+        let err = build_request(&defaults, 16, 1, p).unwrap_err();
+        assert!(err.contains("2 pictures"), "{err}");
+        assert!(err.contains("starts from one"), "{err}");
+
+        let mut p = params("x");
+        p.init = vec![("image/png".into(), png)];
+        let err = build_request(&defaults, 16, 0, p).unwrap_err();
+        assert!(err.contains("text alone"), "{err}");
+    }
+
+    #[test]
+    fn an_unreadable_picture_is_named_by_its_place() {
+        let defaults = ImageDefaults::default();
+        let mut p = params("x");
+        p.init = vec![
+            ("image/png".into(), picture(64, 64, ImageFormat::Png)),
+            ("image/png".into(), b"not a picture".to_vec()),
+        ];
+        let err = build_request(&defaults, 16, usize::MAX, p).unwrap_err();
+        assert!(err.starts_with("attached picture 2:"), "{err}");
+    }
+
+    #[test]
+    fn image_is_one_payload_or_several() {
+        let one: ImageGenerationRequest =
+            serde_json::from_value(json!({"prompt": "x", "image": "AQID"})).unwrap();
+        assert_eq!(one.image.unwrap().as_slice(), ["AQID".to_string()]);
+        let many: ImageGenerationRequest =
+            serde_json::from_value(json!({"prompt": "x", "image": ["AQID", "BAUG"]})).unwrap();
+        let many = many.image.unwrap();
+        assert_eq!(many.as_slice().len(), 2);
+        let decoded = decode_image_payloads(many.as_slice()).unwrap();
+        assert_eq!(decoded[1].1, vec![4, 5, 6]);
+        let err = decode_image_payloads(&["AQID", "http://example.com/a.png"]).unwrap_err();
+        assert!(err.starts_with("attached picture 2:"), "{err}");
     }
 
     #[test]
