@@ -335,13 +335,20 @@ fn in_layers(layers: &Range<usize>) -> impl Fn(&str, &[u64]) -> bool + '_ {
     |name, _| crate::engine::loader::block_index(name).is_some_and(|il| layers.contains(&il))
 }
 
-/// Fetches `layers`' tensors, if this process runs a partial model.
-pub fn layers(layers: &Range<usize>) -> Result<()> {
+/// Fetches `layers`' tensors, if this process runs a partial model, and
+/// has a device place again what it placed of them before: anything that
+/// ran them before they were fetched read the file's holes.
+pub fn layers(loaded: &LoadedModel, layers: &Range<usize>) -> Result<()> {
     let Some(partial) = partial() else {
         return Ok(());
     };
     let started = Instant::now();
     let bytes = partial.fetch(in_layers(layers))?;
+    if bytes > 0
+        && let Some(mapped) = loaded.mapped_layers(layers)
+    {
+        crate::engine::backend::refresh_weights(mapped);
+    }
     if bytes > 0 {
         log::info!(
             "orangu-server: fetched layers {}..{} ({}) in {:.1} s",
@@ -356,7 +363,7 @@ pub fn layers(layers: &Range<usize>) -> Result<()> {
 
 /// Fetches `layers`' tensors again, from the next source: they failed the
 /// parent's check. The sources they came from are not asked again.
-pub fn refetch(layers: &Range<usize>) -> Result<()> {
+pub fn refetch(loaded: &LoadedModel, layers: &Range<usize>) -> Result<()> {
     let Some(partial) = partial() else {
         bail!("this node runs no partial model");
     };
@@ -372,7 +379,7 @@ pub fn refetch(layers: &Range<usize>) -> Result<()> {
             format!(" without {}", dropped.join(", "))
         }
     );
-    self::layers(layers).context("fetching the layers again")
+    self::layers(loaded, layers).context("fetching the layers again")
 }
 
 #[cfg(test)]

@@ -63,7 +63,13 @@ checks what clients get while a node is killed (`SIGKILL`), frozen
   goes to a node serving it, a name no node serves stays where it was sent,
   and the node with the second model is never claimed. It runs only when
   `ORANGU_HARNESS_MODEL2` names the second model, in the same models
-  directory.
+  directory;
+- a node with no copy of the model, `download = range` and no way to the
+  Hub fetches the model from the other two, runs its share of a divided
+  answer, and the answer is the one the lead gives alone, word for word, at
+  temperature 0. `ORANGU_HARNESS_RANGE_BACKEND` sets that node's `backend`
+  (`cpu` unless set); `vulkan` checks that a device which ran the model's
+  layers before they were fetched runs them from the fetched bytes.
 
 They need a model, so they are ignored by default:
 

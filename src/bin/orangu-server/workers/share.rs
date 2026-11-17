@@ -28,8 +28,9 @@
 //! While the serving node runs requests — its own, or forwards for a
 //! parent — its ranges go out at [`BUSY_BYTES_PER_SECOND`] in all, so a
 //! download does not take the link and the disk from the requests; idle,
-//! at whatever the link carries. The wait is on the fetch connection's own
-//! thread, never on one that runs the model.
+//! or waiting for a worker to take the layers it assigned (its requests wait
+//! for that worker), at whatever the link carries. The wait is on the fetch
+//! connection's own thread, never on one that runs the model.
 //!
 //! The fetching side is a [`PeerSource`], one of the sources a
 //! [`PartialModel`](orangu::model_download::PartialModel) takes its bytes

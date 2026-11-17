@@ -1138,6 +1138,14 @@ pub trait Backend: Send + Sync {
     }
 }
 
+/// Places again, from `bytes`, every weight a `wgpu` device placed from
+/// within them: bytes written into a mapped model file after a device took its
+/// copy (a model fetched in ranges, whose layers arrive when a parent
+/// assigns them). The CPU reads the mapping itself and needs nothing.
+pub fn refresh_weights(bytes: &[u8]) {
+    vulkan::refresh_weights(bytes);
+}
+
 /// Every distinct tensor type in `tensors` that `backend` has no kernel
 /// for, as type names sorted for a stable message — empty when the backend
 /// can run every tensor.

@@ -2710,14 +2710,22 @@ fn prepare(args: Args) -> Result<Prepared> {
     // Prompt lookup verifies through the same multi-position forward, so a
     // model without one drafts nothing rather than failing its first
     // request that finds a match. A recurrent model is decided per request.
+    // A model fetched in part is not probed: the probe runs every layer,
+    // and the layers not fetched yet are holes; such a node drafts nothing.
     if draft.is_none()
         && !encoder_only
         && engine::generate::speculation_enabled()
         && !model.new_kv_cache(1).has_recurrent()
-        && let Err(err) = supports_multi_position(model.as_ref(), &architecture)
     {
-        log::info!("orangu-server: [speculative] prompt lookup off: {err:#}");
-        engine::generate::disable_prompt_lookup();
+        let probed = if workers::fetch::incomplete() {
+            Err(anyhow!("the model is only partly downloaded"))
+        } else {
+            supports_multi_position(model.as_ref(), &architecture)
+        };
+        if let Err(err) = probed {
+            log::info!("orangu-server: [speculative] prompt lookup off: {err:#}");
+            engine::generate::disable_prompt_lookup();
+        }
     }
 
     let footprint = backend.as_wgpu().map(|wgpu| {

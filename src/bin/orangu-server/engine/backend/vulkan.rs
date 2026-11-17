@@ -178,6 +178,9 @@ struct WeightArena {
     placed_bytes: u64,
     largest_placed: bool,
     slots: HashMap<WeightCacheKey, WeightSlot>,
+    /// The slots whose bytes were written from their own tensor, with its
+    /// row length: every slot but a range bound inside another one.
+    uploaded: HashMap<WeightCacheKey, usize>,
 }
 
 /// Default size of one `ScratchArena` chunk — `CachedOpResources`'s own
@@ -351,6 +354,96 @@ struct UploadStaging {
 /// written by exactly one thread, which is what `Send` promises here.
 struct StagingPiece<'a>(wgpu::WriteOnly<'a, [u8]>);
 unsafe impl Send for StagingPiece<'_> {}
+
+/// Uploads a tensor's raw bytes into `buffer` at `offset` — see
+/// [`VulkanBackend::write_weight_bytes`].
+fn write_weight_bytes(queue: &wgpu::Queue, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+    const ALIGN: usize = wgpu::COPY_BUFFER_ALIGNMENT as usize;
+    const PIECE: usize = 4 << 20;
+    let head = bytes.len() - bytes.len() % ALIGN;
+    if head > 0 {
+        let pieces: Vec<(usize, &[u8])> = bytes[..head].chunks(PIECE).enumerate().collect();
+        on_os_threads(pieces, |(i, piece)| {
+            queue.write_buffer(buffer, offset + (i * PIECE) as u64, piece);
+        });
+    }
+    if head < bytes.len() {
+        let mut tail = [0u8; ALIGN];
+        tail[..bytes.len() - head].copy_from_slice(&bytes[head..]);
+        queue.write_buffer(buffer, offset + head as u64, &tail);
+    }
+}
+
+/// `bytes`' rows of `row_bytes` laid out `stride` apart, the gaps zero.
+fn rows_at_stride(bytes: &[u8], row_bytes: usize, stride: usize) -> Vec<u8> {
+    let rows = bytes.len() / row_bytes.max(1);
+    let mut staged = vec![0u8; stride * rows];
+    for (row, dst) in staged.chunks_exact_mut(stride).enumerate() {
+        dst[..row_bytes].copy_from_slice(&bytes[row * row_bytes..(row + 1) * row_bytes]);
+    }
+    staged
+}
+
+/// What [`refresh_weights`] reaches of one backend.
+struct Placed {
+    queue: wgpu::Queue,
+    weights: std::sync::Weak<Mutex<WeightArena>>,
+    stream: std::sync::Weak<Mutex<Option<StreamArena>>>,
+}
+
+/// Every backend's weight placements, for [`refresh_weights`].
+static PLACED: Mutex<Vec<Placed>> = Mutex::new(Vec::new());
+
+/// Writes again, from `bytes`, every weight placed on a device from
+/// within them: the bytes changed since they were placed. A model fetched
+/// in ranges (`[workers].download = range`) writes a layer into its file
+/// when a parent assigns it, and anything that ran the layer before then —
+/// a start-up probe — placed what the file held at the time. Each weight
+/// keeps its place, so whatever is bound to it reads the new bytes; the
+/// streaming region starts over, so what it held is placed again when
+/// next used.
+pub fn refresh_weights(bytes: &[u8]) {
+    let start = bytes.as_ptr() as usize;
+    let end = start + bytes.len();
+    let mut placed = PLACED.lock().expect("weight placements poisoned");
+    placed.retain(|p| p.weights.strong_count() > 0);
+    for p in placed.iter() {
+        if let Some(weights) = p.weights.upgrade() {
+            let arena = weights.lock().expect("weight cache poisoned");
+            for (key, &row_bytes) in &arena.uploaded {
+                let &(addr, len, ggml_type, _) = key;
+                if addr < start || addr + len > end {
+                    continue;
+                }
+                let Some(&(chunk, offset, _)) = arena.slots.get(key) else {
+                    continue;
+                };
+                let raw = &bytes[addr - start..addr - start + len];
+                let device_bytes = if ggml_type == crate::engine::quant::GGML_TYPE_Q6_K {
+                    std::borrow::Cow::Owned(q6k_device_layout(raw))
+                } else {
+                    std::borrow::Cow::Borrowed(raw)
+                };
+                let stride = VulkanBackend::device_row_stride(row_bytes);
+                let buffer = &arena.chunks[chunk];
+                if stride != row_bytes {
+                    let staged = rows_at_stride(&device_bytes, row_bytes, stride);
+                    write_weight_bytes(&p.queue, buffer, offset, &staged);
+                } else {
+                    write_weight_bytes(&p.queue, buffer, offset, &device_bytes);
+                }
+            }
+        }
+        if let Some(stream) = p.stream.upgrade()
+            && let Some(region) = stream.lock().expect("stream arena poisoned").as_mut()
+            && !region.slots.is_empty()
+        {
+            region.next_offset = 0;
+            region.slots.clear();
+            region.epochs += 1;
+        }
+    }
+}
 
 /// Runs `work` over `items` on up to one OS thread per core, this thread
 /// taking the first share — for the copies a caller makes while holding
@@ -680,11 +773,15 @@ pub struct VulkanBackend {
     /// are both 2 bytes/element, 1 element/block) while decoding those
     /// bytes completely differently — exactly the pair that first caught
     /// this needing `ggml_type` too, not just a length check.
-    weight_cache: Mutex<WeightArena>,
+    ///
+    /// Shared with [`PLACED`], as the streaming region below is, so that
+    /// bytes written into the model file after they were placed reach the
+    /// device ([`refresh_weights`]).
+    weight_cache: Arc<Mutex<WeightArena>>,
     /// The recyclable expert-weight region — see [`StreamArena`]. `None`
     /// until a streamed call first needs it, so a run that never streams
     /// pays no VRAM for it.
-    stream_arena: Mutex<Option<StreamArena>>,
+    stream_arena: Arc<Mutex<Option<StreamArena>>>,
     /// The streaming region's size when the model asked for one at load
     /// (`reserve_stream_region`) and whether the last attempt to bring it
     /// back found the card too full — see `stream_region_ready`.
@@ -6277,19 +6374,20 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             pipelines,
             pipelines_coop,
             pipelines_coop_tiled,
-            stream_arena: Mutex::new(None),
+            stream_arena: Arc::new(Mutex::new(None)),
             stream_region: Mutex::new((0, false)),
             moe_scratch: Mutex::new(Vec::new()),
             stream_staging: Mutex::new(Vec::new()),
             upload_staging_min,
-            weight_cache: Mutex::new(WeightArena {
+            weight_cache: Arc::new(Mutex::new(WeightArena {
                 chunks: Vec::new(),
                 fill: Vec::new(),
                 planned: None,
                 placed_bytes: 0,
                 largest_placed: false,
                 slots: HashMap::new(),
-            }),
+                uploaded: HashMap::new(),
+            })),
             x_arena: Mutex::new(ScratchArena::new()),
             output_arena: Mutex::new(ScratchArena::new()),
             prefill_regions: Mutex::new(HashMap::new()),
@@ -6517,6 +6615,14 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         {
             backend.ensure_stream_capacity_bytes(bytes << 20);
         }
+        PLACED
+            .lock()
+            .expect("weight placements poisoned")
+            .push(Placed {
+                queue: backend.queue.clone(),
+                weights: Arc::downgrade(&backend.weight_cache),
+                stream: Arc::downgrade(&backend.stream_arena),
+            });
         Some(backend)
     }
 
@@ -7638,21 +7744,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     /// 1.4 tok/s after one streamed prefill). The queue's own staging is
     /// transient and leaves that heap as it found it.
     fn write_weight_bytes(&self, buffer: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
-        const ALIGN: usize = wgpu::COPY_BUFFER_ALIGNMENT as usize;
-        const PIECE: usize = 4 << 20;
-        let head = bytes.len() - bytes.len() % ALIGN;
-        if head > 0 {
-            let pieces: Vec<(usize, &[u8])> = bytes[..head].chunks(PIECE).enumerate().collect();
-            on_os_threads(pieces, |(i, piece)| {
-                self.queue
-                    .write_buffer(buffer, offset + (i * PIECE) as u64, piece);
-            });
-        }
-        if head < bytes.len() {
-            let mut tail = [0u8; ALIGN];
-            tail[..bytes.len() - head].copy_from_slice(&bytes[head..]);
-            self.queue.write_buffer(buffer, offset + head as u64, &tail);
-        }
+        write_weight_bytes(&self.queue, buffer, offset, bytes);
     }
 
     /// [`Self::write_weight_bytes`] for a tensor whose device rows are
@@ -7668,14 +7760,12 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
         w: &QuantMatrix,
         stride: usize,
     ) {
-        let row_bytes = w.row_bytes();
         let device_bytes = Self::device_weight_bytes(w);
-        let bytes = &*device_bytes;
-        let mut staged = vec![0u8; stride * w.out_dim];
-        for (row, dst) in staged.chunks_exact_mut(stride).enumerate() {
-            dst[..row_bytes].copy_from_slice(&bytes[row * row_bytes..(row + 1) * row_bytes]);
-        }
-        self.write_weight_bytes(buffer, offset, &staged);
+        self.write_weight_bytes(
+            buffer,
+            offset,
+            &rows_at_stride(&device_bytes, w.row_bytes(), stride),
+        );
     }
 
     /// Drops every cached weight upload and returns the device memory.
@@ -7697,6 +7787,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
     pub(crate) fn release_weight_cache(&self) {
         let mut arena = self.weight_cache.lock().expect("weight cache poisoned");
         arena.slots.clear();
+        arena.uploaded.clear();
         for chunk in arena.chunks.drain(..) {
             chunk.destroy();
         }
@@ -7847,6 +7938,7 @@ than half the speed. Prefer another quantization of this model, or `backend = cp
             arena.largest_placed = true;
         }
         arena.slots.insert(key, (chunk_index, offset, size));
+        arena.uploaded.insert(key, w.row_bytes());
         (arena.chunks[chunk_index].clone(), offset, size)
     }
 

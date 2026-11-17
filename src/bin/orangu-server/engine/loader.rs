@@ -1257,6 +1257,19 @@ pub(crate) fn test_quant_matrix(
     in_dim: usize,
     out_dim: usize,
 ) -> QuantMatrix {
+    test_quant_matrix_in_file(bytes, ggml_type, in_dim, out_dim).0
+}
+
+/// [`test_quant_matrix`], with the file mapped under it open for writing:
+/// what is written into it shows through the matrix, as a range fetched
+/// into a partly downloaded model does.
+#[cfg(test)]
+pub(crate) fn test_quant_matrix_in_file(
+    bytes: &[u8],
+    ggml_type: u32,
+    in_dim: usize,
+    out_dim: usize,
+) -> (QuantMatrix, std::fs::File) {
     use std::io::Write;
 
     /// Every `Arc<Mmap>` any test-built `QuantMatrix` has ever used,
@@ -1292,7 +1305,8 @@ pub(crate) fn test_quant_matrix(
         .lock()
         .expect("leaked test mmap registry poisoned")
         .push(mmap.clone());
-    QuantMatrix {
+    let writer = file.reopen().expect("failed to reopen temp file");
+    let matrix = QuantMatrix {
         bytes: mmap,
         ggml_type,
         start: 0,
@@ -1301,7 +1315,8 @@ pub(crate) fn test_quant_matrix(
         out_dim,
         device: 0,
         layer: NO_LAYER,
-    }
+    };
+    (matrix, writer)
 }
 
 /// Like [`QuantMatrix`], but for a 3D "stacked per-expert" GGUF tensor
@@ -1732,6 +1747,33 @@ impl LoadedModel {
             }
         }
         released
+    }
+
+    /// The mapped bytes from the first to the end of the last tensor of
+    /// the layers `layers`, when they lie in one mapping of the file:
+    /// what a device may have placed of those layers' weights. `None` when
+    /// there are none, or they span files.
+    pub fn mapped_layers(&self, layers: &std::ops::Range<usize>) -> Option<&[u8]> {
+        let (mut start, mut end) = (usize::MAX, 0usize);
+        for (name, loc) in &self.tensors {
+            if !block_index(name).is_some_and(|il| layers.contains(&il)) {
+                continue;
+            }
+            let at = loc.bytes.as_ptr() as usize + loc.start;
+            start = start.min(at);
+            end = end.max(at + loc.len);
+        }
+        if start >= end
+            || !self
+                .mappings
+                .iter()
+                .any(|&(at, len)| start >= at && end <= at + len)
+        {
+            return None;
+        }
+        // SAFETY: `start..end` lies inside one of this model's live
+        // mappings, which last as long as `self`.
+        Some(unsafe { std::slice::from_raw_parts(start as *const u8, end - start) })
     }
 
     /// A tensor's stored bytes, as the file holds them (after the one

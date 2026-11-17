@@ -94,7 +94,9 @@ taken.
 A node serves ranges at full speed while it runs no request. While it
 serves requests, or leads a tree with requests in flight, all of its
 fetching nodes together get 8 MiB a second, so a download does not take the
-link and the disk from the requests. A node that fetches in part serves
+link and the disk from the requests. While it waits for a worker to take the
+layers it assigned, it serves at full speed: its requests are waiting for
+that worker. A node that fetches in part serves
 nothing itself.
 
 The small Gemma 4 models limit where they can be cut. Their last layers

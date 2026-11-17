@@ -296,6 +296,10 @@ pub struct Node {
     /// Forwards running here for a parent: what this node's load counts
     /// while it works as a worker.
     forwards: Arc<AtomicUsize>,
+    /// Assignments this node waits on: a worker fetching the layers it was
+    /// given holds up the requests that are running here, so its fetch is
+    /// not paced for them.
+    assigning: AtomicUsize,
     /// Whether this node holds the whole model within its memory: it can
     /// serve requests alone, so it routes rather than splits.
     fits_alone: bool,
@@ -814,6 +818,7 @@ impl Node {
             active: AtomicUsize::new(0),
             last_request: Mutex::new(Instant::now()),
             forwards: Arc::new(AtomicUsize::new(0)),
+            assigning: AtomicUsize::new(0),
             fits_alone,
             content_hash,
             standing_in: Mutex::new(Vec::new()),
@@ -2979,6 +2984,7 @@ impl Node {
         // An assignment may fetch its layers first (`super::fetch`): gigabytes,
         // at whatever the worker's link to this node, another node or the Hub
         // gives.
+        self.assigning.fetch_add(1, Ordering::AcqRel);
         let reply = link.request_within(
             &Message::Assign(Assign {
                 model: self.settings.label.clone(),
@@ -2992,7 +2998,9 @@ impl Node {
                 prompt_weights: Some(terms.weights.bits()),
             }),
             ASSIGN_TIMEOUT.max(self.settings.timeout),
-        )?;
+        );
+        self.assigning.fetch_sub(1, Ordering::AcqRel);
+        let reply = reply?;
         let with_path = |mut error: WorkerError| {
             if error.path.first() != Some(&link.addr) {
                 error.path.insert(0, link.addr.clone());
@@ -3361,7 +3369,7 @@ impl Node {
                 self.settings.tls.as_ref(),
             );
         }
-        if let Err(e) = super::fetch::layers(&layers) {
+        if let Err(e) = super::fetch::layers(&self.loaded, &layers) {
             log::warn!("orangu-server: could not fetch layers {layers:?}: {e:#}");
             return error(
                 ErrorCode::Internal,
@@ -3381,7 +3389,7 @@ impl Node {
                 if identity::check(&assign.identity, &own, &layers).is_ok() {
                     break;
                 }
-                if let Err(e) = super::fetch::refetch(&layers) {
+                if let Err(e) = super::fetch::refetch(&self.loaded, &layers) {
                     log::warn!("orangu-server: could not fetch layers {layers:?} again: {e:#}");
                     break;
                 }
@@ -3677,7 +3685,10 @@ impl Node {
                     secret: self.settings.secret.as_deref(),
                 });
                 super::share::serve(reader, writer, nonce, offer, &self.fetch_pace, &|| {
-                    self.active.load(Ordering::Acquire) + self.forwards.load(Ordering::Acquire) > 0
+                    self.assigning.load(Ordering::Acquire) == 0
+                        && self.active.load(Ordering::Acquire)
+                            + self.forwards.load(Ordering::Acquire)
+                            > 0
                 });
                 return None;
             }

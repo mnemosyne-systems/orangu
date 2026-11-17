@@ -17583,3 +17583,59 @@ fn q6k_device_layout_puts_d_first_only_on_misaligned_blocks() {
     assert_eq!(out[210..212], bytes[418..420]);
     assert_eq!(out[212..420], bytes[210..418]);
 }
+
+/// A weight placed while its file held a hole reads the bytes written
+/// into the file afterwards once [`refresh_weights`] is given them — in
+/// place, so the resources a matmul already built around it read them
+/// too. At a row length the device pads (`device_row_stride`).
+#[test]
+fn a_weight_written_after_it_was_placed_is_placed_again() {
+    use std::os::unix::fs::FileExt;
+    let _gpu_lock = super::gpu_test_lock();
+    let Some(vulkan) = shared_vulkan() else {
+        eprintln!("{NO_GPU_SKIP}");
+        return;
+    };
+    let (in_dim, out_dim, n_tokens) = (128usize, 24usize, 2usize);
+    assert_ne!(
+        VulkanBackend::device_row_stride(in_dim * 4),
+        in_dim * 4,
+        "a padded row length"
+    );
+    let rows: Vec<f32> = (0..in_dim * out_dim)
+        .map(|i| ((i * 37) % 23) as f32 / 8.0 - 1.4)
+        .collect();
+    let real: Vec<u8> = bytemuck::cast_slice::<f32, u8>(&rows).to_vec();
+    let (w, file) = crate::engine::loader::test_quant_matrix_in_file(
+        &vec![0u8; real.len()],
+        GGML_TYPE_F32,
+        in_dim,
+        out_dim,
+    );
+    let x: Vec<f32> = (0..n_tokens * in_dim)
+        .map(|i| ((i * 11) % 7) as f32 / 4.0 - 0.6)
+        .collect();
+    let on_device = || {
+        vulkan
+            .matmul_batch(&[MatmulOp {
+                x: &x,
+                n_tokens,
+                w: &w,
+            }])
+            .pop()
+            .unwrap()
+    };
+    assert!(on_device().iter().all(|&v| v == 0.0), "placed from a hole");
+    file.write_all_at(&real, 0).unwrap();
+    let want = CpuBackend.matmul(&x, n_tokens, &w);
+    assert!(want.iter().any(|&v| v != 0.0));
+    assert!(
+        on_device().iter().all(|&v| v == 0.0),
+        "the device keeps what it placed"
+    );
+    refresh_weights(w.raw_bytes());
+    let got = on_device();
+    for (g, e) in got.iter().zip(&want) {
+        assert!((g - e).abs() <= 1e-3 * e.abs().max(1.0), "{g} vs {e}");
+    }
+}
