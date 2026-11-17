@@ -145,6 +145,12 @@ const PROMPT21_SYSTEM: &str =
     "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n";
 const PROMPT21_USER_PREFIX: &str = "<|im_start|>user\n";
 
+fn edit_picture_tags(count: usize) -> String {
+    (1..=count)
+        .map(|n| format!("<image{n}><|vision_start|><|image_pad|><|vision_end|>"))
+        .collect()
+}
+
 /// FLUX.2 [klein]'s framing: the Qwen3 chat template around a user turn,
 /// `add_generation_prompt` with `enable_thinking = False` (the empty
 /// thought). Nothing is dropped: every token conditions the picture.
@@ -843,17 +849,23 @@ pub struct ImageRequest {
     /// `None` draws one, and the result reports which.
     pub seed: Option<u64>,
     pub format: ImageFormat,
-    /// A picture to start from, for image-to-image.
+    /// Pictures to start from, for image-to-image or an edit.
     pub init: Option<InitImage>,
 }
 
 #[derive(Debug, Clone)]
 pub struct InitImage {
-    /// PNG, JPEG or SVG bytes; resized to the request's size.
-    pub bytes: Vec<u8>,
+    /// PNG, JPEG or SVG bytes, in attachment order; never empty.
+    pub pictures: Vec<Vec<u8>>,
     /// How much of the schedule to run: `1.0` ignores the picture's content
     /// entirely (pure noise), `0.0` returns it unchanged.
     pub strength: f32,
+}
+
+impl InitImage {
+    pub fn first(&self) -> &[u8] {
+        self.pictures.first().map_or(&[], Vec::as_slice)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1030,17 +1042,22 @@ impl RateModel {
 }
 
 impl Pipeline {
-    /// The latent tokens of the reference an attached picture would be
-    /// edited from — `0` when it would not be (no vision tower, or not
+    /// The latent tokens of the references the attached pictures would be
+    /// edited from — `0` when they would not be (no vision tower, or not
     /// readable), as the step-0 estimate counts it.
     fn reference_tokens(&self, request: &ImageRequest) -> usize {
         let Some(init) = request.init.as_ref().filter(|_| self.edits()) else {
             return 0;
         };
-        codec::dimensions(&init.bytes).map_or(0, |dims| {
-            let (w, h) = reference_size(dims, request.width * request.height);
-            (w / 16) * (h / 16)
-        })
+        init.pictures
+            .iter()
+            .map(|bytes| {
+                codec::dimensions(bytes).map_or(0, |dims| {
+                    let (w, h) = reference_size(dims, request.width * request.height);
+                    (w / 16) * (h / 16)
+                })
+            })
+            .sum()
     }
 
     /// The current [`RateModel`], if any.
@@ -1125,6 +1142,25 @@ struct Reference {
     latents: Vec<f32>,
     rows: usize,
     cols: usize,
+}
+
+pub fn max_pictures(variant: Variant, edits: bool) -> usize {
+    match (variant, edits) {
+        (Variant::MiniMaxH3Image, _) => 0,
+        (_, true) => usize::MAX,
+        (_, false) => 1,
+    }
+}
+
+pub fn too_many_pictures(count: usize, max: usize) -> String {
+    match max {
+        0 => "this picture model draws from text alone and takes no attached picture".into(),
+        1 => format!(
+            "{count} pictures were attached, but this picture model starts from one: only an \
+             edit (Qwen-Image 2.1 with its vision projector) reads several"
+        ),
+        max => format!("{count} pictures were attached; this picture model reads at most {max}"),
+    }
 }
 
 /// The size a reference picture is read at: its own proportions at the
@@ -1767,6 +1803,10 @@ impl Pipeline {
         self.vision.is_some()
     }
 
+    pub fn max_pictures(&self) -> usize {
+        max_pictures(self.variant, self.edits())
+    }
+
     /// An attached picture prepared for editing a `(width, height)`
     /// picture: read by the vision tower, and encoded (the posterior's
     /// mean, as diffusers takes it) to latents.
@@ -1812,24 +1852,25 @@ impl Pipeline {
     }
 
     /// Qwen-Image 2.1's conditioning for an edit: diffusers'
-    /// `prompt_template_ti2i` — the picture's `<|image_pad|>` run inside
+    /// `prompt_template_ti2i` — each picture's `<|image_pad|>` run inside
     /// the user turn — through the text encoder with the vision tokens in
-    /// it, then through the transformer with the picture's latents where
-    /// the encoder read it.
+    /// it, then through the transformer with the pictures' latents where
+    /// the encoder read them.
     fn condition_edit(
         &self,
         prompt: &str,
-        reference: &Reference,
+        references: &[Reference],
         cancel: &AtomicBool,
     ) -> Result<Condition> {
         let (Some(vision), Model::QwenImage21 { transformer, .. }) = (&self.vision, &self.model)
         else {
             bail!("this picture model does not edit pictures");
         };
+        ensure!(!references.is_empty(), "an edit needs a picture");
         let system = self.tokenizer.encode(PROMPT21_SYSTEM, false);
         let text = format!(
-            "{PROMPT21_SYSTEM}{PROMPT21_USER_PREFIX}<image1><|vision_start|><|image_pad|>\
-             <|vision_end|>{prompt}{PROMPT_TEMPLATE_SUFFIX}"
+            "{PROMPT21_SYSTEM}{PROMPT21_USER_PREFIX}{}{prompt}{PROMPT_TEMPLATE_SUFFIX}",
+            edit_picture_tags(references.len())
         );
         let mut tokens = self.tokenizer.encode(&text, false);
         ensure!(
@@ -1841,48 +1882,72 @@ impl Pipeline {
             pad.len() == 1,
             "the text encoder's tokenizer has no <|image_pad|> token"
         );
-        let at = tokens
+        let pad = pad[0];
+        // The template's pads precede the prompt, so the first ones are the pictures'.
+        let pads: Vec<usize> = tokens
             .iter()
-            .position(|&t| t == pad[0])
-            .context("the prompt template lost its picture")?;
-        let (rows, cols) = reference.vision.grid;
-        let slots = rows * cols;
+            .enumerate()
+            .filter(|&(_, &t)| t == pad)
+            .map(|(i, _)| i)
+            .take(references.len())
+            .collect();
         ensure!(
-            slots * 4 == reference.rows * reference.cols,
-            "the vision tower read {slots} cells of a {}x{} latent",
-            reference.rows,
-            reference.cols
+            pads.len() == references.len(),
+            "the prompt template lost its pictures: {} of {}",
+            pads.len(),
+            references.len()
         );
-        tokens.splice(at..at + 1, std::iter::repeat_n(pad[0], slots));
+        let mut starts = Vec::with_capacity(references.len());
+        let mut shift = 0usize;
+        for (&at, reference) in pads.iter().zip(references) {
+            let (rows, cols) = reference.vision.grid;
+            let slots = rows * cols;
+            ensure!(
+                slots * 4 == reference.rows * reference.cols,
+                "the vision tower read {slots} cells of a {}x{} latent",
+                reference.rows,
+                reference.cols
+            );
+            let at = at + shift;
+            tokens.splice(at..at + 1, std::iter::repeat_n(pad, slots));
+            starts.push(at);
+            shift += slots - 1;
+        }
         let started = Instant::now();
-        let hidden = vision.text.forward_pre_norm(
-            &tokens,
-            &[qwen3vl::PromptPicture {
-                start: at,
+        let pictures: Vec<qwen3vl::PromptPicture<'_>> = starts
+            .iter()
+            .zip(references)
+            .map(|(&start, reference)| qwen3vl::PromptPicture {
+                start,
                 vision: &reference.vision,
-            }],
-            Some(cancel),
-        )?;
+            })
+            .collect();
+        let hidden = vision
+            .text
+            .forward_pre_norm(&tokens, &pictures, Some(cancel))?;
         let width = self.encoder.config().n_embd;
         ensure!(
             hidden.len() == tokens.len() * width,
             "text encoder returned the wrong shape"
         );
         let mut segments = Vec::new();
-        if at > system.len() {
-            segments.push(transformer21::Segment::Text(
-                &hidden[system.len() * width..at * width],
-            ));
+        let mut from = system.len();
+        for (&at, reference) in starts.iter().zip(references) {
+            if at > from {
+                segments.push(transformer21::Segment::Text(
+                    &hidden[from * width..at * width],
+                ));
+            }
+            segments.push(transformer21::Segment::Picture {
+                latents: &reference.latents,
+                rows: reference.rows,
+                cols: reference.cols,
+            });
+            let (rows, cols) = reference.vision.grid;
+            from = at + rows * cols;
         }
-        segments.push(transformer21::Segment::Picture {
-            latents: &reference.latents,
-            rows: reference.rows,
-            cols: reference.cols,
-        });
-        if at + slots < tokens.len() {
-            segments.push(transformer21::Segment::Text(
-                &hidden[(at + slots) * width..],
-            ));
+        if from < tokens.len() {
+            segments.push(transformer21::Segment::Text(&hidden[from * width..]));
         }
         let text = started.elapsed();
         let prefix = transformer.prefill_segments(&segments, Some(cancel))?;
@@ -2155,6 +2220,17 @@ impl Pipeline {
              picture would need",
             self.variant.architecture()
         );
+        if let Some(init) = &request.init {
+            ensure!(
+                !init.pictures.is_empty(),
+                "no attached picture to start from"
+            );
+            ensure!(
+                init.pictures.len() <= self.max_pictures(),
+                "{}",
+                too_many_pictures(init.pictures.len(), self.max_pictures())
+            );
+        }
         // One token per 16 pixels along each side for all but MiniMax-H3-
         // Image: 2x2 eight-pixel cells packed, or one sixteen-pixel cell.
         // Its tokens are 2x2 sixteen-pixel cells, 32 pixels.
@@ -2205,19 +2281,26 @@ impl Pipeline {
         // Whatever a previous, cancelled pass left behind is not this
         // picture's.
         let _ = self.take_stages();
-        // An attached picture under Qwen-Image 2.1 with its vision tower is
+        // Attached pictures under Qwen-Image 2.1 with its vision tower are
         // edited: read once here, placed in both prompts' prefixes, and the
         // picture drawn from noise over the whole schedule.
-        let reference = match (&request.init, self.edits()) {
-            (Some(init), true) => {
-                Some(self.prepare_reference(&init.bytes, request.width, request.height, cancel)?)
-            }
-            _ => None,
+        let references = match (&request.init, self.edits()) {
+            (Some(init), true) => init
+                .pictures
+                .iter()
+                .enumerate()
+                .map(|(i, bytes)| {
+                    self.prepare_reference(bytes, request.width, request.height, cancel)
+                        .with_context(|| format!("attached picture {}", i + 1))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            _ => Vec::new(),
         };
         let condition = |prompt: &str| -> Result<Condition> {
-            match &reference {
-                Some(reference) => self.condition_edit(prompt, reference, cancel),
-                None => self.condition(prompt, cancel),
+            if references.is_empty() {
+                self.condition(prompt, cancel)
+            } else {
+                self.condition_edit(prompt, &references, cancel)
             }
         };
         let positive = condition(&request.prompt)?;
@@ -2265,8 +2348,9 @@ impl Pipeline {
         let token_width = self.transformer_config().in_channels;
         let mut latents = noise.normals(n_tokens * token_width);
         let mut first_step = 0;
-        if let Some(init) = request.init.as_ref().filter(|_| reference.is_none()) {
-            let clean = self.latent_from_picture(&init.bytes, width, height, &mut noise, cancel)?;
+        if let Some(init) = request.init.as_ref().filter(|_| references.is_empty()) {
+            let clean =
+                self.latent_from_picture(init.first(), width, height, &mut noise, cancel)?;
             first_step = scheduler::first_step_for_strength(steps, init.strength);
             if first_step >= steps {
                 // Strength 0: nothing to run; the picture comes straight back
@@ -2376,7 +2460,8 @@ impl Pipeline {
             let previous = *rate;
             // An edit's encode is its own figure: the text-to-image one
             // stays what the last plain picture measured.
-            let edited = reference.as_ref().map(|r| r.rows * r.cols);
+            let edited = (!references.is_empty())
+                .then(|| references.iter().map(|r| r.rows * r.cols).sum::<usize>());
             let encode = timings.encode.as_secs_f64();
             *rate = Some(RateModel {
                 linear_per_token_pass: linear / token_passes,
@@ -2715,6 +2800,30 @@ pub(crate) fn unpack_patches(tokens: &[f32], h8: usize, w8: usize, channels: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_edit_tags_its_pictures_in_order() {
+        assert_eq!(
+            edit_picture_tags(1),
+            "<image1><|vision_start|><|image_pad|><|vision_end|>"
+        );
+        let two = edit_picture_tags(2);
+        assert_eq!(two.matches("<|image_pad|>").count(), 2);
+        assert!(two.find("<image1>").unwrap() < two.find("<image2>").unwrap());
+        assert!(edit_picture_tags(0).is_empty());
+    }
+
+    #[test]
+    fn the_pictures_a_request_may_carry_follow_the_model() {
+        assert_eq!(max_pictures(Variant::QwenImage21, true), usize::MAX);
+        assert_eq!(max_pictures(Variant::QwenImage21, false), 1);
+        assert_eq!(max_pictures(Variant::QwenImage, false), 1);
+        assert_eq!(max_pictures(Variant::Flux2Klein, false), 1);
+        assert_eq!(max_pictures(Variant::MossImage, false), 1);
+        assert_eq!(max_pictures(Variant::MiniMaxH3Image, false), 0);
+        assert!(too_many_pictures(2, 1).contains("starts from one"));
+        assert!(too_many_pictures(1, 0).contains("text alone"));
+    }
 
     #[test]
     fn a_small_minimax_h3_request_is_drawn_on_a_larger_canvas() {

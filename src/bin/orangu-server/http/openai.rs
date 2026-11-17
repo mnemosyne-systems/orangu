@@ -1827,8 +1827,8 @@ pub async fn chat_completions(
 }
 
 /// `/v1/chat/completions` on a `qwen_image` model: the last user message is
-/// the prompt, its last attached picture (an `image_url` content part) is
-/// what the picture starts from, and the assistant's answer is the picture
+/// the prompt, its attached pictures (`image_url` content parts) are what
+/// the picture starts from, and the assistant's answer is the picture
 /// as a markdown image over a `data:` URL — which any chat client that
 /// renders markdown shows inline, and which is also handed back raw under
 /// `message.images` for one that wants the bytes.
@@ -1849,16 +1849,14 @@ async fn image_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::r
     let Some(turn) = req.messages.iter().rev().find(|m| m.role == "user") else {
         return (StatusCode::BAD_REQUEST, "no user message to draw from").into_response();
     };
-    let init = match turn.images.last() {
-        Some(payload) => match super::images::decode_image_payload(payload) {
-            Ok(init) => Some(init),
-            Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
-        },
-        None => None,
+    let init = match super::images::decode_image_payloads(&turn.images) {
+        Ok(init) => init,
+        Err(err) => return (StatusCode::BAD_REQUEST, err).into_response(),
     };
     let request = match super::images::build_request(
         &pipeline.defaults(),
         pipeline.size_unit(),
+        pipeline.max_pictures(),
         super::images::ImageParams {
             prompt: &turn.content,
             negative_prompt: None,
