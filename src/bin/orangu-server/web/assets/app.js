@@ -1545,6 +1545,7 @@
               }
               addTimingFooter(assistantEl, payload.generation_ms, payload.content, tpsText(), payload.stats);
               if (payload.stats) showContextGauge(payload.stats);
+              if (payload.route) noteWorkersTurn(payload.route);
               state.versions = payload.versions || 0;
               state.activeVersion = payload.active_version || 0;
               turnFinished = true;
@@ -2599,6 +2600,21 @@
   const workersList = document.getElementById("workers-list");
   const workersHardware = document.getElementById("workers-hardware");
   const workersChannel = document.getElementById("workers-channel");
+  const workersGraph = document.getElementById("workers-graph");
+  const workersPanel = document.getElementById("workers-panel");
+  // The last console turn's routing and its time at each node, from its
+  // `done` event; drawn over the topology until the next turn replaces it.
+  let workersLastTurn = null;
+  // What each node of a channel is doing, as the scan reports it; `other`
+  // is the console's own word for a node serving a different model, which
+  // is never claimed whatever its state.
+  const workerStates = {
+    idle: "Idle",
+    leading: "Leading workers",
+    serving: "Working for another node",
+    worker_only: "Worker only (part of the model)",
+    other: "Another model — not used",
+  };
   document.getElementById("workers-refresh-btn").addEventListener("click", () => {
     openWorkers().catch((err) => { workersSummary.textContent = err.message; });
   });
@@ -2637,11 +2653,19 @@
     return layers ? `${layers[0]}–${layers[1] - 1}` : "—";
   }
 
+  // "layer 11" for a share of one, "layers 0–10" for more: a span from a
+  // layer to itself reads as a typo.
+  function layersLabel(layers) {
+    if (layers && layers[1] - layers[0] === 1) return `layer ${layers[0]}`;
+    return `layers ${layerSpan(layers)}`;
+  }
+
   function renderWorkers(status) {
     workersPlan.replaceChildren();
     workersList.replaceChildren();
     workersHardware.replaceChildren();
     workersChannel.replaceChildren();
+    workersGraph.replaceChildren();
     if (status.role === "none") {
       workersRole.textContent = "";
       workersSummary.textContent = "This server has no [workers] section; it runs every layer itself.";
@@ -2653,9 +2677,10 @@
     if (status.model) parts.push(status.quant ? `${status.model} · ${status.quant}` : status.model);
     if (status.listen) parts.push(`listening on ${status.listen}`);
     if (status.shares) parts.push(`shares by ${status.shares}`);
-    if (status.role === "worker") parts.push(`layers ${layerSpan(status.layers)} for a parent`);
+    if (status.role === "worker") parts.push(`${layersLabel(status.layers)} for a parent`);
     if (status.lost && status.lost.length) parts.push(`lost: ${status.lost.join(", ")}`);
     workersSummary.textContent = parts.join(" — ");
+    renderTopology(status);
     renderChannel(status);
     if (status.plan && status.plan.length) {
       workersPlan.appendChild(workersTable(
@@ -2687,7 +2712,8 @@
       ));
     } else {
       workersList.textContent = status.channel
-        ? "No workers claimed: a node claims them only for a model it cannot hold alone."
+        ? "No workers claimed: the node a request reaches divides the model over every free "
+          + "node of its channel, whatever the model's size, and this node has claimed none."
         : "No workers.";
     }
     // Every node's processors and measured speed: this one, then each
@@ -2715,6 +2741,264 @@
     }
   }
 
+  // A console turn just finished: keep where it ran, and redraw the pane
+  // when it is the one open, so the overlay follows the conversation.
+  function noteWorkersTurn(route) {
+    workersLastTurn = route;
+    if (!workersPanel.hidden) {
+      openWorkers().catch((err) => { workersSummary.textContent = err.message; });
+    }
+  }
+
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  function svgEl(name, attrs, text) {
+    const el = document.createElementNS(SVG_NS, name);
+    for (const [key, value] of Object.entries(attrs || {})) el.setAttribute(key, String(value));
+    if (text != null) el.textContent = text;
+    return el;
+  }
+
+  // The nodes and links the status describes, before any of it is placed:
+  // this node, the parent it works for, each worker it claimed with the
+  // nodes below that worker, its standbys, and every other node the scan
+  // found. A node is matched to its scan entry by name or by any of its
+  // addresses, since a worker's link names it by the address it was dialled
+  // on and the plan names it by its configured name.
+  function topologyModel(status) {
+    const found = status.found || [];
+    const plan = status.plan || [];
+    const claimed = new Set();
+    const scanned = (name, address) => found.find((f) => (name && f.name === name)
+      || (address && (f.address === address || (f.alternates || []).includes(address))));
+    const layersOf = (name) => {
+      const entry = plan.find((e) => e.node === name);
+      return entry ? entry.layers : null;
+    };
+    const node = (name, address, state) => {
+      const f = scanned(name, address);
+      if (f) claimed.add(f);
+      const label = name || (f && f.name) || address || "?";
+      return {
+        label,
+        keys: [name, address].concat(f ? [f.name, f.address, ...(f.alternates || [])] : []).filter(Boolean),
+        // A node of another model is never claimed, whatever it is busy
+        // with, so that is the one fact its colour gives.
+        state: f ? (f.same_model ? f.state : "other") : state,
+        load: f ? f.load : null,
+        layers: layersOf(label),
+        api: f ? f.api : null,
+        children: [],
+      };
+    };
+    const ownName = status.name || status.node;
+    const self = {
+      label: ownName,
+      keys: [status.name, status.node].filter(Boolean),
+      state: status.role === "worker" ? "serving" : (status.leading ? "leading" : "idle"),
+      load: status.load,
+      layers: status.role === "worker" ? status.layers : layersOf(ownName),
+      api: null,
+      self: true,
+      children: [],
+    };
+    const parent = status.parent
+      ? { node: node(status.parent.name, null, "leading"), suspect: status.parent.suspect }
+      : null;
+    const branches = (status.workers || []).map((w) => {
+      const n = node(w.name || (w.setups && w.setups[0] && w.setups[0].name), w.address, "serving");
+      // A worker's own setup comes first; the rest are the nodes below it.
+      n.children = (w.setups || []).slice(1).map((s) => node(s.name, null, "serving"));
+      return { node: n, kind: w.connected ? "claimed" : "lost", link: w.link, tls: w.tls };
+    }).concat((status.standby || []).map((w) => ({
+      node: node(null, w.address, "idle"),
+      kind: "standby",
+      link: null,
+      tls: null,
+    })));
+    const others = found.filter((f) => !claimed.has(f)).map((f) => node(f.name, f.address, f.state));
+    return { self, parent, branches, others };
+  }
+
+  // Settings › Workers' graph: the channel as this node sees it, in plain
+  // SVG drawn from the status, coloured by the theme's own variables.
+  function renderTopology(status) {
+    const model = topologyModel(status);
+    if (!status.channel && !model.branches.length && !model.parent) return;
+    const turn = workersLastTurn;
+    const all = [model.self, ...(model.parent ? [model.parent.node] : [])]
+      .concat(...model.branches.map((b) => [b.node, ...b.node.children]), model.others);
+    // The last turn's time at each node, matched by any name the node goes
+    // by; a time that matches no node drawn here still reaches the caption.
+    const stageOf = new Map();
+    const unplaced = [];
+    for (const stage of (turn && turn.workers) || []) {
+      const at = all.find((n) => n.keys.includes(stage.node));
+      if (at) stageOf.set(at, (stageOf.get(at) || 0) + stage.ms);
+      else unplaced.push(stage);
+    }
+    const routedTo = turn
+      ? (turn.routed_to ? all.find((n) => n.api === turn.routed_to) : model.self)
+      : null;
+
+    const width = 720;
+    const row = 86;
+    const top = 40;
+    const x = model.parent ? { parent: 80, self: 250, worker: 480, below: 650 }
+      : { self: 90, worker: 370, below: 610 };
+    const rows = model.branches.reduce((sum, b) => sum + Math.max(1, b.node.children.length), 0);
+    const treeHeight = Math.max(1, rows) * row;
+    const perLine = 6;
+    const otherRows = Math.ceil(model.others.length / perLine);
+    const othersTop = top + treeHeight + (otherRows ? 40 : 0);
+    const height = othersTop + otherRows * row + 20;
+
+    const svg = svgEl("svg", {
+      viewBox: `0 0 ${width} ${height}`,
+      class: "wk-graph",
+      role: "img",
+      "aria-label": "Topology of the workers channel",
+    });
+    const edges = svgEl("g");
+    const nodes = svgEl("g");
+    svg.append(edges, nodes);
+
+    const fmt = (ms) => (ms >= 100 ? `${Math.round(ms)} ms` : `${ms.toFixed(1)} ms`);
+    // A node's radius follows its load, so the busy ones stand out at a
+    // glance; a node that reports none is drawn at the smallest size.
+    const radius = (load) => 12 + 14 * Math.min(1, Math.max(0, load || 0));
+    const place = (n, px, py) => {
+      n.x = px;
+      n.y = py;
+      n.r = radius(n.load);
+    };
+    const drawNode = (n) => {
+      const g = svgEl("g", { class: "wk-node-group" });
+      const facts = [workerStates[n.state] || n.state];
+      if (n.load != null) facts.push(`load ${Math.round(n.load * 100)}%`);
+      if (n.layers) facts.push(layersLabel(n.layers));
+      if (stageOf.has(n)) facts.push(`last turn ${fmt(stageOf.get(n))}`);
+      if (n === routedTo) facts.push("the last console turn ran here");
+      g.appendChild(svgEl("title", {}, `${n.label}${n.self ? " (this node)" : ""}\n${facts.join("\n")}`));
+      if (n === routedTo) {
+        g.appendChild(svgEl("circle", { cx: n.x, cy: n.y, r: n.r + 6, class: "wk-routed" }));
+      }
+      g.appendChild(svgEl("circle", {
+        cx: n.x,
+        cy: n.y,
+        r: n.r,
+        class: `wk-node wk-${n.state in workerStates ? n.state : "other"}${n.self ? " wk-self" : ""}`,
+      }));
+      g.appendChild(svgEl("text", { x: n.x, y: n.y + n.r + 15, class: "wk-name" }, n.label));
+      const sub = [];
+      if (n.layers) sub.push(layersLabel(n.layers));
+      if (n.load != null) sub.push(`${Math.round(n.load * 100)}%`);
+      if (sub.length) {
+        g.appendChild(svgEl("text", { x: n.x, y: n.y + n.r + 29, class: "wk-sub" }, sub.join(" · ")));
+      }
+      if (stageOf.has(n)) {
+        g.appendChild(svgEl("text", { x: n.x, y: n.y - n.r - 10, class: "wk-stage" }, fmt(stageOf.get(n))));
+      }
+      nodes.appendChild(g);
+    };
+    const drawEdge = (a, b, kind, lines, active) => {
+      edges.appendChild(svgEl("line", {
+        x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+        class: `wk-edge wk-edge-${kind}${active ? " wk-edge-active" : ""}`,
+      }));
+      // Nearer the far end than the middle, where edges fanning out of one
+      // node have spread apart enough for two lines of text each. A plate
+      // in the graph's background sits under the text, sized from its
+      // length since the graph is not on the page yet to be measured.
+      const lx = a.x + (b.x - a.x) * 0.6;
+      const ly = a.y + (b.y - a.y) * 0.6;
+      if (lines.length) {
+        const w = Math.max(...lines.map((line) => line.length)) * 6 + 10;
+        const h = lines.length * 13 + 4;
+        edges.appendChild(svgEl("rect", {
+          x: lx - w / 2,
+          y: ly - 15 - (lines.length - 1) * 6,
+          width: w,
+          height: h,
+          rx: 4,
+          class: "wk-edge-plate",
+        }));
+      }
+      lines.forEach((line, i) => {
+        edges.appendChild(svgEl("text", {
+          x: lx,
+          y: ly - 5 + i * 13 - (lines.length - 1) * 6,
+          class: "wk-edge-label",
+        }, line));
+      });
+    };
+
+    place(model.self, x.self, top + treeHeight / 2);
+    if (model.parent) {
+      place(model.parent.node, x.parent, top + treeHeight / 2);
+      drawEdge(model.parent.node, model.self, model.parent.suspect ? "lost" : "claimed",
+        [model.parent.suspect ? "parent, not answering" : "parent"], false);
+    }
+    let at = 0;
+    for (const b of model.branches) {
+      const span = Math.max(1, b.node.children.length);
+      place(b.node, x.worker, top + (at + span / 2) * row);
+      b.node.children.forEach((c, i) => place(c, x.below, top + (at + i + 0.5) * row));
+      at += span;
+      let lines;
+      if (b.kind === "standby") lines = ["standby"];
+      else if (b.kind === "lost") lines = ["unreachable"];
+      else {
+        const timing = b.link
+          ? `${b.link.rtt_ms.toFixed(1)} ms · ${Math.round(b.link.mb_per_s)} MB/s`
+          : "not timed";
+        lines = [timing, b.tls ? "TLS" : "plain TCP"];
+      }
+      drawEdge(model.self, b.node, b.kind, lines, stageOf.has(b.node));
+      for (const c of b.node.children) drawEdge(b.node, c, "below", [], stageOf.has(b.node));
+    }
+    if (model.others.length) {
+      svg.appendChild(svgEl("text", { x: 12, y: othersTop - 16, class: "wk-band" }, "Elsewhere on the channel"));
+      const step = width / perLine;
+      model.others.forEach((n, i) => {
+        place(n, step / 2 + (i % perLine) * step, othersTop + 34 + Math.floor(i / perLine) * row);
+      });
+    }
+    for (const n of all) if (n.x != null) drawNode(n);
+    workersGraph.appendChild(svg);
+
+    const legend = document.createElement("div");
+    legend.className = "wk-legend";
+    for (const [state, text] of Object.entries(workerStates)) {
+      const item = document.createElement("span");
+      const swatch = document.createElement("i");
+      swatch.className = `wk-swatch wk-${state}`;
+      item.append(swatch, text);
+      legend.appendChild(item);
+    }
+    const sizes = document.createElement("span");
+    sizes.textContent = "Size: load · solid line: claimed link · dashed: unreachable · dotted: standby";
+    legend.appendChild(sizes);
+    workersGraph.appendChild(legend);
+
+    const caption = document.createElement("p");
+    caption.className = "mcps-note";
+    if (!turn) {
+      caption.textContent = "Send a console turn to see where it runs and its time at each node.";
+    } else {
+      const where = turn.routed_to
+        ? (routedTo ? routedTo.label : turn.routed_to)
+        : `${model.self.label} (this node)`;
+      const times = (turn.workers || []).map((s) => {
+        const at = all.find((n) => n.keys.includes(s.node));
+        return `${at ? at.label : s.node} ${fmt(s.ms)}`;
+      });
+      caption.textContent = `Last console turn: ran on ${where}`
+        + (times.length ? ` — ${times.join(", ")}` : " — no tree, the model ran on one node")
+        + (unplaced.length ? ". Times for nodes not drawn here are listed but not placed." : ".");
+    }
+    workersGraph.appendChild(caption);
+  }
+
   // The channel this node is on, how busy it is, and every other node the
   // last scan found: where requests go, and which nodes can be claimed.
   function renderChannel(status) {
@@ -2736,12 +3020,6 @@
       workersChannel.appendChild(document.createTextNode("No other node found on the channel yet."));
       return;
     }
-    const states = {
-      idle: "Idle",
-      leading: "Leading workers",
-      serving: "Working for another node",
-      worker_only: "Worker only (part of the model)",
-    };
     workersChannel.appendChild(workersTable(
       ["Node", "Address", "State", "Load", "Model", "Probe"],
       found.map((f) => [
@@ -2749,7 +3027,7 @@
         f.alternates && f.alternates.length
           ? `${f.address} (also ${f.alternates.join(", ")})`
           : f.address,
-        states[f.state] || f.state,
+        workerStates[f.state] || f.state,
         load(f.load),
         !f.same_model ? "Another model — not used" : (f.holds_model ? "Same, whole" : "Same"),
         f.probe_ms == null ? "—" : `${f.probe_ms.toFixed(1)} ms`,

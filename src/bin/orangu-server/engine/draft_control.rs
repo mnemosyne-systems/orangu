@@ -515,6 +515,18 @@ mod tests {
 
     /// Prices for these tests under a drafter id of their own, so tests
     /// running together do not read each other's.
+    /// Held by every test that sets prices for the length to follow: the
+    /// prices are one table for the process, and a test running beside
+    /// another that notes a different step price on the same key would read
+    /// that one's.
+    static PRICING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn pricing() -> std::sync::MutexGuard<'static, ()> {
+        PRICING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn priced(drafter: u8, sharing: usize, in_batch: bool, step: f64, verify: &[(usize, f64)]) {
         let ms = |v: f64| Duration::from_secs_f64(v / 1000.0);
         for _ in 0..3 {
@@ -562,6 +574,7 @@ mod tests {
     /// at the same prices.
     #[test]
     fn the_draft_length_follows_acceptance_by_depth() {
+        let _pricing = pricing();
         let verify: Vec<(usize, f64)> = LENGTHS
             .iter()
             .map(|&l| (l + 1, 20.0 + 2.0 * l as f64))
@@ -583,6 +596,7 @@ mod tests {
     /// behind the first are not assumed likelier than it.
     #[test]
     fn a_few_misses_stop_the_verifies() {
+        let _pricing = pricing();
         let verify: Vec<(usize, f64)> = LENGTHS.iter().map(|&l| (l + 1, 12.0 + l as f64)).collect();
         priced(211, 1, false, 10.0, &verify);
         let mut c = DraftControl::with(true, 211);
@@ -668,6 +682,7 @@ mod tests {
     /// once in [`PROBE_EVERY`].
     #[test]
     fn a_losing_verify_is_probed_now_and_then() {
+        let _pricing = pricing();
         let verify: Vec<(usize, f64)> = LENGTHS.iter().map(|&l| (l + 1, 100.0)).collect();
         priced(203, 1, false, 16.0, &verify);
         let mut c = DraftControl::with(true, 203);
@@ -682,6 +697,7 @@ mod tests {
     /// has to beat every row of the step on its own.
     #[test]
     fn a_verify_in_the_batch_is_charged_only_what_it_adds() {
+        let _pricing = pricing();
         let verify: Vec<(usize, f64)> = LENGTHS.iter().map(|&l| (l + 1, 36.0)).collect();
         priced(204, 4, false, 30.0, &verify);
         priced(204, 4, true, 30.0, &verify);
@@ -697,6 +713,7 @@ mod tests {
     /// plain step is timed again.
     #[test]
     fn the_plain_step_is_priced_and_priced_again() {
+        let _pricing = pricing();
         let mut c = DraftControl::with(true, 205);
         assert_eq!(c.decide(9, false, 4), Some(4));
         c.verifies = VERIFIES_BEFORE_A_TIMED_STEP;

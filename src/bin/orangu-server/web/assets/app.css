@@ -16,6 +16,12 @@
   --assistant-bubble: #ffffff;
   --error: #d92d20;
   --radius: 10px;
+  /* The workers topology's node states (Settings › Workers). */
+  --wk-idle: #16a34a;
+  --wk-leading: #7c3aed;
+  --wk-serving: #d97706;
+  --wk-worker-only: #0d9488;
+  --wk-other: #9ca3af;
 
   /* The "orangu" brand brown — the header/footer bars, deliberately the
      same in light and dark mode (a brand color, not a theme color), so
@@ -39,6 +45,11 @@
     --user-bubble: #2b3a55;
     --assistant-bubble: #23272e;
     --error: #ff6b6b;
+    --wk-idle: #4ade80;
+    --wk-leading: #a78bfa;
+    --wk-serving: #fbbf24;
+    --wk-worker-only: #2dd4bf;
+    --wk-other: #6b7280;
   }
 }
 
@@ -54,6 +65,11 @@
   --user-bubble: #dbe6ff;
   --assistant-bubble: #ffffff;
   --error: #d92d20;
+  --wk-idle: #16a34a;
+  --wk-leading: #7c3aed;
+  --wk-serving: #d97706;
+  --wk-worker-only: #0d9488;
+  --wk-other: #9ca3af;
 }
 
 :root[data-theme="dark"] {
@@ -68,6 +84,11 @@
   --user-bubble: #2b3a55;
   --assistant-bubble: #23272e;
   --error: #ff6b6b;
+  --wk-idle: #4ade80;
+  --wk-leading: #a78bfa;
+  --wk-serving: #fbbf24;
+  --wk-worker-only: #2dd4bf;
+  --wk-other: #6b7280;
 }
 
 * {
@@ -1501,6 +1522,32 @@ button:disabled {
 .workers-table { color: var(--text-dim); font-size: .9rem; overflow-x: auto; }
 .workers-table table { width: 100%; border-collapse: collapse; color: var(--text); font-size: 1rem; }
 .workers-table th, .workers-table td { padding: .55rem; border-bottom: 1px solid var(--border); text-align: left; }
+/* The topology graph: drawn in SVG by app.js (`renderTopology`). It keeps a
+   readable size and scrolls inside its own box on a narrow screen, rather
+   than shrinking its labels or widening the page. Labels carry a halo in the
+   graph's background so an edge passing under one does not cross it out. */
+.workers-graph { overflow-x: auto; }
+.wk-graph { display: block; width: 100%; min-width: 560px; height: auto; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius); }
+.wk-graph text { text-anchor: middle; font-size: 12px; fill: var(--text); paint-order: stroke; stroke: var(--bg); stroke-width: 3px; stroke-linejoin: round; }
+.wk-graph .wk-sub, .wk-graph .wk-edge-label { font-size: 11px; fill: var(--text-dim); }
+.wk-graph .wk-band { text-anchor: start; font-size: 11px; fill: var(--text-dim); text-transform: uppercase; letter-spacing: .04em; }
+.wk-graph .wk-stage { font-weight: 600; fill: var(--accent); }
+.wk-node { stroke-width: 2px; }
+.wk-edge-plate { fill: var(--bg); }
+.wk-routed { fill: none; stroke: var(--accent); stroke-width: 3px; }
+.wk-edge { stroke: var(--text-dim); stroke-width: 1.5px; }
+.wk-edge-lost { stroke: var(--error); stroke-dasharray: 6 4; }
+.wk-edge-standby { stroke-dasharray: 2 4; }
+.wk-edge-active { stroke: var(--accent); stroke-width: 3px; }
+.wk-idle { fill: var(--wk-idle); stroke: var(--wk-idle); background: var(--wk-idle); }
+.wk-leading { fill: var(--wk-leading); stroke: var(--wk-leading); background: var(--wk-leading); }
+.wk-serving { fill: var(--wk-serving); stroke: var(--wk-serving); background: var(--wk-serving); }
+.wk-worker_only { fill: var(--wk-worker-only); stroke: var(--wk-worker-only); background: var(--wk-worker-only); }
+.wk-other { fill: var(--wk-other); stroke: var(--wk-other); background: var(--wk-other); }
+.wk-node.wk-self { stroke: var(--text); stroke-width: 2.5px; }
+.wk-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; color: var(--text-dim); font-size: .85rem; }
+.wk-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.wk-swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
 .workers-table th { font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }
 #mcps-table th, #mcps-table td { padding: .55rem; border-bottom: 1px solid var(--border); text-align: left; }
 #mcps-table th { font-size: 0.78em; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-dim); }

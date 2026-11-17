@@ -414,6 +414,12 @@ impl ChildLink {
         self.live().is_some()
     }
 
+    /// Whether this link dials its worker over TLS: what `/v1/workers`
+    /// reports, so a reader can tell an encrypted link from a plain one.
+    pub fn tls(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| t.client.is_some())
+    }
+
     /// The worker's handshake answer, while connected.
     pub fn info(&self) -> Option<ChildInfo> {
         if !self.is_connected() {

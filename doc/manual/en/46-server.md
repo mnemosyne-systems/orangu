@@ -2887,7 +2887,11 @@ not reused there: a file holds only this node's rows.
 `GET /v1/workers` shows a node's place in its tree: its role, the layers
 it runs, the plan below it and what its shares followed, each configured
 worker, the processors and measured speed of every node, and any worker
-the plan has lost; the web console shows the same under **Settings › Workers**.
+the plan has lost; the web console shows the same under **Settings › Workers**,
+with a graph of the channel above the tables: nodes coloured by state and
+sized by load, the claimed links with their round trip, bandwidth and
+encryption, and where the last console turn ran with its time at each node
+(see the workers chapter).
 `/metrics` adds the `orangu_server_worker*` families: per worker,
 the round trip of a forward, bytes each way, failures, and whether it is
 up; per node, plans and mid-request recoveries. When a request finishes,
@@ -5141,9 +5145,12 @@ Naming an active session explicitly refuses rather than deleting it. `-y`/`--yes
 
 ## Shutting it down
 
-Three equivalent ways: `Ctrl+C`, `SIGINT` (`kill -INT <pid>`), or
-`POST /v1/shutdown` (loopback-only — refused from a non-localhost peer, the
-same safety rule `orangu-coordinator`'s own shutdown endpoint uses). Both
+Four equivalent ways: `Ctrl+C`, `SIGINT` (`kill -INT <pid>`), `SIGTERM`
+(`kill <pid>`, what a service manager sends), or `POST /v1/shutdown`
+(loopback-only — refused from a non-localhost peer, the same safety rule
+`orangu-coordinator`'s own shutdown endpoint uses). On the way out the
+server keeps its prefix caches: `ORANGU_PREFIX_CACHE_DIR`'s snapshot, and a
+`[workers]` tree's saved on every node. Both
 the API and (if enabled) the web UI listener stop together, and the
 process is gone within a few seconds whatever it was doing: a picture in
 flight stops at its next transformer block or VAE layer rather than at its

@@ -1258,7 +1258,7 @@ async fn send_message(
             match crate::http::peer::generate_on(&base, state.api_key.as_deref(), &peer).await {
                 Ok(rx) => {
                     log::debug!("orangu-server: workers: routed a console turn to {base}");
-                    Some(rx)
+                    Some((rx, base))
                 }
                 Err(err) => {
                     log::warn!(
@@ -1271,9 +1271,9 @@ async fn send_message(
         }
         _ => None,
     };
-    let mut rx = match routed {
-        Some(rx) => rx,
-        None => {
+    let (mut rx, routed_to) = match routed {
+        Some((rx, base)) => (rx, Some(base)),
+        None => (
             state
                 .engine
                 .generate(GenerateRequest {
@@ -1298,8 +1298,9 @@ async fn send_message(
                     timings_per_token: false,
                     ..Default::default()
                 })
-                .await
-        }
+                .await,
+            None,
+        ),
     };
 
     let user_message = req.content;
@@ -1379,7 +1380,7 @@ async fn send_message(
                     }
                     let truncated = finish_reason == FinishReason::Length;
                     yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "done", "html": html, "reasoning_html": reasoning_html, "content": full, "reasoning": reasoning, "truncated": truncated, "generation_ms": generation_ms, "stats": answer_stats, "versions": session.turn_versions.len(), "active_version": session.active_version}).to_string()));
+                        .data(json!({"type": "done", "html": html, "reasoning_html": reasoning_html, "content": full, "reasoning": reasoning, "truncated": truncated, "generation_ms": generation_ms, "stats": answer_stats, "route": turn_route(&stats, routed_to.as_deref()), "versions": session.turn_versions.len(), "active_version": session.active_version}).to_string()));
                     break;
                 }
                 StreamEvent::Overloaded => {
@@ -1781,6 +1782,23 @@ fn html_delta<'a>(sent: &str, current: &'a str) -> (usize, &'a str) {
     (keep_utf16, &current[keep_bytes..])
 }
 
+/// Where a console turn ran, for the topology view in Settings › Workers:
+/// `routed_to` is the API address of the channel node the turn was sent to
+/// (the address an API answer names in `x-orangu-routed-to`), `null` when it
+/// ran here, and `workers` is the turn's time at each node of the tree that
+/// served it, in the shape of an API answer's `timings.workers` — empty when
+/// that node runs the model alone.
+fn turn_route(
+    stats: &crate::engine::generate::GenerateStats,
+    routed_to: Option<&str>,
+) -> serde_json::Value {
+    let timings = crate::http::openai::timings_json(stats);
+    json!({
+        "routed_to": routed_to,
+        "workers": timings.get("workers").cloned().unwrap_or_else(|| json!([])),
+    })
+}
+
 /// The prompt for this turn and, for a model whose state cannot be rewound,
 /// the same conversation rendered without the generation prompt when that
 /// is a prefix of it — the end of the turn the next one repeats. With a
@@ -2022,6 +2040,37 @@ mod tests {
     }
 
     /// Nothing rendered yet: keep nothing, send everything.
+    /// A turn served here by a tree names each node's time and no routing;
+    /// a turn sent elsewhere names the node's API address; a turn without a
+    /// tree carries an empty list rather than none, so the console reads
+    /// one shape.
+    #[test]
+    fn a_turn_route_names_the_node_and_each_stage() {
+        use std::time::Duration;
+        let mut stats = crate::engine::generate::GenerateStats {
+            prompt_tokens: 3,
+            cached_tokens: 0,
+            prompt_time: Duration::from_millis(5),
+            generated_tokens: 2,
+            generate_time: Duration::from_millis(7),
+            dropped_tokens: 0,
+            workers: Vec::new(),
+        };
+        let alone = super::turn_route(&stats, None);
+        assert!(alone["routed_to"].is_null());
+        assert_eq!(alone["workers"], json!([]));
+
+        stats.workers = vec![
+            ("top".to_string(), Duration::from_millis(12)),
+            ("10.0.0.2:8400".to_string(), Duration::from_millis(31)),
+        ];
+        let routed = super::turn_route(&stats, Some("http://10.0.0.3:8400"));
+        assert_eq!(routed["routed_to"], "http://10.0.0.3:8400");
+        assert_eq!(routed["workers"][0]["node"], "top");
+        assert_eq!(routed["workers"][1]["node"], "10.0.0.2:8400");
+        assert_eq!(routed["workers"][1]["ms"], 31.0);
+    }
+
     #[test]
     fn the_first_delta_is_the_whole_render() {
         assert_eq!(super::html_delta("", "<p>Hi</p>"), (0, "<p>Hi</p>"));

@@ -1918,6 +1918,9 @@ impl Node {
                     "failures_in_a_row": link.failures_in_a_row(),
                     "left_out_seconds": link.out_for().map(|left| left.as_secs()),
                     "node": info.as_ref().map(|i| i.node.clone()),
+                    // Its name as plans print it, so a reader can match the
+                    // worker to the channel's nodes and the plan's entries.
+                    "name": info.as_ref().and_then(|i| i.capacity.setups.first()).map(|s| s.name.clone()),
                     "metrics": metrics,
                     "subtree_nodes": info.as_ref().map(|i| i.capacity.subtree_nodes),
                     "features": info.as_ref().map(|i| super::protocol::feature_names(i.features)),
@@ -1927,6 +1930,7 @@ impl Node {
                         "rtt_ms": rtt.as_secs_f64() * 1e3,
                         "mb_per_s": bandwidth / 1e6,
                     })),
+                    "tls": link.tls(),
                 })
             })
             .collect();
@@ -4248,6 +4252,10 @@ mod tests {
 
     /// A node that answers at two addresses is found once, and claimed once.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS answers on 127.0.0.1 alone, not the rest of 127.0.0.0/8"
+    )]
     fn a_node_at_two_addresses_is_claimed_once() {
         let mut s = on_channel("beta", "lab", &[], true);
         s.listen = Some("0.0.0.0:0".to_string());
@@ -5056,6 +5064,7 @@ mod tests {
         );
         let info = link.connect(Some("s"), &["x".to_string()]).unwrap();
         assert!(info.link.is_some_and(|(_, bandwidth)| bandwidth > 0.0));
+        assert!(link.tls());
         let data: Vec<u8> = (0..4usize << 20).map(|i| i as u8).collect();
         match link.request(&Message::Echo { data: data.clone() }) {
             Ok(Message::Echo { data: back }) => assert!(back == data),
@@ -5430,6 +5439,12 @@ mod tests {
         assert_eq!(status["shares"], "decode speed");
         assert_eq!(status["setup"]["decode_gb_per_s"], 2.0);
         assert_eq!(status["workers"][1]["setups"][0]["name"], "b");
+        // What the console's topology view draws an edge from: the worker's
+        // name, its link's timing and whether the link is encrypted.
+        assert_eq!(status["workers"][1]["name"], "b");
+        assert_eq!(status["workers"][1]["tls"], false);
+        assert!(status["workers"][1]["link"]["rtt_ms"].is_number());
+        assert!(status["workers"][1]["link"]["mb_per_s"].is_number());
         assert_eq!(
             run(split.as_ref(), &tokens, 5),
             run(fixture::model().as_ref(), &tokens, 5)

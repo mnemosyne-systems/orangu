@@ -3062,6 +3062,12 @@ pub trait RemoteLayers: Send + Sync {
     fn fork_new(&self, _from: u64, _len: usize) -> Option<u64> {
         None
     }
+    /// How many of `session`'s first positions every node holds on the
+    /// host, where a copy is made from: a decode on a device may keep its
+    /// rows there alone.
+    fn host_len(&self, _session: u64) -> usize {
+        usize::MAX
+    }
     /// Every node is to keep `session` until it is released (`held`), past
     /// its own eviction — or may evict it again as any other (`!held`).
     fn hold(&self, _session: u64, _held: bool) {}
@@ -3933,14 +3939,23 @@ impl KvCache {
 
     /// A copy of this cache that owns its rows everywhere: [`Self::duplicate`]
     /// plus, for a cache with remote rows, a new session on the workers
-    /// holding a copy of the first `len` of them ([`RemoteLayers::fork_new`]).
+    /// holding a copy of the first `len` of them ([`RemoteLayers::fork_new`]),
+    /// or, when a node refuses those, of as many as every node holds on the
+    /// host ([`RemoteLayers::host_len`]): the copy's `remote.len` says which.
     /// `None` when the workers cannot make one — their sessions are full, or
     /// they cannot copy. A cache with no remote rows always copies.
     pub fn share(&self, len: usize) -> Option<Self> {
         let mut copy = self.duplicate();
         if let Some(remote) = &self.remote {
-            let len = len.min(remote.len);
-            let id = remote.owner.fork_new(remote.id, len)?;
+            let full = len.min(remote.len);
+            // A node whose device kept a decode's rows refuses them; the
+            // positions every node holds on the host still make a copy.
+            let host = remote.owner.host_len(remote.id).min(full);
+            let (id, len) = match remote.owner.fork_new(remote.id, full) {
+                Some(id) => (id, full),
+                None if host > 0 && host < full => (remote.owner.fork_new(remote.id, host)?, host),
+                None => return None,
+            };
             copy.remote = Some(Box::new(RemoteSession {
                 id,
                 len,

@@ -29,7 +29,9 @@ pub struct PeerGenerate {
 }
 
 /// One [`StreamEvent`] on the wire. Progress, timings and log
-/// probabilities are not sent: the console shows none of them.
+/// probabilities are not sent: the console shows none of them. The finished
+/// answer does carry where its forwards spent their time, which the
+/// console's topology view of the channel overlays.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum PeerEvent {
@@ -42,6 +44,10 @@ enum PeerEvent {
         generated_tokens: usize,
         generate_ms: u64,
         length: bool,
+        /// [`GenerateStats::workers`] in microseconds. Absent from a node
+        /// that does not send it, which reads as no tree.
+        #[serde(default)]
+        workers: Vec<(String, u64)>,
     },
     Overloaded,
     NoRoom(String),
@@ -63,6 +69,11 @@ impl PeerEvent {
                 generated_tokens: stats.generated_tokens,
                 generate_ms: stats.generate_time.as_millis() as u64,
                 length: finish_reason == FinishReason::Length,
+                workers: stats
+                    .workers
+                    .iter()
+                    .map(|(node, t)| (node.clone(), t.as_micros() as u64))
+                    .collect(),
             },
             StreamEvent::Overloaded => Self::Overloaded,
             StreamEvent::NoRoom(text) => Self::NoRoom(text),
@@ -84,6 +95,7 @@ impl PeerEvent {
                 generated_tokens,
                 generate_ms,
                 length,
+                workers,
             } => StreamEvent::Done {
                 stats: GenerateStats {
                     prompt_tokens,
@@ -92,7 +104,10 @@ impl PeerEvent {
                     generated_tokens,
                     generate_time: Duration::from_millis(generate_ms),
                     dropped_tokens: 0,
-                    workers: Vec::new(),
+                    workers: workers
+                        .into_iter()
+                        .map(|(node, us)| (node, Duration::from_micros(us)))
+                        .collect(),
                 },
                 finish_reason: if length {
                     FinishReason::Length
@@ -241,7 +256,7 @@ mod tests {
             generated_tokens: 7,
             generate_time: Duration::from_millis(90),
             dropped_tokens: 0,
-            workers: Vec::new(),
+            workers: vec![("b:8400".into(), Duration::from_micros(31_250))],
         };
         let sent = [
             StreamEvent::Reasoning("hm".into()),
@@ -267,9 +282,27 @@ mod tests {
                     assert_eq!((stats.prompt_tokens, stats.cached_tokens), (12, 4));
                     assert_eq!(stats.generated_tokens, 7);
                     assert_eq!(stats.generate_time, Duration::from_millis(90));
+                    assert_eq!(
+                        stats.workers,
+                        vec![("b:8400".to_string(), Duration::from_micros(31_250))]
+                    );
                 }
                 _ => panic!("an event changed kind on the wire"),
             }
+        }
+    }
+
+    /// A node that sends no stage times still ends its answer: it reads as
+    /// one served without a tree.
+    #[test]
+    fn a_done_without_stage_times_reads_as_no_tree() {
+        let line = r#"{"done":{"prompt_tokens":1,"cached_tokens":0,"prompt_ms":2,"generated_tokens":3,"generate_ms":4,"length":false}}"#;
+        match serde_json::from_str::<PeerEvent>(line)
+            .unwrap()
+            .into_event()
+        {
+            StreamEvent::Done { stats, .. } => assert!(stats.workers.is_empty()),
+            _ => panic!("a done event changed kind on the wire"),
         }
     }
 

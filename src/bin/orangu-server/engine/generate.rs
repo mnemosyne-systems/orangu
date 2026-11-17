@@ -1396,8 +1396,12 @@ pub(crate) fn keep_finished(
             } else {
                 store.retain(slot, history.clone(), final_cache);
             }
+            // A copy may hold fewer positions than the conversation — those
+            // every node had on the host — and its entry no more tokens.
             if let Some(copy) = copy {
-                pool.store(history, copy);
+                let mut tokens = history;
+                tokens.truncate(copy.remote.as_ref().map_or(len, |remote| remote.len));
+                pool.store(tokens, copy);
             }
         }
         (Some(pool), Some(store)) => {

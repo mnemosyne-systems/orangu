@@ -5279,6 +5279,11 @@ async fn serve(prepared: Prepared) -> Result<()> {
         _ = wait_for_sigint() => {
             log::info!("shutting down");
         }
+        // What `kill` and a service manager send: the same way out, so what
+        // is kept on the way — the prefix caches — is kept.
+        _ = wait_for_sigterm() => {
+            log::info!("shutting down");
+        }
     }
 
     // A picture in flight runs on a blocking thread the runtime joins on the
@@ -6715,6 +6720,23 @@ async fn wait_for_sigint() {
 
 #[cfg(not(unix))]
 async fn wait_for_sigint() {
+    std::future::pending::<()>().await
+}
+
+/// `SIGTERM`, as `kill` and a service manager send it.
+#[cfg(unix)]
+async fn wait_for_sigterm() {
+    use tokio::signal::unix::{SignalKind, signal};
+    match signal(SignalKind::terminate()) {
+        Ok(mut sig) => {
+            sig.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_sigterm() {
     std::future::pending::<()>().await
 }
 

@@ -386,11 +386,32 @@ server's.
   node's prefix cache keeps there. A top-level node adds `prefix_cache`:
   the entries its prefix cache holds, its `hits` and `misses`, and
   `tokens_held`. A worker adds `retained_sessions`: how many sessions it keeps for its
-  parent's prefix cache, and their bytes.
-- **Settings › Workers** in the web console: the same, as tables — the
-  channel with this node's load, every node found with its address and
-  alternates, state, load and whether it serves the same model, then the
-  plan, the workers and their hardware.
+  parent's prefix cache, and their bytes. Each entry of `workers` also
+  carries the worker's `name` as plans print it, its `link` as timed after
+  the handshake (`rtt_ms`, the round trip, and `mb_per_s`, the bandwidth
+  each way) and `tls`, whether the link is encrypted.
+- **Settings › Workers** in the web console: the same, as a graph above
+  the tables. The graph draws this node, the parent it works for, each
+  worker it claimed with the nodes below that worker, its standbys, and
+  under *Elsewhere on the channel* every other node the scan found:
+
+  | On the graph | Shows |
+  |---|---|
+  | Node colour | its state: idle, leading workers, working for another node, worker only, or another model (never claimed) |
+  | Node size | its load: a busier node is drawn larger |
+  | Under a node | its name, the layers the plan gives it, and its load |
+  | Outlined node | this node |
+  | Line to a worker | a claimed link, labelled with its round trip, bandwidth and `TLS` or `plain TCP`; dashed when the worker is unreachable, dotted for a standby |
+  | Ring around a node | the node the last console turn ran on: this one, or the node of the channel it was routed to (the address an API answer names in `x-orangu-routed-to`) |
+  | Time above a node | the last console turn's `timings.workers` time there; the lines it crossed are highlighted |
+
+  Hovering a node lists the same facts. The caption under the graph names
+  where the last console turn ran and every stage time, including any
+  for a node the graph does not draw. The overlay follows each console
+  turn; *Refresh* reads the channel again. Below the graph, the tables
+  list the channel with this node's load, every node found with its
+  address and alternates, state, load and whether it serves the same
+  model, then the plan, the workers and their hardware.
 - `GET /ready`: `serving a parent orangu-server` on a worker, or
   `serving a parent orangu-server that does not answer` while its parent is
   suspect; `a worker was lost` on a node whose plan lost one and has not repaired
@@ -571,6 +592,14 @@ prompt, the node drops its oldest entry, which frees the entry's session on
 every worker, and asks again, until the cache is empty; only then is the
 prompt refused. When the workers cannot make a copy, the conversation is not
 added to the cache, and its slot still keeps it.
+
+A worker that decodes on its GPU keeps the reply's rows of some layers — a
+sliding window's — on the device alone, and copies only what it holds on
+the host. The copy then takes the conversation's positions every node wrote
+with its prompts, and the entry keeps those tokens: a shared system prompt
+and the turns before the last reply, which is what a new conversation
+shares. The slot's own next turn reuses the reply as well. Each copy the
+workers refuse outright is logged (`no prefix pool copy of …`).
 
 ### Saved across a release
 

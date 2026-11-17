@@ -1031,6 +1031,11 @@ struct SessionState {
     rebuilt: bool,
     /// The positions its prompt was promised, for a rebuild to ask for again.
     promised: usize,
+    /// Its first positions that every node holds on the host: written by
+    /// prompt forwards from position 0 without a gap. A decode on a worker's
+    /// device can keep its rows there alone (a sliding window's ring), so
+    /// decoded positions do not count.
+    host: usize,
     prefill: Trace,
     decode: Trace,
 }
@@ -1094,6 +1099,14 @@ impl RemoteLayers for SessionOwner {
         self.pipeline.truncate(session, len);
     }
 
+    fn host_len(&self, session: u64) -> usize {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .map_or(0, |state| state.host)
+    }
+
     /// Both sequences must be on this owner's pipeline, and `from` must
     /// hold the tokens: `to` takes them as its own, to be rebuilt from.
     fn fork(&self, from: u64, to: u64, len: usize) -> bool {
@@ -1129,7 +1142,7 @@ impl RemoteLayers for SessionOwner {
         );
         if held >= reserve {
             log::info!(
-                "orangu-server: workers: the prefix pool keeps no copy: the workers keep {reserve} \
+                "orangu-server: workers: no prefix pool copy of {len} positions: the workers keep {reserve} \
                  sessions for it, and {held} are held"
             );
             return None;
@@ -1139,7 +1152,7 @@ impl RemoteLayers for SessionOwner {
             let mut sessions = self.sessions.lock().unwrap();
             let Some(source) = sessions.get(&from).filter(|s| s.tokens.len() >= len) else {
                 log::info!(
-                    "orangu-server: workers: the prefix pool keeps no copy: session {from} holds {} \
+                    "orangu-server: workers: no prefix pool copy of {len} positions: session {from} holds {} \
                      of the {len} positions",
                     sessions.get(&from).map_or(0, |s| s.tokens.len())
                 );
@@ -1150,13 +1163,30 @@ impl RemoteLayers for SessionOwner {
                 tokens: source.tokens[..len].to_vec(),
                 rebuilt: false,
                 promised: 0,
+                host: len,
                 prefill: Trace::default(),
                 decode: Trace::default(),
             };
             sessions.insert(to, state);
         }
         if let Err(error) = self.pipeline.fork(from, to, len) {
-            log::info!("orangu-server: workers: the prefix pool keeps no copy: {error:#}");
+            // A node that decoded on a device holds a reply's rows there alone:
+            // the copy is asked again at what every node holds on the host
+            // (`KvCache::share`), so that refusal is no news.
+            let decoded_on_a_device = error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<WorkerError>())
+                .is_some_and(|e| e.code == ErrorCode::PositionMismatch);
+            let state_host = self.host_len(from);
+            if decoded_on_a_device && state_host < len {
+                log::debug!(
+                    "orangu-server: workers: no prefix pool copy of {len} positions: {error:#}"
+                );
+            } else {
+                log::info!(
+                    "orangu-server: workers: no prefix pool copy of {len} positions: {error:#}"
+                );
+            }
             self.sessions.lock().unwrap().remove(&to);
             self.pipeline.release(to);
             return None;
@@ -1560,7 +1590,7 @@ impl DelegatingModel {
                 Ok(tokens) => tokens,
                 Err(error) => {
                     log::warn!(
-                        "orangu-server: workers: a saved prefix is dropped on every node:                          {error:#}"
+                        "orangu-server: workers: a saved prefix is dropped on every node: {error:#}"
                     );
                     drop(cache);
                     pipeline.forget(key);
@@ -1573,6 +1603,8 @@ impl DelegatingModel {
             }
             if let Some(state) = self.sessions.lock().unwrap().get_mut(&session) {
                 state.tokens = tokens.clone();
+                // Opened from files: on the host on every node.
+                state.host = tokens.len();
             }
             pool.store(tokens, cache);
             self.saved.keys.lock().unwrap().insert(session, key.clone());
@@ -1626,6 +1658,8 @@ impl DelegatingModel {
             session,
             SessionState {
                 generation,
+                // Replayed or loaded from files: written as a prompt is.
+                host: tokens.len(),
                 tokens,
                 rebuilt: false,
                 promised: 0,
@@ -1829,6 +1863,11 @@ impl DelegatingModel {
                     {
                         state.tokens.truncate(start_pos);
                         state.tokens.extend_from_slice(tokens);
+                        state.host = if tokens.len() > 1 && start_pos <= state.host {
+                            start_pos + tokens.len()
+                        } else {
+                            state.host.min(start_pos)
+                        };
                         let total = if tokens.len() > 1 {
                             &mut state.prefill
                         } else {
@@ -1978,6 +2017,7 @@ impl ModelForward for DelegatingModel {
             {
                 state.tokens.truncate(row.pos);
                 state.tokens.push(token);
+                state.host = state.host.min(row.pos);
                 state.decode.forwards += 1;
                 state.decode.tokens += 1;
                 for (name, elapsed) in &trace.parts {
@@ -2991,6 +3031,103 @@ mod tests {
         drop(next);
         slots.clear();
         assert_eq!(leaf.len(), 0);
+    }
+
+    /// A worker that, as one decoding on a device, holds a session's decoded
+    /// rows there alone: it copies no more than the prompt's positions.
+    struct DeviceDecode {
+        inner: Box<dyn Stage>,
+        host: usize,
+    }
+
+    impl Stage for DeviceDecode {
+        fn layers(&self) -> Range<usize> {
+            self.inner.layers()
+        }
+
+        fn name(&self) -> String {
+            self.inner.name()
+        }
+
+        fn forward(
+            &self,
+            session: u64,
+            hidden: Vec<f32>,
+            tokens: &[u32],
+            start_pos: usize,
+            rows: Rows,
+        ) -> Result<Vec<f32>> {
+            self.inner.forward(session, hidden, tokens, start_pos, rows)
+        }
+
+        fn truncate(&self, session: u64, len: usize) {
+            self.inner.truncate(session, len);
+        }
+
+        fn release(&self, session: u64) {
+            self.inner.release(session);
+        }
+
+        fn fork(&self, from: u64, to: u64, len: usize) -> Result<()> {
+            anyhow::ensure!(
+                len <= self.host,
+                "holds {} positions on the host",
+                self.host
+            );
+            self.inner.fork(from, to, len)
+        }
+
+        fn retain(&self, session: u64, held: bool) {
+            self.inner.retain(session, held);
+        }
+
+        fn pool_reserve(&self) -> usize {
+            self.inner.pool_reserve()
+        }
+    }
+
+    /// A worker that refuses a conversation's decoded rows still gives the
+    /// pool a copy of the prompt's, which every node holds on the host: the
+    /// entry keeps those tokens, and a prompt sharing them is served from it
+    /// with the answer a model alone gives.
+    #[test]
+    fn a_worker_decoding_on_a_device_gives_the_pool_its_prompt_rows() {
+        use crate::engine::slot_store::SlotStore;
+        let model = fixture::model();
+        let leaf = Arc::new(SessionStore::new(
+            Arc::new(LayerPipeline::new(model, 2..4, vec![]).unwrap()),
+            N_CTX,
+            8,
+        ));
+        let split = delegating(
+            0..2,
+            vec![Box::new(DeviceDecode {
+                inner: Box::new(LoopbackStage::new(leaf.clone(), ActivationFormat::F32)),
+                host: 5,
+            })],
+        );
+        let pool = PrefixCache::new(crate::engine::prefix_cache::ENTRIES);
+        let slots = SlotStore::at(std::path::PathBuf::new(), String::new(), 2);
+        let history = finish_first_turn(&split, &pool, &slots);
+        assert_eq!(pool.stats().entries, 1);
+        assert_eq!(pool.stats().tokens_held, 5, "the prompt's positions");
+        assert_eq!(leaf.retained().0, 1);
+
+        let mut prompt = history[..5].to_vec();
+        prompt.extend([11, 12, 13]);
+        let mut next = split.new_kv_cache(N_CTX);
+        let reused = crate::engine::generate::reuse_from_pool(&pool, &prompt, &mut next);
+        assert_eq!(reused, 5);
+        let logits = split.forward(&mut next, &prompt[5..], 5, 0).unwrap();
+        let alone = fixture::model();
+        let mut reference = alone.new_kv_cache(N_CTX);
+        let want = alone.forward(&mut reference, &prompt, 0, 0).unwrap();
+        let worst = logits
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-3, "{worst}");
     }
 
     /// With the pool on, the slot store keeps the conversation itself — rows
