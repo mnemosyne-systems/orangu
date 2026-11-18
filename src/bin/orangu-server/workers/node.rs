@@ -413,6 +413,9 @@ pub struct Node {
     /// The saved prefixes a claim planned for, and whether it kept their
     /// split: put back in the pool, or deleted, at the next request.
     pending_prefixes: Mutex<Option<(Manifest, bool)>>,
+    /// Requests this node got for a model no free node of the channel
+    /// served ([`note_request`]).
+    demand: Mutex<super::demand::Window>,
 }
 
 static NODE: OnceLock<Arc<Node>> = OnceLock::new();
@@ -533,6 +536,89 @@ pub fn route_by_model(asked: &str, forwarded: bool) -> Option<String> {
         return None;
     }
     NODE.get()?.route_by_model(asked)
+}
+
+/// Whether this process counts the models requests name
+/// ([`note_request`]): it is on a channel. Only then, or when
+/// [`routes_by_model`], is a request's body read before it is served.
+pub fn counts_demand() -> bool {
+    NODE.get()
+        .is_some_and(|node| node.settings.channel.is_some())
+}
+
+/// A request that runs the model, and was not routed here by another node,
+/// names `asked` in its `model` field: counted as unserved demand when no
+/// free node of the channel serves that model ([`Node::note_request`]).
+/// What happens to the request is not changed.
+pub fn note_request(asked: &str) {
+    if let Some(node) = NODE.get() {
+        node.note_request(asked, Instant::now());
+    }
+}
+
+/// The names of `orangu-server`'s roles: a request naming one names no
+/// model, and counts as demand for none.
+const ROLE_NAMES: [&str; 6] = [
+    "all",
+    "code",
+    "review",
+    "explorer",
+    "embeddings",
+    "embedding",
+];
+
+/// A node of the channel as demand sees it ([`Node::servers`]).
+#[derive(Clone, Debug, PartialEq)]
+struct Server {
+    name: String,
+    label: String,
+    quant: String,
+    /// Holds the whole model: a node with part of one serves no request
+    /// alone.
+    whole: bool,
+    /// Serves its own clients and is under [`CLAIM_CUTOFF`]: a request for
+    /// its model is served without waiting.
+    free: bool,
+}
+
+impl Server {
+    fn serves(&self, asked: &str) -> bool {
+        self.whole && super::channel::names_model(asked, &self.label, &self.quant)
+    }
+}
+
+/// What a request naming `asked` counts as, given the nodes of the
+/// channel: `None` when a free node serves it; otherwise the model's name —
+/// as the first node serving it names it, or as asked when none does. A
+/// role's name, or an empty or overlong name, counts as nothing.
+fn unserved_name(asked: &str, servers: &[Server]) -> Option<String> {
+    let asked = asked.trim();
+    if asked.is_empty()
+        || asked.len() > super::demand::MAX_NAME_BYTES
+        || ROLE_NAMES.iter().any(|r| asked.eq_ignore_ascii_case(r))
+    {
+        return None;
+    }
+    let mut serving = servers.iter().filter(|s| s.serves(asked)).peekable();
+    let first = serving.peek().map(|s| model_id(&s.label, &s.quant));
+    if serving.any(|s| s.free) {
+        return None;
+    }
+    Some(first.unwrap_or_else(|| asked.to_string()))
+}
+
+/// One model of the channel's demand, for `/v1/workers`: how many requests
+/// wanted it (this node's and the found nodes' together) and how many of
+/// them this node got, the nodes serving it, and how many of those are free.
+fn demand_row(model: &str, wanted: u32, here: u32, servers: &[Server]) -> serde_json::Value {
+    let serving: Vec<&Server> = servers.iter().filter(|s| s.serves(model)).collect();
+    serde_json::json!({
+        "model": model,
+        "wanted": wanted,
+        "here": here,
+        "nodes": serving.iter().map(|s| s.name.clone()).collect::<Vec<_>>(),
+        "free": serving.iter().filter(|s| s.free).count(),
+    })
 }
 
 /// Runs a sync benchmark against a free node of this node's channel
@@ -931,6 +1017,7 @@ impl Node {
             observed_step: Mutex::new(None),
             last_decision: Mutex::new(None),
             benching: AtomicBool::new(false),
+            demand: Mutex::new(super::demand::Window::default()),
         });
         let _ = node.this.set(Arc::downgrade(&node));
         if let Some(listener) = listener {
@@ -1195,6 +1282,84 @@ impl Node {
             }
         }
         out
+    }
+
+    /// This node and the others of the channel as the last scan found them,
+    /// for counting demand: each with what it serves by name, whether it
+    /// holds it whole (the samples of its weights a probe answer carries are
+    /// zeros otherwise), and whether it is free.
+    fn servers(&self, found: &[super::channel::Found]) -> Vec<Server> {
+        let mut out = vec![Server {
+            name: self.settings.name.clone(),
+            label: self.settings.label.clone(),
+            quant: self.settings.quant.clone(),
+            whole: self.content_hash != [0; 32],
+            free: matches!(self.probe_state(), ProbeState::Idle | ProbeState::Leading)
+                && self.load() < CLAIM_CUTOFF,
+        }];
+        out.extend(found.iter().filter(|f| f.node != self.id).map(|f| Server {
+            name: f.name.clone(),
+            label: f.label.clone(),
+            quant: f.quant.clone(),
+            whole: f.content != [0; 32],
+            free: matches!(f.state, ProbeState::Idle | ProbeState::Leading)
+                && f.load < CLAIM_CUTOFF,
+        }));
+        out
+    }
+
+    /// Counts a request naming `asked` as unserved demand ([`note_request`])
+    /// when no free node of the channel serves it ([`unserved_name`]).
+    fn note_request(&self, asked: &str, now: Instant) {
+        if self.settings.channel.is_none() {
+            return;
+        }
+        let found = self.found.lock().unwrap().0.clone();
+        if let Some(name) = unserved_name(asked, &self.servers(&found)) {
+            self.demand.lock().unwrap().note(&name, now);
+        }
+    }
+
+    /// What this node's probe answer says was wanted here.
+    fn shared_demand(&self) -> Vec<super::protocol::Wanted> {
+        self.demand.lock().unwrap().shared(Instant::now())
+    }
+
+    /// The channel's unserved demand, for `/v1/workers`: this node's own
+    /// model, and every model wanted anywhere on the channel, most wanted
+    /// first.
+    fn demand_status(&self) -> serde_json::Value {
+        let here = self.demand.lock().unwrap().counts(Instant::now());
+        let found = self.found.lock().unwrap().0.clone();
+        let mut wanted = here.clone();
+        for f in found.iter().filter(|f| f.node != self.id) {
+            super::demand::merge(&mut wanted, &f.demand);
+        }
+        wanted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.model.cmp(&b.model)));
+        let servers = self.servers(&found);
+        let here_of = |model: &str| {
+            here.iter()
+                .find(|w| w.model.eq_ignore_ascii_case(model))
+                .map_or(0, |w| w.count)
+        };
+        let own_id = model_id(&self.settings.label, &self.settings.quant);
+        let names_own = |model: &str| self.serves_named(model);
+        let own_wanted = wanted
+            .iter()
+            .filter(|w| names_own(&w.model))
+            .fold(0u32, |sum, w| sum.saturating_add(w.count));
+        let own_here = here
+            .iter()
+            .filter(|w| names_own(&w.model))
+            .fold(0u32, |sum, w| sum.saturating_add(w.count));
+        serde_json::json!({
+            "window_seconds": super::demand::WINDOW.as_secs(),
+            "own": demand_row(&own_id, own_wanted, own_here, &servers),
+            "models": wanted
+                .iter()
+                .map(|w| demand_row(&w.model, w.count, here_of(&w.model), &servers))
+                .collect::<Vec<_>>(),
+        })
     }
 
     /// How many workers this node holds while it leads, its standby
@@ -2768,6 +2933,8 @@ impl Node {
             "prefill": self.prefill_status(),
             // Whether requests are served alone or divided, and why.
             "divide": self.divide_status(),
+            // Requests for models no free node of the channel served.
+            "demand": self.demand_status(),
             // Spare workers, and whom each stands in for since the last
             // plan, if anyone.
             "standby": self
@@ -4415,6 +4582,7 @@ impl Node {
                                 budget_bytes: self.own_budget(false),
                                 step_ms: self.step_ms(),
                             },
+                            demand: self.shared_demand(),
                         },
                     );
                     self.note_prober(&tcp);
@@ -7879,6 +8047,7 @@ mod tests {
             quant: String::new(),
             features: 0,
             pace: Default::default(),
+            demand: Vec::new(),
             rtt: Duration::from_millis(1),
             alternates: Vec::new(),
         }
@@ -8096,5 +8265,70 @@ mod tests {
         assert!(standby.is_assigned(), "let go for silence");
         top.stop();
         standby.stop();
+    }
+
+    fn server(name: &str, label: &str, quant: &str, free: bool) -> Server {
+        Server {
+            name: name.to_string(),
+            label: label.to_string(),
+            quant: quant.to_string(),
+            whole: true,
+            free,
+        }
+    }
+
+    /// A request counts as demand only when no free node serves what it
+    /// names: under the serving node's name for the model, or as asked
+    /// when no node serves it. Roles and blank names count as nothing.
+    #[test]
+    fn a_request_counts_as_demand_only_when_no_free_node_serves_it() {
+        let a = "org/a-GGUF:Q4_K_M";
+        let busy_a = server("alpha:8400", a, "Q4_K_M", false);
+        let free_a = server("beta:8400", a, "Q4_K_M", true);
+        let other = server("gamma:8400", "org/b-GGUF", "Q8_0", true);
+        assert_eq!(
+            unserved_name("org/a-gguf", &[busy_a.clone(), other.clone()]),
+            Some(a.to_string())
+        );
+        assert_eq!(unserved_name("org/a-GGUF", &[busy_a.clone(), free_a]), None);
+        assert_eq!(
+            unserved_name(" gpt-4 ", &[busy_a.clone(), other.clone()]),
+            Some("gpt-4".to_string())
+        );
+        // A node with only part of the model serves nothing alone.
+        let partial = Server {
+            whole: false,
+            ..server("delta:8400", "org/b-GGUF", "Q8_0", true)
+        };
+        assert_eq!(
+            unserved_name("org/b-GGUF", &[partial]),
+            Some("org/b-GGUF".to_string())
+        );
+        assert_eq!(unserved_name("org/b-GGUF:Q8_0", &[other]), None);
+        for nothing in ["", "  ", "explorer", "ALL", "embeddings"] {
+            assert_eq!(
+                unserved_name(nothing, std::slice::from_ref(&busy_a)),
+                None,
+                "{nothing:?}"
+            );
+        }
+    }
+
+    /// A model's row lists every node serving it and how many are free.
+    #[test]
+    fn a_demand_row_counts_the_free_nodes_serving_it() {
+        let servers = [
+            server("alpha:8400", "org/a-GGUF", "Q4_K_M", false),
+            server("beta:8400", "org/a-GGUF", "Q4_K_M", true),
+            server("gamma:8400", "org/b-GGUF", "Q8_0", true),
+        ];
+        let row = demand_row("org/a-GGUF:Q4_K_M", 7, 2, &servers);
+        assert_eq!(row["wanted"], 7);
+        assert_eq!(row["here"], 2);
+        assert_eq!(row["nodes"], serde_json::json!(["alpha:8400", "beta:8400"]));
+        assert_eq!(row["free"], 1);
+        let row = demand_row("gpt-4", 1, 0, &servers);
+        assert_eq!(row["nodes"], serde_json::json!([]));
+        assert_eq!(row["free"], 0);
     }
 }

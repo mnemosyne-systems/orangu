@@ -26,6 +26,11 @@ use std::{collections::HashMap, path::Path, path::PathBuf};
 
 pub const CLIENT_SECTION: &str = "orangu-coordinator";
 
+/// The section copied, key by key, into every profile's generated
+/// `orangu-server.conf`, so each profile's server joins the same workers
+/// channel. Never a profile.
+pub const WORKERS_SECTION: &str = "workers";
+
 /// The `host` value meaning "every network interface on this machine" — the
 /// default, and what `--init`'s `host` prompts offer first. `*` is accepted
 /// as an alias for it. Mirrors `orangu-server`'s own `config::HOST_ALL`/
@@ -170,6 +175,10 @@ pub struct CoordinatorConfiguration {
     /// reload that changes these keys takes effect on the next start.
     pub log: LogTarget,
     pub llms: HashMap<String, CoordinatorLlmEntry>,
+    /// The `[workers]` section's keys and values, sorted by key, when the
+    /// file has one: copied verbatim into every profile's generated
+    /// `orangu-server.conf` (see `process::write_server_config`).
+    pub workers: Option<Vec<(String, String)>>,
     /// Name of the section whose `role` is `all`; used whenever a request's
     /// `model` field is absent or matches no configured entry.
     pub default_entry: String,
@@ -498,6 +507,12 @@ pub fn load_coordinator_configuration(path: &Path) -> Result<CoordinatorConfigur
         client.get("log_path").map(String::as_str),
     )?;
 
+    let workers = sections.remove(WORKERS_SECTION).map(|values| {
+        let mut values: Vec<(String, String)> = values.into_iter().collect();
+        values.sort();
+        values
+    });
+
     if sections.is_empty() {
         return Err(anyhow!("At least one named LLM profile must be defined"));
     }
@@ -529,6 +544,7 @@ pub fn load_coordinator_configuration(path: &Path) -> Result<CoordinatorConfigur
         shutdown_token,
         log,
         llms,
+        workers,
         default_entry,
     })
 }
@@ -798,6 +814,30 @@ mod tests {
                 .contains("invalid value for [orangu-coordinator].log_type"),
             "unexpected error: {err:#}"
         );
+    }
+
+    /// `[workers]` is not a profile: its keys are kept, sorted, for every
+    /// profile's server, and a file without it has none.
+    #[test]
+    fn the_workers_section_is_kept_and_is_no_profile() {
+        let conf = load(
+            "[orangu-coordinator]\nmodels = /srv/models\n\n[workers]\nport = 8400\nname = lab\nsecret = s3cret\n\n[main]\nmodel = org/gemma\n",
+        )
+        .unwrap();
+        assert_eq!(conf.llms.len(), 1);
+        assert!(!conf.llms.contains_key("workers"));
+        assert_eq!(
+            conf.workers,
+            Some(vec![
+                ("name".to_string(), "lab".to_string()),
+                ("port".to_string(), "8400".to_string()),
+                ("secret".to_string(), "s3cret".to_string()),
+            ])
+        );
+        let conf =
+            load("[orangu-coordinator]\nmodels = /srv/models\n\n[main]\nmodel = org/gemma\n")
+                .unwrap();
+        assert_eq!(conf.workers, None);
     }
 
     #[test]

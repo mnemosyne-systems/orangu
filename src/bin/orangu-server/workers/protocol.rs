@@ -942,6 +942,11 @@ pub enum Message {
         /// ([`super::divide`]). Appended; unknown (zeros) from a node that
         /// does not send it.
         pace: Pace,
+        /// The models requests asked this node for that no free node of the
+        /// channel served, with how many in the last few minutes
+        /// ([`super::demand`]); at most [`MAX_DEMAND`], most wanted first.
+        /// Appended; empty from a node that does not send it.
+        demand: Vec<Wanted>,
     },
     /// Sent instead of `Hello` by a node that fetches a model in part
     /// (`[workers].download = range`) from a node holding the whole file.
@@ -1014,6 +1019,19 @@ pub struct Pace {
     /// Milliseconds a token for a request sent to it: its model alone, or
     /// through the tree it leads; `0` when it cannot tell.
     pub step_ms: f32,
+}
+
+/// The most [`Wanted`] entries a [`Message::ProbeAck`] carries.
+pub const MAX_DEMAND: usize = 8;
+
+/// A model requests asked a node for while no free node of the channel
+/// served it, as its [`Message::ProbeAck`] says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Wanted {
+    /// The name the requests used, or the name of the model they matched.
+    pub model: String,
+    /// How many such requests the node got in its window.
+    pub count: u32,
 }
 
 /// What a node on a channel is doing, as a [`Message::ProbeAck`] says.
@@ -1608,6 +1626,7 @@ impl Message {
                 quant,
                 features,
                 pace,
+                demand,
             } => {
                 w.string(node);
                 w.string(name);
@@ -1626,6 +1645,12 @@ impl Message {
                 w.f32(pace.decode_fixed_ms);
                 w.u64(pace.budget_bytes);
                 w.f32(pace.step_ms);
+                let shared = &demand[..demand.len().min(MAX_DEMAND)];
+                w.u8(shared.len() as u8);
+                for wanted in shared {
+                    w.string(&wanted.model);
+                    w.u32(wanted.count);
+                }
                 tag::PROBE_ACK
             }
             Self::FetchHello { nonce } => {
@@ -1887,6 +1912,21 @@ impl Message {
                         step_ms: r.f32()?,
                     }
                 },
+                demand: if r.0.is_empty() {
+                    Vec::new()
+                } else {
+                    let n = r.u8()? as usize;
+                    let mut demand = (0..n)
+                        .map(|_| {
+                            Ok(Wanted {
+                                model: r.string()?,
+                                count: r.u32()?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    demand.truncate(MAX_DEMAND);
+                    demand
+                },
             },
             tag::FETCH_HELLO => Self::FetchHello { nonce: r.fixed()? },
             tag::FETCH_ACK => Self::FetchAck {
@@ -2093,10 +2133,12 @@ mod tests {
             quant: "Q8_0".to_string(),
             features: FEATURE_FETCH,
             pace: Pace::default(),
+            demand: Vec::new(),
         }
         .encode();
-        // The pace takes twenty bytes at the end, the features eight before it.
-        let older = &payload[..payload.len() - 28];
+        // The demand's count takes a byte at the end, the pace twenty before
+        // it, the features eight before that.
+        let older = &payload[..payload.len() - 29];
         let Message::ProbeAck {
             features, label, ..
         } = Message::decode(tag, older).unwrap()
@@ -2104,6 +2146,67 @@ mod tests {
             panic!("not a probe answer");
         };
         assert_eq!((features, label.as_str()), (0, "m"));
+    }
+
+    fn ack_wanting(demand: Vec<Wanted>) -> Message {
+        Message::ProbeAck {
+            node: "n".to_string(),
+            name: "n:8400".to_string(),
+            state: ProbeState::Idle,
+            load: 0.0,
+            whole: true,
+            api_port: 8100,
+            api_tls: false,
+            model: [1; 32],
+            content: [2; 32],
+            workers: 0,
+            label: "m".to_string(),
+            quant: "Q8_0".to_string(),
+            features: 0,
+            pace: Pace {
+                decode_rate: 1.0,
+                decode_fixed_ms: 2.0,
+                budget_bytes: 3,
+                step_ms: 4.0,
+            },
+            demand,
+        }
+    }
+
+    /// A probe answer from a node that does not send its demand reads as
+    /// a node no request went unserved at; the pace before it survives.
+    #[test]
+    fn a_probe_ack_without_demand_decodes_to_none() {
+        let (tag, payload) = ack_wanting(vec![Wanted {
+            model: "gpt-4".to_string(),
+            count: 3,
+        }])
+        .encode();
+        // The demand: a count, then the name (four bytes and five) and its
+        // count of requests.
+        let older = &payload[..payload.len() - (1 + 4 + 5 + 4)];
+        let Message::ProbeAck { demand, pace, .. } = Message::decode(tag, older).unwrap() else {
+            panic!("not a probe answer");
+        };
+        assert!(demand.is_empty());
+        assert_eq!(pace.step_ms, 4.0);
+    }
+
+    /// A node sends at most [`MAX_DEMAND`] models it was asked for, and a
+    /// longer list read from a peer is cut to as many.
+    #[test]
+    fn a_probe_ack_carries_at_most_max_demand_models() {
+        let many: Vec<Wanted> = (0..MAX_DEMAND as u32 + 3)
+            .map(|i| Wanted {
+                model: format!("m{i}"),
+                count: 100 - i,
+            })
+            .collect();
+        let (tag, payload) = ack_wanting(many.clone()).encode();
+        let Message::ProbeAck { demand, .. } = Message::decode(tag, &payload).unwrap() else {
+            panic!("not a probe answer");
+        };
+        assert_eq!(demand, many[..MAX_DEMAND].to_vec());
     }
 
     /// A parent that advertised both extensions under bit 64 still gets
@@ -2327,6 +2430,16 @@ mod tests {
                     budget_bytes: 7 << 30,
                     step_ms: 13.0,
                 },
+                demand: vec![
+                    Wanted {
+                        model: "unsloth/other-GGUF:Q8_0".to_string(),
+                        count: 5,
+                    },
+                    Wanted {
+                        model: "gpt-4".to_string(),
+                        count: 1,
+                    },
+                ],
             });
         }
         round_trip(Message::FetchHello { nonce: [3; 32] });
@@ -2421,11 +2534,12 @@ mod tests {
             quant: String::new(),
             features: 0,
             pace: Pace::default(),
+            demand: Vec::new(),
         }
         .encode();
         // The two empty names take eight bytes, the workers count four
-        // more, the features eight, the pace twenty.
-        let older = &payload[..payload.len() - 40];
+        // more, the features eight, the pace twenty, the demand's count one.
+        let older = &payload[..payload.len() - 41];
         let Message::ProbeAck { workers, state, .. } = Message::decode(tag, older).unwrap() else {
             panic!("not a probe answer");
         };
@@ -2451,9 +2565,10 @@ mod tests {
             quant: "Q8_0".to_string(),
             features: FEATURE_FETCH,
             pace: Pace::default(),
+            demand: Vec::new(),
         }
         .encode();
-        let label_bytes = 4 + 1 + 4 + 4 + 8 + 20;
+        let label_bytes = 4 + 1 + 4 + 4 + 8 + 20 + 1;
         let older = &payload[..payload.len() - label_bytes];
         let Message::ProbeAck {
             workers,

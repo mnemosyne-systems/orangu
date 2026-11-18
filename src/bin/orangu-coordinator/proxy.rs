@@ -70,6 +70,14 @@ pub async fn coordinator_info(State(coordinator): State<Arc<Coordinator>>) -> Js
         // seconds since it began and the starting server's last line of
         // output — or `null`.
         "activating": coordinator.progress().await,
+        // The profiles paused after repeated crashes, and the seconds until
+        // each is started again.
+        "paused": coordinator.paused_json(),
+        // With a `[workers]` section: the mover's last decision and its last
+        // move to the model the channel wants; `null` without one.
+        "workers": coordinator
+            .workers_enabled()
+            .then(|| coordinator.mover.lock().unwrap().json()),
     }))
 }
 
@@ -220,23 +228,92 @@ fn wants_stream(body: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// Why a request could not be forwarded: the message to answer `502` with,
+/// or the pause of a profile that crashed repeatedly, answered `503`.
+enum Refusal {
+    Failed(String),
+    Paused(crate::crashes::Paused),
+}
+
+impl Refusal {
+    /// `err` as a refusal: a paused profile's pause, otherwise `message`.
+    fn from_error(err: &anyhow::Error, message: impl FnOnce() -> String) -> Self {
+        match err.downcast_ref::<crate::crashes::Paused>() {
+            Some(paused) => Self::Paused(paused.clone()),
+            None => Self::Failed(message()),
+        }
+    }
+
+    fn status(&self) -> StatusCode {
+        match self {
+            Self::Failed(_) => StatusCode::BAD_GATEWAY,
+            Self::Paused(_) => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    /// What the answer's body says: the message, or a paused profile's
+    /// error object.
+    fn body(&self) -> String {
+        match self {
+            Self::Failed(message) => message.clone(),
+            Self::Paused(paused) => paused_body(paused).to_string(),
+        }
+    }
+
+    fn into_response(self) -> Response {
+        match &self {
+            Self::Failed(message) => (self.status(), message.clone()).into_response(),
+            Self::Paused(paused) => (
+                self.status(),
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    paused.retry_after_seconds().to_string(),
+                )],
+                Json(paused_body(paused)),
+            )
+                .into_response(),
+        }
+    }
+}
+
+/// The error object a paused profile's requests are answered with: what
+/// happened, and when the profile is started again — in seconds, and as a
+/// UTC time.
+fn paused_body(paused: &crate::crashes::Paused) -> Value {
+    let seconds = paused.retry_after_seconds();
+    let resumes_at = chrono::Utc::now() + chrono::Duration::seconds(seconds as i64);
+    json!({
+        "error": {
+            "message": format!("orangu-coordinator: {paused}"),
+            "type": "unavailable",
+            "code": "profile_paused",
+            "profile": paused.profile,
+            "resumes_in_seconds": seconds,
+            "resumes_at": resumes_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }
+    })
+}
+
 /// Makes `entry`'s server active — falling back to the default profile when
-/// it cannot start — and counts the request in flight there from inside the
-/// activation, so a swap to another profile waits for this answer instead of
-/// cutting it off. `Err` is the message to answer with.
+/// it cannot start, unless it is paused after repeated crashes — and counts
+/// the request in flight there from inside the activation, so a swap to
+/// another profile waits for this answer instead of cutting it off.
 async fn activate_entry(
     coordinator: Arc<Coordinator>,
     entry: crate::config::CoordinatorLlmEntry,
-) -> Result<(String, crate::process::InFlight), String> {
+) -> Result<(String, crate::process::InFlight), Refusal> {
     match coordinator.begin_active_request(&entry).await {
         Ok(active) => Ok(active),
         Err(err) => {
+            if let Some(paused) = err.downcast_ref::<crate::crashes::Paused>() {
+                return Err(Refusal::Paused(paused.clone()));
+            }
             let default_entry = coordinator.default_entry();
             if entry.name == default_entry.name {
-                return Err(format!(
+                return Err(Refusal::Failed(format!(
                     "orangu-coordinator: failed to start default profile '{}': {err:#}",
                     entry.name
-                ));
+                )));
             }
             log::warn!(
                 "warning: failed to start '{}': {err:#}; falling back to '{}'",
@@ -247,18 +324,20 @@ async fn activate_entry(
                 .begin_active_request(&default_entry)
                 .await
                 .map_err(|fallback_err| {
-                    format!(
-                        "orangu-coordinator: failed to start both '{}' and fallback '{}': \
-                         {fallback_err:#}",
-                        entry.name, default_entry.name
-                    )
+                    Refusal::from_error(&fallback_err, || {
+                        format!(
+                            "orangu-coordinator: failed to start both '{}' and fallback '{}': \
+                             {fallback_err:#}",
+                            entry.name, default_entry.name
+                        )
+                    })
                 })
         }
     }
 }
 
-/// Sends the request to `origin`. `Err` is the message to answer with.
-async fn forward(f: &Forward, origin: &str) -> Result<reqwest::Response, String> {
+/// Sends the request to `origin`.
+async fn forward(f: &Forward, origin: &str) -> Result<reqwest::Response, Refusal> {
     let target = format!("{origin}{}", f.path_and_query);
     match send_upstream(
         &f.coordinator,
@@ -286,10 +365,13 @@ async fn forward(f: &Forward, origin: &str) -> Result<reqwest::Response, String>
         // connection failed, and asking the question that can lag is how
         // the retry ends up in the same closed port. See its doc comment.
         Err(first) => {
-            let Ok(origin) = f.coordinator.ensure_reachable(&f.entry).await else {
-                return Err(format!(
-                    "orangu-coordinator: failed to reach {target}: {first}"
-                ));
+            let origin = match f.coordinator.ensure_reachable(&f.entry).await {
+                Ok(origin) => origin,
+                Err(err) => {
+                    return Err(Refusal::from_error(&err, || {
+                        format!("orangu-coordinator: failed to reach {target}: {first}")
+                    }));
+                }
             };
             let target = format!("{origin}{}", f.path_and_query);
             send_upstream(
@@ -302,11 +384,11 @@ async fn forward(f: &Forward, origin: &str) -> Result<reqwest::Response, String>
             )
             .await
             .map_err(|retry| {
-                format!(
+                Refusal::Failed(format!(
                     "orangu-coordinator: failed to reach {target}: {retry} \
                      (after restarting '{}', which had stopped: {first})",
                     f.entry.name
-                )
+                ))
             })
         }
     }
@@ -352,18 +434,20 @@ pub async fn proxy(
 }
 
 /// The upstream's answer passed through as it came, status and headers
-/// included — or a `502` with the message when it cannot be had.
+/// included — or a `502` with the message when it cannot be had, and a
+/// `503` with a `Retry-After` while the profile is paused after repeated
+/// crashes.
 async fn answer(
     f: Forward,
-    activation: Result<(String, crate::process::InFlight), String>,
+    activation: Result<(String, crate::process::InFlight), Refusal>,
 ) -> Response {
     let (origin, in_flight) = match activation {
         Ok(active) => active,
-        Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
+        Err(refusal) => return refusal.into_response(),
     };
     let upstream = match forward(&f, &origin).await {
         Ok(response) => response,
-        Err(message) => return (StatusCode::BAD_GATEWAY, message).into_response(),
+        Err(refusal) => return refusal.into_response(),
     };
 
     let status = upstream.status();
@@ -471,7 +555,7 @@ fn progress_stream(
     f: Forward,
     mut activation: std::pin::Pin<
         Box<
-            impl std::future::Future<Output = Result<(String, crate::process::InFlight), String>>
+            impl std::future::Future<Output = Result<(String, crate::process::InFlight), Refusal>>
             + Send
             + 'static,
         >,
@@ -492,15 +576,15 @@ fn progress_stream(
         let path = f.path_and_query.clone();
         let (origin, _in_flight) = match done {
             Ok(active) => active,
-            Err(message) => {
-                yield Ok(error_event(&path, StatusCode::BAD_GATEWAY, &message));
+            Err(refusal) => {
+                yield Ok(error_event(&path, refusal.status(), &refusal.body()));
                 return;
             }
         };
         let mut upstream = match forward(&f, &origin).await {
             Ok(upstream) => upstream,
-            Err(message) => {
-                yield Ok(error_event(&path, StatusCode::BAD_GATEWAY, &message));
+            Err(refusal) => {
+                yield Ok(error_event(&path, refusal.status(), &refusal.body()));
                 return;
             }
         };
@@ -858,5 +942,93 @@ mod tests {
         assert_eq!(implied_role_for_path("/v1/models"), None);
         assert_eq!(implied_role_for_path("/health"), None);
         assert_eq!(implied_role_for_path("/v1/coordinator"), None);
+    }
+
+    /// A profile whose server crashes as it starts is paused at the third
+    /// crash: that request and every one after it is answered `503` with a
+    /// `Retry-After`, and no server is started meanwhile. A reloaded
+    /// configuration clears the pause, and the profile is tried again.
+    ///
+    /// Unix-only: the stand-in server is a shell script.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_crash_looping_profile_is_paused_with_503_and_retry_after() {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        use std::io::Write;
+        writeln!(
+            file,
+            "[orangu-coordinator]\nmodels = /srv/models\nstartup_timeout = 10\n\n\
+             [main]\nrole = all\nmodel = org/gemma\nhost = 127.0.0.1\nport = {port}\n"
+        )
+        .unwrap();
+        let config = crate::config::load_coordinator_configuration(file.path()).unwrap();
+        let starts = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+        let script = crate::process::fake_server_script(&format!(
+            "echo started >> {}\necho boom >&2\nexit 1\n",
+            starts.display()
+        ));
+        let started = || {
+            std::fs::read_to_string(&starts)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let coordinator = Arc::new(Coordinator::new(config.clone(), Some(script.clone())).unwrap());
+        let ask = || {
+            proxy(
+                State(coordinator.clone()),
+                Method::POST,
+                "/v1/chat/completions".parse::<Uri>().unwrap(),
+                HeaderMap::new(),
+                Bytes::from_static(br#"{"model":"org/gemma"}"#),
+            )
+        };
+
+        for crash in 1..=2 {
+            let response = ask().await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "crash {crash}");
+            assert_eq!(started(), crash);
+        }
+        for attempt in 3..=4 {
+            let response = ask().await;
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "attempt {attempt}"
+            );
+            let retry_after: u64 = response.headers()[axum::http::header::RETRY_AFTER]
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            assert!(
+                (1..=crate::crashes::PAUSE_FOR.as_secs()).contains(&retry_after),
+                "{retry_after}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["code"], "profile_paused", "{body}");
+            assert_eq!(body["error"]["profile"], "main", "{body}");
+            assert!(body["error"]["resumes_at"].is_string(), "{body}");
+            // The third crash started the pause; nothing was started since.
+            assert_eq!(started(), 3, "attempt {attempt}");
+        }
+        let info = coordinator_info(State(coordinator.clone())).await.0;
+        assert_eq!(info["paused"][0]["profile"], "main", "{info}");
+
+        coordinator.reload_config(config);
+        let response = ask().await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(started(), 4);
+
+        coordinator.shutdown().await;
+        std::fs::remove_file(&script).ok();
     }
 }

@@ -18,6 +18,7 @@
 //! start/stop/health machinery to swap it for a different one on demand.
 
 use crate::config::{CoordinatorConfiguration, CoordinatorLlmEntry, role_server_flag};
+use crate::crashes::{Crashes, Paused};
 use anyhow::{Context, Result, anyhow};
 use std::{
     collections::{HashMap, VecDeque},
@@ -76,6 +77,9 @@ struct ActiveProcess {
     /// The card bytes it was started with (`ORANGU_DEVICE_BYTES`), when it
     /// shares its card; a server without one may take the whole card.
     device_cap: Option<u64>,
+    /// The `[workers]` section its config was written with: a reload that
+    /// changes it makes the process stale, as a changed profile does.
+    workers_at_start: Option<Vec<(String, String)>>,
 }
 
 /// An `orangu-server` found already listening on a profile's address.
@@ -229,6 +233,11 @@ pub struct Coordinator {
     /// Held while fit checks run, outside the lock on the active set, so
     /// that the requests for one profile run its check once.
     fit_checks: Mutex<()>,
+    /// Each profile's recent crashes, and the profiles paused for them.
+    crashes: StdMutex<Crashes>,
+    /// What the channel-demand mover last decided, and when it last moved
+    /// ([`crate::mover`]).
+    pub(crate) mover: StdMutex<crate::mover::MoverState>,
     /// Fit checks run under test too, against the stand-in server.
     #[cfg(test)]
     plan_in_test: std::sync::atomic::AtomicBool,
@@ -508,9 +517,127 @@ impl Coordinator {
             needs: StdMutex::new(HashMap::new()),
             verdicts: StdMutex::new(HashMap::new()),
             fit_checks: Mutex::new(()),
+            crashes: StdMutex::new(Crashes::default()),
+            mover: StdMutex::new(crate::mover::MoverState::default()),
             #[cfg(test)]
             plan_in_test: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Counts an unexplained crash of `profile`'s server, which may pause
+    /// the profile ([`crate::crashes`]).
+    fn note_crash(&self, profile: &str) {
+        let paused = self
+            .crashes
+            .lock()
+            .unwrap()
+            .note(profile, std::time::Instant::now());
+        if paused.is_some() {
+            log::warn!(
+                "'{profile}' crashed {} times within {} minutes; it is paused for {} minutes, \
+                 and its requests are answered 503 until then",
+                crate::crashes::CRASHES_TO_PAUSE,
+                crate::crashes::CRASH_WINDOW.as_secs() / 60,
+                crate::crashes::PAUSE_FOR.as_secs() / 60,
+            );
+        }
+    }
+
+    /// Whether `profile` is paused after repeated crashes, and for how long
+    /// yet.
+    pub(crate) fn paused(&self, profile: &str) -> Option<Paused> {
+        let now = std::time::Instant::now();
+        let until = self.crashes.lock().unwrap().paused_until(profile, now)?;
+        Some(Paused {
+            profile: profile.to_string(),
+            remaining: until.saturating_duration_since(now),
+        })
+    }
+
+    /// The profiles paused after repeated crashes, for `GET /v1/coordinator`.
+    pub fn paused_json(&self) -> serde_json::Value {
+        let now = std::time::Instant::now();
+        let paused = self.crashes.lock().unwrap().paused(now);
+        paused
+            .into_iter()
+            .map(|(profile, until)| {
+                let left = Paused {
+                    profile,
+                    remaining: until.saturating_duration_since(now),
+                };
+                serde_json::json!({
+                    "profile": left.profile,
+                    "resumes_in_seconds": left.retry_after_seconds(),
+                })
+            })
+            .collect()
+    }
+
+    /// `err`, or the profile's pause in its place when `profile` is paused
+    /// now: a start that failed with the crash that paused it is reported as
+    /// the pause, with the failure itself logged.
+    fn or_paused(&self, profile: &str, err: anyhow::Error) -> anyhow::Error {
+        match self.paused(profile) {
+            Some(paused) => {
+                log::warn!("warning: {err:#}");
+                anyhow::Error::new(paused)
+            }
+            None => err,
+        }
+    }
+
+    /// Whether this coordinator's profiles join a workers channel.
+    pub(crate) fn workers_enabled(&self) -> bool {
+        self.config.read().unwrap().workers.is_some()
+    }
+
+    /// Requests still being answered, by every server together.
+    pub(crate) fn in_flight_total(&self) -> usize {
+        self.in_flight
+            .lock()
+            .unwrap()
+            .values()
+            .map(|count| count.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// The most recently used running server's profile and origin; `None`
+    /// when none runs, or when a swap holds the set of them.
+    pub(crate) fn current_server(&self) -> Option<(String, String)> {
+        let guard = self.active.try_lock().ok()?;
+        let active = guard.first()?;
+        Some((active.entry_name.clone(), active.entry_at_start.origin()))
+    }
+
+    /// Whether a swap or start is under way.
+    pub(crate) fn swapping(&self) -> bool {
+        self.progress.lock().unwrap().is_some() || self.active.try_lock().is_err()
+    }
+
+    /// Every profile's name and model, and whether it is paused.
+    pub(crate) fn profiles(&self) -> Vec<crate::mover::Profile> {
+        let mut out: Vec<crate::mover::Profile> = {
+            let config = self.config.read().unwrap();
+            config
+                .llms
+                .values()
+                .map(|e| crate::mover::Profile {
+                    name: e.name.clone(),
+                    model: e.model.clone(),
+                    paused: false,
+                })
+                .collect()
+        };
+        for profile in &mut out {
+            profile.paused = self.paused(&profile.name).is_some();
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// The profile named `name`, as configured now.
+    pub(crate) fn profile(&self, name: &str) -> Option<CoordinatorLlmEntry> {
+        self.config.read().unwrap().llms.get(name).cloned()
     }
 
     /// Records the step a swap toward `profile` has reached; the first step
@@ -755,13 +882,17 @@ impl Coordinator {
         config.llms[&config.default_entry].clone()
     }
 
+    /// Takes `new_config`, and forgets every crash and pause: a changed
+    /// configuration is what an operator fixes a crashing profile with.
     pub fn reload_config(&self, new_config: CoordinatorConfiguration) {
         *self.config.write().unwrap() = new_config;
+        self.crashes.lock().unwrap().clear();
     }
 
     /// After a config reload, stop every running process whose profile was
-    /// removed or had any of its settings changed — otherwise it would keep
-    /// running with stale settings indefinitely.
+    /// removed or had any of its settings changed, or whose `[workers]`
+    /// section changed — otherwise it would keep running with stale settings
+    /// indefinitely.
     pub async fn stop_if_stale(&self) {
         let mut guard = self.active.lock().await;
         let stale: Vec<usize> = {
@@ -771,7 +902,9 @@ impl Coordinator {
                 .enumerate()
                 .filter(|(_, active)| match config.llms.get(&active.entry_name) {
                     None => true, // profile was removed
-                    Some(entry) => *entry != active.entry_at_start,
+                    Some(entry) => {
+                        *entry != active.entry_at_start || config.workers != active.workers_at_start
+                    }
                 })
                 .map(|(i, _)| i)
                 .collect()
@@ -1009,11 +1142,18 @@ impl Coordinator {
                              (status: {status}){}",
                             format_output_tail(&guard[i].tail).await
                         );
+                        self.note_crash(&running);
                     }
                 }
                 _ => {}
             }
             Self::stop(guard.remove(i)).await;
+        }
+
+        // A profile paused after repeated crashes is not started until its
+        // pause ends.
+        if let Some(paused) = self.paused(&entry.name) {
+            return Err(anyhow::Error::new(paused));
         }
 
         // From here a swap or start is under way, which waiting clients hear
@@ -1029,12 +1169,18 @@ impl Coordinator {
         // it is started with one whenever another profile might join it.
         let (resident, sharing) = {
             let config = self.config.read().unwrap();
-            let sharing = config.resident > 1
-                && config
-                    .llms
-                    .values()
-                    .any(|p| p.name != entry.name && entry.shares_card_with(p));
-            (config.resident, sharing)
+            // Every profile's server listens on the one `[workers]` port, so
+            // with a channel only one of them runs at a time.
+            if config.workers.is_some() {
+                (1, false)
+            } else {
+                let sharing = config.resident > 1
+                    && config
+                        .llms
+                        .values()
+                        .any(|p| p.name != entry.name && entry.shares_card_with(p));
+                (config.resident, sharing)
+            }
         };
         let mut leaving: Vec<usize> = (0..guard.len())
             .filter(|&i| {
@@ -1172,6 +1318,7 @@ impl Coordinator {
                         // start; its output belongs to whoever did.
                         tail: Arc::new(Mutex::new(VecDeque::new())),
                         device_cap: None,
+                        workers_at_start: self.workers_section(),
                     },
                 );
                 return Ok(Activation::Active(entry.origin()));
@@ -1202,12 +1349,16 @@ impl Coordinator {
                     child: ServerHandle::Adopted { pid: occupant.pid },
                     tail: Arc::new(Mutex::new(VecDeque::new())),
                     device_cap: None,
+                    workers_at_start: None,
                 })
                 .await;
             }
         }
 
-        let (child, tail) = self.start(entry, device_cap).await?;
+        let (child, tail, workers_at_start) = self
+            .start(entry, device_cap)
+            .await
+            .map_err(|err| self.or_paused(&entry.name, err))?;
         guard.insert(
             0,
             ActiveProcess {
@@ -1216,6 +1367,7 @@ impl Coordinator {
                 child: ServerHandle::Spawned(Box::new(child)),
                 tail,
                 device_cap,
+                workers_at_start,
             },
         );
         Ok(Activation::Active(entry.origin()))
@@ -1307,21 +1459,38 @@ impl Coordinator {
             .iter()
             .position(|active| active.entry_at_start.origin() == entry.origin())
         {
-            let active = guard.remove(i);
+            let mut active = guard.remove(i);
             device_cap = active.device_cap;
             log::warn!(
                 "'{}' stopped answering on {}; restarting it",
                 active.entry_name,
                 entry.origin()
             );
+            // A server that stepped aside over a lost device has not
+            // crashed; one gone any other way, or not answering, has. Its
+            // exit can take a moment to be reported.
+            let mut status = active.child.try_wait();
+            if matches!(status, Ok(None)) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                status = active.child.try_wait();
+            }
+            if !matches!(&status, Ok(Some(status)) if is_device_lost_exit(status)) {
+                self.note_crash(&active.entry_name);
+            }
             // Same ordering rule as `ensure_active`: clear the pid before
             // reaping, so a concurrent `shutdown` can't signal a number the
             // OS has already handed to something else.
             self.current_pid.store(0, Ordering::Relaxed);
             Self::stop(active).await;
         }
+        if let Some(paused) = self.paused(&entry.name) {
+            return Err(anyhow::Error::new(paused));
+        }
         let _progress = ProgressGuard(self);
-        let (child, tail) = self.start(entry, device_cap).await?;
+        let (child, tail, workers_at_start) = self
+            .start(entry, device_cap)
+            .await
+            .map_err(|err| self.or_paused(&entry.name, err))?;
         guard.insert(
             0,
             ActiveProcess {
@@ -1330,6 +1499,7 @@ impl Coordinator {
                 child: ServerHandle::Spawned(Box::new(child)),
                 tail,
                 device_cap,
+                workers_at_start,
             },
         );
         Ok(entry.origin())
@@ -1467,11 +1637,16 @@ impl Coordinator {
         if !self.plan_in_test.load(Ordering::Relaxed) {
             return None;
         }
-        let (models_dir, log) = {
+        let (models_dir, log, workers) = {
             let config = self.config.read().unwrap();
-            (config.models.clone(), config.log.clone())
+            (
+                config.models.clone(),
+                config.log.clone(),
+                config.workers.clone(),
+            )
         };
-        let server_config_path = write_server_config(entry, &models_dir, &log).ok()?;
+        let server_config_path =
+            write_server_config(entry, &models_dir, &log, workers.as_deref()).ok()?;
         let mut command = Command::new(self.resolve_server_binary());
         command
             .arg("--config")
@@ -1492,13 +1667,21 @@ impl Coordinator {
         &self,
         entry: &CoordinatorLlmEntry,
         device_cap: Option<u64>,
-    ) -> Result<(tokio::process::Child, OutputTail)> {
-        let (models_dir, log) = {
+    ) -> Result<(
+        tokio::process::Child,
+        OutputTail,
+        Option<Vec<(String, String)>>,
+    )> {
+        let (models_dir, log, workers) = {
             let config = self.config.read().unwrap();
-            (config.models.clone(), config.log.clone())
+            (
+                config.models.clone(),
+                config.log.clone(),
+                config.workers.clone(),
+            )
         };
-        let server_config_path =
-            write_server_config(entry, &models_dir, &log).with_context(|| {
+        let server_config_path = write_server_config(entry, &models_dir, &log, workers.as_deref())
+            .with_context(|| {
                 format!("failed to write orangu-server config for '{}'", entry.name)
             })?;
         let program = self.resolve_server_binary();
@@ -1566,7 +1749,12 @@ impl Coordinator {
             return Err(err);
         }
 
-        Ok((child, tail))
+        Ok((child, tail, workers))
+    }
+
+    /// The `[workers]` section a server started now is written with.
+    fn workers_section(&self) -> Option<Vec<(String, String)>> {
+        self.config.read().unwrap().workers.clone()
     }
 
     async fn wait_until_healthy(
@@ -1605,6 +1793,11 @@ impl Coordinator {
                     }
                 })
                 .await;
+                // Stepping aside over a lost device is not a crash; any
+                // other exit before it answered is.
+                if !is_device_lost_exit(&status) {
+                    self.note_crash(&entry.name);
+                }
                 return Err(anyhow!(
                     "orangu-server for '{}' exited before becoming ready (status: {status}){}",
                     entry.name,
@@ -1765,7 +1958,7 @@ async fn format_output_tail(tail: &OutputTail) -> String {
 /// section (`models`, `host`, `port`, whichever of `backend`/`slots` were
 /// set, and the coordinator's own `log_type`/`log_path` when that is a
 /// file), plus a `[web]` section when the profile asks for a web console
-/// — to `~/.orangu/coordinator/servers/<name>.conf`,
+/// and the coordinator's `[workers]` section when it has one — to `~/.orangu/coordinator/servers/<name>.conf`,
 /// overwriting any previous contents — `orangu-server` itself reads this
 /// file once at its own startup, so a stale file from a previous run is
 /// never an issue, and this path doubles as a debugging aid: exactly what a
@@ -1781,6 +1974,7 @@ fn write_server_config(
     entry: &CoordinatorLlmEntry,
     models_dir: &Path,
     log: &orangu::logging::LogTarget,
+    workers: Option<&[(String, String)]>,
 ) -> Result<PathBuf> {
     let dir = home::home_dir()
         .context("failed to resolve home directory")?
@@ -1819,6 +2013,14 @@ fn write_server_config(
     // `web` gets no section, and so no second listener.
     if let Some(web) = entry.web {
         contents.push_str(&format!("\n[web]\nport = {web}\n"));
+    }
+    // The coordinator's `[workers]`, key by key as written there: every
+    // profile's server joins the same channel.
+    if let Some(workers) = workers {
+        contents.push_str("\n[workers]\n");
+        for (key, value) in workers {
+            contents.push_str(&format!("{key} = {value}\n"));
+        }
     }
 
     std::fs::write(&path, contents)
@@ -2476,6 +2678,7 @@ mod tests {
             &entry,
             Path::new("/srv/models"),
             &orangu::logging::LogTarget::Console,
+            None,
         )
         .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -2502,12 +2705,54 @@ mod tests {
             &minimal_entry,
             Path::new("/srv/models"),
             &orangu::logging::LogTarget::Console,
+            None,
         )
         .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         assert!(!contents.contains("backend"));
         assert!(!contents.contains("slots"));
         assert!(!contents.contains("web ="));
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The coordinator's `[workers]` section is written into the server's
+    /// config key by key, as its own section.
+    #[test]
+    fn write_server_config_copies_the_workers_section() {
+        let entry = CoordinatorLlmEntry {
+            name: "test-profile-workers".to_string(),
+            role: "all".to_string(),
+            model: "org/gemma".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 8100,
+            backend: None,
+            device: None,
+            slots: None,
+            context: None,
+            web: Some(8181),
+        };
+        let workers = vec![
+            ("name".to_string(), "lab".to_string()),
+            ("port".to_string(), "8400".to_string()),
+            ("secret".to_string(), "s3cret".to_string()),
+        ];
+        let path = write_server_config(
+            &entry,
+            Path::new("/srv/models"),
+            &orangu::logging::LogTarget::Console,
+            Some(&workers),
+        )
+        .unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.ends_with("\n[workers]\nname = lab\nport = 8400\nsecret = s3cret\n"),
+            "{contents}"
+        );
+        assert!(contents.contains("[web]\nport = 8181"), "{contents}");
+        // Read back as the server reads it: `[workers]` is its own section.
+        let sections = orangu::config::parse_ini_sections(&contents).unwrap();
+        assert_eq!(sections["workers"]["name"], "lab");
+        assert_eq!(sections["orangu-server"]["port"], "8100");
         std::fs::remove_file(&path).ok();
     }
 
@@ -2533,6 +2778,7 @@ mod tests {
             &entry,
             Path::new("/srv/models"),
             &orangu::logging::LogTarget::File(PathBuf::from("/var/log/orangu.log")),
+            None,
         )
         .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();

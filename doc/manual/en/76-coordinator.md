@@ -220,6 +220,33 @@ cannot lag — a `GET /v1/models` probe under `HEALTH_CHECK_TIMEOUT` — and
 restarts only when it goes unanswered, so a transient blip doesn't cost a
 working process and its other in-flight requests.
 
+### Pausing a profile that keeps crashing
+
+`crashes::Crashes` counts, per profile, the crashes the coordinator sees: a
+child `ensure_active` finds exited, one `ensure_reachable` finds not answering
+and restarts, and one `wait_until_healthy` sees exit before it is ready. An
+exit with `75` (`is_device_lost_exit`) is not counted, and a stop the
+coordinator makes is never observed as an exit. The third within
+`CRASH_WINDOW` pauses the profile for `PAUSE_FOR`: `activate` and
+`ensure_reachable` return a `crashes::Paused` error instead of starting it,
+and a start that fails with the crash that paused it is reported as the pause
+(`Coordinator::or_paused`). The proxy downcasts it to a `503` with
+`Retry-After` and does not fall back to the default profile. A pause that has
+run out is forgotten when next asked about, and `reload_config` clears them
+all.
+
+### Moving to the channel's demand
+
+`mover::run` ticks every `CHECK_EVERY` while the configuration has a
+`[workers]` section. It reads the most recently used child's `/v1/workers`
+(`mover::child_view`) and passes it, with the requests in flight, whether a
+swap is under way, the time since the last move and every profile's model and
+pause, to `mover::decide`, a pure function. A `Move` is weighed again after a
+random wait of up to `JITTER` and carried out with `ensure_active`, the swap a
+request makes. `Coordinator::current_server` and `swapping` use `try_lock` on
+the active set, so a long start never blocks the loop; a swap holding the lock
+reads as a reason to stay.
+
 ### Crash diagnostics
 
 If a profile's `orangu-server` exits before answering `GET /v1/models`, or

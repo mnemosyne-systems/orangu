@@ -203,7 +203,8 @@ answers `POST /v1/chat/completions`, `/v1/completions` and `/completion` with
 | `GET /v1/audio/voices` | the voices, languages and formats a `qwen3tts` model offers |
 | `GET /health` | liveness: is this process up. Stays `200` while the server is merely busy |
 | `GET /ready` | readiness: would a request sent now be served |
-| `GET /v1/workers` | this node's place in its `[workers]` tree: role, layers, plan, workers |
+| `GET /v1/workers` | this node's place in its `[workers]` tree: role, layers, plan, workers, the channel's unserved `demand` |
+| `POST /v1/workers/sync-bench` | times the per-token sums two nodes splitting every layer would exchange, against a free node of the channel |
 | `GET /version` | which build this is: version, commit, compiler, profile, target |
 | `GET /props` | model and server metadata: backend, devices, build, slot count, workspace |
 | `GET /slots` | per-slot busy/prompt/generated-token state |
@@ -3299,9 +3300,28 @@ client can probe it to tell the three apart:
     "step": "loading unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
     "seconds": 7,
     "last_output": "orangu-server: [kv] paged cache — 256 pages of 64 tokens"
+  },
+  "paused": [
+    {"profile": "review", "resumes_in_seconds": 412}
+  ],
+  "workers": {
+    "last_decision": {
+      "seconds_ago": 4,
+      "action": "stay",
+      "reason": "no model this coordinator serves is wanted without a free node"
+    },
+    "last_move": null
   }
 }
 ```
+
+`paused` lists the profiles paused after repeated crashes, with the seconds
+until each is started again (see the Coordinator chapter). `workers` is `null`
+without a `[workers]` section; with one, `last_decision` is what the
+coordinator last decided about moving to the model its channel wants —
+`action` `stay` or `move`, the `reason`, and for a move the `profile` and
+`model` — and `last_move` the last move it made, with its `profile`, `model`
+and `reason`; each has the seconds since.
 
 `activating` is the swap or start under way, `null` when there is none: the
 profile being made active, the step it has reached (waiting for the outgoing

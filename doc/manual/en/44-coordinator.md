@@ -283,6 +283,62 @@ If a role you're using has no dedicated profile in
 instead, so nothing errors out; it just means that role doesn't get its own
 specialized model.
 
+## Joining a workers channel
+
+A `[workers]` section in `orangu-coordinator.conf` puts every profile's
+`orangu-server` on a workers channel (see the Workers chapter). It is not a
+profile: its keys are copied, as written, into the `[workers]` section of the
+config the coordinator writes for each profile, so whichever profile runs
+joins the same channel. Every server on a channel listens on its one `port`,
+so with a `[workers]` section one profile runs at a time, whatever `resident`
+says. A reload that changes the section stops the running server, and the
+next request starts it with the new one.
+
+```ini
+[orangu-coordinator]
+models = ~/.cache/huggingface/hub
+
+[workers]
+port = 8400
+name = lab
+secret = a-long-random-string
+
+[main]
+model = unsloth/gemma-4-E2B-it-GGUF:Q4_K_M
+
+[qwen]
+model = unsloth/Qwen3-8B-GGUF:Q4_K_M
+```
+
+Every ten seconds the coordinator reads the running server's
+`/v1/workers` `demand`: the models requests asked the channel for while no
+free node served them. It moves this machine to another of its profiles'
+models — the same swap a request makes, which lets every answer still
+streaming finish first — only when all of these hold:
+
+- a profile here serves the model (its `model` names it, with or without the
+  `:QUANT` tag), and that profile is not paused after repeated crashes;
+- the channel wanted the model in the last five minutes and no node serving
+  it is free;
+- this machine is free: no request in flight through the coordinator, no swap
+  under way, and its server works for no other node, leads no workers and
+  has a load under 0.3;
+- its own model has no unserved demand, and another node of the channel
+  serves it too: the last node serving a model never leaves it;
+- ten minutes have passed since this coordinator last moved.
+
+Of several such models it takes the most wanted. Before it moves it waits a
+random 0–15 seconds and reads the demand again, so two coordinators that see
+the same demand do not both move; it moves only if the move is still called
+for. Each move is logged with its reason:
+
+```text
+workers: moving from 'main' to 'qwen' (unsloth/Qwen3-8B-GGUF:Q4_K_M): 'unsloth/Qwen3-8B-GGUF:Q4_K_M' was wanted 7 time(s) with no free node serving it, and 'unsloth/gemma-4-E2B-it-GGUF:Q4_K_M' is served by 1 other node(s)
+```
+
+`GET /v1/coordinator` shows the last decision and the last move under
+`workers`.
+
 ## File operations through the coordinator
 
 `orangu-server`'s file-lifecycle endpoints (`/v1/create_file`,
@@ -350,6 +406,18 @@ the first one pays the same cold start as any other request.
   restart, rather than failed: nothing had been written back to you yet, so
   the request was still whole. What you see is a slow answer, not an error.
   A second failure is reported rather than retried.
+- **Crash loops pause a profile**: a profile whose `orangu-server` crashes
+  three times within ten minutes — exits on its own while serving, stops
+  answering and is restarted, or exits before it is ready — is paused for ten
+  minutes. A server that exits after losing its GPU device has not crashed,
+  and neither has one the coordinator stopped. While a profile is paused it
+  is not started, and its requests are answered `503` with a `Retry-After`
+  header and an error object with `code: "profile_paused"`, saying when it is
+  started again (`resumes_in_seconds`, and `resumes_at` as a UTC time); they
+  do not fall back to the `all` profile. When the pause ends the profile is
+  tried again, and its crashes are counted afresh. Reloading the
+  configuration ends every pause. `GET /v1/coordinator` lists the paused
+  profiles under `paused`.
 - On shutdown (`Ctrl+C` or the internal `GET /v1/coordinator/shutdown` API), the coordinator gracefully stops whatever `orangu-server`
   process is currently active — or still starting up — so nothing is left
   running in the background.

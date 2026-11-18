@@ -35,6 +35,7 @@
 //! - [`syncbench`]: timing the sums two nodes splitting every layer would
 //!   exchange, against a peer of the channel.
 //! - [`load`]: how busy a node is, for routing requests and sizing shares.
+//! - [`demand`]: requests for a model no free node of the channel served.
 //! - [`clock`]: keeping a node's cores at full clock while a request runs.
 //! - [`transport`]: plain TCP or TLS between nodes.
 //! - [`fetch`]: a node that downloads only what it runs; [`share`]: byte
@@ -43,6 +44,7 @@
 pub mod auth;
 pub mod channel;
 pub mod clock;
+pub mod demand;
 pub mod divide;
 pub mod fetch;
 pub mod guard;

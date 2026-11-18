@@ -159,6 +159,10 @@ pub struct Found {
     /// How fast it decodes, and a request sent to it would; unknown
     /// (zeros) from a node that does not say.
     pub pace: Pace,
+    /// The models requests asked it for that no free node served, with how
+    /// many in its window ([`super::demand`]); empty from a node that does
+    /// not say.
+    pub demand: Vec<super::protocol::Wanted>,
     /// How long the probe took at `addr`, dialing included.
     pub rtt: Duration,
     /// Its other addresses on this machine's networks, where it answered
@@ -392,6 +396,7 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             quant,
             features,
             pace,
+            demand,
         } => Some(Found {
             addr: shown,
             node,
@@ -411,6 +416,7 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             quant,
             features,
             pace,
+            demand,
             rtt: started.elapsed(),
             alternates: Vec::new(),
         }),
@@ -568,6 +574,7 @@ mod tests {
             quant: String::new(),
             features: 0,
             pace: Pace::default(),
+            demand: Vec::new(),
             rtt: Duration::from_millis(rtt_ms),
             alternates: Vec::new(),
         }
@@ -665,6 +672,7 @@ mod tests {
                             quant: "Q4_K_M".to_string(),
                             features: 0,
                             pace: Pace::default(),
+                            demand: Vec::new(),
                         },
                     );
                 }

@@ -151,7 +151,9 @@ const ROUTED_TO_HEADER: &str = "x-orangu-routed-to";
 /// when that is not this node's and another node of the channel serves it
 /// (`crate::workers::node::route_by_model`); otherwise the least busy one
 /// that holds this node's model, or the parent a working node's layers
-/// belong to (`crate::workers::node::route`).
+/// belong to (`crate::workers::node::route`). The model it names counts
+/// as the channel's unserved demand when no free node serves it
+/// (`crate::workers::node::note_request`).
 /// Otherwise turns the API away while this node's layers belong to a
 /// parent's requests, so the parent's work has the whole machine — 503
 /// rather than a refusal: the node is unavailable for a while, not the
@@ -165,13 +167,18 @@ async fn route_or_pause(
     if request.method() == axum::http::Method::POST && ROUTED.contains(&request.uri().path()) {
         let forwarded = request.headers().contains_key(FORWARDED_HEADER);
         let mut base = None;
-        if !forwarded && crate::workers::node::routes_by_model() {
+        if !forwarded
+            && (crate::workers::node::routes_by_model() || crate::workers::node::counts_demand())
+        {
             let limit = routed_body_limit(&state, request.uri().path());
             let (named, read) = model_named(request, limit).await;
             request = match read {
                 Ok(request) => request,
                 Err(response) => return *response,
             };
+            if let Some(asked) = &named {
+                crate::workers::node::note_request(asked);
+            }
             base = named.and_then(|asked| crate::workers::node::route_by_model(&asked, false));
         }
         if base.is_none() {

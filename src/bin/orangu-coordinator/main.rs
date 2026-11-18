@@ -34,7 +34,9 @@
 //! on stderr regardless — they are for the terminal that started this.
 
 mod config;
+mod crashes;
 mod init;
+mod mover;
 mod process;
 mod proxy;
 mod shell;
@@ -306,6 +308,10 @@ async fn run(
             }
         }
     });
+
+    // With a `[workers]` section, moves this machine to the model its
+    // channel wants (`mover`); idle otherwise, so a reload can add one.
+    tokio::spawn(mover::run(coordinator.clone()));
 
     let app = Router::new()
         .route(

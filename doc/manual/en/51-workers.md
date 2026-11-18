@@ -456,6 +456,43 @@ unsloth/Qwen3-8B-GGUF:Q4_K_M           orangu-server channel
 A chat turn in the web console names no model: it is served by the
 console's own model, routed as described above.
 
+### Demand nobody serves
+
+Each node counts the requests it gets for a model no free node of the
+channel serves: one no node serves at all, or one whose every node is busy —
+working for another node, or with a load of 0.8 or more. A request for the
+node's own model counts too when the node itself is busy and no other free
+node holds it. Only the requests routed above count, each once, at the node
+it was sent to, and only those that name a model; a request naming a role
+(`all`, `code`, `review`, `explorer`, `embeddings`) names none. Counting
+changes nothing about how the request is served. A request is counted under
+the name the nodes serving its model give it, `label:QUANT`, or as it named
+the model when no node serves it.
+
+A node keeps the last five minutes of these counts and sends its eight most
+wanted models with every answer to a probe, so each node sees the whole
+channel's demand within seconds. `/v1/workers` shows it as `demand`:
+
+```json
+"demand": {
+  "window_seconds": 300,
+  "own": {"model": "unsloth/gemma-4-E2B-it-GGUF:Q4_K_M", "wanted": 0, "here": 0,
+          "nodes": ["alpha:8400", "beta:8400"], "free": 2},
+  "models": [
+    {"model": "unsloth/Qwen3-8B-GGUF:Q4_K_M", "wanted": 7, "here": 2,
+     "nodes": ["gamma:8400"], "free": 0}
+  ]
+}
+```
+
+`own` is this node's model; `models` lists every model wanted anywhere on the
+channel, most wanted first. For each: `wanted`, the requests in the window
+across the channel, this node's and the found nodes' together; `here`, how
+many of them this node got; `nodes`, the `[workers]` names of the nodes
+serving it whole, this one included; and `free`, how many of those are free
+now. An `orangu-coordinator` with a `[workers]` section reads this to move its
+machine to a model the channel wants (see the Coordinator chapter).
+
 ## Checks a parent makes
 
 A worker is left out, with a warning naming it and the reason, when it:
@@ -543,7 +580,9 @@ server's.
   worker the plan lost. Each worker's `sessions` shows what its handshake
   reported — its `slots`, `n_ctx` and `pool_reserve` — with the
   `session_limit` it holds for this node and the `retained_sessions` this
-  node's prefix cache keeps there. A top-level node adds `prefix_cache`:
+  node's prefix cache keeps there. `demand` shows the requests for
+  models no free node served, channel-wide (see **Demand nobody serves**).
+  A top-level node adds `prefix_cache`:
   the entries its prefix cache holds, its `hits` and `misses`, and
   `tokens_held`. A worker adds `retained_sessions`: how many sessions it keeps for its
   parent's prefix cache, and their bytes. Each entry of `workers` also
