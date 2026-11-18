@@ -17590,7 +17590,7 @@ fn q6k_device_layout_puts_d_first_only_on_misaligned_blocks() {
 /// too. At a row length the device pads (`device_row_stride`).
 #[test]
 fn a_weight_written_after_it_was_placed_is_placed_again() {
-    use std::os::unix::fs::FileExt;
+    use std::io::{Seek, SeekFrom, Write};
     let _gpu_lock = super::gpu_test_lock();
     let Some(vulkan) = shared_vulkan() else {
         eprintln!("{NO_GPU_SKIP}");
@@ -17626,7 +17626,10 @@ fn a_weight_written_after_it_was_placed_is_placed_again() {
             .unwrap()
     };
     assert!(on_device().iter().all(|&v| v == 0.0), "placed from a hole");
-    file.write_all_at(&real, 0).unwrap();
+    let mut writer = &file;
+    writer.seek(SeekFrom::Start(0)).unwrap();
+    writer.write_all(&real).unwrap();
+    writer.flush().unwrap();
     let want = CpuBackend.matmul(&x, n_tokens, &w);
     assert!(want.iter().any(|&v| v != 0.0));
     assert!(
