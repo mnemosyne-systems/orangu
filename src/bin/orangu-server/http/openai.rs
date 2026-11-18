@@ -1855,7 +1855,7 @@ async fn image_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::r
     };
     let request = match super::images::build_request(
         &pipeline.defaults(),
-        pipeline.size_unit(),
+        pipeline.variant,
         pipeline.max_pictures(),
         super::images::ImageParams {
             prompt: &turn.content,
@@ -1881,7 +1881,8 @@ async fn image_chat(state: Arc<AppState>, req: ChatCompletionRequest) -> axum::r
             "b64_json": base64::engine::general_purpose::STANDARD.encode(&image.bytes),
             "output_format": image.format.extension(),
             "mime": image.format.mime(),
-            "size": format!("{}x{}", image.width, image.height),
+            "size": image.size(),
+            "requested_size": image.requested_size(),
             "seed": image.seed,
             "steps": image.steps,
             "generation_ms": image.elapsed.as_millis() as u64,

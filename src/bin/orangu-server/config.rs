@@ -2205,7 +2205,7 @@ fn parse_image_defaults(
         let (width, height) = parse_image_size(value).ok_or_else(|| {
             anyhow!(
                 "invalid value for [{SERVER_SECTION}].image_size: '{}' (expected WIDTHxHEIGHT, \
-                 both multiples of 16)",
+                 each side from {MIN_IMAGE_SIDE} to {MAX_IMAGE_SIDE})",
                 value.trim()
             )
         })?;
@@ -2269,9 +2269,16 @@ fn parse_image_defaults(
     Ok(image)
 }
 
-/// `WIDTHxHEIGHT` (or `WIDTH` alone for a square), both multiples of 16 —
-/// the unit a picture is generated in: the VAE's 8 pixels per latent cell
-/// times the transformer's 2x2 patch.
+/// The smallest and largest side a picture size may name. A size between
+/// them is drawn at the model's unit (rounded up, then cropped back) and
+/// capped to the largest area the model draws.
+pub const MIN_IMAGE_SIDE: usize = 16;
+pub const MAX_IMAGE_SIDE: usize = 16384;
+
+/// `WIDTHxHEIGHT` (or `WIDTH` alone for a square), each side from
+/// [`MIN_IMAGE_SIDE`] to [`MAX_IMAGE_SIDE`] pixels. Any side in that range
+/// is a size: one off the model's unit is drawn rounded up and cropped
+/// back, so 1920x1080 is 1920x1080.
 pub fn parse_image_size(value: &str) -> Option<(usize, usize)> {
     let value = value.trim().to_ascii_lowercase();
     let (w, h) = match value.split_once(['x', '*']) {
@@ -2284,7 +2291,8 @@ pub fn parse_image_size(value: &str) -> Option<(usize, usize)> {
             (side, side)
         }
     };
-    (w >= 16 && h >= 16 && w.is_multiple_of(16) && h.is_multiple_of(16)).then_some((w, h))
+    let side = MIN_IMAGE_SIDE..=MAX_IMAGE_SIDE;
+    (side.contains(&w) && side.contains(&h)).then_some((w, h))
 }
 
 /// `WIDTHxHEIGHT` (or `WIDTH` alone for a square), both multiples of 32 —
@@ -3226,18 +3234,36 @@ mod tests {
         assert_eq!(conf.model, None);
     }
 
-    /// `image_size` is `WIDTHxHEIGHT` or one side for a square, in the
-    /// 16-pixel unit a picture is generated in; anything else is refused
-    /// at startup rather than rounded.
+    /// `image_size` is `WIDTHxHEIGHT` or one side for a square. Any side
+    /// from 16 to 16384 is a size — the standard ones (1920x1080, 1366x768)
+    /// are not multiples of the model's unit, and are drawn rounded up and
+    /// cropped back; anything else is refused at startup.
     #[test]
-    fn image_size_parses_pairs_and_squares_in_sixteens() {
+    fn image_size_parses_pairs_and_squares() {
         assert_eq!(parse_image_size("1024x768"), Some((1024, 768)));
         assert_eq!(parse_image_size(" 512 X 512 "), Some((512, 512)));
         assert_eq!(parse_image_size("640*400"), Some((640, 400)));
         assert_eq!(parse_image_size("768"), Some((768, 768)));
-        assert_eq!(parse_image_size("1000x1000"), None);
+        assert_eq!(parse_image_size("1000x1000"), Some((1000, 1000)));
+        assert_eq!(parse_image_size("1920x1080"), Some((1920, 1080)));
+        assert_eq!(parse_image_size("3840x2160"), Some((3840, 2160)));
+        assert_eq!(parse_image_size("1366x768"), Some((1366, 768)));
+        assert_eq!(parse_image_size("16x16384"), Some((16, 16384)));
         assert_eq!(parse_image_size("8"), None);
+        assert_eq!(parse_image_size("15x1080"), None);
+        assert_eq!(parse_image_size("16385x16"), None);
+        assert_eq!(parse_image_size("99999999999999999999x2"), None);
+        assert_eq!(parse_image_size("0x0"), None);
+        assert_eq!(parse_image_size("-1x5"), None);
         assert_eq!(parse_image_size("wide"), None);
+    }
+
+    /// The video size keeps its own check: multiples of 32.
+    #[test]
+    fn video_size_still_wants_multiples_of_thirty_two() {
+        assert_eq!(parse_video_size("1280x704"), Some((1280, 704)));
+        assert_eq!(parse_video_size("1920x1080"), None);
+        assert_eq!(parse_video_size("16x16"), None);
     }
 
     #[test]
@@ -3265,7 +3291,7 @@ mod tests {
             ("image_steps", "0"),
             ("image_cfg_scale", "-1"),
             ("image_strength", "2"),
-            ("image_size", "100x100"),
+            ("image_size", "8x8"),
             ("image_format", "bmp"),
         ] {
             let mut section = HashMap::new();
@@ -3273,6 +3299,12 @@ mod tests {
             let err = parse_image_defaults(&section).unwrap_err().to_string();
             assert!(err.contains(key), "{key}: {err}");
         }
+
+        // A standard size off the 16-pixel unit is a size now.
+        let mut section = HashMap::new();
+        section.insert("image_size".to_string(), "1920x1080".to_string());
+        let image = parse_image_defaults(&section).unwrap();
+        assert_eq!((image.width, image.height), (1920, 1080));
     }
 
     /// A hand-edited `.ini` gets every spelling of a switch a person might

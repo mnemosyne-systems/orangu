@@ -1400,6 +1400,19 @@ async fn send_message(
     axum::response::sse::Sse::new(stream).into_response()
 }
 
+/// A picture's size as its caption gives it: `1920x1080`, or for one the
+/// model capped, `2720x1536 (3840x2160 asked; the largest this model
+/// draws)` — so a capped picture is not taken for the size that was set.
+fn image_caption_size(image: &crate::engine::image::GeneratedImage) -> String {
+    match image.requested_size() {
+        Some(asked) => format!(
+            "{} ({asked} asked; the largest this model draws)",
+            image.size()
+        ),
+        None => image.size(),
+    }
+}
+
 /// A chat turn on a `qwen_image` server: the message is the prompt, the
 /// attached pictures are what the picture starts from, and the answer is
 /// the picture — kept as a file beside the transcript and written into the
@@ -1423,7 +1436,7 @@ async fn send_image_message(
     };
     let request = match crate::http::images::build_request(
         &pipeline.defaults(),
-        pipeline.size_unit(),
+        pipeline.variant,
         pipeline.max_pictures(),
         crate::http::images::ImageParams {
             prompt: &user_message,
@@ -1476,9 +1489,9 @@ async fn send_image_message(
                     };
                     let alt = user_message.replace(['[', ']', '\n'], " ");
                     let content = format!(
-                        "![{alt}]({})\n\n*{}x{}, {} steps, seed {}*",
+                        "![{alt}]({})\n\n*{}, {} steps, seed {}*",
                         sessions::file_url(&session.id, &name),
-                        image.width, image.height, image.steps, image.seed
+                        image_caption_size(&image), image.steps, image.seed
                     );
                     let html = render::render_markdown_to_html(&content, state.project_licence.as_ref());
                     let generation_ms = image.elapsed.as_millis() as u64;

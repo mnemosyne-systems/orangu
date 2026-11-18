@@ -278,7 +278,8 @@ The `base` checkpoint is the undistilled model and is released to run
 **fifty steps at guidance 4** — two transformer passes a step — which is
 what `image_steps` and `image_cfg_scale` default to under it. A
 step-distilled [klein] (a file without `base` in its name) defaults to
-**four steps without guidance**. Sides are multiples of 16 pixels, and a
+**four steps without guidance**. It draws in 16-pixel units, up to
+2048 × 2048 (4 megapixels, Black Forest Labs' limit), and a
 blank negative prompt is the empty one FLUX.2 is guided against. Every
 prompt is read as 512 tokens — padded or cut — so a long prompt costs no
 more than a short one, and words past the 512th are not read.
@@ -322,8 +323,8 @@ orangu-server download unsloth/MOSS-Image-Base-GGUF:Q8_0
 `list` shows the transformer as `Yes (moss_image)`. It is released to run
 **fifty steps at guidance 3**, which is what `image_steps` and
 `image_cfg_scale` default to under it; the negative pass of every step
-leaves out block 22, as the reference pipeline does. Sides are multiples
-of 16 pixels, and a blank negative prompt is the empty one. The prompt is
+leaves out block 22, as the reference pipeline does. It draws in 16-pixel
+units, up to 2048 × 2048, and a blank negative prompt is the empty one. The prompt is
 read in full (up to 4,096 tokens), so a JSON layout fits.
 
 MOSS-Image does not draw transparency, and an attached picture is a
@@ -365,14 +366,15 @@ recognises the picture model by its tensors, and a video file stays
 It is released to run **six steps without guidance**, which is what
 `image_steps` and `image_cfg_scale` default to under it; each step uses the
 output head the model was distilled with for it, so another step count is
-an approximation. Sides are multiples of **32 pixels**, and the prompt is
+an approximation. It draws in **32-pixel** units, and the prompt is
 read as written — no chat template — up to 4,096 tokens.
 
 The model falls apart on small canvases: its makers give 4 megapixels and
 up as its working range. A request under 512 × 512 in area is drawn at the
 same aspect ratio on a canvas of at least that area and scaled down to the
 requested size, so a 256 × 256 picture costs as much as a 512 × 512 one.
-Larger sizes give more detail and cost more time.
+Larger sizes give more detail and cost more time, up to the 16 megapixels
+(4096 × 4096) it draws directly: 3840 × 2160 is drawn whole.
 
 MiniMax-H3-Image does not draw transparency, and it draws from text
 alone: a request with an attached picture is refused, because the
@@ -458,7 +460,7 @@ not say otherwise. Each row has an **(i)** that explains it on hover.
 
 | setting | choices | |
 | :-- | :-- | :-- |
-| **Size** | 256 × 256 up to 2048 × 2048, or *Other…* for any `WIDTHxHEIGHT` | Both sides a multiple of 32 for Qwen-Image 2.1 and MiniMax-H3-Image (16 for Qwen-Image 2512, FLUX.2 [klein] and MOSS-Image); a preset the served model cannot draw, such as 1280 × 720 on 2.1, is greyed. 1024 × 1024 is the default; 2048 × 2048 is 2.1's native size, and hours on a CPU. 512 × 512 is a preview in minutes |
+| **Size** | 256 × 256 up to 3840 × 2160 (HD, Full HD, QHD and 4K UHD, landscape and portrait), or *Other…* for any `WIDTHxHEIGHT` | Any size is drawn: one that is not a multiple of the model's unit (32 pixels for Qwen-Image 2.1 and MiniMax-H3-Image, 16 for the others) is drawn a few pixels bigger and cropped back, so 1920 × 1080 is 1920 × 1080. A preset larger than the served model draws is greyed, and names the size it would come out at; see **Sizes** below. 1024 × 1024 is the default; 2048 × 2048 is 2.1's native size, and hours on a CPU. 512 × 512 is a preview in minutes |
 | **Steps** | 4, 8, 20, 40, 50, or a number | The time is linear in them. Qwen-Image 2.1 is made for 40, and 20 is a usable draft. For 2512, the 8-step adapter is made for 8, the 4-step file for 4, and the base model without an adapter needs 50. FLUX.2 [klein] base is made for 50, a distilled [klein] for 4, MOSS-Image for 50, MiniMax-H3-Image for 6 |
 | **Guidance** | Off, 4, 6, or a number | Classifier-free guidance pushes the picture towards the prompt and away from the negative one; it doubles the work of every step. Qwen-Image 2.1 is released to run with it off (stable-diffusion.cpp's examples use 6). For 2512: off under a Lightning adapter, which was trained without it, and 4 for the base model. FLUX.2 [klein] base: 4; a distilled [klein]: off; MOSS-Image: 3; MiniMax-H3-Image: off |
 | **Negative prompt** | text | What the picture is pushed away from — *blurry, text, extra limbs*. Read only when guidance is on |
@@ -466,8 +468,20 @@ not say otherwise. Each row has an **(i)** that explains it on hover.
 | **Format** | PNG, JPEG, GIF, WebP, SVG | What the picture comes back as. PNG and WebP are lossless and keep a transparent picture's alpha, JPEG smaller (a transparent picture on white), GIF one frame on 256 colours, SVG a document of the picture's size carrying it as PNG (there is no pixels-to-vector). A picture started from an attachment comes back in the attachment's own format |
 
 Under the rows a line says what a picture at these settings costs on
-this server — from the server's own measured rate, before anything is
-sent — and updates as you change them. **Reset** puts the form back to
+this server — from the server's own measured rate, at the size the
+picture is drawn at, before anything is sent — and updates as you change
+them.
+
+#### Sizes
+
+Each model draws up to an area of its own: 1328 × 1328 for Qwen-Image
+2512, 2048 × 2048 for Qwen-Image 2.1, FLUX.2 [klein] and MOSS-Image, and
+4096 × 4096 for MiniMax-H3-Image. A larger size — typed under *Other…*,
+set as `image_size`, or sent to the API — comes back at that area
+instead, at the same proportions: 3840 × 2160 on Qwen-Image 2.1 is a
+2720 × 1536 picture, and its caption says *2720x1536 (3840x2160 asked;
+the largest this model draws)*. orangu does not scale a picture up: open
+it in a picture editor such as GIMP for that. **Reset** puts the form back to
 the configuration file's values.
 
 The dialog's footer is shared by every pane: **Save** makes what the

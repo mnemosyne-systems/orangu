@@ -266,16 +266,50 @@ impl Variant {
         }
     }
 
-    /// The canvas a `width` x `height` request is drawn on: the request
-    /// itself, or for one smaller than `min_generation_area` the same aspect
-    /// ratio scaled up to it, each side rounded up to a multiple of
-    /// `size_unit`. The picture is scaled back to the request afterwards.
-    pub fn generation_canvas(self, width: usize, height: usize) -> (usize, usize) {
-        let floor = self.min_generation_area();
-        if width * height >= floor {
+    /// The largest picture area, in pixels, the variant draws: its makers'
+    /// native size. Qwen-Image 2512's largest preset is 1328x1328; Qwen-Image
+    /// 2.1, FLUX.2 [klein] and MOSS-Image are made for up to 4 megapixels
+    /// (2048x2048); MiniMax-H3-Image draws about 16 megapixels (4096x4096)
+    /// directly. A larger request is drawn at this area instead (see
+    /// [`Variant::capped_size`]): scaling a picture up is left to a picture
+    /// editor.
+    pub fn max_generation_area(self) -> usize {
+        match self {
+            Self::QwenImage => 1328 * 1328,
+            Self::QwenImage21 | Self::Flux2Klein | Self::MossImage => 2048 * 2048,
+            Self::MiniMaxH3Image => 4096 * 4096,
+        }
+    }
+
+    /// The size a `width` x `height` request comes back at: the request
+    /// itself, or for one larger than `max_generation_area` the same aspect
+    /// ratio shrunk to fit it, each side rounded down to a multiple of
+    /// `size_unit` (and at least one unit).
+    pub fn capped_size(self, width: usize, height: usize) -> (usize, usize) {
+        let ceiling = self.max_generation_area();
+        let area = width.saturating_mul(height);
+        if area <= ceiling {
             return (width, height);
         }
         let unit = self.size_unit();
+        let scale = (ceiling as f64 / area as f64).sqrt();
+        // The epsilon keeps an exact fit (2160 * 0.7111… = 1536) from
+        // landing a unit short on a rounding error.
+        let side = |v: usize| ((v as f64 * scale + 1e-6) as usize / unit).max(1) * unit;
+        (side(width), side(height))
+    }
+
+    /// The canvas a `width` x `height` request is drawn on: the request
+    /// with each side rounded up to a multiple of `size_unit`, or for one
+    /// smaller than `min_generation_area` the same aspect ratio scaled up to
+    /// it and rounded up the same way. The picture is fitted back to the
+    /// request afterwards (see [`fit_to_request`]).
+    pub fn generation_canvas(self, width: usize, height: usize) -> (usize, usize) {
+        let unit = self.size_unit();
+        let floor = self.min_generation_area();
+        if width * height >= floor {
+            return (round_up(width, unit), round_up(height, unit));
+        }
         let scale = (floor as f64 / (width * height) as f64).sqrt();
         let side = |v: usize| (v as f64 * scale / unit as f64).ceil() as usize * unit;
         (side(width), side(height))
@@ -841,8 +875,13 @@ pub struct ImageRequest {
     pub prompt: String,
     /// `None` takes the server default; `Some("")` is a blank prompt too.
     pub negative_prompt: Option<String>,
+    /// The size the picture comes back at: what was asked for, or for a
+    /// request past the model's largest, that capped (see `capped_from`).
     pub width: usize,
     pub height: usize,
+    /// The size asked for when it was larger than the model draws, and
+    /// `width` x `height` is it capped to the model's largest area.
+    pub capped_from: Option<(usize, usize)>,
     pub steps: usize,
     /// `<= 1` runs the positive prompt alone — half the work, no guidance.
     pub cfg_scale: f32,
@@ -874,10 +913,26 @@ pub struct GeneratedImage {
     pub format: ImageFormat,
     pub width: usize,
     pub height: usize,
+    /// The request's [`ImageRequest::capped_from`]: the size asked for,
+    /// when the picture is smaller because the model draws no larger.
+    pub capped_from: Option<(usize, usize)>,
     pub seed: u64,
     pub steps: usize,
     pub elapsed: std::time::Duration,
     pub timings: Timings,
+}
+
+impl GeneratedImage {
+    /// `WIDTHxHEIGHT`, for a reply.
+    pub fn size(&self) -> String {
+        format!("{}x{}", self.width, self.height)
+    }
+
+    /// The size asked for as `WIDTHxHEIGHT`, when the picture was capped
+    /// below it — what a reply's `requested_size` carries.
+    pub fn requested_size(&self) -> Option<String> {
+        self.capped_from.map(|(w, h)| format!("{w}x{h}"))
+    }
 }
 
 /// Where a generation's time went, phase by phase — what `orangu-bench
@@ -1072,18 +1127,21 @@ impl Pipeline {
     /// `/props`.
     pub fn token_passes_per_second(&self) -> Option<f64> {
         let d = self.defaults();
+        let (width, height) = self.variant.generation_canvas(d.width, d.height);
         self.rate_model()
-            .map(|m| m.token_passes_per_second((d.width / 16) * (d.height / 16)))
+            .map(|m| m.token_passes_per_second((width / 16) * (height / 16)))
     }
 
     /// The estimated wall time of a whole picture at the server defaults
     /// — the wait the console's user is looking at — or `None` before any
-    /// rate is known.
+    /// rate is known. It is costed at the canvas the picture is drawn on,
+    /// which is what the steps run over.
     pub fn estimated_default_seconds(&self) -> Option<f64> {
         let d = self.defaults();
+        let (width, height) = self.variant.generation_canvas(d.width, d.height);
         let passes = if d.cfg_scale > 1.0 { 2.0 } else { 1.0 };
         self.rate_model()
-            .map(|m| m.seconds_for(d.width, d.height, d.steps, passes))
+            .map(|m| m.seconds_for(width, height, d.steps, passes))
     }
 }
 
@@ -1161,6 +1219,42 @@ pub fn too_many_pictures(count: usize, max: usize) -> String {
         ),
         max => format!("{count} pictures were attached; this picture model reads at most {max}"),
     }
+}
+
+/// `value` rounded up to a multiple of `unit`.
+fn round_up(value: usize, unit: usize) -> usize {
+    value.div_ceil(unit) * unit
+}
+
+/// A picture drawn on `unit`-rounded canvas, brought to the `width` x
+/// `height` asked for. A canvas that is only the request rounded up to the
+/// unit is centre-cropped — 1920x1080 is drawn at 1920x1088 and loses four
+/// rows top and bottom, no pixel resampled. A larger canvas (the
+/// `min_generation_area` floor) is scaled down until it just covers the
+/// request, then centre-cropped the same way, so nothing is stretched.
+pub fn fit_to_request(
+    picture: Feature,
+    width: usize,
+    height: usize,
+    unit: usize,
+) -> Result<Feature> {
+    if (picture.width, picture.height) == (width, height) {
+        return Ok(picture);
+    }
+    let rounded = (round_up(width, unit), round_up(height, unit));
+    let picture = if (picture.width, picture.height) == rounded {
+        picture
+    } else {
+        let scale =
+            (width as f64 / picture.width as f64).max(height as f64 / picture.height as f64);
+        let cover = |v: usize, at_least: usize| ((v as f64 * scale).round() as usize).max(at_least);
+        codec::resize(
+            &picture,
+            cover(picture.width, width),
+            cover(picture.height, height),
+        )?
+    };
+    Ok(codec::crop_centre(&picture, width, height))
 }
 
 /// The size a reference picture is read at: its own proportions at the
@@ -1528,6 +1622,19 @@ impl Pipeline {
         companions: Companions,
         rate: Option<RateModel>,
     ) -> Self {
+        let mut defaults = defaults;
+        let (width, height) = variant.capped_size(defaults.width, defaults.height);
+        if (width, height) != (defaults.width, defaults.height) {
+            log::warn!(
+                "orangu-server: [image] image_size {}x{} is larger than {} draws; pictures \
+                 default to {width}x{height}",
+                defaults.width,
+                defaults.height,
+                variant.architecture()
+            );
+            defaults.width = width;
+            defaults.height = height;
+        }
         Self {
             model,
             variant,
@@ -2204,13 +2311,20 @@ impl Pipeline {
         let started = Instant::now();
         let unit = self.size_unit();
         ensure!(
-            request.width >= unit
-                && request.height >= unit
-                && request.width.is_multiple_of(unit)
-                && request.height.is_multiple_of(unit),
-            "image size must be a multiple of {unit} pixels on each side (got {}x{})",
+            request.width > 0 && request.height > 0,
+            "image size must be at least 1x1 (got {}x{})",
             request.width,
             request.height
+        );
+        // Requests arrive capped (`Variant::capped_size`); one that is not
+        // would be hours past what the model was made to draw.
+        ensure!(
+            request.width * request.height <= self.variant.max_generation_area(),
+            "{}x{} is larger than {} draws ({} pixels at most)",
+            request.width,
+            request.height,
+            self.variant.architecture(),
+            self.variant.max_generation_area()
         );
         ensure!(request.steps > 0, "steps must be at least 1");
         ensure!(!request.prompt.trim().is_empty(), "the prompt is empty");
@@ -2234,8 +2348,10 @@ impl Pipeline {
         // One token per 16 pixels along each side for all but MiniMax-H3-
         // Image: 2x2 eight-pixel cells packed, or one sixteen-pixel cell.
         // Its tokens are 2x2 sixteen-pixel cells, 32 pixels.
-        // A request below the variant's smallest good area is drawn on a
-        // larger canvas and scaled back down after the VAE.
+        // A side that is not a multiple of the unit is drawn rounded up and
+        // cropped back after the VAE; a request below the variant's
+        // smallest good area is drawn on a larger canvas and scaled back
+        // down.
         let (width, height) = self
             .variant
             .generation_canvas(request.width, request.height);
@@ -2488,9 +2604,7 @@ impl Pipeline {
         let mut picture = self
             .picture_from_latent(&latents, width, height, cancel)
             .context("decoding the picture")?;
-        if (width, height) != (request.width, request.height) {
-            picture = codec::resize(&picture, request.width, request.height)?;
-        }
+        picture = fit_to_request(picture, request.width, request.height, unit)?;
         let vae_done = decode_started.elapsed();
         let convs = vae::take_conv_clock();
         let bytes = codec::encode(&picture, request.format)?;
@@ -2515,10 +2629,14 @@ impl Pipeline {
              ({:.1}s each), decode {:.1}s",
             request.width,
             request.height,
-            if (width, height) != (request.width, request.height) {
-                format!(" (drawn at {width}x{height})")
-            } else {
-                String::new()
+            match (
+                (width, height) != (request.width, request.height),
+                request.capped_from
+            ) {
+                (true, Some((w, h))) => format!(" (asked for {w}x{h}, drawn at {width}x{height})"),
+                (true, None) => format!(" (drawn at {width}x{height})"),
+                (false, Some((w, h))) => format!(" (asked for {w}x{h})"),
+                (false, None) => String::new(),
             },
             started.elapsed().as_secs_f64(),
             timings.encode.as_secs_f64(),
@@ -2566,6 +2684,7 @@ impl Pipeline {
             format: request.format,
             width: request.width,
             height: request.height,
+            capped_from: request.capped_from,
             seed,
             steps: steps_to_run,
             elapsed: started.elapsed(),
@@ -2834,6 +2953,148 @@ mod tests {
         let (w, h) = h3.generation_canvas(384, 192);
         assert_eq!((w, h), (736, 384));
         assert_eq!(Variant::QwenImage.generation_canvas(256, 256), (256, 256));
+        // Below the floor and off the unit: the floor's canvas, rounded up.
+        assert_eq!(h3.generation_canvas(200, 100), (736, 384));
+    }
+
+    const VARIANTS: [Variant; 5] = [
+        Variant::QwenImage,
+        Variant::QwenImage21,
+        Variant::Flux2Klein,
+        Variant::MossImage,
+        Variant::MiniMaxH3Image,
+    ];
+
+    /// A side off the model's unit is drawn rounded up to it: 1080 is
+    /// 1088 on a 16-pixel model and 1088 on a 32-pixel one too; 768 and
+    /// 1920 are already on both.
+    #[test]
+    fn a_size_off_the_unit_is_drawn_rounded_up() {
+        assert_eq!(Variant::Flux2Klein.size_unit(), 16);
+        assert_eq!(Variant::QwenImage21.size_unit(), 32);
+        assert_eq!(
+            Variant::Flux2Klein.generation_canvas(1920, 1080),
+            (1920, 1088)
+        );
+        assert_eq!(
+            Variant::QwenImage21.generation_canvas(1920, 1080),
+            (1920, 1088)
+        );
+        assert_eq!(
+            Variant::QwenImage21.generation_canvas(1000, 750),
+            (1024, 768)
+        );
+        assert_eq!(Variant::MossImage.generation_canvas(1000, 750), (1008, 752));
+        assert_eq!(Variant::QwenImage.generation_canvas(1024, 768), (1024, 768));
+        assert_eq!(Variant::QwenImage21.generation_canvas(17, 1), (32, 32));
+        for variant in VARIANTS {
+            let unit = variant.size_unit();
+            for (w, h) in [(1920, 1080), (1366, 768), (1000, 1000), (3840, 2160)] {
+                let (cw, ch) = variant.generation_canvas(w, h);
+                assert!(cw >= w && ch >= h, "{variant:?} {w}x{h} -> {cw}x{ch}");
+                assert!(cw.is_multiple_of(unit) && ch.is_multiple_of(unit));
+            }
+        }
+    }
+
+    /// The standard sizes the issue asks for, on every model: at or under
+    /// the model's largest area they come back as asked; past it, at the
+    /// same proportions inside that area, on the unit.
+    #[test]
+    fn a_size_past_the_largest_area_is_capped_to_it() {
+        for variant in VARIANTS {
+            assert_eq!(variant.capped_size(1024, 768), (1024, 768), "{variant:?}");
+            assert_eq!(variant.capped_size(1, 1), (1, 1));
+        }
+        // 1920x1080 is 2.07 megapixels: past Qwen-Image 2512's 1328².
+        assert_eq!(Variant::QwenImage.capped_size(1920, 1080), (1760, 992));
+        assert_eq!(Variant::QwenImage21.capped_size(1920, 1080), (1920, 1080));
+        assert_eq!(Variant::Flux2Klein.capped_size(1920, 1080), (1920, 1080));
+        // 3840x2160 is 8.3 megapixels: 2.1, [klein] and MOSS-Image draw
+        // 4, MiniMax-H3-Image 16.
+        assert_eq!(Variant::QwenImage21.capped_size(3840, 2160), (2720, 1536));
+        assert_eq!(Variant::Flux2Klein.capped_size(3840, 2160), (2720, 1536));
+        assert_eq!(Variant::MossImage.capped_size(3840, 2160), (2720, 1536));
+        assert_eq!(
+            Variant::MiniMaxH3Image.capped_size(3840, 2160),
+            (3840, 2160)
+        );
+        assert_eq!(
+            Variant::MiniMaxH3Image.capped_size(8192, 8192),
+            (4096, 4096)
+        );
+        // A square exactly at the area is not shrunk by a rounding error.
+        assert_eq!(Variant::QwenImage21.capped_size(4096, 4096), (2048, 2048));
+        assert_eq!(Variant::QwenImage.capped_size(2656, 2656), (1328, 1328));
+        for variant in VARIANTS {
+            let unit = variant.size_unit();
+            for (w, h) in [(3840, 2160), (2160, 3840), (16384, 16), (5000, 5000)] {
+                let (cw, ch) = variant.capped_size(w, h);
+                assert!(
+                    cw * ch <= variant.max_generation_area(),
+                    "{variant:?} {w}x{h} -> {cw}x{ch}"
+                );
+                if (cw, ch) == (w, h) {
+                    continue;
+                }
+                assert!(cw.is_multiple_of(unit) && ch.is_multiple_of(unit));
+                assert!(cw >= unit && ch >= unit);
+                // The proportions stay within a unit's rounding.
+                let asked = w as f64 / h as f64;
+                let got = cw as f64 / ch as f64;
+                assert!(
+                    (got / asked - 1.0).abs() < 0.05 || ch == unit || cw == unit,
+                    "{variant:?} {w}x{h} -> {cw}x{ch}"
+                );
+                // A capped size is drawn as it is: on the unit already.
+                assert_eq!(variant.generation_canvas(cw, ch), (cw, ch));
+            }
+        }
+    }
+
+    fn numbered(width: usize, height: usize) -> Feature {
+        // Each pixel's first channel is its index, so a crop shows where it
+        // was taken from.
+        let mut data = Vec::with_capacity(width * height * 3);
+        for i in 0..width * height {
+            data.extend([i as f32, 0.0, 0.0]);
+        }
+        Feature::new(height, width, 3, data)
+    }
+
+    /// 1920x1080 drawn at 1920x1088 loses four rows top and bottom: the
+    /// pixels are the canvas's own, none resampled.
+    #[test]
+    fn a_rounded_canvas_is_cropped_to_the_middle() {
+        let canvas = numbered(1920, 1088);
+        let picture = fit_to_request(canvas, 1920, 1080, 16).unwrap();
+        assert_eq!((picture.width, picture.height), (1920, 1080));
+        assert_eq!(picture.data[0], (4 * 1920) as f32);
+        let last = (1920 * 1080 - 1) * 3;
+        assert_eq!(picture.data[last], (1083 * 1920 + 1919) as f32);
+
+        // Both sides off the unit: 1000x750 on 32 is drawn at 1024x768.
+        let canvas = numbered(1024, 768);
+        let picture = fit_to_request(canvas, 1000, 750, 32).unwrap();
+        assert_eq!((picture.width, picture.height), (1000, 750));
+        assert_eq!(picture.data[0], (9 * 1024 + 12) as f32);
+
+        // A canvas already the request's size is returned as it is.
+        let canvas = numbered(64, 32);
+        let picture = fit_to_request(canvas.clone(), 64, 32, 16).unwrap();
+        assert_eq!(picture.data, canvas.data);
+    }
+
+    /// The `min_generation_area` canvas is scaled down to cover the
+    /// request and then cropped, so its proportions are kept.
+    #[test]
+    fn a_floor_canvas_is_scaled_down_then_cropped() {
+        let h3 = Variant::MiniMaxH3Image;
+        let (w, h) = h3.generation_canvas(200, 100);
+        let canvas = Feature::new(h, w, 3, vec![0.25; w * h * 3]);
+        let picture = fit_to_request(canvas, 200, 100, h3.size_unit()).unwrap();
+        assert_eq!((picture.width, picture.height), (200, 100));
+        assert!(picture.data.iter().all(|v| (v - 0.25).abs() < 1e-3));
     }
 
     /// The rate model scales attention with the token count and the rest
@@ -3015,6 +3276,7 @@ mod tests {
                     negative_prompt: None,
                     width: 256,
                     height: 256,
+                    capped_from: None,
                     steps,
                     cfg_scale: 1.0,
                     seed: Some(1),

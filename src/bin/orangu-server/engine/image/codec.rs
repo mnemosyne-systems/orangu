@@ -214,6 +214,25 @@ pub fn resize(picture: &Feature, width: usize, height: usize) -> Result<Feature>
     Ok(Feature::new(height, width, c, data))
 }
 
+/// The `width` x `height` middle of `picture`, pixels copied as they are.
+/// An odd surplus leaves the extra row or column on the bottom or right.
+/// A picture no larger than that on a side keeps that side whole.
+pub fn crop_centre(picture: &Feature, width: usize, height: usize) -> Feature {
+    let (width, height) = (width.min(picture.width), height.min(picture.height));
+    if (width, height) == (picture.width, picture.height) {
+        return picture.clone();
+    }
+    let c = picture.channels;
+    let left = (picture.width - width) / 2;
+    let top = (picture.height - height) / 2;
+    let mut data = Vec::with_capacity(width * height * c);
+    for row in top..top + height {
+        let start = (row * picture.width + left) * c;
+        data.extend_from_slice(&picture.data[start..start + width * c]);
+    }
+    Feature::new(height, width, c, data)
+}
+
 /// The pixel size of a picture without decoding all of it, for choosing a
 /// generation size from an attachment.
 pub fn dimensions(bytes: &[u8]) -> Result<(usize, usize)> {
