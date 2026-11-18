@@ -4968,9 +4968,11 @@ WAV), and comes back on a later visit through **History**. While it is
 made the progress reads _Reading the text_, _Speaking — N s so far_ and
 _Decoding_; Stop cancels it.
 
-**Settings › Audio** is where the speech settings live: the voice (with
-the pack's description under it), the language, the format (WAV or
-FLAC), the temperature and the longest reply in seconds. **Save** makes
+**Settings › Audio** is where the speech settings live. Its **General**
+tab holds the voice (with the pack's description under it), the
+language, the format (WAV or FLAC) and the longest reply in seconds; its
+**Advanced** tab the model's sampling: the temperature, the top-k and
+the repetition penalty. **Save** makes
 them the server's defaults until it restarts, and **Reset** puts the form
 back to the configuration file's values, as on the Video pane. On a
 model that is not a speech model the pane is greyed with a note saying
