@@ -36,7 +36,7 @@ use super::guard::{GuardedStage, TakeStandby};
 use super::identity;
 use super::link::{ChildInfo, ChildLink};
 use super::metrics::{LinkSnapshot, NodeMetrics};
-use super::pipeline::{DelegatingModel, LayerPipeline, PipelineSource, Stage};
+use super::pipeline::{DelegatingModel, Handoff, LayerPipeline, PipelineSource, Prefilled, Stage};
 use super::plan;
 use super::prefixes::{Manifest, PrefixFiles, SavedNode};
 use super::protocol::{
@@ -219,6 +219,20 @@ impl Drop for RequestGuard {
     }
 }
 
+/// Where a top-level node's prompts ran ([`super::prefill`]), for
+/// `/v1/workers` and the next decision.
+#[derive(Default)]
+struct PrefillSeen {
+    on_node: u64,
+    on_tree: u64,
+    fell_back: u64,
+    /// Tokens a second through the tree, on the plan of this generation.
+    tree: Option<(f64, u64)>,
+    /// Tokens a second a hand-over to each node took, by its name.
+    nodes: HashMap<String, f64>,
+    last: Option<serde_json::Value>,
+}
+
 /// A plan of a range over this node and its workers.
 struct Planned {
     pipeline: Arc<LayerPipeline>,
@@ -375,6 +389,13 @@ pub struct Node {
     saved_plan: Mutex<Option<Manifest>>,
     /// Whether the last top-level plan kept [`Self::saved_plan`]'s split.
     saved_split_kept: AtomicBool,
+    /// Each layer's rows, in bytes a position: what handing a prompt's rows
+    /// over moves ([`super::prefill`]).
+    row_bytes: Vec<u64>,
+    /// Why this model's rows cannot be handed between nodes, if they cannot.
+    unmovable: Option<String>,
+    /// Where prompts ran, and how fast.
+    prefills: Mutex<PrefillSeen>,
     /// The saved prefixes a claim planned for, and whether it kept their
     /// split: put back in the pool, or deleted, at the next request.
     pending_prefixes: Mutex<Option<(Manifest, bool)>>,
@@ -802,6 +823,16 @@ impl Node {
                 &settings.name,
             ))
         });
+        let row_bytes = if model.supports_layer_split() {
+            super::prefill::row_bytes(model.as_ref())
+        } else {
+            Vec::new()
+        };
+        let unmovable = if model.supports_layer_split() {
+            super::prefill::movable(model.as_ref()).err()
+        } else {
+            Some("the model cannot be split".to_string())
+        };
         let node = Arc::new(Self {
             id: format!("{:016x}", rand::random::<u64>()),
             settings,
@@ -856,6 +887,9 @@ impl Node {
             saved_plan: Mutex::new(None),
             saved_split_kept: AtomicBool::new(false),
             pending_prefixes: Mutex::new(None),
+            row_bytes,
+            unmovable,
+            prefills: Mutex::new(PrefillSeen::default()),
         });
         let _ = node.this.set(Arc::downgrade(&node));
         if let Some(listener) = listener {
@@ -1981,6 +2015,8 @@ impl Node {
         SessionStore::new(pipeline, terms.n_ctx, own.session_limit(terms.slots))
             .with_pool_reserve(reserve)
             .with_prefixes(self.prefix_files.clone())
+            .with_whole_model(self.fits_alone && !super::fetch::incomplete())
+            .with_model_hash(self.identity.header_hash)
             .named(&self.settings.name)
     }
 
@@ -2189,6 +2225,9 @@ impl Node {
             "observed_gb_per_s": self.observed.lock().unwrap().iter().map(|(n, (rate, tokens))| (n.clone(), serde_json::json!({"rate": rate, "tokens": tokens}))).collect::<serde_json::Map<_, _>>(),
             "planned_gb_per_s": self.planned_rates.lock().unwrap().clone(),
             "head": if self.head_on_last.load(Ordering::Acquire) { "on the node with the final layer" } else { "here" },
+            // Where prompts ran: on one node that holds the whole model, or
+            // through the tree, and the last one's numbers.
+            "prefill": self.prefill_status(),
             // Spare workers, and whom each stands in for since the last
             // plan, if anyone.
             "standby": self
@@ -2224,6 +2263,142 @@ impl Node {
             // This node's own metrics address, for Prometheus's tree list.
             "metrics": metrics,
         })
+    }
+
+    /// Where prompts ran, for `/v1/workers`.
+    fn prefill_status(&self) -> serde_json::Value {
+        let seen = self.prefills.lock().unwrap();
+        let mut observed: serde_json::Map<String, serde_json::Value> = seen
+            .nodes
+            .iter()
+            .map(|(name, rate)| (name.clone(), serde_json::json!(rate)))
+            .collect();
+        if let Some((rate, _)) = seen.tree {
+            observed.insert("tree".to_string(), serde_json::json!(rate));
+        }
+        serde_json::json!({
+            "mode": super::prefill::Mode::from_env().label(),
+            "on_node": seen.on_node,
+            "on_tree": seen.on_tree,
+            "fell_back": seen.fell_back,
+            "observed_tokens_per_s": observed,
+            "last": seen.last,
+        })
+    }
+
+    /// What [`super::prefill::decide`] weighs for a prompt on `pipeline`:
+    /// every node's measured prompt speed, the links to the workers, the rows
+    /// each worker's layers hold, and what earlier prompts took.
+    fn prefill_inputs(
+        &self,
+        pipeline: &LayerPipeline,
+        tree_tokens: usize,
+        all_tokens: usize,
+    ) -> super::prefill::Inputs {
+        use super::prefill::{Branch, Candidate, TreeNode};
+        let rows_of = |range: Range<usize>| -> u64 {
+            range
+                .map(|il| self.row_bytes.get(il).copied().unwrap_or(0))
+                .sum()
+        };
+        let links: Vec<Arc<ChildLink>> = self
+            .links()
+            .into_iter()
+            .chain(self.standby_links())
+            .collect();
+        let found = self.found.lock().unwrap().0.clone();
+        let seen = self.prefills.lock().unwrap();
+        let generation = self.top.read().unwrap().1;
+        let own = self.settings.capacity.setups[0].clone();
+        let mut setups = vec![own.clone()];
+        let mut candidates = Vec::new();
+        if self.fits_alone && !super::fetch::incomplete() {
+            candidates.push(Candidate {
+                addr: None,
+                name: self.settings.name.clone(),
+                rate: own.prompt_rate,
+                fixed_ms: own.prompt_fixed_ms,
+                observed: seen.nodes.get(&self.settings.name).copied(),
+            });
+        }
+        // The plan's direct workers: their own names and links.
+        let mut direct: Vec<(String, Option<(Duration, f64)>)> = Vec::new();
+        let mut branches = Vec::new();
+        for stage in pipeline.stages() {
+            let addr = stage.name();
+            let info = links.iter().find(|l| l.addr == addr).and_then(|l| l.info());
+            let link = info.as_ref().and_then(|i| i.link);
+            branches.push(Branch {
+                addr: addr.clone(),
+                row_bytes: rows_of(stage.layers()),
+                link,
+                takes_rows: stage.takes_rows(),
+            });
+            let Some(info) = info else { continue };
+            let theirs = info.capacity.setups.first().cloned().unwrap_or_default();
+            let name = if theirs.name.is_empty() {
+                addr.clone()
+            } else {
+                theirs.name.clone()
+            };
+            direct.push((name.clone(), link));
+            setups.extend(info.capacity.setups.iter().cloned());
+            let whole = found.iter().any(|f| f.node == info.node && f.whole);
+            if whole && stage.takes_rows() {
+                candidates.push(Candidate {
+                    addr: Some(addr),
+                    observed: seen.nodes.get(&name).copied(),
+                    name,
+                    rate: theirs.prompt_rate,
+                    fixed_ms: theirs.prompt_fixed_ms,
+                });
+            }
+        }
+        let nodes = self
+            .plan()
+            .iter()
+            .filter(|e| e.layer_start < e.layer_end)
+            .map(|e| {
+                let setup = setups.iter().find(|s| s.name == e.node);
+                TreeNode {
+                    bytes: plan::bytes_of(
+                        &(e.layer_start as usize..e.layer_end as usize),
+                        &self.layer_bytes,
+                    ),
+                    rate: setup.map_or(0.0, |s| s.prompt_rate),
+                    fixed_ms: setup.map_or(0.0, |s| s.prompt_fixed_ms),
+                    link: direct
+                        .iter()
+                        .find(|(name, _)| *name == e.node)
+                        .and_then(|(_, link)| *link),
+                }
+            })
+            .collect();
+        let n_embd = self.model.config().n_embd as f64;
+        let hidden_bytes = match self.settings.activations {
+            ActivationFormat::F32 => 4.0 * n_embd,
+            ActivationFormat::F16 => 2.0 * n_embd,
+            ActivationFormat::Q8_0 => 34.0 / 32.0 * n_embd,
+        };
+        let width = super::pipeline::sub_chunk();
+        super::prefill::Inputs {
+            tree_tokens,
+            all_tokens,
+            part: super::prefill::width(),
+            pipelined: width > 0 && super::pipeline::pipelining(),
+            hidden_bytes,
+            total_bytes: self.layer_bytes.iter().sum(),
+            nodes,
+            local_row_bytes: rows_of(pipeline.local_layers()),
+            branches,
+            candidates,
+            widest_layer: self.row_bytes.iter().copied().max().unwrap_or(0),
+            observed_tree: seen
+                .tree
+                .filter(|(_, at)| *at == generation)
+                .map(|(rate, _)| rate),
+            refused: self.unmovable.clone(),
+        }
     }
 
     /// This node and every node below it that it is connected to.
@@ -4070,6 +4245,64 @@ impl PipelineSource for Node {
                 link.forgive();
             }
         }
+    }
+
+    fn prefill_choice(
+        &self,
+        pipeline: &LayerPipeline,
+        tree_tokens: usize,
+        all_tokens: usize,
+    ) -> Option<Handoff> {
+        let inputs = self.prefill_inputs(pipeline, tree_tokens, all_tokens);
+        let choice = super::prefill::decide(&inputs, &super::prefill::Mode::from_env());
+        if choice.on.is_none() {
+            log::debug!(
+                "orangu-server: workers: a prompt of {tree_tokens} tokens runs through the tree: {}",
+                choice.reason
+            );
+        }
+        Some(Handoff {
+            choice,
+            header_hash: self.identity.header_hash,
+            n_ctx: self.settings.n_ctx,
+        })
+    }
+
+    fn prefilled(&self, ran: &Prefilled) {
+        let generation = self.top.read().unwrap().1;
+        let secs = ran.took.as_secs_f64();
+        let mut seen = self.prefills.lock().unwrap();
+        // Halfway to the newest: one odd prompt moves it, two confirm it.
+        let blend = |old: Option<f64>, new: f64| old.map_or(new, |old| (old + new) / 2.0);
+        if ran.fell_back.is_some() {
+            seen.fell_back += 1;
+        } else if ran.on.is_empty() {
+            seen.on_tree += 1;
+            if ran.tokens >= super::prefill::MIN_TOKENS && secs > 0.0 {
+                let old = seen
+                    .tree
+                    .filter(|(_, at)| *at == generation)
+                    .map(|(r, _)| r);
+                seen.tree = Some((blend(old, ran.tokens as f64 / secs), generation));
+            }
+        } else {
+            seen.on_node += 1;
+            if secs > 0.0 {
+                let rate = blend(seen.nodes.get(&ran.on).copied(), ran.tokens as f64 / secs);
+                seen.nodes.insert(ran.on.clone(), rate);
+            }
+        }
+        let ms = |s: Option<f64>| s.map(|s| s * 1e3);
+        seen.last = Some(serde_json::json!({
+            "on": if ran.on.is_empty() { "tree" } else { ran.on.as_str() },
+            "tokens": ran.tokens,
+            "ms": secs * 1e3,
+            "rows_ms": ran.rows.as_secs_f64() * 1e3,
+            "reason": ran.choice.reason,
+            "predicted_tree_ms": ms(ran.choice.tree_s),
+            "predicted_node_ms": ms(ran.choice.node_s),
+            "fell_back": ran.fell_back,
+        }));
     }
 
     fn observed_decode(&self, parts: &[(String, Duration)], tokens: usize) {

@@ -50,7 +50,8 @@ pub const FEATURES: u64 = FEATURE_FORK
     | FEATURE_ROOM
     | FEATURE_METRICS
     | FEATURE_RETAIN
-    | FEATURE_PREFIXES;
+    | FEATURE_PREFIXES
+    | FEATURE_ROWS;
 
 /// [`Message::Fork`]: a worker copies one session's rows into another.
 pub const FEATURE_FORK: u64 = 1;
@@ -102,12 +103,19 @@ pub const FEATURE_PREFIXES: u64 = 512;
 /// node that did not advertise it is never asked for bytes.
 pub const FEATURE_FETCH: u64 = 1024;
 
+/// [`Message::Prefill`], [`Message::RowsOf`], [`Message::Put`] and
+/// [`Message::Open`]: a node takes rows computed elsewhere into its layers
+/// and sends the slices of the workers below on, and — when it holds the
+/// whole model — runs a prompt through every layer alone and hands out the
+/// rows. A parent sends none of them to a child without it.
+pub const FEATURE_ROWS: u64 = 2048;
+
 /// The most bytes one [`Message::FetchRange`] may ask for: a larger range
 /// is asked for in pieces.
 pub const MAX_FETCH_BYTES: u64 = 8 << 20;
 
 /// Every extension bit, each a distinct power of two.
-const ALL_FEATURES: [u64; 9] = [
+const ALL_FEATURES: [u64; 10] = [
     FEATURE_FORK,
     FEATURE_HEAD,
     FEATURE_ECHO,
@@ -117,6 +125,7 @@ const ALL_FEATURES: [u64; 9] = [
     FEATURE_RETAIN,
     FEATURE_PREFIXES,
     FEATURE_FETCH,
+    FEATURE_ROWS,
 ];
 
 const _: () = {
@@ -149,6 +158,7 @@ pub fn feature_names(features: u64) -> Vec<&'static str> {
         (FEATURE_RETAIN, "retain"),
         (FEATURE_PREFIXES, "prefixes"),
         (FEATURE_FETCH, "fetch"),
+        (FEATURE_ROWS, "rows"),
     ]
     .into_iter()
     .filter(|(bit, _)| features & bit != 0)
@@ -820,6 +830,52 @@ pub enum Message {
     Forget {
         key: String,
     },
+    /// Run `tokens`, from position 0, through every layer of the model on
+    /// this node alone, and answer with the last position's logits
+    /// ([`Message::Prefilled`]). The rows of the layers this node and the
+    /// workers below it run open `session` there, as [`Message::Open`] does;
+    /// the rest are kept for the parent to take ([`Message::RowsOf`]). Only
+    /// sent to a child that advertised [`FEATURE_ROWS`], and refused by one
+    /// that does not hold the whole model.
+    Prefill {
+        session: u64,
+        tokens: Vec<u32>,
+    },
+    /// The answer to a [`Message::Prefill`]: `f32` logits, one row.
+    Prefilled {
+        session: u64,
+        logits: Activations,
+    },
+    /// The rows a [`Message::Prefill`] kept of layers
+    /// `layer_start..layer_end`, answered with [`Message::RowsData`];
+    /// `last` lets go of what is left of them.
+    RowsOf {
+        session: u64,
+        layer_start: u32,
+        layer_end: u32,
+        last: bool,
+    },
+    /// Rows of a range of layers in the self-describing form of
+    /// `super::prefixes::encode_rows`.
+    RowsData {
+        session: u64,
+        data: Vec<u8>,
+    },
+    /// Rows for `session` on a range of the layers this node and the workers
+    /// below it run (`data`, as in [`Message::RowsData`]): its own kept until
+    /// [`Message::Open`], the workers' slices sent on. Answered with an empty
+    /// `data`. Only sent to a child that advertised [`FEATURE_ROWS`].
+    Put {
+        session: u64,
+        data: Vec<u8>,
+    },
+    /// Open `session` from the rows put here, its first `len` positions, here
+    /// and on every worker below: refused, with nothing opened, when a layer
+    /// has none or they hold another length. Answered with the same message.
+    Open {
+        session: u64,
+        len: u32,
+    },
     /// Answered with the same bytes: what a parent times a link's bandwidth
     /// by. Only sent to a child that advertised [`FEATURE_ECHO`].
     Echo {
@@ -1019,6 +1075,12 @@ mod tag {
     pub const FETCH_ACK: u8 = 32;
     pub const FETCH_RANGE: u8 = 33;
     pub const FETCH_DATA: u8 = 34;
+    pub const PREFILL: u8 = 35;
+    pub const PREFILLED: u8 = 36;
+    pub const ROWS_OF: u8 = 37;
+    pub const ROWS_DATA: u8 = 38;
+    pub const PUT: u8 = 39;
+    pub const OPEN: u8 = 40;
 }
 
 struct Writer(Vec<u8>);
@@ -1445,6 +1507,46 @@ impl Message {
                 w.string(key);
                 tag::FORGET
             }
+            Self::Prefill { session, tokens } => {
+                w.u64(*session);
+                w.u32(tokens.len() as u32);
+                for t in tokens {
+                    w.u32(*t);
+                }
+                tag::PREFILL
+            }
+            Self::Prefilled { session, logits } => {
+                w.u64(*session);
+                w.activations(logits);
+                tag::PREFILLED
+            }
+            Self::RowsOf {
+                session,
+                layer_start,
+                layer_end,
+                last,
+            } => {
+                w.u64(*session);
+                w.u32(*layer_start);
+                w.u32(*layer_end);
+                w.u8(u8::from(*last));
+                tag::ROWS_OF
+            }
+            Self::RowsData { session, data } => {
+                w.u64(*session);
+                w.bytes(data);
+                tag::ROWS_DATA
+            }
+            Self::Put { session, data } => {
+                w.u64(*session);
+                w.bytes(data);
+                tag::PUT
+            }
+            Self::Open { session, len } => {
+                w.u64(*session);
+                w.u32(*len);
+                tag::OPEN
+            }
             Self::Echo { data } => {
                 w.bytes(data);
                 tag::ECHO
@@ -1688,6 +1790,34 @@ impl Message {
                 len: r.u32()?,
             },
             tag::FORGET => Self::Forget { key: r.string()? },
+            tag::PREFILL => {
+                let session = r.u64()?;
+                let n = r.count(4)?;
+                let tokens = (0..n).map(|_| r.u32()).collect::<Result<_>>()?;
+                Self::Prefill { session, tokens }
+            }
+            tag::PREFILLED => Self::Prefilled {
+                session: r.u64()?,
+                logits: r.activations()?,
+            },
+            tag::ROWS_OF => Self::RowsOf {
+                session: r.u64()?,
+                layer_start: r.u32()?,
+                layer_end: r.u32()?,
+                last: r.u8()? != 0,
+            },
+            tag::ROWS_DATA => Self::RowsData {
+                session: r.u64()?,
+                data: r.bytes()?,
+            },
+            tag::PUT => Self::Put {
+                session: r.u64()?,
+                data: r.bytes()?,
+            },
+            tag::OPEN => Self::Open {
+                session: r.u64()?,
+                len: r.u32()?,
+            },
             tag::ECHO => Self::Echo { data: r.bytes()? },
             tag::CANCEL => Self::Cancel {
                 session: r.u64()?,
@@ -1864,6 +1994,49 @@ mod tests {
         assert!(feature_names(FEATURE_FETCH).contains(&"fetch"));
         // Advertised per node, by a node that holds its whole file.
         assert_eq!(FEATURES & FEATURE_FETCH, 0);
+        assert_eq!(FEATURE_ROWS, 2048);
+        assert!(ALL_FEATURES.contains(&FEATURE_ROWS));
+        assert!(feature_names(FEATURES).contains(&"rows"));
+        assert!(!feature_names(FEATURES & !FEATURE_ROWS).contains(&"rows"));
+    }
+
+    /// The messages that move a prompt's rows, each through a frame and
+    /// back; their tags follow the last one in use, and none is a retired tag.
+    #[test]
+    fn the_rows_messages_survive_a_round_trip() {
+        let messages = [
+            Message::Prefill {
+                session: 9,
+                tokens: vec![1, 2, 3],
+            },
+            Message::Prefilled {
+                session: 9,
+                logits: activations(),
+            },
+            Message::RowsOf {
+                session: 9,
+                layer_start: 2,
+                layer_end: 5,
+                last: true,
+            },
+            Message::RowsData {
+                session: 9,
+                data: vec![7; 33],
+            },
+            Message::Put {
+                session: 9,
+                data: vec![1, 2],
+            },
+            Message::Open {
+                session: 9,
+                len: 300,
+            },
+        ];
+        for (message, expected) in messages.into_iter().zip(35u8..) {
+            assert_eq!(message.encode().0, expected);
+            assert!(![18, 19, 21].contains(&expected));
+            round_trip(message);
+        }
     }
 
     /// A probe answer from a node that does not send its features reads as

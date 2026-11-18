@@ -642,6 +642,8 @@ impl ChildLink {
             Message::ForwardBatch(forwards) => {
                 forwards.iter().map(|f| f.tokens.len()).max().unwrap_or(0)
             }
+            // Every layer of the model, where a forward runs a share of them.
+            Message::Prefill { tokens, .. } => tokens.len(),
             _ => 0,
         };
         self.send_and_wait(message, forward_limit(self.timeout, tokens))

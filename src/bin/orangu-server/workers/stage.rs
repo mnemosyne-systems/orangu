@@ -405,6 +405,81 @@ impl<E: Exchange> Stage for MessageStage<E> {
         }
     }
 
+    fn takes_rows(&self) -> bool {
+        self.exchange.features() & super::protocol::FEATURE_ROWS != 0
+    }
+
+    fn prefill_whole(&self, session: u64, tokens: &[u32]) -> Result<Vec<f32>> {
+        ensure!(
+            self.takes_rows(),
+            "{} cannot run a prompt alone",
+            self.exchange.name()
+        );
+        let tokens = tokens.to_vec();
+        match self
+            .exchange
+            .exchange(&Message::Prefill { session, tokens })?
+        {
+            Message::Prefilled {
+                session: answered,
+                logits,
+            } => {
+                ensure!(
+                    answered == session && logits.rows == 1,
+                    "a prompt of session {session} answered session {answered} with {} rows",
+                    logits.rows
+                );
+                logits.decode()
+            }
+            Message::Error(error) => Err(anyhow!(error)),
+            other => bail!("unexpected reply to a prompt: {other:?}"),
+        }
+    }
+
+    fn rows(&self, session: u64, layers: Range<usize>, last: bool) -> Result<Vec<u8>> {
+        ensure!(self.takes_rows(), "{} keeps no rows", self.exchange.name());
+        match self.exchange.exchange(&Message::RowsOf {
+            session,
+            layer_start: u32::try_from(layers.start)?,
+            layer_end: u32::try_from(layers.end)?,
+            last,
+        })? {
+            Message::RowsData {
+                session: answered,
+                data,
+            } if answered == session => Ok(data),
+            Message::Error(error) => Err(anyhow!(error)),
+            other => bail!("unexpected reply to a request for rows: {other:?}"),
+        }
+    }
+
+    fn put(&self, session: u64, data: Vec<u8>) -> Result<()> {
+        ensure!(
+            self.takes_rows(),
+            "{} cannot take rows",
+            self.exchange.name()
+        );
+        match self.exchange.exchange(&Message::Put { session, data })? {
+            Message::Put { .. } => Ok(()),
+            Message::Error(error) => Err(anyhow!(error)),
+            other => bail!("unexpected reply to rows: {other:?}"),
+        }
+    }
+
+    fn open(&self, session: u64, len: usize) -> Result<()> {
+        ensure!(
+            self.takes_rows(),
+            "{} cannot take rows",
+            self.exchange.name()
+        );
+        let len = u32::try_from(len)?;
+        match self.exchange.exchange(&Message::Open { session, len })? {
+            Message::Open { .. } => Ok(()),
+            Message::Error(error) => Err(anyhow!(error)),
+            other => bail!("unexpected reply to an open: {other:?}"),
+        }
+    }
+
     fn forget(&self, key: &str) {
         if !self.saves_prefixes() {
             return;

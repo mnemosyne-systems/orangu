@@ -101,6 +101,17 @@ impl GuardedStage {
         })
     }
 
+    /// `session` started without its input rows going through here.
+    fn no_rows_kept(&self, session: u64) {
+        self.kept.lock().unwrap().insert(
+            session,
+            Kept {
+                gap: true,
+                ..Kept::default()
+            },
+        );
+    }
+
     fn current(&self) -> (Arc<dyn EncodedStage>, u64) {
         let current = self.current.read().unwrap();
         (current.0.clone(), current.1)
@@ -288,18 +299,39 @@ impl Stage for GuardedStage {
     /// be given them, and it is rebuilt from the top instead.
     fn load(&self, session: u64, key: &str, len: usize) -> Result<()> {
         self.current().0.load(session, key, len)?;
-        self.kept.lock().unwrap().insert(
-            session,
-            Kept {
-                gap: true,
-                ..Kept::default()
-            },
-        );
+        self.no_rows_kept(session);
         Ok(())
     }
 
     fn forget(&self, key: &str) {
         self.current().0.forget(key);
+    }
+
+    fn takes_rows(&self) -> bool {
+        self.current().0.takes_rows()
+    }
+
+    /// A session whose rows were computed elsewhere went by without its
+    /// input rows here: a standby cannot be given them, and it is rebuilt
+    /// from the top instead.
+    fn prefill_whole(&self, session: u64, tokens: &[u32]) -> Result<Vec<f32>> {
+        let logits = self.current().0.prefill_whole(session, tokens)?;
+        self.no_rows_kept(session);
+        Ok(logits)
+    }
+
+    fn rows(&self, session: u64, layers: Range<usize>, last: bool) -> Result<Vec<u8>> {
+        self.current().0.rows(session, layers, last)
+    }
+
+    fn put(&self, session: u64, data: Vec<u8>) -> Result<()> {
+        self.current().0.put(session, data)
+    }
+
+    fn open(&self, session: u64, len: usize) -> Result<()> {
+        self.current().0.open(session, len)?;
+        self.no_rows_kept(session);
+        Ok(())
     }
 
     fn fork(&self, from: u64, to: u64, len: usize) -> Result<()> {

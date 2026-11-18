@@ -4079,6 +4079,21 @@ pub trait ModelForward: Send + Sync {
         Ok(())
     }
 
+    /// Runs `tokens`, at positions from `start_pos`, into `cache` some other
+    /// way than chunk by chunk through [`Self::forward`] — a model whose
+    /// layers are on other machines may have one machine run the whole
+    /// prompt — and returns the last position's logits. `None`, with
+    /// `cache` as it was, leaves the prompt to the chunked prefill.
+    fn prefill_whole(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let _ = (cache, tokens, start_pos);
+        Ok(None)
+    }
+
     fn new_kv_cache_for_layers(&self, layers: std::ops::Range<usize>, capacity: usize) -> KvCache {
         let _ = layers;
         self.new_kv_cache(capacity)

@@ -3812,6 +3812,53 @@ impl KvCache {
         self.recent_tokens.clone_from(&src.recent_tokens);
     }
 
+    /// [`Self::copy_prefix_from`] for the attention layers `layers` alone:
+    /// their first `len` positions copied from `src`, every other layer left
+    /// as it is. For a cache of one node's layers filled from a cache of
+    /// more of them (`crate::workers`), which agree in shape on `layers`.
+    /// An error, with nothing copied, when a layer's width differs, `src`
+    /// holds fewer than `len` positions on the host there, or `len` is past
+    /// this cache's capacity.
+    pub fn copy_layers_from(
+        &mut self,
+        src: &KvCache,
+        len: usize,
+        layers: std::ops::Range<usize>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            layers.end <= self.layers.len() && layers.end <= src.layers.len(),
+            "layers {layers:?} of caches of {} and {} layers",
+            self.layers.len(),
+            src.layers.len()
+        );
+        for il in layers.clone() {
+            let (dst, from) = (&self.layers[il], &src.layers[il]);
+            anyhow::ensure!(
+                dst.kv_dim == from.kv_dim && dst.stride == from.stride,
+                "layer {il} is {} wide here and {} in the rows",
+                dst.kv_dim,
+                from.kv_dim
+            );
+            anyhow::ensure!(
+                dst.paged.is_none(),
+                "layer {il} is paged, and is filled by pushing rows"
+            );
+            if from.len == 0 {
+                continue;
+            }
+            anyhow::ensure!(
+                len / dst.stride <= dst.capacity && len / dst.stride <= from.host_len(),
+                "layer {il} holds {} positions on the host and {} at most, not {len}",
+                from.host_len() * dst.stride,
+                dst.capacity * dst.stride
+            );
+        }
+        for il in layers {
+            self.layers[il].copy_prefix_from(&src.layers[il], len);
+        }
+        Ok(())
+    }
+
     /// The recurrent state this cache had at `len` positions, where it has
     /// one: its own at its full length, or its [`Self::shared_checkpoint`]
     /// there. `None` for any other length.

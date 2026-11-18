@@ -125,6 +125,44 @@ pub trait Stage: Send + Sync {
         let _ = key;
     }
 
+    /// Whether this stage's node takes rows computed elsewhere, and runs a
+    /// prompt alone when it holds the whole model
+    /// ([`super::protocol::FEATURE_ROWS`]).
+    fn takes_rows(&self) -> bool {
+        false
+    }
+
+    /// Runs `tokens`, from position 0, through every layer of the model on
+    /// this stage's node alone: `session` opens on its layers and the
+    /// workers' below it, the other layers' rows are kept there for
+    /// [`Self::rows`], and the last position's logits come back. A stage
+    /// that cannot says so.
+    fn prefill_whole(&self, session: u64, tokens: &[u32]) -> Result<Vec<f32>> {
+        let _ = (session, tokens);
+        anyhow::bail!("{} cannot run a prompt alone", self.name())
+    }
+
+    /// The rows a [`Self::prefill_whole`] kept of `layers`
+    /// (`super::prefixes::encode_rows`); `last` lets go of the rest.
+    fn rows(&self, session: u64, layers: Range<usize>, last: bool) -> Result<Vec<u8>> {
+        let _ = (session, layers, last);
+        anyhow::bail!("{} keeps no rows", self.name())
+    }
+
+    /// Rows for `session` on some of this stage's layers, kept until
+    /// [`Self::open`]. A stage that cannot says so.
+    fn put(&self, session: u64, data: Vec<u8>) -> Result<()> {
+        let _ = (session, data);
+        anyhow::bail!("{} cannot take rows", self.name())
+    }
+
+    /// Opens `session`, its first `len` positions, from the rows put on
+    /// every layer of this stage. A stage that cannot says so.
+    fn open(&self, session: u64, len: usize) -> Result<()> {
+        let _ = (session, len);
+        anyhow::bail!("{} cannot take rows", self.name())
+    }
+
     /// Several sessions' forwards at once — one decode step of every slot —
     /// each answered on its own. The default sends them one by one; a
     /// stage behind a connection sends them as one message. An `Err` is
@@ -190,7 +228,7 @@ pub struct LayerPipeline {
 
 /// `ORANGU_WORKERS_PIPELINE=0`: every forward waits for the whole tree, as
 /// before prefill was pipelined, for comparison.
-fn pipelining() -> bool {
+pub(crate) fn pipelining() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_WORKERS_PIPELINE"))
 }
@@ -198,7 +236,7 @@ fn pipelining() -> bool {
 /// `ORANGU_WORKERS_CHUNK`: the width, in tokens, a top-level node cuts a
 /// prompt chunk into when it pipelines prefill through its tree; `0` keeps
 /// the chunks the engine chose. See `DelegatingModel::run`.
-fn sub_chunk() -> usize {
+pub(crate) fn sub_chunk() -> usize {
     static WIDTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *WIDTH.get_or_init(|| {
         std::env::var("ORANGU_WORKERS_CHUNK")
@@ -942,6 +980,21 @@ impl LayerPipeline {
             stage.forget(key);
         }
     }
+
+    /// Opens `session`, its first `len` positions, on every stage from the
+    /// rows put there ([`Stage::open`]). One that fails has the others
+    /// release it.
+    pub fn open_below(&self, session: u64, len: usize) -> Result<()> {
+        for (i, stage) in self.stages.iter().enumerate() {
+            if let Err(error) = stage.open(session, len) {
+                for opened in &self.stages[..i] {
+                    opened.release(session);
+                }
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl RemoteLayers for LayerPipeline {
@@ -1003,6 +1056,50 @@ pub trait PipelineSource: Send + Sync {
     /// finished only by a replay says nothing, or a worker that dies once a
     /// request and comes back would be forgiven every time.
     fn served_whole(&self) {}
+
+    /// Where a prompt runs on `pipeline`: `tree_tokens` through the tree
+    /// after any prefix it reuses, or all `all_tokens` on one node that holds
+    /// the whole model ([`super::prefill::decide`]). A source that cannot say
+    /// keeps every prompt on the tree.
+    fn prefill_choice(
+        &self,
+        pipeline: &LayerPipeline,
+        tree_tokens: usize,
+        all_tokens: usize,
+    ) -> Option<Handoff> {
+        let _ = (pipeline, tree_tokens, all_tokens);
+        None
+    }
+
+    /// Where a prompt ran and how long it took, for `/v1/workers` and for
+    /// the next [`Self::prefill_choice`].
+    fn prefilled(&self, ran: &Prefilled) {
+        let _ = ran;
+    }
+}
+
+/// What [`PipelineSource::prefill_choice`] decided, and what a hand-over
+/// needs: the model's header hash its rows carry, and the context the
+/// tree's sessions hold.
+#[derive(Clone, Debug)]
+pub struct Handoff {
+    pub choice: super::prefill::Choice,
+    pub header_hash: [u8; 32],
+    pub n_ctx: usize,
+}
+
+/// A prompt that ran: where, how many tokens, how long, and why there.
+#[derive(Clone, Debug)]
+pub struct Prefilled {
+    /// The node's name; empty for the tree.
+    pub on: String,
+    pub tokens: usize,
+    pub took: Duration,
+    /// Of `took`, the rows: pulled, sent on and taken in.
+    pub rows: Duration,
+    pub choice: super::prefill::Choice,
+    /// Why it went to the tree after all, when a hand-over failed.
+    pub fell_back: Option<String>,
 }
 
 /// One pipeline, for good.
@@ -1038,6 +1135,9 @@ struct SessionState {
     host: usize,
     prefill: Trace,
     decode: Trace,
+    /// A prompt on its way through the tree: when it started, its tokens, and
+    /// why it went there — told to the source when its last part is through.
+    tree_prefill: Option<(Instant, usize, super::prefill::Choice)>,
 }
 
 type Sessions = Arc<Mutex<HashMap<u64, SessionState>>>;
@@ -1166,6 +1266,7 @@ impl RemoteLayers for SessionOwner {
                 host: len,
                 prefill: Trace::default(),
                 decode: Trace::default(),
+                tree_prefill: None,
             };
             sessions.insert(to, state);
         }
@@ -1665,6 +1766,7 @@ impl DelegatingModel {
                 promised: 0,
                 prefill: Trace::default(),
                 decode: Trace::default(),
+                tree_prefill: None,
             },
         );
         let owner: Arc<dyn RemoteLayers> = Arc::new(SessionOwner {
@@ -1734,6 +1836,115 @@ impl DelegatingModel {
             }
             Ok(()) => Ok(()),
         }
+    }
+
+    /// Runs every one of `tokens` (a session's positions from 0) on the node
+    /// `handoff` chose, alone, and gives every other node the rows of its own
+    /// layers: a new session on `pipeline`, holding them all, and the last
+    /// position's logits. An error, with the new session released on every
+    /// node, when a node does not answer or refuses the rows.
+    fn hand_over(
+        &self,
+        pipeline: &Arc<LayerPipeline>,
+        generation: u64,
+        capacity: usize,
+        tokens: &[u32],
+        promised: usize,
+        handoff: &Handoff,
+    ) -> Result<(KvCache, Vec<f32>, Duration, Duration)> {
+        let len = tokens.len();
+        let mut fresh = self.cache_on(pipeline, generation, capacity, tokens.to_vec());
+        let session = fresh.remote.as_ref().map_or(0, |r| r.id);
+        // Asked, not made: a node with no room leaves the prompt to the tree,
+        // whose own promise stands, and the prefix pool keeps its entries.
+        Self::ask_once(pipeline, &fresh, session, promised.max(len + 1))
+            .map_err(|refusal| anyhow::anyhow!("no room for the rows: {refusal}"))?;
+        let (hash, n_ctx) = (handoff.header_hash, handoff.n_ctx);
+        let model = self.model.as_ref();
+        let local = pipeline.local_layers();
+        let stages = pipeline.stages();
+        let started = Instant::now();
+        let (logits, rows_started) = match &handoff.choice.on {
+            Some(None) => {
+                let (full, logits) =
+                    super::prefill::run_whole(model, tokens, super::prefill::width())?;
+                let rows_started = Instant::now();
+                fresh.copy_layers_from(&full, len, local.clone())?;
+                for stage in stages {
+                    let range = stage.layers();
+                    for piece in super::prefill::groups(range, |il| {
+                        8 * full.layers.get(il).map_or(0, |l| l.kv_dim() * l.len) as u64
+                    }) {
+                        let data =
+                            super::prefill::encode_layers(model, hash, &full, piece, n_ctx, len)?;
+                        stage.put(session, data)?;
+                    }
+                }
+                (logits, rows_started)
+            }
+            Some(Some(addr)) => {
+                let fast = stages
+                    .iter()
+                    .position(|s| s.name() == *addr)
+                    .ok_or_else(|| anyhow::anyhow!("{addr} is not a worker of this plan"))?;
+                let logits = stages[fast].prefill_whole(session, tokens)?;
+                let rows_started = Instant::now();
+                let row_bytes = super::prefill::row_bytes(model);
+                let per = |il: usize| row_bytes.get(il).copied().unwrap_or(0) * len as u64;
+                // Where each piece goes: this node (`None`) or a stage.
+                let mut pieces: Vec<(Range<usize>, Option<usize>)> =
+                    super::prefill::groups(local.clone(), per)
+                        .into_iter()
+                        .map(|piece| (piece, None))
+                        .collect();
+                for (i, stage) in stages.iter().enumerate().filter(|(i, _)| *i != fast) {
+                    pieces.extend(
+                        super::prefill::groups(stage.layers(), per)
+                            .into_iter()
+                            .map(|piece| (piece, Some(i))),
+                    );
+                }
+                if pieces.is_empty() {
+                    stages[fast].rows(session, 0..0, true)?;
+                }
+                let last = pieces.len().saturating_sub(1);
+                for (n, (piece, to)) in pieces.into_iter().enumerate() {
+                    let data = stages[fast].rows(session, piece.clone(), n == last)?;
+                    match to {
+                        Some(i) => stages[i].put(session, data)?,
+                        None => {
+                            let shape = super::prefill::expected_shape(model, piece.clone());
+                            let rows = super::prefixes::decode_rows(
+                                hash,
+                                &data,
+                                &super::prefixes::Expect {
+                                    layers: piece.clone(),
+                                    shape: &shape,
+                                    n_ctx,
+                                    len,
+                                },
+                            )?;
+                            fresh.copy_layers_from(&rows, len, piece)?;
+                        }
+                    }
+                }
+                (logits, rows_started)
+            }
+            None => anyhow::bail!("the prompt was not handed over"),
+        };
+        // A stage that refuses leaves `fresh` to be dropped, which releases
+        // the session on every node.
+        for stage in stages {
+            if handoff.choice.on != Some(Some(stage.name())) {
+                stage.open(session, len)?;
+            }
+        }
+        pipeline.room().wrote(session, len);
+        if let Some(remote) = fresh.remote.as_mut() {
+            remote.len = len;
+        }
+        let took = started.elapsed();
+        Ok((fresh, logits, took, rows_started.elapsed()))
     }
 
     /// Replaces `cache` with one on `pipeline` holding the same first
@@ -2050,12 +2261,124 @@ impl ModelForward for DelegatingModel {
         start_pos: usize,
         _slot_id: usize,
     ) -> Result<Vec<f32>> {
-        if self.source.head_on_last() {
-            return self.run(cache, tokens, start_pos, Rows::LastLogits);
+        let logits = if self.source.head_on_last() {
+            self.run(cache, tokens, start_pos, Rows::LastLogits)?
+        } else {
+            let last = self.run(cache, tokens, start_pos, Rows::Last)?;
+            self.model.head(&last, 1)?.pop().unwrap_or_default()
+        };
+        // A prompt's last part: how long the whole of it took the tree.
+        let through = cache.remote.as_ref().and_then(|r| {
+            self.sessions
+                .lock()
+                .unwrap()
+                .get_mut(&r.id)
+                .and_then(|state| state.tree_prefill.take())
+        });
+        if let Some((started, n, choice)) = through {
+            self.source.prefilled(&Prefilled {
+                on: String::new(),
+                tokens: n,
+                took: started.elapsed(),
+                rows: Duration::ZERO,
+                fell_back: None,
+                choice,
+            });
         }
-        let last = self.run(cache, tokens, start_pos, Rows::Last)?;
-        let mut logits = self.model.head(&last, 1)?;
-        Ok(logits.pop().unwrap_or_default())
+        Ok(logits)
+    }
+
+    fn prefill_whole(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        start_pos: usize,
+    ) -> Result<Option<Vec<f32>>> {
+        let Some((old, capacity)) = cache.remote.as_ref().map(|r| (r.id, r.capacity)) else {
+            return Ok(None);
+        };
+        let (pipeline, generation) = self.source.current();
+        if pipeline.stages().is_empty() {
+            return Ok(None);
+        }
+        // Every position from 0: the ones the session holds, and the prompt.
+        let held = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .get(&old)
+                .filter(|state| state.generation == generation && state.tokens.len() >= start_pos)
+                .map(|state| (state.tokens[..start_pos].to_vec(), state.promised))
+        };
+        let Some((mut all, promised)) = held else {
+            return Ok(None);
+        };
+        all.extend_from_slice(tokens);
+        let Some(handoff) = self
+            .source
+            .prefill_choice(&pipeline, tokens.len(), all.len())
+        else {
+            return Ok(None);
+        };
+        let through_tree = |choice: super::prefill::Choice| {
+            if let Some(state) = self.sessions.lock().unwrap().get_mut(&old) {
+                state.tree_prefill = Some((Instant::now(), tokens.len(), choice));
+            }
+        };
+        if handoff.choice.on.is_none() {
+            through_tree(handoff.choice);
+            return Ok(None);
+        }
+        super::clock::hold();
+        let _running = InFlight::new(self);
+        let name = handoff.choice.name.clone();
+        match self.hand_over(&pipeline, generation, capacity, &all, promised, &handoff) {
+            Ok((fresh, logits, took, rows)) => {
+                let session = fresh.remote.as_ref().map_or(0, |r| r.id);
+                if let Some(state) = self.sessions.lock().unwrap().get_mut(&session) {
+                    state.prefill.forwards += 1;
+                    state.prefill.tokens += all.len();
+                    state.prefill.add(&name, took);
+                    state.promised = promised;
+                }
+                log::info!(
+                    "orangu-server: workers: a prompt of {} tokens ran on {name} alone, every \
+                     node given its rows, in {:.0} ms, {:.0} ms of it the rows ({})",
+                    all.len(),
+                    took.as_secs_f64() * 1e3,
+                    rows.as_secs_f64() * 1e3,
+                    handoff.choice.reason
+                );
+                self.source.prefilled(&Prefilled {
+                    on: name,
+                    tokens: all.len(),
+                    took,
+                    rows,
+                    choice: handoff.choice,
+                    fell_back: None,
+                });
+                // The old session — empty, or a prefix the new one holds too —
+                // is released on every node as it drops.
+                *cache = fresh;
+                Ok(Some(logits))
+            }
+            Err(error) => {
+                log::warn!(
+                    "orangu-server: workers: a prompt of {} tokens goes through the tree, not \
+                     {name}: {error:#}",
+                    all.len()
+                );
+                self.source.prefilled(&Prefilled {
+                    on: String::new(),
+                    tokens: tokens.len(),
+                    took: Duration::ZERO,
+                    rows: Duration::ZERO,
+                    choice: handoff.choice.clone(),
+                    fell_back: Some(format!("{error:#}")),
+                });
+                through_tree(handoff.choice);
+                Ok(None)
+            }
+        }
     }
 
     /// Every stage still runs — its keys and values are the point — but
@@ -2685,6 +3008,175 @@ mod tests {
 
     fn over(store: &Arc<SessionStore>) -> Box<dyn Stage> {
         Box::new(LoopbackStage::new(store.clone(), ActivationFormat::F32))
+    }
+
+    /// A fixed pipeline whose every prompt is handed to `on`
+    /// ([`PipelineSource::prefill_choice`]), noting where each ran.
+    struct HandingOver {
+        pipeline: Arc<LayerPipeline>,
+        on: Option<Option<String>>,
+        ran: Mutex<Vec<Prefilled>>,
+    }
+
+    impl PipelineSource for HandingOver {
+        fn current(&self) -> (Arc<LayerPipeline>, u64) {
+            (self.pipeline.clone(), 0)
+        }
+
+        fn recover(&self, _generation: u64) -> bool {
+            false
+        }
+
+        fn prefill_choice(
+            &self,
+            _pipeline: &LayerPipeline,
+            _tree_tokens: usize,
+            _all_tokens: usize,
+        ) -> Option<Handoff> {
+            Some(Handoff {
+                choice: super::super::prefill::Choice {
+                    on: self.on.clone(),
+                    name: match &self.on {
+                        Some(Some(addr)) => addr.clone(),
+                        Some(None) => "top".to_string(),
+                        None => String::new(),
+                    },
+                    tree_s: None,
+                    node_s: None,
+                    reason: "a test".to_string(),
+                },
+                header_hash: [6; 32],
+                n_ctx: N_CTX,
+            })
+        }
+
+        fn prefilled(&self, ran: &Prefilled) {
+            self.ran.lock().unwrap().push(ran.clone());
+        }
+    }
+
+    /// A worker of `layers` taking rows of the model `hash`, named `name`.
+    fn taking(layers: Range<usize>, name: &str, hash: [u8; 32], whole: bool) -> Arc<SessionStore> {
+        let pipeline = LayerPipeline::new(fixture::model(), layers, vec![]).unwrap();
+        Arc::new(
+            SessionStore::new(Arc::new(pipeline), N_CTX, 8)
+                .with_model_hash(hash)
+                .with_whole_model(whole)
+                .named(name),
+        )
+    }
+
+    /// A top over layer 0, and workers `a` (1..2) and `b` (2..4), every prompt
+    /// handed to `on`; `b` takes rows of the model `b_hash`.
+    fn handing_over(
+        on: Option<Option<String>>,
+        b_hash: [u8; 32],
+        whole: bool,
+    ) -> (
+        DelegatingModel,
+        Arc<HandingOver>,
+        Arc<SessionStore>,
+        Arc<SessionStore>,
+    ) {
+        let a = taking(1..2, "a", [6; 32], whole);
+        let b = taking(2..N_LAYER, "b", b_hash, whole);
+        let pipeline = Arc::new(
+            LayerPipeline::new(fixture::model(), 0..1, vec![over(&a), over(&b)])
+                .unwrap()
+                .named("top"),
+        );
+        let source = Arc::new(HandingOver {
+            pipeline,
+            on,
+            ran: Mutex::new(Vec::new()),
+        });
+        let model = DelegatingModel::with_source(fixture::model(), source.clone());
+        (model, source, a, b)
+    }
+
+    /// What the engine does with a prompt of `prompt` tokens, then a decode
+    /// step for each token after it: every step's logits, and whether the
+    /// prompt was handed over.
+    fn prompt_and_decode(
+        model: &DelegatingModel,
+        tokens: &[u32],
+        prompt: usize,
+    ) -> (Vec<Vec<f32>>, bool) {
+        let mut cache = model.new_kv_cache(N_CTX);
+        model.admit_prompt(&cache, prompt + 1).unwrap();
+        let (first, handed) = match model
+            .prefill_whole(&mut cache, &tokens[..prompt], 0)
+            .unwrap()
+        {
+            Some(logits) => (logits, true),
+            None => (
+                model.forward(&mut cache, &tokens[..prompt], 0, 0).unwrap(),
+                false,
+            ),
+        };
+        let mut out = vec![first];
+        for (pos, token) in tokens.iter().enumerate().skip(prompt) {
+            out.push(model.forward(&mut cache, &[*token], pos, 0).unwrap());
+        }
+        (out, handed)
+    }
+
+    fn worst_of(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .flat_map(|(a, b)| a.iter().zip(b).map(|(x, y)| (x - y).abs()))
+            .fold(0f32, f32::max)
+    }
+
+    /// A prompt run on one node — this one, or either worker — and its rows
+    /// handed to every node computes what the tree does, and decode goes on
+    /// from it through the tree.
+    #[test]
+    fn a_prompt_run_on_one_node_answers_as_the_tree_does() {
+        let tokens = fixture::tokens();
+        let (tree, _, _, _) = handing_over(None, [6; 32], true);
+        let (expected, handed) = prompt_and_decode(&tree, &tokens, 5);
+        assert!(!handed);
+        for on in [None, Some("a".to_string()), Some("b".to_string())] {
+            let (model, source, a, b) = handing_over(Some(on.clone()), [6; 32], true);
+            let (got, handed) = prompt_and_decode(&model, &tokens, 5);
+            assert!(handed, "{on:?}");
+            let worst = worst_of(&got, &expected);
+            assert!(worst < 1e-4, "on {on:?}: {worst}");
+            let ran = source.ran.lock().unwrap();
+            assert_eq!(ran.len(), 1);
+            assert_eq!(ran[0].tokens, 5);
+            assert!(ran[0].fell_back.is_none());
+            // Decode went on from the handed rows on both workers; with the
+            // cache dropped nothing is left on them, nor any rows waiting.
+            assert_eq!((a.len(), b.len()), (0, 0), "on {on:?}");
+            assert_eq!((a.rows_waiting(), b.rows_waiting()), ((0, 0), (0, 0)));
+        }
+    }
+
+    /// A hand-over that fails — rows refused, or a node that does not hold
+    /// the model — leaves the prompt to the tree, and the answer as it was.
+    #[test]
+    fn a_failed_hand_over_leaves_the_prompt_to_the_tree() {
+        let tokens = fixture::tokens();
+        let (tree, _, _, _) = handing_over(None, [6; 32], true);
+        let (expected, _) = prompt_and_decode(&tree, &tokens, 5);
+        for (on, b_hash, whole) in [
+            (None, [9; 32], true),
+            (Some("a".to_string()), [9; 32], true),
+            (Some("a".to_string()), [6; 32], false),
+        ] {
+            let (model, source, a, b) = handing_over(Some(on.clone()), b_hash, whole);
+            let (got, handed) = prompt_and_decode(&model, &tokens, 5);
+            assert!(!handed, "{on:?}");
+            assert!(worst_of(&got, &expected) < 1e-6, "{on:?}");
+            let ran = source.ran.lock().unwrap();
+            assert!(ran[0].fell_back.is_some(), "{on:?}");
+            assert_eq!(ran.last().unwrap().on, "", "the tree ran it");
+            assert_eq!((a.len(), b.len()), (0, 0), "nothing left behind: {on:?}");
+            assert_eq!((a.rows_waiting(), b.rows_waiting()), ((0, 0), (0, 0)));
+        }
     }
 
     /// A worker that cannot hold the prompt says so before any of it runs,

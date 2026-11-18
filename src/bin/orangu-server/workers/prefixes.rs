@@ -203,26 +203,7 @@ impl PrefixFiles {
         let path = self
             .path(key, lead)
             .ok_or_else(|| anyhow::anyhow!("{key:?} is not a key"))?;
-        let shape = cache.structure_tag();
-        let mut blob = Vec::new();
-        blob.extend_from_slice(MAGIC);
-        blob.extend_from_slice(&VERSION.to_le_bytes());
-        blob.extend_from_slice(&self.header_hash);
-        for value in [layers.start, layers.end, shape.len()] {
-            blob.extend_from_slice(&(value as u32).to_le_bytes());
-        }
-        blob.extend_from_slice(&shape);
-        blob.extend_from_slice(&(n_ctx as u32).to_le_bytes());
-        blob.extend_from_slice(&(len as u32).to_le_bytes());
-        let saved_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos() as u64);
-        blob.extend_from_slice(&saved_at.to_le_bytes());
-        blob.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
-        for token in tokens {
-            blob.extend_from_slice(&token.to_le_bytes());
-        }
-        blob.extend_from_slice(&cache.to_bytes());
+        let blob = encode(self.header_hash, layers, n_ctx, len, tokens, cache);
         write_atomic(&path, &blob)?;
         Ok(blob.len() as u64)
     }
@@ -237,98 +218,15 @@ impl PrefixFiles {
         let bytes =
             std::fs::read(&path).with_context(|| format!("no prefix {key} on this node"))?;
         let mut reader = bytes.as_slice();
-        let header = self
-            .header(&mut reader)
-            .with_context(|| format!("prefix {key}"))?;
-        ensure!(
-            header.layers == expect.layers,
-            "prefix {key} holds layers {:?}, this node runs {:?}",
-            header.layers,
-            expect.layers
-        );
-        ensure!(
-            header.shape == expect.shape,
-            "prefix {key} was saved from a cache of another shape"
-        );
-        ensure!(
-            header.n_ctx == expect.n_ctx,
-            "prefix {key} was saved for a context of {}, the session is {}",
-            header.n_ctx,
-            expect.n_ctx
-        );
-        ensure!(
-            header.len >= expect.len,
-            "prefix {key} holds {} positions, not {}",
-            header.len,
-            expect.len
-        );
-        let cache =
-            KvCache::from_bytes(reader).with_context(|| format!("prefix {key} is damaged"))?;
-        ensure!(
-            Some(dims_of(&cache)) == dims_of_tag(expect.shape),
-            "prefix {key} is damaged: its rows are of another shape than its header says"
-        );
-        let held = if cache.layers.iter().all(|l| l.kv_dim() == 0) {
-            header.len
-        } else {
-            cache.host_committed_len()
-        };
-        ensure!(
-            held >= expect.len,
-            "prefix {key} is damaged: it holds {held} positions, its header says {}",
-            header.len
-        );
-        // A recurrent state is of every position it saw: only all of them.
-        ensure!(
-            cache.recurrent.is_empty() || (header.len == expect.len && held == expect.len),
-            "prefix {key} holds a state of {} positions, not {}",
-            header.len,
-            expect.len
-        );
-        Ok((header.tokens, cache))
+        let header =
+            header(self.header_hash, &mut reader).with_context(|| format!("prefix {key}"))?;
+        check(&format!("prefix {key}"), header, reader, expect)
     }
 
     /// Reads a header from `reader`, refusing a file of another kind, layout
     /// or model.
     fn header(&self, reader: &mut impl Read) -> Result<Header> {
-        let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic).context("damaged")?;
-        ensure!(&magic == MAGIC, "not a saved prefix");
-        let version = read_u32(reader)?;
-        ensure!(
-            version == VERSION,
-            "a file of layout {version}, not {VERSION}"
-        );
-        let mut hash = [0u8; 32];
-        reader.read_exact(&mut hash).context("damaged")?;
-        ensure!(hash == self.header_hash, "saved from another model");
-        let start = read_u32(reader)? as usize;
-        let end = read_u32(reader)? as usize;
-        let shape_len = read_u32(reader)? as usize;
-        ensure!(shape_len <= 1 << 20, "damaged");
-        let mut shape = vec![0u8; shape_len];
-        reader.read_exact(&mut shape).context("damaged")?;
-        let n_ctx = read_u32(reader)? as usize;
-        let len = read_u32(reader)? as usize;
-        let mut saved_at = [0u8; 8];
-        reader.read_exact(&mut saved_at).context("damaged")?;
-        let n_tokens = read_u32(reader)? as usize;
-        ensure!(n_tokens <= 1 << 26, "damaged");
-        let mut tokens = Vec::with_capacity(n_tokens.min(1 << 16));
-        for _ in 0..n_tokens {
-            tokens.push(read_u32(reader)?);
-        }
-        if start > end {
-            bail!("damaged");
-        }
-        Ok(Header {
-            layers: start..end,
-            shape,
-            n_ctx,
-            len,
-            saved_at: u64::from_le_bytes(saved_at),
-            tokens,
-        })
+        header(self.header_hash, reader)
     }
 
     /// Deletes `key`'s file, if there is one.
@@ -431,6 +329,172 @@ impl PrefixFiles {
             }
         }
     }
+}
+
+/// The first `len` positions `cache` holds on `layers`, and the `tokens` they
+/// are of, behind a header that says what they are: the model, the layers,
+/// the cache's shape, the context and the positions. What a saved prefix's
+/// file holds, and what [`encode_rows`] sends.
+fn encode(
+    header_hash: [u8; 32],
+    layers: Range<usize>,
+    n_ctx: usize,
+    len: usize,
+    tokens: &[u32],
+    cache: &KvCache,
+) -> Vec<u8> {
+    let shape = cache.structure_tag();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(MAGIC);
+    blob.extend_from_slice(&VERSION.to_le_bytes());
+    blob.extend_from_slice(&header_hash);
+    for value in [layers.start, layers.end, shape.len()] {
+        blob.extend_from_slice(&(value as u32).to_le_bytes());
+    }
+    blob.extend_from_slice(&shape);
+    blob.extend_from_slice(&(n_ctx as u32).to_le_bytes());
+    blob.extend_from_slice(&(len as u32).to_le_bytes());
+    let saved_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    blob.extend_from_slice(&saved_at.to_le_bytes());
+    blob.extend_from_slice(&(tokens.len() as u32).to_le_bytes());
+    for token in tokens {
+        blob.extend_from_slice(&token.to_le_bytes());
+    }
+    blob.extend_from_slice(&cache.to_bytes());
+    blob
+}
+
+/// Reads a header from `reader`, refusing bytes of another kind, layout or
+/// model.
+fn header(header_hash: [u8; 32], reader: &mut impl Read) -> Result<Header> {
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic).context("damaged")?;
+    ensure!(&magic == MAGIC, "not a saved prefix");
+    let version = read_u32(reader)?;
+    ensure!(
+        version == VERSION,
+        "a file of layout {version}, not {VERSION}"
+    );
+    let mut hash = [0u8; 32];
+    reader.read_exact(&mut hash).context("damaged")?;
+    ensure!(hash == header_hash, "saved from another model");
+    let start = read_u32(reader)? as usize;
+    let end = read_u32(reader)? as usize;
+    let shape_len = read_u32(reader)? as usize;
+    ensure!(shape_len <= 1 << 20, "damaged");
+    let mut shape = vec![0u8; shape_len];
+    reader.read_exact(&mut shape).context("damaged")?;
+    let n_ctx = read_u32(reader)? as usize;
+    let len = read_u32(reader)? as usize;
+    let mut saved_at = [0u8; 8];
+    reader.read_exact(&mut saved_at).context("damaged")?;
+    let n_tokens = read_u32(reader)? as usize;
+    ensure!(n_tokens <= 1 << 26, "damaged");
+    let mut tokens = Vec::with_capacity(n_tokens.min(1 << 16));
+    for _ in 0..n_tokens {
+        tokens.push(read_u32(reader)?);
+    }
+    if start > end {
+        bail!("damaged");
+    }
+    Ok(Header {
+        layers: start..end,
+        shape,
+        n_ctx,
+        len,
+        saved_at: u64::from_le_bytes(saved_at),
+        tokens,
+    })
+}
+
+/// Checks `header`, and the rows after it in `rows`, against `expect`, field
+/// by field; `what` names them in an error.
+fn check(what: &str, header: Header, rows: &[u8], expect: &Expect) -> Result<(Vec<u32>, KvCache)> {
+    ensure!(
+        header.layers == expect.layers,
+        "{what} holds layers {:?}, this node runs {:?}",
+        header.layers,
+        expect.layers
+    );
+    ensure!(
+        header.shape == expect.shape,
+        "{what} was saved from a cache of another shape"
+    );
+    ensure!(
+        header.n_ctx == expect.n_ctx,
+        "{what} was saved for a context of {}, the session is {}",
+        header.n_ctx,
+        expect.n_ctx
+    );
+    ensure!(
+        header.len >= expect.len,
+        "{what} holds {} positions, not {}",
+        header.len,
+        expect.len
+    );
+    let cache = KvCache::from_bytes(rows).with_context(|| format!("{what} is damaged"))?;
+    ensure!(
+        Some(dims_of(&cache)) == dims_of_tag(expect.shape),
+        "{what} is damaged: its rows are of another shape than its header says"
+    );
+    let held = if cache.layers.iter().all(|l| l.kv_dim() == 0) {
+        header.len
+    } else {
+        cache.host_committed_len()
+    };
+    ensure!(
+        held >= expect.len,
+        "{what} is damaged: it holds {held} positions, its header says {}",
+        header.len
+    );
+    // A recurrent state is of every position it saw: only all of them.
+    ensure!(
+        cache.recurrent.is_empty() || (header.len == expect.len && held == expect.len),
+        "{what} holds a state of {} positions, not {}",
+        header.len,
+        expect.len
+    );
+    Ok((header.tokens, cache))
+}
+
+/// A session's first `len` positions on `layers`, as `cache` holds them, in
+/// memory rather than on disk: the same self-describing form as a saved
+/// prefix's file — the model, the layers, the cache's shape, the context and
+/// the positions — so the node that takes them checks each field before it
+/// uses them. What one node sends another when it ran a prompt through
+/// layers the other runs (`super::protocol::Message::Put`).
+pub fn encode_rows(
+    header_hash: [u8; 32],
+    layers: Range<usize>,
+    n_ctx: usize,
+    len: usize,
+    cache: &KvCache,
+) -> Vec<u8> {
+    encode(header_hash, layers, n_ctx, len, &[], cache)
+}
+
+/// The layers and the positions [`encode_rows`] wrote, read from its header
+/// alone: what a node checks against the layers it runs before it asks for
+/// the cache shape to expect.
+pub fn rows_header(header_hash: [u8; 32], bytes: &[u8]) -> Result<(Range<usize>, usize)> {
+    let mut reader = bytes;
+    let header = header(header_hash, &mut reader).context("rows")?;
+    Ok((header.layers, header.len))
+}
+
+/// Reads [`encode_rows`]'s bytes, checking every field against this node's
+/// model and `expect` as a saved prefix's file is checked: the rows, as a
+/// cache of `expect.layers`. Refused, saying which field differs, when they
+/// are of another model, other layers, another shape, another context or
+/// fewer positions, or damaged.
+pub fn decode_rows(header_hash: [u8; 32], bytes: &[u8], expect: &Expect) -> Result<KvCache> {
+    let mut reader = bytes;
+    let header = header(header_hash, &mut reader).context("rows")?;
+    let layers = header.layers.clone();
+    let what = format!("rows of layers {}..{}", layers.start, layers.end);
+    check(&what, header, reader, expect).map(|(_, cache)| cache)
 }
 
 /// Each layer's `kv_dim` and the count of recurrent states: the part of a
@@ -610,6 +674,61 @@ mod tests {
         std::fs::write(&path, &bytes[..20]).unwrap();
         assert!(files.read(&key, false, &expect(&shape, 5)).is_err());
         assert!(files.list().is_empty(), "a damaged header is not listed");
+    }
+
+    /// Rows in memory read back as they were written, every field checked.
+    #[test]
+    fn rows_in_memory_read_back_as_they_were() {
+        let saved = cache(5);
+        let shape = saved.structure_tag();
+        let bytes = encode_rows([7; 32], 1..3, 16, 5, &saved);
+        assert_eq!(rows_header([7; 32], &bytes).unwrap(), (1..3, 5));
+        let rows = decode_rows([7; 32], &bytes, &expect(&shape, 5)).unwrap();
+        assert_eq!(rows.to_bytes(), saved.to_bytes());
+    }
+
+    /// Rows that differ from what the node expects in any field are refused,
+    /// saying which; so are damaged ones.
+    #[test]
+    fn rows_that_do_not_match_are_refused() {
+        let saved = cache(5);
+        let shape = saved.structure_tag();
+        let bytes = encode_rows([7; 32], 1..3, 16, 5, &saved);
+        let refused = |hash: [u8; 32], bytes: &[u8], expect: Expect| match decode_rows(
+            hash, bytes, &expect,
+        ) {
+            Ok(_) => panic!("taken"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(refused([8; 32], &bytes, expect(&shape, 5)).contains("another model"));
+        assert!(rows_header([8; 32], &bytes).is_err());
+        assert!(
+            refused(
+                [7; 32],
+                &bytes,
+                Expect {
+                    layers: 0..3,
+                    ..expect(&shape, 5)
+                }
+            )
+            .contains("layers")
+        );
+        assert!(
+            refused(
+                [7; 32],
+                &bytes,
+                Expect {
+                    n_ctx: 32,
+                    ..expect(&shape, 5)
+                }
+            )
+            .contains("context")
+        );
+        assert!(refused([7; 32], &bytes, expect(&shape, 6)).contains("positions"));
+        let other = KvCache::new_with_dims(16, &[0, 8, 8, 0]).structure_tag();
+        assert!(refused([7; 32], &bytes, expect(&other, 5)).contains("shape"));
+        assert!(refused([7; 32], &bytes[..bytes.len() - 3], expect(&shape, 5)).contains("damaged"));
+        assert!(refused([7; 32], &bytes[..10], expect(&shape, 5)).contains("damaged"));
     }
 
     #[test]

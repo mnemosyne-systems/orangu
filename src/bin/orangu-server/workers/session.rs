@@ -84,6 +84,33 @@ pub struct SessionStore {
     /// Where this node saves sessions its parent asks it to
     /// ([`Message::Save`]); `None` saves nothing.
     files: Option<Arc<PrefixFiles>>,
+    /// Whether this node holds the whole model and memory for it, and runs a
+    /// prompt alone when asked ([`Message::Prefill`]).
+    whole: bool,
+    /// The model's header hash, which rows sent between nodes carry.
+    model_hash: [u8; 32],
+    /// Rows put here for sessions not opened yet ([`Message::Put`]).
+    pending: Mutex<HashMap<u64, Pending>>,
+    /// The rows a [`Message::Prefill`] ran here of layers other nodes run,
+    /// until the parent has taken them ([`Message::RowsOf`]).
+    exports: Mutex<HashMap<u64, Export>>,
+}
+
+/// A session's rows on their way in: this node's own layers, filled as they
+/// come, until [`Message::Open`].
+struct Pending {
+    cache: KvCache,
+    len: usize,
+    /// This node's own layers rows were put on.
+    filled: std::collections::HashSet<usize>,
+    since: Instant,
+}
+
+/// Every layer's rows of a prompt this node ran alone.
+struct Export {
+    cache: KvCache,
+    len: usize,
+    since: Instant,
 }
 
 /// [`SessionStore::evictable_after`].
@@ -100,7 +127,24 @@ impl SessionStore {
             evictable_after: EVICTABLE_AFTER,
             pool_reserve: crate::engine::prefix_cache::ENTRIES,
             files: None,
+            whole: false,
+            model_hash: [0; 32],
+            pending: Mutex::new(HashMap::new()),
+            exports: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Runs a prompt through every layer alone when the parent asks: this
+    /// node holds the whole model, `header_hash`'s.
+    pub fn with_whole_model(mut self, whole: bool) -> Self {
+        self.whole = whole;
+        self
+    }
+
+    /// Takes rows of the model whose header hash is `header_hash`.
+    pub fn with_model_hash(mut self, header_hash: [u8; 32]) -> Self {
+        self.model_hash = header_hash;
+        self
     }
 
     /// Saves and opens sessions in `files` when the parent asks.
@@ -113,6 +157,16 @@ impl SessionStore {
     #[cfg(test)]
     pub fn saved(&self) -> Vec<super::protocol::SavedPrefix> {
         self.files.as_ref().map_or_else(Vec::new, |f| f.list())
+    }
+
+    /// Rows waiting here: put for sessions not opened, and kept of prompts
+    /// run here for the parent to take.
+    #[cfg(test)]
+    pub fn rows_waiting(&self) -> (usize, usize) {
+        (
+            self.pending.lock().unwrap().len(),
+            self.exports.lock().unwrap().len(),
+        )
     }
 
     /// Keeps `reserve` sessions for the parent's prefix pool rather than the
@@ -235,6 +289,33 @@ impl SessionStore {
                 self.forget(&key);
                 Message::Forget { key }
             }
+            Message::Prefill { session, tokens } => match self.prefill(session, &tokens) {
+                Ok(logits) => Message::Prefilled {
+                    session,
+                    logits: Activations::encode(&logits, 1, logits.len(), ActivationFormat::F32),
+                },
+                Err(error) => Message::Error(error),
+            },
+            Message::RowsOf {
+                session,
+                layer_start,
+                layer_end,
+                last,
+            } => match self.rows_of(session, layer_start as usize..layer_end as usize, last) {
+                Ok(data) => Message::RowsData { session, data },
+                Err(error) => Message::Error(error),
+            },
+            Message::Put { session, data } => match self.put(session, &data) {
+                Ok(()) => Message::Put {
+                    session,
+                    data: Vec::new(),
+                },
+                Err(error) => Message::Error(error),
+            },
+            Message::Open { session, len } => match self.open(session, len as usize) {
+                Ok(()) => Message::Open { session, len },
+                Err(error) => Message::Error(error),
+            },
             Message::Cancel { session, step } => Message::Cancel { session, step },
             Message::Ping { nonce } => Message::Pong { nonce },
             other => Message::Error(self.error(
@@ -493,6 +574,278 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Runs `tokens`, from position 0, through every layer of the model
+    /// alone; opens `session` from the rows of this node's layers and the
+    /// workers' below it, keeps the others for the parent to take
+    /// ([`Self::rows_of`]), and answers the last position's logits. Refused
+    /// on a node that does not hold the whole model.
+    pub fn prefill(&self, session: u64, tokens: &[u32]) -> Result<Vec<f32>, WorkerError> {
+        if !self.whole {
+            return Err(self.error(
+                ErrorCode::Unsupported,
+                "this node does not hold the whole model",
+            ));
+        }
+        if tokens.len() > self.capacity {
+            return Err(self.error(
+                ErrorCode::ContextFull,
+                format!("{} positions do not fit in {}", tokens.len(), self.capacity),
+            ));
+        }
+        self.unused(session)?;
+        let model = self.pipeline.model().clone();
+        let (full, logits) =
+            super::prefill::run_whole(model.as_ref(), tokens, super::prefill::width())
+                .map_err(|e| self.error(ErrorCode::Internal, format!("{e:#}")))?;
+        let len = tokens.len();
+        let subtree = self.pipeline.layers();
+        let mut pending = Pending {
+            cache: self.pipeline.new_cache(session, self.capacity),
+            len,
+            filled: Default::default(),
+            since: Instant::now(),
+        };
+        let local = self.pipeline.local_layers();
+        pending
+            .cache
+            .copy_layers_from(&full, len, local.clone())
+            .map_err(|e| self.error(ErrorCode::Internal, format!("{e:#}")))?;
+        pending.filled.extend(local);
+        for stage in self.pipeline.stages() {
+            for piece in super::prefill::groups(stage.layers(), |il| {
+                8 * full.layers.get(il).map_or(0, |l| l.kv_dim() * l.len) as u64
+            }) {
+                let data = super::prefill::encode_layers(
+                    model.as_ref(),
+                    self.model_hash,
+                    &full,
+                    piece,
+                    self.capacity,
+                    len,
+                )
+                .map_err(|e| self.error(ErrorCode::Internal, format!("{e:#}")))?;
+                stage.put(session, data).map_err(|e| {
+                    self.with_this_node(super::pipeline::worker_error(e, ErrorCode::ChildLost))
+                })?;
+            }
+        }
+        self.pending.lock().unwrap().insert(session, pending);
+        self.open(session, len)?;
+        // What the parent takes: the layers outside this node's subtree.
+        if subtree.start > 0 || subtree.end < full.layers.len() {
+            self.exports.lock().unwrap().insert(
+                session,
+                Export {
+                    cache: full,
+                    len,
+                    since: Instant::now(),
+                },
+            );
+        }
+        log::info!(
+            "orangu-server: workers: ran a prompt of {len} tokens through every layer for the \
+             parent"
+        );
+        Ok(logits)
+    }
+
+    /// The rows a [`Self::prefill`] kept of `layers`, as
+    /// [`super::prefixes::encode_rows`] writes them; `last` lets go of them.
+    pub fn rows_of(
+        &self,
+        session: u64,
+        layers: std::ops::Range<usize>,
+        last: bool,
+    ) -> Result<Vec<u8>, WorkerError> {
+        let mut exports = self.exports.lock().unwrap();
+        let Some(export) = exports.get(&session) else {
+            return Err(self.error(
+                ErrorCode::UnknownSession,
+                format!("no rows of session {session} here"),
+            ));
+        };
+        let data = if layers.is_empty() {
+            Vec::new()
+        } else if layers.end > export.cache.layers.len() {
+            return Err(self.error(
+                ErrorCode::Internal,
+                format!(
+                    "layers {layers:?} of a model of {}",
+                    export.cache.layers.len()
+                ),
+            ));
+        } else {
+            super::prefill::encode_layers(
+                self.pipeline.model().as_ref(),
+                self.model_hash,
+                &export.cache,
+                layers,
+                self.capacity,
+                export.len,
+            )
+            .map_err(|e| self.error(ErrorCode::Internal, format!("{e:#}")))?
+        };
+        if last {
+            exports.remove(&session);
+        }
+        Ok(data)
+    }
+
+    /// Takes rows for `session` on some of the layers this node and the
+    /// workers below it run: this node's own kept until [`Self::open`], each
+    /// worker's slice sent on. Refused when they are of another model, of
+    /// layers this node does not run, of another shape or context, or of
+    /// another length than rows put before them.
+    pub fn put(&self, session: u64, data: &[u8]) -> Result<(), WorkerError> {
+        let refuse = |e: anyhow::Error| self.error(ErrorCode::ModelMismatch, format!("{e:#}"));
+        let (layers, len) = super::prefixes::rows_header(self.model_hash, data).map_err(refuse)?;
+        let subtree = self.pipeline.layers();
+        if layers.start < subtree.start || layers.end > subtree.end {
+            return Err(self.error(
+                ErrorCode::ModelMismatch,
+                format!("rows of layers {layers:?}; this node runs {subtree:?}"),
+            ));
+        }
+        if len > self.capacity {
+            return Err(self.error(
+                ErrorCode::ContextFull,
+                format!("{len} positions do not fit in {}", self.capacity),
+            ));
+        }
+        if self.sessions.lock().unwrap().contains_key(&session) {
+            return Err(self.error(
+                ErrorCode::Internal,
+                format!("session {session} is open already"),
+            ));
+        }
+        let model = self.pipeline.model().clone();
+        let shape = super::prefill::expected_shape(model.as_ref(), layers.clone());
+        let rows = super::prefixes::decode_rows(
+            self.model_hash,
+            data,
+            &Expect {
+                layers: layers.clone(),
+                shape: &shape,
+                n_ctx: self.capacity,
+                len,
+            },
+        )
+        .map_err(refuse)?;
+        let mut all = self.pending.lock().unwrap();
+        let pending = all.entry(session).or_insert_with(|| Pending {
+            cache: self.pipeline.new_cache(session, self.capacity),
+            len,
+            filled: Default::default(),
+            since: Instant::now(),
+        });
+        if pending.len != len {
+            return Err(self.error(
+                ErrorCode::PositionMismatch,
+                format!("rows of {len} positions after rows of {}", pending.len),
+            ));
+        }
+        let local = self.pipeline.local_layers();
+        let own = layers.start.max(local.start)..layers.end.min(local.end);
+        if !own.is_empty() {
+            pending
+                .cache
+                .copy_layers_from(&rows, len, own.clone())
+                .map_err(refuse)?;
+            pending.filled.extend(own);
+        }
+        drop(all);
+        for stage in self.pipeline.stages() {
+            let theirs = stage.layers();
+            let part = layers.start.max(theirs.start)..layers.end.min(theirs.end);
+            if part.is_empty() {
+                continue;
+            }
+            let sent = if part == layers {
+                data.to_vec()
+            } else {
+                super::prefill::encode_layers(
+                    model.as_ref(),
+                    self.model_hash,
+                    &rows,
+                    part,
+                    self.capacity,
+                    len,
+                )
+                .map_err(refuse)?
+            };
+            stage.put(session, sent).map_err(|e| {
+                self.with_this_node(super::pipeline::worker_error(e, ErrorCode::ChildLost))
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Opens `session`, its first `len` positions, from the rows put on every
+    /// one of this node's layers, and has the workers below do the same.
+    /// Refused, with nothing opened, when a layer has none or they hold
+    /// another length.
+    pub fn open(&self, session: u64, len: usize) -> Result<(), WorkerError> {
+        let Some(mut pending) = self.pending.lock().unwrap().remove(&session) else {
+            return Err(self.error(
+                ErrorCode::UnknownSession,
+                format!("no rows of session {session} here"),
+            ));
+        };
+        if pending.len != len {
+            return Err(self.error(
+                ErrorCode::PositionMismatch,
+                format!("rows of {} positions, opened at {len}", pending.len),
+            ));
+        }
+        if let Some(missing) = self
+            .pipeline
+            .local_layers()
+            .find(|il| !pending.filled.contains(il))
+        {
+            return Err(self.error(
+                ErrorCode::Internal,
+                format!("no rows of layer {missing} here"),
+            ));
+        }
+        self.unused(session)?;
+        if pending.cache.remote.is_some() {
+            self.pipeline.open_below(session, len).map_err(|e| {
+                self.with_this_node(super::pipeline::worker_error(e, ErrorCode::ChildLost))
+            })?;
+            if let Some(remote) = pending.cache.remote.as_mut() {
+                remote.len = len;
+            }
+        }
+        self.pipeline.room().wrote(session, len);
+        let entry = Arc::new(Mutex::new(Session {
+            cache: pending.cache,
+            last_used: Instant::now(),
+            held: false,
+            trace: tracing().then(Trace::default),
+        }));
+        self.sessions.lock().unwrap().insert(session, entry);
+        Ok(())
+    }
+
+    /// Refuses a new session under `session` when one is open, or this node
+    /// holds as many as it may.
+    fn unused(&self, session: u64) -> Result<(), WorkerError> {
+        let sessions = self.sessions.lock().unwrap();
+        if sessions.contains_key(&session) {
+            return Err(self.error(
+                ErrorCode::Internal,
+                format!("session {session} already exists"),
+            ));
+        }
+        if sessions.len() >= self.max_sessions {
+            return Err(self.error(
+                ErrorCode::Busy,
+                format!("already holding {} sessions", self.max_sessions),
+            ));
+        }
+        Ok(())
+    }
+
     /// Deletes what is saved under `key` here and below.
     pub fn forget(&self, key: &str) {
         if let Some(files) = &self.files {
@@ -517,6 +870,9 @@ impl SessionStore {
 
     pub fn release(&self, session: u64) {
         self.pipeline.room().forget(session);
+        let pending = self.pending.lock().unwrap().remove(&session);
+        drop(pending);
+        self.exports.lock().unwrap().remove(&session);
         let removed = self.sessions.lock().unwrap().remove(&session);
         // Dropped after the map's lock is let go: dropping the cache
         // releases the session on this node's own workers.
@@ -542,6 +898,21 @@ impl SessionStore {
         for id in &stale {
             self.pipeline.room().forget(*id);
         }
+        // Rows a parent put or left here and never came back for.
+        self.exports
+            .lock()
+            .unwrap()
+            .retain(|_, e| now.duration_since(e.since) < idle);
+        let gone: Vec<Pending> = {
+            let mut pending = self.pending.lock().unwrap();
+            let stale: Vec<u64> = pending
+                .iter()
+                .filter(|(_, p)| now.duration_since(p.since) >= idle)
+                .map(|(id, _)| *id)
+                .collect();
+            stale.iter().filter_map(|id| pending.remove(id)).collect()
+        };
+        drop(gone);
         removed.len()
     }
 
@@ -1263,5 +1634,218 @@ mod tests {
             vec!["w0:8400".to_string(), "w1:8400".to_string()]
         );
         assert_eq!(store.pipeline.room().promised_bytes(), 0);
+    }
+
+    /// A middle node over a leaf, both taking rows of the model `[4; 32]`;
+    /// the middle runs a prompt alone when `whole`.
+    fn rows_tree(whole: bool) -> (Arc<SessionStore>, Arc<SessionStore>) {
+        let leaf = Arc::new(
+            SessionStore::new(
+                Arc::new(
+                    LayerPipeline::new(fixture::model(), 3..fixture::N_LAYER, vec![]).unwrap(),
+                ),
+                N_CTX,
+                4,
+            )
+            .with_model_hash([4; 32])
+            .named("leaf"),
+        );
+        let stage = LoopbackStage::new(leaf.clone(), ActivationFormat::F32);
+        let middle = Arc::new(
+            SessionStore::new(
+                Arc::new(
+                    LayerPipeline::new(fixture::model(), 1..3, vec![Box::new(stage)]).unwrap(),
+                ),
+                N_CTX,
+                4,
+            )
+            .with_model_hash([4; 32])
+            .with_whole_model(whole)
+            .named("middle"),
+        );
+        (middle, leaf)
+    }
+
+    /// `tokens`' rows of `layers`, run through the whole model elsewhere.
+    fn rows_of(layers: Range<usize>, tokens: &[u32], hash: [u8; 32]) -> Vec<u8> {
+        let model = fixture::model();
+        let (full, _) = crate::workers::prefill::run_whole(model.as_ref(), tokens, 128).unwrap();
+        crate::workers::prefill::encode_layers(
+            model.as_ref(),
+            hash,
+            &full,
+            layers,
+            N_CTX,
+            tokens.len(),
+        )
+        .unwrap()
+    }
+
+    /// What enters layer 1 for `tokens` at `start_pos`, given layer 0's cache.
+    fn into_layer_one(cache: &mut KvCache, tokens: &[u32], start_pos: usize) -> Vec<f32> {
+        let model = fixture::model();
+        let x = model.embed(tokens).unwrap();
+        model
+            .forward_layers(cache, x, tokens, 0..1, start_pos)
+            .unwrap()
+    }
+
+    fn forward_of(session: u64, start_pos: u32, tokens: &[u32], hidden: &[f32]) -> Forward {
+        Forward {
+            session,
+            step: 1,
+            start_pos,
+            rows: Rows::All,
+            kv_truncate_to: None,
+            tokens: tokens.to_vec(),
+            hidden: Activations::encode(hidden, tokens.len(), N_EMBD, ActivationFormat::F32),
+        }
+    }
+
+    /// Rows put on a middle node keep its own layers and go on to the leaf
+    /// below; opened, the session goes on where they end, computing what a
+    /// session its own forwards built does.
+    #[test]
+    fn rows_put_on_a_node_reach_the_workers_below_and_open_there() {
+        let (middle, leaf) = rows_tree(false);
+        let tokens = fixture::tokens();
+        let n = tokens.len() as u32;
+        assert_eq!(
+            middle.handle(Message::Put {
+                session: 1,
+                data: rows_of(1..2, &tokens, [4; 32]),
+            }),
+            Message::Put {
+                session: 1,
+                data: Vec::new(),
+            }
+        );
+        // Straddling the middle's last layer and the leaf's.
+        middle.put(1, &rows_of(2..4, &tokens, [4; 32])).unwrap();
+        assert_eq!(
+            (middle.len(), leaf.len()),
+            (0, 0),
+            "nothing opens before Open"
+        );
+        assert_eq!(
+            middle.handle(Message::Open { session: 1, len: n }),
+            Message::Open { session: 1, len: n }
+        );
+        assert_eq!((middle.len(), leaf.len()), (1, 1));
+
+        let model = fixture::model();
+        let mut first = model.new_kv_cache_for_layers(0..1, N_CTX);
+        let prompt = into_layer_one(&mut first, &tokens, 0);
+        middle.forward(forward_of(2, 0, &tokens, &prompt)).unwrap();
+        let next = into_layer_one(&mut first, &[3], tokens.len());
+        let handed = middle.forward(forward_of(1, n, &[3], &next)).unwrap();
+        let built = middle.forward(forward_of(2, n, &[3], &next)).unwrap();
+        let (a, b) = (
+            handed.hidden.decode().unwrap(),
+            built.hidden.decode().unwrap(),
+        );
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-4, "{worst}");
+        middle.release(1);
+        assert_eq!(leaf.len(), 1, "released below too");
+    }
+
+    /// Rows of another model, of layers this node does not run, of another
+    /// length than the rows before them, or missing a layer, open nothing.
+    #[test]
+    fn rows_that_do_not_fit_open_nothing() {
+        let (middle, leaf) = rows_tree(false);
+        let tokens = fixture::tokens();
+        let code = |m: Message| match m {
+            Message::Error(e) => e.code,
+            other => panic!("taken: {other:?}"),
+        };
+        assert_eq!(
+            code(middle.handle(Message::Put {
+                session: 1,
+                data: rows_of(1..3, &tokens, [5; 32]),
+            })),
+            ErrorCode::ModelMismatch
+        );
+        assert_eq!(
+            code(middle.handle(Message::Put {
+                session: 1,
+                data: rows_of(0..2, &tokens, [4; 32]),
+            })),
+            ErrorCode::ModelMismatch
+        );
+        middle.put(1, &rows_of(2..4, &tokens, [4; 32])).unwrap();
+        assert_eq!(
+            middle
+                .put(1, &rows_of(1..2, &tokens[..5], [4; 32]))
+                .unwrap_err()
+                .code,
+            ErrorCode::PositionMismatch
+        );
+        let error = middle.open(1, tokens.len()).unwrap_err();
+        assert!(error.message.contains("layer 1"), "{error}");
+        assert_eq!(
+            middle.open(1, tokens.len()).unwrap_err().code,
+            ErrorCode::UnknownSession
+        );
+        assert_eq!((middle.len(), leaf.len()), (0, 0));
+        assert!(middle.pending.lock().unwrap().is_empty());
+        assert!(leaf.pending.lock().unwrap().is_empty(), "let go below too");
+    }
+
+    /// A node that holds the whole model runs a prompt alone: its session
+    /// opens here and below, its logits are the whole model's, and the rows
+    /// of the other layers wait for the parent until it takes the last.
+    #[test]
+    fn a_node_with_the_whole_model_runs_a_prompt_alone() {
+        let (middle, leaf) = rows_tree(true);
+        let tokens = fixture::tokens();
+        let Message::Prefilled { session, logits } = middle.handle(Message::Prefill {
+            session: 3,
+            tokens: tokens.clone(),
+        }) else {
+            panic!("refused");
+        };
+        assert_eq!(session, 3);
+        let model = fixture::model();
+        let mut cache = model.new_kv_cache(N_CTX);
+        let whole = model.forward(&mut cache, &tokens, 0, 0).unwrap();
+        let logits = logits.decode().unwrap();
+        let worst = logits
+            .iter()
+            .zip(&whole)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst < 1e-3, "{worst}");
+        assert_eq!((middle.len(), leaf.len()), (1, 1));
+        let data = middle.rows_of(3, 0..1, true).unwrap();
+        let shape = crate::workers::prefill::expected_shape(model.as_ref(), 0..1);
+        let rows = crate::workers::prefixes::decode_rows(
+            [4; 32],
+            &data,
+            &Expect {
+                layers: 0..1,
+                shape: &shape,
+                n_ctx: N_CTX,
+                len: tokens.len(),
+            },
+        )
+        .unwrap();
+        assert_eq!(rows.layers[0].len, tokens.len());
+        assert_eq!(
+            middle.rows_of(3, 0..1, true).unwrap_err().code,
+            ErrorCode::UnknownSession,
+            "the last let go of them"
+        );
+
+        let (alone, _) = rows_tree(false);
+        assert_eq!(
+            alone.prefill(3, &tokens).unwrap_err().code,
+            ErrorCode::Unsupported
+        );
     }
 }

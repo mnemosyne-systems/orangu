@@ -69,7 +69,20 @@ checks what clients get while a node is killed (`SIGKILL`), frozen
   answer, and the answer is the one the lead gives alone, word for word, at
   temperature 0. `ORANGU_HARNESS_RANGE_BACKEND` sets that node's `backend`
   (`cpu` unless set); `vulkan` checks that a device which ran the model's
-  layers before they were fetched runs them from the fetched bytes.
+  layers before they were fetched runs them from the fetched bytes;
+- a prompt run on one worker that holds the whole model, its rows then
+  handed to every node of the tree, answers word for word what the same
+  prompt answers through the tree, at temperature 0, and the lead's
+  `/v1/workers` names that worker under `prefill.last`.
+
+`ORANGU_WORKERS_PREFILL` overrides where the top-level node of a tree runs a
+prompt, for such a test: `force` runs every prompt, whatever its length, on
+one node of the plan that holds the whole model — the one predicted fastest,
+else the first worker that holds it, else the top-level node — and a node's
+name (`host:port`, as plans print it) runs every prompt on that node when it
+holds the whole model; `0` (or `off`) keeps every prompt on the tree. Unset,
+or `auto`, decides by the measured numbers (*Workers*, **Where a long prompt
+runs**). A prompt given to a node that fails still goes through the tree.
 
 They need a model, so they are ignored by default:
 

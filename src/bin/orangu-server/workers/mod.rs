@@ -27,6 +27,8 @@
 //! - [`session`]: the worker side of a forward.
 //! - [`plan`]: dividing a range of layers by memory.
 //! - [`prefixes`]: a tree's prefix pool, saved per node.
+//! - [`prefill`]: where a prompt runs — through the tree, or on one node
+//!   that holds the whole model, its rows then handed to every node.
 //! - [`node`]: one process's place in the tree, both halves.
 //! - [`load`]: how busy a node is, for routing requests and sizing shares.
 //! - [`clock`]: keeping a node's cores at full clock while a request runs.
@@ -46,6 +48,7 @@ pub mod metrics;
 pub mod node;
 pub mod pipeline;
 pub mod plan;
+pub mod prefill;
 pub mod prefixes;
 pub mod protocol;
 pub mod room;

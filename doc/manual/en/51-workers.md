@@ -463,7 +463,8 @@ server's.
   since its connection last carried anything), the layers it runs, the
   plan below it, each worker's connection and failures in a row, how long
   those leave it out, the extensions it advertised under `features`
-  (`fork`, `head`, `echo`, `switch`, `room`, `metrics`, `retain`), and any
+  (`fork`, `head`, `echo`, `switch`, `room`, `metrics`, `retain`,
+  `prefixes`, `rows`), and any
   worker the plan lost. Each worker's `sessions` shows what its handshake
   reported — its `slots`, `n_ctx` and `pool_reserve` — with the
   `session_limit` it holds for this node and the `retained_sessions` this
@@ -630,6 +631,74 @@ limit where there is one, so this holds in a container. Some limits:
   own memory is held to host memory too, so it can refuse early, and the card's
   own room is not checked on a worker.
 
+## Where a long prompt runs
+
+A prompt goes through the tree part by part, every node running its own
+layers. When a node of the plan holds the whole model — memory for every
+layer, `holds_model` in `/v1/workers` — and reads prompts much faster than
+the tree, a long prompt runs there instead: that node runs every layer of
+the prompt alone, each node of the tree is then given the rows of its own
+layers, and the answer is decoded through the tree as usual. The node is the
+top-level node itself or one of the workers directly below it.
+
+The top-level node decides for every prompt, from what was measured:
+
+- **Through the tree**: each node's prompt speed and fixed cost (`setup`:
+  `prompt_gb_per_s` and `prompt_fixed_ms`), the hidden state over each link,
+  and the parts overlapping once the pipeline is full. Once a prompt of at
+  least 256 tokens has run through the current plan, the speed it ran at
+  counts instead.
+- **On one node**: every layer at that node's prompt speed, then the rows of
+  every layer it does not run sent to the node that does, at each link's
+  bandwidth (`link`), and taken in there. Once a prompt has run there, the
+  speed the whole hand-over ran at counts instead.
+
+The prompt goes to the node only when that comes out at three quarters of
+the tree's time or less; otherwise, and whenever a side cannot be priced, it
+stays on the tree:
+
+- prompts under 256 tokens;
+- a node of the plan that has no measured prompt speed (with `shares =
+  memory` no node times itself), or a link that was not timed;
+- a worker that does not list `rows` under `features`;
+- a model that keeps a recurrent state — Qwen3.5 and Qwen3-Next: a state is
+  of every position it saw, and stays where it was computed.
+
+A prompt that starts like a cached conversation reuses its rows on the tree
+and runs only what is new. The node that runs a prompt alone holds no rows
+of that conversation, so it runs all of it from the start, and every node's
+rows of it are replaced; whether it goes there is decided by the length of
+the new part.
+
+The log line says where a prompt ran:
+
+```text
+workers: a prompt of 2765 tokens ran on gamma:8400 alone, every node given its
+rows, in 4330 ms, 910 ms of it the rows (predicted 4.1 s there, 52.8 s through
+the tree)
+```
+
+and `/v1/workers` on the top-level node has `prefill`: how many prompts ran
+on one node (`on_node`), through the tree (`on_tree`) and on the tree after a
+hand-over failed (`fell_back`), the speeds observed (`observed_tokens_per_s`,
+under `tree` and each node's name), and the last prompt (`last`): where it
+ran, its tokens, how long it took and how much of that the rows took
+(`rows_ms`), the two predictions and the reason.
+
+A hand-over that fails — the node goes away, a node has no room for the
+rows, or refuses them — releases what it opened on every node, and the
+prompt goes through the tree; the answer is the tree's. Every node checks the
+rows it is given as it checks a saved prefix: the model, the layers, the
+shape of its cache, the context and the positions.
+
+The rows are computed in the parts the tree cuts a prompt into and travel
+in `f32`, so on machines of one kind they are the rows the tree computes but
+for the hidden state between nodes, which the tree sends in `activations`.
+A node of another kind — a GPU beside boards that compute on their cores —
+rounds as it does. A node runs the layers outside its share from the file's
+weights, not from `prompt_weights` copies. While it hands the rows over, the
+node holds every layer's rows of the prompt.
+
 ## Machines that clock down
 
 A node works in bursts: its layers of a token, then nothing while the
@@ -744,7 +813,9 @@ tokens.
   in common, on every worker. Paged KV, MTP heads and slot save/restore are
   off on a top-level node with workers.
 - One request runs through the machines one after another, so a single
-  request is not faster than on one machine. What a tree adds is
+  request is not faster than on one machine — but for a long prompt, which
+  can run on one fast node of the tree (see **Where a long prompt runs**).
+  What a tree adds is
   concurrency: with several `slots`, each machine works on a different
   request at the same time. And a long prompt is pipelined: while one
   machine works on a chunk of it, the one before it already works on the

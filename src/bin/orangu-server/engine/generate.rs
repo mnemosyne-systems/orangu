@@ -3758,6 +3758,16 @@ fn prefill(
     drafter: Option<&mut Drafter<'_>>,
     on_chunk: &mut dyn FnMut(usize) -> Result<()>,
 ) -> Result<Vec<f32>> {
+    // A model that runs the whole prompt another way (a tree of workers
+    // handing it to one node) does, unless a drafter reads the states it
+    // passes through.
+    if !tokens.is_empty()
+        && drafter.as_deref().is_none_or(|d| !d.wants_states())
+        && let Some(logits) = model.prefill_whole(cache, tokens, start_pos)?
+    {
+        on_chunk(tokens.len())?;
+        return Ok(logits);
+    }
     // Priced once and carried forward: see [`CHUNK_COST`].
     let mut cost = load_chunk_cost();
     let out = prefill_in_chunks(
