@@ -82,7 +82,7 @@ its target against `[orangu-server].models`.
 ### Reference fixtures
 
 The `#[ignore]`d embedding tests compare against vectors captured from real
-llama.cpp, in `src/bin/orangu-server/engine/arch/testdata/`.
+llama.cpp, in `src/engine/arch/testdata/`.
 
 **These are generated, not committed.** They are gitignored, and are read at
 run time (`engine::arch::read_reference_fixture`) rather than through
@@ -107,7 +107,7 @@ curl -s localhost:18080/embedding \
     -d '{"content":"The quick brown fox jumps over the lazy dog"}' \
   | python3 -c 'import json,sys; v=json.load(sys.stdin)[0]["embedding"][0]; \
       print(",".join(repr(x) for x in v))' \
-  > src/bin/orangu-server/engine/arch/testdata/embeddinggemma_reference.csv
+  > src/engine/arch/testdata/embeddinggemma_reference.csv
 ```
 
 Then run the test against it:
@@ -124,7 +124,7 @@ ORANGU_TEST_EMBEDDING_MODEL=/path/to/embeddinggemma-300M-Q8_0.gguf \
 `engine/arch/llama.rs`.
 
 The same arrangement covers a second, unrelated fixture:
-`src/bin/orangu-server/engine/testdata/ggml-dequant-reference.bin`, which
+`src/engine/testdata/ggml-dequant-reference.bin`, which
 pins `engine::quant`'s dequantizers. It holds random quantized blocks of
 every type paired with the `f32`s **ggml itself** produced from them, via
 `ggml_get_type_traits(t)->to_float` — the same entry point llama.cpp reads
@@ -134,10 +134,10 @@ is gitignored too; building it needs `libggml-base` installed:
 
 ```sh
 cc -O2 -o genfix \
-    src/bin/orangu-server/engine/testdata/ggml-dequant-reference.c \
+    src/engine/testdata/ggml-dequant-reference.c \
     -I/usr/local/include -L/usr/local/lib64 -lggml-base
 LD_LIBRARY_PATH=/usr/local/lib64 ./genfix \
-    src/bin/orangu-server/engine/testdata/ggml-dequant-reference.bin
+    src/engine/testdata/ggml-dequant-reference.bin
 ```
 
 Adding a quantization type means appending it to the `types[]` list in that

@@ -21,6 +21,9 @@ user-facing chapter is *Building a model*.
 | `train.rs` | AdamW, the schedule, the loop, and the checkpoint. |
 | `quant.rs` | Float encodings, block quantizations, and the per-tensor type rules. |
 | `write.rs` | The GGUF writer. |
+| `hf/` | Hugging Face checkpoints: `mod.rs` the conversion and its transforms, `llama.rs`, `phi.rs`, `gemma.rs` and `qwen35.rs` the architectures' tables, `tokenizer.rs` `tokenizer.json` as `tokenizer.*` keys. |
+| `inspect.rs` | `--dump`, `--hash` and `--compare`. |
+| `imatrix.rs` | Importance matrices for `--imatrix` and `--calibration`: both file formats, measuring one (`orangu::engine::calibrate`, which runs the model through the library's engine on the CPU while `orangu::engine::importance` records every block matmul's inputs), finding or downloading a repository's matrix, checking it against the planned tensors, and the `quantize.imatrix.*` keys. The weighted encoders are `encode_weighted` in `src/quantize.rs`, and the lattice types' in `src/quantize_lattice.rs`. |
 | `shell.rs` | The bash/zsh/fish/PowerShell completion scripts `-s` prints. |
 
 Each stage's output is a file in the work directory, and each stage reads

@@ -1,0 +1,3134 @@
+// Copyright (C) 2026 The orangu community
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+//! A from-scratch BPE tokenizer covering two real vocab shapes, dispatched
+//! on `tokenizer.ggml.model`:
+//!
+//! - **`"gpt2"`** (every Llama3/Qwen2/Qwen3/Mistral/qwen35moe/qwen3next GGUF): the
+//!   classic byte-level scheme — every byte maps to a printable-unicode
+//!   alphabet (`byte_to_unicode_table`) before merges run, so a leading
+//!   space rides along inside a token like `"Ġcapital"`.
+//! - **`"gemma4"`** (confirmed against real upstream `llama.cpp` source,
+//!   `src/llama-vocab.cpp`'s `tokenizer_pre == "gemma4"` branch, fetched
+//!   and read directly): merges still come from `tokenizer.ggml.merges`
+//!   (this is genuinely still BPE, not SentencePiece-unigram, despite the
+//!   model-name-shaped `tokenizer.ggml.model` value), but every literal
+//!   space in the input is escaped to `▁` (U+2581) *before* merging, merges
+//!   run on raw UTF-8 codepoints rather than the byte-to-unicode alphabet,
+//!   and the pre-tokenizer only splits on newlines. Getting this wrong
+//!   doesn't just produce different-but-valid tokens: decoding a `"gpt2"`-
+//!   shaped reverse mapping against `▁`-marked tokens silently drops every
+//!   space (that character isn't in the byte-to-unicode alphabet), which is
+//!   exactly the "no spaces between words" bug this module now avoids.
+//!
+//! - **`"llama"`** (the original Llama/Llama2 vocab shape, and — despite
+//!   the name — `gemma-embedding`'s vocab too, e.g. `ggml-org/
+//!   embeddinggemma-300M-GGUF`, confirmed directly: no `tokenizer.ggml.
+//!   merges` key at all, only `tokenizer.ggml.scores`): **not** a Viterbi/
+//!   unigram-LM search despite "SentencePiece-unigram" being the usual
+//!   name for this vocab shape — real upstream `llama.cpp` (`src/llama-
+//!   vocab.cpp`'s `llm_tokenizer_spm_session`, fetched and read directly)
+//!   runs the *same* greedy adjacent-pair-merge loop as `"gemma4"`, just
+//!   with two differences: a pair is mergeable whenever its concatenated
+//!   string is itself a valid vocab token (no explicit merge-rule table),
+//!   with priority = that token's own score (highest first) rather than a
+//!   merge rank; and there's no pre-tokenizer word-splitting at all — the
+//!   whole (space-escaped) text is fed through the merge loop as one
+//!   unbroken run, letting `▁`-marked vocab tokens define word boundaries
+//!   implicitly instead of a regex splitting them first.
+//!
+//! A `"gpt2"`-model vocab splits text into words before merging them. How is
+//! a property of `tokenizer.ggml.pre`: see [`split_pattern_for_pre`] for the
+//! patterns and [`WordSplitter`] for how they run. A `pre` value not listed
+//! there takes the generic pattern.
+
+use crate::gguf::{GgufFile, GgufValue};
+use anyhow::{Context, Result, anyhow};
+use regex::Regex;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
+/// Sentinel id for a BPE symbol whose string isn't a vocab token (byte-fallback
+/// candidate). `u32::MAX` can't collide with a real token id (vocabs are far
+/// smaller), and never appears as a `merge_map` key, so a sentinel never merges.
+const NO_TOKEN: u32 = u32::MAX;
+
+/// GPT-2's own pre-tokenizer split pattern: contractions, then runs of
+/// letters/digits/other-non-space (each optionally preceded by one space,
+/// so the space stays attached to what follows), then any remaining
+/// whitespace. Its `\s+` stands for upstream's `\s+(?!\S)|\s+`: see
+/// [`WordSplitter`] for the look-ahead this crate cannot compile.
+const SPLIT_PATTERN: &str = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+";
+
+/// Llama 3's pre-tokenizer (`tokenizer.ggml.pre` = `llama3`/`llama-bpe`/…),
+/// transcribed from upstream `llama.cpp`'s own
+/// `LLAMA_VOCAB_PRE_TYPE_LLAMA3` arm in `src/llama-vocab.cpp`.
+///
+/// The load-bearing difference from [`SPLIT_PATTERN`] is `\p{N}{1,3}`:
+/// digits split into runs of **at most three**, and with no optional
+/// leading space. Under the generic pattern, ` ?\p{N}+` swallows `2023` as
+/// one chunk that BPE then merges to `20`+`23`, where Llama 3 produces
+/// `202`+`3`. That is not a harmless difference in an equally-valid
+/// segmentation: Llama 3.2's chat template injects `Cutting Knowledge Date:
+/// December 2023` / `Today Date: …` into the system block of *every*
+/// request, so mis-tokenized digits reached the model on every single chat
+/// turn, and the 1B/3B Instruct models answered "What is the capital of
+/// France?" by echoing dates back (`"The 2021\nThe\nThe"`) instead of
+/// answering.
+const SPLIT_PATTERN_LLAMA3: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// GPT-4o's pre-tokenizer (`tokenizer.ggml.pre` = `gpt-4o`, e.g.
+/// Phi-4-mini), from upstream's `LLAMA_VOCAB_PRE_TYPE_GPT4O` arm. Shares
+/// `\p{N}{1,3}` with [`SPLIT_PATTERN_LLAMA3`] and additionally splits
+/// letter runs on an upper/lower-case boundary.
+///
+/// See [`GPT4O_PRE_TYPES`] for the other `pre` values that land here —
+/// `llama4` in particular *looks* like it belongs with the llama3 family
+/// and does not.
+const SPLIT_PATTERN_GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
+
+/// Mistral's "tekken" pre-tokenizer (`tokenizer.ggml.pre = "tekken"`, e.g.
+/// `Ministral-3-3B-Instruct`), from upstream's
+/// `LLAMA_VOCAB_PRE_TYPE_TEKKEN` arm. Transcribed from the *original*
+/// regex upstream keeps in a comment above the active one — the active
+/// form only exists to work around C++ `std::regex` lacking `\p{Lu}`, using
+/// look-ahead this crate can't compile either, whereas the original's
+/// Unicode classes are directly supported here.
+///
+/// Note `\p{N}` (a **single** digit), not `\p{N}{1,3}` as llama3/gpt-4o
+/// use, and no contraction alternatives at all. Like llama3 it sets
+/// `ignore_merges`. Upstream also sets `clean_spaces = false`, which needs
+/// no code here: that cleanup pass is `"gemma4"`-only in this module, so a
+/// `"gpt2"`-shaped vocab already skips it.
+const SPLIT_PATTERN_TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
+
+/// The "tekken-num3" pre-tokenizer (`mistral-large4`), upstream's
+/// `LLAMA_VOCAB_PRE_TYPE_TEKKEN_NUM3`: [`SPLIT_PATTERN_TEKKEN`] with digits
+/// split into **right-aligned** groups of three — `12345` is `12`, `345`.
+///
+/// Upstream spells the grouping as `\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))`,
+/// a look-ahead this crate cannot compile. The pattern here takes the whole
+/// digit run instead, and [`right_aligned_digit_groups`] cuts it after the
+/// match — see [`Tokenizer::right_aligned_digits`].
+const SPLIT_PATTERN_TEKKEN_NUM3: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}+| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+";
+
+/// The `tokenizer.ggml.pre` values whose digit runs are cut into
+/// right-aligned groups of three after the regex split.
+const RIGHT_ALIGNED_DIGIT_PRE_TYPES: &[&str] = &["tekken-num3"];
+
+/// Cuts one digit run into right-aligned groups of three: the first group
+/// takes `len % 3` digits (or three), every later one exactly three. What
+/// upstream's look-ahead produces, since its greedy `\p{N}{1,3}` only
+/// succeeds when a multiple of three digits follows.
+fn right_aligned_digit_groups(run: &str) -> Vec<&str> {
+    let starts: Vec<usize> = run.char_indices().map(|(i, _)| i).collect();
+    let n = starts.len();
+    let mut groups = Vec::with_capacity(n / 3 + 1);
+    let mut take = if n.is_multiple_of(3) { 3 } else { n % 3 };
+    let mut at = 0;
+    while at < n {
+        let end = starts.get(at + take).copied().unwrap_or(run.len());
+        groups.push(&run[starts[at]..end]);
+        at += take;
+        take = 3;
+    }
+    groups
+}
+
+/// The Bailing/Ling pre-tokenizer (`tokenizer.ggml.pre` =
+/// `bailingmoe`/`bailingmoe2`/`llada-moe`), from upstream's
+/// `LLAMA_VOCAB_PRE_TYPE_BAILINGMOE` arm.
+///
+/// Two things set it apart from the generic [`SPLIT_PATTERN`], and both
+/// change the ids a prompt produces rather than merely how it looks:
+/// `\p{N}` splits digits **one at a time** (not `\p{N}{1,3}` as llama3
+/// does, and not the greedy ` ?\p{N}+` the generic pattern uses), and
+/// `\s*[\r\n]` takes a *single* line break rather than a run of them, so a
+/// blank line between paragraphs is two pre-tokens here and one elsewhere.
+/// The contraction set is the usual seven, case-insensitively.
+///
+/// Upstream also sets `clean_spaces = false`,
+/// which needs no code here: that cleanup pass is `"gemma4"`-only in this
+/// module, so a `"gpt2"`-shaped vocab already skips it.
+const SPLIT_PATTERN_BAILINGMOE: &str = r"'(?:[sSdDmMtT]|[lL][lL]|[vV][eE]|[rR][eE])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]|\s+";
+
+/// The DeepSeek-V3 pre-tokenizer (`tokenizer.ggml.pre` = `deepseek-v3`,
+/// and `joyai-llm`, which DeepSeek-V4.1 ships), from upstream's
+/// `LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM` arm.
+///
+/// Upstream runs three expressions in sequence, each re-splitting the pieces
+/// of the one before: [`DEEPSEEK3_STAGES`] and then this.
+const SPLIT_PATTERN_DEEPSEEK3: &str = r"[!-/:-@\[-`{-~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// What runs before [`SPLIT_PATTERN_DEEPSEEK3`]: digit runs of up to three,
+/// then CJK runs.
+const DEEPSEEK3_STAGES: &[&str] = &[r"\p{N}{1,3}", r"[一-龥぀-ゟ゠-ヿ]+"];
+
+/// The Qwen2 pre-tokenizer (`tokenizer.ggml.pre` = `qwen2`, which Qwen2.5 and
+/// Qwen3 ship), from upstream's `LLAMA_VOCAB_PRE_TYPE_QWEN2` arm: digits **one
+/// at a time**, and a line break stays on the punctuation before it.
+const SPLIT_PATTERN_QWEN2: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// `tokenizer.ggml.pre` values upstream routes to the Qwen2 split.
+const QWEN2_PRE_TYPES: &[&str] = &[
+    "qwen2",
+    "deepseek-r1-qwen",
+    "kormo",
+    "f2llmv2",
+    "stablelm2",
+    "hunyuan",
+    "megrez",
+    "solar-open",
+];
+
+/// The Qwen3.5 pre-tokenizer (`qwen35`, which Qwen3.5 and later ship):
+/// [`SPLIT_PATTERN_QWEN2`] with combining marks kept on their letters.
+const SPLIT_PATTERN_QWEN35: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+/// `tokenizer.ggml.pre` values upstream routes to the generic pattern with
+/// digits first split one at a time ([`DIGIT_AT_A_TIME_STAGES`]).
+const DIGIT_AT_A_TIME_PRE_TYPES: &[&str] = &[
+    "starcoder",
+    "refact",
+    "command-r",
+    "smollm",
+    "codeshell",
+    "exaone",
+    "minerva-7b",
+];
+
+const DIGIT_AT_A_TIME_STAGES: &[&str] = &[r"\p{N}"];
+
+/// `tokenizer.ggml.pre` values upstream routes to the DeepSeek-V3 split
+/// (its `deepseek-v3` and `joyai-llm` names). Neither sets `ignore_merges`.
+const DEEPSEEK3_PRE_TYPES: &[&str] = &["deepseek-v3", "joyai-llm"];
+
+/// `tokenizer.ggml.pre` values upstream routes to
+/// `LLAMA_VOCAB_PRE_TYPE_BAILINGMOE` (its own list, verbatim) — Ling 1.0,
+/// Ling 2.0 and Ling 3.0 share one vocabulary family with LLaDA-MoE. None
+/// of them sets `ignore_merges`.
+const BAILINGMOE_PRE_TYPES: &[&str] = &["bailingmoe", "bailingmoe2", "llada-moe"];
+
+/// `tokenizer.ggml.pre` values upstream routes to
+/// `LLAMA_VOCAB_PRE_TYPE_CHATGLM4` — GLM-4 and GLM-5 family vocabs,
+/// including `glm-dsa` (GLM-5.2).
+///
+/// The split pattern is *character-identical* to
+/// [`SPLIT_PATTERN_LLAMA3`]'s, so this shares that constant rather than
+/// repeating it. What it does **not** share is `ignore_merges`: upstream
+/// sets that flag on its llama3 arm and not on this one, so a GLM vocab
+/// runs the ordinary BPE merge loop over every pre-token, including ones
+/// that happen to be whole vocab entries. It also clears `special_bos_id`
+/// — see [`Tokenizer::open`]'s own handling.
+const CHATGLM4_PRE_TYPES: &[&str] = &["glm4", "chatglm-bpe"];
+
+/// `tokenizer.ggml.pre` values upstream routes to
+/// `LLAMA_VOCAB_PRE_TYPE_LLAMA3` (its own list, verbatim). Every one of
+/// them also sets `ignore_merges`.
+const LLAMA3_PRE_TYPES: &[&str] = &[
+    "llama3",
+    "llama-v3",
+    "llama-bpe",
+    "falcon3",
+    "falcon-h1",
+    "pixtral",
+    "midm-2.0",
+    "lfm2",
+    "jina-v5-nano",
+];
+
+/// `tokenizer.ggml.pre` values upstream routes to
+/// `LLAMA_VOCAB_PRE_TYPE_GPT4O` (its own list, verbatim). None of them sets
+/// `ignore_merges`.
+///
+/// `llama4` is the trap here: every other `llama*` `pre` value sits in
+/// [`LLAMA3_PRE_TYPES`], but upstream puts Llama 4's vocab — and
+/// `muse-glimmer`, which reuses it (`unsloth/Muse-Glimmer-30B-GGUF`) — on
+/// the GPT-4o arm instead, which both splits letter runs on case
+/// boundaries and leaves `ignore_merges` clear. Reading the name rather
+/// than the table would mis-tokenize every prompt in a way that still
+/// produces fluent-looking output.
+///
+/// `inkling` (`unsloth/Inkling-Small-GGUF`) is here because its vocabulary
+/// *is* this one: a 200k byte-level BPE whose pre-tokenizer split is the
+/// o200k regex character for character — the case-boundary alternation, the
+/// `\p{N}{1,3}` digit runs, and the `[\r\n/]*` tail that no other family
+/// here has. Confirmed against colibrì's `inkling` engine, which carries
+/// the same pattern spelled out as an explicit scanner.
+///
+/// `minimax-m2` (MiniMax-M2 and `minimax-m3`, e.g.
+/// `unsloth/MiniMax-M3.1-Flash-GGUF`) shares upstream's `GPT4O` regex case
+/// arm verbatim, and like the rest leaves `ignore_merges` clear.
+const GPT4O_PRE_TYPES: &[&str] = &[
+    "gpt-4o",
+    "llama4",
+    "kanana2",
+    "talkie",
+    "inkling",
+    "minimax-m2",
+];
+
+/// `tokenizer.ggml.pre` values whose upstream arm leaves `add_bos` at its
+/// `false` default, for a file that does not set
+/// `tokenizer.ggml.add_bos_token` itself. Everywhere else an absent key
+/// means `true` (see [`Tokenizer::wants_bos`]). `minimax-m2`'s vocab
+/// declares a BOS (`]~b]`) that its chat template writes itself, as a role
+/// marker, and a raw completion never starts with.
+const NO_DEFAULT_BOS_PRE_TYPES: &[&str] = &["minimax-m2"];
+
+/// Picks the pre-tokenizer split pattern and upstream's `ignore_merges`
+/// flag for a `tokenizer.ggml.pre` value, falling back to the generic
+/// GPT-2-ish pattern for anything not specifically handled (the behavior
+/// every `"gpt2"`-model vocab got before per-`pre` patterns existed).
+fn split_pattern_for_pre(pre: &str) -> (&'static str, bool) {
+    if LLAMA3_PRE_TYPES.contains(&pre) {
+        return (SPLIT_PATTERN_LLAMA3, true);
+    }
+    if CHATGLM4_PRE_TYPES.contains(&pre) {
+        // Same pattern, deliberately without `ignore_merges`.
+        return (SPLIT_PATTERN_LLAMA3, false);
+    }
+    if GPT4O_PRE_TYPES.contains(&pre) {
+        return (SPLIT_PATTERN_GPT4O, false);
+    }
+    if BAILINGMOE_PRE_TYPES.contains(&pre) {
+        return (SPLIT_PATTERN_BAILINGMOE, false);
+    }
+    if pre == "tekken" {
+        return (SPLIT_PATTERN_TEKKEN, true);
+    }
+    if pre == "tekken-num3" {
+        return (SPLIT_PATTERN_TEKKEN_NUM3, true);
+    }
+    if DEEPSEEK3_PRE_TYPES.contains(&pre) {
+        return (SPLIT_PATTERN_DEEPSEEK3, false);
+    }
+    if QWEN2_PRE_TYPES.contains(&pre) {
+        return (SPLIT_PATTERN_QWEN2, false);
+    }
+    if pre == "qwen35" {
+        return (SPLIT_PATTERN_QWEN35, false);
+    }
+    (SPLIT_PATTERN, false)
+}
+
+/// What a `tokenizer.ggml.pre` value runs before its split pattern.
+fn split_stages_for_pre(pre: &str) -> &'static [&'static str] {
+    if DEEPSEEK3_PRE_TYPES.contains(&pre) {
+        DEEPSEEK3_STAGES
+    } else if DIGIT_AT_A_TIME_PRE_TYPES.contains(&pre) {
+        DIGIT_AT_A_TIME_STAGES
+    } else {
+        &[]
+    }
+}
+
+/// One expression of a [`WordSplitter`].
+struct SplitStage {
+    re: Regex,
+    /// Whether the pattern has an alternative for whitespace up to a line
+    /// break (`\s*[\r\n]`), which then keeps what it matched.
+    has_line_break_run: bool,
+}
+
+/// Splits text into the words BPE merges.
+///
+/// The expressions run in order, each re-splitting the pieces of the one
+/// before, and text an expression does not match stays a piece of its own.
+///
+/// **The look-ahead.** Upstream's patterns end in `\s+(?!\S)|\s+`, which this
+/// crate cannot compile, so they end in `\s+` here and [`Self::word_end`] does
+/// the rest. It matters beyond runs of spaces: the rule leaves the last
+/// whitespace character for what follows it, so in `\n    x` the word `x` takes
+/// a space with it. That is most indented lines of code.
+struct WordSplitter {
+    stages: Vec<SplitStage>,
+}
+
+impl WordSplitter {
+    fn new(leading: &[&str], pattern: &str) -> Result<Self> {
+        let stages = leading
+            .iter()
+            .chain(std::iter::once(&pattern))
+            .map(|&expression| {
+                Ok(SplitStage {
+                    re: Regex::new(expression).context("building tokenizer split regex")?,
+                    has_line_break_run: expression.contains(r"\s*[\r\n]"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { stages })
+    }
+
+    fn split<'a>(&self, text: &'a str) -> Vec<&'a str> {
+        let mut pieces = vec![text];
+        for stage in &self.stages {
+            let mut split = Vec::with_capacity(pieces.len());
+            for piece in pieces {
+                stage.split_into(piece, &mut split);
+            }
+            pieces = split;
+        }
+        pieces
+    }
+}
+
+impl SplitStage {
+    fn split_into<'a>(&self, piece: &'a str, out: &mut Vec<&'a str>) {
+        let mut at = 0;
+        while at < piece.len() {
+            let Some(found) = self.re.find_at(piece, at) else {
+                out.push(&piece[at..]);
+                return;
+            };
+            if found.start() > at {
+                out.push(&piece[at..found.start()]);
+            }
+            let end = self.word_end(piece, found.start(), found.end());
+            out.push(&piece[found.start()..end]);
+            at = end;
+        }
+    }
+
+    /// Where a match really ends: `\s+(?!\S)` gives back the last character of
+    /// a whitespace run with something after it. Where nothing follows in this
+    /// piece, the run stays whole, as it does where the run is one character,
+    /// the alternative `\s+` taking it.
+    fn word_end(&self, piece: &str, start: usize, end: usize) -> usize {
+        let word = &piece[start..end];
+        let Some((last_at, last)) = word.char_indices().next_back() else {
+            // No expression here matches nothing, but a loop that did not
+            // advance would never end.
+            return piece[start..]
+                .chars()
+                .next()
+                .map_or(piece.len(), |c| start + c.len_utf8());
+        };
+        let followed = piece[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace());
+        let kept = self.has_line_break_run && matches!(last, '\r' | '\n');
+        if last_at > 0 && followed && !kept && word.chars().all(char::is_whitespace) {
+            start + last_at
+        } else {
+            end
+        }
+    }
+}
+
+/// The control token that opens a *reasoning* message body, for a
+/// vocabulary that types its bodies (see [`Tokenizer::content_kinds`]).
+const REASONING_CONTENT_TOKEN: &str = "<|content_thinking|>";
+
+/// The control tokens that open every other kind of message body — an
+/// answer, markup, a tool invocation, a tool error. A vocabulary need not
+/// have all of them; the ones it does have mark a body the caller sees.
+///
+/// Listed rather than derived as "anything that isn't the reasoning
+/// marker", because the alternative would treat every unknown control
+/// token in a reply — a turn marker, an end marker — as the start of a
+/// visible body and reset the suppression mid-reasoning.
+const OTHER_CONTENT_TOKENS: &[&str] = &[
+    "<|content_text|>",
+    "<|content_xml|>",
+    "<|content_invoke_tool_json|>",
+    "<|content_invoke_tool_text|>",
+    "<|content_tool_error|>",
+];
+
+/// A vocabulary's message-body kind markers — see
+/// [`Tokenizer::content_kinds`].
+#[derive(Clone)]
+pub struct ContentKinds {
+    /// The marker that opens a reasoning body.
+    pub reasoning: u32,
+    /// The markers that open a body the caller is meant to see.
+    pub other: Vec<u32>,
+}
+
+/// SentencePiece's word-boundary marker (U+2581, "▁") — gemma4-family
+/// vocabs escape every literal space to this before running BPE merges, and
+/// unescape it back on the way out.
+const SPM_SPACE: char = '\u{2581}';
+
+/// How many prompt heads [`Tokenizer::encode_prompt`] keeps: a client's
+/// conversation and its subagents, with room to spare.
+const PROMPT_HEADS: usize = 16;
+
+pub struct Tokenizer {
+    /// Recently encoded prompt heads, cut on a special token's edge, with
+    /// their tokens — see [`Tokenizer::encode_prompt`].
+    heads: std::sync::Mutex<std::collections::VecDeque<(String, std::sync::Arc<[u32]>)>>,
+    /// Byte-mapped-unicode (`VocabKind::Gpt2Byte`) or raw-UTF-8 (every other
+    /// `VocabKind`) token string -> id. `FxHashMap`: the fixed vocab
+    /// needs no HashDoS resistance, so the stdlib's SipHash default was pure
+    /// overhead in the tokenizer hot loop.
+    token_to_id: FxHashMap<String, u32>,
+    id_to_token: Vec<String>,
+    /// [`Tokenizer::token_bytes`]'s table, built on first use and only when a
+    /// request constrains its output.
+    token_bytes: std::sync::OnceLock<std::sync::Arc<Vec<Vec<u8>>>>,
+    /// **Interned** merge table: `(left_id, right_id) -> (rank,
+    /// merged_id)`. Keyed by the two operand token *ids*, not their strings, so
+    /// the BPE merge loop looks merges up with an 8-byte integer key and never
+    /// allocates/hashes a `String` — and the merged token id is stored inline,
+    /// so a merge needs no `format!`+lookup either. Lower rank merges first.
+    merge_map: FxHashMap<(u32, u32), (u32, u32)>,
+    byte_to_char: [char; 256],
+    char_to_byte: FxHashMap<char, u8>,
+    splitter: WordSplitter,
+    /// Upstream's `vocab.get_ignore_merges()`: when a whole pre-tokenized
+    /// word is *itself* a vocab token, emit it directly instead of running
+    /// the merge loop over its bytes. Set for every `LLAMA3_PRE_TYPES`
+    /// vocab; false elsewhere, which is exactly the previous behavior.
+    ignore_merges: bool,
+    /// Whether a digit run the split regex matched whole is cut into
+    /// right-aligned groups of three before merging
+    /// ([`RIGHT_ALIGNED_DIGIT_PRE_TYPES`]).
+    right_aligned_digits: bool,
+    /// Structural tokens ([`is_structural_token_type`]), longest-string-first,
+    /// so a literal occurrence in text (a chat template's
+    /// `<|start_header_id|>`, or the `<think>` its generation prompt opens
+    /// with) is recognized as one atomic token instead of being run through
+    /// BPE like ordinary text.
+    ///
+    /// The same set [`Tokenizer::is_special`] hides on the way out: a marker
+    /// this cannot produce is a marker that filter can never catch.
+    special_matcher: Option<aho_corasick::AhoCorasick>,
+    special_tokens: Vec<(String, u32)>,
+    /// Ids of every CONTROL / USER_DEFINED token (BOS/EOS/pad plus a chat
+    /// format's structural markers — gemma-4's `<|turn>`/`<turn|>`/
+    /// `<|channel>`/`<channel|>`/`<|tool_call>` etc.). Rendered literally by
+    /// [`Tokenizer::decode`], so callers streaming to a human suppress them
+    /// via [`Tokenizer::is_special`] (`skip_special_tokens`) rather than
+    /// showing raw `<turn|>`-style tokens.
+    special_ids: FxHashSet<u32>,
+    pub bos_token: Option<u32>,
+    pub eos_token: Option<u32>,
+    fim_prefix: Option<u32>,
+    fim_suffix: Option<u32>,
+    fim_middle: Option<u32>,
+    fim_pad: Option<u32>,
+    fim_repo: Option<u32>,
+    fim_separator: Option<u32>,
+    /// `tokenizer.ggml.eot_token_id` — the "end of turn" token, which for a
+    /// chat format can be a *different* id from `eos_token` (gemma-4 ends an
+    /// assistant turn with `<turn|>` = 106, while `<eos>` = 1). Generation
+    /// must stop on it too; see [`Tokenizer::stop_token_ids`].
+    pub eot_token: Option<u32>,
+    /// `tokenizer.ggml.add_eos_token` — sentence-embedding models (e.g.
+    /// `gemma-embedding`) set this to mark a trailing sentence-boundary
+    /// token; causal decoder models generally don't. Only consulted by
+    /// [`Tokenizer::encode_for_embedding`], never by [`Tokenizer::encode`]
+    /// itself — a trailing EOS injected into a generation prompt would
+    /// immediately end generation, which is never what a chat/completion
+    /// caller wants.
+    add_eos_token: bool,
+    /// `tokenizer.ggml.add_bos_token`, read by [`Tokenizer::wants_bos`] and
+    /// by [`Tokenizer::encode_for_embedding`]. Defaults to `true` when the
+    /// key is absent — most decoder-LM GGUFs want BOS and don't bother
+    /// setting it — except for [`NO_DEFAULT_BOS_PRE_TYPES`].
+    ///
+    /// **A completion asks this rather than assuming.** It used to be
+    /// consulted only for embeddings, on the reasoning that a chat or
+    /// completion caller decides BOS for itself; every such caller then
+    /// passed `true`, which is wrong for a file that says `false` and wrong
+    /// in a way nothing reports. `qwen3vl` and `bailingmoe3` both set it
+    /// `false`.
+    add_bos_token: bool,
+    vocab_kind: VocabKind,
+    /// Token id -> raw byte value, for `<0xXX>`-format byte-fallback tokens
+    /// (`tokenizer.ggml.token_type == BYTE`). Only populated for a non-
+    /// `Gpt2Byte` vocab — a byte-encoded vocab already represents every
+    /// byte through its ordinary byte-to-unicode alphabet instead.
+    byte_fallback: FxHashMap<u32, u8>,
+    /// `tokenizer.ggml.scores` — `VocabKind::SpmUnigram`'s per-token merge
+    /// priority (see [`Tokenizer::spm_merge_symbols`]). Empty for every
+    /// other vocab kind.
+    scores: Vec<f32>,
+    /// `tokenizer.ggml.add_space_prefix` — `VocabKind::SpmUnigram` only:
+    /// whether to prepend a literal space (before `▁`-escaping) to the
+    /// first text segment, and to any segment immediately following a
+    /// special token. Defaults to upstream `llama.cpp`'s own SPM-type
+    /// default (`true`) when the key is absent, since that default only
+    /// ever applies to a `VocabKind::SpmUnigram` vocab.
+    add_space_prefix: bool,
+}
+
+/// Which of the two vocab-string encodings and matching merge/decode
+/// algorithm this tokenizer uses — see the module doc comment for the full
+/// story on each. Dispatched once, at load time, from `tokenizer.ggml.
+/// model`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VocabKind {
+    /// `"gpt2"` (Llama3/Qwen2/Qwen3/Mistral/qwen35moe/qwen3next): byte-to-unicode
+    /// alphabet, GPT-2's own pre-tokenizer regex, merge-rank BPE.
+    Gpt2Byte,
+    /// `"gemma4"`: raw UTF-8 codepoints, `▁`-space-escaping, newline-only
+    /// pre-split, merge-rank BPE, cross-token cleanup on decode.
+    Gemma4Raw,
+    /// `"llama"` (original Llama/Llama2, and `gemma-embedding`): raw UTF-8
+    /// codepoints, `▁`-space-escaping, *no* pre-split, score-priority
+    /// merge (no merge-rank table), *no* cross-token cleanup on decode.
+    SpmUnigram,
+}
+
+/// llama.cpp's `LLAMA_TOKEN_TYPE_CONTROL`/`_BYTE` (`enum llama_token_type`
+/// in `llama.h`).
+const TOKEN_TYPE_CONTROL: i64 = 3;
+const TOKEN_TYPE_USER_DEFINED: i64 = 4;
+const TOKEN_TYPE_BYTE: i64 = 6;
+
+/// Whether a `tokenizer.ggml.token_type` marks a token as **structural** —
+/// one that must be matched atomically when text is encoded, and hidden
+/// rather than printed when it comes back out.
+///
+/// One predicate for both directions, deliberately. They were two: the
+/// encoder split only on `CONTROL` while [`Tokenizer::is_special`] hid
+/// `CONTROL | USER_DEFINED`, and a set that can be suppressed but never
+/// produced is a set that does nothing. A vocabulary typing `<think>` /
+/// `</think>` / `<tool_call>` as `USER_DEFINED` — Qwen-family models do — had
+/// them run through BPE into ordinary pieces on the way in, so the model wrote
+/// the pieces back out and no id-keyed filter could ever see them: a plain
+/// greeting came back with a literal `</think>` sitting in the middle of it,
+/// and a tool call reached the parser as loose prose.
+///
+/// `UNKNOWN` is the one attribute the reference also splits on and this does
+/// not: no vocabulary here types a structural marker that way, and admitting
+/// it would silently change what an unknown-piece vocabulary tokenizes to.
+fn is_structural_token_type(ty: i64) -> bool {
+    ty == TOKEN_TYPE_CONTROL || ty == TOKEN_TYPE_USER_DEFINED
+}
+
+/// Reusable per-thread working set for [`Tokenizer::bpe_merge_word`]:
+/// the symbol linked-list columns and the bigram heap. Held in a thread-local
+/// and `reset` (not reallocated) per word, so a hot tokenize loop mallocs
+/// nothing after the first large word — it only re-`memset`s the reused
+/// capacity. Struct-of-arrays (parallel `Vec`s indexed by node) so each column
+/// stays contiguous.
+/// A heap entry: `Reverse<(rank, left, right, merged_id, size)>`, so a max-heap
+/// pops the lowest `(rank, left)` — lowest merge rank first, leftmost symbol on
+/// ties (matching the old rescan and llama.cpp's comparator). `right`,
+/// `merged_id` and `size` (the combined unit length when the bigram was pushed,
+/// for the staleness check) are payload that never affects ordering, since among
+/// *valid* bigrams `(rank, left)` is already unique.
+type Bigram = Reverse<(u32, u32, u32, u32, u32)>;
+
+#[derive(Default)]
+struct BpeScratch {
+    /// Current token id of node `i` (`NO_TOKEN` = not a vocab token / sentinel).
+    id: Vec<u32>,
+    /// Byte offset + length of node `i`'s span in the word — used only to
+    /// byte-fallback a surviving sentinel (always exactly one initial symbol).
+    span_start: Vec<u32>,
+    span_len: Vec<u32>,
+    /// Node `i`'s length in *initial-symbol units*; `0` marks a merged-away
+    /// (dead) node, for the O(1) staleness check on popped bigrams.
+    units: Vec<u32>,
+    prev: Vec<i32>,
+    next: Vec<i32>,
+    heap: BinaryHeap<Bigram>,
+}
+
+impl BpeScratch {
+    fn reset(&mut self) {
+        self.id.clear();
+        self.span_start.clear();
+        self.span_len.clear();
+        self.units.clear();
+        self.prev.clear();
+        self.next.clear();
+        self.heap.clear();
+    }
+
+    /// Appends one symbol node; `prev`/`next` are set to the adjacent indices
+    /// (the final node's `next` is fixed to `-1` by the caller).
+    fn push_node(&mut self, id: u32, start: u32, len: u32) {
+        let i = self.id.len() as i32;
+        self.id.push(id);
+        self.span_start.push(start);
+        self.span_len.push(len);
+        self.units.push(1);
+        self.prev.push(i - 1);
+        self.next.push(i + 1);
+    }
+
+    fn try_push_bigram(
+        &mut self,
+        merge_map: &FxHashMap<(u32, u32), (u32, u32)>,
+        l: usize,
+        r: usize,
+    ) {
+        let (il, ir) = (self.id[l], self.id[r]);
+        if il == NO_TOKEN || ir == NO_TOKEN {
+            return;
+        }
+        if let Some(&(rank, merged)) = merge_map.get(&(il, ir)) {
+            let size = self.units[l] + self.units[r];
+            self.heap
+                .push(Reverse((rank, l as u32, r as u32, merged, size)));
+        }
+    }
+}
+
+thread_local! {
+    static BPE_SCRATCH: RefCell<BpeScratch> = RefCell::new(BpeScratch::default());
+}
+
+/// A vocabulary's fill-in-the-middle tokens: from the
+/// `tokenizer.ggml.fim_*_token_id` keys, or for a file written without them,
+/// from the spellings fill-in-the-middle vocabularies use. A token spelled that
+/// way exists for this and nothing else, so the vocabulary has still declared
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FimTokens {
+    pub prefix: u32,
+    pub suffix: u32,
+    pub middle: u32,
+    pub pad: Option<u32>,
+    /// Opens a repository's name, in a prompt holding several files.
+    pub repo: Option<u32>,
+    /// Opens a file's name, in a prompt holding several files.
+    pub separator: Option<u32>,
+}
+
+impl Tokenizer {
+    pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
+        let tokens = string_array(gguf, "tokenizer.ggml.tokens")
+            .ok_or_else(|| anyhow!("GGUF file is missing tokenizer.ggml.tokens"))?;
+        let merges = string_array(gguf, "tokenizer.ggml.merges").unwrap_or_default();
+        let tokenizer_model = metadata_string(gguf, "tokenizer.ggml.model").unwrap_or_default();
+        let vocab_kind = match tokenizer_model.as_str() {
+            "gemma4" => VocabKind::Gemma4Raw,
+            "llama" => VocabKind::SpmUnigram,
+            _ => VocabKind::Gpt2Byte,
+        };
+        // The pre-tokenizer split pattern is a property of `tokenizer.ggml.
+        // pre`, not of `tokenizer.ggml.model` — every vocab below is still
+        // `"gpt2"`-shaped, they just disagree on where word boundaries fall.
+        let pre = metadata_string(gguf, "tokenizer.ggml.pre").unwrap_or_default();
+        let (split_pattern, ignore_merges) = match vocab_kind {
+            VocabKind::Gpt2Byte => split_pattern_for_pre(pre.as_str()),
+            _ => (SPLIT_PATTERN, false),
+        };
+        let split_stages = match vocab_kind {
+            VocabKind::Gpt2Byte => split_stages_for_pre(pre.as_str()),
+            _ => &[],
+        };
+        let right_aligned_digits = vocab_kind == VocabKind::Gpt2Byte
+            && RIGHT_ALIGNED_DIGIT_PRE_TYPES.contains(&pre.as_str());
+        let scores = f32_array(gguf, "tokenizer.ggml.scores").unwrap_or_default();
+        let add_space_prefix =
+            metadata_u32(gguf, "tokenizer.ggml.add_space_prefix").is_none_or(|v| v != 0);
+
+        let mut token_to_id: FxHashMap<String, u32> =
+            FxHashMap::with_capacity_and_hasher(tokens.len(), Default::default());
+        for (id, tok) in tokens.iter().enumerate() {
+            token_to_id.insert(tok.clone(), id as u32);
+        }
+
+        // Intern the merge table to integer keys once, at load time.
+        // Any `String` concatenation here is one-time setup, never the hot loop:
+        // for each merge `(left, right)` at `rank`, resolve both operands and the
+        // merged token `left+right` to ids and store `(l,r) -> (rank, merged)`.
+        // Merges whose operands or result aren't vocab tokens (never true for a
+        // well-formed BPE table) are dropped — they could never fire correctly.
+        let mut merge_map: FxHashMap<(u32, u32), (u32, u32)> =
+            FxHashMap::with_capacity_and_hasher(merges.len(), Default::default());
+        let mut merged_buf = String::new();
+        for (rank, merge) in merges.iter().enumerate() {
+            let Some((left, right)) = split_merge(merge) else {
+                continue;
+            };
+            let (Some(&l), Some(&r)) = (token_to_id.get(left), token_to_id.get(right)) else {
+                continue;
+            };
+            merged_buf.clear();
+            merged_buf.push_str(left);
+            merged_buf.push_str(right);
+            if let Some(&m) = token_to_id.get(&merged_buf) {
+                merge_map.insert((l, r), (rank as u32, m));
+            }
+        }
+
+        let byte_to_char = byte_to_unicode_table();
+        let char_to_byte: FxHashMap<char, u8> = byte_to_char
+            .iter()
+            .enumerate()
+            .map(|(b, &c)| (c, b as u8))
+            .collect();
+
+        // GLM vocabs declare a BOS token id and then upstream throws it
+        // away (`special_bos_id = LLAMA_TOKEN_NULL` on its `glm4` arm), so
+        // nothing ever prepends it. Honoring the declared id instead would
+        // put a token in front of every prompt that the model never saw
+        // there during training.
+        let bos_token = metadata_string(gguf, "tokenizer.ggml.pre")
+            .is_none_or(|pre| !CHATGLM4_PRE_TYPES.contains(&pre.as_str()))
+            .then(|| metadata_u32(gguf, "tokenizer.ggml.bos_token_id"))
+            .flatten();
+        let eos_token = metadata_u32(gguf, "tokenizer.ggml.eos_token_id");
+        let eot_token = metadata_u32(gguf, "tokenizer.ggml.eot_token_id");
+        let fim = |keys: &[&str], spellings: &[&str]| {
+            keys.iter()
+                .find_map(|key| metadata_u32(gguf, &format!("tokenizer.ggml.{key}")))
+                .or_else(|| spellings.iter().find_map(|s| token_to_id.get(*s).copied()))
+        };
+        let fim_prefix = fim(
+            &["fim_pre_token_id", "prefix_token_id"],
+            &[
+                "<|fim_prefix|>",
+                "<fim-prefix>",
+                "<fim_prefix>",
+                "<\u{ff5c}fim\u{2581}begin\u{ff5c}>",
+                "<PRE>",
+                "\u{2581}<PRE>",
+                "[PREFIX]",
+            ],
+        );
+        let fim_suffix = fim(
+            &["fim_suf_token_id", "suffix_token_id"],
+            &[
+                "<|fim_suffix|>",
+                "<fim-suffix>",
+                "<fim_suffix>",
+                "<\u{ff5c}fim\u{2581}hole\u{ff5c}>",
+                "<SUF>",
+                "\u{2581}<SUF>",
+                "[SUFFIX]",
+            ],
+        );
+        let fim_middle = fim(
+            &["fim_mid_token_id", "middle_token_id"],
+            &[
+                "<|fim_middle|>",
+                "<fim-middle>",
+                "<fim_middle>",
+                "<\u{ff5c}fim\u{2581}end\u{ff5c}>",
+                "<MID>",
+                "\u{2581}<MID>",
+                "[MIDDLE]",
+            ],
+        );
+        let fim_pad = fim(
+            &["fim_pad_token_id"],
+            &["<|fim_pad|>", "<fim-pad>", "<fim_pad>", "<PAD>"],
+        );
+        let fim_repo = fim(
+            &["fim_rep_token_id"],
+            &[
+                "<|fim_repo|>",
+                "<|repo_name|>",
+                "<fim-repo>",
+                "<REPO>",
+                "<reponame>",
+            ],
+        );
+        let fim_separator = fim(
+            &["fim_sep_token_id"],
+            &[
+                "<|fim_sep|>",
+                "<|file_sep|>",
+                "<fim-sep>",
+                "<SEP>",
+                "<filename>",
+            ],
+        );
+        let add_eos_token = metadata_u32(gguf, "tokenizer.ggml.add_eos_token").unwrap_or(0) != 0;
+        let add_bos_token = match metadata_u32(gguf, "tokenizer.ggml.add_bos_token") {
+            Some(v) => v != 0,
+            None => metadata_string(gguf, "tokenizer.ggml.pre")
+                .is_none_or(|pre| !NO_DEFAULT_BOS_PRE_TYPES.contains(&pre.as_str())),
+        };
+
+        let token_types = i64_array(gguf, "tokenizer.ggml.token_type").unwrap_or_default();
+        // One predicate for both — see `is_structural_token_type`. Matched
+        // atomically when text is encoded, and suppressed by `is_special` when
+        // it comes back out.
+        let mut special_tokens: Vec<(String, u32)> = token_types
+            .iter()
+            .enumerate()
+            .filter(|&(_, &ty)| is_structural_token_type(ty))
+            .filter_map(|(id, _)| tokens.get(id).map(|tok| (tok.clone(), id as u32)))
+            // A token of no text would match everywhere.
+            .filter(|(tok, _)| !tok.is_empty())
+            .collect();
+        special_tokens.sort_by_key(|(tok, _)| std::cmp::Reverse(tok.len()));
+        let special_matcher = (!special_tokens.is_empty())
+            .then(|| {
+                aho_corasick::AhoCorasick::builder()
+                    .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+                    .build(special_tokens.iter().map(|(tok, _)| tok))
+            })
+            .transpose()
+            .context("building the special-token matcher")?;
+
+        let special_ids: FxHashSet<u32> = token_types
+            .iter()
+            .enumerate()
+            .filter(|&(_, &ty)| is_structural_token_type(ty))
+            .map(|(id, _)| id as u32)
+            .collect();
+
+        let mut byte_fallback: FxHashMap<u32, u8> = FxHashMap::default();
+        if vocab_kind != VocabKind::Gpt2Byte {
+            for (id, &ty) in token_types.iter().enumerate() {
+                if ty == TOKEN_TYPE_BYTE
+                    && let Some(tok) = tokens.get(id)
+                    && let Some(byte) = parse_byte_fallback_token(tok)
+                {
+                    byte_fallback.insert(id as u32, byte);
+                }
+            }
+        }
+
+        Ok(Self {
+            token_to_id,
+            id_to_token: tokens,
+            token_bytes: std::sync::OnceLock::new(),
+            merge_map,
+            byte_to_char,
+            char_to_byte,
+            splitter: WordSplitter::new(split_stages, split_pattern)?,
+            ignore_merges,
+            right_aligned_digits,
+            special_tokens,
+            special_matcher,
+            special_ids,
+            bos_token,
+            eos_token,
+            fim_prefix,
+            fim_suffix,
+            fim_middle,
+            fim_pad,
+            fim_repo,
+            fim_separator,
+            eot_token,
+            add_eos_token,
+            add_bos_token,
+            vocab_kind,
+            byte_fallback,
+            scores,
+            add_space_prefix,
+            heads: std::sync::Mutex::default(),
+        })
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.id_to_token.len()
+    }
+
+    /// Whether this file asks for a BOS token in front of a prompt —
+    /// `tokenizer.ggml.add_bos_token`, `true` where the key is absent unless
+    /// the pre-tokenizer is one of [`NO_DEFAULT_BOS_PRE_TYPES`].
+    ///
+    /// **What a completion should pass to [`Self::encode`].** Hardcoding
+    /// `true` there puts a BOS in front of every prompt for a model trained
+    /// without one, and nothing about that is visible as an error: the
+    /// prompt is one token longer than the same text is anywhere else, and
+    /// the continuation is merely different. Measured on a `bailingmoe3`
+    /// file, which sets the key to `false`: 907 tokens against the
+    /// reference's 906 for the same text, and a greedy continuation that
+    /// diverged from it while every other model in the set matched byte for
+    /// byte.
+    pub fn wants_bos(&self) -> bool {
+        self.add_bos_token
+    }
+
+    /// Encodes `text` to token ids, prefixed with the model's BOS token if
+    /// it has one (matching llama.cpp's default `add_bos` behavior for a
+    /// chat/completion request).
+    pub fn encode(&self, text: &str, add_bos: bool) -> Vec<u32> {
+        self.encode_segments(self.split_on_special_tokens(text), add_bos)
+    }
+
+    /// [`Self::encode`] for text a user wrote rather than a template: what
+    /// spells a special token in it is that spelling, not the token. A source
+    /// file that mentions `<|fim_middle|>` must not be able to end its own
+    /// prefix.
+    pub fn encode_literal(&self, text: &str) -> Vec<u32> {
+        self.encode_segments(vec![Segment::Plain(text)], false)
+    }
+
+    fn encode_segments(&self, segments: Vec<Segment<'_>>, add_bos: bool) -> Vec<u32> {
+        let mut ids = Vec::new();
+        if add_bos && let Some(bos) = self.bos_token {
+            ids.push(bos);
+        }
+        // `true` even when `add_bos` didn't actually push a BOS token —
+        // matches upstream `llama.cpp`'s own `llm_tokenizer_spm_session`
+        // (`bool is_prev_special = true; // prefix with space if first
+        // token`), only consulted by `VocabKind::SpmUnigram`'s space-
+        // prefix handling below.
+        let mut is_prev_special = true;
+        for segment in segments {
+            match segment {
+                Segment::Special(id) => {
+                    ids.push(id);
+                    is_prev_special = true;
+                }
+                Segment::Plain(text) => {
+                    match self.vocab_kind {
+                        VocabKind::Gpt2Byte => self.encode_plain_byte(text, &mut ids),
+                        VocabKind::Gemma4Raw => self.encode_plain_raw(text, &mut ids),
+                        VocabKind::SpmUnigram => {
+                            self.encode_plain_spm(text, is_prev_special, &mut ids)
+                        }
+                    }
+                    is_prev_special = false;
+                }
+            }
+        }
+        ids
+    }
+
+    /// Like [`Tokenizer::encode`], but with `add_bos` driven by this
+    /// tokenizer's own `add_bos_token` metadata (not hardcoded — `qwen3vl`-
+    /// embedding models explicitly set this `false`, unlike every other
+    /// model tested so far) and with the model's EOS token additionally
+    /// appended when `add_eos_token` says to. The embeddings-request path
+    /// (`http::openai::pooled_embedding`) is the only caller; a trailing
+    /// EOS has no place in a generation prompt.
+    pub fn encode_for_embedding(&self, text: &str) -> Vec<u32> {
+        let mut ids = self.encode(text, self.add_bos_token);
+        if self.add_eos_token
+            && let Some(eos) = self.eos_token
+        {
+            ids.push(eos);
+        }
+        ids
+    }
+
+    fn encode_plain_byte(&self, text: &str, ids: &mut Vec<u32>) {
+        // Reused across words so `ignore_merges`' whole-word lookup doesn't
+        // allocate per pre-token; untouched entirely when the flag is off.
+        let mut mapped = String::new();
+        let words = self.splitter.split(text).into_iter().flat_map(|word| {
+            let digits = self.right_aligned_digits && word.chars().all(char::is_numeric);
+            let (whole, grouped) = if digits {
+                (None, Some(right_aligned_digit_groups(word)))
+            } else {
+                (Some(word), None)
+            };
+            whole.into_iter().chain(grouped.into_iter().flatten())
+        });
+        for word in words {
+            // Upstream's `llm_tokenizer_bpe_session::tokenize`: with
+            // `ignore_merges`, a pre-tokenized word that is already a vocab
+            // token is emitted as that token rather than being rebuilt from
+            // its bytes by the merge loop (which can land on a different,
+            // equally-mergeable split).
+            if self.ignore_merges {
+                mapped.clear();
+                mapped.extend(word.bytes().map(|b| self.byte_to_char[b as usize]));
+                if let Some(&id) = self.token_to_id.get(&mapped) {
+                    ids.push(id);
+                    continue;
+                }
+            }
+            self.bpe_merge_word(word, false, ids);
+        }
+    }
+
+    /// The `"gemma4"`-vocab encode path: escape every literal space to `▁`
+    /// first (matching `llama_escape_whitespace`), then split only on
+    /// newline runs and BPE-merge each word's raw UTF-8 codepoints —
+    /// no byte-to-unicode alphabet involved at all.
+    fn encode_plain_raw(&self, text: &str, ids: &mut Vec<u32>) {
+        let escaped = text.replace(' ', &SPM_SPACE.to_string());
+        for word in split_newline_runs(&escaped) {
+            // Real llama.cpp's gemma4-specific fix (ref: llama.cpp#21343):
+            // an all-newline run that's directly a vocab token is emitted
+            // as-is, skipping the merge process (this vocab has multi-
+            // newline tokens like "\n\n\n...\n" that BPE-merging the
+            // ordinary way wouldn't necessarily reconstruct).
+            if !word.is_empty()
+                && word.chars().all(|c| c == '\n')
+                && let Some(&id) = self.token_to_id.get(word)
+            {
+                ids.push(id);
+                continue;
+            }
+            self.bpe_merge_word(word, true, ids);
+        }
+    }
+
+    /// The `"llama"`-vocab (`VocabKind::SpmUnigram`) encode path: unlike
+    /// `Self::encode_plain_raw`, there is no pre-tokenizer word-splitting
+    /// at all — the *whole* segment is escaped and fed through `Self::
+    /// spm_merge_symbols` as one run (real upstream `llama.cpp` does the
+    /// same: `llm_tokenizer_spm_session::tokenize` never splits its input).
+    /// `is_prev_special` gates the leading-space prefix exactly as
+    /// upstream's `is_prev_special`/`add_space_prefix` do.
+    fn encode_plain_spm(&self, text: &str, is_prev_special: bool, ids: &mut Vec<u32>) {
+        let mut escaped = String::new();
+        if self.add_space_prefix && is_prev_special {
+            escaped.push(' ');
+        }
+        escaped.push_str(text);
+        let escaped = escaped.replace(' ', &SPM_SPACE.to_string());
+
+        let symbols: Vec<String> = escaped.chars().map(|c| c.to_string()).collect();
+        let symbols = self.spm_merge_symbols(symbols);
+        for symbol in symbols {
+            match self.token_to_id.get(&symbol) {
+                Some(&id) => ids.push(id),
+                // A leftover symbol that never merged into a vocab token
+                // (e.g. a character outside this vocab entirely) falls
+                // back to its raw bytes' `<0xXX>`-format tokens — the same
+                // fallback `Self::encode_plain_raw` uses.
+                None => {
+                    for byte in symbol.bytes() {
+                        if let Some(&id) = self.token_to_id.get(&byte_fallback_token_name(byte)) {
+                            ids.push(id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Self::encode`] of a chat prompt (no BOS), reusing the tokens of the
+    /// longest recently encoded prompt this one extends.
+    ///
+    /// A conversation's next request repeats its last one and adds a turn,
+    /// and its prompt used to be encoded in full every time. Each prompt is
+    /// remembered up to its last special token — the last place the encoder
+    /// is sure to break it — so a later prompt that begins with it encodes
+    /// only what follows. [`PROMPT_HEADS`] are kept, newest first, so several
+    /// conversations (a client's subagents) each find their own.
+    pub fn encode_prompt(&self, text: &str) -> Vec<u32> {
+        let found = {
+            let heads = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+            heads
+                .iter()
+                .filter(|(head, _)| text.starts_with(head.as_str()))
+                .max_by_key(|(head, _)| head.len())
+                .cloned()
+        };
+        let tokens = found
+            .and_then(|(head, tokens)| self.encode_after(&head, &tokens, text))
+            .unwrap_or_else(|| self.encode(text, false));
+        self.remember_head(text, &tokens);
+        tokens
+    }
+
+    /// Keeps `text` up to its last special token, with that part's tokens.
+    fn remember_head(&self, text: &str, tokens: &[u32]) {
+        let Some(matcher) = &self.special_matcher else {
+            return;
+        };
+        let Some(last) = matcher.find_iter(text).last() else {
+            return;
+        };
+        let head = &text[..last.end()];
+        // After a special token the encoder starts afresh, so the text past
+        // the last one encodes the same on its own: its length says where
+        // the head's tokens end.
+        let tail = &text[last.end()..];
+        let tail_len = if tail.is_empty() {
+            0
+        } else {
+            self.encode_segments(vec![Segment::Plain(tail)], false)
+                .len()
+        };
+        let Some(len) = tokens.len().checked_sub(tail_len).filter(|&n| n > 0) else {
+            return;
+        };
+        let mut heads = self.heads.lock().unwrap_or_else(|e| e.into_inner());
+        heads.retain(|(h, _)| !head.starts_with(h.as_str()));
+        heads.push_front((head.to_string(), tokens[..len].into()));
+        heads.truncate(PROMPT_HEADS);
+    }
+
+    /// [`Self::encode`] of `text`, which begins with `head`, reusing
+    /// `head_tokens` (`encode(head, false)`) and encoding only the rest.
+    ///
+    /// The result equals a full encode only where the encoder itself breaks
+    /// the text at `head`'s end: on a special token's edge. Plain text merges
+    /// across any other cut, so `None` there, and the caller encodes in full.
+    pub fn encode_after(&self, head: &str, head_tokens: &[u32], text: &str) -> Option<Vec<u32>> {
+        if !text.starts_with(head) {
+            return None;
+        }
+        let cut = head.len();
+        if cut == 0 {
+            return Some(self.encode(text, false));
+        }
+        let matcher = self.special_matcher.as_ref()?;
+        // Whether a special token ends or starts exactly at the cut, found in
+        // the whole text: a match running across the cut means the head's
+        // own split differs from the text's.
+        let mut on_edge = false;
+        let mut segments = Vec::new();
+        let mut at = cut;
+        for found in matcher.find_iter(text) {
+            if found.end() <= cut {
+                on_edge |= found.end() == cut;
+                continue;
+            }
+            if found.start() < cut {
+                return None;
+            }
+            on_edge |= found.start() == cut;
+            if found.start() > at {
+                segments.push(Segment::Plain(&text[at..found.start()]));
+            }
+            segments.push(Segment::Special(
+                self.special_tokens[found.pattern().as_usize()].1,
+            ));
+            at = found.end();
+        }
+        if !on_edge {
+            return None;
+        }
+        if at < text.len() {
+            segments.push(Segment::Plain(&text[at..]));
+        }
+        // After a special token the rest starts afresh, which is what
+        // `encode_segments` assumes; before one, the rest starts with it.
+        let mut tokens = head_tokens.to_vec();
+        tokens.extend(self.encode_segments(segments, false));
+        Some(tokens)
+    }
+
+    /// Splits `text` around any literal occurrence of a control/special
+    /// token's own string (e.g. a chat template's `<|start_header_id|>`),
+    /// longest-match-first, so those bypass BPE entirely — matching
+    /// llama.cpp's own special-token handling in `llama-vocab.cpp`.
+    fn split_on_special_tokens<'a>(&self, text: &'a str) -> Vec<Segment<'a>> {
+        let Some(matcher) = &self.special_matcher else {
+            return vec![Segment::Plain(text)];
+        };
+        // One pass over the text, however many special tokens the vocabulary
+        // has and however many of them a request spells out.
+        let mut segments = Vec::new();
+        let mut at = 0;
+        for found in matcher.find_iter(text) {
+            if found.start() > at {
+                segments.push(Segment::Plain(&text[at..found.start()]));
+            }
+            segments.push(Segment::Special(
+                self.special_tokens[found.pattern().as_usize()].1,
+            ));
+            at = found.end();
+        }
+        if at < text.len() || segments.is_empty() {
+            segments.push(Segment::Plain(&text[at..]));
+        }
+        segments
+    }
+
+    /// Decodes token ids back to text. For a `VocabKind::Gpt2Byte`
+    /// (`"gpt2"`) vocab: concatenates each token's mapped string, reversing
+    /// the byte-to-unicode mapping. For `Gemma4Raw`/`SpmUnigram`:
+    /// raw-byte-fallback tokens decode to their one raw byte, everything
+    /// else decodes as literal UTF-8 text with `▁` unescaped back to a
+    /// space. Unknown ids are
+    /// skipped. Safe to call per-token during streaming (each token's
+    /// bytes depend only on itself) — but see [`Tokenizer::
+    /// clean_up_tokenization_spaces`] for the cross-token cleanup a
+    /// `"gemma4"` vocab additionally needs once the *complete* text is
+    /// known, exactly mirroring real llama.cpp's own split between a per-
+    /// token `token_to_piece` (no cleanup) and a whole-sequence
+    /// `detokenize` (cleanup applied once at the end).
+    /// The token ids whose generation ends a reply: `eos_token`, plus
+    /// `eot_token` (end-of-turn) when the model defines a distinct one. A
+    /// chat format can terminate an assistant turn on a token that is *not*
+    /// `<eos>` — gemma-4 ends on `<turn|>` (`eot_token_id` = 106, distinct
+    /// from `<eos>` = 1) — so stopping on EOS alone lets the model run past
+    /// the end of its reply, spilling raw turn/channel control tokens into
+    /// the output. Callers that must ignore EOS (raw benchmark decode) skip
+    /// this and pass their own empty set instead.
+    /// A vocabulary can also carry an end token the GGUF metadata never names.
+    /// gemma-4 is the case in hand: its `tokenizer.ggml.eos_token_id` is 106
+    /// (`<turn|>`, the end-of-turn marker) and it declares no
+    /// `eot_token_id` — but the vocabulary *also* holds a token whose text is
+    /// literally `<eos>` (id 1), typed `NORMAL` rather than `CONTROL`, and the
+    /// model emits it to end a tool call. Typed normal it is not suppressed
+    /// either, so it arrived as the literal five characters `<eos>` in the
+    /// answer.
+    ///
+    /// gemma-4 can also end a tool call with `<|tool_response>`: its chat
+    /// template closes a turn whose call has no result yet with that token
+    /// instead of `<turn|>`, so it is where the model hands over and waits.
+    /// Not stopping there, the model writes the tool's result itself and
+    /// carries on calling tools against results it made up.
+    ///
+    /// Matching on the vocabulary's own name for a token is not a guess
+    /// about content: no model emits `<eos>` or `<|tool_response>` as
+    /// prose. A vocabulary without such a token is unaffected.
+    const NAMED_END_TOKENS: [&'static str; 2] = ["<eos>", "<|tool_response>"];
+
+    /// The tokens that frame a fill-in-the-middle prompt, or `None` when this
+    /// vocabulary cannot make one: it has to have all of prefix, suffix and
+    /// middle. See [`FimTokens`].
+    pub fn fim_tokens(&self) -> Option<FimTokens> {
+        Some(FimTokens {
+            prefix: self.fim_prefix?,
+            suffix: self.fim_suffix?,
+            middle: self.fim_middle?,
+            pad: self.fim_pad,
+            repo: self.fim_repo,
+            separator: self.fim_separator,
+        })
+    }
+
+    pub fn stop_token_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::with_capacity(3);
+        ids.extend(self.eos_token);
+        if let Some(eot) = self.eot_token
+            && Some(eot) != self.eos_token
+        {
+            ids.push(eot);
+        }
+        for name in Self::NAMED_END_TOKENS {
+            if let Some(&id) = self.token_to_id.get(name)
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    /// Whether `id` is a structural CONTROL / USER_DEFINED token (BOS/EOS/
+    /// pad, and a chat format's turn/channel/tool markers) that should be
+    /// suppressed from human-visible output rather than rendered as its
+    /// literal `<…>` string — the `skip_special_tokens` behavior every chat
+    /// UI wants. [`Tokenizer::decode`] itself stays faithful (renders
+    /// everything); the streaming caller filters via this.
+    pub fn is_special(&self, id: u32) -> bool {
+        self.special_ids.contains(&id)
+    }
+
+    /// `(<|start|>, <|message|>)` for a vocabulary that frames each message
+    /// as `<|start|><role> <header><|message|><content>`, and `None` for
+    /// every vocabulary that doesn't.
+    ///
+    /// Both markers are CONTROL tokens and so are already hidden by
+    /// [`Self::is_special`]. What this exists for is the text *between*
+    /// them, which is not: in `muse-glimmer`'s format the model writes its
+    /// own ` to=self` / ` to=user` / ` to=<tool>` recipient there, and the
+    /// generation prompt deliberately stops right before it
+    /// (`…<|eot|><|start|>assistant`) so the model can choose. Rendered as
+    /// content, that reaches a chat client as a reply literally beginning
+    /// `" to=self"`. `engine::generate` uses this pair to skip a message's
+    /// header the way it already skips the markers around it.
+    ///
+    /// Matching on the vocabulary's own names for the tokens, as
+    /// [`Self::NAMED_END_TOKENS`] does, rather than on an architecture: the
+    /// framing is a property of the chat format, several models share it
+    /// (`muse-glimmer`, the gpt-oss family), and a vocabulary without both
+    /// tokens is unaffected.
+    pub fn message_framing(&self) -> Option<(u32, u32)> {
+        let start = *self.token_to_id.get("<|start|>")?;
+        let message = *self.token_to_id.get("<|message|>")?;
+        (self.is_special(start) && self.is_special(message)).then_some((start, message))
+    }
+
+    /// `(<|channel>, <channel|>)` for a vocabulary that wraps the model's
+    /// side channels in them, and `None` for every vocabulary that doesn't.
+    ///
+    /// The third spelling of the question [`Self::message_framing`] and
+    /// [`Self::content_kinds`] answer, and the one gemma-4 uses: an assistant
+    /// turn may contain `<|channel>thought\n…<channel|>` (or `tool_code`, or
+    /// any other channel name) alongside the answer. Both markers are
+    /// USER_DEFINED and so already hidden by [`Self::is_special`] — what this
+    /// exists for is the channel *name*, which is not. It is written for the
+    /// format's benefit and ends at the first newline, and left visible every
+    /// such reply reached the reader beginning `"thought"`.
+    ///
+    /// Matched on the vocabulary's own token names, like its two neighbours
+    /// here: the framing belongs to the chat format, not to an architecture.
+    pub fn channel_framing(&self) -> Option<(u32, u32)> {
+        let open = *self.token_to_id.get("<|channel>")?;
+        let close = *self.token_to_id.get("<channel|>")?;
+        (self.is_special(open) && self.is_special(close)).then_some((open, close))
+    }
+
+    /// `(<think>, </think>)` for a vocabulary that wraps the model's chain
+    /// of thought in them, and `None` for every vocabulary that doesn't.
+    ///
+    /// The fourth spelling of the question [`Self::message_framing`],
+    /// [`Self::channel_framing`] and [`Self::content_kinds`] answer, and by
+    /// far the most common one: Qwen3.x, DeepSeek-R1, QwQ and GLM all mark
+    /// their reasoning this way. Both markers are already hidden by
+    /// [`Self::is_special`] — which is exactly the problem this exists to
+    /// fix. Hidden and otherwise unaccounted for, the chain of thought is
+    /// delivered as ordinary content, glued to the answer by nothing more
+    /// than the newlines around the vanished tag, and a client has no way
+    /// left to tell the two apart.
+    ///
+    /// Matched on the vocabulary's own token names, like its three
+    /// neighbours here: the framing belongs to the chat format, not to an
+    /// architecture.
+    ///
+    /// MiniMax's vocabulary carries both `<think>`/`</think>` and its own
+    /// `<mm:think>`/`</mm:think>`, and its chat template writes — so the
+    /// model emits — only the latter. Its pair is tried first; a vocabulary
+    /// without it falls through to the common spelling.
+    pub fn think_framing(&self) -> Option<(u32, u32)> {
+        [("<mm:think>", "</mm:think>"), ("<think>", "</think>")]
+            .into_iter()
+            .find_map(|(open, close)| {
+                let open = *self.token_to_id.get(open)?;
+                let close = *self.token_to_id.get(close)?;
+                (self.is_special(open) && self.is_special(close)).then_some((open, close))
+            })
+    }
+
+    /// The marker a reasoning body opens with, and the markers every other
+    /// kind of body opens with — for a vocabulary that types each message
+    /// *body* with a control token instead of naming a recipient in text.
+    /// `None` for every vocabulary without the reasoning one, which is
+    /// every model here but `inkling`.
+    ///
+    /// The same question [`Self::message_framing`] answers, asked of a
+    /// format that answers it differently. `inkling` writes
+    /// `<|content_thinking|>`, its chain of thought, `<|end_message|>`,
+    /// then a fresh `<|message_model|><|content_text|>` and the answer — so
+    /// which of an assistant turn's several messages the caller sees is
+    /// decided by a *token*, not by text between two markers. Both markers
+    /// are already hidden by [`Self::is_special`]; what this exists for is
+    /// the body that follows one.
+    ///
+    /// Matched on the vocabulary's own token names, as
+    /// [`Self::NAMED_END_TOKENS`] and [`Self::message_framing`] are: the
+    /// framing is a property of the chat format rather than of an
+    /// architecture.
+    pub fn content_kinds(&self) -> Option<ContentKinds> {
+        let reasoning = *self.token_to_id.get(REASONING_CONTENT_TOKEN)?;
+        if !self.is_special(reasoning) {
+            return None;
+        }
+        Some(ContentKinds {
+            reasoning,
+            other: OTHER_CONTENT_TOKENS
+                .iter()
+                .filter_map(|name| self.token_to_id.get(*name).copied())
+                .filter(|&id| self.is_special(id))
+                .collect(),
+        })
+    }
+
+    pub fn decode(&self, ids: &[u32]) -> String {
+        let mut bytes = Vec::new();
+        for &id in ids {
+            self.append_token_bytes(id, &mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The bytes one token contributes, appended to `out` — what
+    /// [`StreamDecoder`] needs and what [`Self::decode`] is built from.
+    pub fn append_bytes(&self, id: u32, out: &mut Vec<u8>) {
+        self.append_token_bytes(id, out);
+    }
+
+    /// The bytes one token id contributes to decoded output.
+    ///
+    /// Split out of [`decode`](Self::decode) rather than duplicated because
+    /// [`token_bytes`](Self::token_bytes) needs the same answer per token, and
+    /// a second copy of this would be a second opinion on what a token *is* —
+    /// byte-fallback ids, the GPT-2 byte alphabet and `SPM_SPACE` all have to
+    /// be unwound the same way or a constrained decoder would be reasoning
+    /// about text the model is not actually emitting.
+    fn append_token_bytes(&self, id: u32, out: &mut Vec<u8>) {
+        if let Some(&b) = self.byte_fallback.get(&id) {
+            out.push(b);
+            return;
+        }
+        let Some(token) = self.id_to_token.get(id as usize) else {
+            return;
+        };
+        if self.vocab_kind == VocabKind::Gpt2Byte {
+            for ch in token.chars() {
+                if let Some(&b) = self.char_to_byte.get(&ch) {
+                    out.push(b);
+                }
+            }
+        } else {
+            for ch in token.chars() {
+                if ch == SPM_SPACE {
+                    out.push(b' ');
+                } else {
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+            }
+        }
+    }
+
+    /// Every token's emitted bytes, indexed by id — built once, on first use.
+    ///
+    /// Only a constrained decoder asks for this, and it asks on every sampled
+    /// token, so the per-id work has to happen once rather than per step.
+    /// Nothing builds it unless a request actually constrains its output.
+    /// The same table, shared. A constrained request holds one for its whole
+    /// life, so it takes a handle rather than borrowing the tokenizer.
+    pub fn token_bytes_shared(&self) -> std::sync::Arc<Vec<Vec<u8>>> {
+        std::sync::Arc::clone(self.token_bytes.get_or_init(|| {
+            std::sync::Arc::new(
+                (0..self.vocab_size() as u32)
+                    .map(|id| {
+                        let mut out = Vec::new();
+                        self.append_token_bytes(id, &mut out);
+                        out
+                    })
+                    .collect(),
+            )
+        }))
+    }
+
+    /// Cross-token cleanup a `"gemma4"` vocab needs once the *complete*
+    /// generated (or detokenized) text is known — real llama.cpp's own
+    /// `clean_up_tokenization_spaces`-style pass (`llama_vocab::impl::
+    /// detokenize`'s three passes, confirmed by reading that source
+    /// directly): drops the space immediately before `? ! . ,`, collapses
+    /// a lone apostrophe surrounded by spaces, and drops the space before
+    /// `'s`/`'m`/`'re`/`'ve` contractions (deliberately *not* `'t`/`'d`/
+    /// `'ll` — matching upstream's own, slightly inconsistent behavior
+    /// exactly rather than a more "sensible" version). A no-op for
+    /// `VocabKind::Gpt2Byte` (whose pre-tokenizer types this engine
+    /// supports — `"gpt2"`-style Qwen2/Qwen3/Llama3/qwen35moe — don't use
+    /// this pass, their tokens are already correctly spaced) *and* for
+    /// `VocabKind::SpmUnigram` (real upstream sets `clean_spaces = false`
+    /// for `LLAMA_VOCAB_TYPE_SPM`, confirmed directly against `src/
+    /// llama-vocab.cpp` — this pass is `"gemma4"`-specific, not a general
+    /// property of "not byte-encoded").
+    pub fn clean_up_tokenization_spaces(&self, text: &str) -> String {
+        if self.vocab_kind != VocabKind::Gemma4Raw {
+            return text.to_string();
+        }
+        clean_spaces_postprocess(text)
+    }
+
+    pub fn token_text(&self, id: u32) -> Option<&str> {
+        self.id_to_token.get(id as usize).map(String::as_str)
+    }
+
+    /// Merge-rank BPE for one pre-tokenizer `word`, appending token ids to
+    /// `out` (the rewrite of the old `merge_symbols`/`bpe_merge_*`).
+    /// `raw` picks the initial alphabet: raw UTF-8 codepoints (`"gemma4"`) vs.
+    /// the byte-to-unicode alphabet (GPT-2). The algorithm is llama.cpp's
+    /// `llm_tokenizer_bpe` — a doubly-linked list of symbols plus a bigram
+    /// min-heap keyed `(rank, left)`, so each merge is O(1) (relink) and each
+    /// next-merge selection is O(log n): **O(n log n)** per word, versus the old
+    /// O(n²) rescan-plus-`Vec::splice`. Every symbol is its token *id* (interned
+    /// via `merge_map`), so the hot loop clones/hashes/`format!`s no `String`
+    /// at all, and all working state lives in a reused thread-local
+    /// [`BpeScratch`] — after the first large word the loop allocates nothing.
+    fn bpe_merge_word(&self, word: &str, raw: bool, out: &mut Vec<u32>) {
+        BPE_SCRATCH.with(|scratch| {
+            let s = &mut *scratch.borrow_mut();
+            s.reset();
+            let bytes = word.as_bytes();
+            let mut utf8 = [0u8; 4];
+
+            // 1. Initial symbols → nodes, resolving each to its token id (or
+            //    `NO_TOKEN`) with an allocation-free lookup (a `&str` slice of
+            //    `word` for raw, a stack `encode_utf8` buffer for the byte map).
+            if raw {
+                for (start, ch) in word.char_indices() {
+                    let clen = ch.len_utf8();
+                    let id = self
+                        .token_to_id
+                        .get(&word[start..start + clen])
+                        .copied()
+                        .unwrap_or(NO_TOKEN);
+                    s.push_node(id, start as u32, clen as u32);
+                }
+            } else {
+                for (i, &b) in bytes.iter().enumerate() {
+                    let sub = self.byte_to_char[b as usize].encode_utf8(&mut utf8);
+                    let id = self.token_to_id.get(sub).copied().unwrap_or(NO_TOKEN);
+                    s.push_node(id, i as u32, 1);
+                }
+            }
+            let n = s.id.len();
+            if n == 0 {
+                return;
+            }
+            s.next[n - 1] = -1;
+
+            // 2. Seed the heap with every adjacent bigram present in `merge_map`.
+            for l in 0..n - 1 {
+                s.try_push_bigram(&self.merge_map, l, l + 1);
+            }
+
+            // 3. Pop the lowest (rank, left) valid bigram, merge, push the two
+            //    new neighbouring bigrams. Stale entries (a symbol has since
+            //    merged, so the stored `size` no longer matches) are skipped.
+            while let Some(Reverse((_rank, l, r, merged, size))) = s.heap.pop() {
+                let (l, r) = (l as usize, r as usize);
+                if s.units[l] == 0
+                    || s.units[r] == 0
+                    || s.next[l] != r as i32
+                    || s.units[l] + s.units[r] != size
+                {
+                    continue;
+                }
+                s.id[l] = merged;
+                s.units[l] += s.units[r];
+                s.units[r] = 0;
+                s.next[l] = s.next[r];
+                if s.next[r] >= 0 {
+                    s.prev[s.next[r] as usize] = l as i32;
+                }
+                if s.prev[l] >= 0 {
+                    let p = s.prev[l] as usize;
+                    s.try_push_bigram(&self.merge_map, p, l);
+                }
+                if s.next[l] >= 0 {
+                    let nx = s.next[l] as usize;
+                    s.try_push_bigram(&self.merge_map, l, nx);
+                }
+            }
+
+            // 4. Walk the surviving list (node 0 is always the head — the
+            //    leftmost symbol is never the *right* of any merge) and emit.
+            //    A `NO_TOKEN` symbol never merged, so it's a single initial
+            //    symbol: byte-fallback it exactly as the old code did.
+            let mut cur = 0i32;
+            while cur >= 0 {
+                let c = cur as usize;
+                if s.id[c] != NO_TOKEN {
+                    out.push(s.id[c]);
+                } else {
+                    let st = s.span_start[c] as usize;
+                    let ln = s.span_len[c] as usize;
+                    if raw {
+                        for &b in &bytes[st..st + ln] {
+                            if let Some(&id) =
+                                self.token_to_id.get(byte_fallback_token_name(b).as_str())
+                            {
+                                out.push(id);
+                            }
+                        }
+                    } else {
+                        let sub = self.byte_to_char[bytes[st] as usize].encode_utf8(&mut utf8);
+                        if let Some(&id) = self.token_to_id.get(sub) {
+                            out.push(id);
+                        }
+                    }
+                }
+                cur = s.next[c];
+            }
+        });
+    }
+
+    /// `VocabKind::SpmUnigram`'s merge algorithm — real upstream
+    /// `llama.cpp`'s `llm_tokenizer_spm_session` (`src/llama-vocab.cpp`,
+    /// fetched and read directly): the same greedy adjacent-pair-merge
+    /// loop as [`Tokenizer::merge_symbols`], but a pair is mergeable
+    /// whenever its *concatenated string is itself a valid vocab token*
+    /// (this vocab has no `tokenizer.ggml.merges` table at all) rather
+    /// than an explicit merge-rank lookup, and priority is that token's
+    /// own *score* — highest first, ties broken by earliest position
+    /// (matching upstream's `llm_bigram_spm::comparator` exactly: `(l.score
+    /// < r.score) || (l.score == r.score && l.left > r.left)`, a max-heap
+    /// on score with leftmost-wins on ties — the same outcome this method's
+    /// "only replace `best` on strictly greater score" rescan produces,
+    /// since earlier-found ties are never displaced).
+    fn spm_merge_symbols(&self, mut symbols: Vec<String>) -> Vec<String> {
+        if symbols.len() < 2 {
+            return symbols;
+        }
+
+        loop {
+            let mut best: Option<(f32, usize)> = None; // (score, pair index)
+            for i in 0..symbols.len() - 1 {
+                let merged = format!("{}{}", symbols[i], symbols[i + 1]);
+                if let Some(&id) = self.token_to_id.get(&merged) {
+                    let score = self.scores.get(id as usize).copied().unwrap_or(0.0);
+                    if best.is_none_or(|(best_score, _)| score > best_score) {
+                        best = Some((score, i));
+                    }
+                }
+            }
+            let Some((_, i)) = best else { break };
+            let merged = format!("{}{}", symbols[i], symbols[i + 1]);
+            symbols.splice(i..=i + 1, [merged]);
+        }
+        symbols
+    }
+}
+
+enum Segment<'a> {
+    Plain(&'a str),
+    Special(u32),
+}
+
+fn i64_array(gguf: &GgufFile, key: &str) -> Option<Vec<i64>> {
+    gguf.metadata.iter().find_map(|(k, v)| {
+        (k == key).then_some(v).and_then(|v| match v {
+            GgufValue::Array(items) => Some(
+                items
+                    .iter()
+                    .map(|item| match item {
+                        GgufValue::I8(v) => *v as i64,
+                        GgufValue::I16(v) => *v as i64,
+                        GgufValue::I32(v) => *v as i64,
+                        GgufValue::I64(v) => *v,
+                        GgufValue::U8(v) => *v as i64,
+                        GgufValue::U16(v) => *v as i64,
+                        GgufValue::U32(v) => *v as i64,
+                        GgufValue::U64(v) => *v as i64,
+                        _ => 0,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+    })
+}
+
+fn f32_array(gguf: &GgufFile, key: &str) -> Option<Vec<f32>> {
+    gguf.metadata.iter().find_map(|(k, v)| {
+        (k == key).then_some(v).and_then(|v| match v {
+            GgufValue::Array(items) => Some(
+                items
+                    .iter()
+                    .map(|item| match item {
+                        GgufValue::F32(v) => *v,
+                        GgufValue::F64(v) => *v as f32,
+                        _ => 0.0,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+    })
+}
+
+fn string_array(gguf: &GgufFile, key: &str) -> Option<Vec<String>> {
+    gguf.metadata.iter().find_map(|(k, v)| {
+        (k == key).then_some(v).and_then(|v| match v {
+            GgufValue::Array(items) => Some(
+                items
+                    .iter()
+                    .filter_map(|item| match item {
+                        GgufValue::String(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        })
+    })
+}
+
+fn metadata_u32(gguf: &GgufFile, key: &str) -> Option<u32> {
+    gguf.metadata
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| v.as_u64())
+        .map(|v| v as u32)
+}
+
+fn metadata_string(gguf: &GgufFile, key: &str) -> Option<String> {
+    gguf.metadata.iter().find_map(|(k, v)| {
+        (k == key).then_some(v).and_then(|v| match v {
+            GgufValue::String(s) => Some(s.clone()),
+            _ => None,
+        })
+    })
+}
+
+/// Splits a `tokenizer.ggml.merges` entry into its `(left, right)` pieces —
+/// matches real llama.cpp's own `word.find(' ', 1)` exactly (search for the
+/// space starting one *byte* in, not from the very start), rather than the
+/// simpler "first space anywhere" a plain `split_once(' ')` would use.
+/// Observably identical for every merge in practice (a merge's `left` part
+/// is never itself a bare, unescaped space), but this is what upstream
+/// actually does, so it's what this mirrors. Searches raw bytes rather than
+/// slicing `merge[1..]` directly: byte 1 of a merge starting with a multi-
+/// byte character (e.g. a gemma4 merge starting with `▁`, itself 3 bytes)
+/// isn't a char boundary, so a `&str` slice there would panic — but a
+/// space is always a complete one-byte codepoint, so once a `b' '` is
+/// found, splitting immediately before and after it is always safe.
+fn split_merge(merge: &str) -> Option<(&str, &str)> {
+    let bytes = merge.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let pos = bytes[1..].iter().position(|&b| b == b' ')? + 1;
+    Some((&merge[..pos], &merge[pos + 1..]))
+}
+
+/// Parses ggml's `<0xXX>` byte-fallback token spelling (two uppercase hex
+/// digits) back to the raw byte it represents.
+fn parse_byte_fallback_token(token: &str) -> Option<u8> {
+    let hex = token.strip_prefix("<0x")?.strip_suffix('>')?;
+    u8::from_str_radix(hex, 16).ok()
+}
+
+/// Formats a raw byte as ggml's `<0xXX>` byte-fallback token spelling (two
+/// uppercase hex digits) — the encode-side inverse of
+/// [`parse_byte_fallback_token`].
+fn byte_fallback_token_name(byte: u8) -> String {
+    format!("<0x{byte:02X}>")
+}
+
+/// The `"gemma4"`-vocab pre-tokenizer: splits into runs of non-newline
+/// characters and runs of newlines (`"[^\n]+|[\n]+"` in real llama.cpp) —
+/// hand-written rather than added as another `Regex` pattern, since a plain
+/// "does this char equal '\n'" scan needs no regex engine at all.
+fn split_newline_runs(text: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_newline_run: Option<bool> = None;
+    for (i, ch) in text.char_indices() {
+        let is_newline = ch == '\n';
+        match in_newline_run {
+            Some(prev) if prev != is_newline => {
+                out.push(&text[start..i]);
+                start = i;
+                in_newline_run = Some(is_newline);
+            }
+            None => in_newline_run = Some(is_newline),
+            _ => {}
+        }
+    }
+    if start < text.len() {
+        out.push(&text[start..]);
+    }
+    out
+}
+
+/// Real llama.cpp's `clean_up_tokenization_spaces`-style post-processing
+/// (`llama_vocab::impl::detokenize`'s three passes, read directly from
+/// upstream source rather than guessed) — see [`Tokenizer::
+/// clean_up_tokenization_spaces`] for what and why.
+fn clean_spaces_postprocess(text: &str) -> String {
+    // **Prose only, and never a line's indentation.** Upstream runs this
+    // over a whole detokenized string, which is right for the artifact it
+    // repairs (`word .` from a tokenizer that split the punctuation off)
+    // and wrong for everything else in a chat answer. Two exclusions, both
+    // from output this served:
+    //
+    // - *Inside a fenced code block.* The pass rewrites code: `foo (a , b)`
+    //   becomes `foo (a, b)`, and a Python `[1 , 2]` becomes `[1, 2]`. It
+    //   is repairing a tokenizer artifact that code does not have.
+    // - *A line's leading spaces.* "Drop the space before `.`" eats
+    //   indentation whenever the first thing on a line is punctuation.
+    //   gemma 4 E2B ends a doubly-linked-list answer with `  ./dll` inside
+    //   a three-space fence; this pass turned it into ` ./dll`, one space
+    //   short of where it already was, and an under-indented body line
+    //   breaks its code block out of the list item it lives in.
+    //
+    // Applied per line, so the passes below see prose and only prose.
+    let mut out = String::with_capacity(text.len());
+    let mut fence: Option<(char, usize)> = None;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let indent = body.len() - body.trim_start_matches(' ').len();
+        let rest = &body[indent..];
+        let marker = (indent <= 3)
+            .then(|| rest.chars().next().filter(|c| *c == '`' || *c == '~'))
+            .flatten()
+            .map(|c| (c, rest.chars().take_while(|x| *x == c).count()))
+            .filter(|(_, len)| *len >= 3);
+        match (fence, marker) {
+            (Some((open_c, open_len)), Some((c, len)))
+                if c == open_c && len >= open_len && rest[len..].trim().is_empty() =>
+            {
+                fence = None;
+                out.push_str(line);
+            }
+            (None, Some((c, len))) => {
+                fence = Some((c, len));
+                out.push_str(line);
+            }
+            // Inside a block: code, left exactly as the model wrote it.
+            (Some(_), _) => out.push_str(line),
+            // Prose: the indentation is structure, the rest is text.
+            (None, None) => {
+                out.push_str(&line[..indent]);
+                out.push_str(&clean_spaces_in_prose(&line[indent..]));
+            }
+        }
+    }
+    out
+}
+
+/// The three upstream passes, over one line of prose.
+fn clean_spaces_in_prose(text: &str) -> String {
+    let mut chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return text.to_string();
+    }
+
+    // Pass 1: drop the space immediately before ? ! . ,
+    let mut out: Vec<char> = Vec::with_capacity(chars.len());
+    out.push(chars[0]);
+    for &x in &chars[1..] {
+        if out.last() == Some(&' ') && matches!(x, '?' | '!' | '.' | ',') {
+            out.pop();
+        }
+        out.push(x);
+    }
+    chars = out;
+
+    // Pass 2: collapse a lone apostrophe surrounded by spaces (" ' " -> "'").
+    let mut out: Vec<char> = Vec::with_capacity(chars.len());
+    out.push(chars[0]);
+    let mut i = 1;
+    while i < chars.len() {
+        let x = chars[i];
+        if x == '\'' && i + 1 < chars.len() && out.last() == Some(&' ') && chars[i + 1] == ' ' {
+            out.pop(); // drop the preceding space
+            out.push(x);
+            i += 2; // and the following one
+            continue;
+        }
+        out.push(x);
+        i += 1;
+    }
+    chars = out;
+
+    // Pass 3: drop the space before 's/'m/'re/'ve contractions — but *not*
+    // before 't/'d/'ll, matching upstream's own inconsistency exactly.
+    let mut out: Vec<char> = Vec::with_capacity(chars.len());
+    out.push(chars[0]);
+    for i in 1..chars.len() {
+        let x = chars[i];
+        if x == '\'' && out.last() == Some(&' ') {
+            let drop_space = match chars.get(i + 1..) {
+                Some([c, ..]) if *c == 's' || *c == 'm' => true,
+                Some([c1, c2, ..]) if (*c1 == 'r' || *c1 == 'v') && *c2 == 'e' => true,
+                _ => false,
+            };
+            if drop_space {
+                out.pop();
+            }
+        }
+        out.push(x);
+    }
+
+    out.into_iter().collect()
+}
+
+/// The GPT-2 `bytes_to_unicode()` table: every byte value maps to a visible
+/// unicode codepoint, so a BPE vocab (whose tokens are ordinary strings) can
+/// represent arbitrary binary byte sequences. Printable ASCII/Latin-1 bytes
+/// map to themselves; everything else (control characters, space, ...) maps
+/// to a codepoint starting at 256 upward, in byte order.
+pub fn byte_to_unicode_table() -> [char; 256] {
+    let printable: Vec<u32> = (b'!' as u32..=b'~' as u32)
+        .chain(0xA1..=0xAC)
+        .chain(0xAE..=0xFF)
+        .collect();
+    let mut table = [0u32; 256];
+    let mut assigned = [false; 256];
+    for &b in &printable {
+        table[b as usize] = b;
+        assigned[b as usize] = true;
+    }
+    let mut next_extra = 256u32;
+    for (b, slot) in table.iter_mut().enumerate() {
+        if !assigned[b] {
+            *slot = next_extra;
+            next_extra += 1;
+        }
+    }
+    let mut out = ['\u{0}'; 256];
+    for (b, &cp) in table.iter().enumerate() {
+        out[b] = char::from_u32(cp).expect("byte_to_unicode codepoints are all valid");
+    }
+    out
+}
+
+/// Decodes a token stream one token at a time **without splitting
+/// characters**.
+///
+/// [`Tokenizer::decode`] is given every id at once and so never sees a
+/// character cut in half. A streaming caller has no such luxury: it must emit
+/// each token as it is sampled, and on a byte-level BPE vocabulary one
+/// character is routinely several tokens. Decoding each of those alone hands
+/// `String::from_utf8_lossy` two byte fragments and it replaces both — so a
+/// waving-hand emoji reached the reader as two replacement characters, and
+/// every emoji, and most CJK text, arrived the same way.
+///
+/// This holds the trailing bytes of an unfinished character back until the
+/// token that completes it arrives. Only a *prefix* is ever withheld — at most
+/// three bytes, since that is the longest incomplete UTF-8 sequence there is —
+/// so nothing is delayed by more than the character it belongs to.
+///
+/// A byte that cannot begin a valid sequence is not withheld: it is replaced
+/// immediately, exactly as `from_utf8_lossy` would. Waiting for a continuation
+/// that can never come would stall the rest of the stream behind one corrupt
+/// byte.
+#[derive(Clone, Default)]
+pub struct StreamDecoder {
+    /// The tail of an incomplete UTF-8 sequence, waiting for the token that
+    /// finishes it. Empty between characters, which is almost always.
+    pending: Vec<u8>,
+}
+
+impl StreamDecoder {
+    /// The text `id` completes, which may be empty (a token that is only the
+    /// first half of a character) or longer than that token alone (the token
+    /// that finishes one held over from before).
+    pub fn push(&mut self, tokenizer: &Tokenizer, id: u32) -> String {
+        tokenizer.append_bytes(id, &mut self.pending);
+        self.take_complete()
+    }
+
+    /// Everything still held, at the end of a stream.
+    ///
+    /// Generation can stop mid-character — a token limit, a stop token, a
+    /// client hanging up — and the bytes held for a continuation that will
+    /// never arrive are still bytes the model produced. Rendered lossily here
+    /// rather than dropped: a replacement character says something was cut
+    /// off, and silence does not.
+    pub fn flush(&mut self) -> String {
+        let out = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        out
+    }
+
+    /// Splits `pending` into the text that is complete and the incomplete tail
+    /// to keep.
+    fn take_complete(&mut self) -> String {
+        match std::str::from_utf8(&self.pending) {
+            // The common case: everything held is a whole character or more.
+            Ok(text) => {
+                let out = text.to_string();
+                self.pending.clear();
+                out
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                match error.error_len() {
+                    // A truncated sequence: emit what is whole and keep the
+                    // rest for the next token.
+                    None => {
+                        let out = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
+                        self.pending.drain(..valid);
+                        out
+                    }
+                    // Genuinely invalid, not merely unfinished. Replace it now
+                    // and carry on, or the stream stalls behind it forever.
+                    Some(bad) => {
+                        let out =
+                            String::from_utf8_lossy(&self.pending[..valid + bad]).into_owned();
+                        self.pending.drain(..valid + bad);
+                        // What follows the bad bytes may itself be a whole
+                        // character, or another bad one.
+                        out + &self.take_complete()
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_gguf(tokens: &[&str], merges: &[&str], bos: u32, eos: u32) -> GgufFile {
+        GgufFile {
+            version: 3,
+            metadata: vec![
+                (
+                    "tokenizer.ggml.tokens".to_string(),
+                    GgufValue::Array(
+                        tokens
+                            .iter()
+                            .map(|t| GgufValue::String(t.to_string()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tokenizer.ggml.merges".to_string(),
+                    GgufValue::Array(
+                        merges
+                            .iter()
+                            .map(|m| GgufValue::String(m.to_string()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tokenizer.ggml.bos_token_id".to_string(),
+                    GgufValue::U32(bos),
+                ),
+                (
+                    "tokenizer.ggml.eos_token_id".to_string(),
+                    GgufValue::U32(eos),
+                ),
+            ],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        }
+    }
+
+    /// A byte-level vocab with every single byte's mapped char as its own
+    /// token, plus one merge combining 'h'+'i' into "hi" — the minimal
+    /// vocab needed to exercise both the fallback (unmerged) path and an
+    /// actual BPE merge.
+    fn minimal_byte_vocab() -> GgufFile {
+        let byte_to_char = byte_to_unicode_table();
+        let mut tokens: Vec<String> = (0..256u32)
+            .map(|b| byte_to_char[b as usize].to_string())
+            .collect();
+        tokens.push("hi".to_string());
+        let owned_tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        build_gguf(&owned_tokens, &["h i"], 1, 2)
+    }
+
+    /// GLM vocabs share llama3's split pattern but not its
+    /// `ignore_merges`, and drop the BOS token entirely.
+    #[test]
+    fn the_glm_pre_tokenizer_shares_llama3s_pattern_without_ignore_merges() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("glm4");
+        assert_eq!(pattern, super::SPLIT_PATTERN_LLAMA3);
+        assert!(!ignore_merges);
+
+        let (llama3_pattern, llama3_ignore) = super::split_pattern_for_pre("llama3");
+        assert_eq!(llama3_pattern, pattern);
+        assert!(llama3_ignore);
+
+        // Anything unknown still falls back to the generic pattern.
+        assert_eq!(super::split_pattern_for_pre("gpt2").0, super::SPLIT_PATTERN);
+    }
+
+    /// `llama4` is named like the llama3 family and belongs to the GPT-4o
+    /// one — upstream's own table, and the routing `muse-glimmer`'s vocab
+    /// (`unsloth/Muse-Glimmer-30B-GGUF`) depends on. The two patterns
+    /// disagree about case boundaries inside a word and about
+    /// `ignore_merges`, so reading the *name* rather than the table
+    /// mis-tokenizes every prompt while still producing fluent-looking
+    /// output.
+    #[test]
+    fn llama4_uses_the_gpt4o_pre_tokenizer_and_not_llama3s() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("llama4");
+        assert_eq!(pattern, super::SPLIT_PATTERN_GPT4O);
+        assert!(!ignore_merges);
+        assert_ne!(pattern, super::split_pattern_for_pre("llama3").0);
+        assert_eq!(pattern, super::split_pattern_for_pre("gpt-4o").0);
+    }
+
+    /// `inkling`'s vocabulary is the o200k one, so its `pre` value has to
+    /// land on the GPT-4o arm rather than on the generic GPT-2 fallback an
+    /// unrecognized name gets. The two disagree about case boundaries
+    /// inside a word and about digit runs, and the fallback would produce
+    /// fluent-looking output from a mis-tokenized prompt rather than an
+    /// error.
+    #[test]
+    fn inkling_uses_the_gpt4o_pre_tokenizer_and_not_the_generic_fallback() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("inkling");
+        assert_eq!(pattern, super::SPLIT_PATTERN_GPT4O);
+        assert!(!ignore_merges);
+        assert_ne!(pattern, super::SPLIT_PATTERN);
+    }
+
+    /// The Ling/Bailing vocabs (`bailingmoe`, `bailingmoe2`,
+    /// `llada-moe` — Ling 3.0 declares the middle one) split **one digit
+    /// at a time**, where both the generic GPT-2 fallback and the llama3
+    /// arm keep digits together. `Ling-3.0-tiny`'s own chat template
+    /// injects nothing numeric, but a prompt that mentions a year or a
+    /// version would be mis-tokenized in a way that still reads fluently,
+    /// which is exactly the failure this arm exists to prevent.
+    /// `tekken-num3` groups digits from the *right*: `12345` is `12`,`345`,
+    /// not the left-aligned `123`,`45` that `\p{N}{1,3}` gives. Everything
+    /// else splits as plain `tekken` does.
+    #[test]
+    fn the_tekken_num3_pre_tokenizer_groups_digits_from_the_right() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("tekken-num3");
+        assert_eq!(pattern, super::SPLIT_PATTERN_TEKKEN_NUM3);
+        assert!(ignore_merges);
+        assert!(super::RIGHT_ALIGNED_DIGIT_PRE_TYPES.contains(&"tekken-num3"));
+        assert!(!super::RIGHT_ALIGNED_DIGIT_PRE_TYPES.contains(&"tekken"));
+
+        use super::right_aligned_digit_groups as groups;
+        assert_eq!(groups("1"), ["1"]);
+        assert_eq!(groups("12"), ["12"]);
+        assert_eq!(groups("123"), ["123"]);
+        assert_eq!(groups("1234"), ["1", "234"]);
+        assert_eq!(groups("12345"), ["12", "345"]);
+        assert_eq!(groups("1234567"), ["1", "234", "567"]);
+
+        let re = regex::Regex::new(pattern).expect("the pattern compiles");
+        let split: Vec<&str> = re.find_iter("Paris 12345 x").map(|m| m.as_str()).collect();
+        assert_eq!(split, ["Paris", " ", "12345", " x"]);
+    }
+
+    #[test]
+    fn the_bailing_pre_tokenizer_splits_digits_one_at_a_time() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("bailingmoe2");
+        assert_eq!(pattern, super::SPLIT_PATTERN_BAILINGMOE);
+        assert!(!ignore_merges);
+        assert_ne!(pattern, super::SPLIT_PATTERN);
+        assert_eq!(super::split_pattern_for_pre("bailingmoe").0, pattern);
+        assert_eq!(super::split_pattern_for_pre("llada-moe").0, pattern);
+
+        let re = regex::Regex::new(pattern).expect("the pattern compiles");
+        let digits: Vec<&str> = re.find_iter("2026").map(|m| m.as_str()).collect();
+        assert_eq!(digits, vec!["2", "0", "2", "6"]);
+
+        // The generic fallback would take the whole run as one chunk.
+        let generic = regex::Regex::new(super::SPLIT_PATTERN).unwrap();
+        let generic_digits: Vec<&str> = generic.find_iter("2026").map(|m| m.as_str()).collect();
+        assert_eq!(generic_digits, vec!["2026"]);
+    }
+
+    /// A vocabulary with `specials` control tokens, for what they cost to find.
+    fn with_specials(specials: &[String]) -> Tokenizer {
+        let mut tokens: Vec<String> = super::byte_to_unicode_table()
+            .iter()
+            .map(char::to_string)
+            .collect();
+        tokens.extend_from_slice(specials);
+        let types = (0..tokens.len())
+            .map(|i| GgufValue::I32(if i < 256 { 1 } else { 3 }))
+            .collect();
+        let strings = |items: &[String]| {
+            GgufValue::Array(items.iter().map(|t| GgufValue::String(t.clone())).collect())
+        };
+        Tokenizer::from_gguf(&GgufFile {
+            version: 3,
+            metadata: vec![
+                ("tokenizer.ggml.tokens".to_string(), strings(&tokens)),
+                ("tokenizer.ggml.merges".to_string(), strings(&[])),
+                (
+                    "tokenizer.ggml.token_type".to_string(),
+                    GgufValue::Array(types),
+                ),
+            ],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        })
+        .unwrap()
+    }
+
+    /// The longest special token at the earliest place wins, with text between
+    /// them kept, and a token with no text never matches.
+    #[test]
+    fn special_tokens_are_found_earliest_and_longest_first() {
+        let tokenizer = with_specials(&["<a>".to_string(), "<a>b".to_string(), String::new()]);
+        let [a, ab] = [256u32, 257];
+        assert_eq!(tokenizer.encode("<a>", false), [a]);
+        assert_eq!(tokenizer.encode("<a>b", false), [ab]);
+        assert_eq!(tokenizer.encode("<a><a>b<a>", false), [a, ab, a]);
+        assert_eq!(tokenizer.encode("x<a>y", false).len(), 3);
+        assert!(tokenizer.encode("", false).is_empty());
+    }
+
+    /// Reusing a head's tokens gives exactly a full encode wherever it is
+    /// allowed, at every cut of a chat-shaped text, and is refused at a cut
+    /// the encoder would merge across.
+    #[test]
+    fn encoding_after_a_head_equals_encoding_the_whole() {
+        let tokenizer =
+            with_specials(&["<s>".to_string(), "<s>x".to_string(), "<|end|>".to_string()]);
+        let text = "<s>user hi<|end|>\n<s>assistant ok<|end|><s>xtail<|end|>";
+        let whole = tokenizer.encode(text, false);
+        let mut reused = 0;
+        for cut in (0..=text.len()).filter(|&c| text.is_char_boundary(c)) {
+            let head = &text[..cut];
+            let head_tokens = tokenizer.encode(head, false);
+            if let Some(tokens) = tokenizer.encode_after(head, &head_tokens, text) {
+                assert_eq!(tokens, whole, "cut at {cut}: {head:?}");
+                reused += 1;
+            }
+        }
+        // Each edge of every special token, the start, and nothing inside
+        // `<s>x` (its `<s>` prefix ends mid-match).
+        assert!(reused >= 9, "{reused}");
+        let at = text.find("ok").unwrap();
+        assert!(tokenizer.encode_after(&text[..at], &[], text).is_none());
+        let inside = text.find("<s>xtail").unwrap() + 3;
+        assert!(tokenizer.encode_after(&text[..inside], &[], text).is_none());
+        assert!(tokenizer.encode_after("nope", &[], text).is_none());
+    }
+
+    /// A conversation growing turn by turn, and a second one beside it,
+    /// encode exactly as a full encode would, and each turn's head is
+    /// remembered for the next.
+    #[test]
+    fn a_growing_conversation_encodes_as_a_whole_prompt_does() {
+        let tokenizer = with_specials(&["<s>".to_string(), "<|end|>".to_string()]);
+        let mut a = String::from("<s>system be brief<|end|>");
+        let mut b = String::from("<s>system other<|end|>");
+        for turn in 0..6 {
+            for convo in [&mut a, &mut b] {
+                convo.push_str(&format!("<s>user q{turn}<|end|>"));
+                let prompt = format!("{convo}<s>assistant ");
+                assert_eq!(
+                    tokenizer.encode_prompt(&prompt),
+                    tokenizer.encode(&prompt, false)
+                );
+                convo.push_str(&format!("<s>assistant reply {turn}<|end|>"));
+            }
+        }
+        let heads = tokenizer.heads.lock().unwrap();
+        // One head per conversation: each turn's replaced the one before.
+        assert_eq!(
+            heads.len(),
+            2,
+            "{:?}",
+            heads.iter().map(|h| &h.0).collect::<Vec<_>>()
+        );
+        for (head, tokens) in heads.iter() {
+            assert!(head.ends_with("<s>"));
+            assert_eq!(&tokenizer.encode(head, false)[..], &tokens[..]);
+        }
+    }
+
+    /// [`a_growing_conversation_encodes_as_a_whole_prompt_does`] on real
+    /// vocabularies, whose plain-text encoders (byte BPE, raw BPE, SPM with
+    /// its space prefix) are where a reused head could differ. Run with
+    /// `ORANGU_TEST_MODELS=a.gguf:b.gguf cargo test … -- --ignored`.
+    #[test]
+    #[ignore]
+    fn prompt_heads_match_a_full_encode_on_real_vocabularies() {
+        let paths = std::env::var("ORANGU_TEST_MODELS").unwrap_or_default();
+        for path in paths.split(':').filter(|p| !p.is_empty()) {
+            let gguf = GgufFile::open(std::path::Path::new(path)).expect("open the model");
+            let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+            let marks: Vec<String> = tok
+                .special_tokens
+                .iter()
+                .rev()
+                .filter(|(t, _)| !t.is_empty())
+                .take(3)
+                .map(|(t, _)| t.clone())
+                .collect();
+            let [open, close, role] = [&marks[0], &marks[1], &marks[2]];
+            let mut convo =
+                format!("{open}system\nYou are brief.  Answer in Ünïcode, 12345.{close}\n");
+            for turn in 0..8 {
+                convo.push_str(&format!(
+                    "{open}user\n  turn {turn}: what is {}?\n\n{close}\n",
+                    turn * 37
+                ));
+                for prompt in [
+                    format!("{convo}{open}assistant\n"),
+                    format!("{convo}{role} assistant"),
+                    convo.clone(),
+                ] {
+                    assert_eq!(
+                        tok.encode_prompt(&prompt),
+                        tok.encode(&prompt, false),
+                        "{path}: {prompt:?}"
+                    );
+                }
+                convo.push_str(&format!("{open}assistant\n It is {}.{close}\n", turn * 37));
+            }
+            eprintln!("{path}: ok ({} heads)", tok.heads.lock().unwrap().len());
+        }
+    }
+
+    /// A request full of special tokens is a client's to send, and the
+    /// vocabulary can hold thousands: finding them has to stay linear.
+    #[test]
+    fn a_request_full_of_special_tokens_takes_no_longer_than_reading_it() {
+        let specials: Vec<String> = (0..5000).map(|i| format!("<|unused{i}|>")).collect();
+        let tokenizer = with_specials(&specials);
+        let text = specials[17].repeat((1 << 20) / specials[17].len());
+        let started = std::time::Instant::now();
+        let ids = tokenizer.encode(&text, false);
+        assert_eq!(ids.len(), (1 << 20) / specials[17].len());
+        assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
+    }
+
+    fn words_for_pre(pre: &str, text: &str) -> Vec<String> {
+        let (pattern, _) = super::split_pattern_for_pre(pre);
+        let splitter = super::WordSplitter::new(super::split_stages_for_pre(pre), pattern)
+            .expect("the patterns compile");
+        let words: Vec<String> = splitter.split(text).iter().map(|w| w.to_string()).collect();
+        assert_eq!(words.concat(), text, "{pre} lost text");
+        words
+    }
+
+    /// The DeepSeek-V3 split: digit runs of three, CJK runs on their own even
+    /// inside a Latin word, an ASCII punctuation mark glued to the letters
+    /// after it, and spaces kept in front of a word.
+    #[test]
+    fn the_deepseek3_pre_tokenizer_splits_digits_cjk_and_words() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("joyai-llm");
+        assert_eq!(pattern, super::SPLIT_PATTERN_DEEPSEEK3);
+        assert!(!ignore_merges);
+        assert_eq!(super::split_pattern_for_pre("deepseek-v3").0, pattern);
+
+        let split = |text| words_for_pre("joyai-llm", text);
+        assert_eq!(split("12345"), ["123", "45"]);
+        assert_eq!(split("abc中文def"), ["abc", "中文", "def"]);
+        assert_eq!(
+            split("The capital of France is"),
+            ["The", " capital", " of", " France", " is"]
+        );
+        assert_eq!(split("x.y = 1;\n"), ["x", ".y", " =", " ", "1", ";\n"]);
+    }
+
+    /// The last whitespace character before a word goes with the word, which
+    /// is the shape of every indented line of code. A pattern with a line-break
+    /// alternative keeps a break whole; the generic one hands back that too.
+    #[test]
+    fn the_whitespace_before_a_word_stays_with_the_word() {
+        for pre in ["qwen2", "qwen35", "llama-bpe", "gpt-4o", "tekken"] {
+            assert_eq!(words_for_pre(pre, "\n    x"), ["\n", "   ", " x"], "{pre}");
+        }
+        assert_eq!(words_for_pre("gpt-2", "\n    x"), ["\n   ", " x"]);
+        assert_eq!(words_for_pre("gpt-2", "\n\nx"), ["\n", "\n", "x"]);
+        assert_eq!(words_for_pre("qwen2", "\n\nx"), ["\n\n", "x"]);
+        assert_eq!(words_for_pre("qwen2", "a  b"), ["a", " ", " b"]);
+        // One whitespace character has nothing to give back, and a run with
+        // nothing after it stays whole.
+        assert_eq!(words_for_pre("qwen2", "\tx"), ["\tx"]);
+        assert_eq!(words_for_pre("gpt-2", "\tx"), ["\t", "x"]);
+        assert_eq!(words_for_pre("qwen2", "x   "), ["x", "   "]);
+        assert_eq!(words_for_pre("qwen2", "   "), ["   "]);
+        // Whitespace in front of a symbol, as in ` \n = Robert`.
+        assert_eq!(
+            words_for_pre("qwen2", " \n = Robert"),
+            [" \n", " =", " Robert"]
+        );
+    }
+
+    /// Every Qwen pre-tokenizer takes digits one at a time, which the generic
+    /// pattern does not, and a line break stays on the punctuation before it.
+    #[test]
+    fn the_qwen_pre_tokenizers_are_their_own() {
+        for pre in ["qwen2", "qwen35"] {
+            assert_eq!(words_for_pre(pre, "x 2024"), ["x", " ", "2", "0", "2", "4"]);
+            assert_eq!(words_for_pre(pre, "f();\n"), ["f", "();\n"]);
+            assert_eq!(words_for_pre(pre, "don't"), ["don", "'t"]);
+        }
+        assert_eq!(words_for_pre("gpt-2", "x 2024"), ["x", " 2024"]);
+        // The two differ on a combining mark.
+        assert_eq!(words_for_pre("qwen35", "e\u{301}a"), ["e\u{301}a"]);
+        assert_eq!(words_for_pre("qwen2", "e\u{301}a"), ["e", "\u{301}a"]);
+        for pre in ["deepseek-r1-qwen", "megrez"] {
+            assert_eq!(
+                super::split_pattern_for_pre(pre).0,
+                super::SPLIT_PATTERN_QWEN2,
+                "{pre}"
+            );
+        }
+    }
+
+    /// A stage's pieces bound the next stage: its digits come apart first, so
+    /// the generic pattern never sees a space beside one.
+    #[test]
+    fn a_stage_splits_what_the_one_before_left() {
+        assert_eq!(
+            words_for_pre("smollm", "ab 123"),
+            ["ab", " ", "1", "2", "3"]
+        );
+        // The whitespace run ends its piece, so it stays whole.
+        assert_eq!(words_for_pre("smollm", "a  1"), ["a", "  ", "1"]);
+        assert_eq!(words_for_pre("smollm", "a  b"), ["a", " ", " b"]);
+    }
+
+    #[test]
+    fn encode_falls_back_to_individual_bytes_without_merges() {
+        let gguf = build_gguf(&["a", "b", "c"], &[], 0, 1);
+        // No merges and no BOS configured beyond what's requested — just
+        // confirms construction succeeds and vocab_size is right.
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(tok.vocab_size(), 3);
+    }
+
+    #[test]
+    fn a_gemma_tool_call_ends_where_its_result_would_begin() {
+        let gguf = build_gguf(&["a", "<eos>", "<turn|>", "<|tool_response>"], &[], 0, 2);
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let stops = tok.stop_token_ids();
+        assert!(stops.contains(&2) && stops.contains(&1) && stops.contains(&3));
+        let plain = Tokenizer::from_gguf(&build_gguf(&["a", "b"], &[], 0, 1)).unwrap();
+        assert_eq!(plain.stop_token_ids(), vec![1]);
+    }
+
+    #[test]
+    fn encode_applies_a_merge_rule() {
+        let gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let ids = tok.encode("hi", false);
+        let hi_id = tok.token_to_id["hi"];
+        assert_eq!(ids, vec![hi_id]);
+    }
+
+    #[test]
+    fn encode_recognizes_adjacent_literal_special_tokens_over_bpe() {
+        let byte_to_char = byte_to_unicode_table();
+        let mut tokens: Vec<String> = (0..256u32)
+            .map(|b| byte_to_char[b as usize].to_string())
+            .collect();
+        let start_idx = tokens.len();
+        tokens.push("<|a|>".to_string());
+        let end_idx = tokens.len();
+        tokens.push("<|b|>".to_string());
+        let owned_tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let mut gguf = build_gguf(&owned_tokens, &[], 0, 0);
+        let mut types = vec![1i32; owned_tokens.len()]; // NORMAL
+        types[start_idx] = 3; // CONTROL
+        types[end_idx] = 3; // CONTROL
+        gguf.metadata.push((
+            "tokenizer.ggml.token_type".to_string(),
+            GgufValue::Array(types.into_iter().map(GgufValue::I32).collect()),
+        ));
+
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        // Two special tokens directly adjacent, no plain text between them
+        // — the case that broke a naive longest-token-first scan.
+        let ids = tok.encode("<|a|><|b|>", false);
+        assert_eq!(ids, vec![start_idx as u32, end_idx as u32]);
+    }
+
+    /// A `USER_DEFINED` marker must be encoded as **one** token, not run
+    /// through BPE into ordinary pieces.
+    ///
+    /// This is the bug it guards, and it is not cosmetic: `is_special`
+    /// suppresses `USER_DEFINED` ids, but the encoder used to split only on
+    /// `CONTROL`, so a vocabulary typing `</think>` as `USER_DEFINED` never
+    /// produced that id at all. The model wrote the pieces back, the id-keyed
+    /// filter had nothing to match, and a literal `</think>` landed in the
+    /// middle of the answer. The two sets have to name the same tokens or
+    /// neither does its job.
+    #[test]
+    fn a_user_defined_marker_encodes_as_one_token_and_is_suppressed() {
+        let byte_to_char = byte_to_unicode_table();
+        let mut tokens: Vec<String> = (0..256u32)
+            .map(|b| byte_to_char[b as usize].to_string())
+            .collect();
+        // The pieces BPE would otherwise fall back to, so the test fails by
+        // producing them rather than by failing to encode at all.
+        for piece in ["</", "think", ">"] {
+            tokens.push(piece.to_string());
+        }
+        let marker_idx = tokens.len();
+        tokens.push("</think>".to_string());
+        let owned_tokens: Vec<&str> = tokens.iter().map(String::as_str).collect();
+        let mut gguf = build_gguf(&owned_tokens, &[], 0, 0);
+        let mut types = vec![1i32; owned_tokens.len()]; // NORMAL
+        types[marker_idx] = 4; // USER_DEFINED
+        gguf.metadata.push((
+            "tokenizer.ggml.token_type".to_string(),
+            GgufValue::Array(types.into_iter().map(GgufValue::I32).collect()),
+        ));
+
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(tok.encode("</think>", false), vec![marker_idx as u32]);
+        assert!(tok.is_special(marker_idx as u32));
+    }
+
+    /// A character split across tokens must survive being streamed one token
+    /// at a time.
+    ///
+    /// The whole-string form always worked — `decode` sees every byte at once
+    /// — so this deliberately drives the **streaming** shape, token by token,
+    /// which is the only one the bug ever appeared in: an emoji reached the
+    /// reader as two replacement characters because each half was
+    /// lossy-converted on its own.
+    #[test]
+    fn a_character_split_across_tokens_survives_streaming() {
+        let gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        // A byte-level vocabulary of single bytes, so a 4-byte emoji is
+        // necessarily four tokens — exactly the case that broke.
+        let text = "a\u{1f44b}b";
+        let ids = tok.encode(text, false);
+        assert!(ids.len() >= 4, "expected the emoji to span tokens: {ids:?}");
+        assert_eq!(streamed(&tok, &ids), text);
+        // Streaming and whole-string decoding must agree, or a caller could
+        // tell which one produced the text.
+        assert_eq!(streamed(&tok, &ids), tok.decode(&ids));
+    }
+
+    /// Bytes held for a continuation that never arrives are still reported,
+    /// rather than vanishing when the stream ends mid-character.
+    #[test]
+    fn a_stream_cut_mid_character_flushes_what_it_held() {
+        let gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let ids = tok.encode("\u{1f44b}", false);
+        let mut decoder = StreamDecoder::default();
+        // Every token but the last: the character can never complete.
+        let held: String = ids[..ids.len() - 1]
+            .iter()
+            .map(|&id| decoder.push(&tok, id))
+            .collect();
+        assert_eq!(
+            held, "",
+            "an unfinished character must not be emitted early"
+        );
+        assert!(
+            !decoder.flush().is_empty(),
+            "the withheld bytes must be reported at the end, not dropped"
+        );
+    }
+
+    /// `ids` decoded the way the generate loop decodes them: one token at a
+    /// time, then flushed.
+    fn streamed(tok: &Tokenizer, ids: &[u32]) -> String {
+        let mut decoder = StreamDecoder::default();
+        let mut out: String = ids.iter().map(|&id| decoder.push(tok, id)).collect();
+        out.push_str(&decoder.flush());
+        out
+    }
+
+    /// `wants_bos` is what a completion passes to `encode`, so it has to
+    /// be the file's answer and not a constant. Both directions: a file
+    /// that says `false` gets no BOS, and a file that says nothing keeps
+    /// the default that every other model in the set relies on.
+    ///
+    /// The bug this guards: every chat and completion call site hardcoded
+    /// `true`, which put a BOS in front of a `bailingmoe3` prompt — 907
+    /// tokens where the reference made 906 of the same text — and showed
+    /// up only as a continuation that quietly disagreed with it.
+    #[test]
+    fn a_completion_takes_bos_from_the_file_not_from_a_constant() {
+        let mut gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert!(
+            tok.wants_bos(),
+            "absent metadata keeps the default every other model relies on"
+        );
+        assert_eq!(tok.encode("hi", tok.wants_bos())[0], tok.bos_token.unwrap());
+
+        gguf.metadata.push((
+            "tokenizer.ggml.add_bos_token".to_string(),
+            GgufValue::Bool(false),
+        ));
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert!(!tok.wants_bos(), "the file said not to");
+        assert_ne!(
+            tok.encode("hi", tok.wants_bos()).first().copied(),
+            tok.bos_token,
+            "a completion must not prefix BOS for this file"
+        );
+    }
+
+    #[test]
+    fn encode_prefixes_bos_when_requested() {
+        let gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let ids = tok.encode("hi", true);
+        assert_eq!(ids[0], tok.bos_token.unwrap());
+    }
+
+    /// The bug this test is named for: `Tokenizer::encode_for_embedding`
+    /// must honor this tokenizer's own `add_bos_token` metadata rather
+    /// than hardcoding BOS on — real `qwen3vl`-embedding models set
+    /// `tokenizer.ggml.add_bos_token = false` (confirmed directly against
+    /// a real GGUF), and prepending a spurious BOS anyway produced a
+    /// genuinely wrong embedding (cosine ~0.47 against real llama.cpp,
+    /// not just float noise) before this was caught and fixed.
+    #[test]
+    fn encode_for_embedding_omits_bos_when_add_bos_token_is_false() {
+        let mut gguf = minimal_byte_vocab();
+        gguf.metadata.push((
+            "tokenizer.ggml.add_bos_token".to_string(),
+            GgufValue::Bool(false),
+        ));
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let ids = tok.encode_for_embedding("hi");
+        assert_ne!(ids[0], tok.bos_token.unwrap());
+    }
+
+    /// The complementary case: `add_bos_token` absent (or explicitly
+    /// `true`) still prepends BOS, matching every other model this engine
+    /// has been tested against.
+    #[test]
+    fn encode_for_embedding_includes_bos_by_default() {
+        let gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let ids = tok.encode_for_embedding("hi");
+        assert_eq!(ids[0], tok.bos_token.unwrap());
+    }
+
+    #[test]
+    fn decode_reverses_encode_for_ascii_text() {
+        let gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let text = "hi there";
+        let ids = tok.encode(text, false);
+        assert_eq!(tok.decode(&ids), text);
+    }
+
+    #[test]
+    fn missing_tokens_key_is_an_error() {
+        let gguf = GgufFile {
+            version: 3,
+            metadata: vec![],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        };
+        assert!(Tokenizer::from_gguf(&gguf).is_err());
+    }
+
+    /// Like `build_gguf`, plus `tokenizer.ggml.model = "gemma4"` — the
+    /// non-byte-encoded, space-escaped BPE vocab shape.
+    fn build_gemma4_gguf(tokens: &[&str], merges: &[&str]) -> GgufFile {
+        let mut gguf = build_gguf(tokens, merges, 0, 1);
+        gguf.metadata.push((
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String("gemma4".to_string()),
+        ));
+        gguf
+    }
+
+    /// Regression test for a real bug caught by testing against a real
+    /// downloaded gemma-4-E2B-it model, not just synthetic vocabs: sending
+    /// any message through the web UI against a gemma4 model crashed the
+    /// whole server on startup with "start byte index 1 is not a char
+    /// boundary" — merges starting with `▁` (a 3-byte character) made
+    /// `split_merge`'s original `merge[1..]` implementation panic.
+    #[test]
+    fn split_merge_does_not_panic_on_a_multibyte_first_character() {
+        assert_eq!(split_merge("\u{2581} b"), Some(("\u{2581}", "b")));
+    }
+
+    /// The core bug this vocab shape's support fixes: without it, `▁`
+    /// (SentencePiece's word-boundary marker, `tokenizer.ggml.model =
+    /// "gemma4"`'s real spelling for a leading space) isn't in the byte-
+    /// to-unicode alphabet a `"gpt2"`-shaped reverse mapping expects, so it
+    /// gets silently dropped — producing exactly the "no spaces between
+    /// words" a real gemma-4-E2B-it model's web UI responses showed before
+    /// this was fixed.
+    #[test]
+    fn gemma4_escapes_spaces_and_merges_raw_codepoints() {
+        let gguf = build_gemma4_gguf(&["a", "b", "\u{2581}", "\u{2581}b"], &["\u{2581} b"]);
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(tok.vocab_kind, VocabKind::Gemma4Raw);
+
+        let ids = tok.encode("a b", false);
+        assert_eq!(
+            ids,
+            vec![tok.token_to_id["a"], tok.token_to_id["\u{2581}b"]]
+        );
+        assert_eq!(tok.decode(&ids), "a b");
+    }
+
+    #[test]
+    fn gemma4_byte_fallback_roundtrips_an_unmapped_byte() {
+        let mut gguf = build_gemma4_gguf(&["a", "<0x00>"], &[]);
+        gguf.metadata.push((
+            "tokenizer.ggml.token_type".to_string(),
+            GgufValue::Array(vec![GgufValue::I32(1), GgufValue::I32(6)]), // NORMAL, BYTE
+        ));
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+
+        // A NUL byte has no single-codepoint vocab entry other than the
+        // byte-fallback token, so it must round-trip through it.
+        let text = "a\u{0}";
+        let ids = tok.encode(text, false);
+        assert_eq!(ids, vec![tok.token_to_id["a"], tok.token_to_id["<0x00>"]]);
+        assert_eq!(tok.decode(&ids), text);
+    }
+
+    /// Like `build_gemma4_gguf`, but `tokenizer.ggml.model = "llama"`
+    /// (`VocabKind::SpmUnigram`) with `scores` instead of `merges` — no
+    /// `tokenizer.ggml.merges` key at all, matching a real GGUF like
+    /// `ggml-org/embeddinggemma-300M-GGUF`'s (confirmed directly: it has
+    /// none). `add_space_prefix` defaults to upstream's own SPM default
+    /// (`true`) unless explicitly overridden.
+    fn build_spm_gguf(tokens: &[&str], scores: &[f32], add_space_prefix: Option<bool>) -> GgufFile {
+        let mut gguf = GgufFile {
+            version: 3,
+            metadata: vec![
+                (
+                    "tokenizer.ggml.tokens".to_string(),
+                    GgufValue::Array(
+                        tokens
+                            .iter()
+                            .map(|t| GgufValue::String(t.to_string()))
+                            .collect(),
+                    ),
+                ),
+                (
+                    "tokenizer.ggml.scores".to_string(),
+                    GgufValue::Array(scores.iter().map(|&s| GgufValue::F32(s)).collect()),
+                ),
+                ("tokenizer.ggml.bos_token_id".to_string(), GgufValue::U32(0)),
+                ("tokenizer.ggml.eos_token_id".to_string(), GgufValue::U32(1)),
+                (
+                    "tokenizer.ggml.model".to_string(),
+                    GgufValue::String("llama".to_string()),
+                ),
+            ],
+            tensors: vec![],
+            alignment: 32,
+            data_offset: 0,
+        };
+        if let Some(add_space_prefix) = add_space_prefix {
+            gguf.metadata.push((
+                "tokenizer.ggml.add_space_prefix".to_string(),
+                GgufValue::Bool(add_space_prefix),
+            ));
+        }
+        gguf
+    }
+
+    /// `tokenizer.ggml.model = "llama"` with no `merges` key at all
+    /// dispatches to `VocabKind::SpmUnigram`, not `Gpt2Byte` — the exact
+    /// bug found (and fixed) against a real `embeddinggemma-300M` GGUF:
+    /// without this, the vocab fell back to byte-encoded BPE with almost
+    /// every merge missing, producing near-byte-level tokenization (43
+    /// tokens instead of 11 for a 9-word sentence).
+    #[test]
+    fn tokenizer_model_llama_dispatches_to_spm_unigram() {
+        let gguf = build_spm_gguf(&["a", "b", "\u{2581}", "\u{2581}b"], &[0.0; 4], Some(false));
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(tok.vocab_kind, VocabKind::SpmUnigram);
+    }
+
+    /// The core of `Self::spm_merge_symbols`: a pair only merges when its
+    /// concatenated string is itself a valid vocab token — no merge-rank
+    /// table involved at all, unlike `Self::merge_symbols`. `"a\u{2581}"`
+    /// (a + space) is *not* a vocab token here, so `('a','\u{2581}')`
+    /// never merges even though it's the leftmost pair; only `('\u{2581}',
+    /// 'b') -> "\u{2581}b"` does, and the leftover `'a'` symbol (with no
+    /// direct vocab entry) falls through to `Self::spm_merge_symbols`'s
+    /// caller, which byte-falls-back it via `<0x61>`.
+    #[test]
+    fn spm_merge_only_merges_pairs_that_are_valid_vocab_tokens() {
+        let mut gguf = build_spm_gguf(
+            &["<0x61>", "b", "\u{2581}", "\u{2581}b"],
+            &[0.0, 0.0, 0.0, 1.0],
+            Some(false),
+        );
+        gguf.metadata.push((
+            "tokenizer.ggml.token_type".to_string(),
+            GgufValue::Array(vec![
+                GgufValue::I32(6), // BYTE
+                GgufValue::I32(1), // NORMAL
+                GgufValue::I32(1), // NORMAL
+                GgufValue::I32(1), // NORMAL
+            ]),
+        ));
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        // symbols start as ['a', '▁', 'b']; "a▁" isn't a vocab token so
+        // only "▁b" merges, leaving ['a', '▁b'] — 'a' has no direct vocab
+        // entry (only a byte-fallback token), so it decomposes to <0x61>.
+        let ids = tok.encode("a b", false);
+        assert_eq!(
+            ids,
+            vec![tok.token_to_id["<0x61>"], tok.token_to_id["\u{2581}b"]]
+        );
+    }
+
+    /// When two *different* valid merges are both available in the same
+    /// pass, the higher-scoring one is chosen first — checked by giving
+    /// `"ab"` a higher score than `"bc"` in a 3-symbol chain where both are
+    /// simultaneously mergeable.
+    #[test]
+    fn spm_merge_prefers_higher_score_over_leftmost_when_both_valid() {
+        // ids: 0=a 1=<pad> 2=b 3=c 4=ab 5=bc
+        let gguf = build_spm_gguf(
+            &["a", "<pad>", "b", "c", "ab", "bc"],
+            &[0.0, 0.0, 0.0, 0.0, /* ab */ 5.0, /* bc */ 1.0],
+            Some(false),
+        );
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        // symbols start as ['a', 'b', 'c']; "ab" (score 5) beats "bc"
+        // (score 1), so it merges first -> ['ab', 'c'] -> "abc" isn't a
+        // token, so no further merge.
+        let ids = tok.encode("abc", false);
+        assert_eq!(ids, vec![tok.token_to_id["ab"], tok.token_to_id["c"]]);
+    }
+
+    /// `add_space_prefix = true` (upstream's own default for `VocabKind::
+    /// SpmUnigram` when the GGUF doesn't override it) prepends a literal
+    /// space — escaped to `▁` like every other space — to the very start
+    /// of the text, so a bare `"b"` becomes `"▁b"`, not `"b"`.
+    #[test]
+    fn spm_add_space_prefix_escapes_a_leading_space_by_default() {
+        let gguf = build_spm_gguf(&["b", "\u{2581}b"], &[0.0, 1.0], None);
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let ids = tok.encode("b", false);
+        assert_eq!(ids, vec![tok.token_to_id["\u{2581}b"]]);
+    }
+
+    /// A character with no vocab entry at all (and no possible merge)
+    /// falls back to its raw UTF-8 bytes' `<0xXX>`-format tokens — same
+    /// fallback convention `Self::encode_plain_raw` uses.
+    #[test]
+    fn spm_falls_back_to_byte_tokens_for_an_unknown_character() {
+        let mut gguf = build_spm_gguf(&["a", "<0x00>"], &[0.0, 0.0], Some(false));
+        gguf.metadata.push((
+            "tokenizer.ggml.token_type".to_string(),
+            GgufValue::Array(vec![GgufValue::I32(1), GgufValue::I32(6)]), // NORMAL, BYTE
+        ));
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        let text = "a\u{0}";
+        let ids = tok.encode(text, false);
+        assert_eq!(ids, vec![tok.token_to_id["a"], tok.token_to_id["<0x00>"]]);
+        assert_eq!(tok.decode(&ids), text);
+    }
+
+    /// `VocabKind::SpmUnigram` doesn't get `Gemma4Raw`'s punctuation
+    /// cleanup pass — real upstream `llama.cpp` sets `clean_spaces = false`
+    /// for `LLAMA_VOCAB_TYPE_SPM` specifically (confirmed directly against
+    /// `src/llama-vocab.cpp`), unlike the `"gemma4"` BPE variant.
+    /// The space cleanup repairs prose and must not touch code or
+    /// indentation — both of which it used to rewrite.
+    #[test]
+    fn clean_up_tokenization_spaces_leaves_code_and_indentation_alone() {
+        let gguf = build_gemma4_gguf(&["a", "b"], &[]);
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+
+        // Verbatim from gemma 4 E2B: a three-space fence with a two-space
+        // body. Dropping "the space before `.`" ate one of those two and
+        // broke the block out of its list item in the console.
+        let answer = "3. Run the executable:\n   ```bash\n  ./dll\n   ```\n";
+        assert_eq!(tok.clean_up_tokenization_spaces(answer), answer);
+
+        // Code is not prose: this pass exists for a tokenizer artifact that
+        // code does not have.
+        let code = "```c\nfoo (a , b) ;\n```\n";
+        assert_eq!(tok.clean_up_tokenization_spaces(code), code);
+
+        // Prose is still repaired, indentation included but untouched.
+        assert_eq!(
+            tok.clean_up_tokenization_spaces("  a word , and one more .\n"),
+            "  a word, and one more.\n"
+        );
+    }
+
+    #[test]
+    fn clean_up_tokenization_spaces_is_a_no_op_for_spm_unigram() {
+        let gguf = build_spm_gguf(&["a"], &[0.0], Some(false));
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(
+            tok.clean_up_tokenization_spaces("hi , there !"),
+            "hi , there !"
+        );
+    }
+
+    #[test]
+    fn clean_up_tokenization_spaces_is_a_no_op_for_a_byte_encoded_vocab() {
+        let gguf = minimal_byte_vocab();
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(
+            tok.clean_up_tokenization_spaces("hi , there !"),
+            "hi , there !"
+        );
+    }
+
+    #[test]
+    fn clean_up_tokenization_spaces_drops_space_before_punctuation() {
+        let gguf = build_gemma4_gguf(&["a"], &[]);
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        assert_eq!(
+            tok.clean_up_tokenization_spaces("Hello , world !"),
+            "Hello, world!"
+        );
+    }
+
+    #[test]
+    fn clean_up_tokenization_spaces_collapses_a_lone_apostrophe() {
+        let gguf = build_gemma4_gguf(&["a"], &[]);
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        // Both the space before *and* the space after get dropped (real
+        // llama.cpp's own `text[++i] = '\0'` consumes the trailing space
+        // too, not just the leading one).
+        assert_eq!(
+            tok.clean_up_tokenization_spaces("rock ' n ' roll"),
+            "rock'n'roll"
+        );
+    }
+
+    #[test]
+    fn clean_up_tokenization_spaces_drops_space_before_s_and_ve_but_not_t_or_ll() {
+        let gguf = build_gemma4_gguf(&["a"], &[]);
+        let tok = Tokenizer::from_gguf(&gguf).unwrap();
+        // 's/'ve lose their preceding space; 't/'ll keep it — matching real
+        // llama.cpp's own (slightly inconsistent) behavior exactly.
+        assert_eq!(
+            tok.clean_up_tokenization_spaces("it 's fine, we 've won"),
+            "it's fine, we've won"
+        );
+        assert_eq!(
+            tok.clean_up_tokenization_spaces("don 't stop, they 'll see"),
+            "don 't stop, they 'll see"
+        );
+    }
+
+    /// Cross-check against real llama.cpp's `/tokenize?add_special=false`
+    /// for `ggml-org/embeddinggemma-300M-GGUF:Q8_0` — the exact model that
+    /// exposed this whole vocab shape gap (`tokenizer.ggml.model =
+    /// "llama"`, no `merges` key at all, so it needs `VocabKind::
+    /// SpmUnigram`, not `Gpt2Byte`). Before that fix, this sentence
+    /// encoded to 43 near-byte-level tokens; real llama.cpp gives exactly
+    /// these 9. Run with `ORANGU_TEST_EMBEDDING_MODEL=/path/to/
+    /// embeddinggemma-300M-Q8_0.gguf cargo test --release --bin
+    /// orangu-server tokenizer -- --ignored`.
+    #[test]
+    #[ignore]
+    fn embeddinggemma_tokenization_matches_real_llama_cpp() {
+        let path =
+            std::env::var("ORANGU_TEST_EMBEDDING_MODEL").expect("set ORANGU_TEST_EMBEDDING_MODEL");
+        let gguf = GgufFile::open(std::path::Path::new(&path)).expect("open model");
+        let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        assert_eq!(tok.vocab_kind, VocabKind::SpmUnigram);
+
+        let ids = tok.encode("The quick brown fox jumps over the lazy dog", false);
+        assert_eq!(
+            ids,
+            vec![818, 3823, 8864, 37423, 38167, 1024, 506, 31770, 4799]
+        );
+    }
+
+    /// Cross-check against real `llama.cpp`'s `/tokenize` for
+    /// `bartowski/Ling-3.0-tiny-GGUF:Q4_K_M` (`tokenizer.ggml.model =
+    /// "gpt2"`, `.pre = "bailingmoe2"`), the model that needed the Bailing
+    /// pre-tokenizer arm.
+    ///
+    /// The second string is the one that matters: under the generic GPT-2
+    /// fallback `1` and `=` would still land on the same ids, but a
+    /// multi-digit run would not — real llama.cpp gives `2`, `0`, `2`, `6`
+    /// as four separate tokens where the fallback pattern hands BPE a
+    /// single `2026` chunk. Run with
+    /// `ORANGU_TEST_BAILINGMOE_MODEL=/path/to/Ling-3.0-tiny-Q4_K_M.gguf
+    /// cargo test --release --bin orangu-server tokenizer -- --ignored`.
+    #[test]
+    #[ignore]
+    fn ling3_tokenization_matches_real_llama_cpp() {
+        let path = std::env::var("ORANGU_TEST_BAILINGMOE_MODEL")
+            .expect("set ORANGU_TEST_BAILINGMOE_MODEL");
+        let gguf = GgufFile::open(std::path::Path::new(&path)).expect("open model");
+        let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        assert_eq!(tok.vocab_kind, VocabKind::Gpt2Byte);
+
+        assert_eq!(
+            tok.encode("The quick brown fox jumps over the lazy", false),
+            vec![678, 3901, 13187, 46998, 40977, 997, 268, 27028]
+        );
+        assert_eq!(
+            tok.encode("In 2026 the answer is 1 + 1 =", false),
+            vec![
+                846, 220, 17, 15, 17, 21, 268, 3766, 341, 220, 16, 781, 220, 16, 373
+            ]
+        );
+    }
+
+    /// Cross-check against real llama.cpp's `/tokenize` for
+    /// `mradermacher/Qwen3-VL-Embedding-8B-GGUF:Q4_K_M` — a plain
+    /// `VocabKind::Gpt2Byte` vocab (`tokenizer.ggml.model = "gpt2"`,
+    /// `.pre = "qwen2"`), already-supported shape, included here mainly to
+    /// pin `add_bos_token = false` (confirmed directly against the real
+    /// GGUF) — `Tokenizer::encode_for_embedding` must *not* prepend BOS
+    /// for this model, unlike every other tested model. Run with
+    /// `ORANGU_TEST_QWEN3VL_MODEL=/path/to/Qwen3-VL-Embedding-8B.Q4_K_M
+    /// .gguf cargo test --release --bin orangu-server tokenizer --
+    /// --ignored`.
+    #[test]
+    #[ignore]
+    fn qwen3vl_tokenization_matches_real_llama_cpp() {
+        let path =
+            std::env::var("ORANGU_TEST_QWEN3VL_MODEL").expect("set ORANGU_TEST_QWEN3VL_MODEL");
+        let gguf = GgufFile::open(std::path::Path::new(&path)).expect("open model");
+        let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        assert_eq!(tok.vocab_kind, VocabKind::Gpt2Byte);
+        assert!(!tok.add_bos_token);
+        assert!(tok.add_eos_token);
+
+        let ids = tok.encode("The quick brown fox jumps over the lazy dog", false);
+        assert_eq!(
+            ids,
+            vec![785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562]
+        );
+
+        let embedding_ids = tok.encode_for_embedding("The quick brown fox jumps over the lazy dog");
+        assert_eq!(
+            embedding_ids,
+            vec![
+                785,
+                3974,
+                13876,
+                38835,
+                34208,
+                916,
+                279,
+                15678,
+                5562,
+                tok.eos_token.unwrap()
+            ]
+        );
+    }
+
+    /// Isolated tokenizer throughput on the *real* E2B vocab (256K
+    /// tokens, real merge table), timing the `bpe_merge_word` BPE hot loop.
+    /// Prints tokens/s and
+    /// MB/s over 10 samples. `ORANGU_TEST_MODEL=/path/to/gemma-4-E2B-it-Q4_K_M
+    /// .gguf cargo test --profile release-with-debug --bin orangu-server
+    /// bench_tokenizer_encode -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_tokenizer_encode_throughput() {
+        let path = std::env::var("ORANGU_TEST_MODEL").unwrap_or_else(|_| {
+            "/mnt/ai/jews/llama.cpp/models--unsloth--gemma-4-E2B-it-GGUF/snapshots/\
+             0314792d7f1f7e229411f620751375812bb9faf2/gemma-4-E2B-it-Q4_K_M.gguf"
+                .to_string()
+        });
+        let Ok(gguf) = GgufFile::open(std::path::Path::new(&path)) else {
+            eprintln!("skipping: set ORANGU_TEST_MODEL to a gemma4 gguf");
+            return;
+        };
+        let tok = Tokenizer::from_gguf(&gguf).expect("build tokenizer");
+        let para = "The history of computing spans many centuries, from early mechanical \
+            calculators through the invention of the transistor, the integrated circuit, and \
+            the modern microprocessor. Each advance built upon the last, enabling faster and \
+            more capable machines that reshaped science, industry, and daily life. ";
+        // One long paragraph with no newline = one BPE "word", which is the
+        // O(n²)-per-word case the merge loop is pathological on. `repeat(6)` (~1.7K
+        // chars) keeps the current O(n²) baseline tractable; the fix should scale
+        // far better as this grows. Set ORANGU_TEST_REPEAT to sweep the length.
+        let reps: usize = std::env::var("ORANGU_TEST_REPEAT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(6);
+        let text = para.repeat(reps);
+        let bytes = text.len();
+        let ids0 = tok.encode(&text, false);
+        let ntok = ids0.len();
+        // Fingerprint the id sequence so a before/after run proves byte-identical
+        // tokenization across the rewrite.
+        let fp = ids0.iter().fold(1469598103934665603u64, |h, &i| {
+            (h ^ i as u64).wrapping_mul(1099511628211)
+        });
+        eprintln!(
+            "orangu-server: [bench] input: {bytes} bytes, one word, reps={reps}, id-fp={fp:016x}"
+        );
+        let mut samples = Vec::new();
+        for _ in 0..10 {
+            let t = std::time::Instant::now();
+            let ids = tok.encode(&text, false);
+            samples.push(t.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(&ids);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = samples[samples.len() / 2];
+        eprintln!(
+            "orangu-server: [bench] tokenizer encode: {ntok} tokens / {bytes} bytes — \
+             min={:.3}ms median={:.3}ms => {:.1} Ktok/s ({:.1} MB/s)",
+            samples[0],
+            med,
+            ntok as f64 / (med / 1000.0) / 1000.0,
+            bytes as f64 / (med / 1000.0) / 1e6,
+        );
+    }
+}

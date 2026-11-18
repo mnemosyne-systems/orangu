@@ -88,33 +88,67 @@ pub fn write(
     path: &Path,
     metadata: &[(String, GgufValue)],
     tensors: &[TensorPlan],
-    mut values: impl FnMut(&TensorPlan) -> Result<Vec<f32>>,
+    values: impl FnMut(&TensorPlan) -> Result<Vec<f32>>,
     progress: &dyn Fn(usize, usize, &TensorPlan),
 ) -> Result<u64> {
-    let mut header: Vec<u8> = Vec::with_capacity(1 << 20);
-    header.extend_from_slice(MAGIC);
-    header.extend_from_slice(&VERSION.to_le_bytes());
-    header.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
-    header.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
-    for (key, value) in metadata {
-        put_string(&mut header, key);
-        put_value(&mut header, value)?;
-    }
+    write_weighted(path, metadata, tensors, values, &|_| None, progress)
+}
 
+/// [`write`], fitting each tensor `importance` has an entry for to it
+/// ([`quant::encode_weighted`]).
+pub fn write_weighted<'a>(
+    path: &Path,
+    metadata: &[(String, GgufValue)],
+    tensors: &[TensorPlan],
+    mut values: impl FnMut(&TensorPlan) -> Result<Vec<f32>>,
+    importance: &dyn Fn(&TensorPlan) -> Option<&'a [f32]>,
+    progress: &dyn Fn(usize, usize, &TensorPlan),
+) -> Result<u64> {
+    write_streamed(
+        path,
+        metadata,
+        tensors,
+        |t| values(t).map(Weights::All),
+        importance,
+        progress,
+    )
+}
+
+/// A tensor's values as [`write_streamed`] takes them.
+pub enum Weights<'a> {
+    /// Every value at once, row-major.
+    All(Vec<f32>),
+    /// Blocks of whole rows, in order: a tensor too large to hold, encoded
+    /// and written a block at a time.
+    Rows(Box<dyn Iterator<Item = Result<Vec<f32>>> + 'a>),
+}
+
+/// [`write_weighted`], each tensor's values taken whole or a block of rows
+/// at a time ([`Weights`]). Rows are independent in every type written, so
+/// a tensor written in blocks is the same bytes as one written whole.
+pub fn write_streamed<'a, 'v>(
+    path: &Path,
+    metadata: &[(String, GgufValue)],
+    tensors: &[TensorPlan],
+    mut values: impl FnMut(&TensorPlan) -> Result<Weights<'v>>,
+    importance: &dyn Fn(&TensorPlan) -> Option<&'a [f32]>,
+    progress: &dyn Fn(usize, usize, &TensorPlan),
+) -> Result<u64> {
     let mut offset = 0u64;
-    for tensor in tensors {
-        if tensor.dims.is_empty() {
-            bail!("tensor {} has no dimensions", tensor.name);
-        }
-        put_string(&mut header, &tensor.name);
-        header.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
-        for &dim in &tensor.dims {
-            header.extend_from_slice(&dim.to_le_bytes());
-        }
-        header.extend_from_slice(&tensor.ggml_type.to_le_bytes());
-        header.extend_from_slice(&offset.to_le_bytes());
-        offset += pad_to(tensor.bytes() as u64, ALIGNMENT);
-    }
+    let entries: Vec<HeaderTensor<'_>> = tensors
+        .iter()
+        .map(|t| {
+            let at = offset;
+            offset += pad_to(t.bytes() as u64, ALIGNMENT);
+            HeaderTensor {
+                name: &t.name,
+                dims: &t.dims,
+                ggml_type: t.ggml_type,
+                offset: at,
+            }
+        })
+        .collect();
+    let header = header(metadata, &entries)?;
 
     let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
     let mut out = BufWriter::with_capacity(4 << 20, file);
@@ -125,20 +159,104 @@ pub fn write(
     let data_start = written;
     for (n, tensor) in tensors.iter().enumerate() {
         progress(n, tensors.len(), tensor);
-        let raw =
-            values(tensor).with_context(|| format!("reading the weights of {}", tensor.name))?;
-        if raw.len() != tensor.elements() {
+        let encode = |raw: &[f32]| match importance(tensor) {
+            Some(weights) => quant::encode_weighted(tensor.ggml_type, raw, tensor.ncols(), weights),
+            None => quant::encode(tensor.ggml_type, raw, tensor.ncols()),
+        };
+        debug_assert_eq!(written - data_start, offset_of(tensors, n));
+        let read = || format!("reading the weights of {}", tensor.name);
+        let mut count = 0usize;
+        match values(tensor).with_context(read)? {
+            Weights::All(raw) => {
+                count = raw.len();
+                if count == tensor.elements() {
+                    let bytes = encode(&raw);
+                    out.write_all(&bytes)?;
+                    written += bytes.len() as u64;
+                }
+            }
+            Weights::Rows(blocks) => {
+                for block in blocks {
+                    let block = block.with_context(read)?;
+                    if !block.len().is_multiple_of(tensor.ncols().max(1))
+                        || count + block.len() > tensor.elements()
+                    {
+                        bail!(
+                            "{}: a block of {} weights is not whole rows of this tensor",
+                            tensor.name,
+                            block.len()
+                        );
+                    }
+                    count += block.len();
+                    let bytes = encode(&block);
+                    out.write_all(&bytes)?;
+                    written += bytes.len() as u64;
+                }
+            }
+        }
+        if count != tensor.elements() {
             bail!(
                 "{}: {} weights for a tensor of {}",
                 tensor.name,
-                raw.len(),
+                count,
                 tensor.elements()
             );
         }
-        let bytes = quant::encode(tensor.ggml_type, &raw, tensor.ncols());
-        debug_assert_eq!(written - data_start, offset_of(tensors, n));
-        out.write_all(&bytes)?;
-        written += bytes.len() as u64;
+        written += pad(&mut out, written, ALIGNMENT)?;
+    }
+    out.flush()?;
+    Ok(written)
+}
+
+/// Writes a GGUF file whose tensor bytes come from `produce`: called once
+/// per tensor in order, it hands that tensor's encoded bytes to the sink it
+/// is given, in as many pieces as it likes. A tensor whose pieces do not
+/// add up to its planned size is refused.
+pub fn write_with(
+    path: &Path,
+    metadata: &[(String, GgufValue)],
+    tensors: &[TensorPlan],
+    mut produce: impl FnMut(&TensorPlan, &mut (dyn FnMut(&[u8]) -> Result<()> + Send)) -> Result<()>,
+    progress: &dyn Fn(usize, usize, &TensorPlan),
+) -> Result<u64> {
+    let mut offset = 0u64;
+    let entries: Vec<HeaderTensor<'_>> = tensors
+        .iter()
+        .map(|t| {
+            let at = offset;
+            offset += pad_to(t.bytes() as u64, ALIGNMENT);
+            HeaderTensor {
+                name: &t.name,
+                dims: &t.dims,
+                ggml_type: t.ggml_type,
+                offset: at,
+            }
+        })
+        .collect();
+    let header = header(metadata, &entries)?;
+
+    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut out = BufWriter::with_capacity(4 << 20, file);
+    out.write_all(&header)?;
+    let mut written = header.len() as u64;
+    written += pad(&mut out, written, ALIGNMENT)?;
+    for (n, tensor) in tensors.iter().enumerate() {
+        progress(n, tensors.len(), tensor);
+        let mut count = 0u64;
+        produce(tensor, &mut |bytes: &[u8]| {
+            out.write_all(bytes)?;
+            count += bytes.len() as u64;
+            Ok(())
+        })
+        .with_context(|| format!("writing {}", tensor.name))?;
+        if count != tensor.bytes() as u64 {
+            bail!(
+                "{}: {count} bytes for a tensor of {}",
+                tensor.name,
+                tensor.bytes()
+            );
+        }
+        written += count;
         written += pad(&mut out, written, ALIGNMENT)?;
     }
     out.flush()?;
@@ -254,6 +372,94 @@ pub fn size_label(parameters: usize) -> String {
     } else {
         format!("{:.0}M", parameters as f64 / 1e6)
     }
+}
+
+/// One tensor's record in a header: its offset is relative to the start of
+/// the tensor-data section.
+pub struct HeaderTensor<'a> {
+    pub name: &'a str,
+    pub dims: &'a [u64],
+    pub ggml_type: u32,
+    pub offset: u64,
+}
+
+/// The magic, version, metadata and tensor records, unpadded.
+pub fn header(metadata: &[(String, GgufValue)], tensors: &[HeaderTensor<'_>]) -> Result<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::with_capacity(1 << 20);
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&VERSION.to_le_bytes());
+    out.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(metadata.len() as u64).to_le_bytes());
+    for (key, value) in metadata {
+        put_string(&mut out, key);
+        put_value(&mut out, value)?;
+    }
+    for tensor in tensors {
+        if tensor.dims.is_empty() {
+            bail!("tensor {} has no dimensions", tensor.name);
+        }
+        put_string(&mut out, tensor.name);
+        out.extend_from_slice(&(tensor.dims.len() as u32).to_le_bytes());
+        for &dim in tensor.dims {
+            out.extend_from_slice(&dim.to_le_bytes());
+        }
+        out.extend_from_slice(&tensor.ggml_type.to_le_bytes());
+        out.extend_from_slice(&tensor.offset.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// One tensor copied as it is stored.
+pub struct RawTensor<'a> {
+    pub name: &'a str,
+    pub dims: &'a [u64],
+    pub ggml_type: u32,
+    pub bytes: &'a [u8],
+}
+
+/// Writes a GGUF file whose tensors are copied byte for byte, each padded to
+/// `alignment` — which `metadata` must declare as `general.alignment` when
+/// it is not the default 32.
+pub fn write_raw(
+    path: &Path,
+    metadata: &[(String, GgufValue)],
+    tensors: &[RawTensor<'_>],
+    alignment: u64,
+    progress: &dyn Fn(usize, usize, &str),
+) -> Result<u64> {
+    let mut offset = 0u64;
+    let entries: Vec<HeaderTensor<'_>> = tensors
+        .iter()
+        .map(|t| {
+            let at = offset;
+            offset += pad_to(t.bytes.len() as u64, alignment);
+            HeaderTensor {
+                name: t.name,
+                dims: t.dims,
+                ggml_type: t.ggml_type,
+                offset: at,
+            }
+        })
+        .collect();
+    let header = header(metadata, &entries)?;
+    let file = File::create(path).with_context(|| format!("creating {}", path.display()))?;
+    let mut out = BufWriter::with_capacity(4 << 20, file);
+    out.write_all(&header)?;
+    let mut written = header.len() as u64;
+    written += pad(&mut out, written, alignment)?;
+    for (n, tensor) in tensors.iter().enumerate() {
+        progress(n, tensors.len(), tensor.name);
+        out.write_all(tensor.bytes)?;
+        written += tensor.bytes.len() as u64;
+        written += pad(&mut out, written, alignment)?;
+    }
+    out.flush()?;
+    Ok(written)
+}
+
+/// `value` rounded up to a multiple of `alignment`.
+pub fn aligned(value: u64, alignment: u64) -> u64 {
+    pad_to(value, alignment)
 }
 
 #[cfg(test)]

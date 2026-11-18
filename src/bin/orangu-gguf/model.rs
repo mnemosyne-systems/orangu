@@ -1094,7 +1094,7 @@ pub fn activation_budget() -> usize {
     })
 }
 
-fn grad_slice(grads: &mut [f32], offset: usize, len: usize) -> &mut [f32] {
+pub(crate) fn grad_slice(grads: &mut [f32], offset: usize, len: usize) -> &mut [f32] {
     &mut grads[offset..offset + len]
 }
 
@@ -1566,7 +1566,7 @@ fn slab_rows(k: usize) -> usize {
 /// accurate than what it replaces rather than a little less. The forward
 /// kernels have always used the fused form; this is the backward catching
 /// up with them.
-fn matmul_add_dx(dx: &mut [f32], dy: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
+pub(crate) fn matmul_add_dx(dx: &mut [f32], dy: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
     debug_assert_eq!(dx.len(), t * k);
     debug_assert_eq!(dy.len(), t * n);
     debug_assert_eq!(w.len(), n * k);
@@ -1734,7 +1734,7 @@ fn dw_block_strided<const R: usize>(
 /// an `axpy` into memory per token per output row, which is a load and a
 /// store of the accumulator for every multiply. The same note about the
 /// fused multiply-add applies.
-fn matmul_add_dw(dw: &mut [f32], dy: &[f32], x: &[f32], t: usize, k: usize, n: usize) {
+pub(crate) fn matmul_add_dw(dw: &mut [f32], dy: &[f32], x: &[f32], t: usize, k: usize, n: usize) {
     debug_assert_eq!(dw.len(), n * k);
     debug_assert_eq!(dy.len(), t * n);
     debug_assert_eq!(x.len(), t * k);
@@ -2002,7 +2002,7 @@ fn axpy(y: &mut [f32], x: &[f32], a: f32) {
 }
 
 #[inline]
-fn silu(x: f32) -> f32 {
+pub(crate) fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
@@ -2055,7 +2055,13 @@ fn swiglu_backward(d_gate: &mut [f32], d_up: &mut [f32], d_act: &[f32], gate: &[
 /// RMSNorm over each `dim`-wide row, returning the normalized values and
 /// each row's reciprocal RMS (which the backward needs and which is far
 /// cheaper to keep than to recompute).
-fn rmsnorm_forward(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> (Aligned, Aligned) {
+pub(crate) fn rmsnorm_forward(
+    x: &[f32],
+    w: &[f32],
+    rows: usize,
+    dim: usize,
+    eps: f32,
+) -> (Aligned, Aligned) {
     let mut out = Aligned::zeros(rows * dim);
     let mut scales = Aligned::zeros(rows);
     out.par_chunks_mut(dim)
@@ -2075,7 +2081,7 @@ fn rmsnorm_forward(x: &[f32], w: &[f32], rows: usize, dim: usize, eps: f32) -> (
 /// Adds RMSNorm's input gradient into `dx` and its weight gradient into
 /// `dw`.
 #[allow(clippy::too_many_arguments)]
-fn rmsnorm_backward(
+pub(crate) fn rmsnorm_backward(
     dx: &mut [f32],
     dw: &mut [f32],
     dy: &[f32],
@@ -2141,7 +2147,7 @@ const NORM_GROUP: usize = 32;
 ///
 /// `inverse` negates the sine, which transposes each 2x2 rotation and so
 /// gives exactly the backward pass.
-fn rope(x: &mut [f32], heads: usize, head_dim: usize, base: f32, inverse: bool) {
+pub(crate) fn rope(x: &mut [f32], heads: usize, head_dim: usize, base: f32, inverse: bool) {
     let half = head_dim / 2;
     // One `powf` per index rather than one per (position, index): the
     // frequency does not depend on the position, and this loop ran the
@@ -2195,7 +2201,7 @@ fn attn_queries() -> usize {
 const ATTN_CHUNK: usize = 64;
 
 /// Causal grouped-query attention. Returns the per-token context vectors.
-fn attention(q: &[f32], k: &[f32], v: &[f32], cfg: &Config, t: usize) -> Aligned {
+pub(crate) fn attention(q: &[f32], k: &[f32], v: &[f32], cfg: &Config, t: usize) -> Aligned {
     let (hd, heads, group) = (cfg.head_dim, cfg.heads, cfg.group());
     let kvd = cfg.kv_dim();
     let scale = 1.0 / (hd as f32).sqrt();
@@ -2315,7 +2321,7 @@ const ATTN_BACKWARD_MIN: usize = 32;
 /// exact reproducibility — every sum here takes the same terms in the same
 /// order as the single-pass version did, so a model trained through this
 /// is byte for byte the model trained through that.
-fn attention_backward(
+pub(crate) fn attention_backward(
     q: &[f32],
     k: &[f32],
     v: &[f32],

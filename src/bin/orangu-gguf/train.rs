@@ -46,7 +46,7 @@ use std::{
 };
 
 use crate::aligned::Aligned;
-use crate::model::{Config, Layout, Model, Rng};
+use crate::model::{Config, Layout, Model, Rng, TensorSpec};
 use crate::pack::Tokens;
 
 /// The share of the token stream held back for validation.
@@ -124,7 +124,7 @@ impl Optimizer {
         &mut self,
         params: &mut [f32],
         grads: &[f32],
-        layout: &Layout,
+        specs: &[TensorSpec],
         lr: f32,
         weight_decay: f32,
         scale: f32,
@@ -134,7 +134,7 @@ impl Optimizer {
         let correction2 = 1.0 - self.beta2.powi(self.step as i32);
         let (beta1, beta2, eps) = (self.beta1, self.beta2, self.eps);
 
-        for spec in &layout.specs {
+        for spec in specs {
             let range = spec.offset..spec.offset + spec.len();
             let decay = if spec.is_matrix() { weight_decay } else { 0.0 };
             params[range.clone()]
@@ -289,8 +289,8 @@ impl Drop for Reporter {
 }
 
 /// Runs training to completion, checkpointing as it goes.
-pub fn run(
-    model: &mut Model,
+pub fn run<N: Network>(
+    model: &mut N,
     optimizer: &mut Optimizer,
     tokens: &Tokens,
     options: &Options,
@@ -308,7 +308,7 @@ pub fn run(
     let validation_start = total - ((total as f64 * VALIDATION_SHARE) as usize).max(need);
     let train_limit = validation_start - need;
 
-    let mut grads = Aligned::zeros(model.layout.total);
+    let mut grads = Aligned::zeros(model.specs().iter().map(TensorSpec::len).sum());
     let mut rng = Rng::new(options.seed ^ 0x5EED_0000 ^ start_step);
     let started = Instant::now();
     let status = Arc::new(Mutex::new(Status {
@@ -339,8 +339,7 @@ pub fn run(
         for _ in 0..options.batch {
             let at = (rng.next_u64() % train_limit as u64) as usize;
             let window = tokens.window(at, need);
-            loss +=
-                model.forward_backward(&window[..options.sequence], &window[1..], Some(&mut grads));
+            loss += model.pass(&window[..options.sequence], &window[1..], Some(&mut grads));
             // Counted per sequence rather than per step: at the sizes where
             // a step takes minutes, a step is too coarse a thing to measure
             // a rate with.
@@ -361,10 +360,11 @@ pub fn run(
         };
         let lr = learning_rate(step, options);
         time(Stage::Optimizer, || {
+            let (params, specs) = model.parts();
             optimizer.apply(
-                &mut model.params,
+                params,
                 &grads,
-                &model.layout,
+                specs,
                 lr,
                 options.weight_decay,
                 clip / options.batch as f32,
@@ -412,7 +412,7 @@ pub fn run(
 
 /// Mean loss over held-out windows. Fixed offsets, so two runs measure the
 /// same thing and the number is comparable across steps.
-pub fn validate(model: &Model, tokens: &Tokens, start: usize, options: &Options) -> f32 {
+pub fn validate<N: Network>(model: &N, tokens: &Tokens, start: usize, options: &Options) -> f32 {
     let need = options.sequence + 1;
     let span = tokens.len() - start;
     let count = VALIDATION_SEQUENCES.min(span / need).max(1);
@@ -421,28 +421,96 @@ pub fn validate(model: &Model, tokens: &Tokens, start: usize, options: &Options)
     for i in 0..count {
         let at = start + i * stride;
         let window = tokens.window(at, need);
-        total += model.forward_backward(&window[..options.sequence], &window[1..], None);
+        total += model.pass(&window[..options.sequence], &window[1..], None);
     }
     total / count as f32
 }
 
+/// A model the loop trains: its tensors, its parameters, one pass, and its
+/// shape as a checkpoint carries it.
+pub trait Network: Sized {
+    type Config: Clone + PartialEq + std::fmt::Debug;
+    /// The checkpoint's version field: which model it holds.
+    const KIND: u32;
+
+    fn config(&self) -> &Self::Config;
+    fn specs(&self) -> &[TensorSpec];
+    fn params(&self) -> &[f32];
+    /// The parameters to step, beside the tensors they belong to.
+    fn parts(&mut self) -> (&mut [f32], &[TensorSpec]);
+    /// The cross-entropy of predicting `targets`, with the gradient of the
+    /// training objective added into `grads` when one is supplied.
+    fn pass(&self, inputs: &[u32], targets: &[u32], grads: Option<&mut [f32]>) -> f32;
+    /// The parameters `cfg` takes.
+    fn parameters(cfg: &Self::Config) -> usize;
+    /// A model of `cfg` holding `params`.
+    fn assemble(cfg: Self::Config, params: Aligned) -> Self;
+    fn write_config(out: &mut impl Write, cfg: &Self::Config) -> Result<()>;
+    fn read_config(input: &mut impl Read) -> Result<Self::Config>;
+}
+
+impl Network for Model {
+    type Config = Config;
+    const KIND: u32 = 1;
+
+    fn config(&self) -> &Config {
+        &self.cfg
+    }
+    fn specs(&self) -> &[TensorSpec] {
+        &self.layout.specs
+    }
+    fn params(&self) -> &[f32] {
+        &self.params
+    }
+    fn parts(&mut self) -> (&mut [f32], &[TensorSpec]) {
+        (&mut self.params, &self.layout.specs)
+    }
+    fn pass(&self, inputs: &[u32], targets: &[u32], grads: Option<&mut [f32]>) -> f32 {
+        self.forward_backward(inputs, targets, grads)
+    }
+    fn parameters(cfg: &Config) -> usize {
+        cfg.parameters()
+    }
+    fn assemble(cfg: Config, params: Aligned) -> Self {
+        Model {
+            layout: Layout::new(&cfg),
+            cfg,
+            params,
+        }
+    }
+    fn write_config(out: &mut impl Write, cfg: &Config) -> Result<()> {
+        write_config(out, cfg)
+    }
+    fn read_config(input: &mut impl Read) -> Result<Config> {
+        read_config(input)
+    }
+}
+
+/// The name of the model a checkpoint's version field says it holds.
+fn kind_name(kind: u32) -> &'static str {
+    match kind {
+        1 => "qwen3",
+        2 => "qwen4exp",
+        _ => "unknown",
+    }
+}
+
 const CHECKPOINT_MAGIC: &[u8; 8] = b"ORANGUCK";
-const CHECKPOINT_VERSION: u32 = 1;
 
 /// Writes the checkpoint to a temporary file and renames it into place, so
 /// an interrupted write cannot leave a half-written checkpoint where a
 /// complete one used to be.
-pub fn save(path: &Path, model: &Model, optimizer: &Optimizer, step: u64) -> Result<()> {
+pub fn save<N: Network>(path: &Path, model: &N, optimizer: &Optimizer, step: u64) -> Result<()> {
     let temporary: PathBuf = path.with_extension("tmp");
     {
         let file = File::create(&temporary)
             .with_context(|| format!("creating {}", temporary.display()))?;
         let mut out = BufWriter::with_capacity(4 << 20, file);
         out.write_all(CHECKPOINT_MAGIC)?;
-        out.write_all(&CHECKPOINT_VERSION.to_le_bytes())?;
+        out.write_all(&N::KIND.to_le_bytes())?;
         out.write_all(&step.to_le_bytes())?;
-        write_config(&mut out, &model.cfg)?;
-        write_floats(&mut out, &model.params)?;
+        N::write_config(&mut out, model.config())?;
+        write_floats(&mut out, model.params())?;
         write_floats(&mut out, &optimizer.first)?;
         write_floats(&mut out, &optimizer.second)?;
         out.flush()?;
@@ -452,43 +520,47 @@ pub fn save(path: &Path, model: &Model, optimizer: &Optimizer, step: u64) -> Res
     Ok(())
 }
 
-/// The step and the config, without the weights behind them. A caller
+/// The step a checkpoint reached, without the weights behind it. A caller
 /// deciding whether a checkpoint is in the way should not have to read the
-/// whole thing to find out.
-pub fn peek(path: &Path) -> Result<(u64, Config)> {
+/// whole thing to find out — nor know which model it holds.
+pub fn peek(path: &Path) -> Result<u64> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut input = BufReader::with_capacity(1 << 12, file);
-    read_header(&mut input, path)
+    let (_, step) = read_header(&mut input, path)?;
+    Ok(step)
 }
 
-/// Magic, version and step, then the config. Shared so `peek` and `load`
-/// cannot drift apart on the layout.
-fn read_header(input: &mut impl Read, path: &Path) -> Result<(u64, Config)> {
+/// Magic, the model kind and the step. Shared so `peek` and `load` cannot
+/// drift apart on the layout.
+fn read_header(input: &mut impl Read, path: &Path) -> Result<(u32, u64)> {
     let mut magic = [0u8; 8];
     input.read_exact(&mut magic)?;
     if &magic != CHECKPOINT_MAGIC {
         bail!("{} is not a checkpoint", path.display());
     }
-    let version = read_u32(input)?;
-    if version != CHECKPOINT_VERSION {
-        bail!(
-            "{} is a version {version} checkpoint, not {CHECKPOINT_VERSION}",
-            path.display()
-        );
-    }
+    let kind = read_u32(input)?;
     let step = read_u64(input)?;
-    let cfg = read_config(input)?;
-    Ok((step, cfg))
+    Ok((kind, step))
 }
 
 /// Reads a checkpoint back, refusing one that was written for a different
-/// shape of model — resuming into a mismatched architecture would produce
-/// weights that are numerically fine and completely meaningless.
-pub fn load(path: &Path, expected: &Config) -> Result<(Model, Optimizer, u64)> {
+/// model — resuming into a mismatched architecture would produce weights
+/// that are numerically fine and completely meaningless.
+pub fn load<N: Network>(path: &Path, expected: &N::Config) -> Result<(N, Optimizer, u64)> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut input = BufReader::with_capacity(4 << 20, file);
 
-    let (step, cfg) = read_header(&mut input, path)?;
+    let (kind, step) = read_header(&mut input, path)?;
+    if kind != N::KIND {
+        bail!(
+            "{} holds a {} model, and this run trains a {} one — delete it or change the \
+             manifest back",
+            path.display(),
+            kind_name(kind),
+            kind_name(N::KIND)
+        );
+    }
+    let cfg = N::read_config(&mut input)?;
     if cfg != *expected {
         bail!(
             "{} holds a different model than this run asks for — delete it or change the options back\n  checkpoint: {cfg:?}\n  requested:  {expected:?}",
@@ -499,15 +571,11 @@ pub fn load(path: &Path, expected: &Config) -> Result<(Model, Optimizer, u64)> {
     let first = read_floats(&mut input)?;
     let second = read_floats(&mut input)?;
 
-    let layout = Layout::new(&cfg);
-    if params.len() != layout.total || first.len() != layout.total || second.len() != layout.total {
+    let total = N::parameters(&cfg);
+    if params.len() != total || first.len() != total || second.len() != total {
         bail!("{} is truncated", path.display());
     }
-    let model = Model {
-        cfg,
-        layout,
-        params: Aligned::from_slice(&params),
-    };
+    let model = N::assemble(cfg, Aligned::from_slice(&params));
     let optimizer = Optimizer {
         first: Aligned::from_slice(&first),
         second: Aligned::from_slice(&second),
@@ -588,17 +656,17 @@ fn read_floats(input: &mut impl Read) -> Result<Vec<f32>> {
     Ok(values)
 }
 
-fn read_bytes<const N: usize>(input: &mut impl Read) -> Result<[u8; N]> {
+pub(crate) fn read_bytes<const N: usize>(input: &mut impl Read) -> Result<[u8; N]> {
     let mut buffer = [0u8; N];
     input.read_exact(&mut buffer)?;
     Ok(buffer)
 }
 
-fn read_u32(input: &mut impl Read) -> Result<u32> {
+pub(crate) fn read_u32(input: &mut impl Read) -> Result<u32> {
     Ok(u32::from_le_bytes(read_bytes(input)?))
 }
 
-fn read_u64(input: &mut impl Read) -> Result<u64> {
+pub(crate) fn read_u64(input: &mut impl Read) -> Result<u64> {
     Ok(u64::from_le_bytes(read_bytes(input)?))
 }
 
@@ -703,7 +771,7 @@ mod tests {
                 optimizer.apply(
                     &mut model.params,
                     &grads,
-                    &model.layout,
+                    &model.layout.specs,
                     learning_rate(step, &options),
                     options.weight_decay,
                     clip,
@@ -755,7 +823,7 @@ mod tests {
             optimizer.apply(
                 &mut model.params,
                 &grads,
-                &model.layout,
+                &model.layout.specs,
                 learning_rate(step, &options),
                 options.weight_decay,
                 clip,
@@ -779,10 +847,17 @@ mod tests {
         // Move the moments off zero so the round trip has something to
         // prove.
         let grads = vec![0.01f32; model.layout.total];
-        optimizer.apply(&mut model.params, &grads, &model.layout, 1e-3, 0.1, 1.0);
+        optimizer.apply(
+            &mut model.params,
+            &grads,
+            &model.layout.specs,
+            1e-3,
+            0.1,
+            1.0,
+        );
         save(&path, &model, &optimizer, 7).unwrap();
 
-        let (restored, restored_optimizer, step) = load(&path, &cfg).unwrap();
+        let (restored, restored_optimizer, step) = load::<Model>(&path, &cfg).unwrap();
         assert_eq!(step, 7);
         assert_eq!(restored_optimizer.step, 7);
         assert_eq!(&restored.params[..], &model.params[..]);
@@ -791,7 +866,7 @@ mod tests {
 
         let mut other = cfg.clone();
         other.layers += 1;
-        let err = match load(&path, &other) {
+        let err = match load::<Model>(&path, &other) {
             Err(err) => err.to_string(),
             Ok(_) => panic!("a checkpoint for another shape of model was accepted"),
         };
@@ -810,7 +885,14 @@ mod tests {
         model.params[matrix_offset] = 1.0;
 
         let grads = vec![0.0f32; model.layout.total];
-        optimizer.apply(&mut model.params, &grads, &model.layout, 0.1, 0.5, 1.0);
+        optimizer.apply(
+            &mut model.params,
+            &grads,
+            &model.layout.specs,
+            0.1,
+            0.5,
+            1.0,
+        );
         assert_eq!(model.params[norm_offset], 1.0);
         assert!(model.params[matrix_offset] < 1.0);
     }
@@ -824,9 +906,7 @@ mod tests {
         let optimizer = Optimizer::new(model.layout.total);
         save(&path, &model, &optimizer, 7).unwrap();
 
-        let (step, seen) = peek(&path).unwrap();
-        assert_eq!(step, 7);
-        assert_eq!(seen, cfg);
+        assert_eq!(peek(&path).unwrap(), 7);
     }
 
     #[test]

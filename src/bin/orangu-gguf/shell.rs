@@ -55,7 +55,7 @@ _orangu_gguf() {
             compopt -o filenames 2>/dev/null
             return 0
             ;;
-        -o|--output|--flamegraph)
+        -o|--output|--imatrix|--calibration|--imatrix-out|--flamegraph|--dump|--hash|--compare|--merge|--config|--perplexity)
             COMPREPLY=( $(compgen -f -- "$cur") )
             compopt -o filenames 2>/dev/null
             return 0
@@ -68,15 +68,15 @@ _orangu_gguf() {
             COMPREPLY=( $(compgen -W "fp dwarf" -- "$cur") )
             return 0
             ;;
-        -ts|--training-size|-cs|--context-size|--flamegraph-freq)
+        -ts|--training-size|-cs|--context-size|--flamegraph-freq|--split-max-size|--split-max-tensors|--set|--delete|--override-kv)
             return 0
             ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "-m --model -ts --training-size -q --quantization -cs --context-size -o --output --list-quantizations \
-             --flamegraph --flamegraph-freq --flamegraph-call-graph --flamegraph-png -s --shell-completions -h --help -V --version" -- "$cur") )
+            "-m --model -ts --training-size -q --quantization -cs --context-size -o --output --imatrix --calibration --imatrix-out --list-quantizations --max-size --max-kl --tensor-type \
+             --dump --hash --compare --split-max-size --split-max-tensors --keep-split --merge --set --delete --override-kv --pure --allow-requantize --worker --channel --config --perplexity --flamegraph --flamegraph-freq --flamegraph-call-graph --flamegraph-png -s --shell-completions -h --help -V --version" -- "$cur") )
         return 0
     fi
 
@@ -107,12 +107,34 @@ _orangu_gguf_quantizations() {
 
 _orangu_gguf() {
     _arguments \
-        '(-m --model)'{-m,--model}'[Convert this GGUF file instead of training a new model]:model:_files -g "*.gguf"' \
+        '(-m --model)'{-m,--model}'[Convert this GGUF file, checkpoint directory or HF repo instead of training]:model:_files -g "*.gguf"' \
         '(-ts --training-size)'{-ts,--training-size}'[Training size for this run, overriding the manifest]:size:' \
         '(-q --quantization)'{-q,--quantization}'[Weight format written, overriding the manifest]:quantization:_orangu_gguf_quantizations' \
         '(-cs --context-size)'{-cs,--context-size}'[Context length the model declares, overriding the manifest]:n:' \
         '(-o --output)'{-o,--output}'[Where the model is written, overriding the manifest]:output:_files' \
+        '--imatrix[Fit the quantization to this importance matrix file or HF repo]:imatrix:_files' \
+        '--calibration[Measure an importance matrix over this text and fit the quantization to it]:calibration:_files' \
+        '--imatrix-out[With --calibration, write the measured importance matrix here and stop]:imatrix-out:_files' \
         '--list-quantizations[List the weight formats a manifest'"'"'s quantization accepts]' \
+        '--max-size[With -q auto, the most bytes of weights the file may take]:size:' \
+        '--max-kl[With -q auto, the most KL from the source over the calibration text]:nats:' \
+        '*--tensor-type[Write tensors whose name matches PATTERN as TYPE (repeatable)]:pattern=type:' \
+        '--dump[Print a model file'"'"'s metadata and tensor table]:model:_files -g "*.gguf"' \
+        '--hash[Print a content hash of every tensor in a model file]:model:_files -g "*.gguf"' \
+        '--compare[Compare two model files'"'"' metadata and tensors]:a:_files -g "*.gguf":b:_files -g "*.gguf"' \
+        '--split-max-size[Write the model as shards of at most SIZE each]:size:' \
+        '--split-max-tensors[Write the model as shards of at most N tensors each]:n:' \
+        '--keep-split[Write a shard set as the source set is cut]' \
+        '--merge[Join a shard set, named by its first shard, into one file]:model:_files -g "*.gguf"' \
+        '*--set[Set a metadata key, in place when no format is given (repeatable)]:key=type\:value:' \
+        '*--delete[Delete a metadata key, in place when no format is given (repeatable)]:key:' \
+        '*--override-kv[Write this metadata key into the output (repeatable)]:key=type\:value:' \
+        '--pure[Quantize every tensor that may be to the format'"'"'s base type]' \
+        '--allow-requantize[Accept a quantized source, rounding its tensors a second time]' \
+        '--worker[Join the \[workers\] channel as a node that takes a share of building a model]' \
+        '--channel[List the nodes of the \[workers\] channel, servers and gguf nodes]' \
+        '--config[Read \[workers\] from this file instead of orangu-gguf.conf]:file:_files' \
+        '--perplexity[Print the perplexity of the -m model over this text]:text:_files' \
         '--flamegraph[Record a CPU flamegraph of the run and render it here]:path:_files' \
         '--flamegraph-freq[Sampling frequency in Hz for --flamegraph]:hz:' \
         '--flamegraph-call-graph[Call-graph mode for --flamegraph]:mode:(fp dwarf)' \
@@ -142,12 +164,34 @@ end
 
 # The positional MANIFEST: a JSON file.
 complete -c orangu-gguf -n '__fish_is_first_arg' -k -a '(__fish_complete_suffix .json)'
-complete -c orangu-gguf -s m -l model              -r -k -a '(__fish_complete_suffix .gguf)' -d 'Convert this GGUF file instead of training a new model'
+complete -c orangu-gguf -s m -l model              -r -k -a '(__fish_complete_suffix .gguf)' -d 'Convert this GGUF file, checkpoint directory or HF repo instead of training'
 complete -c orangu-gguf -o ts -l training-size     -x -d 'Training size for this run, overriding the manifest'
 complete -c orangu-gguf -s q -l quantization       -x -a '(__orangu_gguf_quantizations)' -d 'Weight format written, overriding the manifest'
 complete -c orangu-gguf -o cs -l context-size      -x -d 'Context length the model declares, overriding the manifest'
 complete -c orangu-gguf -s o -l output             -r -d 'Where the model is written, overriding the manifest'
+complete -c orangu-gguf      -l imatrix            -r -d 'Fit the quantization to this importance matrix file or HF repo'
+complete -c orangu-gguf      -l calibration        -r -d 'Measure an importance matrix over this text and fit the quantization to it'
+complete -c orangu-gguf      -l imatrix-out        -r -d 'With --calibration, write the measured importance matrix here and stop'
 complete -c orangu-gguf      -l list-quantizations    -d 'List the weight formats a manifest\'s quantization accepts'
+complete -c orangu-gguf      -l max-size           -r -d 'With -q auto, the most bytes of weights the file may take'
+complete -c orangu-gguf      -l max-kl             -r -d 'With -q auto, the most KL from the source over the calibration text'
+complete -c orangu-gguf      -l tensor-type        -r -d 'Write tensors whose name matches PATTERN as TYPE (repeatable)'
+complete -c orangu-gguf      -l dump               -r -k -a '(__fish_complete_suffix .gguf)' -d 'Print a model file\'s metadata and tensor table'
+complete -c orangu-gguf      -l hash               -r -k -a '(__fish_complete_suffix .gguf)' -d 'Print a content hash of every tensor in a model file'
+complete -c orangu-gguf      -l compare            -r -k -a '(__fish_complete_suffix .gguf)' -d 'Compare two model files\' metadata and tensors'
+complete -c orangu-gguf      -l split-max-size     -r -d 'Write the model as shards of at most SIZE each'
+complete -c orangu-gguf      -l split-max-tensors  -r -d 'Write the model as shards of at most N tensors each'
+complete -c orangu-gguf      -l keep-split            -d 'Write a shard set as the source set is cut'
+complete -c orangu-gguf      -l merge              -r -k -a '(__fish_complete_suffix .gguf)' -d 'Join a shard set, named by its first shard, into one file'
+complete -c orangu-gguf      -l set                -r -d 'Set a metadata key, in place when no format is given (repeatable)'
+complete -c orangu-gguf      -l delete             -r -d 'Delete a metadata key, in place when no format is given (repeatable)'
+complete -c orangu-gguf      -l override-kv        -r -d 'Write this metadata key into the output (repeatable)'
+complete -c orangu-gguf      -l pure                  -d 'Quantize every tensor that may be to the format\'s base type'
+complete -c orangu-gguf      -l allow-requantize      -d 'Accept a quantized source, rounding its tensors a second time'
+complete -c orangu-gguf      -l worker                -d 'Join the [workers] channel as a node that takes a share of building a model'
+complete -c orangu-gguf      -l channel               -d 'List the nodes of the [workers] channel, servers and gguf nodes'
+complete -c orangu-gguf      -l config             -r -d 'Read [workers] from this file instead of orangu-gguf.conf'
+complete -c orangu-gguf      -l perplexity         -r -d 'Print the perplexity of the -m model over this text'
 complete -c orangu-gguf      -l flamegraph         -r -d 'Record a CPU flamegraph of the run and render it here'
 complete -c orangu-gguf      -l flamegraph-freq    -x -d 'Sampling frequency in Hz for --flamegraph'
 complete -c orangu-gguf      -l flamegraph-call-graph -x -a 'fp dwarf' -d 'Call-graph mode for --flamegraph'
@@ -178,12 +222,34 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-gguf' -ScriptBlock {
     $prev = $words[-1]
 
     $flags = @(
-        @('-m', '--model', 'Convert this GGUF file instead of training a new model'),
+        @('-m', '--model', 'Convert this GGUF file, checkpoint directory or HF repo instead of training'),
         @('-ts', '--training-size', 'Training size for this run, overriding the manifest'),
         @('-q', '--quantization', 'Weight format written, overriding the manifest'),
         @('-cs', '--context-size', 'Context length the model declares, overriding the manifest'),
         @('-o', '--output', 'Where the model is written, overriding the manifest'),
+        @('--imatrix', 'Fit the quantization to this importance matrix file or HF repo'),
+        @('--calibration', 'Measure an importance matrix over this text and fit the quantization to it'),
+        @('--imatrix-out', 'With --calibration, write the measured importance matrix here and stop'),
         @('--list-quantizations', 'List the weight formats a manifest''s quantization accepts'),
+        @('--max-size', 'With -q auto, the most bytes of weights the file may take'),
+        @('--max-kl', 'With -q auto, the most KL from the source over the calibration text'),
+        @('--tensor-type', 'Write tensors whose name matches PATTERN as TYPE (repeatable)'),
+        @('--dump', 'Print a model file''s metadata and tensor table'),
+        @('--hash', 'Print a content hash of every tensor in a model file'),
+        @('--compare', 'Compare two model files'' metadata and tensors'),
+        @('--split-max-size', 'Write the model as shards of at most SIZE each'),
+        @('--split-max-tensors', 'Write the model as shards of at most N tensors each'),
+        @('--keep-split', 'Write a shard set as the source set is cut'),
+        @('--merge', 'Join a shard set, named by its first shard, into one file'),
+        @('--set', 'Set a metadata key, in place when no format is given (repeatable)'),
+        @('--delete', 'Delete a metadata key, in place when no format is given (repeatable)'),
+        @('--override-kv', 'Write this metadata key into the output (repeatable)'),
+        @('--pure', 'Quantize every tensor that may be to the format''s base type'),
+        @('--allow-requantize', 'Accept a quantized source, rounding its tensors a second time'),
+        @('--worker', 'Join the [workers] channel as a node that takes a share of building a model'),
+        @('--channel', 'List the nodes of the [workers] channel, servers and gguf nodes'),
+        @('--config', 'Read [workers] from this file instead of orangu-gguf.conf'),
+        @('--perplexity', 'Print the perplexity of the -m model over this text'),
         @('--flamegraph', 'Record a CPU flamegraph of the run and render it here'),
         @('--flamegraph-freq', 'Sampling frequency in Hz for --flamegraph'),
         @('--flamegraph-call-graph', 'Call-graph mode for --flamegraph: fp or dwarf'),
@@ -208,7 +274,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-gguf' -ScriptBlock {
 
     switch ($prev) {
         # A path (the manifest, a model, an output): PowerShell's own completion takes over.
-        { $_ -in '-m', '--model', '-o', '--output', '--flamegraph' } { return }
+        { $_ -in '-m', '--model', '-o', '--output', '--imatrix', '--calibration', '--imatrix-out', '--flamegraph', '--dump', '--hash', '--compare', '--merge', '--config', '--perplexity' } { return }
         { $_ -in '-q', '--quantization' } { return Offer (Quantizations) }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         { $_ -in '-ts', '--training-size', '-cs', '--context-size', '--flamegraph-freq' } { return }

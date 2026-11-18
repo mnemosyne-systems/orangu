@@ -404,6 +404,8 @@ mod tests {
             features,
             pace: Default::default(),
             demand: Vec::new(),
+            kind: Default::default(),
+            capabilities: Vec::new(),
             rtt: Duration::from_millis(1),
             alternates: Vec::new(),
         }

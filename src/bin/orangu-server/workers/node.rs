@@ -101,9 +101,9 @@ const MIN_SPARE: f64 = 0.05;
 /// How often the nodes a scan found are asked again how busy they are.
 const REFRESH_EVERY: Duration = Duration::from_secs(2);
 
-/// How long a free node stays promised to a node about to claim it
-/// ([`Message::Lease`]): long enough for the claim's handshakes.
-const LEASE_FOR: Duration = Duration::from_secs(10);
+// How long a free node stays promised to a node about to claim it
+// ([`Message::Lease`]): long enough for the claim's handshakes.
+use super::channel::LEASE_FOR;
 
 /// Probes in a row a parent seen on the channel may leave unanswered, with
 /// its connection quiet for a quarter of [`NodeSettings::parent_silence`],
@@ -1400,13 +1400,9 @@ impl Node {
         }
         let mut lease = self.lease.lock().unwrap();
         let now = Instant::now();
-        match lease.as_ref() {
-            Some((holder, until))
-                if now < *until && holder != candidate && holder.as_str() < candidate =>
-            {
-                refused(holder.clone(), false)
-            }
-            _ => {
+        match super::channel::promised_against(lease.as_ref(), candidate, now) {
+            Some(holder) => refused(holder, false),
+            None => {
                 *lease = Some((candidate.to_string(), now + LEASE_FOR));
                 Message::LeaseAck {
                     granted: true,
@@ -2591,7 +2587,8 @@ impl Node {
                 }
             }
             found.extend(super::channel::probe_all(&rest, &hash, tls.as_ref()));
-            found.retain(|f| f.node != self.id);
+            // A gguf node runs no layers: it is never this node's worker.
+            found.retain(|f| f.node != self.id && f.kind == super::protocol::NodeKind::Server);
             self.check_parent(&found);
             {
                 let mut slot = self.found.lock().unwrap();
@@ -4583,6 +4580,8 @@ impl Node {
                                 step_ms: self.step_ms(),
                             },
                             demand: self.shared_demand(),
+                            kind: Default::default(),
+                            capabilities: Vec::new(),
                         },
                     );
                     self.note_prober(&tcp);
@@ -6697,7 +6696,7 @@ mod tests {
     #[test]
     fn a_tree_runs_over_tls() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = transport::fixture::certificate(dir.path(), "shared");
+        let shared = crate::workers::fixture::certificate(dir.path(), "shared");
         let with_tls = |name: &str, workers: Vec<String>| {
             let mut s = settings(name, workers, Some("s"));
             s.tls = tls(Some(&shared), None);
@@ -6725,7 +6724,7 @@ mod tests {
     #[test]
     fn a_large_frame_crosses_tls() {
         let dir = tempfile::tempdir().unwrap();
-        let shared = transport::fixture::certificate(dir.path(), "shared");
+        let shared = crate::workers::fixture::certificate(dir.path(), "shared");
         let mut s = settings("leaf", vec![], Some("s"));
         s.tls = tls(Some(&shared), None);
         let leaf = node_with(s, Variant::default());
@@ -6751,8 +6750,8 @@ mod tests {
     #[test]
     fn a_tls_mismatch_leaves_the_worker_out() {
         let dir = tempfile::tempdir().unwrap();
-        let worker_cert = transport::fixture::certificate(dir.path(), "worker");
-        let other = transport::fixture::certificate(dir.path(), "other");
+        let worker_cert = crate::workers::fixture::certificate(dir.path(), "worker");
+        let other = crate::workers::fixture::certificate(dir.path(), "other");
         let mut s = settings("worker", vec![], None);
         s.tls = tls(Some(&worker_cert), None);
         let worker = node_with(s, Variant::default());
@@ -8048,6 +8047,8 @@ mod tests {
             features: 0,
             pace: Default::default(),
             demand: Vec::new(),
+            kind: Default::default(),
+            capabilities: Vec::new(),
             rtt: Duration::from_millis(1),
             alternates: Vec::new(),
         }

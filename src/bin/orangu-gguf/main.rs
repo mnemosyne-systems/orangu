@@ -36,7 +36,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use orangu::gguf::{GgufFile, GgufValue};
+use orangu::gguf::GgufValue;
 use orangu::profiling::profile;
 use orangu::shell_completions;
 use rayon::prelude::*;
@@ -48,13 +48,26 @@ use std::{
 };
 
 mod aligned;
+mod auto;
+mod choose;
 mod corpus;
 mod gpu;
+mod hf;
+mod imatrix;
+mod inspect;
+mod jobs;
+mod kl;
 mod manifest;
 mod model;
+mod model4;
+mod node;
+mod optimize;
 mod pack;
 mod quant;
+mod shards;
 mod shell;
+mod speed;
+mod spread;
 mod stages;
 mod train;
 mod vocab;
@@ -67,12 +80,6 @@ use quant::Ftype;
 
 /// The architecture written into every model this tool trains.
 ///
-/// A dense block with grouped-query attention, rotary positions, RMSNorm
-/// and a SwiGLU feed-forward, plus the per-head query and key norms — the
-/// strongest shape on the inference side's fully-supported dense path, and
-/// the one whose stability a from-scratch run most benefits from.
-const ARCHITECTURE: &str = "qwen3";
-
 /// The help text, with the two-letter short options in the column they
 /// belong in. `{about-with-newline}`, `{usage-heading}`, `{usage}` and
 /// `{positionals}` are filled in by the parser; the options are not.
@@ -84,12 +91,36 @@ Arguments:
 {positionals}
 
 Options:
-  -m,  --model <FILE>          Convert this GGUF file instead of training a new model
+  -m,  --model <PATH>          Convert this GGUF file, checkpoint directory or HF repo instead of training
   -ts, --training-size <SIZE>  Training size for this run, overriding the manifest
   -q,  --quantization <QUANT>  Weight format written, overriding the manifest
   -cs, --context-size <N>      Context length the model declares, overriding the manifest
   -o,  --output <FILE>         Where the model is written, overriding the manifest
+       --imatrix <FILE>        Fit the quantization to this importance matrix file or HF repo
+       --calibration <FILE>    Measure an importance matrix over this text and fit the quantization to it
+       --imatrix-out <FILE>    With --calibration, write the measured importance matrix here and stop
        --list-quantizations    List the weight formats a manifest's quantization accepts
+       --max-size <SIZE>       With -q auto, the most bytes of weights the file may take
+       --max-kl <NATS>         With -q auto, the most KL from the source over the calibration text
+       --tensor-type <PATTERN=TYPE>
+                               Write tensors whose name matches PATTERN as TYPE (repeatable)
+       --dump <FILE>           Print a model file's metadata and tensor table
+       --hash <FILE>           Print a content hash of every tensor in a model file
+       --compare <A> <B>       Compare two model files' metadata and tensors
+       --split-max-size <SIZE> Write the model as shards of at most SIZE each
+       --split-max-tensors <N> Write the model as shards of at most N tensors each
+       --keep-split            Write a shard set as the source set is cut
+       --merge <FILE>          Join a shard set, named by its first shard, into one file
+       --set <KEY=TYPE:VALUE>  Set a metadata key, in place when no format is given (repeatable)
+       --delete <KEY>          Delete a metadata key, in place when no format is given (repeatable)
+       --override-kv <KEY=TYPE:VALUE>
+                               Write this metadata key into the output (repeatable)
+       --pure                  Quantize every tensor that may be to the format's base type
+       --allow-requantize      Accept a quantized source, rounding its tensors a second time
+       --worker                Join the [workers] channel as a node that takes a share of building a model
+       --channel               List the nodes of the [workers] channel, servers and gguf nodes
+       --config <FILE>         Read [workers] from this file instead of orangu-gguf.conf
+       --perplexity <TEXT>     Print the perplexity of the -m model over this text
        --flamegraph <PATH>     Record a CPU flamegraph of the run and render it here
        --flamegraph-freq <HZ>  Sampling frequency in Hz for --flamegraph [default: 999]
        --flamegraph-call-graph <MODE>
@@ -121,8 +152,8 @@ struct Args {
     #[arg(value_name = "MANIFEST")]
     manifest: Option<PathBuf>,
 
-    /// Convert this GGUF file instead of training a new model.
-    #[arg(short = 'm', long, value_name = "FILE")]
+    /// Convert this GGUF file, checkpoint directory or HF repo instead of training.
+    #[arg(short = 'm', long, value_name = "PATH")]
     model: Option<PathBuf>,
 
     /// Training size for this run, overriding the manifest.
@@ -141,9 +172,97 @@ struct Args {
     #[arg(short = 'o', long, value_name = "FILE")]
     output: Option<PathBuf>,
 
+    /// Fit the quantization to this importance matrix file or HF repo.
+    #[arg(long, value_name = "FILE")]
+    imatrix: Option<PathBuf>,
+
+    /// Measure an importance matrix over this text and fit the quantization to it.
+    #[arg(long, value_name = "FILE")]
+    calibration: Option<PathBuf>,
+
+    /// With --calibration, write the measured importance matrix here and stop.
+    #[arg(long = "imatrix-out", value_name = "FILE", requires = "calibration")]
+    imatrix_out: Option<PathBuf>,
+
     /// List the weight formats a manifest's `quantization` accepts and exit.
     #[arg(long = "list-quantizations")]
     list_quantizations: bool,
+
+    /// With -q auto, the most bytes of weights the file may take.
+    #[arg(long = "max-size", value_name = "SIZE")]
+    max_size: Option<String>,
+
+    /// With -q auto, the most KL from the source over the calibration text.
+    #[arg(long = "max-kl", value_name = "NATS")]
+    max_kl: Option<f64>,
+
+    /// Write tensors whose name matches PATTERN as TYPE (repeatable).
+    #[arg(long = "tensor-type", value_name = "PATTERN=TYPE")]
+    tensor_type: Vec<String>,
+
+    /// Print a model file's metadata and tensor table.
+    #[arg(long, value_name = "FILE")]
+    dump: Option<PathBuf>,
+
+    /// Print a content hash of every tensor in a model file.
+    #[arg(long, value_name = "FILE")]
+    hash: Option<PathBuf>,
+
+    /// Compare two model files' metadata and tensors.
+    #[arg(long, num_args = 2, value_names = ["A", "B"])]
+    compare: Option<Vec<PathBuf>>,
+
+    /// Write the model as shards of at most SIZE each.
+    #[arg(long = "split-max-size", value_name = "SIZE")]
+    split_max_size: Option<String>,
+
+    /// Write the model as shards of at most N tensors each.
+    #[arg(long = "split-max-tensors", value_name = "N")]
+    split_max_tensors: Option<usize>,
+
+    /// Write a shard set as the source set is cut.
+    #[arg(long = "keep-split")]
+    keep_split: bool,
+
+    /// Join a shard set, named by its first shard, into one file.
+    #[arg(long, value_name = "FILE")]
+    merge: Option<PathBuf>,
+
+    /// Set a metadata key, in place when no format is given (repeatable).
+    #[arg(long, value_name = "KEY=TYPE:VALUE")]
+    set: Vec<String>,
+
+    /// Delete a metadata key, in place when no format is given (repeatable).
+    #[arg(long, value_name = "KEY")]
+    delete: Vec<String>,
+
+    /// Write this metadata key into the output (repeatable).
+    #[arg(long = "override-kv", value_name = "KEY=TYPE:VALUE")]
+    override_kv: Vec<String>,
+
+    /// Quantize every tensor that may be to the format's base type.
+    #[arg(long)]
+    pure: bool,
+
+    /// Accept a quantized source, rounding its tensors a second time.
+    #[arg(long = "allow-requantize")]
+    allow_requantize: bool,
+
+    /// Join the [workers] channel as a node that takes a share of building a model.
+    #[arg(long)]
+    worker: bool,
+
+    /// List the nodes of the [workers] channel, servers and gguf nodes.
+    #[arg(long)]
+    channel: bool,
+
+    /// Read [workers] from this file instead of orangu-gguf.conf.
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Print the perplexity of the -m model over this text.
+    #[arg(long, value_name = "TEXT", requires = "model")]
+    perplexity: Option<PathBuf>,
 
     /// Record a CPU flamegraph of the run and render it here.
     #[arg(long, value_name = "PATH")]
@@ -194,14 +313,185 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    node::configure(args.config.clone());
+    if let Some(text) = &args.perplexity {
+        let model = listed(
+            args.model
+                .as_deref()
+                .context("--perplexity needs -m MODEL")?,
+        )?;
+        let links = jobs::claim_for("perplexity");
+        let tally = jobs::perplexity(&model, text, kl::CHUNK, links)?;
+        let (perplexity, error) = tally.perplexity();
+        println!(
+            "perplexity {perplexity:.4} +/- {error:.5}, {} tokens scored in windows of {}",
+            tally.count,
+            kl::CHUNK
+        );
+        return Ok(());
+    }
+    if args.worker || args.channel {
+        let settings = node::Settings::load(args.config.as_deref())?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "no channel to join: give orangu-gguf.conf a [workers] section with a name \
+                 (and the secret, when the channel has one)"
+            )
+        })?;
+        return if args.worker {
+            node::Worker::serve(settings)
+        } else {
+            node::list(&settings)
+        };
+    }
+    if let Some(path) = &args.dump {
+        return inspect::dump(&listed(path)?);
+    }
+    if let Some(path) = &args.hash {
+        return inspect::hash(&listed(path)?);
+    }
+    if let Some(pair) = &args.compare {
+        return inspect::compare(&listed(&pair[0])?, &listed(&pair[1])?);
+    }
+    let layout = layout_of(&args)?;
+    if let Some(path) = &args.merge {
+        return merge(&listed(path)?, args.output.as_deref(), &layout);
+    }
 
     match (&args.manifest, &args.model) {
         (Some(manifest), None) => build(&args, manifest),
         (None, Some(model)) => {
             // Nothing here has a manifest to take a default from, so the
             // command line keeps one of its own.
-            let ftype = Ftype::parse(args.quantization.as_deref().unwrap_or("bf16"))?;
-            convert(&args, model, ftype)
+            // `-q auto` chooses within the standard `Q4_K_M`, planned first.
+            let requested = args.quantization.as_deref().unwrap_or("bf16");
+            let auto = requested.eq_ignore_ascii_case("auto").then_some(());
+            let options = optimize::Options {
+                max_bytes: args
+                    .max_size
+                    .as_deref()
+                    .map(optimize::parse_size)
+                    .transpose()?,
+                max_kl: args.max_kl,
+                text: args.calibration.clone(),
+                overrides: args
+                    .tensor_type
+                    .iter()
+                    .map(|t| optimize::parse_override(t))
+                    .collect::<Result<_>>()?,
+            };
+            if auto.is_none() && (options.max_bytes.is_some() || options.max_kl.is_some()) {
+                bail!("--max-size and --max-kl go with -q auto");
+            }
+            match (auto, &args.imatrix, &args.calibration) {
+                (Some(()), _, None) => bail!(
+                    "-q auto needs --calibration TEXT: it measures each choice's KL over that text"
+                ),
+                (None, Some(_), Some(_)) => bail!(
+                    "--imatrix and --calibration are alternatives, except with -q auto, where \
+                     the matrix comes from --imatrix and the KL is measured over --calibration"
+                ),
+                _ => {}
+            }
+            let ftype = if auto.is_some() {
+                Ftype::Q4KM
+            } else {
+                Ftype::parse(requested)?
+            };
+            let matrix = args
+                .imatrix
+                .as_deref()
+                .map(imatrix::Loaded::open)
+                .transpose()?;
+            // A matrix given with --imatrix is used as it is; the text is
+            // then only what -q auto measures KL over.
+            let calibrated = |source: &Path| -> Result<Option<imatrix::Loaded>> {
+                args.calibration
+                    .as_deref()
+                    .filter(|_| args.imatrix.is_none())
+                    .map(|text| imatrix::Loaded::open(&imatrix::measure(source, text, None)?))
+                    .transpose()
+            };
+            // `--imatrix-out`: measure into that file and stop.
+            let measure_only = |source: &Path| -> Result<Option<()>> {
+                let (Some(out), Some(text)) = (&args.imatrix_out, &args.calibration) else {
+                    return Ok(None);
+                };
+                let written = imatrix::measure(source, text, Some(out))?;
+                println!("wrote {}", written.display());
+                Ok(Some(()))
+            };
+            // A file or checkpoint directory here; then a model the server
+            // lists, by name or NR; then a Hugging Face repository.
+            let file = if model.is_file() {
+                Some(model.clone())
+            } else if !model.exists() {
+                listed(model).ok()
+            } else {
+                None
+            };
+            if let Some(path) = file {
+                // No format: the tensors are copied as stored.
+                if args.quantization.is_none()
+                    && (layout.split.is_set() || layout.keep_split || !layout.edits.is_empty())
+                {
+                    return rewrite(&path, args.output.as_deref(), &layout);
+                }
+                if measure_only(&path)?.is_some() {
+                    return Ok(());
+                }
+                let measured = calibrated(&path)?;
+                return convert(
+                    args.output.as_deref(),
+                    &path,
+                    ftype,
+                    measured.as_ref().or(matrix.as_ref()),
+                    &options,
+                    auto.is_some(),
+                    &layout,
+                );
+            }
+            match hf::locate(model)? {
+                Some(checkpoint) => {
+                    // A checkpoint is measured as the BF16 file it converts
+                    // to, which is kept beside the result.
+                    let measured = match &args.calibration {
+                        Some(_) => {
+                            let source = hf::run(&checkpoint, None, Ftype::Bf16, None)?;
+                            if measure_only(&source)?.is_some() {
+                                return Ok(());
+                            }
+                            calibrated(&source)?
+                        }
+                        None => None,
+                    };
+                    let matrix = measured.as_ref().or(matrix.as_ref());
+                    if auto.is_some() {
+                        // Chosen from the BF16 file the checkpoint converts to.
+                        let source = hf::run(&checkpoint, None, Ftype::Bf16, None)?;
+                        return convert(
+                            args.output.as_deref(),
+                            &source,
+                            ftype,
+                            matrix,
+                            &options,
+                            true,
+                            &layout,
+                        );
+                    }
+                    if layout.pure || layout.requantize || layout.keep_split {
+                        bail!(
+                            "--pure, --allow-requantize and --keep-split apply to a GGUF source; \
+                             convert the checkpoint first"
+                        );
+                    }
+                    let written = hf::run(&checkpoint, args.output.clone(), ftype, matrix)?;
+                    finish_checkpoint(&written, &layout)
+                }
+                None => bail!(
+                    "{} is not a model file, a checkpoint or a listed model",
+                    model.display()
+                ),
+            }
         }
         (Some(_), Some(_)) => bail!(
             "give a manifest to train from, or --model to convert an existing file — not both"
@@ -211,6 +501,188 @@ fn main() -> Result<()> {
              existing file — orangu-gguf --help lists both"
         ),
     }
+}
+
+/// The layout and metadata options of the command line.
+fn layout_of(args: &Args) -> Result<Layout> {
+    let mut edits = Vec::new();
+    for text in args.set.iter().chain(&args.override_kv) {
+        edits.push(shards::parse_set(text)?);
+    }
+    for key in &args.delete {
+        edits.push(shards::Edit::Delete(key.clone()));
+    }
+    if args.split_max_tensors == Some(0) {
+        bail!("--split-max-tensors 0 would put no tensor anywhere");
+    }
+    let max_bytes = args
+        .split_max_size
+        .as_deref()
+        .map(optimize::parse_size)
+        .transpose()?;
+    if max_bytes == Some(0) {
+        bail!("--split-max-size 0 would put no tensor anywhere");
+    }
+    Ok(Layout {
+        split: shards::Split {
+            max_bytes,
+            max_tensors: args.split_max_tensors,
+        },
+        keep_split: args.keep_split,
+        pure: args.pure,
+        requantize: args.allow_requantize,
+        edits,
+    })
+}
+
+/// Writes `source` again with every tensor as stored: cut into new shards,
+/// or with its metadata changed — in place, when no output is named and
+/// nothing is re-cut.
+fn rewrite(source: &Path, output: Option<&Path>, layout: &Layout) -> Result<()> {
+    if layout.pure || layout.requantize {
+        bail!("--pure and --allow-requantize go with -q: without a format nothing is quantized");
+    }
+    if layout.keep_split && layout.split.is_set() {
+        bail!("--keep-split keeps the source's shards; --split-max-* cuts new ones — give one");
+    }
+    let set = shards::Source::open(source)?;
+    if !layout.split.is_set() && output.is_none() {
+        if layout.edits.is_empty() {
+            bail!("nothing to change: name an output, a shard limit or a metadata edit");
+        }
+        let first = &set.paths[0];
+        let in_place = shards::edit(first, &layout.edits)?;
+        println!(
+            "{} {}",
+            if in_place {
+                "edited in place:"
+            } else {
+                "the header changed size, so the file was rewritten:"
+            },
+            first.display()
+        );
+        return Ok(());
+    }
+    let mut metadata = set.metadata.clone();
+    shards::apply(&mut metadata, &layout.edits)?;
+    let groups = if layout.split.is_set() {
+        copy_groups(&set, &metadata, &layout.split)?
+    } else {
+        set.shard_groups()
+    };
+    let output = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| source.with_file_name(format!("{}.gguf", shards::set_stem(source))));
+    write_copy(&set, &output, &metadata, &groups)
+}
+
+/// The shards a byte-for-byte copy of `set` is cut into.
+fn copy_groups(
+    set: &shards::Source,
+    metadata: &[(String, GgufValue)],
+    split: &shards::Split,
+) -> Result<Vec<Vec<usize>>> {
+    let sizes: Vec<u64> = (0..set.tensors.len())
+        .map(|i| write::aligned(set.bytes(i).len() as u64, set.alignment))
+        .collect();
+    let records: Vec<(&str, &[u64], u32)> = set
+        .tensors
+        .iter()
+        .map(|t| (t.name.as_str(), t.dims.as_slice(), t.ggml_type))
+        .collect();
+    Ok(shards::groups(
+        &sizes,
+        split,
+        shards::overheads(metadata, &records, set.alignment)?,
+    ))
+}
+
+/// `--merge`: a shard set into one file, or re-cut to new limits.
+fn merge(source: &Path, output: Option<&Path>, layout: &Layout) -> Result<()> {
+    if layout.pure || layout.requantize || layout.keep_split {
+        bail!(
+            "--merge copies tensors as stored: --pure, --allow-requantize and --keep-split do not apply"
+        );
+    }
+    let set = shards::Source::open(source)?;
+    if !set.is_split() {
+        bail!(
+            "{} is one file, not the first shard of a set",
+            source.display()
+        );
+    }
+    let mut metadata = set.metadata.clone();
+    shards::apply(&mut metadata, &layout.edits)?;
+    let groups = copy_groups(&set, &metadata, &layout.split)?;
+    let output = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| source.with_file_name(format!("{}.gguf", shards::set_stem(source))));
+    write_copy(&set, &output, &metadata, &groups)
+}
+
+fn write_copy(
+    set: &shards::Source,
+    output: &Path,
+    metadata: &[(String, GgufValue)],
+    groups: &[Vec<usize>],
+) -> Result<()> {
+    let started = Instant::now();
+    println!(
+        "source      {} ({} tensors in {} file{})",
+        set.paths[0].display(),
+        set.tensors.len(),
+        set.paths.len(),
+        if set.paths.len() == 1 { "" } else { "s" }
+    );
+    let count = groups.len();
+    println!(
+        "output      {} ({count} file{})\n",
+        shards::shard_path(output, 0, count).display(),
+        if count == 1 { "" } else { "s" }
+    );
+    let written = shards::copy(set, output, metadata, groups)?;
+    println!(
+        "\nwrote {} in {count} file{} in {}",
+        bytes(written),
+        if count == 1 { "" } else { "s" },
+        train::format_duration(started.elapsed().as_secs_f64())
+    );
+    Ok(())
+}
+
+/// A checkpoint's converted file, cut into shards or edited as asked.
+fn finish_checkpoint(written: &Path, layout: &Layout) -> Result<()> {
+    if layout.split.is_set() {
+        let set = shards::Source::open(written)?;
+        let mut metadata = set.metadata.clone();
+        shards::apply(&mut metadata, &layout.edits)?;
+        let groups = copy_groups(&set, &metadata, &layout.split)?;
+        if groups.len() > 1 {
+            write_copy(&set, written, &metadata, &groups)?;
+            drop(set);
+            fs::remove_file(written).with_context(|| format!("removing {}", written.display()))?;
+            return Ok(());
+        }
+    }
+    if !layout.edits.is_empty() {
+        shards::edit(written, &layout.edits)?;
+    }
+    Ok(())
+}
+
+/// A model file named by path, or by the name or NR `orangu-server list`
+/// shows for it in the configured models directory.
+fn listed(model: &Path) -> Result<PathBuf> {
+    if model.is_file() {
+        return Ok(model.to_path_buf());
+    }
+    let models = hf::models_dir().with_context(|| {
+        format!(
+            "{} is not a file, and no models directory is configured to look it up in",
+            model.display()
+        )
+    })?;
+    orangu::model_spec::resolve_show_target(&models, &model.to_string_lossy())
 }
 
 /// Rewrites the two multi-letter short options into their long spellings.
@@ -365,17 +837,17 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
     }
 
     let ftype = Ftype::parse(&manifest.quantization)?;
-    let size = model::size_named(&manifest.training_size).ok_or_else(|| {
-        anyhow::anyhow!(
-            "unknown training size {:?} — one of: {}",
-            manifest.training_size,
-            model::SIZES
-                .iter()
-                .map(|s| s.key)
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })?;
+    // Refused here rather than at the end: the matrix is measured on the
+    // trained model, so without a text to measure it over the run would
+    // train for nothing.
+    if ftype.needs_importance() && manifest.calibration.is_none() {
+        bail!(
+            "{} needs an importance matrix: give the manifest a \"calibration\" text to \
+             measure it over",
+            ftype.name()
+        );
+    }
+    let shape = Shape::named(&manifest.architecture, &manifest.training_size)?;
     let context = parse_context(&manifest.context_size)?;
 
     let work = match &manifest.work_dir {
@@ -405,7 +877,11 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
         );
     }
     println!("work        {}", work.display());
-    println!("model       {} {ARCHITECTURE}, context {context}", size.key);
+    println!(
+        "model       {} {}, context {context}",
+        shape.key(),
+        shape.architecture()
+    );
     println!("output      {}", ftype.name());
     // The devices this machine offers, in the order this tool would use
     // them. Training runs on the CPU today — see GGUF.md, T6, for the
@@ -427,7 +903,7 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
     // manifest with no steps left to run profiles corpus preparation and one
     // with steps profiles training — which is how the two are told apart
     // without a second flag that could disagree with the manifest.
-    let recorder = start_profile(args, size.key)?;
+    let recorder = start_profile(args, shape.key())?;
     let outcome = (|| -> Result<()> {
         // 1. The corpus.
         let mut roots: Vec<corpus::Root> = if manifest.offline {
@@ -543,7 +1019,6 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
         println!("packed: {} tokens", tokens.len());
 
         // 4. The model.
-        let cfg = Config::from_size(size, vocabulary.len(), context);
         let sequence = manifest.sequence_length.min(context);
         let steps = match manifest.steps {
             Some(steps) => steps,
@@ -556,7 +1031,7 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
             steps,
             batch: manifest.batch,
             sequence,
-            peak_lr: manifest.learning_rate.unwrap_or_else(|| size.peak_lr()),
+            peak_lr: manifest.learning_rate.unwrap_or_else(|| shape.peak_lr()),
             warmup: (steps / 20).clamp(1, 2000),
             weight_decay: 0.1,
             grad_clip: 1.0,
@@ -565,101 +1040,36 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
             eval_every: manifest.eval_every,
             checkpoint_every: manifest.checkpoint_every,
         };
-
-        if manifest.export_only && !checkpoint_path.exists() {
-            bail!(
-                "\"export_only\" has nothing to export: {} does not exist",
-                checkpoint_path.display()
-            );
-        }
-        let (mut network, mut optimizer, start_step) = if (manifest.resume || manifest.export_only)
-            && checkpoint_path.exists()
-        {
-            let (network, optimizer, step) = train::load(&checkpoint_path, &cfg)?;
-            println!("resuming from step {step}");
-            (network, optimizer, step)
-        } else {
-            // A checkpoint in the way stops the run — but only when there
-            // is something in it to lose. One left by a run that reached its
-            // last step has nothing unfinished in it, and refusing to start
-            // over that would make a repeatable stage un-repeatable.
-            if checkpoint_path.exists() && !manifest.rebuild {
-                let (reached, _) = train::peek(&checkpoint_path)?;
-                if reached < steps {
-                    bail!(
-                        "{} already holds a checkpoint, stopped at step {reached} of {steps}.\n  \
-                         To continue it, set \"resume\": true in {}.\n  \
-                         To start over, set \"rebuild\": true there, or delete the file.",
-                        checkpoint_path.display(),
-                        manifest_path.display()
-                    );
-                }
-                println!("replacing the finished checkpoint at step {reached}");
-            }
-            let network = Model::new(cfg.clone(), manifest.seed);
-            let optimizer = train::Optimizer::new(network.layout.total);
-            (network, optimizer, 0)
-        };
-
-        if manifest.export_only {
-            println!(
-                "\nexporting {} parameters as they stand\n",
-                network.layout.total
-            );
-        } else {
-            println!(
-                "\ntraining {} parameters for {steps} steps of {} x {sequence} tokens",
-                network.layout.total, options.batch
-            );
-            // What the backward will keep rather than recompute. Printed
-            // because it is the one setting that trades memory for time,
-            // and a run that quietly took a gigabyte should say so.
-            let budget = model::activation_budget();
-            if budget == 0 {
-                println!("activations recomputed (ORANGU_GGUF_CACHE_MIB=0)");
-            } else {
-                println!("activations cached up to {}", bytes(budget as u64));
-            }
-            println!();
-        }
-        if !manifest.export_only {
-            train::run(
-                &mut network,
-                &mut optimizer,
-                &tokens,
-                &options,
-                &checkpoint_path,
-                start_step,
-            )?;
-            if options.checkpoint_every == 0 {
-                train::save(&checkpoint_path, &network, &optimizer, steps)?;
-            }
-        }
-
-        // 5. The model file.
         let output = manifest.output.clone().unwrap_or_else(|| {
             PathBuf::from(format!(
                 "{}-{}-{}.gguf",
                 manifest.name,
-                size.key,
+                shape.key(),
                 ftype.name()
             ))
         });
-        let metadata = model_metadata(
-            &manifest,
-            &cfg,
+        let run = Run {
+            manifest: &manifest,
+            manifest_path,
+            work: &work,
+            checkpoint: &checkpoint_path,
+            tokens: &tokens,
+            vocabulary: &vocabulary,
+            options: &options,
             ftype,
-            size.key,
-            wikipedia_source.as_deref(),
-        );
-        let written = export(
-            &output,
-            &network,
-            &vocabulary,
-            metadata,
-            ftype,
-            &manifest.chat_template,
-        )?;
+            size: shape.key(),
+            wikipedia_source: wikipedia_source.as_deref(),
+            output: &output,
+        };
+        let written = match shape {
+            Shape::Dense(size) => {
+                train_and_write::<Model>(&run, Config::from_size(size, vocabulary.len(), context))?
+            }
+            Shape::Hybrid(size) => train_and_write::<model4::Model>(
+                &run,
+                model4::Config::from_size(size, vocabulary.len(), vocabulary.eos, context),
+            )?,
+        };
         println!(
             "\nwrote {} ({}) in {}",
             output.display(),
@@ -672,10 +1082,286 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
     outcome
 }
 
+/// The architecture a manifest names, at one of its sizes.
+#[derive(Clone, Copy)]
+enum Shape {
+    Dense(&'static model::Size),
+    Hybrid(&'static model4::Size),
+}
+
+impl Shape {
+    fn named(architecture: &str, size: &str) -> Result<Self> {
+        let unknown = |keys: Vec<&str>| {
+            anyhow::anyhow!(
+                "unknown {architecture} training size {size:?} — one of: {}",
+                keys.join(", ")
+            )
+        };
+        match architecture {
+            "qwen4exp" => model4::size_named(size)
+                .map(Shape::Hybrid)
+                .ok_or_else(|| unknown(model4::SIZES.iter().map(|s| s.key).collect())),
+            "qwen3" => model::size_named(size)
+                .map(Shape::Dense)
+                .ok_or_else(|| unknown(model::SIZES.iter().map(|s| s.key).collect())),
+            other => bail!("unknown architecture {other:?} — one of: qwen4exp, qwen3"),
+        }
+    }
+
+    fn key(&self) -> &'static str {
+        match self {
+            Shape::Dense(s) => s.key,
+            Shape::Hybrid(s) => s.key,
+        }
+    }
+
+    fn peak_lr(&self) -> f32 {
+        match self {
+            Shape::Dense(s) => s.peak_lr(),
+            Shape::Hybrid(s) => s.peak_lr(),
+        }
+    }
+
+    fn architecture(&self) -> &'static str {
+        match self {
+            Shape::Dense(_) => <Model as Trained>::ARCHITECTURE,
+            Shape::Hybrid(_) => <model4::Model as Trained>::ARCHITECTURE,
+        }
+    }
+}
+
+/// A trainable model as a file carries it.
+trait Trained: train::Network {
+    const ARCHITECTURE: &'static str;
+    fn create(cfg: Self::Config, seed: u64) -> Self;
+    /// Whether the backward keeps activations within
+    /// [`model::activation_budget`].
+    const CACHES_ACTIVATIONS: bool;
+    /// Every tensor's name and GGUF shape, in file order.
+    fn file_specs(&self) -> Vec<(String, Vec<u64>)>;
+    fn file_values(&self, name: &str) -> Option<Vec<f32>>;
+    /// The `<architecture>.*` keys.
+    fn architecture_metadata(&self) -> Vec<(String, GgufValue)>;
+}
+
+impl Trained for Model {
+    const ARCHITECTURE: &'static str = "qwen3";
+    const CACHES_ACTIVATIONS: bool = true;
+
+    fn create(cfg: Config, seed: u64) -> Self {
+        Model::new(cfg, seed)
+    }
+    fn file_specs(&self) -> Vec<(String, Vec<u64>)> {
+        self.layout
+            .specs
+            .iter()
+            .map(|s| (s.name.clone(), s.dims.clone()))
+            .collect()
+    }
+    fn file_values(&self, name: &str) -> Option<Vec<f32>> {
+        let s = self.layout.specs.iter().find(|s| s.name == name)?;
+        Some(self.params[s.offset..s.offset + s.len()].to_vec())
+    }
+    fn architecture_metadata(&self) -> Vec<(String, GgufValue)> {
+        let cfg = &self.cfg;
+        let arch = Self::ARCHITECTURE;
+        let mut out = Vec::new();
+        for (suffix, value) in [
+            ("context_length", cfg.context as u32),
+            ("embedding_length", cfg.hidden as u32),
+            ("block_count", cfg.layers as u32),
+            ("feed_forward_length", cfg.ffn as u32),
+            ("attention.head_count", cfg.heads as u32),
+            ("attention.head_count_kv", cfg.kv_heads as u32),
+            ("attention.key_length", cfg.head_dim as u32),
+            ("attention.value_length", cfg.head_dim as u32),
+            ("rope.dimension_count", cfg.head_dim as u32),
+            ("vocab_size", cfg.vocab as u32),
+        ] {
+            out.push((format!("{arch}.{suffix}"), GgufValue::U32(value)));
+        }
+        out.push((
+            format!("{arch}.attention.layer_norm_rms_epsilon"),
+            GgufValue::F32(cfg.eps),
+        ));
+        out.push((
+            format!("{arch}.rope.freq_base"),
+            GgufValue::F32(cfg.rope_base),
+        ));
+        out
+    }
+}
+
+impl Trained for model4::Model {
+    const ARCHITECTURE: &'static str = "qwen4exp";
+    const CACHES_ACTIVATIONS: bool = false;
+
+    fn create(cfg: model4::Config, seed: u64) -> Self {
+        model4::Model::new(cfg, seed)
+    }
+    fn file_specs(&self) -> Vec<(String, Vec<u64>)> {
+        model4::Model::file_specs(self)
+    }
+    fn file_values(&self, name: &str) -> Option<Vec<f32>> {
+        model4::Model::file_values(self, name)
+    }
+    fn architecture_metadata(&self) -> Vec<(String, GgufValue)> {
+        self.file_metadata()
+            .into_iter()
+            .filter(|(k, _)| k != "general.architecture")
+            .collect()
+    }
+}
+
+/// What one build's training and export read.
+struct Run<'a> {
+    manifest: &'a Manifest,
+    manifest_path: &'a Path,
+    work: &'a Path,
+    checkpoint: &'a Path,
+    tokens: &'a pack::Tokens,
+    vocabulary: &'a vocab::Vocab,
+    options: &'a train::Options,
+    ftype: Ftype,
+    size: &'static str,
+    wikipedia_source: Option<&'a str>,
+    output: &'a Path,
+}
+
+/// Trains a model of `cfg` — from its checkpoint when the manifest resumes
+/// — and writes it out: the bytes written.
+fn train_and_write<N: Trained>(run: &Run, cfg: N::Config) -> Result<u64> {
+    let (manifest, options) = (run.manifest, run.options);
+    let steps = options.steps;
+    if manifest.export_only && !run.checkpoint.exists() {
+        bail!(
+            "\"export_only\" has nothing to export: {} does not exist",
+            run.checkpoint.display()
+        );
+    }
+    let (mut network, mut optimizer, start_step) =
+        if (manifest.resume || manifest.export_only) && run.checkpoint.exists() {
+            let (network, optimizer, step) = train::load::<N>(run.checkpoint, &cfg)?;
+            println!("resuming from step {step}");
+            (network, optimizer, step)
+        } else {
+            // A checkpoint in the way stops the run — but only when there
+            // is something in it to lose. One left by a run that reached its
+            // last step has nothing unfinished in it, and refusing to start
+            // over that would make a repeatable stage un-repeatable.
+            if run.checkpoint.exists() && !manifest.rebuild {
+                let reached = train::peek(run.checkpoint)?;
+                if reached < steps {
+                    bail!(
+                        "{} already holds a checkpoint, stopped at step {reached} of {steps}.\n  \
+                         To continue it, set \"resume\": true in {}.\n  \
+                         To start over, set \"rebuild\": true there, or delete the file.",
+                        run.checkpoint.display(),
+                        run.manifest_path.display()
+                    );
+                }
+                println!("replacing the finished checkpoint at step {reached}");
+            }
+            let network = N::create(cfg, manifest.seed);
+            let optimizer = train::Optimizer::new(N::parameters(network.config()));
+            (network, optimizer, 0)
+        };
+    let parameters = N::parameters(network.config());
+
+    if manifest.export_only {
+        println!("\nexporting {parameters} parameters as they stand\n");
+    } else {
+        println!(
+            "\ntraining {parameters} parameters for {steps} steps of {} x {} tokens",
+            options.batch, options.sequence
+        );
+        // What the backward will keep rather than recompute. Printed
+        // because it is the one setting that trades memory for time, and a
+        // run that quietly took a gigabyte should say so.
+        if N::CACHES_ACTIVATIONS {
+            let budget = model::activation_budget();
+            if budget == 0 {
+                println!("activations recomputed (ORANGU_GGUF_CACHE_MIB=0)");
+            } else {
+                println!("activations cached up to {}", bytes(budget as u64));
+            }
+        }
+        println!();
+        train::run(
+            &mut network,
+            &mut optimizer,
+            run.tokens,
+            options,
+            run.checkpoint,
+            start_step,
+        )?;
+        if options.checkpoint_every == 0 {
+            train::save(run.checkpoint, &network, &optimizer, steps)?;
+        }
+    }
+
+    // 5. The model file.
+    let metadata = |ftype| {
+        let mut out = model_metadata(
+            manifest,
+            N::ARCHITECTURE,
+            parameters,
+            ftype,
+            run.size,
+            run.wikipedia_source,
+        );
+        out.extend(network.architecture_metadata());
+        out
+    };
+    match &manifest.calibration {
+        None => export(
+            run.output,
+            &network,
+            run.vocabulary,
+            metadata(run.ftype),
+            run.ftype,
+            &manifest.chat_template,
+        ),
+        // Measured as BF16 in the work directory, then written at the
+        // manifest's format fitted to what it measured.
+        Some(text) => {
+            let full = run
+                .work
+                .join(format!("{}-{}-BF16.gguf", manifest.name, run.size));
+            export(
+                &full,
+                &network,
+                run.vocabulary,
+                metadata(Ftype::Bf16),
+                Ftype::Bf16,
+                &manifest.chat_template,
+            )?;
+            let measured = imatrix::measure(
+                &full,
+                text,
+                Some(&run.work.join("calibration.imatrix.gguf")),
+            )?;
+            let matrix = imatrix::Loaded::open(&measured)?;
+            convert(
+                Some(run.output),
+                &full,
+                run.ftype,
+                Some(&matrix),
+                &optimize::Options::default(),
+                false,
+                &Layout::default(),
+            )?;
+            Ok(fs::metadata(run.output)
+                .with_context(|| format!("reading {}", run.output.display()))?
+                .len())
+        }
+    }
+}
+
 /// Writes a trained model out at `ftype`.
-fn export(
+fn export<N: Trained>(
     path: &Path,
-    network: &Model,
+    network: &N,
     vocabulary: &vocab::Vocab,
     mut metadata: Vec<(String, GgufValue)>,
     ftype: Ftype,
@@ -683,26 +1369,33 @@ fn export(
 ) -> Result<u64> {
     metadata.extend(tokenizer_metadata(vocabulary, chat_template));
 
-    let model = quant::Model {
-        layers: network.cfg.layers,
-        gqa: (network.cfg.heads / network.cfg.kv_heads.max(1)).max(1),
-    };
-    let mut plans = Vec::with_capacity(network.layout.specs.len());
+    let model = quant::Model::from_metadata(&metadata);
+    let specs = network.file_specs();
+    let inputs: Vec<quant::Tensor<'_>> = specs
+        .iter()
+        .map(|(name, dims)| quant::Tensor {
+            name,
+            dims,
+            source: quant::GGML_TYPE_F32,
+        })
+        .collect();
+    let mut plans = Vec::with_capacity(specs.len());
     let mut fallbacks = Vec::new();
-    for spec in &network.layout.specs {
-        let plan = quant::plan_tensor(ftype, &spec.name, &spec.dims, model);
+    for ((name, dims), plan) in specs
+        .iter()
+        .zip(quant::plan_tensors(ftype, &inputs, &model))
+    {
         if let Some(from) = plan.fallback_from {
             fallbacks.push(format!(
-                "{}: {} does not divide {}, wrote {}",
-                spec.name,
+                "{name}: {} does not divide {}, wrote {}",
                 quant::type_name(from),
-                spec.dims[0],
+                dims[0],
                 quant::type_name(plan.ggml_type)
             ));
         }
         plans.push(write::TensorPlan {
-            name: spec.name.clone(),
-            dims: spec.dims.clone(),
+            name: name.clone(),
+            dims: dims.clone(),
             ggml_type: plan.ggml_type,
         });
     }
@@ -715,22 +1408,15 @@ fn export(
         bytes(write::planned_bytes(&plans))
     );
 
-    let by_name: std::collections::HashMap<&str, &model::TensorSpec> = network
-        .layout
-        .specs
-        .iter()
-        .map(|s| (s.name.as_str(), s))
-        .collect();
-
+    imatrix::require(ftype, &plans, None)?;
     write::write(
         path,
         &metadata,
         &plans,
         |plan| {
-            let spec = by_name
-                .get(plan.name.as_str())
-                .ok_or_else(|| anyhow::anyhow!("no weights for {}", plan.name))?;
-            Ok(network.params[spec.offset..spec.offset + spec.len()].to_vec())
+            network
+                .file_values(&plan.name)
+                .ok_or_else(|| anyhow::anyhow!("no weights for {}", plan.name))
         },
         &|n, total, plan| {
             print!(
@@ -744,15 +1430,15 @@ fn export(
     )
 }
 
-/// The architecture and provenance keys of a trained model.
+/// The general and provenance keys of a trained model.
 fn model_metadata(
     manifest: &Manifest,
-    cfg: &Config,
+    arch: &str,
+    parameters: usize,
     ftype: Ftype,
     size: &str,
     wikipedia_source: Option<&str>,
 ) -> Vec<(String, GgufValue)> {
-    let arch = ARCHITECTURE;
     let mut out: Vec<(String, GgufValue)> = vec![
         (
             "general.architecture".into(),
@@ -765,7 +1451,7 @@ fn model_metadata(
         ),
         (
             "general.size_label".into(),
-            GgufValue::String(write::size_label(cfg.parameters())),
+            GgufValue::String(write::size_label(parameters)),
         ),
         (
             "general.file_type".into(),
@@ -819,29 +1505,6 @@ fn model_metadata(
                 .map(GgufValue::String)
                 .collect(),
         ),
-    ));
-
-    for (suffix, value) in [
-        ("context_length", cfg.context as u32),
-        ("embedding_length", cfg.hidden as u32),
-        ("block_count", cfg.layers as u32),
-        ("feed_forward_length", cfg.ffn as u32),
-        ("attention.head_count", cfg.heads as u32),
-        ("attention.head_count_kv", cfg.kv_heads as u32),
-        ("attention.key_length", cfg.head_dim as u32),
-        ("attention.value_length", cfg.head_dim as u32),
-        ("rope.dimension_count", cfg.head_dim as u32),
-        ("vocab_size", cfg.vocab as u32),
-    ] {
-        out.push((format!("{arch}.{suffix}"), GgufValue::U32(value)));
-    }
-    out.push((
-        format!("{arch}.attention.layer_norm_rms_epsilon"),
-        GgufValue::F32(cfg.eps),
-    ));
-    out.push((
-        format!("{arch}.rope.freq_base"),
-        GgufValue::F32(cfg.rope_base),
     ));
     out
 }
@@ -923,9 +1586,37 @@ fn tokenizer_metadata(vocabulary: &vocab::Vocab, chat_template: &str) -> Vec<(St
 }
 
 /// Rewrites an existing model at another weight format.
-fn convert(args: &Args, source: &Path, ftype: Ftype) -> Result<()> {
+/// Chunks of the calibration text `-q auto` measures KL over.
+const KL_CHUNKS: usize = 2;
+
+/// How a written file is laid out and labelled, beyond its weight format.
+#[derive(Debug, Default)]
+struct Layout {
+    /// Shards no larger than this.
+    split: shards::Split,
+    /// A shard set written as the source set is cut.
+    keep_split: bool,
+    /// One type for every quantizable tensor (`--pure`).
+    pure: bool,
+    /// Quantized source tensors are read back and quantized again.
+    requantize: bool,
+    /// Metadata changes, in order.
+    edits: Vec<shards::Edit>,
+}
+
+fn convert(
+    output: Option<&Path>,
+    source: &Path,
+    ftype: Ftype,
+    matrix: Option<&imatrix::Loaded>,
+    options: &optimize::Options,
+    auto: bool,
+    layout: &Layout,
+) -> Result<()> {
     let started = Instant::now();
-    let file = GgufFile::open(source).with_context(|| format!("reading {}", source.display()))?;
+    let format = if auto { "auto" } else { ftype.name() };
+    let set = shards::Source::open(source)?;
+    let file = set.as_file();
     let architecture = file
         .metadata
         .iter()
@@ -934,45 +1625,37 @@ fn convert(args: &Args, source: &Path, ftype: Ftype) -> Result<()> {
             GgufValue::String(s) => Some(s.clone()),
             _ => None,
         })
-        .unwrap_or_else(|| ARCHITECTURE.to_string());
-    let number = |key: &str| {
-        file.metadata
-            .iter()
-            .find(|(k, _)| *k == format!("{architecture}.{key}"))
-            .and_then(|(_, v)| v.as_u64())
-            .unwrap_or(0) as usize
-    };
-    let layers = number("block_count");
-    // The mixture rules need the query-per-key-value ratio: with grouped
-    // query attention the value projection is small, and carrying it above
-    // the file's base type costs almost nothing. A file that does not say
-    // reads as 1, which is the conservative answer.
-    let heads = number("attention.head_count");
-    let kv_heads = number("attention.head_count_kv").max(1);
+        .unwrap_or_else(|| "unknown".to_string());
     let model = quant::Model {
-        layers,
-        gqa: (heads / kv_heads).max(1),
+        imatrix: matrix.is_some(),
+        pure: layout.pure,
+        ..quant::Model::from_metadata(&file.metadata)
     };
-
-    let output = args.output.clone().unwrap_or_else(|| {
-        source.with_file_name(format!("{}-{}.gguf", base_name(source), ftype.name()))
-    });
-    if output == source {
-        bail!("that would overwrite {} with itself", source.display());
+    let layers = model.layers;
+    if layout.keep_split && !set.is_split() {
+        bail!(
+            "--keep-split needs a shard set to keep: {} is one file",
+            source.display()
+        );
+    }
+    if layout.keep_split && layout.split.is_set() {
+        bail!("--keep-split keeps the source's shards; --split-max-* cuts new ones — give one");
     }
 
-    println!(
-        "source      {} ({architecture}, {layers} blocks)",
-        source.display()
-    );
-    println!("output      {} ({})\n", output.display(), ftype.name());
+    let output = output
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| source.with_file_name(format!("{}-{}.gguf", base_name(source), format)));
 
-    // Every metadata key comes across unchanged except the two that
+    // Every metadata key comes across unchanged except the ones that
     // describe the encoding, which are now this file's, not the source's.
     let mut metadata: Vec<(String, GgufValue)> = file
         .metadata
         .iter()
-        .filter(|(k, _)| k != "general.file_type" && k != "general.quantization_version")
+        .filter(|(k, _)| {
+            k != "general.file_type"
+                && k != "general.quantization_version"
+                && !k.starts_with("quantize.imatrix.")
+        })
         .cloned()
         .collect();
     metadata.push((
@@ -981,9 +1664,64 @@ fn convert(args: &Args, source: &Path, ftype: Ftype) -> Result<()> {
     ));
     metadata.push(("general.quantization_version".into(), GgufValue::U32(2)));
 
-    let mut plans = Vec::with_capacity(file.tensors.len());
-    for tensor in &file.tensors {
-        let plan = quant::plan_tensor(ftype, &tensor.name, &tensor.dims, model);
+    // Quantized tensors read back are rounded twice; done only when asked.
+    let mut quantized: Vec<u32> = file
+        .tensors
+        .iter()
+        .map(|t| t.ggml_type)
+        .filter(|&t| {
+            !matches!(
+                t,
+                quant::GGML_TYPE_F32 | quant::GGML_TYPE_F16 | quant::GGML_TYPE_BF16
+            )
+        })
+        .collect();
+    quantized.sort_unstable();
+    quantized.dedup();
+    let quantized: Vec<&str> = quantized.iter().map(|&t| quant::type_name(t)).collect();
+
+    println!(
+        "source      {} ({architecture}, {layers} blocks{})",
+        source.display(),
+        if set.is_split() {
+            format!(", {} shards", set.paths.len())
+        } else {
+            String::new()
+        }
+    );
+    println!("output      {} ({})\n", output.display(), format);
+    if !quantized.is_empty() {
+        if !layout.requantize {
+            bail!(
+                "{} holds {} tensors — quantizing them again rounds them twice. Quantize from \
+                 the F32, F16 or BF16 file, or pass --allow-requantize",
+                source.display(),
+                quantized.join(", ")
+            );
+        }
+        println!(
+            "warning: requantizing from {}: each tensor is rounded twice, and the result is \
+             worse than quantizing the original once\n",
+            quantized.join(", ")
+        );
+    }
+
+    // Listed block by block, the order the mixture's counters run in.
+    let mut ordered: Vec<&orangu::gguf::TensorInfo> = file.tensors.iter().collect();
+    quant::sort_for_quantizing(&mut ordered, |t| t.name.as_str());
+    let inputs: Vec<quant::Tensor<'_>> = ordered
+        .iter()
+        .map(|t| quant::Tensor {
+            name: &t.name,
+            dims: &t.dims,
+            source: t.ggml_type,
+        })
+        .collect();
+    let mut plans = Vec::with_capacity(ordered.len());
+    for (tensor, plan) in ordered
+        .iter()
+        .zip(quant::plan_tensors(ftype, &inputs, &model))
+    {
         if let Some(from) = plan.fallback_from {
             println!(
                 "note: {}: {} does not divide {}, writing {}",
@@ -1000,59 +1738,161 @@ fn convert(args: &Args, source: &Path, ftype: Ftype) -> Result<()> {
         });
     }
 
+    let index: std::collections::HashMap<&str, usize> = set
+        .tensors
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name.as_str(), i))
+        .collect();
+    let read = |plan: &write::TensorPlan| -> Result<Vec<f32>> {
+        let &i = index
+            .get(plan.name.as_str())
+            .ok_or_else(|| anyhow::anyhow!("{} vanished from the source", plan.name))?;
+        set.values(i, layout.requantize)
+    };
+
+    if auto {
+        let text = options
+            .text
+            .as_deref()
+            .context("-q auto needs --calibration TEXT")?;
+        let text = kl::Text::open(source, text, KL_CHUNKS)?;
+        let summary = optimize::select(
+            &file,
+            source,
+            &text,
+            &mut plans,
+            |name| matrix.and_then(|m| m.matrix.get(name)).map(<[f32]>::to_vec),
+            read,
+            options,
+        )?;
+        optimize::print(&summary, &plans);
+        if let Some((_, value)) = metadata.iter_mut().find(|(k, _)| k == "general.file_type") {
+            *value = GgufValue::U32(optimize::file_type(&plans));
+        }
+    }
+
+    optimize::apply_overrides(&mut plans, &options.overrides)?;
+    imatrix::require(ftype, &plans, matrix)?;
+    if let Some(matrix) = matrix {
+        matrix.apply(&plans, &mut metadata)?;
+    }
+    shards::apply(&mut metadata, &layout.edits)?;
+
+    // The shards: the source's own, or cut to the limits given.
+    let groups: Vec<Vec<usize>> = if layout.keep_split {
+        let mut by_shard = vec![Vec::new(); set.paths.len()];
+        for (p, plan) in plans.iter().enumerate() {
+            by_shard[set.shard_of[index[plan.name.as_str()]]].push(p);
+        }
+        by_shard.retain(|g| !g.is_empty());
+        by_shard
+    } else {
+        let sizes: Vec<u64> = plans
+            .iter()
+            .map(|p| write::aligned(p.bytes() as u64, 32))
+            .collect();
+        let records: Vec<(&str, &[u64], u32)> = plans
+            .iter()
+            .map(|p| (p.name.as_str(), p.dims.as_slice(), p.ggml_type))
+            .collect();
+        shards::groups(
+            &sizes,
+            &layout.split,
+            shards::overheads(&metadata, &records, 32)?,
+        )
+    };
+    let count = groups.len();
+    for no in 0..count {
+        let path = shards::shard_path(&output, no, count);
+        if set.paths.contains(&path) {
+            bail!("that would overwrite {} with itself", path.display());
+        }
+    }
     println!(
-        "writing {} tensors, {} of weights",
+        "writing {} tensors, {} of weights{}",
         plans.len(),
-        bytes(write::planned_bytes(&plans))
+        bytes(write::planned_bytes(&plans)),
+        if count > 1 {
+            format!(", in {count} shards")
+        } else {
+            String::new()
+        }
     );
 
-    let handle = fs::File::open(source)?;
-    // Safety: the source file is opened read-only and this process does not
-    // write to it.
-    let map = unsafe { memmap2::Mmap::map(&handle) }
-        .with_context(|| format!("mapping {}", source.display()))?;
-    let by_name: std::collections::HashMap<&str, &orangu::gguf::TensorInfo> =
-        file.tensors.iter().map(|t| (t.name.as_str(), t)).collect();
-
-    let written = write::write(
-        &output,
-        &metadata,
-        &plans,
-        |plan| {
-            let tensor = by_name
-                .get(plan.name.as_str())
-                .ok_or_else(|| anyhow::anyhow!("{} vanished from the source", plan.name))?;
-            let elements = tensor.element_count() as usize;
-            let ncols = tensor.dims[0] as usize;
-            let bytes = quant::row_bytes(tensor.ggml_type, ncols) * (elements / ncols.max(1));
-            let start = (file.data_offset + tensor.offset) as usize;
-            let end = start + bytes;
-            if bytes == 0 || end > map.len() {
-                bail!(
-                    "{} is {} in the source, which this tool cannot read back",
+    // Nodes of a channel take pieces of the tensors worth dividing.
+    let mut spread = if plans.iter().any(|p| quant::block_size(p.ggml_type) > 1) {
+        spread::Spread::start(source, layout.requantize, jobs::claim_for("quantize"))?
+    } else {
+        None
+    };
+    let mut written = 0u64;
+    for (no, group) in groups.iter().enumerate() {
+        let path = shards::shard_path(&output, no, count);
+        let keys = shards::shard_metadata(&metadata, no, count, plans.len());
+        let part: Vec<write::TensorPlan> = group.iter().map(|&i| plans[i].clone()).collect();
+        written += write::write_with(
+            &path,
+            &keys,
+            &part,
+            |plan, sink| {
+                let reading = Instant::now();
+                let values = read(plan)?;
+                if values.len() != plan.elements() {
+                    bail!(
+                        "{} weights for a tensor of {}",
+                        values.len(),
+                        plan.elements()
+                    );
+                }
+                let importance = matrix.and_then(|m| m.for_plan(plan));
+                match spread.as_mut() {
+                    Some(spread) => spread.tensor(
+                        plan,
+                        &values,
+                        importance,
+                        reading.elapsed().as_secs_f64(),
+                        sink,
+                    ),
+                    None => sink(&match importance {
+                        Some(w) => orangu::quantize::encode_weighted(
+                            plan.ggml_type,
+                            &values,
+                            plan.ncols(),
+                            w,
+                        ),
+                        None => orangu::quantize::encode(plan.ggml_type, &values, plan.ncols()),
+                    }),
+                }
+            },
+            &|n, total, plan| {
+                print!(
+                    "\r  writing {}/{total} {} as {}    ",
+                    n + 1,
                     plan.name,
-                    quant::type_name(tensor.ggml_type)
+                    quant::type_name(plan.ggml_type)
                 );
-            }
-            quant::decode(tensor.ggml_type, &map[start..end], elements)
-                .with_context(|| plan.name.clone())
-        },
-        &|n, total, plan| {
-            print!(
-                "\r  writing {}/{total} {} as {}    ",
-                n + 1,
-                plan.name,
-                quant::type_name(plan.ggml_type)
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        },
-    )?;
+                let _ = std::io::Write::flush(&mut std::io::stdout());
+            },
+        )?;
+        if count > 1 {
+            println!("\n  wrote {}", path.display());
+        }
+    }
 
+    if let Some(spread) = spread {
+        spread.finish();
+    }
+    let was: u64 = set
+        .paths
+        .iter()
+        .map(|p| fs::metadata(p).map(|m| m.len()))
+        .sum::<std::io::Result<u64>>()?;
     println!(
         "\nwrote {} ({}, was {}) in {}",
-        output.display(),
+        shards::shard_path(&output, 0, count).display(),
         bytes(written),
-        bytes(fs::metadata(source)?.len()),
+        bytes(was),
         train::format_duration(started.elapsed().as_secs_f64())
     );
     Ok(())
@@ -1062,10 +1902,12 @@ fn convert(args: &Args, source: &Path, ftype: Ftype) -> Result<()> {
 /// off, so converting `m-BF16.gguf` produces `m-Q4_K_M.gguf` rather than
 /// `m-BF16-Q4_K_M.gguf`, which claims two formats and is neither.
 fn base_name(source: &Path) -> String {
-    let stem = source
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("model");
+    without_format(&shards::set_stem(source))
+}
+
+/// `stem` with a weight format it ends in (`-BF16`, `-Q4_K_M`, …) taken
+/// off: a checkpoint published as `Model-BF16` converts to `Model-Q4_K_M`.
+fn without_format(stem: &str) -> String {
     // The formats this tool writes, and the ones it does not but may well
     // be handed: a file called `model-Q8_0.gguf` is a perfectly good source
     // and its conversion should be `model-Q4_K_M.gguf`, not
@@ -1295,7 +2137,7 @@ mod tests {
         // And the manifest's own defaults are the documented ones.
         let manifest =
             Manifest::parse(r#"{"repositories": [{"url": "u", "license": "MIT"}]}"#).unwrap();
-        assert_eq!(manifest.training_size, "2b");
+        assert_eq!(manifest.training_size, "1b");
         assert_eq!(parse_context(&manifest.context_size).unwrap(), 262_144);
         assert_eq!(Ftype::parse(&manifest.quantization).unwrap(), Ftype::Bf16);
     }
@@ -1318,6 +2160,10 @@ mod tests {
         // A name that is only a format keeps it, rather than becoming
         // nothing at all.
         assert_eq!(base_name(Path::new("/m/BF16.gguf")), "BF16");
+        assert_eq!(
+            without_format("Ministral-3-3B-Instruct-2512-BF16"),
+            "Ministral-3-3B-Instruct-2512"
+        );
     }
 
     /// Without a template a chat endpoint refuses the request outright, so
@@ -1373,8 +2219,12 @@ mod tests {
             r#"{"name":"n","license":"Apache-2.0","repositories":[{"url":"u","license":"MIT"}]}"#,
         )
         .unwrap();
-        let cfg = Config::from_size(model::size_named("2b").unwrap(), 32768, 262_144);
-        let metadata = model_metadata(&manifest, &cfg, Ftype::Bf16, "2b", None);
+        let network = Model::new(
+            Config::from_size(model::size_named("tiny").unwrap(), 300, 262_144),
+            1,
+        );
+        let mut metadata = model_metadata(&manifest, "qwen3", 0, Ftype::Bf16, "tiny", None);
+        metadata.extend(network.architecture_metadata());
         let keys: Vec<&str> = metadata.iter().map(|(k, _)| k.as_str()).collect();
         for required in [
             "general.architecture",

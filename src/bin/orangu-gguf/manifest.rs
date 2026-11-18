@@ -34,7 +34,8 @@
 //! {
 //!   "name": "orangu-code",
 //!   "license": "Apache-2.0",
-//!   "training_size": "2b",
+//!   "architecture": "qwen4exp",
+//!   "training_size": "1b",
 //!   "context_size": "256k",
 //!   "quantization": "bf16",
 //!   "repositories": [
@@ -139,8 +140,11 @@ impl Repository {
 fn default_vocab_size() -> usize {
     32768
 }
+fn default_architecture() -> String {
+    "qwen4exp".to_string()
+}
 fn default_training_size() -> String {
-    "2b".to_string()
+    "1b".to_string()
 }
 fn default_context_size() -> String {
     "256k".to_string()
@@ -209,7 +213,11 @@ pub struct Manifest {
     #[serde(default)]
     pub description: Option<String>,
 
-    /// `smoke`, `0.5b`, `1b` or `2b`.
+    /// The architecture trained: `qwen4exp` or `qwen3`.
+    #[serde(default = "default_architecture")]
+    pub architecture: String,
+    /// One of the architecture's sizes: `tiny`, `smoke`, `1b`, and for
+    /// `qwen3` also `0.5b` and `2b`.
     #[serde(default = "default_training_size")]
     pub training_size: String,
     /// The context length the finished model declares: `8192`, `8k`, `256k`.
@@ -292,6 +300,11 @@ pub struct Manifest {
     /// weight format.
     #[serde(default)]
     pub output: Option<PathBuf>,
+    /// A text the trained model reads before it is written: what it measures
+    /// is the importance matrix the weights are fitted to. Absent writes
+    /// without one, which the formats below three bits refuse.
+    #[serde(default)]
+    pub calibration: Option<PathBuf>,
 
     /// English (or another language's) Wikipedia, as prose to train on
     /// beside the code. Absent leaves it out.
@@ -624,7 +637,8 @@ mod tests {
     fn a_manifest_of_material_alone_takes_every_default() {
         let m = Manifest::parse(MINIMAL).unwrap();
         assert_eq!(m.name, "orangu");
-        assert_eq!(m.training_size, "2b");
+        assert_eq!(m.training_size, "1b");
+        assert_eq!(m.architecture, "qwen4exp");
         assert_eq!(m.context_size, "256k");
         assert_eq!(m.quantization, "bf16");
         assert_eq!(m.vocab_size, 32768);
@@ -663,7 +677,7 @@ mod tests {
                  "resume": true, "export_only": true,
                  "jobs": 8, "max_file_size": 4096, "tokenizer_sample": 8192,
                  "offline": true, "rebuild": true, "allow_any_license": true,
-                 "work_dir": "/w", "output": "/o/m.gguf",
+                 "work_dir": "/w", "output": "/o/m.gguf", "calibration": "/c.txt",
                  "repositories": [{"url": "u", "license": "GPL-3.0-or-later"}]
                }"#,
         )
@@ -689,6 +703,7 @@ mod tests {
         assert_eq!(m.tokenizer_sample, 8192);
         assert_eq!(m.work_dir.as_deref(), Some(Path::new("/w")));
         assert_eq!(m.output.as_deref(), Some(Path::new("/o/m.gguf")));
+        assert_eq!(m.calibration.as_deref(), Some(Path::new("/c.txt")));
     }
 
     /// Wikipedia is a corpus source like any other, and what it brings

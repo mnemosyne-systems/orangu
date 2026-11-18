@@ -456,6 +456,13 @@ unsloth/Qwen3-8B-GGUF:Q4_K_M           orangu-server channel
 A chat turn in the web console names no model: it is served by the
 console's own model, routed as described above.
 
+### gguf nodes
+
+A channel can also hold `orangu-gguf --worker` nodes, which take a share of
+building a model file (see *Building a model*, *Several machines*). Their
+probe answers say they are gguf nodes; a server never claims one as a
+worker, and `/v1/workers` does not list them.
+
 ### Demand nobody serves
 
 Each node counts the requests it gets for a model no free node of the

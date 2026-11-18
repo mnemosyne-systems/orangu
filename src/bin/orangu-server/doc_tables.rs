@@ -26,7 +26,7 @@ const ENGINE_DOC: &str = include_str!("../../../doc/ENGINE.md");
 const SERVER_DOC: &str = include_str!("../../../doc/SERVER.md");
 const SERVER_MANUAL: &str = include_str!("../../../doc/manual/en/46-server.md");
 const README: &str = include_str!("../../../README.md");
-const LOADER: &str = include_str!("engine/loader.rs");
+const LOADER: &str = include_str!("../../engine/loader.rs");
 
 /// The text of `doc`'s section under `heading`, up to the next heading of the
 /// same depth or shallower.

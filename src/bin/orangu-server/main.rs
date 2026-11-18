@@ -43,10 +43,10 @@ mod best;
 mod bundle;
 mod config;
 mod daemon;
-mod device_lost;
+use orangu::device_lost;
 #[cfg(test)]
 mod doc_tables;
-mod engine;
+use orangu::engine;
 #[cfg(test)]
 mod fuzz_targets;
 #[cfg(test)]
@@ -56,14 +56,14 @@ mod fuzzing;
 mod http;
 mod init;
 mod npu_tool;
-mod panic_capture;
+use orangu::panic_capture;
 mod prune;
 mod reexec;
 mod refresh;
 mod shell;
 mod speed;
 mod suggest;
-mod tls;
+use orangu::tls;
 mod web;
 mod workers;
 
@@ -73,24 +73,6 @@ use config::{
     BackendPreference, ServerConfiguration, default_server_config_path, load_server_configuration,
 };
 use engine::arch::ModelForward;
-use engine::arch::bailingmoe::BailingMoeModel;
-use engine::arch::deepseek4::Deepseek4Model;
-use engine::arch::deepseek41::Deepseek41Model;
-use engine::arch::dflash::DFlashModel;
-use engine::arch::gemma::GemmaModel;
-use engine::arch::glm5::Glm5Model;
-use engine::arch::inkling::InklingModel;
-use engine::arch::kimi3::Kimi3Model;
-use engine::arch::llama::LlamaModel;
-use engine::arch::mistral::MistralModel;
-use engine::arch::muse::MuseModel;
-use engine::arch::muse_spark::MuseSparkModel;
-use engine::arch::nemotron::NemotronModel;
-use engine::arch::phi::PhiModel;
-use engine::arch::qwen3next::Qwen3NextModel;
-use engine::arch::qwen4exp::Qwen4ExpModel;
-use engine::arch::qwen35::Qwen35Model;
-use engine::arch::qwen35moe::Qwen35MoeModel;
 use engine::backend::device;
 use engine::backend::device::DeviceClass;
 use engine::backend::vulkan_shaders::KvStorage;
@@ -101,7 +83,6 @@ use engine::backend::{
 use engine::footprint::DeviceFootprint;
 use engine::generate::Engine;
 use engine::kv_cache::KvCache;
-use engine::loader::ArchFamily;
 use engine::loader::LoadedModel;
 use engine::placement::{self, SplitMode, SplitPlan};
 use engine::scheduler::SlotPool;
@@ -658,6 +639,13 @@ const COMPLETION_SCRIPTS: shell_completions::Scripts = shell_completions::Script
 
 fn main() -> ExitCode {
     panic_capture::install();
+    engine::generate::on_request_started(|| {
+        Box::pin(async {
+            workers::node::request_started_async()
+                .await
+                .map(|guard| Box::new(guard) as engine::generate::RequestGuard)
+        })
+    });
     // Backtraces normally need `RUST_BACKTRACE=1` from whoever launched
     // the process — set unconditionally instead, so both a captured panic
     // (`panic_capture`) and every `anyhow::Error` created from here on
@@ -1759,9 +1747,18 @@ fn prepare(args: Args) -> Result<Prepared> {
         (context, per_token * context as u64 + fixed)
     });
     let mut escalated_for_context = false;
-    let split_mode = if partial && requested.is_off() {
+    let fits_whole_model = !overflows_selected_device(
+        backend.as_ref(),
+        weights_device_bytes + transformer_reserve_bytes.unwrap_or(0),
+    ) && context_kv_bytes.is_none_or(|(_, kv)| fits_context(kv))
+        && usable_context_kv.is_none_or(|(_, kv)| fits_weights_beside(kv));
+    let split_mode = if partial && requested.is_off() && fits_whole_model {
         // Whether this node's share fits its device is the plan's question
-        // (`workers::plan`), not the whole model's.
+        // (`workers::plan`), not the whole model's. A model the device cannot
+        // hold whole still moves layers to the host below: the plan only
+        // warns about a share over budget, and a node with no worker to take
+        // the rest would otherwise put every layer on the card and have no
+        // room left for a single token.
         requested
     } else if requested.is_off()
         && split_flag.is_none()
@@ -4544,122 +4541,7 @@ fn build_model(
     loaded: &engine::loader::LoadedModel,
     backend: &Arc<dyn Backend>,
 ) -> Result<Arc<dyn ModelForward>> {
-    let architecture = loaded.config.architecture.clone();
-    let family = engine::loader::resolve_arch_family(&architecture)?;
-    // A Hadamard-folded file (`engine::hadamard`) is only served by the
-    // architectures whose loaders route every folded weight through the
-    // fold ledger. The rest would load it as if the weights were plain and
-    // generate confidently wrong text, so they refuse it up front.
-    if !matches!(
-        family,
-        ArchFamily::Qwen35 | ArchFamily::Qwen35Moe | ArchFamily::Qwen3Next | ArchFamily::Qwen4Exp
-    ) && engine::hadamard::from_loaded(loaded)?.is_some()
-    {
-        bail!(
-            "this file's weights are Hadamard-folded (prism.hadamard.*), and the `{architecture}`              architecture does not apply the activation transform that requires; only the Qwen              3.5-family architectures do"
-        );
-    }
-    let model: Arc<dyn ModelForward> = match family {
-        ArchFamily::LlamaStyle => Arc::new(
-            LlamaModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Gemma => Arc::new(
-            GemmaModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Qwen35Moe => Arc::new(
-            Qwen35MoeModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Qwen35 => Arc::new(
-            Qwen35Model::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Qwen3Next => Arc::new(
-            Qwen3NextModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Qwen4Exp => Arc::new(
-            Qwen4ExpModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::DFlash => {
-            Arc::new(DFlashModel::load_with_backend(loaded).context("building model")?)
-        }
-        ArchFamily::Deepseek41 => Arc::new(
-            Deepseek41Model::load_with_backend(loaded, backend.clone())
-                .context("building model")?,
-        ),
-        ArchFamily::Deepseek4 => Arc::new(
-            Deepseek4Model::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        // `glm-dsa` and `mistral-large4` are two configurations of one
-        // trunk, `arch::dsa`; each module reads its own file conventions
-        // into it.
-        ArchFamily::GlmDsa => Arc::new(
-            crate::engine::arch::glm::load_with_backend(loaded, backend.clone())
-                .context("building model")?,
-        ),
-        ArchFamily::MistralLarge4 => Arc::new(
-            crate::engine::arch::mistral_large4::load_with_backend(loaded, backend.clone())
-                .context("building model")?,
-        ),
-        ArchFamily::MinimaxM3 => Arc::new(
-            crate::engine::arch::minimax_m3::MinimaxM3Model::load_with_backend(
-                loaded,
-                backend.clone(),
-            )
-            .context("building model")?,
-        ),
-        ArchFamily::Glm5Next => Arc::new(
-            Glm5Model::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::KimiK3 => Arc::new(
-            Kimi3Model::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Phi3 => Arc::new(
-            PhiModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Mistral3 => Arc::new(
-            MistralModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        // `arch::granite` returns a `LlamaModel` — Granite's block *is*
-        // llama's, and the module is the four multipliers that make it
-        // Granite rather than a second forward pass.
-        ArchFamily::Granite => Arc::new(
-            crate::engine::arch::granite::load_with_backend(loaded, backend.clone())
-                .context("building model")?,
-        ),
-        ArchFamily::Muse => Arc::new(
-            MuseModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::MuseSpark => Arc::new(
-            MuseSparkModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::Inkling => Arc::new(
-            InklingModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::NemotronHMoe => Arc::new(
-            NemotronModel::load_with_backend(loaded, backend.clone()).context("building model")?,
-        ),
-        ArchFamily::BailingMoe3 => Arc::new(
-            BailingMoeModel::load_with_backend(loaded, backend.clone())
-                .context("building model")?,
-        ),
-        // Not a language model: `prepare` builds the served `ModelForward`
-        // from its text encoder and the transformer through
-        // `engine::image::Pipeline`, and never reaches here with one. A
-        // draft-model spec naming one is the only way in.
-        ArchFamily::QwenImage => bail!(
-            "{architecture} is a diffusion transformer, not a language model; it is served as \
-             the model, with its text encoder and VAE beside it, and cannot stand in as a draft"
-        ),
-        ArchFamily::Qwen3Tts => bail!(
-            "{architecture} is a speech generator, not a language model; it is served as the \
-             model, with its codec and voices beside it, and cannot stand in as a draft"
-        ),
-        ArchFamily::Ltxv => bail!(
-            "{architecture} is a video diffusion transformer, not a language model; it is \
-             served as the model, with its text encoder and VAEs beside it, and cannot stand in \
-             as a draft"
-        ),
-    };
-    Ok(model)
+    engine::build::model(loaded, backend)
 }
 
 /// Starts this process's [`workers::node::Node`] from its `[workers]`

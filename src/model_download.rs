@@ -687,14 +687,32 @@ pub fn download_repo_file(
     file_path: &str,
     progress: Option<Arc<DownloadProgress>>,
 ) -> Result<PathBuf> {
+    let snapshot = download_repo_files(models_dir, repo, &|path| path == file_path, progress)?;
+    Ok(snapshot.join(file_path))
+}
+
+/// Fetches every file of a repository that `wanted` accepts into the
+/// hub-cache layout, the way [`download_repo_file`] fetches one — a model
+/// checkpoint that is not GGUF: its `config.json`, tokenizer files and
+/// safetensors shards. Returns the snapshot directory. A file already
+/// complete in the blob store is not fetched again, and a partial one
+/// resumes.
+pub fn download_repo_files(
+    models_dir: &Path,
+    repo: &str,
+    wanted: &dyn Fn(&str) -> bool,
+    progress: Option<Arc<DownloadProgress>>,
+) -> Result<PathBuf> {
     let client = build_client(None)?;
     let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
     let commit = resolve_commit(&client, repo, token.as_deref())?;
-    let files = list_repo_files(&client, repo, &commit, token.as_deref())?;
-    let file = files
-        .iter()
-        .find(|f| f.path == file_path)
-        .ok_or_else(|| anyhow!("{repo} has no file {file_path}"))?;
+    let files: Vec<RepoFile> = list_repo_files(&client, repo, &commit, token.as_deref())?
+        .into_iter()
+        .filter(|f| wanted(&f.path))
+        .collect();
+    if files.is_empty() {
+        bail!("{repo} has no file this download wants");
+    }
 
     let repo_dir = models_dir.join(repo_folder_name(repo));
     let blobs_dir = repo_dir.join("blobs");
@@ -709,52 +727,60 @@ pub fn download_repo_file(
     fs::write(refs_dir.join("main"), &commit)
         .with_context(|| format!("failed to write {}", refs_dir.join("main").display()))?;
 
-    let blob_path = blobs_dir.join(&file.oid);
-    let already_downloaded = blob_path.is_file() && fs::metadata(&blob_path)?.len() == file.size;
-    let resumed = resumed_bytes(&blob_path, file.size);
-    let slots = vec![Slot {
-        label: file.path.clone(),
-        size: file.size,
-        downloaded: if already_downloaded {
-            file.size
-        } else {
-            resumed
-        },
-        state: if already_downloaded {
-            SlotState::Skipped
-        } else {
-            SlotState::Queued
-        },
-    }];
-    check_space(
-        &blobs_dir,
-        file.size - slots[0].downloaded,
-        crate::os::available_space(&blobs_dir),
-    )?;
+    let mut slots = Vec::with_capacity(files.len());
+    let mut tasks = Vec::new();
+    let mut needed = 0u64;
+    for (slot, file) in files.iter().enumerate() {
+        let blob_path = blobs_dir.join(&file.oid);
+        let done = blob_path.is_file() && fs::metadata(&blob_path)?.len() == file.size;
+        let resumed = resumed_bytes(&blob_path, file.size);
+        let downloaded = if done { file.size } else { resumed };
+        needed += file.size - downloaded;
+        slots.push(Slot {
+            label: file.path.clone(),
+            size: file.size,
+            downloaded,
+            state: if done {
+                SlotState::Skipped
+            } else {
+                SlotState::Queued
+            },
+        });
+        if !done {
+            tasks.push(DownloadTask {
+                label: file.path.clone(),
+                url: format!(
+                    "{HUB_ENDPOINT}/{repo}/resolve/{commit}/{}",
+                    urlencode_path(&file.path)
+                ),
+                blob_path,
+                size: file.size,
+                slot,
+            });
+        }
+    }
+    check_space(&blobs_dir, needed, crate::os::available_space(&blobs_dir))?;
     let board = Mutex::new(ProgressBoard::new(slots, progress));
     board.lock().unwrap().draw();
-    if !already_downloaded {
-        let tasks = vec![DownloadTask {
-            label: file.path.clone(),
-            url: format!(
-                "{HUB_ENDPOINT}/{repo}/resolve/{commit}/{}",
-                urlencode_path(&file.path)
-            ),
-            blob_path: blob_path.clone(),
-            size: file.size,
-            slot: 0,
-        }];
+    if !tasks.is_empty() {
         download_all(&client, &tasks, token.as_deref(), &board)?;
     }
-    let snapshot_path = snapshot_dir.join(&file.path);
-    if let Some(parent) = snapshot_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
+    for file in &files {
+        let snapshot_path = snapshot_dir.join(&file.path);
+        if let Some(parent) = snapshot_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        if !snapshot_path.exists() {
+            link_or_copy(
+                &blobs_dir.join(&file.oid),
+                &snapshot_path,
+                &file.oid,
+                &file.path,
+            )?;
+        }
     }
-    if !snapshot_path.exists() {
-        link_or_copy(&blob_path, &snapshot_path, &file.oid, &file.path)?;
-    }
-    Ok(snapshot_path)
+    Ok(snapshot_dir)
 }
 
 /// How long one shard's header fetch may take before
@@ -1020,7 +1046,7 @@ pub fn strip_hub_url(spec: &str) -> &str {
 /// `models--<user>--<model>`, the Hugging Face hub cache's own directory
 /// naming convention (`repo_id.replace("/", "--")`, prefixed) — the same
 /// one `models::hf_repo_id_from_path` reverses when reading a cache back.
-fn repo_folder_name(repo: &str) -> String {
+pub fn repo_folder_name(repo: &str) -> String {
     format!("models--{}", repo.replace('/', "--"))
 }
 

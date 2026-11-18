@@ -218,57 +218,7 @@ fn decode_seam_usable(gguf: &GgufFile) -> bool {
 }
 
 /// The prefill chunk this engine issues, and so the only width a block is
-/// ever compiled for.
-///
-/// A graph on this device has one static shape, so this is part of a
-/// block's cache identity: a request at any other width finds nothing and
-/// goes to the CPU or GPU as before.
-pub const PREFILL_WIDTH: usize = 16;
-
-/// The prefill width to compile for, `ORANGU_NPU_PREFILL_WIDTH` overriding
-/// [`PREFILL_WIDTH`].
-///
-/// A measurement knob first: the device is not equally efficient at every
-/// width, and 16 is what this engine's chunk sizer happens to issue rather
-/// than what the hardware likes. One block of llama 3.2 3B `Q8_0`, per
-/// token on the device:
-///
-/// | width | per token | rate |
-/// |---|---|---|
-/// | 1 | 3.27 ms | 46 GF/s |
-/// | 16 | 0.342 ms | 441 GF/s |
-/// | 32 | 0.415 ms | 364 GF/s |
-/// | 64 | **0.256 ms** | **590 GF/s** |
-/// | 128 | 0.281 ms | 537 GF/s |
-///
-/// Whether that 1.34x survives end to end is a different question, because
-/// a wider graph only gets used if `prefill_in_chunks` issues chunks that
-/// wide, and its sizer is bounded by `ORANGU_PREFILL_CHUNK_MS`. The two
-/// have to move together, which is what this knob is for.
-pub fn prefill_width() -> usize {
-    if let Some(forced) = forced_prefill_width() {
-        return forced;
-    }
-    match MEASURED_WIDTH.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => PREFILL_WIDTH,
-        measured => measured,
-    }
-}
-
-/// `ORANGU_NPU_PREFILL_WIDTH`, when an operator has pinned the width.
-fn forced_prefill_width() -> Option<usize> {
-    static FORCED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *FORCED.get_or_init(|| {
-        std::env::var("ORANGU_NPU_PREFILL_WIDTH")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .filter(|w| *w > 1)
-    })
-}
-
-/// What [`probe_prefill_width`] measured on this device, or `0` before it
-/// has run.
-static MEASURED_WIDTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub use orangu::engine::npu_switches::{forced_prefill_width, prefill_width};
 
 /// Widths [`probe_prefill_width`] times.
 ///
@@ -1658,16 +1608,6 @@ fn attention_input_width(path: &Path, layer: usize) -> Option<usize> {
         .map(|d| d as usize)
 }
 
-/// Whether the attention projections may run on the device, on unless
-/// `ORANGU_NPU_ATTN=0`.
-///
-/// A serving-time switch rather than a compile-time one, so one cache
-/// serves both arms of a measurement and the two differ in nothing else.
-pub fn attention_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::engine::env::flag_on_unless_disabled("ORANGU_NPU_ATTN"))
-}
-
 /// Measures this model's attention projections on the device.
 ///
 /// Two invocations, because compiling needs ONNX Runtime and executing
@@ -2647,7 +2587,7 @@ fn prepare(model: &Path, enabled: bool, budget_bytes: u64) {
         && let Ok(executable) = std::env::current_exe()
         && let Some(width) = probe_prefill_width(model, &executable)
     {
-        MEASURED_WIDTH.store(width, std::sync::atomic::Ordering::Relaxed);
+        orangu::engine::npu_switches::set_measured_width(width);
         log::info!("orangu-server: [npu] compiling for {width}-token chunks on this device");
     }
     if stopping() {

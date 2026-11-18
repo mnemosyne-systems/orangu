@@ -41,8 +41,7 @@
 //! - [`fetch`]: a node that downloads only what it runs; [`share`]: byte
 //!   ranges of a node's model file, served to such a node.
 
-pub mod auth;
-pub mod channel;
+pub use orangu::workers::{auth, channel, protocol, transport};
 pub mod clock;
 pub mod demand;
 pub mod divide;
@@ -57,11 +56,53 @@ pub mod pipeline;
 pub mod plan;
 pub mod prefill;
 pub mod prefixes;
-pub mod protocol;
 pub mod room;
 pub mod session;
 pub mod share;
 pub mod speed;
 pub mod stage;
 pub mod syncbench;
-pub mod transport;
+
+#[cfg(test)]
+pub mod fixture {
+    use std::path::{Path, PathBuf};
+
+    /// A self-signed certificate for `127.0.0.1` and `localhost`, and its
+    /// key, written under `dir` with `openssl` as the TLS tests do.
+    pub fn certificate(dir: &Path, name: &str) -> (PathBuf, PathBuf) {
+        let cert = dir.join(format!("{name}.pem"));
+        let key = dir.join(format!("{name}.key"));
+        let out = std::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=IP:127.0.0.1,DNS:localhost",
+                // A server's own certificate, not an authority: rustls
+                // refuses a CA certificate presented as a server's.
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+                "-keyout",
+                key.to_str().unwrap(),
+                "-out",
+                cert.to_str().unwrap(),
+            ])
+            .output()
+            .expect("openssl is needed for this test");
+        assert!(
+            out.status.success(),
+            "openssl: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (cert, key)
+    }
+}

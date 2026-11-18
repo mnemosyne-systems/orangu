@@ -10,9 +10,10 @@ ends of one pipeline:
   what it finds, packs the text into tokens, pretrains a transformer from
   random weights, and writes the result as a GGUF file that
   `orangu-server` serves directly.
-- **Convert one you already have.** Given an existing full-precision model,
-  it writes it out again at a smaller weight format — `Q6_K`, `Q4_K_M`,
-  or any of the dozen in *Weight formats* below.
+- **Convert one you already have.** Given an existing full-precision model
+  — a GGUF file, or a Hugging Face checkpoint directory — it writes it out
+  at the weight format you ask for: `BF16`, `Q6_K`, `Q4_K_M`, or any of
+  the dozen in *Weight formats* below.
 
 There is nothing to install beside the binary, and no conversion step
 between the two: what training produces is already the file the server
@@ -89,7 +90,8 @@ form says everything out loud:
   "license": "Apache-2.0",
   "description": "A small code model trained on permissive Rust and C.",
 
-  "training_size": "2b",
+  "architecture": "qwen4exp",
+  "training_size": "1b",
   "context_size": "256k",
   "quantization": "bf16",
   "vocab_size": 32768,
@@ -123,9 +125,11 @@ outcome than a parse failure.
 
 | Field | Default | Meaning |
 |:---|:---|:---|
-| `training_size` | `2b` | `tiny`, `smoke`, `0.5b`, `1b` or `2b` |
+| `architecture` | `qwen4exp` | `qwen4exp` or `qwen3`; see [Sizes](#sizes) |
+| `training_size` | `1b` | One of the architecture's sizes: `tiny`, `smoke`, `1b`, and for `qwen3` also `0.5b` and `2b` |
 | `context_size` | `256k` | The context length the model declares. Accepts `8192`, `8k`, `1M` |
 | `quantization` | `bf16` | The weight format written |
+| `calibration` | *(none)* | A text the trained model reads before it is written, measuring the importance matrix the weights are fitted to; required by the formats below three bits |
 | `vocab_size` | `32768` | Tokens in a newly trained vocabulary |
 | `chat_template` | *(ChatML)* | The Jinja2 template written as `tokenizer.chat_template`; `""` writes none |
 
@@ -388,16 +392,35 @@ orangu-gguf -m ./my-model-BF16.gguf -q q4_k_m
 
 | Option | What it does |
 |:---|:---|
-| `-m`, `--model` | Convert this file instead of training |
+| `-m`, `--model` | Convert this file, listed model, checkpoint directory or Hugging Face repository instead of training |
 | `-ts`, `--training-size` | Override the manifest's size for this run |
 | `-q`, `--quantization` | Override the weight format written |
 | `-cs`, `--context-size` | Override the declared context length |
 | `-o`, `--output` | Override where the model is written |
+| `--imatrix FILE` | Fit the quantization to an importance matrix: a file, or a Hugging Face repository that publishes one |
+| `--calibration FILE` | Measure an importance matrix over this text and fit the quantization to it; with `-q auto`, also the text its KL is measured over |
+| `--imatrix-out FILE` | With `--calibration`, write the measured matrix here and stop |
+| `--max-size SIZE` | With `-q auto`, the most bytes of weights the file may take |
+| `--max-kl NATS` | With `-q auto`, the most KL from the source over the calibration text, in nats |
+| `--tensor-type PATTERN=TYPE` | Write tensors whose name matches `PATTERN` as `TYPE` (repeatable) |
 | `--list-quantizations` | Print the weight formats and exit |
+| `--dump MODEL` | Print a model file's metadata and tensor table |
+| `--hash MODEL` | Print a SHA-256 of every tensor's stored bytes |
+| `--compare A B` | Compare two model files; exits non-zero when they differ |
+| `--split-max-size SIZE`, `--split-max-tensors N` | Write the model as shards; see [Shards and metadata](#shards-and-metadata) |
+| `--keep-split` | Write a shard set cut where the source set is cut |
+| `--merge FIRST` | Join a shard set into one file |
+| `--set`, `--delete`, `--override-kv` | Change metadata, in place or in the file written |
+| `--pure` | Quantize every tensor that may be to the format's base type |
+| `--allow-requantize` | Accept a quantized source |
+| `--worker` | Join the `[workers]` channel as a gguf node; see [Several machines](#several-machines) |
+| `--channel` | List the channel's nodes, servers and gguf nodes |
+| `--config FILE` | Read `[workers]` from this file instead of `orangu-gguf.conf` |
+| `--perplexity TEXT` | Print the perplexity of the `-m` model over the text, divided over the channel's gguf nodes when there are any |
 | `-s`, `--shell-completions` | Print the shell completion script and exit |
 
-The four overrides exist for the one-off — trying `0.5b` before committing
-to `2b`, or writing a second quantization of a model you already have.
+The four overrides exist for the one-off — trying `smoke` before committing
+to `1b`, or writing a second quantization of a model you already have.
 Anything you want to keep belongs in the manifest, where the next run will
 still find it. `-ts` and `-cs` are two letters behind a single dash, which
 most tools read as two separate short flags; they are accepted here anyway,
@@ -407,7 +430,7 @@ in both the `-ts 1b` and `-ts=1b` spellings, alongside the long forms.
 shell detected from `$SHELL` — the same switch every orangu binary has (see
 the Shell completions chapter). It completes the manifest with `.json`
 files, `-m` with `.gguf` files, `-q` with the weight formats (by shelling
-back out to `orangu-gguf --list-quantizations`), `-o` and `--flamegraph`
+back out to `orangu-gguf --list-quantizations`), `-o`, `--imatrix` and `--flamegraph`
 with files, and offers `-ts`/`-cs` alongside their long forms:
 
 ```sh
@@ -421,18 +444,130 @@ orangu-gguf -s | source
 orangu-gguf -s | Out-String | Invoke-Expression
 ```
 
+## Converting a Hugging Face checkpoint
+
+A Hugging Face checkpoint — `config.json`, `tokenizer.json`,
+`tokenizer_config.json` and the `*.safetensors` weights, one file or a
+shard set with its `model.safetensors.index.json` — converts the same way a
+GGUF file does. Name the repository:
+
+```sh
+orangu-gguf -m Qwen/Qwen3-0.6B -q bf16
+```
+
+It is looked for in the models directory `orangu-server` serves from
+(`[orangu-server].models` in `orangu-server.conf`) and downloaded there when
+it is not, in the same layout `orangu-server download` uses, so a second
+conversion of the same model fetches nothing. A local checkpoint directory
+works too: `orangu-gguf -m ./Qwen3-0.6B -q bf16`.
+
+The file is written to `<models>/orangu-converted/<name>-<format>.gguf`,
+where `orangu-server list` shows it as `<name>-<format>` and the server
+serves it by that name; `-o` writes it elsewhere.
+
+`-m` takes, in this order: a model file; a model `orangu-server list`
+shows, by `MODEL` name or `NR`; a checkpoint directory; a Hugging Face
+repository.
+
+Architectures converted:
+
+| Checkpoint | Written as |
+|:---|:---|
+| `LlamaForCausalLM`, `MistralForCausalLM` | `llama` |
+| `Qwen2ForCausalLM` | `qwen2` |
+| `Qwen3ForCausalLM` | `qwen3` |
+| `Qwen3MoeForCausalLM` | `qwen3moe` |
+| `Phi3ForCausalLM` | `phi3` |
+| `Gemma4ForConditionalGeneration`, `Gemma4ForCausalLM` | `gemma4` |
+| `Qwen3_5ForConditionalGeneration`, `Qwen3_5ForCausalLM` | `qwen35` |
+| `Qwen3_5MoeForConditionalGeneration`, `Qwen3_5MoeForCausalLM` | `qwen35moe` |
+
+Any other is refused by name. So is a checkpoint tensor the
+converter has no place for, rather than being left out of a file that
+would then load and answer wrong.
+
+The exceptions are a vision tower and a multi-token prediction head: each
+is a file of its own, so the conversion leaves it out.
+
+The tokenizer is BPE: byte-level (GPT-2 style), or with byte fallback
+(`▁` for a space, `<0xNN>` tokens) as Gemma writes it. A byte-level
+tokenizer's pre-tokenizer — how text is cut into
+words before merging — is recognised from its definition in
+`tokenizer.json`, and one that is not recognised is an error rather than a
+guess, since a wrong guess tokenizes every prompt slightly differently from
+how the model was trained. The special tokens, whether BOS and EOS are
+added, and the chat template come from `tokenizer.json`'s post-processor,
+then `tokenizer_config.json`, then `config.json`, in that order of
+authority. A token `tokenizer_config.json` adds that `tokenizer.json` lacks
+is written too. `add_bos_token` and `add_eos_token` are always written: with
+nothing in the checkpoint asking for them, the tokenizer adds neither, and
+the file says so. A turn that ends on a token other than EOS — `<|end|>`,
+`<turn|>` — is written as `tokenizer.ggml.eot_token_id`, from
+`tokenizer_config.json`'s `eot_token` or the first stop token in
+`generation_config.json`, so the server stops at the end of the turn. The
+sampling defaults in `generation_config.json` are written as
+`general.sampling.*`.
+
+The licence in the model card's front matter (`README.md`) is written as
+`general.license` when the card is there.
+
+`--compare` is how a conversion is checked. Two files of the same model at
+the same weight format hold the same bytes in every tensor; where the
+formats differ, the largest difference between the values read back is
+printed instead, as a share of the largest value — the format's rounding
+when the weights are the same, and far more when they are not. Every
+metadata key that differs, or is on one side only, is named, and for a list
+the first entry that differs. Both sides are files, or models by the name
+`orangu-server list` shows:
+
+```sh
+orangu-gguf --compare SmolLM2-360M-Instruct-F16 bartowski/SmolLM2-360M-Instruct-GGUF:F16
+```
+
 ## Sizes
 
-Five sizes, sharing one vocabulary, so a tokenizer trained once carries
-across all of them. The parameter counts are for the default 32,768-token
-vocabulary; a smaller one takes two tensors down with it, which is most of
-what `tiny` is.
+Each architecture has its own sizes; all share one vocabulary, so a
+tokenizer trained once carries across them. The parameter counts are for the
+default 32,768-token vocabulary; a smaller one takes two tensors down with
+it, which is most of what `tiny` is.
 
 Every hidden and feed-forward width is a multiple of **256**, and that is a
 requirement rather than a preference: 256 is the K-quants' super-block, and
 a row length it does not divide cannot be a K-quant at all. The
 feed-forward *down* projection is the one that decides it, because its row
 length is the feed-forward width rather than the hidden one.
+
+### `qwen4exp`, the default
+
+A hybrid of attention and the gated delta rule, three delta-rule blocks to
+one attention block, with routed experts in every feed-forward:
+
+- **Hyper-connections.** The residual is several streams wide; each
+  sub-layer reads a learned mix of them and writes back into each with a
+  learned weight.
+- **Gated attention** with partial rotary positions, and a **sparse-attention
+  indexer** on every attention block that picks which earlier blocks of
+  positions a query reads once the context passes its budget.
+- **The gated delta rule**: a short causal convolution, then a recurrent
+  state per value head, with a learned decay and step size.
+- **Routed experts** behind a softmax router, with a shared expert beside
+  them, trained with a load-balancing term.
+- **An n-gram hash embedding** on block 1: each token and its predecessors
+  hashed into a table, gated into the streams.
+
+| Size | Hidden | Streams | Blocks | Heads | KV heads | Experts (used) | Expert width | Parameters |
+|:---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `tiny` | 256 | 2 | 4 | 4 | 2 | 8 (2) | 256 | ~28M |
+| `smoke` | 768 | 2 | 8 | 6 | 2 | 16 (4) | 512 | ~0.25B |
+| `1b` | 1024 | 4 | 16 | 8 | 2 | 32 (4) | 512 | ~1.07B |
+
+A token passes through only the experts it is routed to, so the parameters
+it uses are a fraction of the count: about a third at `1b`.
+
+### `qwen3`
+
+A dense decoder: grouped-query attention with rotary positions, RMSNorm, a
+SwiGLU feed-forward, and a per-head norm on the queries and keys.
 
 | Size | Hidden | Feed-forward | Blocks | Heads | KV heads | Parameters |
 |:---|---:|---:|---:|---:|---:|---:|
@@ -442,16 +577,19 @@ length is the feed-forward width rather than the hidden one.
 | `1b` | 1536 | 5632 | 28 | 12 | 6 | ~1.0B |
 | `2b` | 2048 | 8192 | 30 | 16 | 8 | ~2.0B |
 
+### Which size for what
+
 The two small ones have different jobs. `tiny` answers "does this machine
 run the tool at all", and it answers it in a couple of minutes. `smoke`
-answers "does this machine run the tool *properly*", and it takes about
-half an hour, because the things that go wrong quietly need a model shaped
-like a real one to go wrong in: it has fewer key/value heads than query
-heads, so grouped-query attention is actually grouped; three query heads to
-a key/value head, so the group is not a power of two and an index that
-works by alignment stops working; eight blocks; and a feed-forward matrix
-larger than a last-level cache, which is what makes a measurement taken on
-it mean anything at the sizes below.
+answers "does this machine run the tool *properly*", because the things that
+go wrong quietly need a model shaped like a real one to go wrong in: it has
+fewer key/value heads than query heads, so grouped-query attention is
+actually grouped; three query heads to a key/value head, so the group is not
+a power of two and an index that works by alignment stops working; eight
+blocks; and matrices larger than a last-level cache, which is what makes a
+measurement taken on it mean anything at the sizes below. At `qwen4exp` it
+also routes each token to 4 of 16 experts, and its indexer selects at the
+sequence lengths it trains on.
 
 **These are real training runs, and they cost what training costs.**
 Everything runs on the CPU in 32-bit floating point. `tiny` is minutes and
@@ -459,7 +597,7 @@ Everything runs on the CPU in 32-bit floating point. `tiny` is minutes and
 the three real sizes are days to weeks of continuous compute on a corpus
 large enough to be worth it, and they need memory to match — training holds
 four numbers per parameter (the weight, its gradient, and the optimizer's
-two moments), so a `2b` run needs roughly 32 GB before activations.
+two moments), so a 1B-parameter run needs roughly 16 GB before activations.
 `checkpoint_every` and `resume` exist because a run that long will be
 interrupted.
 
@@ -484,7 +622,19 @@ above earn their keep well past that.
 | `q3_k_l` | ~4.3 | Three bits with the most reinforcement. |
 | `q3_k_m` | ~4.0 | Three bits, usable; the model is now measurably worse. |
 | `q3_k_s` | ~3.6 | Three bits throughout. |
-| `q2_k` | ~3.2 | The smallest file worth writing. Expect to notice. |
+| `q2_k` | ~3.2 | The smallest K-quant. Expect to notice. |
+| `iq3_m` | ~3.7 | The best three-bit lattice file. |
+| `iq3_s` | ~3.5 | Three-bit lattice throughout. |
+| `iq3_xs` | ~3.3 | Between `iq3_s` and `iq3_xxs`. |
+| `iq3_xxs` | ~3.1 | The smallest three-bit file. Needs `--imatrix`. |
+| `q2_k_s` | ~2.9 | Two bits with less reinforcement. Needs `--imatrix`. |
+| `iq2_m` | ~2.7 | The smallest file most models still answer well from. Needs `--imatrix`. |
+| `iq2_s` | ~2.5 | Needs `--imatrix`. |
+| `iq2_xs` | ~2.3 | Needs `--imatrix`. |
+| `iq2_xxs` | ~2.1 | Needs `--imatrix`. |
+| `iq1_m` | ~1.8 | For models too large to fit any other way. Needs `--imatrix`. |
+| `iq1_s` | ~1.6 | The smallest file; a much weaker model. Needs `--imatrix`. |
+| `auto` | ~4.5 | A type per tensor, chosen for this machine's speed within `q4_k_m`'s quality and size (below). Not in `--list-quantizations`. |
 
 `--list-quantizations` prints the same table with a line on each. Bits per
 weight are approximate and for a whole file, mixture included — which is why
@@ -497,63 +647,407 @@ much of a model is vocabulary.
 A `Q4_K_M` file is not a file of `Q4_K` tensors. The `_S`, `_M` and `_L` are
 *mixtures*: which tensors are carried above the file's base format, and by
 how much. They are the standard spellings — a model published as `Q4_K_M`
-anywhere means the same mixture this writes — and the tensors that earn the
-extra bits are always the same ones:
+anywhere means the same mixture this writes, tensor for tensor — and the
+tensors that earn the extra bits are always the same ones:
 
 - **The vocabulary projection** (`output.weight`) is six bits in every
-  quantized file. It is the last thing before the softmax, where an error
-  becomes a wrong token directly.
+  quantized file (five in the `IQ1`, `IQ2` and `IQ3_XXS` files), eight when
+  its rows are not a multiple of 256. It is the last thing before the
+  softmax, where an error becomes a wrong token directly. A model without
+  one reads its token embedding as the output, and that embedding is
+  carried the same way.
 - **The value and down projections** are reinforced on the outer blocks,
   and on every third block in between. An error there lands on every token
-  that attends through them.
-- **Norms are never quantized**, in any format. They are the divisor of
-  every activation and a rounding error's worth of file size.
+  that attends through them. A mixture's experts are placed by the block
+  they sit in. Blocks count in number order, and a quantized file lists its
+  tensors that way, block by block, whatever order its source had.
+- **Norms are never quantized**, in any format, and neither are a
+  mixture's router and the other small tensors that steer the rest; they
+  keep the type they had in the source.
 
 `_S` reinforces least, `_M` more, `_L` most; `Q6_K`, `IQ4_NL` and `IQ4_XS`
 have no variants because there is nothing above them worth spending on.
 Grouped-query attention shifts the rules slightly: it makes the value
 projection small, so carrying it high costs almost nothing, and the mixtures
 spend there whenever the model has four or more query heads per key/value
-head. `orangu-server show --tensors` prints what a finished file actually
-contains.
+head. A model with eight experts carries its key and value projections at
+eight bits.
+
+A row a K-quant's 256-wide block does not divide falls back to the 32-wide
+type of about the same precision: `Q2_K` and `Q3_K` to `Q4_0`, `Q4_K` to
+`Q5_0`, `Q5_K` to `Q5_1`, `Q6_K` to `Q8_0`, `IQ4_XS` and the lattice types
+to `IQ4_NL`; and to `f16` when not even 32 divides it. Each one is reported
+as a `note:` while the file is written. `orangu-server show --tensors`
+prints what a finished file actually contains.
+
+### Fitting to an importance matrix
+
+```sh
+orangu-gguf -m HuggingFaceTB/SmolLM2-360M-Instruct -q q4_k_m \
+    --imatrix bartowski/SmolLM2-360M-Instruct-GGUF
+```
+
+An *importance matrix* records, for every input column of every weight
+matrix, the mean squared activation that reached it while the model read a
+calibration text. With one, each block is fitted to keep the errors that
+matter least: a column the model leans on gets a closer fit, at the expense
+of columns it barely reads. The file is the same size and the same format;
+it is the choice of levels that changes. Publishers who make quantized
+files with one usually publish it beside them, and `--imatrix` takes either
+that file or the repository's name. A named repository's matrix is found in
+the models directory, or downloaded into it the first time.
+
+Both matrix formats are read: the GGUF one (`*imatrix*.gguf`) and the older
+binary `.imatrix`. A mixture's experts each have their own importances,
+and each expert is fitted to its own.
+
+Every K-quant (`Q2_K` to `Q6_K`), every lattice type, both 4-bit codebook types (`IQ4_NL`,
+`IQ4_XS`) and the 32-wide fallbacks except `Q8_0` use the matrix; `bf16`,
+`f16` and `f32` ignore it. With a matrix, an `IQ4_NL` or `IQ4_XS` file
+leaves its first blocks' down projections at four bits instead of
+reinforcing them, as the fit already protects them. Tensors the matrix has
+no entry for, the token embedding typically among them, are written as
+they would be without one. A matrix measured on a different model is
+refused, by the first tensor whose shape does not match. The line
+`importance` in the output says how many tensors were fitted, and the
+written file records which matrix it was (`quantize.imatrix.file`, with the
+calibration text's name, entry and chunk counts beside it).
+
+### Measuring an importance matrix
+
+```sh
+orangu-gguf -m Qwen/Qwen3-0.6B -q iq2_m --calibration calib.txt
+orangu-gguf -m 3 --calibration calib.txt --imatrix-out model.imatrix.gguf
+```
+
+`--calibration` measures the matrix instead of taking a published one: the
+model reads the text, and every weight matrix of every block records the
+squared activations that reached each of its input columns. The text is
+cut into chunks of 512 tokens, each read from the start with a fresh
+context; a leftover shorter than a chunk is not read. Any text of the kind
+the model will be asked to handle works; a few hundred kilobytes, a few
+hundred chunks, is typical. For a mixture each expert records only the
+tokens routed to it. Each chunk starts with the model's BOS token when the
+model takes one.
+
+The model runs inside `orangu-gguf`, on the CPU, with the same forward pass
+`orangu-server` serves it with; it needs no GPU and takes the memory the
+model takes. It ends by saying how many of the blocks' weight matrices
+were reached: one that is never multiplied (a convolution, say) has no
+entry. A GGUF source is measured as it is;
+a checkpoint is first written as BF16 to `<models>/orangu-converted/`, and
+that file is measured. The matrix is kept there too, as
+`<model>.<text>.imatrix.gguf`, and reused while it is newer than both the
+model and the text. With `--imatrix-out FILE` the matrix is written there
+instead and nothing is converted: it can then be given to any number of
+conversions with `--imatrix`. It is in the GGUF importance-matrix format
+(`<tensor>.in_sum2`, `<tensor>.counts`, `imatrix.datasets`,
+`imatrix.chunk_count`, `imatrix.chunk_size`), which other quantizers read
+too. `--calibration` and `--imatrix` are alternatives, except with `-q auto`,
+where the matrix comes from `--imatrix` and the text is read for the KL.
+
+A manifest takes the same text as `"calibration"`. The trained model is
+then written as BF16 into the work directory, measured there
+(`calibration.imatrix.gguf`), and written at the manifest's `quantization`
+fitted to that matrix. A format below three bits without a `calibration`
+is refused before training starts, not after.
+
+### The lattice I-quants
+
+The lattice I-quants — `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`,
+`IQ3_XXS`, `IQ3_S` — store each group of four or eight weights as one index
+into a fixed codebook of points, with the signs kept apart. Below about
+three bits that search only lands anywhere useful when it is told which
+weights matter, so `IQ1_*`, `IQ2_*`, `IQ3_XXS` and `Q2_K_S` need an
+importance matrix (`--imatrix`); without one they are refused, naming the
+first tensor that needs it, rather than written to look fine and answer
+badly. The token embedding and the output projection are never held to it.
+`IQ3_S`, `IQ3_XS` and `IQ3_M` can be written without one and are better
+with one.
+
+### Choosing for this machine: `-q auto`
+
+```sh
+orangu-gguf -m ./Qwen3-0.6B-BF16.gguf -q auto --calibration calib.txt
+orangu-gguf -m ./model-BF16.gguf -q auto --imatrix model.imatrix.gguf --calibration calib.txt
+```
+
+The standard mixtures spend bits by rule, the same on every machine. `-q
+auto` spends them by measurement, on the machine that will run the file:
+each tensor gets its own type, chosen so the file decodes and reads prompts
+as fast as this machine can run it, while its KL divergence from the source
+stays within the standard `q4_k_m`'s and its size within the standard
+file's. The standard file is the one made from the same source with the
+same importance matrix. A file is written for one machine; on another its
+choices are still valid, just not chosen for it.
+
+It needs a calibration text: the KL is measured over it. With
+`--calibration` alone the importance matrix is measured over the same text
+(as for any `-q`); with `--imatrix` as well, the matrix is that file and the
+text is only read for the KL. The KL is measured on the end of the text,
+two chunks of 512 tokens, on the CPU, the way an importance matrix is.
+
+What is measured:
+
+- **What each type costs each tensor in error.** Every tensor is encoded
+  at every candidate type and read back, and the difference is weighed by
+  the importance matrix, so it counts where the model reads. A large tensor
+  is measured on a sample of its rows.
+- **What a unit of error costs in KL, per role.** The source is read over
+  the text, then the standard mixture, held in memory; then, one role at a
+  time (every block's value projection, the output projection, …), that
+  role is lowered about a quarter in size and read again. The KL it adds,
+  per unit of error it adds, is the role's weight. It differs between
+  models: an output projection tied to the token embedding, or one
+  architecture's value projection, can cost several times what the same
+  error costs in another.
+- **What each type costs in time**, at the model's own shapes, on the device
+  the model will decode on (the card the server would choose, else the
+  cores): one token's product and one prompt chunk's, through the same
+  kernels the server runs, on each kernel family a card offers, since the
+  server chooses one for the whole file. When the standard file is larger
+  than the card can hold beside its KV pages, a mixture's routed experts
+  are timed on the cores instead, where the server keeps them, and do not
+  count against the card's room. The answers are kept for a week, per
+  device, driver and build, so the next file for this machine starts from
+  them.
+
+Types are chosen a role at a time: every block's value projection gets one
+type, every block's down projection one, and so on. A role whose blocks
+are of different types can decode slower than either type would alone.
+Every role starts at its fastest type, and the change that buys the most
+predicted KL for the least added time is made, one role at a time, until
+the prediction is back within the standard file's. Neither the
+file's size nor the weights the card holds may grow past the standard's,
+nor past the card's memory less room for its KV pages, and neither a
+decoded token nor a prompt token may take longer than the standard file's.
+A card picks its decode kernels and its prompt kernels apart, each for the
+whole file, and each is priced on the family it would pick. A smaller type is
+not always a faster one — the cards' fastest kernels are for `Q4_K`, `Q5_K`
+and `Q6_K` — so the types below those are considered only when
+`--max-size` asks for a file smaller than the standard one.
+
+The choice is then held in memory and its KL measured over the text. If it
+is over the standard's, it is chosen again under a budget tightened by the
+miss, up to four rounds in all. When no round comes within it, the standard
+`q4_k_m` is what is written, and the output says so; the file never misses
+its KL without saying so.
+
+| Option | What it does |
+|:---|:---|
+| `--max-size SIZE` | The most bytes of weights the file may take (`2.2G`, `2300M`); smaller than the standard file's brings in the three-bit and smaller types |
+| `--max-kl NATS` | The most KL from the source over the text, instead of the standard file's |
+| `--tensor-type PATTERN=TYPE` | Write every tensor whose name matches the regular expression as `TYPE`; repeatable, the last match wins. Works with every `-q`, and `-q auto` keeps those types |
+
+The output shows each round and ends with the chosen types:
+
+```
+  the standard Q4_K_M reads at KL 0.0612 over 1024 tokens (56.3 s)
+  measured 8 roles' weights in 108.0 s
+  round 1: predicted KL 0.0611, measured 0.0713 against 0.0612
+  round 2: predicted KL 0.0523, measured 0.0661 against 0.0612
+  round 3: predicted KL 0.0486, measured 0.0594 against 0.0612
+chosen for AMD Radeon RX 5500M (RADV NAVI14) [radv (Mesa 26.2.7)]
+      Q4_K    82 tensors       204.4 MiB
+      Q5_K   115 tensors       140.9 MiB
+  against the standard Q4_K_M: decode -7.5% and prompts -39.0% predicted, size -7.3%, KL 0.0612 -> 0.0594 measured
+```
+
+Time is predicted, not measured: serve the file and compare it with
+`orangu-bench` to see it. The file records `general.file_type` as the
+standard name of the type most of its weights are in, and the name it is
+written to ends in `-auto`. The model is held in memory twice while the
+choice is made — the source, and the encodings being measured.
 
 ### What is not written, and why
 
-The format defines more types than this writes. Two groups are left out
-deliberately.
+The format defines more types than this writes; one group is left out
+deliberately, and one family of names is not offered.
 
 The **round-number quantizations** — `Q4_0`, `Q4_1`, `Q5_0`, `Q5_1`,
-`Q8_0` — are the generation before the K-quants. A K-quant beats them at
-every size, and offering both mostly offers a way to pick the worse one.
-`Q6_K` is `Q8_0`'s size and more accurate. Asking for one says so rather
-than failing as unknown.
+`Q8_0` — are the generation before the K-quants, and none of them is a file
+type here. `Q4_K_M` and `Q5_K_M` are about the size of the 4- and 5-bit ones
+and more accurate; `Q6_K` is a quarter smaller than `Q8_0` and nearly as
+accurate. Asking for one names its replacement rather than failing as
+unknown. They appear inside K-quant files as the fallback for rows a
+256-wide block does not divide, and `Q8_0` is among the types `-q auto`
+chooses from.
 
-The **very low bit I-quants** — `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`,
-`IQ2_S`, `IQ3_XXS`, `IQ3_S`, and `Q2_K_S` — are a search against a fixed
-codebook of lattice points. Below about three bits that search only lands
-anywhere useful when it is told which weights matter, which means an
-*importance matrix*: a measurement of how much each weight moves the output,
-taken by running the finished model over calibration text. This tool does
-not measure one yet, and a file written without it looks fine and answers
-badly. They are refused with that reason, not written badly. `IQ4_NL` and
-`IQ4_XS` are in the same family but wide enough not to need it, so they are
-written.
+You may also see `_XL` or `UD-` on models published elsewhere. They are not
+standard suffixes: they belong to one vendor's dynamic quantizations, whose
+per-tensor choices are their own, so they are not offered here.
 
-You may also see `_XL` on models published elsewhere. It is not a standard
-suffix: it belongs to one vendor's dynamic quantizations, which are derived
-from an importance matrix, and it is not written here for the same reason.
-
-Converting works from a full-precision file only. Quantizing an
+Converting works from a full-precision file. Quantizing an
 already-quantized model would round twice and produce something worse than
 quantizing the original once, so it is refused with a message saying which
-file to start from instead.
+file to start from instead, unless `--allow-requantize` is given ([Shards and
+metadata](#shards-and-metadata)).
+
+## Shards and metadata
+
+A model too large for one file is a **shard set**:
+`model-00001-of-00003.gguf`, `model-00002-of-00003.gguf`,
+`model-00003-of-00003.gguf`. The first shard carries every metadata key;
+each shard says which it is and how many there are. Wherever this tool
+reads a model, the first shard stands for the whole set, and
+`orangu-server` serves a set the same way.
+
+| Option | What it does |
+|:---|:---|
+| `--split-max-size SIZE` | Write the model as shards of at most `SIZE` each (`300M`, `4G`), headers included |
+| `--split-max-tensors N` | Write the model as shards of at most `N` tensors each |
+| `--keep-split` | Write a shard set cut where the source set is cut |
+| `--merge FIRST` | Join a shard set into one file |
+| `--set KEY=TYPE:VALUE` | Set a metadata key (repeatable) |
+| `--delete KEY` | Delete a metadata key (repeatable) |
+| `--override-kv KEY=TYPE:VALUE` | Write this metadata key into the output (repeatable) |
+| `--pure` | Quantize every tensor that may be to the format's base type |
+| `--allow-requantize` | Accept a quantized source, rounding its tensors a second time |
+
+With a format (`-q`), the split options cut the file being written. Without
+one, nothing is converted: every tensor is copied as stored, so splitting a
+file and merging it back gives the original byte for byte.
+
+```sh
+# A 4 GB limit per file, converting as it goes:
+orangu-gguf -m model-BF16.gguf -q q4_k_m --split-max-size 4G
+# A file cut into shards as it is, and joined again:
+orangu-gguf -m model-Q4_K_M.gguf --split-max-size 2G
+orangu-gguf --merge model-Q4_K_M-00001-of-00003.gguf
+# A shard set quantized into a set cut the same way:
+orangu-gguf -m model-BF16-00001-of-00004.gguf -q q6_k --keep-split
+```
+
+A single tensor larger than the limit has a shard to itself. A converted
+Hugging Face checkpoint is written whole and then cut, so it needs room for
+both for a moment.
+
+**Metadata.** `TYPE` is one of `u8`, `i8`, `u16`, `i16`, `u32`, `i32`,
+`u64`, `i64`, `f32`, `f64`, `bool` and `str`, or `int` and `float`, which
+take the type the key already has: `--set llama.context_length=int:4096`
+keeps it the `u32` it was. With no format given, `--set` and `--delete`
+change the file itself: in place when the new header fills the same space as
+the old (the header is padded, so changing a number usually does);
+otherwise the file is rewritten beside itself and renamed over it, its
+tensors copied unchanged. On a shard set they change the first shard. With
+`-o`, the original is left alone and the changed copy written there. With a
+format, `--set`, `--delete` and `--override-kv` all apply to the file being
+written. The `split.*` keys belong to the shard set and cannot be set.
+
+**`--pure`** skips the mixture: no tensor is carried above the format's base
+type, and a tensor whose rows the base type's block does not divide still
+falls back to the narrower type, as always.
+
+**`--allow-requantize`.** A quantized source is refused unless this is
+given, because each tensor is then rounded twice and the result is worse
+than quantizing the full-precision original once. With it, the tool warns,
+naming the source's types, and goes ahead.
+
+## Several machines
+
+`orangu-gguf` joins the same `[workers]` channel as `orangu-server` (see
+*Workers*). A channel then holds two kinds of node: **servers**, which serve
+models, and **gguf nodes**, which take a share of building a model file.
+Both answer the same probe, so each kind finds the other.
+
+The settings live in `orangu-gguf.conf` — `./orangu-gguf.conf`, then
+`~/.orangu/orangu-gguf.conf`, or the file `--config` names — in a
+`[workers]` section spelled as the server's:
+
+```ini
+[workers]
+name = lab
+secret = a-long-shared-secret
+```
+
+| Key | Default | Meaning |
+|:---|:---|:---|
+| `name` | *(none)* | The channel. Without it `orangu-gguf` joins none |
+| `secret` | *(none)* | The channel's shared secret, as the servers have it |
+| `host` | `0.0.0.0` | The address `--worker` listens on |
+| `port` | `8401` | The port `--worker` listens on, and gguf nodes are looked for on |
+| `server_port` | `8400` | The port the channel's servers listen on |
+| `network` | this machine's networks | The IPv4 networks to look on, `10.0.0.0/24,…` |
+| `peers` | *(none)* | `host:port` entries asked as well, as `ORANGU_WORKERS_PEERS` is |
+| `scan` | `on` | `off` asks only `peers`; with peers and no `network`, it is off |
+| `tls_cert`, `tls_key`, `tls_ca` | *(none)* | TLS between nodes, as the servers use it |
+
+The model is not in this file and the file is not in the manifest: which
+machines do the work is not a property of the model, and the same manifest
+builds the same file on any set of them.
+
+**`--worker`** runs this machine as a gguf node until it is stopped. Its
+port is 8401 so it can run beside a server on 8400.
+
+**`--channel`** lists the channel's nodes:
+
+```text
+$ orangu-gguf --channel
+channel 'lab': 3 nodes
+
+kind    name                         address                state        load  does
+server  10.0.0.5:8400                10.0.0.5:8400          free           3%  serves unsloth/Qwen3-8B-GGUF Q4_K_M
+gguf    10.0.0.6:8401                10.0.0.6:8401          free           0%  imatrix, perplexity, quantize
+gguf    10.0.0.7:8401                10.0.0.7:8401          working      100%  imatrix, perplexity, quantize
+```
+
+A gguf node is claimed by the rules a server's workers are: a top about to
+claim asks each free node for a lease first; a free node promises itself
+for ten seconds to the lowest id that asked, so two tops starting together
+do not split the nodes between them; then the top proves the secret and the
+node proves it back. A claimed node works for that top until the top lets
+go, and answers probes as `working` meanwhile. A node more than 80% busy is
+not claimed. A server never claims a gguf node as one of its workers, and a
+gguf top never takes over a server.
+
+**What is divided.** Measuring an importance matrix (`--calibration`, and a
+manifest's `calibration`) and `--perplexity` run in chunks of 512 tokens
+that do not depend on each other. With a channel configured, `orangu-gguf`
+claims the free gguf nodes, runs chunks itself, and hands the next chunk to
+whichever node is free. Each chunk is measured from nothing and the chunks
+are added up in chunk order, alone or divided, so one, two or three nodes
+write the same matrix byte for byte and print the same perplexity. A node
+that is lost has its chunk run again elsewhere. Every node reads its own
+copy of the model: the same file, at the same path or by name under its
+models directory, checked by size and a hash of its first 16 MiB. The
+nodes should be the same kind of CPU: a different one can round a sum
+differently. Each node prints how many chunks it ran and how much it sent.
+
+**Quantizing** a GGUF file (`-m FILE -q TYPE`) divides tensors by rows.
+Every row encodes on its own, so a tensor's rows are cut into pieces,
+encoded on several nodes, and written in row order: the file is the same,
+byte for byte, as one machine writes. Each node reads the rows from its own
+copy of the source, found as above, and sends back only the encoded bytes;
+the top sends the piece's importance values with it.
+
+Whether a tensor is divided is decided per type, tensor by tensor, and
+printed with the numbers it was made from whenever it changes. Each link's
+round trip and bandwidth are timed when the run starts.
+
+- *Alone* is the tensor's size over how fast this machine encoded that type
+  by itself, first timed on a few rows.
+- *Divided*, until the type has been divided past its first tensor, takes
+  each node to be as fast as this one, behind its link's measured latency
+  and bandwidth and the time it takes to read the tensor. After that it is
+  the measured pace of the tensors of that type that were divided, from
+  the first piece sent to the last one back. The first divided tensor of a
+  type is not counted: the nodes build the type's tables during it.
+- A tensor is divided when that is at least 10% sooner. Tensors too small
+  to give every node four pieces are encoded alone.
+
+At the end, the run prints how many tensors of each type were divided and
+how many pieces each node encoded.
+
+`--perplexity TEXT` with `-m MODEL` prints the perplexity of the model over
+the text: windows of 512 tokens, each scored from its middle on, on the
+CPU.
 
 ## What comes out
 
-A GGUF file with a dense decoder architecture: grouped-query attention with
-rotary positions, RMSNorm, a SwiGLU feed-forward, and a per-head norm on
-the queries and keys. `orangu-server` serves it on its fully-supported
-dense path, and so does anything else that reads the format.
+A GGUF file of the manifest's architecture, `qwen4exp` or `qwen3`, which
+`orangu-server` serves. A `qwen4exp` file carries the hash constants of its
+n-gram embedding among its keys, so the server hashes exactly as training
+did.
 
 The tokenizer is a byte-level BPE vocabulary trained on your corpus and
 carried inside the file. Every byte has a token, so there is no input it
