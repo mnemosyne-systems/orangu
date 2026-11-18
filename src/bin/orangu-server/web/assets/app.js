@@ -3451,6 +3451,12 @@
   const audioFormat = document.getElementById("audio-format");
   const audioTemperature = document.getElementById("audio-temperature");
   const audioMaxSeconds = document.getElementById("audio-max-seconds");
+  const audioTopK = document.getElementById("audio-top-k");
+  const audioRepetitionPenalty = document.getElementById("audio-repetition-penalty");
+  const audioSubtabs = [
+    [document.getElementById("audio-general-tab"), document.getElementById("audio-general")],
+    [document.getElementById("audio-advanced-tab"), document.getElementById("audio-advanced")],
+  ];
   const audioStatus = document.getElementById("audio-status");
   const audioResetBtn = document.getElementById("audio-reset-btn");
   const audioTab = settingsTabs.find((tab) => tab.dataset.pane === "audio");
@@ -3472,6 +3478,17 @@
     return word ? `${word.charAt(0).toUpperCase()}${word.slice(1)}` : word;
   }
 
+  function showAudioSubtab(selected) {
+    for (const [tab, panel] of audioSubtabs) {
+      const on = tab === selected;
+      tab.setAttribute("aria-selected", String(on));
+      panel.hidden = !on;
+    }
+  }
+  for (const [tab] of audioSubtabs) {
+    tab.addEventListener("click", () => showAudioSubtab(tab));
+  }
+
   function renderAudioVoiceDescription() {
     const voice = (audioProps?.voices || []).find((v) => v.name === audioVoice.value);
     audioVoiceDescription.textContent = voice?.description || "";
@@ -3491,6 +3508,8 @@
     audioFormat.value = d.format === "flac" ? "flac" : "wav";
     audioTemperature.value = String(d.temperature);
     audioMaxSeconds.value = String(Math.round(Number(d.max_seconds)));
+    audioTopK.value = String(d.top_k);
+    audioRepetitionPenalty.value = String(d.repetition_penalty);
     renderAudioVoiceDescription();
   }
 
@@ -3502,6 +3521,8 @@
       format: audioFormat.value,
       temperature: Number(audioTemperature.value),
       max_seconds: Number(audioMaxSeconds.value),
+      top_k: Number(audioTopK.value),
+      repetition_penalty: Number(audioRepetitionPenalty.value),
     };
   }
 
@@ -3543,7 +3564,9 @@
       f.language !== d.language ||
       f.format !== (d.format === "flac" ? "flac" : "wav") ||
       f.temperature !== Number(d.temperature) ||
-      f.max_seconds !== Math.round(Number(d.max_seconds))
+      f.max_seconds !== Math.round(Number(d.max_seconds)) ||
+      f.top_k !== Number(d.top_k) ||
+      f.repetition_penalty !== Number(d.repetition_penalty)
     );
   }
 

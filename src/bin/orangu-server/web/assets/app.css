@@ -1745,6 +1745,43 @@ button:disabled {
   color: var(--text-dim);
 }
 
+#audio-subtabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid var(--border);
+}
+
+.audio-subtab {
+  padding: 6px 14px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: none;
+  color: var(--text-dim);
+  font: inherit;
+  cursor: pointer;
+}
+
+.audio-subtab:hover {
+  color: var(--text);
+}
+
+.audio-subtab[aria-selected="true"] {
+  border-bottom-color: var(--brand-bg);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.audio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.audio-group[hidden] {
+  display: none;
+}
+
 #audio-voice-description {
   margin: -4px 0 0;
   min-height: 1.2em;

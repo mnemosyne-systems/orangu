@@ -137,17 +137,27 @@ server on the model, and the console reconnects on its own.
 
 ### Speech settings
 
-**Settings › Audio** holds what every reply gets. Each row has an **(i)**
-that explains it on hover. On a model that is not a speech model the tab
-is greyed, with *Not a speech model*.
+**Settings › Audio** holds what every reply gets, on two tabs: **General**
+and **Advanced**. Each row has an **(i)** that explains it on hover. On a
+model that is not a speech model the tab is greyed, with *Not a speech
+model*.
+
+**General**:
 
 | setting | choices | |
 | :-- | :-- | :-- |
 | **Voice** | the voices loaded | The pack's description is under it |
 | **Language** | Auto, or one of Chinese, English, French, German, Italian, Japanese, Korean, Portuguese, Russian, Spanish | Auto lets the model tell from the text |
 | **Format** | WAV, FLAC | How the reply is kept beside the session. FLAC is smaller and sounds the same |
-| **Temperature** | 0 to 2 | How freely the model reads the text: lower is steadier, and `0` always takes the likeliest |
 | **Longest reply** | seconds, up to 600 | A reply also stops when the model ends it, which is normally long before this |
+
+**Advanced**, the model's own sampling:
+
+| setting | choices | |
+| :-- | :-- | :-- |
+| **Temperature** | 0 to 2 | How freely the model reads the text: lower is steadier, and `0` always takes the likeliest |
+| **Top K** | 1 or more | How many of the likeliest frames the model picks among. `50` is the model's own |
+| **Repetition penalty** | 1 to 2 | How much the model avoids repeating itself; `1` is none. `1.05` is the model's own |
 
 **Reset** puts the form back to the configuration file's values, and the
 dialog's **Save** makes the form the server's defaults until it
