@@ -402,6 +402,7 @@ mod tests {
             label: "bartowski/Model-GGUF".to_string(),
             quant: "Q4_K_M".to_string(),
             features,
+            pace: Default::default(),
             rtt: Duration::from_millis(1),
             alternates: Vec::new(),
         }

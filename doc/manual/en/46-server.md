@@ -2648,11 +2648,14 @@ port = 8300
 
 Lets the `orangu-server` nodes of one network serve as one. Nodes with
 the same `name` — a channel — find each other by scanning their networks
-on the same `port`. The model is divided over every free node, whatever
-its size: the node a request reaches claims the free nodes of its channel,
-runs a contiguous range of the layers and hands the rest to them. It tokenizes,
-samples and streams; the hidden states travel to each worker and back for
-every prefill chunk and every generated token.
+on the same `port`. A request goes to the node that serves it fastest: a
+node that holds the model alone serves it alone, or sends it to a node that
+decodes it faster. A model no node holds alone, or one the measured speeds
+predict faster divided, is divided: the node a request reaches claims the
+free nodes of its channel, runs a contiguous range of the layers and hands
+the rest to them. It tokenizes, samples and streams; the hidden states
+travel to each worker and back for every prefill chunk and every generated
+token (*Workers* chapter, **Alone or divided**).
 
 Like `[web]` and `[prometheus]`, a config with no `[workers]` section has
 none. `-i`/`--init` asks `Add workers` (default yes), then `host`, `port`,
@@ -2672,8 +2675,9 @@ activations = f16
 **Roles follow from requests.** A node with a `[workers]` section listens
 on `host`:`port` for probes and for a node that claims it. Every node of a
 channel can take requests: one that holds the model serves or routes them,
-and one that does not claims workers for them and becomes top-level until
-it lets them go. A listener on an address reachable from other machines
+and claims workers for them only when dividing is predicted faster; one that
+does not claims workers for them and becomes top-level until it lets them
+go. A listener on an address reachable from other machines
 without a `secret` is warned about at startup. A `workers` or `standby`
 key is refused at startup with a message pointing to `name`.
 
@@ -2716,9 +2720,13 @@ key is refused at startup with a message pointing to `name`.
   requests and the forwards it runs for another node, over `slots`) and how
   busy its processors are: the CPU, and the busiest GPU where the driver
   reports `gpu_busy_percent`. A node that holds the model keeps a request
-  unless another node of its channel that holds it too, and is free, is
-  at least 0.1 less busy; a node that does not hold it sends the request
-  to the least busy one that does. The routed requests are
+  unless another node of its channel that holds it too, and is free, comes
+  out at most 0.9 of it in time a token over `1 − load` (each node's time
+  for the model alone, from the decode speed it measured and its probe
+  answer carries); a node that does not hold it sends the request to the
+  fastest one that does that way. Where a node of the two measured no
+  speed, by load alone: kept unless the other is at least 0.1 less busy,
+  and sent to the least busy one that holds the model. The routed requests are
   `/v1/chat/completions`, `/v1/completions`, `/v1/messages`,
   `/completion`, `/infill`, `/embedding` and `/v1/embeddings`; a routed
   request carries `x-orangu-forwarded` and is not routed again, and the
@@ -2965,7 +2973,9 @@ comma-separated `host:port` list, makes a node probe just those addresses,
 every two seconds, instead of scanning its networks: several nodes on one
 machine, each on its own `[workers].port`, then find each other.
 `ORANGU_WORKERS_BUDGET_MIB` caps a node's memory budget for weights, so a
-model it could hold is split as on smaller machines. A routed request's
+model it could hold is split as on smaller machines.
+`ORANGU_WORKERS_DIVIDE=always` divides every model over the free nodes,
+whatever its size and speed. A routed request's
 answer carries `x-orangu-routed-to`, the API of the node that served it.
 
 **Every node of one tree needs the same model installed, quantization

@@ -101,6 +101,40 @@ pub async fn workers() -> impl IntoResponse {
     Json(crate::workers::node::status_json())
 }
 
+/// `POST /v1/workers/sync-bench`'s body: the peer, by its `[workers]` name
+/// or address, and the simulated tokens' shape — 50 tokens of this model's
+/// layers and width when not given.
+#[derive(Deserialize)]
+pub struct SyncBenchRequest {
+    peer: String,
+    tokens: Option<usize>,
+    layers: Option<usize>,
+    hidden: Option<usize>,
+}
+
+/// `POST /v1/workers/sync-bench`: times the per-token sums two nodes would
+/// exchange splitting every layer, against a free node of the channel
+/// (`crate::workers::syncbench`), and sets them beside this node's predicted
+/// decode alone. `409` while this node leads or works for a tree, or when
+/// the peer is not free; `404` for a peer the channel does not have.
+pub async fn sync_bench(Json(ask): Json<SyncBenchRequest>) -> impl IntoResponse {
+    let ran = tokio::task::spawn_blocking(move || {
+        crate::workers::node::sync_bench(ask.peer, ask.tokens, ask.layers, ask.hidden)
+    })
+    .await;
+    match ran {
+        Ok(Ok(result)) => (StatusCode::OK, Json(result)),
+        Ok(Err((status, why))) => (
+            StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Json(serde_json::json!({ "error": why })),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        ),
+    }
+}
+
 /// The readiness decision, apart from the state it reads.
 ///
 /// Separated so the rule can be tested at all: the alternative is standing up

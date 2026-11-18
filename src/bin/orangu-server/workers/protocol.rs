@@ -937,6 +937,11 @@ pub enum Message {
         /// its parent: [`FEATURE_FETCH`]. Appended; `0` from a node that
         /// does not send it.
         features: u64,
+        /// How fast it decodes, and a request sent to it would: what a node
+        /// weighs serving a request alone against dividing it
+        /// ([`super::divide`]). Appended; unknown (zeros) from a node that
+        /// does not send it.
+        pace: Pace,
     },
     /// Sent instead of `Hello` by a node that fetches a model in part
     /// (`[workers].download = range`) from a node holding the whole file.
@@ -994,6 +999,21 @@ pub enum Message {
         /// own), rather than holding a promise.
         committed: bool,
     },
+}
+
+/// How fast a node of a channel decodes, as its [`Message::ProbeAck`] says.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Pace {
+    /// Gigabytes of layer weights a second through a decode step, and what
+    /// a step costs it whatever its layers (`super::speed`); `0` when not
+    /// measured.
+    pub decode_rate: f32,
+    pub decode_fixed_ms: f32,
+    /// The bytes of weights it can hold ([`Capacity::budget_bytes`]).
+    pub budget_bytes: u64,
+    /// Milliseconds a token for a request sent to it: its model alone, or
+    /// through the tree it leads; `0` when it cannot tell.
+    pub step_ms: f32,
 }
 
 /// What a node on a channel is doing, as a [`Message::ProbeAck`] says.
@@ -1587,6 +1607,7 @@ impl Message {
                 label,
                 quant,
                 features,
+                pace,
             } => {
                 w.string(node);
                 w.string(name);
@@ -1601,6 +1622,10 @@ impl Message {
                 w.string(label);
                 w.string(quant);
                 w.u64(*features);
+                w.f32(pace.decode_rate);
+                w.f32(pace.decode_fixed_ms);
+                w.u64(pace.budget_bytes);
+                w.f32(pace.step_ms);
                 tag::PROBE_ACK
             }
             Self::FetchHello { nonce } => {
@@ -1852,6 +1877,16 @@ impl Message {
                     r.string()?
                 },
                 features: if r.0.is_empty() { 0 } else { r.u64()? },
+                pace: if r.0.is_empty() {
+                    Pace::default()
+                } else {
+                    Pace {
+                        decode_rate: r.f32()?,
+                        decode_fixed_ms: r.f32()?,
+                        budget_bytes: r.u64()?,
+                        step_ms: r.f32()?,
+                    }
+                },
             },
             tag::FETCH_HELLO => Self::FetchHello { nonce: r.fixed()? },
             tag::FETCH_ACK => Self::FetchAck {
@@ -2057,9 +2092,11 @@ mod tests {
             label: "m".to_string(),
             quant: "Q8_0".to_string(),
             features: FEATURE_FETCH,
+            pace: Pace::default(),
         }
         .encode();
-        let older = &payload[..payload.len() - 8];
+        // The pace takes twenty bytes at the end, the features eight before it.
+        let older = &payload[..payload.len() - 28];
         let Message::ProbeAck {
             features, label, ..
         } = Message::decode(tag, older).unwrap()
@@ -2284,6 +2321,12 @@ mod tests {
                 label: "unsloth/model-GGUF".to_string(),
                 quant: "Q4_K_M".to_string(),
                 features: FEATURE_FETCH,
+                pace: Pace {
+                    decode_rate: 12.5,
+                    decode_fixed_ms: 1.25,
+                    budget_bytes: 7 << 30,
+                    step_ms: 13.0,
+                },
             });
         }
         round_trip(Message::FetchHello { nonce: [3; 32] });
@@ -2377,11 +2420,12 @@ mod tests {
             label: String::new(),
             quant: String::new(),
             features: 0,
+            pace: Pace::default(),
         }
         .encode();
         // The two empty names take eight bytes, the workers count four
-        // more, the features eight.
-        let older = &payload[..payload.len() - 20];
+        // more, the features eight, the pace twenty.
+        let older = &payload[..payload.len() - 40];
         let Message::ProbeAck { workers, state, .. } = Message::decode(tag, older).unwrap() else {
             panic!("not a probe answer");
         };
@@ -2406,9 +2450,10 @@ mod tests {
             label: "m".to_string(),
             quant: "Q8_0".to_string(),
             features: FEATURE_FETCH,
+            pace: Pace::default(),
         }
         .encode();
-        let label_bytes = 4 + 1 + 4 + 4 + 8;
+        let label_bytes = 4 + 1 + 4 + 4 + 8 + 20;
         let older = &payload[..payload.len() - label_bytes];
         let Message::ProbeAck {
             workers,

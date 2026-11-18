@@ -42,8 +42,14 @@ on one machine — each on the CPU, with its own API port and
 checks what clients get while a node is killed (`SIGKILL`), frozen
 (`SIGSTOP`), or cut off by a proxy between two nodes. The scenarios:
 
-- a model every node holds is divided over all three, and a worker's own
-  client is sent on to the lead (`x-orangu-routed-to`);
+- a model every node holds, with no speed measured (`shares = memory`), is
+  served where it is asked: nobody is claimed, and `/v1/workers` says
+  `divide.last.verdict` is `here`;
+- with `ORANGU_WORKERS_DIVIDE=always`, a model every node holds is divided
+  over all three, and a worker's own client is sent on to the lead
+  (`x-orangu-routed-to`);
+- `POST /v1/workers/sync-bench` between two free nodes answers both formats'
+  timings and the prediction, prints them, and leaves both nodes free;
 - a model no node holds alone (`ORANGU_WORKERS_BUDGET_MIB`) is split over
   three nodes, a worker's own client is sent on to the node that claimed
   it, and the workers are let go after `release`;
@@ -65,13 +71,13 @@ checks what clients get while a node is killed (`SIGKILL`), frozen
   `ORANGU_HARNESS_MODEL2` names the second model, in the same models
   directory;
 - a node with no copy of the model, `download = range` and no way to the
-  Hub fetches the model from the other two, runs its share of a divided
-  answer, and the answer is the one the lead gives alone, word for word, at
+  Hub fetches the model from the other two (which divide every model), runs
+  its share of a divided answer, and the answer is the one the lead gives alone, word for word, at
   temperature 0. `ORANGU_HARNESS_RANGE_BACKEND` sets that node's `backend`
   (`cpu` unless set); `vulkan` checks that a device which ran the model's
   layers before they were fetched runs them from the fetched bytes;
-- a prompt run on one worker that holds the whole model, its rows then
-  handed to every node of the tree, answers word for word what the same
+- a prompt run on one worker that holds the whole model (every node
+  divides), its rows then handed to every node of the tree, answers word for word what the same
   prompt answers through the tree, at temperature 0, and the lead's
   `/v1/workers` names that worker under `prefill.last`.
 
@@ -83,6 +89,62 @@ name (`host:port`, as plans print it) runs every prompt on that node when it
 holds the whole model; `0` (or `off`) keeps every prompt on the tree. Unset,
 or `auto`, decides by the measured numbers (*Workers*, **Where a long prompt
 runs**). A prompt given to a node that fails still goes through the tree.
+
+`ORANGU_WORKERS_DIVIDE=always` makes a node divide every model over the free
+nodes of its channel, whatever its size and speed, as a tree of nodes that
+each hold the model would never be otherwise: the harness's nodes share by
+memory, measure no speed, and serve a model they hold alone. Unset (or any
+other value) decides by the measured numbers (*Workers*, **Alone or
+divided**).
+
+### Timing the sums of a split layer
+
+`POST /v1/workers/sync-bench` measures, before anything is built, what two
+nodes that split every layer's matrices between them would spend summing
+their halves: twice a layer — after attention and after the feed-forward —
+each node sends the other a hidden-size vector and waits for the other's.
+The node it is sent to connects to a free node of its channel as a parent
+does (over TLS when the channel uses it, proving the `secret`), echoes a
+hidden-size payload off it `2 × layers` times a simulated token, in `f32`
+and then in `f16`, after one token untimed, and lets it go. It runs between
+requests only:
+
+```sh
+curl -s -X POST alpha:8100/v1/workers/sync-bench \
+  -H 'Content-Type: application/json' \
+  -d '{"peer": "beta:8400", "tokens": 50, "layers": 35, "hidden": 1536}'
+```
+
+`peer` is the other node's `[workers]` name, address or node id, as
+`/v1/workers` lists it under `found`; `tokens` defaults to 50, `layers` and
+`hidden` to this node's model. The API key, if any, is needed as for any
+other endpoint. The answer:
+
+- `f32` and `f16`: `payload_bytes`, `per_token_ms` (a simulated token's
+  round trips added up: `median`, `p90`), `round_trip_ms` (`median`,
+  `p90`) and `mb_per_s`, the payload there and back over the time it took;
+- `link`: the round trip and bandwidth the handshake timed, as `/v1/workers`
+  shows a worker's; `peer`: its name, address, `tls`, whether it has the
+  same model, and its measured `decode_gb_per_s`;
+- `predicted`: `alone_ms`, this node's decode step alone (every layer and
+  the head at its measured speed, and its fixed cost); `tp2_compute_ms`,
+  half of that on each node at the slower node's speed — the peer's, when it
+  measured one, else this node's — with the fixed cost once; `sync_ms`, the
+  per-token median in the format hidden states travel in (`f32` with
+  `activations = f32`, `f16` otherwise, named in `sync_from`);
+  `tp2_total_ms`, the two added; and `pays`, whether that is less than
+  alone. `null` on a node that measured no speed (`shares = memory`).
+
+It answers `409` while this node leads a tree or works for one — a running
+tree is never touched — while another benchmark runs here, or when the peer
+is not free; `404` for a peer the channel does not have, or a node with no
+`[workers]` section; `400` for sizes out of bounds (`tokens` at most 1000,
+`layers` 512, `hidden` 65536, and at most 200 000 round trips a format);
+`502` when the peer cannot be reached or drops the connection. The peer is
+claimed while it runs: its API keeps serving, and no other node can claim
+it. The echo is answered on the peer's connection thread, so the time is
+the transport's and the network's, without the thread a worker starts for
+each forward.
 
 They need a model, so they are ignored by default:
 

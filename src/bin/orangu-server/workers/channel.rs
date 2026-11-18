@@ -23,7 +23,7 @@
 //! never crosses the network, and being found grants nothing: claiming a
 //! node is the ordinary handshake, with `[workers].secret`.
 
-use super::protocol::{Message, ProbeState, read_message, write_message};
+use super::protocol::{Message, Pace, ProbeState, read_message, write_message};
 use super::transport::{self, Tls};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::sync::Mutex;
@@ -156,6 +156,9 @@ pub struct Found {
     /// ([`super::protocol::FEATURE_FETCH`]); `0` from a node that does not
     /// say.
     pub features: u64,
+    /// How fast it decodes, and a request sent to it would; unknown
+    /// (zeros) from a node that does not say.
+    pub pace: Pace,
     /// How long the probe took at `addr`, dialing included.
     pub rtt: Duration,
     /// Its other addresses on this machine's networks, where it answered
@@ -388,6 +391,7 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             label,
             quant,
             features,
+            pace,
         } => Some(Found {
             addr: shown,
             node,
@@ -406,6 +410,7 @@ pub fn probe(addr: SocketAddr, channel: &[u8; 32], tls: Option<&Tls>) -> Option<
             label,
             quant,
             features,
+            pace,
             rtt: started.elapsed(),
             alternates: Vec::new(),
         }),
@@ -562,6 +567,7 @@ mod tests {
             label: String::new(),
             quant: String::new(),
             features: 0,
+            pace: Pace::default(),
             rtt: Duration::from_millis(rtt_ms),
             alternates: Vec::new(),
         }
@@ -658,6 +664,7 @@ mod tests {
                             label: "unsloth/model-GGUF".to_string(),
                             quant: "Q4_K_M".to_string(),
                             features: 0,
+                            pace: Pace::default(),
                         },
                     );
                 }

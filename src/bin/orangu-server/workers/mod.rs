@@ -30,6 +30,10 @@
 //! - [`prefill`]: where a prompt runs — through the tree, or on one node
 //!   that holds the whole model, its rows then handed to every node.
 //! - [`node`]: one process's place in the tree, both halves.
+//! - [`divide`]: whether a request runs on one node alone or divided over a
+//!   tree, from what each node measured.
+//! - [`syncbench`]: timing the sums two nodes splitting every layer would
+//!   exchange, against a peer of the channel.
 //! - [`load`]: how busy a node is, for routing requests and sizing shares.
 //! - [`clock`]: keeping a node's cores at full clock while a request runs.
 //! - [`transport`]: plain TCP or TLS between nodes.
@@ -39,6 +43,7 @@
 pub mod auth;
 pub mod channel;
 pub mod clock;
+pub mod divide;
 pub mod fetch;
 pub mod guard;
 pub mod identity;
@@ -56,4 +61,5 @@ pub mod session;
 pub mod share;
 pub mod speed;
 pub mod stage;
+pub mod syncbench;
 pub mod transport;

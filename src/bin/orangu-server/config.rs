@@ -1549,8 +1549,9 @@ pub fn load_server_configuration(
             for key in ["decode", "offload"] {
                 if workers_section.contains_key(key) {
                     bail!(
-                        "[{WORKERS_SECTION}].{key} is not a setting: the node a request reaches divides \
-                         the model over the free nodes of its channel. Remove {key}"
+                        "[{WORKERS_SECTION}].{key} is not a setting: the node a request reaches serves \
+                         it alone or divides the model over the free nodes of its channel, \
+                         whichever its measurements predict faster. Remove {key}"
                     );
                 }
             }

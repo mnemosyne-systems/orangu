@@ -4911,6 +4911,7 @@ fn start_workers_node(
         },
         shares: workers_conf.shares,
         head: workers_conf.head,
+        divide: workers::divide::Mode::from_env(),
         split,
         maintenance: std::time::Duration::from_secs(5),
         parent_silence: workers::node::PARENT_SILENCE,

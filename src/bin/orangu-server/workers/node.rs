@@ -32,6 +32,7 @@
 //! a middle node does both.
 
 use super::auth;
+use super::divide::Verdict;
 use super::guard::{GuardedStage, TakeStandby};
 use super::identity;
 use super::link::{ChildInfo, ChildLink};
@@ -162,6 +163,9 @@ pub struct NodeSettings {
     pub shares: Shares,
     /// `[workers].head`: which node applies the output head.
     pub head: HeadOn,
+    /// `ORANGU_WORKERS_DIVIDE`: whether a request is divided only when that
+    /// is predicted faster than a node alone ([`super::divide`]).
+    pub divide: super::divide::Mode,
     /// Whether this node serves its model through its tree at all: not a
     /// picture model, whose text encoder is never split. Without it the
     /// node plans nothing for its workers, and serves only as a worker.
@@ -396,6 +400,16 @@ pub struct Node {
     unmovable: Option<String>,
     /// Where prompts ran, and how fast.
     prefills: Mutex<PrefillSeen>,
+    /// A decode step's time through a tree as requests found it, in
+    /// milliseconds: the names of its nodes (sorted), the time, and over how
+    /// many tokens.
+    observed_step: Mutex<Option<(Vec<String>, f64, usize)>>,
+    /// The last decision between serving alone and dividing
+    /// ([`super::divide::decide`]), for `/v1/workers`.
+    last_decision: Mutex<Option<super::divide::Decision>>,
+    /// Set while a sync benchmark holds a free node of the channel
+    /// ([`Self::sync_bench`]): no claim meanwhile.
+    benching: AtomicBool,
     /// The saved prefixes a claim planned for, and whether it kept their
     /// split: put back in the pool, or deleted, at the next request.
     pending_prefixes: Mutex<Option<(Manifest, bool)>>,
@@ -519,6 +533,30 @@ pub fn route_by_model(asked: &str, forwarded: bool) -> Option<String> {
         return None;
     }
     NODE.get()?.route_by_model(asked)
+}
+
+/// Runs a sync benchmark against a free node of this node's channel
+/// ([`Node::sync_bench`]): `peer` names it, and `tokens`, `layers` and
+/// `hidden` default to 50 and this model's own sizes. An error carries the
+/// HTTP status to answer with.
+pub fn sync_bench(
+    peer: String,
+    tokens: Option<usize>,
+    layers: Option<usize>,
+    hidden: Option<usize>,
+) -> Result<serde_json::Value, (u16, String)> {
+    let node = NODE
+        .get()
+        .ok_or((404, "this server has no [workers] section".to_string()))?;
+    let config = node.model.config();
+    let ask = super::syncbench::Ask {
+        peer,
+        tokens: tokens.unwrap_or(50),
+        layers: layers.unwrap_or(config.n_layer),
+        hidden: hidden.unwrap_or(config.n_embd),
+    };
+    ask.check().map_err(|why| (400, why))?;
+    node.sync_bench(&ask)
 }
 
 /// A model another node of the channel serves, for `/v1/models`.
@@ -890,6 +928,9 @@ impl Node {
             row_bytes,
             unmovable,
             prefills: Mutex::new(PrefillSeen::default()),
+            observed_step: Mutex::new(None),
+            last_decision: Mutex::new(None),
+            benching: AtomicBool::new(false),
         });
         let _ = node.this.set(Arc::downgrade(&node));
         if let Some(listener) = listener {
@@ -981,8 +1022,15 @@ impl Node {
 
     /// How busy this node is, `0.0` to `1.0` ([`super::load`]).
     fn load(&self) -> f32 {
+        self.load_besides(0)
+    }
+
+    /// How busy this node is besides `this` of the requests running on it:
+    /// what a request that is already counted weighs the node by.
+    fn load_besides(&self, this: usize) -> f32 {
         super::load::combine(
-            self.active.load(Ordering::Acquire) + self.forwards.load(Ordering::Acquire),
+            self.active.load(Ordering::Acquire).saturating_sub(this)
+                + self.forwards.load(Ordering::Acquire),
             self.settings.slots,
             super::load::busy(),
         )
@@ -996,14 +1044,10 @@ impl Node {
 
     /// Where a request this node got is served instead ([`route`]). A node
     /// working for a parent sends its clients to that parent; a node that
-    /// leads keeps them. Otherwise a request goes to a node that leads a
-    /// tree of the model and is not fully busy; else this node divides the
-    /// model over the free nodes of its channel, whatever the model's size,
-    /// unless another node about to do the same wins them
-    /// ([`Self::contend`]), and then it goes there. With no one free, a
-    /// node that holds the model keeps a request unless a node that can
-    /// serve it too is [`ROUTE_MARGIN`] less busy; one that does not sends
-    /// it to the least busy that can.
+    /// leads keeps them. Otherwise [`Self::choose`] decides: here alone, on
+    /// another node that holds the model or leads a tree of it, or divided
+    /// over the free nodes of the channel — unless another node about to do
+    /// the same wins them ([`Self::contend`]), and then it goes there.
     fn route(&self) -> Option<String> {
         self.settings.channel.as_ref()?;
         let found = self.found.lock().unwrap().0.clone();
@@ -1011,10 +1055,35 @@ impl Node {
             let parent = self.parent.lock().unwrap().as_ref()?.node.clone();
             return found.into_iter().find(|f| f.node == parent).map(|f| f.api);
         }
-        let api_of = |node: &str| found.iter().find(|f| f.node == node).map(|f| f.api.clone());
         if self.leading.load(Ordering::Acquire) {
             return None;
         }
+        if self.settings.divide == super::divide::Mode::Always {
+            return self.route_dividing(&found);
+        }
+        let api_of = |node: &str| found.iter().find(|f| f.node == node).map(|f| f.api.clone());
+        let decision = self.choose(0);
+        let routed = match &decision.verdict {
+            Verdict::Here => None,
+            Verdict::To(api) => Some(api.clone()),
+            Verdict::Divide => match self.contend() {
+                Contest::Won => None,
+                Contest::Lost(winner) => api_of(&winner),
+            },
+        };
+        self.note_decision(decision);
+        routed
+    }
+
+    /// [`Self::route`] with `ORANGU_WORKERS_DIVIDE=always`: to a node that
+    /// leads a tree of the model and is not fully busy; else this node
+    /// divides the model over the free nodes, whatever its size, unless
+    /// another node about to do the same wins them. With no one free, a
+    /// node that holds the model keeps a request unless a node that can
+    /// serve it too is [`ROUTE_MARGIN`] less busy; one that does not sends
+    /// it to the least busy that can.
+    fn route_dividing(&self, found: &[super::channel::Found]) -> Option<String> {
+        let api_of = |node: &str| found.iter().find(|f| f.node == node).map(|f| f.api.clone());
         let leader = found
             .iter()
             .filter(|f| {
@@ -1253,15 +1322,480 @@ impl Node {
         })
     }
 
-    /// Whether a request starting now may claim workers: this node can
-    /// lead, serves its own clients, and its last scan found someone free
-    /// that it does not hold yet. A model this node could hold alone is
-    /// divided too: every free node takes a share.
+    /// Whether a request may claim workers now: [`Self::may_claim_any`],
+    /// and dividing pays ([`Self::divides`]).
     fn may_claim(&self) -> bool {
+        self.may_claim_with(0)
+    }
+
+    /// [`Self::may_claim`], for a request already counted as running here
+    /// when `this` is `1`.
+    fn may_claim_with(&self, this: usize) -> bool {
+        self.may_claim_any() && self.divides(this)
+    }
+
+    /// Whether this node could claim workers now: it can lead, serves its
+    /// own clients, runs no sync benchmark, and its last scan found someone
+    /// free that it does not hold yet.
+    fn may_claim_any(&self) -> bool {
         self.can_lead()
             && !self.is_assigned()
             && !self.alone.load(Ordering::Acquire)
+            && !self.benching.load(Ordering::Acquire)
             && !self.unclaimed().is_empty()
+    }
+
+    /// Whether claiming the free nodes pays, by [`NodeSettings::divide`]:
+    /// always with `ORANGU_WORKERS_DIVIDE=always`. Otherwise, for a node not
+    /// leading yet, when [`Self::choose`] divides; for one that leads, when
+    /// its workers lack the room for the model, when a node's speed is not
+    /// known, or when the free nodes are predicted to make its tree's decode
+    /// step at least [`super::divide::MARGIN`] faster.
+    fn divides(&self, this: usize) -> bool {
+        if self.settings.divide == super::divide::Mode::Always {
+            return true;
+        }
+        if !self.leading.load(Ordering::Acquire) {
+            return self.choose(this).verdict == Verdict::Divide;
+        }
+        let room: u64 = self.own_budget(true)
+            + self
+                .links()
+                .iter()
+                .filter_map(|link| link.info())
+                .map(|info| plan::subtree_budget(&info.capacity))
+                .sum::<u64>();
+        if room < self.layer_bytes.iter().sum::<u64>() {
+            return true;
+        }
+        match (
+            self.predicted_tree_ms(&[]),
+            self.predicted_tree_ms(&self.unclaimed()),
+        ) {
+            (Some(now), Some(with)) => with <= now * (1.0 - super::divide::MARGIN),
+            _ => true,
+        }
+    }
+
+    /// Where a request starting now is served ([`super::divide::decide`]),
+    /// `this` being `1` for a request already counted as running here: this
+    /// node alone when it holds the model; each free node that holds it
+    /// and the nodes that lead a tree of it, at the time a token their probes
+    /// said; and, when this node could claim workers, the tree over it and
+    /// the free nodes, as predicted ([`Self::predicted_tree_ms`]).
+    fn choose(&self, this: usize) -> super::divide::Decision {
+        use super::divide::Server;
+        let found = self.found.lock().unwrap().0.clone();
+        let here = self.whole().then(|| Server {
+            api: None,
+            name: self.settings.name.clone(),
+            ms: self.alone_ms(),
+            load: self.load_besides(this),
+        });
+        let server = |f: &super::channel::Found| Server {
+            api: Some(f.api.clone()),
+            name: f.name.clone(),
+            ms: (f.pace.step_ms > 0.0 && f.pace.step_ms.is_finite())
+                .then_some(f64::from(f.pace.step_ms)),
+            load: f.load,
+        };
+        let holders: Vec<Server> = found
+            .iter()
+            .filter(|f| {
+                f.whole
+                    && f.state == ProbeState::Idle
+                    && f.node != self.id
+                    && self.same_model(f, true)
+            })
+            .map(server)
+            .collect();
+        let leaders: Vec<Server> = found
+            .iter()
+            .filter(|f| {
+                f.state == ProbeState::Leading
+                    && f.node != self.id
+                    && f.load < 1.0
+                    && self.same_model(f, true)
+            })
+            .map(server)
+            .collect();
+        let can_divide = self.may_claim_any();
+        let tree = if can_divide {
+            self.predicted_tree_ms(&self.unclaimed())
+        } else {
+            None
+        };
+        super::divide::decide(
+            here.as_ref(),
+            &holders,
+            &leaders,
+            can_divide,
+            tree,
+            ROUTE_MARGIN,
+        )
+    }
+
+    /// Keeps `decision` for `/v1/workers`, and logs it when it goes another
+    /// way than the last one.
+    fn note_decision(&self, decision: super::divide::Decision) {
+        let mut last = self.last_decision.lock().unwrap();
+        let changed = last.as_ref().is_none_or(|l| l.verdict != decision.verdict);
+        if changed {
+            let to = match &decision.verdict {
+                Verdict::Here => "served here alone".to_string(),
+                Verdict::To(_) => format!("sent to {}", decision.name),
+                Verdict::Divide => "divided over the free nodes".to_string(),
+            };
+            log::info!(
+                "orangu-server: workers: requests are {to}: {}",
+                decision.reason
+            );
+        }
+        *last = Some(decision);
+    }
+
+    /// Times what two nodes splitting every layer would spend summing their
+    /// halves ([`super::syncbench`]): connects to `ask.peer`, a free node of
+    /// the channel, as a parent does — over TLS when the channel uses it, the
+    /// secret proved — and echoes a hidden-size payload off it, `f32` and then
+    /// `f16`, `2 × layers` times a simulated token. The peer works for nobody
+    /// meanwhile and is let go after. Refused while this node leads a tree or
+    /// works for one, so a running tree is never disturbed, and for a peer
+    /// that is not free. The result sets the sync time beside this node's
+    /// predicted decode alone (`predicted`).
+    fn sync_bench(&self, ask: &super::syncbench::Ask) -> Result<serde_json::Value, (u16, String)> {
+        use super::syncbench::{Prediction, Timing, exchange};
+        let refused = |why: String| Err((409, why));
+        if self.settings.channel.is_none() {
+            return refused("this node is on no channel ([workers].name)".to_string());
+        }
+        if self.parent.lock().unwrap().is_some() {
+            return refused("this node works for a parent".to_string());
+        }
+        if self.benching.swap(true, Ordering::AcqRel) {
+            return refused("a sync benchmark is running here already".to_string());
+        }
+        struct Done<'a>(&'a AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _done = Done(&self.benching);
+        // Checked with the benchmark held: no claim starts from here on.
+        let _planning = self.planning.lock().unwrap();
+        if self.leading.load(Ordering::Acquire) {
+            return refused(
+                "this node leads a tree: benchmark between requests, once its workers are let go"
+                    .to_string(),
+            );
+        }
+        let found = self.found.lock().unwrap().0.clone();
+        let wanted = ask.peer.trim();
+        let Some(peer) = found
+            .iter()
+            .find(|f| {
+                f.name == wanted
+                    || f.addr == wanted
+                    || f.node == wanted
+                    || f.alternates.iter().any(|a| a == wanted)
+            })
+            .cloned()
+        else {
+            return Err((
+                404,
+                format!(
+                    "the channel has no node {wanted}; it has {}",
+                    found
+                        .iter()
+                        .map(|f| f.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ));
+        };
+        if !peer.state.claimable() {
+            return refused(format!(
+                "{} is {}: only a free node is benchmarked",
+                peer.name,
+                peer.state.as_str()
+            ));
+        }
+        drop(_planning);
+        let link = ChildLink::with_tls(
+            peer.addr.clone(),
+            self.settings.timeout,
+            self.settings.connect_timeout,
+            self.settings.tls.clone(),
+        );
+        let info = link
+            .connect(
+                self.settings.secret.as_deref(),
+                std::slice::from_ref(&self.id),
+            )
+            .map_err(|e| (502, format!("{}: {e}", peer.name)))?;
+        if info.features & super::protocol::FEATURE_ECHO == 0 {
+            link.disconnect();
+            return Err((
+                409,
+                format!("{} does not echo: run the same release on both", peer.name),
+            ));
+        }
+        log::info!(
+            "orangu-server: workers: sync benchmark with {} ({} tokens, {} layers, {} wide)",
+            peer.name,
+            ask.tokens,
+            ask.layers,
+            ask.hidden
+        );
+        let started = Instant::now();
+        let mut timings = Vec::new();
+        for width in [4usize, 2] {
+            let bytes = ask.hidden * width;
+            match exchange(&link, ask.tokens, ask.round_trips(), bytes) {
+                Ok(times) => timings.push(Timing::of(&times, bytes)),
+                Err(error) => {
+                    link.disconnect();
+                    return Err((502, format!("{}: {error}", peer.name)));
+                }
+            }
+        }
+        link.disconnect();
+        let (f32_timing, f16_timing) = (&timings[0], &timings[1]);
+        let (sync_from, sync) = match self.settings.activations {
+            ActivationFormat::F32 => ("f32", f32_timing),
+            _ => ("f16", f16_timing),
+        };
+        let own = &self.settings.capacity.setups[0];
+        let peer_rate = info
+            .capacity
+            .setups
+            .first()
+            .map(|s| f64::from(s.decode_rate))
+            .filter(|r| *r > 0.0);
+        let predicted = Prediction::new(
+            self.layer_bytes.iter().sum::<u64>() + self.head_bytes,
+            f64::from(own.decode_rate),
+            f64::from(own.decode_fixed_ms),
+            peer_rate,
+            sync.token_median_ms,
+        );
+        log::info!(
+            "orangu-server: workers: sync with {}: {:.2} ms a token in f16, {:.2} in f32 \
+             ({:.3} ms a round trip)",
+            peer.name,
+            f16_timing.token_median_ms,
+            f32_timing.token_median_ms,
+            f16_timing.round_trip_median_ms
+        );
+        Ok(serde_json::json!({
+            "peer": {
+                "name": peer.name,
+                "address": peer.addr,
+                "tls": link.tls(),
+                "same_model": self.same_model(&peer, false),
+                "decode_gb_per_s": peer_rate,
+            },
+            "link": info.link.map(|(rtt, bandwidth)| serde_json::json!({
+                "rtt_ms": rtt.as_secs_f64() * 1e3,
+                "mb_per_s": bandwidth / 1e6,
+            })),
+            "tokens": ask.tokens,
+            "layers": ask.layers,
+            "hidden": ask.hidden,
+            "round_trips_per_token": ask.round_trips(),
+            "f32": f32_timing.json(),
+            "f16": f16_timing.json(),
+            "seconds": started.elapsed().as_secs_f64(),
+            "predicted": predicted.map(|p| {
+                let mut json = p.json();
+                json["sync_from"] = serde_json::json!(sync_from);
+                json["peer_rate_known"] = serde_json::json!(peer_rate.is_some());
+                json
+            }),
+        }))
+    }
+
+    /// The bytes of the hidden state that cross a link each way, a position.
+    fn hidden_bytes(&self) -> f64 {
+        let n_embd = self.model.config().n_embd as f64;
+        match self.settings.activations {
+            ActivationFormat::F32 => 4.0 * n_embd,
+            ActivationFormat::F16 => 2.0 * n_embd,
+            ActivationFormat::Q8_0 => 34.0 / 32.0 * n_embd,
+        }
+    }
+
+    /// This node's time a token serving its model alone, in milliseconds:
+    /// every layer and the output head at its measured decode speed, and the
+    /// cost of a step whatever its layers. `None` when it does not hold the
+    /// model or did not measure.
+    fn alone_ms(&self) -> Option<f64> {
+        if !self.fits_alone || super::fetch::incomplete() {
+            return None;
+        }
+        let own = &self.settings.capacity.setups[0];
+        super::divide::step_ms(
+            self.layer_bytes.iter().sum::<u64>() + self.head_bytes,
+            f64::from(own.decode_rate),
+            f64::from(own.decode_fixed_ms),
+        )
+    }
+
+    /// What a request sent here takes a token, as a probe says
+    /// ([`super::protocol::Pace::step_ms`]): through the tree this node
+    /// leads, or its model alone; `0` when it cannot tell.
+    fn step_ms(&self) -> f32 {
+        let ms = if self.leading.load(Ordering::Acquire) {
+            self.predicted_tree_ms(&[])
+        } else if self.whole() {
+            self.alone_ms()
+        } else {
+            None
+        };
+        ms.map_or(0.0, |ms| ms as f32)
+    }
+
+    /// One node of a tree for [`super::divide::tree_ms`]: its rate as
+    /// requests found it through a tree, else as it measured it (`measured`,
+    /// gigabytes a second), at what its load leaves free.
+    fn member(
+        &self,
+        name: &str,
+        measured: f64,
+        fixed_ms: f32,
+        budget: u64,
+        hop: Option<(Duration, f64)>,
+    ) -> super::divide::Member {
+        let observed = self.observed.lock().unwrap().get(name).map(|(r, _)| *r);
+        let spare = self.spare(name);
+        match observed {
+            // Its subtree, its link and its fixed costs are in what it showed.
+            Some(rate) => super::divide::Member {
+                name: name.to_string(),
+                rate: rate * spare,
+                fixed_ms: 0.0,
+                budget,
+                hop: None,
+            },
+            None => super::divide::Member {
+                name: name.to_string(),
+                rate: measured * spare,
+                fixed_ms: f64::from(fixed_ms),
+                budget,
+                hop,
+            },
+        }
+    }
+
+    /// The nodes of a tree over this node, the workers it holds that answer,
+    /// and `extra`, free nodes as the channel found them: a free node's link
+    /// is its probe's time, halved — a dial and a question — and its
+    /// bandwidth is not known.
+    fn tree_members(&self, extra: &[super::channel::Found]) -> Vec<super::divide::Member> {
+        let own = &self.settings.capacity.setups[0];
+        let mut members = vec![self.member(
+            &self.settings.name,
+            f64::from(own.decode_rate),
+            own.decode_fixed_ms,
+            self.own_budget(true),
+            None,
+        )];
+        for link in &self.links() {
+            let Some(info) = link.info() else { continue };
+            let setups = &info.capacity.setups;
+            let name = setups
+                .first()
+                .map_or_else(|| link.addr.clone(), |s| s.name.clone());
+            let measured = if setups.is_empty() || setups.iter().any(|s| s.decode_rate <= 0.0) {
+                0.0
+            } else {
+                setups.iter().map(|s| f64::from(s.decode_rate)).sum()
+            };
+            let fixed = setups.first().map_or(0.0, |s| s.decode_fixed_ms);
+            members.push(self.member(
+                &name,
+                measured,
+                fixed,
+                plan::subtree_budget(&info.capacity),
+                info.link,
+            ));
+        }
+        for found in extra {
+            members.push(self.member(
+                &found.name,
+                f64::from(found.pace.decode_rate),
+                found.pace.decode_fixed_ms,
+                found.pace.budget_bytes,
+                Some((found.rtt / 2, 0.0)),
+            ));
+        }
+        members
+    }
+
+    /// The names of [`Self::tree_members`], sorted: what a tree's observed
+    /// step is kept under.
+    fn member_names(&self, extra: &[super::channel::Found]) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tree_members(extra)
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A decode step's time through a tree over [`Self::tree_members`], in
+    /// milliseconds: what requests found through a tree of the same nodes,
+    /// after [`CALIBRATE_TOKENS`] tokens, else as predicted
+    /// ([`super::divide::tree_ms`]). `None` for no worker, or a node whose
+    /// speed or budget is not known.
+    fn predicted_tree_ms(&self, extra: &[super::channel::Found]) -> Option<f64> {
+        let members = self.tree_members(extra);
+        if members.len() < 2 {
+            return None;
+        }
+        let mut names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
+        names.sort();
+        if let Some((seen, ms, tokens)) = self.observed_step.lock().unwrap().as_ref()
+            && *seen == names
+            && *tokens >= CALIBRATE_TOKENS
+        {
+            return Some(*ms);
+        }
+        let model = self.model.clone();
+        let allowed = move |at: usize| model.split_allowed(at);
+        super::divide::tree_ms(
+            &members,
+            &super::divide::Model {
+                layer_bytes: &self.layer_bytes,
+                head_bytes: self.head_bytes,
+                hidden_bytes: self.hidden_bytes(),
+                local_layers: self.settings.local_layers,
+                allowed: &allowed,
+            },
+        )
+    }
+
+    /// Why a node that leads a tree of a model it holds alone serves it
+    /// alone again: requests found the tree's decode step slower than this
+    /// node alone is predicted to take, over [`CALIBRATE_TOKENS`] tokens of
+    /// the tree it leads now. Only between requests, and only by measurement.
+    fn tree_is_slower_than_alone(&self) -> Option<String> {
+        if self.settings.divide == super::divide::Mode::Always
+            || !self.leading.load(Ordering::Acquire)
+            || self.active.load(Ordering::Acquire) > 0
+        {
+            return None;
+        }
+        let alone = self.alone_ms()?;
+        let names = self.member_names(&[]);
+        let (seen, ms, tokens) = self.observed_step.lock().unwrap().clone()?;
+        (seen == names && tokens >= CALIBRATE_TOKENS && ms > alone).then(|| {
+            format!(
+                "the tree decoded at {ms:.1} ms a token, this node alone at a predicted                  {alone:.1} ms"
+            )
+        })
     }
 
     /// The free nodes the last scan found that this node does not hold.
@@ -1368,14 +1902,15 @@ impl Node {
     /// the ones already held. A node another node claimed first refuses
     /// the handshake and is let go again.
     fn claim(self: &Arc<Self>) {
-        if !self.may_claim() {
+        // The request that asks is counted as running here already.
+        if !self.may_claim_with(1) {
             return;
         }
         let mut last = self.planning.lock().unwrap();
-        // Claimed by a parent, or another request claimed them, while this
-        // one waited.
+        // Claimed by a parent, or another request claimed them, or a sync
+        // benchmark started, while this one waited.
         let fresh = self.unclaimed();
-        if fresh.is_empty() || self.is_assigned() {
+        if fresh.is_empty() || self.is_assigned() || self.benching.load(Ordering::Acquire) {
             return;
         }
         let was_leading = self.leading.swap(true, Ordering::AcqRel);
@@ -1722,7 +2257,7 @@ impl Node {
     /// Lets go of every worker this node claimed on its channel: each
     /// drops its sessions and serves its own clients again, free for the
     /// next node with a request to claim.
-    fn release_workers(&self) {
+    fn release_workers(&self, why: &str) {
         let mut last = self.planning.lock().unwrap();
         if !self.leading.load(Ordering::Acquire) || self.active.load(Ordering::Acquire) > 0 {
             return;
@@ -1736,8 +2271,7 @@ impl Node {
         }
         self.leading.store(false, Ordering::Release);
         log::info!(
-            "orangu-server: workers: no request for {} s; {} let go",
-            self.settings.release.as_secs(),
+            "orangu-server: workers: {why}; {} let go",
             links
                 .iter()
                 .map(|link| link.addr.as_str())
@@ -2196,6 +2730,10 @@ impl Node {
                         "model_name": f.label,
                         "model_quant": f.quant,
                         "api": f.api,
+                        // How fast it decodes, and its time a token for a
+                        // request sent to it, as its probe said; `0` unknown.
+                        "decode_gb_per_s": f.pace.decode_rate,
+                        "step_ms": f.pace.step_ms,
                     })
                 })
                 .collect::<Vec<_>>(),
@@ -2228,6 +2766,8 @@ impl Node {
             // Where prompts ran: on one node that holds the whole model, or
             // through the tree, and the last one's numbers.
             "prefill": self.prefill_status(),
+            // Whether requests are served alone or divided, and why.
+            "divide": self.divide_status(),
             // Spare workers, and whom each stands in for since the last
             // plan, if anyone.
             "standby": self
@@ -2262,6 +2802,35 @@ impl Node {
                 .collect::<Vec<_>>(),
             // This node's own metrics address, for Prometheus's tree list.
             "metrics": metrics,
+        })
+    }
+
+    /// Whether requests are served alone or divided, for `/v1/workers`: the
+    /// mode, this node's time a token alone and for a request sent to it,
+    /// what requests found through its last tree, and the last decision.
+    fn divide_status(&self) -> serde_json::Value {
+        let observed = self.observed_step.lock().unwrap().clone().map(
+            |(nodes, ms, tokens)| serde_json::json!({ "nodes": nodes, "ms": ms, "tokens": tokens }),
+        );
+        let last = self.last_decision.lock().unwrap().clone().map(|d| {
+            serde_json::json!({
+                "verdict": match d.verdict {
+                    Verdict::Here => "here",
+                    Verdict::To(_) => "routed",
+                    Verdict::Divide => "divided",
+                },
+                "to": d.name,
+                "reason": d.reason,
+                "alone_ms": d.alone_ms,
+                "tree_ms": d.tree_ms,
+            })
+        });
+        serde_json::json!({
+            "mode": self.settings.divide.label(),
+            "alone_ms": self.alone_ms(),
+            "step_ms": self.step_ms(),
+            "observed_tree": observed,
+            "last": last,
         })
     }
 
@@ -2374,12 +2943,7 @@ impl Node {
                 }
             })
             .collect();
-        let n_embd = self.model.config().n_embd as f64;
-        let hidden_bytes = match self.settings.activations {
-            ActivationFormat::F32 => 4.0 * n_embd,
-            ActivationFormat::F16 => 2.0 * n_embd,
-            ActivationFormat::Q8_0 => 34.0 / 32.0 * n_embd,
-        };
+        let hidden_bytes = self.hidden_bytes();
         let width = super::pipeline::sub_chunk();
         super::prefill::Inputs {
             tree_tokens,
@@ -3845,6 +4409,12 @@ impl Node {
                             } else {
                                 0
                             },
+                            pace: super::protocol::Pace {
+                                decode_rate: self.settings.capacity.setups[0].decode_rate,
+                                decode_fixed_ms: self.settings.capacity.setups[0].decode_fixed_ms,
+                                budget_bytes: self.own_budget(false),
+                                step_ms: self.step_ms(),
+                            },
                         },
                     );
                     self.note_prober(&tcp);
@@ -4027,15 +4597,20 @@ impl Node {
                 continue;
             }
             if self.release_due() {
-                self.release_workers();
+                self.release_workers(&format!(
+                    "no request for {} s",
+                    self.settings.release.as_secs()
+                ));
                 continue;
             }
             if self.yields_to_larger() {
-                log::info!(
-                    "orangu-server: workers: another node leads a larger tree of this model; \
-                     this one gives way"
+                self.release_workers(
+                    "another node leads a larger tree of this model; this one gives way",
                 );
-                self.release_workers();
+                continue;
+            }
+            if let Some(why) = self.tree_is_slower_than_alone() {
+                self.release_workers(&format!("{why}; this node serves its model alone"));
                 continue;
             }
             if !self.delegates() || self.alone.load(Ordering::Acquire) {
@@ -4356,6 +4931,24 @@ impl PipelineSource for Node {
             entry.1 += tokens;
         }
         drop(observed);
+        // The step as a whole: every part, one after another.
+        let step: f64 = parts
+            .iter()
+            .map(|(_, elapsed)| elapsed.as_secs_f64() * 1e3)
+            .sum::<f64>()
+            / tokens as f64;
+        if step > 0.0 {
+            let names = self.member_names(&[]);
+            let mut seen = self.observed_step.lock().unwrap();
+            *seen = Some(match seen.take() {
+                Some((was, ms, count)) if was == names => {
+                    let old = count.min(256) as f64;
+                    let blended = (ms * old + step * tokens as f64) / (old + tokens as f64);
+                    (names, blended, count + tokens)
+                }
+                _ => (names, step, tokens),
+            });
+        }
         self.observed_since_plan
             .fetch_add(tokens, Ordering::Relaxed);
     }
@@ -4433,6 +5026,7 @@ mod tests {
             },
             shares: Shares::Memory,
             head: HeadOn::Top,
+            divide: super::super::divide::Mode::Measured,
             split: true,
             maintenance: Duration::from_millis(50),
             parent_silence: Duration::from_secs(30),
@@ -4635,13 +5229,13 @@ mod tests {
         }
     }
 
-    /// A node that cannot hold the model claims the free nodes of its
-    /// channel when a request starts, plans over them, and lets them go
-    /// once it has had no request for `release`.
+    /// A model no node holds alone is divided: the node a request reaches
+    /// claims the free nodes of its channel when the request starts, plans
+    /// over them, and lets them go once it has had no request for `release`.
     #[test]
     fn a_node_that_cannot_hold_the_model_claims_its_channel_and_lets_go() {
-        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
-        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
+        let beta = node_with(on_channel("beta", "lab", &[], false), Variant::default());
+        let gamma = node_with(on_channel("gamma", "lab", &[], false), Variant::default());
         let alpha = node_with(
             on_channel("alpha", "lab", &[&beta, &gamma], false),
             Variant::default(),
@@ -4684,17 +5278,17 @@ mod tests {
         assert!(!beta.is_assigned() && !gamma.is_assigned());
     }
 
-    /// A model the node with the request could hold alone is divided all
-    /// the same: every free node of the channel takes a share, none is held
-    /// back, and the answer is the unsplit model's.
+    /// With `ORANGU_WORKERS_DIVIDE=always`, a model the node with the
+    /// request could hold alone is divided all the same: every free node of
+    /// the channel takes a share, none is held back, and the answer is the
+    /// unsplit model's.
     #[test]
     fn every_free_node_takes_a_share_of_a_model_that_fits_alone() {
         let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
         let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
-        let alpha = node_with(
-            on_channel("alpha", "lab", &[&beta, &gamma], true),
-            Variant::default(),
-        );
+        let mut s = on_channel("alpha", "lab", &[&beta, &gamma], true);
+        s.divide = super::super::divide::Mode::Always;
+        let alpha = node_with(s, Variant::default());
         assert!(alpha.whole());
         found(&alpha, 2);
         assert_eq!(alpha.route(), None, "the node with the request leads");
@@ -4731,7 +5325,7 @@ mod tests {
     /// nodes left.
     #[test]
     fn a_lost_worker_is_replaced_by_a_free_node_of_the_channel() {
-        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let beta = node_with(on_channel("beta", "lab", &[], false), Variant::default());
         let later = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -4743,7 +5337,7 @@ mod tests {
         let request = alpha.start_request();
         assert!(alpha.standby_links().is_empty());
         assert!(beta.is_assigned());
-        let mut s = on_channel("gamma", "lab", &[], true);
+        let mut s = on_channel("gamma", "lab", &[], false);
         s.listen = Some(later.to_string());
         let gamma = node_with(s, Variant::default());
         found(&alpha, 2);
@@ -4780,7 +5374,7 @@ mod tests {
         ignore = "macOS answers on 127.0.0.1 alone, not the rest of 127.0.0.0/8"
     )]
     fn a_node_at_two_addresses_is_claimed_once() {
-        let mut s = on_channel("beta", "lab", &[], true);
+        let mut s = on_channel("beta", "lab", &[], false);
         s.listen = Some("0.0.0.0:0".to_string());
         let beta = node_with(s, Variant::default());
         let port = beta.local_addr().unwrap().port();
@@ -4871,13 +5465,13 @@ mod tests {
         );
     }
 
-    /// Two nodes that cannot hold the model and claim at the same moment:
-    /// whichever asks first, every free node ends promised to the lower
-    /// id, and the other node loses to it.
+    /// Two nodes that claim at the same moment a model no node holds alone:
+    /// whichever asks first, every free node ends promised to the lower id,
+    /// and the other node loses to it.
     #[test]
     fn two_claimers_end_with_one_winner() {
-        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
-        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
+        let beta = node_with(on_channel("beta", "lab", &[], false), Variant::default());
+        let gamma = node_with(on_channel("gamma", "lab", &[], false), Variant::default());
         let one = node_with(
             on_channel("one", "lab", &[&beta, &gamma], false),
             Variant::default(),
@@ -4914,7 +5508,7 @@ mod tests {
     /// sends a request to a node that leads a tree of the model.
     #[test]
     fn a_request_goes_to_a_node_leading_the_model() {
-        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let beta = node_with(on_channel("beta", "lab", &[], false), Variant::default());
         let mut s = on_channel("alpha", "lab", &[&beta], false);
         s.api_port = 1111;
         s.release = Duration::from_secs(60);
@@ -4937,12 +5531,14 @@ mod tests {
     }
 
     /// Of two nodes that lead trees of the same model, the one with fewer
-    /// workers gives way once it is idle.
+    /// workers gives way once it is idle. (A node that finds a tree of its
+    /// model sends its requests there; `delta` divides whatever it finds, as
+    /// two trees that form at once would.)
     #[test]
     fn the_smaller_of_two_trees_gives_way() {
-        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
-        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
-        let epsilon = node_with(on_channel("epsilon", "lab", &[], true), Variant::default());
+        let beta = node_with(on_channel("beta", "lab", &[], false), Variant::default());
+        let gamma = node_with(on_channel("gamma", "lab", &[], false), Variant::default());
+        let epsilon = node_with(on_channel("epsilon", "lab", &[], false), Variant::default());
         let mut s = on_channel("alpha", "lab", &[&beta, &gamma], false);
         s.release = Duration::from_secs(60);
         let alpha = node_with(s, Variant::default());
@@ -4952,6 +5548,7 @@ mod tests {
 
         let mut s = on_channel("delta", "lab", &[&alpha, &epsilon], false);
         s.release = Duration::from_secs(60);
+        s.divide = super::super::divide::Mode::Always;
         let delta = node_with(s, Variant::default());
         found(&delta, 2);
         let smaller = delta.start_request();
@@ -4972,8 +5569,7 @@ mod tests {
     }
 
     /// A node that cannot divide the model (`split` off) sends a request
-    /// to the least busy free node that holds it; one that can keeps the
-    /// request and divides the model over the free nodes.
+    /// to the least busy free node that holds it.
     #[test]
     fn a_node_that_cannot_divide_routes_to_one_that_holds_the_model() {
         let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
@@ -4985,17 +5581,286 @@ mod tests {
         assert_eq!(alpha.route().as_deref(), Some("http://127.0.0.1:0"));
         // A request already routed once stays.
         assert!(route(true).is_none());
+    }
 
+    /// A node that holds the model, with no measured speeds, never claims
+    /// workers: a tree that cannot be priced is not divided over.
+    #[test]
+    fn a_node_that_holds_the_model_does_not_claim_unmeasured() {
+        let beta = node_with(on_channel("beta", "lab", &[], true), Variant::default());
+        let alpha = node_with(
+            on_channel("alpha", "lab", &[&beta], true),
+            Variant::default(),
+        );
+        found(&alpha, 1);
+        assert!(alpha.may_claim_any());
+        assert!(!alpha.may_claim());
+        assert_eq!(alpha.route(), None);
+        let _request = alpha.start_request();
+        assert!(!beta.is_assigned());
+        assert!(alpha.links().is_empty());
+        let status = alpha.status();
+        assert_eq!(status["divide"]["last"]["verdict"], "here", "{status}");
+    }
+
+    /// With no measured speeds, a busy node that holds the model sends a
+    /// request to a less busy one that holds it too; a node that does not
+    /// hold the model sends it to whichever free node does.
+    #[test]
+    fn a_request_goes_to_the_least_busy_node_that_holds_the_model() {
+        let gamma = node_with(on_channel("gamma", "lab", &[], true), Variant::default());
         let beta = node_with(
             on_channel("beta", "lab", &[&gamma], true),
             Variant::default(),
         );
         found(&beta, 1);
-        assert!(beta.may_claim());
+        // Equally idle: served here.
         assert_eq!(beta.route(), None);
-        let _request = beta.start_request();
-        assert!(gamma.is_assigned());
-        assert_eq!(beta.links().len(), 1);
+        // Busy: both slots in use.
+        beta.active.store(2, Ordering::Release);
+        assert_eq!(beta.route().as_deref(), Some("http://127.0.0.1:0"));
+        beta.active.store(0, Ordering::Release);
+
+        let alpha = node_with(
+            on_channel("alpha", "lab", &[&gamma], false),
+            Variant::default(),
+        );
+        found(&alpha, 1);
+        assert_eq!(alpha.route().as_deref(), Some("http://127.0.0.1:0"));
+        let _request = alpha.start_request();
+        assert!(!gamma.is_assigned());
+    }
+
+    /// The bytes of the fixture's layers.
+    fn layer_total() -> u64 {
+        let loaded = fixture::loaded(Variant::default());
+        loaded
+            .tensor_sizes()
+            .filter(|(name, _)| {
+                crate::engine::loader::block_index(name).is_some_and(|il| il < N_LAYER)
+            })
+            .map(|(_, bytes)| bytes)
+            .sum()
+    }
+
+    /// A node on `channel` probing `peers` that measured its decode at
+    /// `ms_for_all` milliseconds for every layer of the fixture, plus
+    /// `fixed_ms` a step, with `budget` bytes for weights.
+    fn paced(
+        name: &str,
+        peers: &[&Arc<Node>],
+        ms_for_all: f64,
+        fixed_ms: f32,
+        budget: u64,
+        api_port: u16,
+    ) -> Arc<Node> {
+        node_with(
+            paced_settings(name, peers, ms_for_all, fixed_ms, budget, api_port),
+            Variant::default(),
+        )
+    }
+
+    fn paced_settings(
+        name: &str,
+        peers: &[&Arc<Node>],
+        ms_for_all: f64,
+        fixed_ms: f32,
+        budget: u64,
+        api_port: u16,
+    ) -> NodeSettings {
+        let mut s = on_channel(name, "lab", peers, true);
+        s.capacity.budget_bytes = budget;
+        s.capacity.setups = vec![NodeSetup {
+            name: name.to_string(),
+            decode_rate: (layer_total() as f64 / 1e9 / (ms_for_all / 1e3)) as f32,
+            decode_fixed_ms: fixed_ms,
+            ..NodeSetup::default()
+        }];
+        s.api_port = api_port;
+        s
+    }
+
+    /// Room for the whole fixture, and for about half its layers.
+    fn room() -> (u64, u64) {
+        let all: u64 = fixture::loaded(Variant::default())
+            .tensor_sizes()
+            .map(|(_, bytes)| bytes)
+            .sum();
+        (all * 4, layer_total() * 6 / 10)
+    }
+
+    /// A node that holds the model and decodes it faster than a tree over
+    /// the free nodes would serves it alone: it claims nobody, and says so.
+    #[test]
+    fn a_fast_node_that_holds_the_model_serves_it_alone() {
+        let (whole, _) = room();
+        let beta = paced("beta", &[], 400.0, 20.0, whole, 0);
+        let gamma = paced("gamma", &[], 400.0, 20.0, whole, 0);
+        let alpha = paced("alpha", &[&beta, &gamma], 10.0, 1.0, whole, 0);
+        found(&alpha, 2);
+        let decision = alpha.choose(0);
+        assert_eq!(decision.verdict, Verdict::Here, "{decision:?}");
+        assert!(
+            decision.tree_ms.unwrap() > decision.alone_ms.unwrap(),
+            "{decision:?}"
+        );
+        let _request = alpha.start_request();
+        assert!(alpha.links().is_empty());
+        assert!(!beta.is_assigned() && !gamma.is_assigned());
+        // The probe tells the others what a request takes here.
+        let alone = alpha.alone_ms().unwrap();
+        assert!(alone >= 11.0, "{alone}");
+        let probe = probe_of(&alpha, "lab").unwrap();
+        assert!(
+            (f64::from(probe.pace.step_ms) - alone).abs() < 0.01,
+            "{probe:?}"
+        );
+        assert!(probe.pace.decode_rate > 0.0 && probe.pace.budget_bytes == whole);
+    }
+
+    /// A slow node that holds the model sends a request to an idle node that
+    /// holds it too and decodes it faster.
+    #[test]
+    fn a_slow_node_sends_a_request_to_a_faster_one() {
+        let (whole, _) = room();
+        let laptop = paced("laptop", &[], 10.0, 1.0, whole, 4444);
+        let board = paced("board", &[&laptop], 400.0, 20.0, whole, 0);
+        found(&board, 1);
+        assert_eq!(board.route().as_deref(), Some("http://127.0.0.1:4444"));
+        let status = board.status();
+        assert_eq!(status["divide"]["last"]["verdict"], "routed", "{status}");
+        assert_eq!(status["divide"]["last"]["to"], "laptop", "{status}");
+        // The laptop keeps its own.
+        found(&laptop, 0);
+        assert_eq!(laptop.route(), None);
+    }
+
+    /// A slow node that holds the model, beside a fast one that holds only
+    /// about half of it: the tree over both is predicted faster, and the
+    /// model is divided.
+    #[test]
+    fn a_tree_predicted_faster_divides_a_model_that_fits_alone() {
+        let (whole, half) = room();
+        let fast = paced("fast", &[], 10.0, 1.0, half, 0);
+        let slow = paced("slow", &[&fast], 2000.0, 1.0, whole, 0);
+        found(&slow, 1);
+        let decision = slow.choose(0);
+        assert_eq!(decision.verdict, Verdict::Divide, "{decision:?}");
+        assert_eq!(slow.route(), None);
+        let _request = slow.start_request();
+        assert!(fast.is_assigned());
+        assert_eq!(slow.links().len(), 1);
+        // Leading, it reports the tree's time a token.
+        let probe = probe_of(&slow, "lab").unwrap();
+        assert_eq!(probe.state, ProbeState::Leading);
+        assert!(
+            f64::from(probe.pace.step_ms) < decision.alone_ms.unwrap(),
+            "{probe:?} {decision:?}"
+        );
+    }
+
+    /// A tree whose decode step requests found slower than the node alone is
+    /// let go between requests, and is not formed again.
+    #[test]
+    fn a_tree_found_slower_than_alone_is_let_go() {
+        let (whole, half) = room();
+        let fast = paced("fast", &[], 10.0, 1.0, half, 0);
+        let mut s = paced_settings("slow", &[&fast], 2000.0, 1.0, whole, 0);
+        s.release = Duration::from_secs(60);
+        let slow = node_with(s, Variant::default());
+        found(&slow, 1);
+        let request = slow.start_request();
+        assert!(slow.leading.load(Ordering::Acquire));
+        // Requests found every step far slower than predicted.
+        let names = slow.member_names(&[]);
+        *slow.observed_step.lock().unwrap() = Some((names, 1e6, CALIBRATE_TOKENS));
+        assert_eq!(slow.tree_is_slower_than_alone(), None, "not mid-request");
+        drop(request);
+        assert!(slow.tree_is_slower_than_alone().is_some());
+        until("the tree is let go", || {
+            !slow.leading.load(Ordering::Acquire) && !fast.is_assigned()
+        });
+        until("fast is free again", || {
+            slow.found
+                .lock()
+                .unwrap()
+                .0
+                .iter()
+                .any(|f| f.name == "fast" && f.state == ProbeState::Idle)
+        });
+        assert_eq!(slow.choose(0).verdict, Verdict::Here);
+    }
+
+    /// A sync benchmark against a free node of the channel: every round
+    /// trip echoed over the worker transport, a token's time the sum of its
+    /// round trips, the prediction beside it, and the peer let go after.
+    /// Refused for a node that leads, a peer that is not free, and one the
+    /// channel does not have.
+    #[test]
+    fn a_sync_benchmark_times_the_sums_against_a_free_peer() {
+        use super::super::syncbench::Ask;
+        let (whole, _) = room();
+        let beta = paced("beta", &[], 25.0, 1.0, whole, 0);
+        let alpha = paced("alpha", &[&beta], 50.0, 1.0, whole, 0);
+        found(&alpha, 1);
+        let ask = Ask {
+            peer: "beta".to_string(),
+            tokens: 5,
+            layers: 3,
+            hidden: 64,
+        };
+        let result = alpha.sync_bench(&ask).unwrap();
+        assert_eq!(result["round_trips_per_token"], 6, "{result}");
+        assert_eq!(result["f32"]["payload_bytes"], 256);
+        assert_eq!(result["f16"]["payload_bytes"], 128);
+        assert_eq!(result["peer"]["name"], "beta");
+        assert_eq!(result["peer"]["tls"], false);
+        assert!(result["link"]["rtt_ms"].as_f64().is_some(), "{result}");
+        for format in ["f32", "f16"] {
+            let token = result[format]["per_token_ms"]["median"].as_f64().unwrap();
+            let trip = result[format]["round_trip_ms"]["median"].as_f64().unwrap();
+            assert!(token > 0.0 && token >= trip, "{result}");
+            assert!(result[format]["mb_per_s"].as_f64().unwrap() > 0.0);
+        }
+        // Hidden states travel in f32 here: the sync is the f32 one, and
+        // the halves run at the slower node's rate — this one's.
+        let predicted = &result["predicted"];
+        let alone = alpha.alone_ms().unwrap();
+        assert!((predicted["alone_ms"].as_f64().unwrap() - alone).abs() < 1e-6);
+        assert_eq!(predicted["sync_from"], "f32");
+        assert_eq!(predicted["peer_rate_known"], true);
+        assert_eq!(
+            predicted["sync_ms"],
+            result["f32"]["per_token_ms"]["median"]
+        );
+        let compute = predicted["tp2_compute_ms"].as_f64().unwrap();
+        assert!(compute < alone && compute > 1.0, "{predicted}");
+        let total = predicted["tp2_total_ms"].as_f64().unwrap();
+        assert!(
+            (total - compute - predicted["sync_ms"].as_f64().unwrap()).abs() < 1e-9,
+            "{predicted}"
+        );
+        until("beta is let go", || beta.parent.lock().unwrap().is_none());
+        assert!(!alpha.benching.load(Ordering::Acquire));
+
+        let missing = Ask {
+            peer: "nobody".to_string(),
+            ..ask.clone()
+        };
+        assert_eq!(alpha.sync_bench(&missing).unwrap_err().0, 404);
+        alpha.leading.store(true, Ordering::Release);
+        let (status, why) = alpha.sync_bench(&ask).unwrap_err();
+        assert_eq!(status, 409, "{why}");
+        assert!(why.contains("leads a tree"), "{why}");
+        alpha.leading.store(false, Ordering::Release);
+        // No more scans: beta is made busy by hand.
+        alpha.stop.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(300));
+        alpha.found.lock().unwrap().0[0].state = ProbeState::Serving;
+        let (status, why) = alpha.sync_bench(&ask).unwrap_err();
+        assert_eq!(status, 409, "{why}");
+        assert!(why.contains("only a free node"), "{why}");
+        beta.stop();
     }
 
     /// Nodes cooperate only on the same model: one with another
@@ -5066,6 +5931,7 @@ mod tests {
         let mut s = on_channel("alpha", "lab", &[&beta, &other], true);
         s.api_port = 1111;
         s.release = Duration::from_secs(60);
+        s.divide = super::super::divide::Mode::Always;
         let alpha = node_with(s, Variant::default());
         let seen = found(&alpha, 2);
         let named = seen.iter().find(|f| f.name == "other").unwrap();
@@ -7012,6 +7878,7 @@ mod tests {
             label: String::new(),
             quant: String::new(),
             features: 0,
+            pace: Default::default(),
             rtt: Duration::from_millis(1),
             alternates: Vec::new(),
         }

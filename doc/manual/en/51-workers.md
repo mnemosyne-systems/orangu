@@ -6,18 +6,21 @@ Several machines on one network can serve as one. Give each
 `orangu-server` the same `[workers].name` — a **channel** — and they find
 each other on their own, then share the work two ways:
 
-- The model is **divided over every free machine**, whatever its size. The
-  node a request reaches claims the free nodes of its channel as its
-  workers: it runs some of the model's layers and hands the rest to them,
-  each node's share sized by its speed and memory.
-- A request reaching a node that works for another is sent on to that
-  node. Each node reports how busy it is, from `0.0` (idle) to `1.0`
-  (fully busy); with no node free, a busy node that holds the model hands
-  a request to a less busy one.
+- A request goes to the machine that serves it **fastest**. A node that
+  holds the model alone serves it alone, or sends it to another node that
+  holds it and decodes it faster for how busy it is. Each node reports how
+  busy it is, from `0.0` (idle) to `1.0` (fully busy).
+- The model is **divided over the free machines** when no machine holds it
+  alone, or when the speeds the machines measured predict that divided it
+  decodes faster than the fastest machine alone (see **Alone or
+  divided**). The node a request reaches claims the free nodes of its
+  channel as its workers: it runs some of the model's layers and hands the
+  rest to them, each node's share sized by its speed and memory.
   For every prompt chunk and every generated token, the hidden states
   travel to each worker and back, and the node that claimed them — the
   top-level node — samples, checks stop conditions and streams the reply,
-  exactly as a single server does.
+  exactly as a single server does. A request reaching a node that works
+  for another is sent on to that node.
 - A channel can serve **several models**. Nodes work together only on the
   same model; a request whose `model` field names another model that a node
   of the channel serves is sent to that node.
@@ -32,9 +35,10 @@ Splitting a model is about **room, not speed**. Every layer still runs once
 per token, one machine after another, and each hand-over adds a network
 round trip, so a model that fits on one machine is fastest there. A tree
 is for a model that does not fit, or for machines that are each too small
-to work together. Keep them close: on a LAN a round trip is a fraction of a
-millisecond, and across the internet it is tens of milliseconds for every
-token.
+to work together. The nodes decide this themselves from what they measure
+(see **Alone or divided**). Keep them close: on a LAN a round trip is a
+fraction of a millisecond, and across the internet it is tens of
+milliseconds for every token.
 
 Each node holds in memory only the layers it runs. Measured with
 `Llama-3.2-3B-Instruct-Q8_0` (3.4 GB) over three nodes of one machine:
@@ -163,12 +167,20 @@ workers: channel 'lab' has delta:8400 (192.168.1.13:8400, idle, another model: n
 ```
 
 **When each machine holds the model**, clients can talk to any of them. A
-node keeps a request unless another node that holds the model is at least
-0.1 less busy, and then sends it there and streams the answer back. A
-request is routed once at most. A node's load is the larger of its slots in
-use and how busy its processors are — the CPU, and a GPU where the driver
-reports its busy time — so a machine busy with something else counts as
-busy too. The requests routed are the ones that run the model:
+node keeps a request unless another node that holds the model, and is free,
+serves it faster: each node's time a token for its model alone, from the
+decode speed it measured, over what its load leaves free (`1 − load`, never
+under 5%). The other node must come out at most 0.9 of this one, and then
+the request is sent there and the answer streamed back. So a slow board
+that gets a request sends it to an idle laptop that decodes the model
+faster, and keeps it only when the laptop is so busy that it would be
+slower. A
+node that measured no speed, or finds another that holds the model and did
+not, goes by load alone: it keeps a request unless another such node is at
+least 0.1 less busy. A request is routed once at most. A node's load is the
+larger of its slots in use and how busy its processors are — the CPU, and a
+GPU where the driver reports its busy time — so a machine busy with
+something else counts as busy too. The requests routed are the ones that run the model:
 `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/completion`,
 `/infill`, `/embedding` and `/v1/embeddings`. The API key, if any, is
 checked first and passed on, so every node of a channel needs the same.
@@ -177,9 +189,10 @@ the other node as tokens, and the answer streams back into the console
 of the node it was typed on. A turn with pictures attached is served
 where it was typed.
 
-**When no machine holds the model**, the first node to get a request claims
-every free node it found whose load is at most 0.8, plans the model's layers
-over itself and them, and serves the request:
+**When no machine holds the model**, or dividing it is predicted faster than
+any machine alone, the first node to get a request claims every free node it
+found whose load is at most 0.8, plans the model's layers over itself and
+them, and serves the request:
 
 ```text
    clients ──▶  alpha  ──▶  beta
@@ -192,7 +205,7 @@ workers: claiming beta:8400 (192.168.1.11:8400), gamma:8400 (192.168.1.12:8400) 
 workers plan: alpha:8400 0..9, beta:8400 9..18, gamma:8400 18..28
 ```
 
-A node that holds the model never claims workers: it routes instead. A tree
+A node that holds the model claims workers only when dividing pays. A tree
 is one level deep: a node that leads workers of its own is not claimed by
 another, and a worker never claims any. When `release` seconds
 (`300` by default) pass with no request running on the top-level node, it
@@ -203,7 +216,8 @@ A channel forms one tree for its model:
 - **A node that already leads one serves the others.** A node that cannot
   hold the model, and finds no free node that can, sends its request to a
   node that leads a tree of the model and is not fully busy, instead of
-  claiming what is left.
+  claiming what is left. A node that holds the model sends it there only
+  when that tree is predicted at most 0.9 of its own time alone.
 - **Two claims at once have one winner.** Before it claims, a node asks
   each free node to promise itself to it for 10 seconds. A free node is
   promised to the lowest node id that asks in that time, the asking nodes
@@ -334,6 +348,67 @@ While `beta` and `gamma` work for `alpha`, a request that runs the model
 and reaches one of them is sent on to `alpha`; everything else but
 `/health`, `/ready`, `/metrics` and `/v1/workers` answers `503`. When
 `alpha` lets them go, or goes away, they serve their own clients again.
+
+## Alone or divided
+
+A tree runs every layer once a token, one node after another, and each
+hand-over adds a round trip, so it decodes faster than a node alone only
+when its fast nodes cannot hold the model by themselves — a GPU with room
+for half of it beside a board that holds all of it. The node a request
+reaches weighs the two before it claims anyone, from what each node
+measured at start (`setup` in `/v1/workers`):
+
+- **Alone**: every layer and the output head at the node's decode speed
+  (`decode_gb_per_s`), and what a step costs it whatever its layers
+  (`decode_fixed_ms`). Every node says its own in its answer to a probe, as
+  `step_ms`; a node that leads a tree says the tree's.
+- **Divided**: a tree over this node and the free nodes, cut as a plan cuts
+  it — by decode speed, up to each node's memory, in the order that runs
+  soonest — then each node's layers at its speed and its fixed cost, the
+  head on this node, and for every worker a round trip and the hidden state
+  each way. A free node's round trip is its probe's time, halved, since the
+  probe dials too; a worker this node already holds counts with its timed
+  `link`. Once requests have run through a tree, the speed each node showed
+  there counts instead, and for a tree of the same nodes, the time its
+  decode steps took.
+
+Each side is weighed by load, as shares are: a node's time over `1 − load`,
+never under 5%. The request is divided only when the tree comes out at most
+0.9 of the fastest node alone; otherwise it goes to that node. A tree
+another node leads takes the request on the same terms, by its `step_ms`.
+
+What cannot be priced is not divided over:
+
+- a node that holds the model with no measured speed, or beside another
+  that holds it and has none — with `shares = memory` no node times
+  itself: the request is served alone, by load as above;
+- a tree with a free node that measured nothing, or does not send its
+  speed: served alone.
+
+A model no node holds alone is always divided: the request goes to a node
+that leads a tree of it, else over the free nodes.
+
+A node that leads a tree of a model it holds alone keeps checking: when the
+decode steps of 32 tokens through the tree took longer than it predicts for
+itself alone, it lets its workers go between requests and serves alone, and
+the measured tree then keeps it from dividing again. While it leads, it
+takes a free node found later only when that is predicted to make the step
+at least 10% faster, or when its workers lack the room for the model.
+
+The log says how requests are served whenever that changes:
+
+```text
+workers: requests are served here alone: predicted 13.2 ms a token on this node alone, 94.1 ms divided
+workers: requests are sent to laptop:8400: predicted 13.2 ms a token on laptop:8400 alone, 94.1 ms divided
+```
+
+and `/v1/workers` has `divide`: `alone_ms`, this node's time a token alone;
+`step_ms`, what its probe answer says; `observed_tree`, the nodes of the
+last tree, its step in milliseconds and the tokens it was seen over; and
+`last`, the last decision — `verdict` (`here`, `routed` or `divided`), `to`,
+`reason`, `alone_ms` (the best node alone, by its load) and `tree_ms`. Each
+node under `found` shows the `decode_gb_per_s` and `step_ms` its probe
+said.
 
 ## Several models on one channel
 
@@ -633,8 +708,9 @@ limit where there is one, so this holds in a container. Some limits:
 
 ## Where a long prompt runs
 
-A prompt goes through the tree part by part, every node running its own
-layers. When a node of the plan holds the whole model — memory for every
+A request served by one node alone runs its prompt there, like any server.
+In a tree, a prompt goes through the tree part by part, every node running
+its own layers. When a node of the plan holds the whole model — memory for every
 layer, `holds_model` in `/v1/workers` — and reads prompts much faster than
 the tree, a long prompt runs there instead: that node runs every layer of
 the prompt alone, each node of the tree is then given the rows of its own

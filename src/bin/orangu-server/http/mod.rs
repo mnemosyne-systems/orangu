@@ -862,6 +862,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/audio/voices", get(audio::voices))
         .route("/v1/shutdown", post(shutdown))
         .route("/v1/workers", get(native::workers))
+        .route("/v1/workers/sync-bench", post(native::sync_bench))
         .route(peer::PATH, post(peer::generate))
         // The file-lifecycle API, mounted from the shared router
         // `orangu-coordinator` mounts too, so both front doors serve the
