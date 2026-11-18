@@ -272,7 +272,7 @@
       <p id="image-none" class="mcps-note" hidden>The served model is a language model; picture settings apply to a <code>qwen_image</code>, <code>qwen_image_2_1</code>, <code>flux2_klein</code>, <code>moss_image</code> or <code>minimax_h3_image</code> model.</p>
       <form id="image-form" hidden>
         <label class="image-field">
-          <span>Size <button type="button" class="info-btn" aria-label="What this setting does" data-tip="The picture's width × height in pixels, both multiples of 16 — 32 for Qwen-Image 2.1, whose presets that do not fit are greyed out. The time grows a little faster than the pixel count. 1024 × 1024 is the model's native size; 512 × 512 is the smallest that still follows the prompt reliably — a preview in a couple of minutes; at 256 × 256 the model wanders (a cat asked for, a man drawn)."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span>Size <button type="button" class="info-btn" aria-label="What this setting does" data-tip="The picture's width × height in pixels — any size: one that is not a multiple of the model's unit (16 pixels, 32 for Qwen-Image 2.1 and MiniMax-H3-Image) is drawn a few pixels bigger and cropped back. Sizes larger than the model draws are greyed out, and a larger Other… size comes back at the largest the model draws, at the same proportions. The time grows a little faster than the pixel count. 1024 × 1024 is the model's native size; 512 × 512 is the smallest that still follows the prompt reliably — a preview in a couple of minutes; at 256 × 256 the model wanders (a cat asked for, a man drawn)."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
           <span class="image-controls">
             <select id="image-size">
               <option value="256x256">256 × 256 — smallest</option>
@@ -281,9 +281,15 @@
               <option value="1024x1024">1024 × 1024</option>
               <option value="1024x768">1024 × 768 — landscape</option>
               <option value="768x1024">768 × 1024 — portrait</option>
-              <option value="1280x720">1280 × 720 — wide</option>
-              <option value="1280x704">1280 × 704 — wide, Qwen-Image 2.1</option>
+              <option value="1280x720">1280 × 720 — HD</option>
+              <option value="720x1280">720 × 1280 — HD portrait</option>
+              <option value="1920x1080">1920 × 1080 — Full HD</option>
+              <option value="1080x1920">1080 × 1920 — Full HD portrait</option>
               <option value="2048x2048">2048 × 2048 — Qwen-Image 2.1's native</option>
+              <option value="2560x1440">2560 × 1440 — QHD</option>
+              <option value="1440x2560">1440 × 2560 — QHD portrait</option>
+              <option value="3840x2160">3840 × 2160 — 4K UHD</option>
+              <option value="2160x3840">2160 × 3840 — 4K UHD portrait</option>
               <option value="custom">Other…</option>
             </select>
             <input id="image-size-custom" type="text" inputmode="numeric" placeholder="WIDTHxHEIGHT" spellcheck="false" hidden>

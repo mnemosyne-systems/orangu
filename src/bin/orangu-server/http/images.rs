@@ -46,7 +46,7 @@ use std::sync::Arc;
 
 use super::AppState;
 use crate::engine::image::{
-    ImageDefaults, ImageEvent, ImageFormat, ImageRequest, InitImage, Pipeline, codec,
+    ImageDefaults, ImageEvent, ImageFormat, ImageRequest, InitImage, Pipeline, Variant, codec,
 };
 
 /// The largest picture, in bytes once decoded, an image server takes to
@@ -143,9 +143,15 @@ pub fn props_json(pipeline: &Pipeline) -> serde_json::Value {
     };
     json!({
         // `qwen_image`, `qwen_image_2_1`, `flux2_klein`, `moss_image` or `minimax_h3_image`, and the
-        // pixels a side must be a multiple of for it.
+        // pixels it draws a side in: a size off the unit is drawn rounded
+        // up to it and cropped back.
         "architecture": pipeline.variant.architecture(),
         "size_unit": pipeline.size_unit(),
+        // The picture areas, in pixels, the model draws well: a request
+        // under `min_area` is drawn at it and scaled down, one over
+        // `max_area` comes back capped to it at the same proportions.
+        "min_area": pipeline.variant.min_generation_area(),
+        "max_area": pipeline.variant.max_generation_area(),
         // Qwen-Image 2.1's step-distilled checkpoint, on its own schedule.
         "turbo": pipeline.turbo,
         "text_encoder": pipeline.companions.text_encoder.display().to_string(),
@@ -211,11 +217,20 @@ pub struct ImageSettings {
     pub format: Option<String>,
 }
 
+/// The reason `size` is not a picture size.
+fn size_error(size: &str) -> String {
+    format!(
+        "size '{size}' is not WIDTHxHEIGHT with each side from {} to {} pixels",
+        crate::config::MIN_IMAGE_SIDE,
+        crate::config::MAX_IMAGE_SIDE
+    )
+}
+
 /// Applies `settings` to the pipeline's defaults, checked as the config
-/// loader checks the same keys — a size that is not multiples of the
-/// model's unit (16, or 32 for Qwen-Image 2.1), zero
+/// loader checks the same keys — a size that is not WIDTHxHEIGHT, zero
 /// steps, a negative guidance, a strength outside 0–1 are refused whole,
 /// so the defaults never hold a value a request could not be built from.
+/// A size past the model's largest area is held capped to it.
 pub fn apply_settings(pipeline: &Pipeline, settings: &ImageSettings) -> Result<(), String> {
     let mut d = if settings.reset {
         pipeline.configured.clone()
@@ -223,12 +238,11 @@ pub fn apply_settings(pipeline: &Pipeline, settings: &ImageSettings) -> Result<(
         pipeline.defaults()
     };
     if let Some(size) = settings.size.as_deref().map(str::trim) {
-        let unit = pipeline.size_unit();
-        let (width, height) = crate::config::parse_image_size(size)
-            .filter(|(w, h)| w.is_multiple_of(unit) && h.is_multiple_of(unit))
-            .ok_or_else(|| format!("size '{size}' is not WIDTHxHEIGHT in multiples of {unit}"))?;
-        d.width = width;
-        d.height = height;
+        let (width, height) =
+            crate::config::parse_image_size(size).ok_or_else(|| size_error(size))?;
+        // Held capped, so the defaults (and the estimate `/props` gives for
+        // them) are the size a picture really comes out at.
+        (d.width, d.height) = pipeline.variant.capped_size(width, height);
     }
     if let Some(steps) = settings.steps {
         if steps == 0 {
@@ -317,14 +331,15 @@ pub fn decode_image_payload(payload: &str) -> Result<(String, Vec<u8>), String> 
 }
 
 /// Resolves the parameters into a request, or the reason they cannot be.
-/// `unit` is the pixels a side must be a multiple of — the pipeline's
-/// [`Pipeline::size_unit`].
+/// `variant` is the served model, whose unit an attachment's proportions
+/// are rounded to and whose largest area a size is capped to.
 pub fn build_request(
     defaults: &ImageDefaults,
-    unit: usize,
+    variant: Variant,
     max_pictures: usize,
     params: ImageParams<'_>,
 ) -> Result<ImageRequest, String> {
+    let unit = variant.size_unit();
     if params.prompt.trim().is_empty() {
         return Err("prompt is required".to_string());
     }
@@ -365,13 +380,9 @@ pub fn build_request(
     {
         return Err("strength must be between 0 and 1".to_string());
     }
-    let (width, height) = match params.size.map(str::trim) {
+    let asked = match params.size.map(str::trim) {
         Some(size) if !size.is_empty() && !size.eq_ignore_ascii_case("auto") => {
-            crate::config::parse_image_size(size)
-                .filter(|(w, h)| w.is_multiple_of(unit) && h.is_multiple_of(unit))
-                .ok_or_else(|| {
-                    format!("size '{size}' is not WIDTHxHEIGHT in multiples of {unit}")
-                })?
+            crate::config::parse_image_size(size).ok_or_else(|| size_error(size))?
         }
         _ => match first_dims {
             // The first picture sets the proportions; the server's
@@ -382,6 +393,11 @@ pub fn build_request(
             None => (defaults.width, defaults.height),
         },
     };
+    // Past the model's largest area the picture is drawn at that area
+    // instead, and the reply says so; scaling it up is a picture editor's
+    // job, not the model's.
+    let (width, height) = variant.capped_size(asked.0, asked.1);
+    let capped_from = ((width, height) != asked).then_some(asked);
     let steps = params.steps.unwrap_or(defaults.steps);
     if steps == 0 {
         return Err("steps must be at least 1".to_string());
@@ -395,6 +411,7 @@ pub fn build_request(
         negative_prompt: params.negative_prompt.map(str::to_string),
         width,
         height,
+        capped_from,
         steps,
         cfg_scale,
         seed: params.seed,
@@ -495,7 +512,7 @@ pub async fn generations(
     };
     let request = match build_request(
         &pipeline.defaults(),
-        pipeline.size_unit(),
+        pipeline.variant,
         pipeline.max_pictures(),
         ImageParams {
             prompt: &req.prompt,
@@ -541,7 +558,8 @@ pub async fn generations(
             data.push(json!({
                 "b64_json": base64::engine::general_purpose::STANDARD.encode(&image.bytes),
                 "output_format": image.format.extension(),
-                "size": format!("{}x{}", image.width, image.height),
+                "size": image.size(),
+                "requested_size": image.requested_size(),
                 "seed": image.seed,
                 "steps": image.steps,
                 "generation_ms": image.elapsed.as_millis() as u64,
@@ -553,6 +571,9 @@ pub async fn generations(
             "model": state.model_label,
             "output_format": request.format.extension(),
             "size": format!("{}x{}", request.width, request.height),
+            // The size asked for, when it was past the model's largest and
+            // `size` is it capped; `null` otherwise.
+            "requested_size": request.capped_from.map(|(w, h)| format!("{w}x{h}")),
             "data": data,
         }))
         .into_response();
@@ -586,7 +607,8 @@ pub async fn generations(
                         "created": created, "model": model,
                         "b64_json": base64::engine::general_purpose::STANDARD.encode(&image.bytes),
                         "output_format": image.format.extension(),
-                        "size": format!("{}x{}", image.width, image.height),
+                        "size": image.size(),
+                        "requested_size": image.requested_size(),
                         "seed": image.seed,
                         "steps": image.steps,
                         "generation_ms": image.elapsed.as_millis() as u64,
@@ -667,7 +689,7 @@ mod tests {
             strength: 0.7,
             format: ImageFormat::Webp,
         };
-        let request = build_request(&defaults, 16, 1, params("a cat")).unwrap();
+        let request = build_request(&defaults, Variant::QwenImage, 1, params("a cat")).unwrap();
         assert_eq!((request.width, request.height), (512, 256));
         assert_eq!(request.steps, 8);
         assert_eq!(request.cfg_scale, 2.5);
@@ -680,7 +702,7 @@ mod tests {
         p.size = Some("768x512");
         p.steps = Some(4);
         p.output_format = Some("jpeg");
-        let request = build_request(&defaults, 16, 1, p).unwrap();
+        let request = build_request(&defaults, Variant::QwenImage, 1, p).unwrap();
         assert_eq!((request.width, request.height), (768, 512));
         assert_eq!(request.steps, 4);
         assert_eq!(request.format, ImageFormat::Jpeg);
@@ -689,28 +711,105 @@ mod tests {
     #[test]
     fn bad_parameters_are_named() {
         let defaults = ImageDefaults::default();
-        assert!(build_request(&defaults, 16, 1, params("  ")).is_err());
-        let mut p = params("x");
-        p.size = Some("100x100");
-        assert!(
-            build_request(&defaults, 16, 1, p)
-                .unwrap_err()
-                .contains("size")
-        );
+        assert!(build_request(&defaults, Variant::QwenImage, 1, params("  ")).is_err());
+        for size in ["8x8", "wide", "1920x", "20000x1080"] {
+            let mut p = params("x");
+            p.size = Some(size);
+            let err = build_request(&defaults, Variant::QwenImage, 1, p).unwrap_err();
+            assert!(err.contains("size") && err.contains("16 to 16384"), "{err}");
+        }
         let mut p = params("x");
         p.steps = Some(0);
         assert!(
-            build_request(&defaults, 16, 1, p)
+            build_request(&defaults, Variant::QwenImage, 1, p)
                 .unwrap_err()
                 .contains("steps")
         );
         let mut p = params("x");
         p.output_format = Some("bmp");
         assert!(
-            build_request(&defaults, 16, 1, p)
+            build_request(&defaults, Variant::QwenImage, 1, p)
                 .unwrap_err()
                 .contains("output_format")
         );
+    }
+
+    fn sized(variant: Variant, size: &str) -> ImageRequest {
+        let mut p = params("a lighthouse at dusk");
+        p.size = Some(size);
+        build_request(&ImageDefaults::default(), variant, 1, p).unwrap()
+    }
+
+    /// The sizes the issue names, on a 16- and a 32-pixel model: each is
+    /// taken as asked (drawn rounded up to the unit and cropped back), and
+    /// nothing is said about a cap.
+    #[test]
+    fn standard_sizes_are_taken_as_asked() {
+        for variant in [Variant::Flux2Klein, Variant::QwenImage21] {
+            for (size, dims) in [
+                ("1024x768", (1024, 768)),
+                ("1920x1080", (1920, 1080)),
+                ("1080x1920", (1080, 1920)),
+                ("1366x768", (1366, 768)),
+                ("1000", (1000, 1000)),
+            ] {
+                let r = sized(variant, size);
+                assert_eq!((r.width, r.height), dims, "{variant:?} {size}");
+                assert_eq!(r.capped_from, None, "{variant:?} {size}");
+            }
+        }
+    }
+
+    /// 3840x2160 is past what Qwen-Image 2.1 draws: it comes back at the
+    /// same proportions inside 2048², and the request remembers what was
+    /// asked so the reply can say so. MiniMax-H3-Image draws it whole.
+    #[test]
+    fn a_size_past_the_model_is_capped_and_remembered() {
+        let r = sized(Variant::QwenImage21, "3840x2160");
+        assert_eq!((r.width, r.height), (2720, 1536));
+        assert_eq!(r.capped_from, Some((3840, 2160)));
+
+        let r = sized(Variant::QwenImage, "1920x1080");
+        assert_eq!((r.width, r.height), (1760, 992));
+        assert_eq!(r.capped_from, Some((1920, 1080)));
+
+        let r = sized(Variant::MiniMaxH3Image, "3840x2160");
+        assert_eq!((r.width, r.height), (3840, 2160));
+        assert_eq!(r.capped_from, None);
+
+        // A server default past the model is capped the same way.
+        let defaults = ImageDefaults {
+            width: 4096,
+            height: 4096,
+            ..ImageDefaults::default()
+        };
+        let r = build_request(&defaults, Variant::Flux2Klein, 1, params("x")).unwrap();
+        assert_eq!((r.width, r.height), (2048, 2048));
+        assert_eq!(r.capped_from, Some((4096, 4096)));
+    }
+
+    /// An attachment larger than the model draws sets the proportions and
+    /// is capped too.
+    #[test]
+    fn an_attachment_past_the_model_is_capped() {
+        let defaults = ImageDefaults {
+            width: 4096,
+            height: 4096,
+            ..ImageDefaults::default()
+        };
+        let mut p = params("brighter");
+        p.init = vec![("image/png".into(), picture(3000, 1500, ImageFormat::Png))];
+        // The defaults' 4096 does not bound it: its own size on the unit is
+        // 3008x1504, 4.5 megapixels, past 2.1's 2048².
+        let r = build_request(&defaults, Variant::QwenImage21, 1, p).unwrap();
+        assert_eq!((r.width, r.height), (2880, 1440));
+        assert_eq!(r.capped_from, Some((3008, 1504)));
+
+        let mut p = params("brighter");
+        p.init = vec![("image/png".into(), picture(400, 200, ImageFormat::Png))];
+        let r = build_request(&defaults, Variant::QwenImage21, 1, p).unwrap();
+        assert_eq!((r.width, r.height), (416, 192));
+        assert_eq!(r.capped_from, None);
     }
 
     /// An attached JPEG comes back as JPEG, at its own size snapped to the
@@ -728,7 +827,7 @@ mod tests {
         let jpeg = codec::encode(&feature, ImageFormat::Jpeg).unwrap();
         let mut p = params("brighter");
         p.init = vec![("image/jpeg".into(), jpeg)];
-        let request = build_request(&defaults, 16, 1, p).unwrap();
+        let request = build_request(&defaults, Variant::QwenImage, 1, p).unwrap();
         assert_eq!(request.format, ImageFormat::Jpeg);
         assert_eq!((request.width, request.height), (400, 208));
         assert_eq!(request.init.as_ref().unwrap().strength, defaults.strength);
@@ -738,7 +837,7 @@ mod tests {
         let png = codec::encode(&feature, ImageFormat::Png).unwrap();
         let mut p = params("brighter");
         p.init = vec![("image/png".into(), png)];
-        let request = build_request(&defaults, 16, 1, p).unwrap();
+        let request = build_request(&defaults, Variant::QwenImage, 1, p).unwrap();
         assert_eq!(request.format, ImageFormat::Png);
         assert_eq!((request.width, request.height), (512, 256));
     }
@@ -767,7 +866,7 @@ mod tests {
             ("image/jpeg".into(), first.clone()),
             ("image/png".into(), second.clone()),
         ];
-        let request = build_request(&defaults, 16, usize::MAX, p).unwrap();
+        let request = build_request(&defaults, Variant::QwenImage, usize::MAX, p).unwrap();
         let init = request.init.unwrap();
         assert_eq!(init.pictures, vec![first.clone(), second]);
         assert_eq!(init.first(), first.as_slice());
@@ -784,13 +883,13 @@ mod tests {
             ("image/png".into(), png.clone()),
             ("image/png".into(), png.clone()),
         ];
-        let err = build_request(&defaults, 16, 1, p).unwrap_err();
+        let err = build_request(&defaults, Variant::QwenImage, 1, p).unwrap_err();
         assert!(err.contains("2 pictures"), "{err}");
         assert!(err.contains("starts from one"), "{err}");
 
         let mut p = params("x");
         p.init = vec![("image/png".into(), png)];
-        let err = build_request(&defaults, 16, 0, p).unwrap_err();
+        let err = build_request(&defaults, Variant::QwenImage, 0, p).unwrap_err();
         assert!(err.contains("text alone"), "{err}");
     }
 
@@ -802,7 +901,7 @@ mod tests {
             ("image/png".into(), picture(64, 64, ImageFormat::Png)),
             ("image/png".into(), b"not a picture".to_vec()),
         ];
-        let err = build_request(&defaults, 16, usize::MAX, p).unwrap_err();
+        let err = build_request(&defaults, Variant::QwenImage, usize::MAX, p).unwrap_err();
         assert!(err.starts_with("attached picture 2:"), "{err}");
     }
 
@@ -828,6 +927,7 @@ mod tests {
             format: ImageFormat::Png,
             width: 16,
             height: 16,
+            capped_from: None,
             seed: 1,
             steps: 1,
             elapsed: std::time::Duration::ZERO,

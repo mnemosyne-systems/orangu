@@ -1483,12 +1483,16 @@ fn prompt_image_keys(
         |value| crate::engine::image::stepcache::ImageCache::parse(value).map(|_| ()),
     )?;
     let default_size = format!("{}x{}", defaults.width, defaults.height);
-    let unit = variant.size_unit();
     let size = prompt_checked("image_size", &default_size, |value| {
         crate::config::parse_image_size(value)
-            .filter(|(w, h)| w.is_multiple_of(unit) && h.is_multiple_of(unit))
             .map(|_| ())
-            .ok_or_else(|| anyhow!("expected WIDTHxHEIGHT or one side, multiples of {unit}"))
+            .ok_or_else(|| {
+                anyhow!(
+                    "expected WIDTHxHEIGHT or one side, each from {} to {}",
+                    crate::config::MIN_IMAGE_SIDE,
+                    crate::config::MAX_IMAGE_SIDE
+                )
+            })
     })?;
     // A step-distilled adapter is made for a step count and no guidance,
     // and says the count in its file name (`…-8steps-…`): the server takes

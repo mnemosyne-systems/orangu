@@ -782,7 +782,7 @@ curl -s localhost:8100/v1/images/generations -H 'Content-Type: application/json'
 | :-- | :-- | :-- |
 | `prompt` | *required* | what to draw |
 | `negative_prompt` | `image_negative_prompt` | what to draw away from; read only when `cfg_scale > 1` |
-| `size` | `image_size` | `WIDTHxHEIGHT`, both multiples of 16; `auto` is the default, or the (first) attached `image`'s own proportions when there is one |
+| `size` | `image_size` | `WIDTHxHEIGHT`, each side from 16 to 16384 — `1920x1080` and `3840x2160` included; `auto` is the default, or the (first) attached `image`'s own proportions when there is one. A side that is not a multiple of the model's unit (`/props`' `image.size_unit`) is drawn rounded up and cropped back to it; a size past the model's largest area (`image.max_area`) comes back capped to that area at the same proportions, and the reply's `requested_size` says what was asked |
 | `n` | `1` | pictures to make, `1` to `10`, in turn; a `seed` seeds the set, each one `seed + i` |
 | `output_format` | `image_format` (`png`) | `png`, `jpeg`, `gif`, `webp` (lossless) or `svg` (an SVG document carrying the picture as PNG); an attached picture defaults to its own format (the first one's, when there are several) |
 | `response_format` | `b64_json` | the only value — there are no files to return a `url` to |
@@ -794,7 +794,9 @@ curl -s localhost:8100/v1/images/generations -H 'Content-Type: application/json'
 | `stream` | `false` | server-sent events instead of one body |
 
 The reply is OpenAI's: `{"created", "model", "data": [{"b64_json", …}]}`,
-with each picture also carrying `output_format`, `size`, `seed`, `steps`,
+with each picture also carrying `output_format`, `size` (the picture's
+own), `requested_size` (the size asked for when the model capped it,
+otherwise `null`), `seed`, `steps`,
 `generation_ms` and `timings` — `{"encode_ms", "steps_ms", "decode_ms"}`,
 where the picture's time went: the prompts through the text encoder, the
 denoising loop, and the VAE plus the file format — and `timings.stages`,
@@ -829,7 +831,7 @@ start from — several only for an edit, as for `image` above. Every knob is
 the server's `image_*` default except `seed`. The assistant's `content` is
 the picture as a markdown image over a `data:` URL, which a markdown-rendering
 chat client shows inline; `message.images` carries the same picture as
-`b64_json` with `mime`, `size`, `seed`, `steps` and `generation_ms` for a
+`b64_json` with `mime`, `size`, `requested_size`, `seed`, `steps` and `generation_ms` for a
 client that wants the bytes. Streamed, the chunks carry an empty `delta` and
 an `image_progress` object (`step`, `steps`, `eta_seconds`) until the final
 chunk delivers the content with `finish_reason: "stop"`.
@@ -2120,7 +2122,8 @@ picture will come out, and how long it will take, before asking for one:
 | `image.` | |
 | :-- | :-- |
 | `architecture` | `qwen_image`, `qwen_image_2_1`, `flux2_klein`, `moss_image` or `minimax_h3_image` |
-| `size_unit` | the pixels each side of a picture must be a multiple of: `16`, or `32` for Qwen-Image 2.1 |
+| `size_unit` | the pixels the model draws a side in: `16`, or `32` for Qwen-Image 2.1 and MiniMax-H3-Image. A side that is not a multiple of it is drawn rounded up and cropped back |
+| `min_area`, `max_area` | the picture areas, in pixels, the model draws well: a request under `min_area` (512 × 512 for MiniMax-H3-Image, `0` for the others) is drawn at it and scaled down; one over `max_area` (1328 × 1328 for Qwen-Image 2512, 2048 × 2048 for Qwen-Image 2.1, FLUX.2 [klein] and MOSS-Image, 4096 × 4096 for MiniMax-H3-Image) comes back capped to it at the same proportions |
 | `turbo` | `true` for a step-distilled checkpoint: Qwen-Image 2.1 Turbo, sampled on its eight-step schedule, or a distilled FLUX.2 [klein] (four steps) |
 | `text_encoder`, `vae` | the companion files the pipeline was loaded with |
 | `vision` | the vision projector a `qwen_image_2_1` pipeline edits attached pictures with, or `null` — an attached picture is then a starting point |
@@ -2164,7 +2167,8 @@ On a speech model, `audio` is the same for a clip of speech:
 
 Changes the picture defaults — the ones every request that does not say
 otherwise gets, and so what a chat turn draws. The body is `{"image":
-{…}}` with any of `size` (`WIDTHxHEIGHT`, multiples of 16), `steps`,
+{…}}` with any of `size` (`WIDTHxHEIGHT`, each side 16 to 16384, held
+capped to the model's `max_area`), `steps`,
 `cfg_scale` (`1` turns guidance off), `negative_prompt`, `strength`
 (0–1), `format` (`png`, `jpeg`, `gif`, `webp`, `svg`); keys left out keep
 their value, and `"reset": true` puts every one
@@ -2177,7 +2181,7 @@ curl -s -X POST localhost:8100/props -H 'Content-Type: application/json' \
 ```
 
 `400` names the value the config loader would have refused too (a size
-not in multiples of 16, zero steps, a guidance below 0, a strength outside
+that is not `WIDTHxHEIGHT`, zero steps, a guidance below 0, a strength outside
 0–1) and changes nothing; `501` on a language model. The web console's
 **Settings › Image** pane is this endpoint, on the console's own port as
 `/api/props`; the change holds until the server restarts, when the

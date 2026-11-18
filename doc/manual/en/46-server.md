@@ -2093,7 +2093,7 @@ shown.
 | `vae_precision`         | `int8`                                     | the VAE's convolutions as `Q6_K` on the `int8` kernel (3–4× faster decode), or `f32` as stored (exact); an `ltxv` model's video VAE follows it too                                                                                                                                                                                                                                                                                                                                                   |
 | `image_cache`           | `easy`                                     | whether a step may reuse the last transformer pass rather than run one (EasyCache): `easy` (the default, threshold 0.08) or `easy:<threshold>` a step whose predicted change since the last pass stays under the threshold takes the last two passes' residual extrapolated to it, and `off` runs every step; at 0.08 about 2.4× a 40-step 1024² picture and 3.6× a 512² edit, the picture close to the uncached one but not identical; 0.05 is closer at 2×, 0.1 and above start to ghost lettering |
 | `image_reference_size`  | `source`                                   | the area an edit reads its reference at: `source` the picture's area but never more than the attached picture's own (upsampling adds nothing but tokens), `output` the picture's area (diffusers reads 1024²), or `WIDTHxHEIGHT` a cap; a 256² picture edited at 1024² encodes in 6 s rather than 84 and steps in 50 s rather than 79                                                                                                                                                                |
-| `image_size`            | `1024x1024`                                | a picture's size when the request does not say; multiples of 16                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `image_size`            | `1024x1024`                                | a picture's size when the request does not say; any `WIDTHxHEIGHT` (see **Picture sizes** below)                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `image_steps`           | `50`; the adapter's under one              | denoising steps                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `image_cfg_scale`       | `4`; `1` under an adapter                  | classifier-free guidance; `1` turns it off                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `image_negative_prompt` | a space                                    | what a picture is pushed away from                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
@@ -4225,8 +4225,9 @@ channel, and it has its own two companions, found the same way as below:
 
 There is no adapter for 2.1 (`image_lora = auto` finds none; naming one is
 an error), and none is needed: its release settings — the defaults when
-the config leaves them out — are forty steps without guidance. Sizes are
-multiples of 32. `orangu-server download unsloth/Qwen-Image-2.1-GGUF:Q4_K_M`
+the config leaves them out — are forty steps without guidance. It draws
+in 32-pixel units, up to 2048 × 2048 (see **Picture sizes** below).
+`orangu-server download unsloth/Qwen-Image-2.1-GGUF:Q4_K_M`
 fetches the three files.
 
 **FLUX.2 [klein] 4B** is served the same way: `unsloth/FLUX.2-klein-base-4B-GGUF`
@@ -4249,8 +4250,8 @@ transformer of five dual-stream and twenty single-stream blocks
 
 Its release settings are fifty steps at guidance 4 for the `base`
 checkpoint, four without guidance for a step-distilled [klein] (a file
-without `base` in its name); sizes are multiples of 16; a blank negative
-prompt is the empty one. There is no adapter and no editing: an attached
+without `base` in its name); it draws in 16-pixel units, up to
+2048 × 2048; a blank negative prompt is the empty one. There is no adapter and no editing: an attached
 picture is a starting point. `orangu-server download
 unsloth/FLUX.2-klein-base-4B-GGUF:Q4_K_M` fetches the three files.
 
@@ -4272,8 +4273,8 @@ companions found the same way:
 
 Its release settings are fifty steps at guidance 3, the negative pass
 skipping block 22; the schedule's levels are shifted by 5 and snapped to
-the thousand it was trained at. Sizes are multiples of 16; a blank
-negative prompt is the empty one. There is no adapter and no editing.
+the thousand it was trained at. It draws in 16-pixel units, up to
+2048 × 2048; a blank negative prompt is the empty one. There is no adapter and no editing.
 `orangu-server download unsloth/MOSS-Image-Base-GGUF:Q8_0` fetches the
 three files.
 
@@ -4299,7 +4300,8 @@ and two companions found the same way:
 
 Its release settings are six steps without guidance on the schedule the
 heads were distilled on; another step count resamples it and blends the
-heads. Sizes are multiples of 32. There is no adapter, and an attached
+heads. It draws in 32-pixel units, from 512 × 512 up to 4096 × 4096.
+There is no adapter, and an attached
 picture is refused: the VAE is published without an encoder.
 `orangu-server download unsloth/MiniMax-H3-Image-GGUF:UD-Q4_K_XL` fetches
 the three files.
@@ -4478,7 +4480,7 @@ unless the file sets them:
 
 | `[orangu-server]`       | default                                         |                                                                                                                                                                                                                                                                                      |
 | :---------------------- | :---------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `image_size`            | `1024x1024`                                     | `WIDTHxHEIGHT`, both multiples of 16 — the VAE's 8 pixels per latent cell times the transformer's 2x2 patch (Qwen-Image, FLUX.2 [klein], MOSS-Image); 32 for Qwen-Image 2.1 and MiniMax-H3-Image                                                                                                                                                   |
+| `image_size`            | `1024x1024`                                     | `WIDTHxHEIGHT` (or one side for a square), each side from 16 to 16384: `1920x1080` and `3840x2160` are sizes too. See **Picture sizes** below for how one the model does not draw directly comes out                                                                                                                                 |
 | `image_steps`           | `50` (2.1: `40`); the adapter's (`8`) under one | denoising steps; the time a picture takes is close to linear in this                                                                                                                                                                                                                 |
 | `image_cfg_scale`       | `4` (2.1: `1`); `1` under an adapter            | classifier-free guidance: how far the picture is pushed towards the prompt and away from the negative one. `1` turns guidance off, which halves the work per step                                                                                                                    |
 | `image_negative_prompt` | a single space                                  | what the picture is pushed away from; only read when guidance is on                                                                                                                                                                                                                  |
@@ -4487,6 +4489,42 @@ unless the file sets them:
 
 The web console sends none of these, so for it they _are_ the settings.
 `/v1/images/generations` takes every one of them per request.
+
+### Picture sizes
+
+Any `WIDTHxHEIGHT` is a size, but each model draws in a unit and up to an
+area of its own, and the size is fitted to them rather than refused:
+
+| model | unit | largest area | smallest area |
+| :-- | :-- | :-- | :-- |
+| Qwen-Image 2512 | 16 | 1328 × 1328 (1.8 megapixels) | — |
+| Qwen-Image 2.1 | 32 | 2048 × 2048 (4.2 megapixels) | — |
+| FLUX.2 [klein] | 16 | 2048 × 2048 | — |
+| MOSS-Image | 16 | 2048 × 2048 | — |
+| MiniMax-H3-Image | 32 | 4096 × 4096 (16.8 megapixels) | 512 × 512 |
+
+- **A side off the unit** is drawn rounded up to it, and the picture is
+  cropped back to the size asked for, from the middle: 1920 × 1080 is
+  drawn at 1920 × 1088 and loses four rows top and bottom. Nothing is
+  stretched or resampled.
+- **A size past the largest area** comes back at that area instead, at
+  the same proportions, each side on the unit: 3840 × 2160 on Qwen-Image
+  2.1 is a 2720 × 1536 picture. The reply says so — the console's caption
+  (*2720x1536 (3840x2160 asked; the largest this model draws)*), and the
+  API's `requested_size` — and the log line names both. The model is not
+  asked for more than it was made to draw, and the picture is not scaled
+  up: that is for a picture editor (GIMP, for one) to do.
+- **A size under the smallest area** (MiniMax-H3-Image, whose pictures fall
+  apart below 512 × 512) is drawn at that area and scaled down to the size
+  asked for.
+
+The largest areas are the models' own: Qwen-Image 2512's largest preset,
+the 2048 × 2048 Qwen-Image 2.1 is native at and FLUX.2 [klein] and
+MOSS-Image are made for, and the 16 megapixels MiniMax-H3-Image draws
+directly. `/props` reports them as `image.size_unit`, `image.min_area` and
+`image.max_area`. An `image_size` past the largest is capped the same
+way, with a warning at startup, and the time estimates are worked out at
+the size the picture is drawn at.
 
 **Time.** The transformer is 20 billion parameters and every step is a full
 pass over them for every image token — 4096 tokens at 1024x1024 — twice
@@ -4546,9 +4584,9 @@ countdown — _Starting · 22s_, then _Step 2/4 · 11s_ — the server's own
 estimate, corrected at every step.
 
 **Settings › Image** (the gear in the topbar) is where the picture's
-settings live: the size (256 × 256 up to 2048 × 2048, or any `WIDTHxHEIGHT`
-in multiples of 16 — 32 for Qwen-Image 2.1, which greys the presets it
-cannot draw), the steps (4, 8, 20, 40, 50, or a number), the guidance
+settings live: the size (256 × 256 up to 3840 × 2160, landscape and
+portrait, or any `WIDTHxHEIGHT`; a preset larger than the served model
+draws is greyed, with the size it would come out at), the steps (4, 8, 20, 40, 50, or a number), the guidance
 (off, Qwen-Image's 4, 6, or a value), the negative prompt, the strength an
 attached picture is followed at, and the format the picture comes back
 in (PNG, JPEG, GIF, WebP or SVG) — each with an (i) that explains it on

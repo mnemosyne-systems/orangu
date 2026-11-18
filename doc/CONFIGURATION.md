@@ -241,7 +241,7 @@ its own.
 | `vae_precision` | No | The VAE's convolutions: `int8` (the default, as `Q6_K` on the `int8` kernel) or `f32` (as stored, exact) |
 | `image_cache` | No | Whether a step may reuse the last transformer pass instead of running one: `easy` (the default, threshold `0.08`), `easy:<threshold>`, or `off` |
 | `image_reference_size` | No | Area an edit reads its reference picture at: `source` (the default: the output's area, but never more than the attached picture's own), `output` (the output's area), or a `WIDTHxHEIGHT` cap |
-| `image_size` | No | Picture size, `WIDTHxHEIGHT` (or one number for a square), both multiples of 16. Defaults to `1024x1024` |
+| `image_size` | No | Picture size, `WIDTHxHEIGHT` (or one number for a square), each side from 16 to 16384. A side that is not a multiple of the model's unit is drawn rounded up and cropped back; a size larger than the model draws is capped to its largest at the same proportions. Defaults to `1024x1024` |
 | `image_steps` | No | Denoising steps. Defaults to `50`, or the adapter's own count under one |
 | `image_cfg_scale` | No | Classifier-free guidance scale; `1` turns guidance off. Defaults to `4`, or `1` under an adapter |
 | `image_negative_prompt` | No | What a picture is pushed away from. Defaults to a single space |

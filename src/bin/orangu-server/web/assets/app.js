@@ -3148,6 +3148,29 @@
     };
   }
 
+  // The size a `width` x `height` picture comes back at on the served
+  // model — past `/props`' `max_area` the same proportions inside it, on
+  // the unit — as `Variant::capped_size` works it out.
+  function imageCapped(width, height) {
+    const unit = (imageProps && imageProps.size_unit) || 16;
+    const ceiling = imageProps && imageProps.max_area;
+    if (!ceiling || width * height <= ceiling) return [width, height];
+    const scale = Math.sqrt(ceiling / (width * height));
+    const side = (v) => Math.max(1, Math.floor((v * scale + 1e-6) / unit)) * unit;
+    return [side(width), side(height)];
+  }
+
+  // The canvas it is drawn on: each side rounded up to the unit, or under
+  // `min_area` that area at the same proportions — `generation_canvas`.
+  function imageCanvas(width, height) {
+    [width, height] = imageCapped(width, height);
+    const unit = (imageProps && imageProps.size_unit) || 16;
+    const floor = (imageProps && imageProps.min_area) || 0;
+    const scale = width * height < floor ? Math.sqrt(floor / (width * height)) : 1;
+    const side = (v) => Math.ceil((v * scale) / unit) * unit;
+    return [side(width), side(height)];
+  }
+
   // The server's rate model (see `/props`' `rate`) over the form's
   // settings: encode + steps × tokens × passes × (linear + attention
   // scaled to this size) + decode per pixel.
@@ -3164,8 +3187,8 @@
       imageEstimate.textContent = "No rate measured yet — the first picture teaches it.";
       return;
     }
-    const width = Number(match[1]);
-    const height = Number(match[2]);
+    // Costed at the canvas the steps run over, as the server costs it.
+    const [width, height] = imageCanvas(Number(match[1]), Number(match[2]));
     const tokens = Math.floor(width / 16) * Math.floor(height / 16);
     const passes = settings.cfg_scale > 1 ? 2 : 1;
     const attention = rate.attention_per_token_pass * tokens / Math.max(rate.attention_tokens, 1);
@@ -3195,15 +3218,23 @@
       imageModelEl.textContent = props.model || "";
       return;
     }
-    // Presets the model cannot draw — a side that is not a multiple of its
-    // unit (32 for Qwen-Image 2.1) — are offered greyed rather than
-    // refused on Save.
-    const unit = image.size_unit || 16;
+    // Every size is drawn (off the unit it is drawn rounded up and cropped
+    // back), but past the model's largest area it would come back smaller
+    // than it says: those presets are offered greyed, named with what the
+    // model draws instead.
     for (const option of imageSize.options) {
       const match = /^(\d+)x(\d+)$/.exec(option.value);
-      option.disabled = !!match && (Number(match[1]) % unit !== 0 || Number(match[2]) % unit !== 0);
+      if (!match) continue;
+      if (!option.dataset.label) option.dataset.label = option.textContent;
+      const asked = [Number(match[1]), Number(match[2])];
+      const [w, h] = imageCapped(asked[0], asked[1]);
+      const capped = w !== asked[0] || h !== asked[1];
+      option.disabled = capped;
+      option.textContent = capped
+        ? `${option.dataset.label} (this model draws at most ${w} × ${h})`
+        : option.dataset.label;
     }
-    imageSizeCustom.placeholder = `WIDTHxHEIGHT, multiples of ${unit}`;
+    imageSizeCustom.placeholder = "WIDTHxHEIGHT";
     const lora = image.lora;
     imageModelEl.textContent = lora
       ? `${props.model} · ${lora.path.split(/[\\/]/).pop()}${lora.steps ? ` (${lora.steps}-step)` : ""}`
