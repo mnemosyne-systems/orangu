@@ -737,7 +737,7 @@ Checks out a GitHub pull request on a dedicated branch.
 /pull <number>
 ```
 
-If `gh` is installed it uses `gh pr checkout`; otherwise it fetches the pull request directly from `origin`. After the checkout it compares the branch against the base branch and, when the branch is behind the base or has more than one commit ahead, reports that the pull request needs a `/rebase` and/or `/squash`.
+If `gh` is installed it uses `gh pr checkout`; otherwise it fetches the pull request directly from `origin`. After the checkout it compares the branch against the base branch and, when the branch is behind the base or has more than one commit ahead, reports that the pull request needs a `/rebase` and/or `/squash`. When the branch carries more than one commit, those commits are listed too — short hash and subject, newest first.
 
 **Examples**
 
@@ -797,7 +797,31 @@ Adds a comment to a GitHub issue or GitLab issue, or to every open pull/merge re
 /comment on all <file>
 ```
 
-It runs `gh issue comment <number> --body <body>` (or the GitLab equivalent). Without the CLI installed it reports an error, since there is no plain Git equivalent. When the third argument is a quoted string it is used as the comment body directly. When it is a bare word it is treated as a filename relative to `~/.orangu/comments/` and the file contents become the body — Tab completion after `/comment <number> ` (without a leading `"`) lists files in that directory.
+It runs `gh issue comment <number> --body <body>` (or the GitLab equivalent). Without the CLI installed it reports an error, since there is no plain Git equivalent. When the third argument is a quoted string it is used as the comment body directly. When it is a bare word it is treated as a filename relative to `~/.orangu/comments/` and the file is used as a template for the body (see below) — Tab completion after `/comment <number> ` (without a leading `"`) lists files in that directory.
+
+### Comment templates
+
+A file in `~/.orangu/comments/` is a template: before it is posted, these placeholders are replaced with the values of the issue or request being commented on.
+
+| Placeholder | Value |
+| :---------- | :---- |
+| `{number}`  | The issue or pull/merge request number |
+| `{title}`   | Its title |
+| `{author}`  | The login of whoever opened it |
+| `{branch}`  | The pull/merge request's branch (requests only) |
+| `{base}`    | The branch it merges into (requests only) |
+| `{url}`     | Its web address |
+
+The values are read with `gh pr view` / `gh issue view` (`glab mr view` / `glab issue view` on GitLab), and only when the template uses a placeholder other than `{number}`. A template that uses a placeholder the number has no value for — `{branch}` on a plain issue, say — is refused with an error rather than posted with the placeholder in it. Any other text in braces is left as written, and a file without placeholders is posted as it is. With `/comment all`, each request gets the template filled in with its own values. Inline bodies and the review reports are never treated as templates.
+
+For example, a `please-rebase.md` of
+
+```text
+Thanks @{author}! {branch} no longer rebases cleanly onto {base}.
+Could you rebase #{number} and push it again?
+```
+
+is posted on request 231 as `Thanks @alice! pr-231 no longer rebases cleanly onto main. …`.
 
 ### Commenting on every open pull request
 
@@ -835,7 +859,7 @@ The last review or auto review report as the body:
 The same template on every open pull request:
 
 ```text
-/comment all rebase-needed.md
+/comment all please-rebase.md
 ```
 
 Natural-language forms:
@@ -846,8 +870,8 @@ add comment to 51 "My comment"
 comment on 51 "My comment"
 comment on 48 with review
 comment on 48 with auto review
-comment on all rebase-needed.md
-add comment on all rebase-needed.md
+comment on all please-rebase.md
+add comment on all please-rebase.md
 ```
 
 \newpage

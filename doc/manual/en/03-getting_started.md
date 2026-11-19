@@ -158,7 +158,7 @@ orangu -i
 
 The first prompt is `Endpoint`: press Enter to accept the default `http://localhost:8100` (`http://localhost:8100/v1` is accepted too). The wizard queries that server's `/v1/models` and offers the first model it advertises as the default for the `Model` prompt — if the server cannot be reached the prompt has no default and you type the name yourself, which is why it is worth starting the server first.
 
-It then walks every remaining option showing its default, so a full run is a row of Enters, and omits from the file anything left at its default. It finishes by reporting which optional tools it detected (`git lg`, `delta`, `bat`, `gh`, `glab`), printing the configuration, and asking `Write this configuration? (Yes/No) [Yes]`. On confirmation it writes `~/.orangu/orangu.conf` — ignoring `-c`/`--config`, like the server wizard — and installs any bundled skills into `~/.orangu/skills/` that are not already present:
+It then walks every remaining option showing its default, so a full run is a row of Enters, and omits from the file anything left at its default. It finishes by reporting which optional tools it detected (`git lg`, `delta`, `bat`, `gh`, `glab`), printing the configuration, and asking `Write this configuration? (Yes/No) [Yes]`. On confirmation it writes `~/.orangu/orangu.conf` — ignoring `-c`/`--config`, like the server wizard — and installs any bundled skills into `~/.orangu/skills/` and the comment templates (`merged.md`, `please-rebase.md`, `welcome.md`, and the rest the merge flow and `/comment` use) into `~/.orangu/comments/` that are not already present:
 
 ```ini
 [orangu]

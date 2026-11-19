@@ -324,6 +324,16 @@ pub enum CommentBody<'a> {
     AutoReview,
 }
 
+impl CommentBody<'_> {
+    /// The `~/.orangu/comments/` template this body is read from, if any.
+    pub fn template(&self) -> Option<&str> {
+        match self {
+            CommentBody::File(name) => Some(name.as_ref()),
+            _ => None,
+        }
+    }
+}
+
 pub enum CloseTarget {
     Issue(u64),
     PullRequest(u64),

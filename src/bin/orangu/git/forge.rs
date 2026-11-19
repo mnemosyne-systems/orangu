@@ -139,7 +139,36 @@ pub fn pull_request_output(
     if try_forge_pr_checkout(&repo_root, pr_number, forge)?.is_none() {
         git_pr_checkout(&repo_root, pr_number)?;
     }
-    Ok(pr_sync_advice(&repo_root))
+    let advice = pr_sync_advice(&repo_root);
+    let commits = pr_commit_listing(&repo_root);
+    Ok(match (advice, commits) {
+        (Some(advice), Some(commits)) => Some(format!("{advice}\n\n{commits}")),
+        (advice, commits) => advice.or(commits),
+    })
+}
+
+/// The commits the checked-out branch adds on top of the default base branch,
+/// one `<short hash> <subject>` line each, newest first — but only when there
+/// is more than one, since a single commit is what a request should carry.
+/// `None` otherwise, or when the base branch cannot be determined.
+fn pr_commit_listing(repo_root: &Path) -> Option<String> {
+    let base_ref = git_find_base_ref(repo_root).ok()?;
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["log", "--format=%h %s", &format!("{base_ref}..HEAD")])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let commits: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+    if commits.len() < 2 {
+        return None;
+    }
+    Some(format!(
+        "Commits on top of {base_ref}:\n  {}",
+        commits.join("\n  ")
+    ))
 }
 
 /// The number of commits on the default base branch (main/master) that the
@@ -339,6 +368,150 @@ fn comment_body_text(body: &CommentBody<'_>, reports: ReviewReports<'_>) -> Resu
     })
 }
 
+/// The placeholders a `~/.orangu/comments/` template may use, each replaced by
+/// the matching value of the issue or request being commented on. Any other
+/// `{...}` in a template is left as written.
+const COMMENT_PLACEHOLDERS: &[&str] = &["number", "title", "author", "branch", "base", "url"];
+
+/// The placeholders from [`COMMENT_PLACEHOLDERS`] that `template` uses.
+fn template_placeholders(template: &str) -> Vec<&'static str> {
+    COMMENT_PLACEHOLDERS
+        .iter()
+        .copied()
+        .filter(|name| template.contains(&format!("{{{name}}}")))
+        .collect()
+}
+
+/// Replace each `{name}` in `template` with its value from `values`. A
+/// placeholder with no value is an error, so a comment never goes out with
+/// `{branch}` still in it.
+fn render_comment_template(
+    template: &str,
+    number: u64,
+    values: &[(&'static str, String)],
+) -> Result<String> {
+    let mut text = template.to_string();
+    for name in template_placeholders(template) {
+        let value = values
+            .iter()
+            .find(|(key, value)| *key == name && !value.is_empty())
+            .map(|(_, value)| value.as_str())
+            .ok_or_else(|| {
+                anyhow!("the comment template uses {{{name}}}, which #{number} does not have")
+            })?;
+        text = text.replace(&format!("{{{name}}}"), value);
+    }
+    Ok(text)
+}
+
+/// The placeholder values for issue or request `number`, read from the forge
+/// CLI: the request first (title, author, branch, base, url), then the issue
+/// (title, author, url) when the number is not a request. Only the number is
+/// known when neither can be read.
+fn comment_template_values(
+    repo_root: &Path,
+    number: u64,
+    forge: Forge,
+) -> Vec<(&'static str, String)> {
+    let mut values = vec![("number", number.to_string())];
+    let id = number.to_string();
+    // (args, login field, head branch field, base branch field, url field)
+    let views: [(Vec<&str>, &str, &str, &str, &str); 2] = match forge {
+        Forge::GitHub => [
+            (
+                vec![
+                    "pr",
+                    "view",
+                    &id,
+                    "--json",
+                    "title,author,headRefName,baseRefName,url",
+                ],
+                "login",
+                "headRefName",
+                "baseRefName",
+                "url",
+            ),
+            (
+                vec!["issue", "view", &id, "--json", "title,author,url"],
+                "login",
+                "",
+                "",
+                "url",
+            ),
+        ],
+        Forge::GitLab => [
+            (
+                vec!["mr", "view", &id, "--output", "json"],
+                "username",
+                "source_branch",
+                "target_branch",
+                "web_url",
+            ),
+            (
+                vec!["issue", "view", &id, "--output", "json"],
+                "username",
+                "",
+                "",
+                "web_url",
+            ),
+        ],
+    };
+    for (args, login, head, base, url) in views {
+        let Some(entry) = std::process::Command::new(forge.cli())
+            .args(&args)
+            .current_dir(repo_root)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+        else {
+            continue;
+        };
+        values.push(("title", json_str(&entry, "title")));
+        values.push((
+            "author",
+            entry
+                .get("author")
+                .and_then(|user| user.get(login))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        ));
+        if !head.is_empty() {
+            values.push(("branch", json_str(&entry, head)));
+            values.push(("base", json_str(&entry, base)));
+        }
+        values.push(("url", json_str(&entry, url)));
+        break;
+    }
+    values
+}
+
+/// The body to post on `number`: a template file has its placeholders filled
+/// in for that number (the forge is only asked when the template uses one
+/// beyond `{number}`); inline bodies and review reports go out as they are.
+fn comment_body_for(
+    repo_root: &Path,
+    body: &CommentBody<'_>,
+    text: &str,
+    number: u64,
+    forge: Forge,
+) -> Result<String> {
+    if !matches!(body, CommentBody::File(_)) {
+        return Ok(text.to_string());
+    }
+    let used = template_placeholders(text);
+    if used.is_empty() {
+        return Ok(text.to_string());
+    }
+    let values = if used.iter().all(|name| *name == "number") {
+        vec![("number", number.to_string())]
+    } else {
+        comment_template_values(repo_root, number, forge)
+    };
+    render_comment_template(text, number, &values)
+}
+
 pub fn comment_output(
     workspace: &Path,
     issue_number: u64,
@@ -348,7 +521,8 @@ pub fn comment_output(
 ) -> Result<String> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("comment is only available inside a Git repository"))?;
-    let body_text = comment_body_text(body, reports)?;
+    let template = comment_body_text(body, reports)?;
+    let body_text = comment_body_for(&repo_root, body, &template, issue_number, forge)?;
     let stdout = post_comment(
         &repo_root,
         CommentOn::Issue,
@@ -400,7 +574,7 @@ pub fn comment_all_output(
 ) -> Result<CommentAllOutcome> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("comment is only available inside a Git repository"))?;
-    let body_text = comment_body_text(body, reports)?;
+    let template = comment_body_text(body, reports)?;
     let cli = forge.cli();
     let requests = list_open_pull_requests(&repo_root, forge)?
         .ok_or_else(|| anyhow!("comment requires the {cli} CLI to be installed"))?;
@@ -409,13 +583,19 @@ pub fn comment_all_output(
         failed: Vec::new(),
     };
     for request in requests {
-        match post_comment(
-            &repo_root,
-            CommentOn::PullRequest,
-            request.number,
-            &body_text,
-            forge,
-        ) {
+        // Each request gets the template filled in with its own values.
+        let posted = comment_body_for(&repo_root, body, &template, request.number, forge).and_then(
+            |body_text| {
+                post_comment(
+                    &repo_root,
+                    CommentOn::PullRequest,
+                    request.number,
+                    &body_text,
+                    forge,
+                )
+            },
+        );
+        match posted {
             Ok(_) => outcome.commented.push(request.number),
             Err(err) => outcome.failed.push((request.number, format!("{err:#}"))),
         }
@@ -2243,6 +2423,50 @@ mod tests {
             advice.contains("2 commits ahead of main"),
             "ahead text: {advice}"
         );
+
+        // `pull` lists the branch's commits too, newest first.
+        let listing = pr_commit_listing(workspace.path()).expect("listing expected");
+        let lines: Vec<&str> = listing.lines().collect();
+        assert_eq!(lines[0], "Commits on top of main:", "{listing}");
+        assert!(lines[1].ends_with(" Second feature commit"), "{listing}");
+        assert!(lines[2].ends_with(" First feature commit"), "{listing}");
+        assert_eq!(lines.len(), 3, "{listing}");
+    }
+
+    #[test]
+    fn comment_templates_fill_in_their_placeholders() {
+        let values = vec![
+            ("number", "231".to_string()),
+            ("title", "Leave room".to_string()),
+            ("author", "alice".to_string()),
+            ("branch", "pr-231".to_string()),
+            ("base", "main".to_string()),
+            ("url", String::new()),
+        ];
+        let text = render_comment_template(
+            "Thanks @{author}! #{number} ({title}) needs {branch} rebased on {base}.\n\
+             Other braces {stay} as {} written.",
+            231,
+            &values,
+        )
+        .expect("rendered");
+        assert_eq!(
+            text,
+            "Thanks @alice! #231 (Leave room) needs pr-231 rebased on main.\n\
+             Other braces {stay} as {} written."
+        );
+        // A placeholder the number has no value for is refused, never posted.
+        let err = render_comment_template("See {url}", 231, &values).unwrap_err();
+        assert!(err.to_string().contains("{url}"), "{err}");
+        // A template without placeholders goes out untouched.
+        assert_eq!(
+            render_comment_template("Merged, thanks.", 231, &[]).expect("plain"),
+            "Merged, thanks."
+        );
+        assert_eq!(
+            template_placeholders("{number} {base} {nope}"),
+            vec!["number", "base"]
+        );
     }
 
     #[test]
@@ -2273,6 +2497,8 @@ mod tests {
         git(&["commit", "-m", "Lone feature commit"]);
 
         assert!(pr_sync_advice(workspace.path()).is_none());
+        // A single commit is not listed either.
+        assert!(pr_commit_listing(workspace.path()).is_none());
     }
 
     #[test]

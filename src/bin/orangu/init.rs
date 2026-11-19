@@ -89,6 +89,34 @@ const BUNDLED_SKILLS: &[(&str, &str)] = &[(
     include_str!("../../../contrib/skills/debugging/SKILL.md"),
 )];
 
+/// Bundled comment templates that will be installed into `~/.orangu/comments/`
+/// during `--init` if they do not already exist. The committer merge flow ends
+/// on one of the `*merged.md` templates (by whether the branch was squashed
+/// and/or rebased), or — when the rebase failed — one of the `please-*.md`
+/// templates (by what the branch still needs), and greets a first-time
+/// contributor with `welcome.md`. `crossport.md` is there for `comment` by
+/// hand.
+const BUNDLED_COMMENTS: &[(&str, &str)] = &[
+    ("merged.md", "Merged.\n\nThanks for your contribution !\n"),
+    (
+        "rebased-merged.md",
+        "Rebased and merged.\n\nThanks for your contribution !\n",
+    ),
+    (
+        "squashed-merged.md",
+        "Squashed and merged.\n\nThanks for your contribution !\n",
+    ),
+    (
+        "squashed-rebased-merged.md",
+        "Squashed, rebased and merged.\n\nThanks for your contribution !\n",
+    ),
+    ("please-rebase.md", "Please, rebase\n"),
+    ("please-squash.md", "Please, squash\n"),
+    ("please-squash-rebase.md", "Please, squash and rebase\n"),
+    ("welcome.md", "Welcome to the community !\n"),
+    ("crossport.md", "Please, cross-port to the other projects\n"),
+];
+
 /// Subset of an OpenAI-compatible `/v1/models` response, enough to pull out the
 /// first advertised model id for pre-filling the `Model` prompt.
 #[derive(Debug, Default, Deserialize)]
@@ -283,7 +311,37 @@ pub async fn run_init() -> Result<()> {
         }
     }
 
+    install_comment_templates(&dir.join("comments"));
+
     Ok(())
+}
+
+/// Install the [`BUNDLED_COMMENTS`] templates into `comments_dir`, leaving any
+/// template already there untouched. Failures are warnings: the configuration
+/// is already written.
+fn install_comment_templates(comments_dir: &std::path::Path) {
+    if let Err(e) = std::fs::create_dir_all(comments_dir) {
+        eprintln!(
+            "Warning: failed to create comment directory {}: {}",
+            comments_dir.display(),
+            e
+        );
+        return;
+    }
+    for (name, content) in BUNDLED_COMMENTS {
+        let path = comments_dir.join(name);
+        if path.exists() {
+            continue;
+        }
+        match std::fs::write(&path, content) {
+            Ok(()) => println!("Installed comment template to {}", path.display()),
+            Err(e) => eprintln!(
+                "Warning: failed to write comment template {}: {}",
+                path.display(),
+                e
+            ),
+        }
+    }
 }
 
 /// On a Mac, the terminal setting the `Alt+…` keys need.
@@ -671,8 +729,8 @@ fn prompt_bool(label: &str, default: bool) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        THEME_SELECTOR, WORKSPACE_OPTIONS, pager_executable, theme_options, tool_status,
-        with_http_scheme,
+        BUNDLED_COMMENTS, THEME_SELECTOR, WORKSPACE_OPTIONS, install_comment_templates,
+        pager_executable, theme_options, tool_status, with_http_scheme,
     };
 
     #[test]
@@ -779,6 +837,25 @@ mod tests {
             rustyline::hint::Hinter::hint(&completer, "10.0.0.2", 8, &ctx),
             None
         );
+    }
+
+    #[test]
+    fn comment_templates_are_installed_without_overwriting() {
+        let dir = tempfile::tempdir().expect("dir");
+        let comments = dir.path().join("comments");
+        std::fs::create_dir_all(&comments).expect("comments");
+        std::fs::write(comments.join("merged.md"), "mine\n").expect("merged");
+        install_comment_templates(&comments);
+        assert_eq!(
+            std::fs::read_to_string(comments.join("merged.md")).expect("merged"),
+            "mine\n"
+        );
+        for (name, content) in BUNDLED_COMMENTS.iter().skip(1) {
+            assert_eq!(
+                std::fs::read_to_string(comments.join(name)).expect("template"),
+                *content
+            );
+        }
     }
 
     #[test]

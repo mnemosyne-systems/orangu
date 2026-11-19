@@ -460,25 +460,43 @@ Merging a reviewed pull request is the same six commands every time, so in commi
 
 ```text
 pull <PR_NUMBER>
+squash                          (only while the branch has more than one commit)
 rebase                          (only while the branch is behind the base branch)
 build | review | auto review    (optional, on the pulled branch)
 switch to main|master
 merge <BRANCH_NAME>
 push
 delete <BRANCH_NAME>
-comment on <PR_NUMBER> merged.md
-close pr <PR_NUMBER>            (only after a rebase on the pulled branch)
-close issue <ISSUE_NUMBER>      (only after a rebase, when a commit names an issue)
+comment on <PR_NUMBER> welcome.md   (only for a first-time contributor)
+comment on <PR_NUMBER> <TEMPLATE>   (merged.md, or the one naming what was done)
+close pr <PR_NUMBER>            (only after a squash or rebase on the pulled branch)
+close issue <ISSUE_NUMBER>      (only after a squash or rebase, when a commit names an issue)
 ```
 
+The closing comment is read from `~/.orangu/comments/` (`orangu --init` installs all of these there) and names what happened to the request:
+
+| Template | Posted when |
+| :------- | :---------- |
+| `merged.md` | Merged as it was pulled |
+| `squashed-merged.md` | Squashed, then merged |
+| `rebased-merged.md` | Rebased, then merged |
+| `squashed-rebased-merged.md` | Squashed and rebased, then merged |
+| `please-rebase.md` | Abandoned after a failed rebase; the branch still needs a rebase |
+| `please-squash.md` | Abandoned; the branch still needs a squash |
+| `please-squash-rebase.md` | Abandoned; the branch still needs both |
+| `welcome.md` | Before the closing comment, when none of the branch's commit authors (matched by e-mail) has a commit on the base branch yet |
+
+The comment tells the truth even when a hinted step was skipped: a branch that needed a squash but was merged without one gets `merged.md`. `crossport.md` is installed too, for posting by hand.
+
 - Before a request is checked out, the empty prompt hints `pull <PR_NUMBER>` for the open pull/merge requests fetched at startup; `Shift+Tab` cycles through them.
-- While the pulled branch is still checked out, `build`, `review`, and `auto review` are offered too — the things worth doing to a request before taking it to the base branch. They are never the first suggestion and they never advance anything: the flow is remembered across them, so after a build or a review the prompt still opens with `rebase` or `switch to main`, whichever the request is waiting on. They drop off the list once the flow has left the branch.
-- `pull` remembers the request number and the branch it checked out. When it reports the branch as behind the base branch, the first step hinted is `rebase`; a rebase done, or skipped by switching to the base, moves the flow on. From then on the empty prompt hints the next step — `switch to main`, then `merge <BRANCH_NAME>`, `push`, `delete <BRANCH_NAME>`, and finally `comment on <PR_NUMBER> merged.md` (the body is read from `~/.orangu/comments/merged.md`, like any other comment template).
+- While the pulled branch is still checked out, `build`, `review`, and `auto review` are offered too — the things worth doing to a request before taking it to the base branch. They are never the first suggestion and they never advance anything: the flow is remembered across them, so after a build or a review the prompt still opens with `squash`, `rebase`, or `switch to main`, whichever the request is waiting on. They drop off the list once the flow has left the branch.
+- `pull` remembers the request number and the branch it checked out. When it reports more than one commit on the branch, the first step hinted is `squash`; when it reports the branch as behind the base branch, `rebase` follows (or comes first, with a single commit). Each is done once it succeeds, or skipped by switching to the base. From then on the empty prompt hints the next step — `switch to main`, then `merge <BRANCH_NAME>`, `push`, `delete <BRANCH_NAME>`, `comment on <PR_NUMBER> welcome.md` for a first-time contributor, and finally the closing comment from the table above.
 - Each step advances only when the command it hints actually succeeds, so a failed merge keeps the merge on offer.
-- Running `rebase` on the pulled branch — whether hinted or not — adds the closing steps: the forge cannot tie a merge of rewritten commits to the request, so after the comment the flow hints `close pr <PR_NUMBER>`, and then `close issue <ISSUE_NUMBER>` when the request refers to an issue. The issue is read when the request is pulled, from the subject of each commit the branch adds on top of the base branch (newest first) and then from the request's title: `#58` in any bracketing or punctuation (`[#58] …`, `… (#58)`), or `issue 58` / `Issue #58`. The first reference found wins; with none, `close pr` is the last step. Without a rebase the comment is the last step.
+- When a rebase of the pulled branch stops on a conflict, the request is abandoned instead: the flow hints `rebase abort`, then `switch to main`, then `delete <BRANCH_NAME>`, and ends with `comment on <PR_NUMBER> please-rebase.md` asking the author for what the branch still needs — `please-squash-rebase.md` when it also carried several commits that were not squashed — and nothing is merged or pushed. A rebase that fails without starting (a dirty worktree, say) leaves the flow as it was.
+- Running `squash` or `rebase` on the pulled branch — whether hinted or not — adds the closing steps: the forge cannot tie a merge of rewritten commits to the request, so after the comment the flow hints `close pr <PR_NUMBER>`, and then `close issue <ISSUE_NUMBER>` when the request refers to an issue. The issue is read when the request is pulled, from the subject of each commit the branch adds on top of the base branch (newest first) and then from the request's title: `#58` in any bracketing or punctuation (`[#58] …`, `… (#58)`), or `issue 58` / `Issue #58`. The first reference found wins; with none, `close pr` is the last step. Without a squash or rebase the comment is the last step.
 - When the last step has run, the request is dropped from the `pull <PR_NUMBER>` suggestions at once and the open requests are fetched again in the background, so the empty prompt never offers to pull a request that has just been merged.
 - The steps come first everywhere the prompt suggests something: as the inline ghost, in the `Shift+Tab` cycle, and in the `Tab` candidate list — where the rest of the flow follows the current step, so a step can be skipped by cycling past it. Nothing is hidden: workspace files and the natural-language bindings still follow.
-- While a request is being merged, its branch also leads the argument completions — `merge `, `delete `, and `switch to ` offer the remembered branch and the base branch first, and `comment on ` and `close pr ` offer the request number (and `merged.md`) first. Every other candidate is still listed, just after them.
+- While a request is being merged, its branch also leads the argument completions — `merge `, `delete `, and `switch to ` offer the remembered branch and the base branch first, and `comment on ` and `close pr ` offer the request number (and the template the step needs) first. Every other candidate is still listed, just after them.
 - The flow belongs to the workspace it was started in, so other workspace tabs are not hinted at its branches. Checking out a branch that is neither the request's nor the base ends it, as does its last step.
 - Steps run in developer mode are still tracked, so `/committer` picks up where the branch actually is instead of starting over.
 

@@ -2325,8 +2325,8 @@ pub(crate) fn handle_command(
         LocalCommand::Pull(Some(pr_number)) => {
             match pull_request_output(workspace, pr_number, forge) {
                 // The checkout starts the merge flow: from here the prompt
-                // hints the request through switch, merge, push, delete and
-                // the closing comment.
+                // hints the request through rebase (when behind), switch, merge,
+                // push, delete and the closing comment.
                 Ok(advice) => {
                     completion::flow::start(pr_number, workspace);
                     match advice {
@@ -2343,7 +2343,7 @@ pub(crate) fn handle_command(
         LocalCommand::Comment(Some((issue_number, body))) => {
             match comment_output(workspace, issue_number, &body, review_reports, forge) {
                 Ok(_) => {
-                    completion::flow::note_comment(issue_number);
+                    completion::flow::note_comment(issue_number, body.template());
                     Ok(CommandOutcome::Quiet)
                 }
                 Err(err) => Ok(local_command_error(err)),
@@ -2356,7 +2356,7 @@ pub(crate) fn handle_command(
             match comment_all_output(workspace, &body, review_reports, forge) {
                 Ok(outcome) => {
                     for &number in &outcome.commented {
-                        completion::flow::note_comment(number);
+                        completion::flow::note_comment(number, body.template());
                     }
                     if outcome.failed.is_empty() {
                         Ok(CommandOutcome::Output(outcome.summary()))
@@ -2414,7 +2414,12 @@ pub(crate) fn handle_command(
                 completion::flow::note_rebase(workspace);
                 Ok(CommandOutcome::Quiet)
             }
-            Err(err) => Ok(local_command_error(err)),
+            // A rebase of the pulled branch that stops on a conflict abandons
+            // the request: the flow turns to abort, switch, and delete.
+            Err(err) => {
+                completion::flow::note_rebase_failed(workspace);
+                Ok(local_command_error(err))
+            }
         },
         LocalCommand::Merge(None) => Ok(CommandOutcome::OutputError(
             merge_usage_message().to_string(),
@@ -2576,7 +2581,12 @@ pub(crate) fn handle_command(
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Abort(operation) => match abort_output(workspace, operation) {
-            Ok(output) => Ok(CommandOutcome::Output(output)),
+            Ok(output) => {
+                if operation == GitOperation::Rebase {
+                    completion::flow::note_rebase_abort(workspace);
+                }
+                Ok(CommandOutcome::Output(output))
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Commit(None) => Ok(CommandOutcome::OutputError(
@@ -2608,7 +2618,11 @@ pub(crate) fn handle_command(
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Squash => match squash_output(workspace) {
-            Ok(_) => Ok(CommandOutcome::Quiet),
+            // Squashing the pulled branch rewrites its commits, like a rebase.
+            Ok(_) => {
+                completion::flow::note_squash(workspace);
+                Ok(CommandOutcome::Quiet)
+            }
             Err(err) => Ok(local_command_error(err)),
         },
         LocalCommand::Stash(sub) => {

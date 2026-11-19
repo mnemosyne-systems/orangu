@@ -19,22 +19,35 @@
 //!
 //! ```text
 //! pull <number>            -> remembers the request and the branch it checked out
+//! squash                   (only while the branch has more than one commit)
+//! rebase                   (only while the branch is behind the base branch)
 //! build | review | auto review   (optional, while still on the branch)
 //! switch to main|master    -> the base branch the request merges into
 //! merge <branch>
 //! push
 //! delete <branch>
-//! comment on <number> merged.md
-//! close pr <number>         (only after a rebase on the branch)
-//! close issue <number>      (only after a rebase, and only when the request's
-//!                            title names an issue)
+//! comment on <number> welcome.md   (only for a first-time contributor)
+//! comment on <number> [squashed-][rebased-]merged.md
+//!                          (naming what was done to the branch)
+//! close pr <number>         (only after a squash or rebase on the branch)
+//! close issue <number>      (only after a squash or rebase, and only when the
+//!                            request names an issue)
+//! ```
+//!
+//! A rebase that stops on a conflict abandons the request instead:
+//!
+//! ```text
+//! rebase abort
+//! switch to main|master
+//! delete <branch>
+//! comment on <number> please-[squash-]rebase.md   (what the branch still needs)
 //! ```
 //!
 //! The optional steps are offered but never advance anything: the flow is
 //! remembered across them, so the next thing suggested after a build or a
 //! review is still the step the request is actually waiting on.
 //!
-//! A `rebase` run on the pulled branch rewrites its commits, so the forge no
+//! A `squash` or `rebase` run on the pulled branch rewrites its commits, so the forge no
 //! longer recognises the merge as the request's and leaves it open. The flow
 //! then adds the two closing steps: the request itself, and the issue it
 //! refers to (`[#45]`, `#45`, `issue 45`) in the subject of one of its
@@ -54,13 +67,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::commands::CloseTarget;
 use crate::git::{
-    discover_git_root, git_branch_subjects, git_find_base_ref, is_protected_branch,
-    workspace_branch_name,
+    discover_git_root, git_branch_subjects, git_commit_count, git_find_base_ref,
+    is_protected_branch, workspace_branch_name,
 };
 
-/// The comment template the flow posts once the branch is merged and deleted,
-/// read from `~/.orangu/comments/` by the `comment` command.
+/// The comment templates the flow ends on, read from `~/.orangu/comments/` by
+/// the `comment` command. A merged request gets the one naming what was done
+/// to its branch on the way in.
 const MERGED_COMMENT_FILE: &str = "merged.md";
+const REBASED_MERGED_COMMENT_FILE: &str = "rebased-merged.md";
+const SQUASHED_MERGED_COMMENT_FILE: &str = "squashed-merged.md";
+const SQUASHED_REBASED_MERGED_COMMENT_FILE: &str = "squashed-rebased-merged.md";
+
+/// The comment templates an abandoned request ends on instead, asking its
+/// author for what the branch still needs.
+const PLEASE_REBASE_COMMENT_FILE: &str = "please-rebase.md";
+const PLEASE_SQUASH_COMMENT_FILE: &str = "please-squash.md";
+const PLEASE_SQUASH_REBASE_COMMENT_FILE: &str = "please-squash-rebase.md";
+
+/// The comment template that greets a first-time contributor, posted just
+/// before the merged comment.
+pub const WELCOME_COMMENT_FILE: &str = "welcome.md";
 
 /// How many `pull <number>` suggestions the empty prompt offers before the flow
 /// starts. The ghost cycles through these with Shift+Tab, so the list is kept
@@ -77,9 +104,21 @@ const OPTIONAL_STEPS: &[&str] = &["build", "review", "auto review"];
 
 /// One step of the merge flow, in the order they are performed. The ordering is
 /// derived so a step can only ever move forward.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
 pub enum MergeFlowStep {
+    /// Fold the pulled branch's commits into one. Only a step when `pull`
+    /// found more than one commit on the branch.
+    Squash,
+    /// Bring the pulled branch up to date with the base branch. Only a step
+    /// when `pull` found the branch behind the base.
+    Rebase,
+    /// Back out of a rebase of the pulled branch that stopped on a conflict.
+    /// Only a step once that rebase has failed, and it turns the flow into
+    /// abandoning the branch: switch to the base, delete it, and ask the
+    /// author for what it still needs.
+    RebaseAbort,
     /// Leave the pull request's branch for the base branch it merges into.
+    #[default]
     Switch,
     /// Merge the request's branch into the base branch.
     Merge,
@@ -87,10 +126,13 @@ pub enum MergeFlowStep {
     Push,
     /// Drop the now-merged branch.
     Delete,
-    /// Tell the request it was merged.
+    /// Greet a first-time contributor. Only a step when none of the branch's
+    /// commit authors has a commit on the base branch yet.
+    Welcome,
+    /// Tell the request it was merged — or, abandoned, what it still needs.
     Comment,
     /// Close the request the forge could not tie to the merge, because the
-    /// branch was rebased.
+    /// branch was squashed or rebased.
     ClosePullRequest,
     /// Close the issue the request's title refers to, for the same reason.
     CloseIssue,
@@ -98,13 +140,17 @@ pub enum MergeFlowStep {
 
 impl MergeFlowStep {
     /// Every step of the flow, in order.
-    const ALL: [MergeFlowStep; 7] = {
+    const ALL: [MergeFlowStep; 11] = {
         use MergeFlowStep::*;
         [
+            Squash,
+            Rebase,
+            RebaseAbort,
             Switch,
             Merge,
             Push,
             Delete,
+            Welcome,
             Comment,
             ClosePullRequest,
             CloseIssue,
@@ -127,45 +173,133 @@ impl MergeFlowStep {
 /// out for it, the base branch it merges into, how far the flow has come, and
 /// the workspace it all belongs to — the suggestions are only offered back in
 /// that workspace, so another tab's prompt is not hinted at branches that only
-/// exist here. `rebased` records that the branch was rebased under the flow,
-/// which is what puts the closing steps on offer; `issue` is the issue the
-/// request's commits or title name, if any.
-#[derive(Clone, Debug)]
+/// exist here. `behind` and `multiple` record that `pull` found the branch
+/// behind the base and carrying more than one commit, which put `rebase` and
+/// `squash` on offer; `rebased` and `squashed` record that those were done
+/// under the flow, which rewrites the commits and so puts the closing steps on
+/// offer; `abandoned` records that a rebase of the branch failed, which turns
+/// the flow into `rebase abort`, the switch, deleting the branch, and asking
+/// the author for what it still needs; `first_time` records that the branch's
+/// authors have no commit on the base yet, which puts the welcome on offer;
+/// `issue` is the issue the request's commits or title name, if any.
+#[derive(Clone, Debug, Default)]
 struct MergeFlow {
     pr: u64,
     branch: String,
     base: String,
     step: MergeFlowStep,
     workspace: PathBuf,
+    behind: bool,
+    multiple: bool,
     rebased: bool,
+    squashed: bool,
+    abandoned: bool,
+    first_time: bool,
     issue: Option<u64>,
 }
 
 impl MergeFlow {
     /// The command that performs `step` for this request, spelled the way the
     /// natural-language parser accepts it — or `None` when the step does not
-    /// apply to this request: the closing steps exist only once the branch
-    /// has been rebased, and the issue one only when the title names an issue.
+    /// apply to this request: the squash and the rebase exist only while a
+    /// branch that needs them has not had them yet, the welcome only for a
+    /// first-time contributor, the closing steps only once the branch's
+    /// commits have been rewritten, and the issue one only when the request
+    /// names an issue. Once a rebase has failed the flow is abandoned: only
+    /// `rebase abort`, the switch, deleting the branch, and the comment
+    /// asking the author for what it still needs are left.
     fn command(&self, step: MergeFlowStep) -> Option<String> {
+        if self.abandoned
+            && !matches!(
+                step,
+                MergeFlowStep::RebaseAbort
+                    | MergeFlowStep::Switch
+                    | MergeFlowStep::Delete
+                    | MergeFlowStep::Comment
+            )
+        {
+            return None;
+        }
+        let rewritten = self.rebased || self.squashed;
         Some(match step {
+            MergeFlowStep::Squash => {
+                if !self.multiple || self.squashed {
+                    return None;
+                }
+                "squash".to_string()
+            }
+            MergeFlowStep::Rebase => {
+                if !self.behind || self.rebased {
+                    return None;
+                }
+                "rebase".to_string()
+            }
+            MergeFlowStep::RebaseAbort => {
+                if !self.abandoned {
+                    return None;
+                }
+                "rebase abort".to_string()
+            }
             MergeFlowStep::Switch => format!("switch to {}", self.base),
             MergeFlowStep::Merge => format!("merge {}", self.branch),
             MergeFlowStep::Push => "push".to_string(),
             MergeFlowStep::Delete => format!("delete {}", self.branch),
-            MergeFlowStep::Comment => format!("comment on {} {MERGED_COMMENT_FILE}", self.pr),
+            MergeFlowStep::Welcome => {
+                if !self.first_time {
+                    return None;
+                }
+                format!("comment on {} {WELCOME_COMMENT_FILE}", self.pr)
+            }
+            MergeFlowStep::Comment => format!("comment on {} {}", self.pr, self.comment_file()),
             MergeFlowStep::ClosePullRequest => {
-                if !self.rebased {
+                if !rewritten {
                     return None;
                 }
                 format!("close pr {}", self.pr)
             }
             MergeFlowStep::CloseIssue => {
-                if !self.rebased {
+                if !rewritten {
                     return None;
                 }
                 format!("close issue {}", self.issue?)
             }
         })
+    }
+
+    /// The comment template this request's workflow ends on. Abandoned, it
+    /// asks the author for what the branch still needs: a squash when it
+    /// carries several commits that were not squashed, a rebase when it is
+    /// behind the base, or both. Merged, it names what was done to the branch
+    /// on the way in: squashed, rebased, both, or neither.
+    fn comment_file(&self) -> &'static str {
+        if self.abandoned {
+            let needs_squash = self.multiple && !self.squashed;
+            let needs_rebase = self.behind && !self.rebased;
+            return match (needs_squash, needs_rebase) {
+                (true, true) => PLEASE_SQUASH_REBASE_COMMENT_FILE,
+                (true, false) => PLEASE_SQUASH_COMMENT_FILE,
+                (false, _) => PLEASE_REBASE_COMMENT_FILE,
+            };
+        }
+        match (self.squashed, self.rebased) {
+            (true, true) => SQUASHED_REBASED_MERGED_COMMENT_FILE,
+            (true, false) => SQUASHED_MERGED_COMMENT_FILE,
+            (false, true) => REBASED_MERGED_COMMENT_FILE,
+            (false, false) => MERGED_COMMENT_FILE,
+        }
+    }
+
+    /// Move a flow still on its branch past the steps that no longer apply —
+    /// a squash or rebase already done, or never needed — so the step it waits
+    /// on is the first one with a command. Never moves past the switch.
+    fn settle(&mut self) {
+        while self.step < MergeFlowStep::Switch && self.command(self.step).is_none() {
+            self.step = self
+                .next_after(self.step)
+                .map_or(MergeFlowStep::Switch, |next| {
+                    next.min(MergeFlowStep::Switch)
+                });
+        }
     }
 
     /// The step this request still has to take after `step`, skipping the
@@ -183,7 +317,8 @@ impl MergeFlow {
     /// While the request is still checked out, [`OPTIONAL_STEPS`] follow it:
     /// they belong to this moment (the branch is under your hands) rather than
     /// to any later one, so they are cycled to before the steps that come after
-    /// the switch. Once the flow has left the branch they are dropped.
+    /// the switch. Once the flow has left the branch, or the branch is being
+    /// abandoned, they are dropped.
     fn remaining_commands(&self) -> Vec<String> {
         let mut steps = self
             .step
@@ -191,7 +326,7 @@ impl MergeFlow {
             .iter()
             .filter_map(|step| self.command(*step));
         let mut commands: Vec<String> = steps.next().into_iter().collect();
-        if self.step == MergeFlowStep::Switch {
+        if self.step <= MergeFlowStep::Switch && !self.abandoned {
             commands.extend(OPTIONAL_STEPS.iter().map(|step| (*step).to_string()));
         }
         commands.extend(steps);
@@ -204,12 +339,16 @@ impl MergeFlow {
     /// value is the one Tab picks.
     fn preferred_arguments(&self) -> Vec<String> {
         let pr = self.pr.to_string();
-        let merged = MERGED_COMMENT_FILE.to_string();
+        let merged = self.comment_file().to_string();
         let mut preferred = match self.step {
-            MergeFlowStep::Switch => vec![self.base.clone(), self.branch.clone()],
+            MergeFlowStep::Squash
+            | MergeFlowStep::Rebase
+            | MergeFlowStep::RebaseAbort
+            | MergeFlowStep::Switch => vec![self.base.clone(), self.branch.clone()],
             MergeFlowStep::Merge | MergeFlowStep::Push | MergeFlowStep::Delete => {
                 vec![self.branch.clone(), self.base.clone()]
             }
+            MergeFlowStep::Welcome => vec![pr.clone(), WELCOME_COMMENT_FILE.to_string()],
             MergeFlowStep::Comment => vec![
                 pr.clone(),
                 merged.clone(),
@@ -326,7 +465,8 @@ fn complete(step: MergeFlowStep, matches: impl FnOnce(&MergeFlow) -> bool) {
 /// the workspace's current branch. The base branch and the issue the request
 /// refers to are resolved once, here, rather than on every keystroke: the
 /// issue is read from the subjects of the commits the branch adds on top of
-/// the base (newest first), then from the request's cached title.
+/// the base (newest first), then from the request's cached title. A branch
+/// that is behind the base opens the flow on `rebase` instead of the switch.
 ///
 /// Nothing is remembered when the branch cannot be determined (detached HEAD)
 /// or when the checkout left the workspace on `main`/`master`, since there
@@ -354,15 +494,70 @@ pub fn start(pr: u64, workspace: &Path) {
                 .as_deref()
                 .and_then(issue_in_subject)
         });
-    store(Some(MergeFlow {
+    let count = |range: String| {
+        base_ref
+            .as_ref()
+            .and_then(|(root, _)| git_commit_count(root, &range).ok())
+            .unwrap_or(0)
+    };
+    let base_name = base_ref.as_ref().map(|(_, base)| base.clone());
+    let behind = base_name
+        .as_ref()
+        .is_some_and(|base| count(format!("HEAD..{base}")) > 0);
+    let multiple = base_name
+        .as_ref()
+        .is_some_and(|base| count(format!("{base}..HEAD")) > 1);
+    let first_time = base_ref
+        .as_ref()
+        .is_some_and(|(root, base)| first_contribution(root, base));
+    let mut flow = MergeFlow {
         pr,
         branch,
         base: base_ref.map_or_else(|| "main".to_string(), |(_, base)| base_branch(&base)),
-        step: MergeFlowStep::Switch,
+        step: MergeFlowStep::Squash,
         workspace: workspace.to_path_buf(),
-        rebased: false,
+        behind,
+        multiple,
+        first_time,
         issue,
-    }));
+        ..MergeFlow::default()
+    };
+    flow.settle();
+    store(Some(flow));
+}
+
+/// Whether the commits the branch adds on top of `base_ref` are all by
+/// authors (matched by e-mail) with no commit on the base yet — a first
+/// contribution. `false` when the branch adds nothing or Git cannot say.
+fn first_contribution(repo_root: &Path, base_ref: &str) -> bool {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    let Some(emails) = git(&["log", "--format=%ae", &format!("{base_ref}..HEAD")]) else {
+        return false;
+    };
+    let mut emails: Vec<&str> = emails.lines().filter(|email| !email.is_empty()).collect();
+    emails.sort_unstable();
+    emails.dedup();
+    !emails.is_empty()
+        && emails.iter().all(|email| {
+            git(&[
+                "log",
+                "-1",
+                "--format=%H",
+                "--fixed-strings",
+                &format!("--author=<{email}>"),
+                base_ref,
+            ])
+            .is_some_and(|found| found.trim().is_empty())
+        })
 }
 
 /// The local name of the branch behind `base_ref` — `main` for `origin/main`.
@@ -385,10 +580,12 @@ pub fn note_checkout(branch: &str) {
     }
 }
 
-/// The branch checked out in `workspace` was rebased. When it is the flow's
-/// branch, the forge will no longer tie the merge to the request, so the
-/// closing steps join the flow.
-pub fn note_rebase(workspace: &Path) {
+/// The branch checked out in `workspace` had its commits rewritten by
+/// `rewrite` (setting `rebased` or `squashed`). When it is the flow's branch,
+/// the forge will no longer tie the merge to the request, so the closing steps
+/// join the flow — and a squash or rebase the flow was waiting on is done, so
+/// it moves on to whatever the branch still needs.
+fn note_rewrite(workspace: &Path, rewrite: impl FnOnce(&mut MergeFlow)) {
     let Some(branch) = workspace_branch_name(workspace) else {
         return;
     };
@@ -399,8 +596,49 @@ pub fn note_rebase(workspace: &Path) {
         && flow.workspace == workspace
         && flow.branch == branch
     {
-        flow.rebased = true;
+        rewrite(flow);
+        flow.settle();
     }
+}
+
+/// The branch checked out in `workspace` was rebased (see [`note_rewrite`]).
+pub fn note_rebase(workspace: &Path) {
+    note_rewrite(workspace, |flow| flow.rebased = true);
+}
+
+/// The branch checked out in `workspace` was squashed (see [`note_rewrite`]).
+pub fn note_squash(workspace: &Path) {
+    note_rewrite(workspace, |flow| flow.squashed = true);
+}
+
+/// A rebase in `workspace` failed. When the flow is still on its branch and
+/// the rebase stopped part-way (a conflict, rather than refusing to start),
+/// the request is abandoned: the flow hints `rebase abort`, the switch to the
+/// base, and deleting the branch.
+pub fn note_rebase_failed(workspace: &Path) {
+    let in_progress = crate::git::discover_git_repository(workspace)
+        .is_some_and(|(_, git_dir)| crate::commands::GitOperation::Rebase.in_progress(&git_dir));
+    if !in_progress {
+        return;
+    }
+    let mut guard = FLOW
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(flow) = guard.as_mut()
+        && flow.workspace == workspace
+        && flow.step <= MergeFlowStep::Switch
+    {
+        flow.abandoned = true;
+        flow.step = MergeFlowStep::RebaseAbort;
+    }
+}
+
+/// A rebase in `workspace` was aborted: the abandoned flow moves on to the
+/// switch.
+pub fn note_rebase_abort(workspace: &Path) {
+    complete(MergeFlowStep::RebaseAbort, |flow| {
+        flow.workspace == workspace && flow.step == MergeFlowStep::RebaseAbort
+    });
 }
 
 /// The flow's branch was merged.
@@ -419,10 +657,17 @@ pub fn note_delete(branch: &str) {
     complete(MergeFlowStep::Delete, |flow| branch == flow.branch);
 }
 
-/// The flow's pull request was commented on: the last step — unless the
-/// branch was rebased, in which case the closing steps remain.
-pub fn note_comment(pr: u64) {
-    complete(MergeFlowStep::Comment, |flow| flow.pr == pr);
+/// The flow's pull request was commented on with `template` (the
+/// `~/.orangu/comments/` file, if the body was one). The welcome template
+/// completes the welcome; any other comment completes the closing comment —
+/// the last step, unless the branch was rewritten, in which case the closing
+/// steps remain.
+pub fn note_comment(pr: u64, template: Option<&str>) {
+    if template == Some(WELCOME_COMMENT_FILE) {
+        complete(MergeFlowStep::Welcome, |flow| flow.pr == pr);
+    } else {
+        complete(MergeFlowStep::Comment, |flow| flow.pr == pr);
+    }
 }
 
 /// An issue or pull request was closed. Closing the flow's request moves on
@@ -530,8 +775,12 @@ pub(crate) mod test_support {
             base: "main".to_string(),
             step,
             workspace: workspace.to_path_buf(),
+            behind: step == MergeFlowStep::Rebase,
+            multiple: step == MergeFlowStep::Squash,
             rebased,
+            abandoned: step == MergeFlowStep::RebaseAbort,
             issue,
+            ..MergeFlow::default()
         }));
     }
 }
@@ -625,7 +874,7 @@ mod tests {
         note_delete("pr-231");
         assert_eq!(candidates("")[0], "comment on 231 merged.md");
         // Commenting on the request finishes the flow.
-        note_comment(231);
+        note_comment(231, None);
         assert!(snapshot().is_none());
     }
 
@@ -675,7 +924,7 @@ mod tests {
                 "merge pr-231",
                 "push",
                 "delete pr-231",
-                "comment on 231 merged.md",
+                "comment on 231 rebased-merged.md",
                 "close pr 231",
                 "close issue 58",
             ]
@@ -684,7 +933,7 @@ mod tests {
         note_merge("pr-231");
         note_push();
         note_delete("pr-231");
-        note_comment(231);
+        note_comment(231, None);
         assert_eq!(candidates(""), vec!["close pr 231", "close issue 58"]);
         // Closing some other issue or request is not this flow's step.
         note_close(&CloseTarget::Issue(231));
@@ -735,10 +984,344 @@ mod tests {
         crate::git::git_run(repo.path(), &["checkout", "--quiet", "pr-232"]);
         note_rebase(repo.path());
         assert_eq!(candidates("").last().unwrap(), "close pr 232");
-        note_comment(232);
+        note_comment(232, None);
         assert_eq!(candidates(""), vec!["close pr 232"]);
         note_close(&CloseTarget::PullRequest(232));
         assert!(snapshot().is_none());
+    }
+
+    #[test]
+    fn a_branch_behind_the_base_is_hinted_to_rebase_first() {
+        let _guard = exclusive();
+        let repo = tempfile::tempdir().expect("repo");
+        crate::git::init_git_for_test(repo.path());
+        std::fs::write(repo.path().join("README.md"), "orangu\n").expect("readme");
+        crate::git::git_run(repo.path(), &["add", "README.md"]);
+        crate::git::git_run(repo.path(), &["commit", "--quiet", "-m", "initial"]);
+        crate::git::git_run(repo.path(), &["branch", "-M", "main"]);
+        crate::git::git_run(repo.path(), &["checkout", "--quiet", "-b", "pr-231"]);
+        std::fs::write(repo.path().join("prompt.rs"), "").expect("prompt.rs");
+        crate::git::git_run(repo.path(), &["add", "prompt.rs"]);
+        crate::git::git_run(repo.path(), &["commit", "--quiet", "-m", "[#58] Prompt"]);
+        // The base moves on after the request was opened.
+        crate::git::git_run(repo.path(), &["checkout", "--quiet", "main"]);
+        std::fs::write(repo.path().join("other.rs"), "").expect("other.rs");
+        crate::git::git_run(repo.path(), &["add", "other.rs"]);
+        crate::git::git_run(repo.path(), &["commit", "--quiet", "-m", "Other"]);
+        crate::git::git_run(repo.path(), &["checkout", "--quiet", "pr-231"]);
+        set_active_pull_requests(&[PullRequest {
+            number: 231,
+            title: "Prompt".to_string(),
+        }]);
+        let candidates = |input: &str| flow_candidates(input, repo.path());
+
+        // Behind the base, the rebase leads, with the optional steps
+        // after it and the switch after those.
+        start(231, repo.path());
+        assert_eq!(
+            candidates("")[..5],
+            ["rebase", "build", "review", "auto review", "switch to main"]
+        );
+        assert_eq!(candidates("r"), vec!["rebase", "review"]);
+        assert_eq!(candidates("reb"), vec!["rebase"]);
+
+        // Rebasing moves on to the switch and adds the closing steps.
+        note_rebase(repo.path());
+        assert_eq!(candidates("")[0], "switch to main");
+        assert!(!candidates("").contains(&"rebase".to_string()));
+        assert_eq!(candidates("").last().unwrap(), "close issue 58");
+
+        // Switching to the base without rebasing skips the rebase.
+        start(231, repo.path());
+        assert_eq!(candidates("")[0], "rebase");
+        note_checkout("main");
+        assert_eq!(candidates("")[0], "merge pr-231");
+        assert_eq!(candidates("").last().unwrap(), "comment on 231 merged.md");
+        store(None);
+    }
+
+    #[test]
+    fn a_failed_rebase_abandons_the_branch() {
+        let _guard = exclusive();
+        let repo = tempfile::tempdir().expect("repo");
+        crate::git::init_git_for_test(repo.path());
+        std::fs::write(repo.path().join("README.md"), "orangu\n").expect("readme");
+        crate::git::git_run(repo.path(), &["add", "README.md"]);
+        crate::git::git_run(repo.path(), &["commit", "--quiet", "-m", "initial"]);
+        crate::git::git_run(repo.path(), &["branch", "-M", "main"]);
+        // The request and the base change the same line, so the rebase
+        // stops on a conflict.
+        crate::git::git_run(repo.path(), &["checkout", "--quiet", "-b", "pr-231"]);
+        std::fs::write(repo.path().join("README.md"), "request\n").expect("readme");
+        crate::git::git_run(repo.path(), &["commit", "--quiet", "-am", "Request"]);
+        crate::git::git_run(repo.path(), &["checkout", "--quiet", "main"]);
+        std::fs::write(repo.path().join("README.md"), "base\n").expect("readme");
+        crate::git::git_run(repo.path(), &["commit", "--quiet", "-am", "Base"]);
+        crate::git::git_run(repo.path(), &["checkout", "--quiet", "pr-231"]);
+        set_active_pull_requests(&[PullRequest {
+            number: 231,
+            title: "Request".to_string(),
+        }]);
+        let candidates = |input: &str| flow_candidates(input, repo.path());
+
+        start(231, repo.path());
+        assert_eq!(candidates("")[0], "rebase");
+
+        // A failure that left no rebase behind changes nothing.
+        note_rebase_failed(repo.path());
+        assert_eq!(candidates("")[0], "rebase");
+
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["rebase", "main"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("rebase");
+        assert!(!status.success(), "the rebase should conflict");
+        note_rebase_failed(repo.path());
+        assert_eq!(
+            candidates(""),
+            vec![
+                "rebase abort",
+                "switch to main",
+                "delete pr-231",
+                "comment on 231 please-rebase.md"
+            ]
+        );
+
+        note_rebase_abort(repo.path());
+        assert_eq!(candidates("")[0], "switch to main");
+        note_checkout("main");
+        assert_eq!(candidates("")[0], "delete pr-231");
+        take_refresh_request();
+        note_delete("pr-231");
+        assert_eq!(candidates(""), vec!["comment on 231 please-rebase.md"]);
+        assert!(!take_refresh_request(), "the flow is not over yet");
+        note_comment(231, None);
+        assert!(snapshot().is_none());
+        assert!(take_refresh_request());
+    }
+
+    /// A repository whose `main` has one commit, and a `pr-231` branch off it
+    /// with `commits` commits (by `author`, `Name <email>`, when given),
+    /// `behind` commits behind `main` (touching `README.md` like the branch
+    /// does when `conflict`), checked out.
+    fn pull_repo(
+        commits: usize,
+        behind: usize,
+        conflict: bool,
+        author: Option<&str>,
+    ) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("repo");
+        let git = |args: &[&str]| crate::git::git_run(repo.path(), args);
+        crate::git::init_git_for_test(repo.path());
+        std::fs::write(repo.path().join("README.md"), "orangu\n").expect("readme");
+        git(&["add", "README.md"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+        git(&["branch", "-M", "main"]);
+        git(&["checkout", "--quiet", "-b", "pr-231"]);
+        for index in 0..commits {
+            let file = if conflict && index == 0 {
+                "README.md".to_string()
+            } else {
+                format!("change-{index}.rs")
+            };
+            std::fs::write(repo.path().join(&file), format!("request {index}\n")).expect("file");
+            git(&["add", &file]);
+            let subject = format!("Change {index}");
+            let mut args = vec!["commit", "--quiet", "-m", &subject];
+            let flag;
+            if let Some(author) = author {
+                flag = format!("--author={author}");
+                args.push(&flag);
+            }
+            git(&args);
+        }
+        git(&["checkout", "--quiet", "main"]);
+        for index in 0..behind {
+            let file = if conflict {
+                "README.md".to_string()
+            } else {
+                format!("base-{index}.rs")
+            };
+            std::fs::write(repo.path().join(&file), format!("base {index}\n")).expect("file");
+            git(&["add", &file]);
+            git(&["commit", "--quiet", "-m", &format!("Base {index}")]);
+        }
+        git(&["checkout", "--quiet", "pr-231"]);
+        set_active_pull_requests(&[PullRequest {
+            number: 231,
+            title: "Request".to_string(),
+        }]);
+        repo
+    }
+
+    /// Walk the merge steps after the switch and return the closing comment.
+    fn merge_and_comment(repo: &Path) -> String {
+        note_checkout("main");
+        note_merge("pr-231");
+        note_push();
+        note_delete("pr-231");
+        let comment = flow_candidates("", repo)[0].clone();
+        note_comment(231, comment.rsplit(' ').next());
+        comment
+    }
+
+    #[test]
+    fn a_branch_with_several_commits_is_hinted_to_squash_before_rebasing() {
+        let _guard = exclusive();
+        let repo = pull_repo(2, 1, false, None);
+        let candidates = |input: &str| flow_candidates(input, repo.path());
+        start(231, repo.path());
+        assert_eq!(
+            candidates("")[..6],
+            [
+                "squash",
+                "build",
+                "review",
+                "auto review",
+                "rebase",
+                "switch to main"
+            ]
+        );
+        note_squash(repo.path());
+        assert_eq!(candidates("")[0], "rebase");
+        note_rebase(repo.path());
+        assert_eq!(candidates("")[0], "switch to main");
+        // Squashed and rebased: the commits were rewritten, so the closing
+        // steps follow the comment naming both.
+        assert_eq!(
+            merge_and_comment(repo.path()),
+            "comment on 231 squashed-rebased-merged.md"
+        );
+        assert_eq!(candidates(""), vec!["close pr 231"]);
+    }
+
+    #[test]
+    fn the_merged_comment_names_what_was_done_to_the_branch() {
+        let _guard = exclusive();
+        // (commits, behind, squash, rebase) -> template
+        for (commits, behind, squash, rebase, template) in [
+            (1, 0, false, false, "merged.md"),
+            (1, 1, false, true, "rebased-merged.md"),
+            (2, 0, true, false, "squashed-merged.md"),
+            (2, 1, true, true, "squashed-rebased-merged.md"),
+            // Skipping the hinted steps is allowed; the comment tells the truth.
+            (2, 1, false, false, "merged.md"),
+        ] {
+            let repo = pull_repo(commits, behind, false, None);
+            start(231, repo.path());
+            if squash {
+                note_squash(repo.path());
+            }
+            if rebase {
+                note_rebase(repo.path());
+            }
+            assert_eq!(
+                merge_and_comment(repo.path()),
+                format!("comment on 231 {template}"),
+                "{commits} commits, {behind} behind"
+            );
+            // Only rewritten commits need the request closed by hand.
+            assert_eq!(snapshot().is_some(), squash || rebase, "{template}");
+            store(None);
+        }
+    }
+
+    #[test]
+    fn an_abandoned_request_is_asked_for_what_it_still_needs() {
+        let _guard = exclusive();
+        let rebase = |repo: &Path| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["rebase", "main"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("rebase");
+            assert!(!status.success(), "the rebase should conflict");
+            note_rebase_failed(repo);
+        };
+        // Squashed, the rebase is all it still needs.
+        let repo = pull_repo(2, 1, true, None);
+        start(231, repo.path());
+        crate::git::git_run(repo.path(), &["reset", "--soft", "HEAD~1"]);
+        crate::git::git_run(
+            repo.path(),
+            &["commit", "--quiet", "--amend", "-m", "Squashed"],
+        );
+        note_squash(repo.path());
+        rebase(repo.path());
+        assert_eq!(
+            flow_candidates("", repo.path()).last().unwrap(),
+            "comment on 231 please-rebase.md"
+        );
+        // Not squashed, it needs both.
+        let repo = pull_repo(2, 1, true, None);
+        start(231, repo.path());
+        rebase(repo.path());
+        assert_eq!(
+            flow_candidates("", repo.path()),
+            vec![
+                "rebase abort",
+                "switch to main",
+                "delete pr-231",
+                "comment on 231 please-squash-rebase.md"
+            ]
+        );
+        store(None);
+        // Only a squash is outstanding when the branch was not behind.
+        test_support::begin(231, "pr-231", MergeFlowStep::Squash, workspace());
+        let mut guard = FLOW
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(flow) = guard.as_mut() {
+            flow.abandoned = true;
+            flow.step = MergeFlowStep::RebaseAbort;
+        }
+        drop(guard);
+        assert_eq!(
+            candidates("").last().unwrap(),
+            "comment on 231 please-squash.md"
+        );
+        store(None);
+    }
+
+    #[test]
+    fn a_first_time_contributor_is_welcomed_before_the_merged_comment() {
+        let _guard = exclusive();
+        let repo = pull_repo(1, 0, false, Some("New Person <new@example.com>"));
+        let candidates = |input: &str| flow_candidates(input, repo.path());
+        start(231, repo.path());
+        note_checkout("main");
+        note_merge("pr-231");
+        note_push();
+        note_delete("pr-231");
+        assert_eq!(
+            candidates(""),
+            vec!["comment on 231 welcome.md", "comment on 231 merged.md"]
+        );
+        // The merged comment is not mistaken for the welcome...
+        note_comment(231, Some("welcome.md"));
+        assert_eq!(candidates(""), vec!["comment on 231 merged.md"]);
+        note_comment(231, Some("merged.md"));
+        assert!(snapshot().is_none());
+
+        // ...and someone with a commit on the base already is not welcomed.
+        let repo = pull_repo(1, 0, false, None);
+        start(231, repo.path());
+        note_checkout("main");
+        note_merge("pr-231");
+        note_push();
+        note_delete("pr-231");
+        assert_eq!(
+            flow_candidates("", repo.path()),
+            vec!["comment on 231 merged.md"]
+        );
+        store(None);
     }
 
     #[test]
@@ -756,7 +1339,7 @@ mod tests {
         ]);
         assert!(!take_refresh_request());
         begin(MergeFlowStep::Comment);
-        note_comment(231);
+        note_comment(231, None);
         // The landed request is gone at once — the prompt must not offer to
         // pull it again while the refetch is still on its way...
         assert_eq!(candidates(""), vec!["pull 12"]);

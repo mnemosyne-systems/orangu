@@ -32,7 +32,12 @@ The wizard:
    [Optional external tools](#optional-external-tools) for how each one is
    activated.
 5. Installs bundled skills into `~/.orangu/skills/` when they are not already
-   present. At the moment this includes `debugging`.
+   present. At the moment this includes `debugging`. Likewise installs the
+   comment templates into `~/.orangu/comments/`, leaving any that already
+   exist untouched: the ones the committer merge flow posts — `merged.md`,
+   `squashed-merged.md`, `rebased-merged.md`, `squashed-rebased-merged.md`,
+   `please-rebase.md`, `please-squash.md`, `please-squash-rebase.md`, and
+   `welcome.md` — and `crossport.md`.
 6. Shows the resulting configuration and asks for confirmation before writing.
 
 The server is `orangu-server`. Only values that differ from their
