@@ -562,7 +562,9 @@ add repository Jubilee101 muse
 
 Merges a branch into the current branch.
 
-If `gh` is installed it uses `gh pr merge --merge`; otherwise it uses `git merge`.
+If the branch is not a local one and `gh` is installed it uses `gh pr merge` (`glab mr merge` on GitLab); otherwise it uses `git merge`.
+
+By default no merge commit is made (`merge_commit = off` in the `[orangu]` section of the configuration): `git merge --ff-only`, which refuses a branch that is not on top of the current one — rebase it first, then merge again — and `gh pr merge --rebase` (`glab mr merge --rebase`). With `merge_commit = on` it uses `git merge --ff`, making a merge commit when the branch cannot be fast-forwarded, and `gh pr merge --merge`.
 
 When the merge stops on conflicts, `/create_patch` resolves them: it hands the model every unmerged path, has it reconstruct the intended combined behavior, and stages the result. It leaves the merge itself for you to commit or abort. See the Core tools chapter.
 
@@ -709,7 +711,17 @@ git init
 
 Pushes the current branch to `origin` with `git push origin <branch>`.
 
-`gh` has no equivalent, so it always uses plain Git. `--force` (or `-f`, or `force`) runs `git push -f origin <branch>` but is blocked on `main` and `master` to prevent accidental history rewrites. After a successful push it compares the branch against the base branch and, when the branch is behind the base or has more than one commit ahead, reports that the branch needs a `/rebase` and/or `/squash`.
+`gh` has no equivalent, so it always uses plain Git. `--force` (or `-f`, or `force`) runs `git push -f origin <branch>` but is blocked on `main` and `master` to prevent accidental history rewrites.
+
+Only a straight line of commits on top of the latest upstream work is pushed. Before pushing, the branch and its base branch are fetched from `origin` (when that fails — offline, or a branch `origin` does not have yet — the refs already known are used), and the push is refused when:
+
+- the branch is behind its base branch (`origin/main`, `origin/master`, `main`, or `master`) — a feature branch must contain the latest commit of the base;
+- the branch is behind its own branch on `origin` — someone pushed first (not checked by `--force`, which is meant to replace it);
+- any commit it would publish is a merge commit — the error lists them, `<hash> <subject>` each.
+
+Each refusal says what to rebase onto. The merge-commit check is skipped with `merge_commit = on` in the `[orangu]` section of the configuration; the other two always apply.
+
+After a successful push it compares the branch against the base branch and, when the branch is behind the base or has more than one commit ahead, reports that the branch needs a `/rebase` and/or `/squash`.
 
 **Examples**
 

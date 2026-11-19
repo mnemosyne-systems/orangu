@@ -551,6 +551,7 @@ async fn run_local_command(input: &str, run: LocalRun<'_>) -> Result<Resolution>
             virtual_width: current_terminal_width(),
             auto_rebase: run.config.auto_rebase,
             auto_squash: run.config.auto_squash,
+            merge_commit: run.config.merge_commit,
             compile_workers: run.config.compile_workers,
             compression: run.config.compression,
             terminal: &run.config.terminal,

@@ -569,25 +569,41 @@ pub fn sync_default_branch(workspace: &Path, forge: Forge) -> Result<Option<Stri
     Ok(Some(format!("Synced {default} with origin")))
 }
 
-pub fn merge_output(workspace: &Path, branch: &str, forge: Forge) -> Result<String> {
+/// Merge `branch` into the current branch. With `merge_commit` off (the
+/// `[orangu]` default) no merge commit is ever made: a local merge only
+/// fast-forwards, and a merge through the forge rebases the request instead.
+pub fn merge_output(
+    workspace: &Path,
+    branch: &str,
+    forge: Forge,
+    merge_commit: bool,
+) -> Result<String> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("merge is only available inside a Git repository"))?;
     let is_local = git_local_branch_names(&repo_root)
         .iter()
         .any(|b| b == branch);
-    if !is_local && let Some(output) = try_gh_merge(&repo_root, branch, forge)? {
+    if !is_local && let Some(output) = try_gh_merge(&repo_root, branch, forge, merge_commit)? {
         return Ok(output);
     }
-    git_merge(&repo_root, branch)
+    git_merge(&repo_root, branch, merge_commit)
 }
 
-pub fn try_gh_merge(repo_root: &Path, branch: &str, forge: Forge) -> Result<Option<String>> {
+pub fn try_gh_merge(
+    repo_root: &Path,
+    branch: &str,
+    forge: Forge,
+    merge_commit: bool,
+) -> Result<Option<String>> {
     let cli = forge.cli();
-    // GitHub: `gh pr merge --merge BRANCH`. GitLab: `glab mr merge BRANCH --yes`
-    // (positional source branch, `--yes` skips the confirmation prompt).
-    let args: Vec<&str> = match forge {
-        Forge::GitHub => vec!["pr", "merge", "--merge", branch],
-        Forge::GitLab => vec!["mr", "merge", branch, "--yes"],
+    // GitHub: `gh pr merge --merge BRANCH`, or `--rebase` without merge
+    // commits. GitLab: `glab mr merge BRANCH --yes` (positional source branch,
+    // `--yes` skips the confirmation prompt), plus `--rebase` without them.
+    let args: Vec<&str> = match (forge, merge_commit) {
+        (Forge::GitHub, true) => vec!["pr", "merge", "--merge", branch],
+        (Forge::GitHub, false) => vec!["pr", "merge", "--rebase", branch],
+        (Forge::GitLab, true) => vec!["mr", "merge", branch, "--yes"],
+        (Forge::GitLab, false) => vec!["mr", "merge", branch, "--rebase", "--yes"],
     };
     let output = match std::process::Command::new(cli)
         .args(&args)
@@ -626,11 +642,15 @@ pub fn try_gh_merge(repo_root: &Path, branch: &str, forge: Forge) -> Result<Opti
     }))
 }
 
-pub fn git_merge(repo_root: &Path, branch: &str) -> Result<String> {
+/// `git merge` `branch` into the current branch: fast-forward only unless
+/// `merge_commit` allows one, in which case a merge commit is made when the
+/// current branch has moved on.
+pub fn git_merge(repo_root: &Path, branch: &str, merge_commit: bool) -> Result<String> {
+    let mode = if merge_commit { "--ff" } else { "--ff-only" };
     let output = std::process::Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["merge", "--ff", branch])
+        .args(["merge", mode, branch])
         .output()
         .context("failed to run git merge")?;
     if !output.status.success() {
@@ -641,6 +661,12 @@ pub fn git_merge(repo_root: &Path, branch: &str) -> Result<String> {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("\n");
+        if !merge_commit && detail.contains("Not possible to fast-forward") {
+            return Err(anyhow!(
+                "'{branch}' is not on top of the current branch, and merge_commit is \
+                 off; rebase '{branch}' first (run rebase on it), then merge again"
+            ));
+        }
         return Err(anyhow!(
             "git merge failed{}",
             if detail.is_empty() {
@@ -865,11 +891,11 @@ pub fn git_amend(repo_root: &Path, message: &str) -> Result<String> {
     Ok(String::new())
 }
 
-pub fn push_output(workspace: &Path, force: bool) -> Result<Option<String>> {
+pub fn push_output(workspace: &Path, force: bool, merge_commit: bool) -> Result<Option<String>> {
     let repo_root = discover_git_root(workspace)
         .ok_or_else(|| anyhow!("push is only available inside a Git repository"))?;
     if try_gh_push(&repo_root, force)?.is_none() {
-        git_push(&repo_root, force)?;
+        git_push(&repo_root, force, merge_commit)?;
     }
     Ok(pr_sync_advice(&repo_root))
 }
@@ -878,7 +904,103 @@ pub fn try_gh_push(_repo_root: &Path, _force: bool) -> Result<Option<String>> {
     Ok(None)
 }
 
-pub fn git_push(repo_root: &Path, force: bool) -> Result<String> {
+/// Refuse a push of `branch` that would publish anything but a straight line
+/// of commits on top of the latest upstream work:
+///
+/// - the commits are compared against what `origin` has now, so the branch
+///   and its base are fetched first (a failed fetch — offline, or a branch
+///   not on `origin` yet — falls back to the refs already known);
+/// - the branch must contain the latest commit of its base branch (a feature
+///   branch) and of its own remote branch (unless force-pushing, which is
+///   meant to replace that) — otherwise it needs a rebase;
+/// - none of the commits it would publish may be a merge commit, unless
+///   `merge_commit` (`[orangu].merge_commit`) allows them.
+///
+/// A repository with no `main`/`master` and no remote branch has nothing to
+/// compare against, and is not grounds to block the push.
+fn ensure_linear_on_latest(
+    repo_root: &Path,
+    branch: &str,
+    force: bool,
+    merge_commit: bool,
+) -> Result<()> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(args)
+            .output()
+    };
+    let protected = is_protected_branch(branch);
+    let base_ref = if protected {
+        None
+    } else {
+        git_find_base_ref(repo_root).ok()
+    };
+    // Refresh what `origin` has for the branch and its base, one at a time so
+    // a branch `origin` does not have yet does not stop the base's fetch.
+    let base_on_origin = base_ref
+        .as_deref()
+        .and_then(|base| base.strip_prefix("origin/"));
+    for name in std::iter::once(branch).chain(base_on_origin) {
+        let _ = git(&["fetch", "--quiet", "origin", name]);
+    }
+    let remote_ref = format!("origin/{branch}");
+    let remote_exists = git(&["rev-parse", "--verify", "--quiet", &remote_ref])
+        .is_ok_and(|output| output.status.success());
+
+    // What the branch must sit on top of, and where its new commits start.
+    let mut upstreams: Vec<&str> = Vec::new();
+    if let Some(base) = base_ref.as_deref() {
+        upstreams.push(base);
+    }
+    if remote_exists && !force {
+        upstreams.push(&remote_ref);
+    }
+    for upstream in &upstreams {
+        let behind = git_commit_count(repo_root, &format!("HEAD..{upstream}"))?;
+        if behind > 0 {
+            return Err(anyhow!(
+                "branch '{branch}' is {behind} commit{} behind {upstream}; \
+                 rebase on {upstream} before pushing (run /rebase)",
+                if behind == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    let range_start = if remote_exists && !force {
+        Some(remote_ref.as_str())
+    } else {
+        base_ref.as_deref()
+    };
+    if merge_commit {
+        return Ok(());
+    }
+    let Some(range_start) = range_start else {
+        return Ok(());
+    };
+    let merges = git(&[
+        "log",
+        "--merges",
+        "--format=%h %s",
+        &format!("{range_start}..HEAD"),
+    ])
+    .context("failed to run git log")?;
+    let merges = String::from_utf8_lossy(&merges.stdout);
+    let merges: Vec<&str> = merges.lines().filter(|line| !line.is_empty()).collect();
+    if !merges.is_empty() {
+        return Err(anyhow!(
+            "push would publish {} merge commit{} on '{branch}'; \
+             rebase so every commit sits on top of {range_start} before pushing:\n  {}",
+            merges.len(),
+            if merges.len() == 1 { "" } else { "s" },
+            merges.join("\n  ")
+        ));
+    }
+    Ok(())
+}
+
+pub fn git_push(repo_root: &Path, force: bool, merge_commit: bool) -> Result<String> {
     let branch = git_current_branch(repo_root)?;
     if force && is_protected_branch(&branch) {
         return Err(anyhow!(
@@ -886,22 +1008,7 @@ pub fn git_push(repo_root: &Path, force: bool) -> Result<String> {
             branch
         ));
     }
-    // Require the branch to be rebased on top of main/master before pushing, so
-    // we never push a branch that is behind its base. Protected branches are
-    // their own base, and a missing base branch (e.g. no main/master) is not
-    // grounds to block the push.
-    if !is_protected_branch(&branch)
-        && let Ok(base_ref) = git_find_base_ref(repo_root)
-    {
-        let behind = git_commit_count(repo_root, &format!("HEAD..{base_ref}"))?;
-        if behind > 0 {
-            return Err(anyhow!(
-                "branch '{branch}' is {behind} commit{} behind {base_ref}; \
-                 rebase on {base_ref} before pushing (run /rebase)",
-                if behind == 1 { "" } else { "s" }
-            ));
-        }
-    }
+    ensure_linear_on_latest(repo_root, &branch, force, merge_commit)?;
     let mut command = std::process::Command::new("git");
     command.arg("-C").arg(repo_root).arg("push");
     if force {
@@ -1716,13 +1823,103 @@ mod tests {
         commit("base.txt", "base2\n", "Base advances");
         git(&["checkout", "feature/push-test"]);
 
-        let result = git_push(workspace.path(), false);
+        let result = git_push(workspace.path(), false, false);
         assert!(result.is_err(), "push should be blocked when behind base");
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("behind main") && msg.contains("/rebase"),
             "error should explain the branch is behind and to rebase: {msg}"
         );
+    }
+
+    #[test]
+    fn push_requires_a_linear_history_on_the_latest_upstream() {
+        let _env_lock = process_env_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let root = tempdir().expect("root");
+        let home = tempdir().expect("home");
+        let _home_guard = EnvVarGuard::set_path("HOME", home.path());
+        let origin = root.path().join("origin.git");
+        let work = root.path().join("work");
+        let other = root.path().join("other");
+        let git = |dir: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git command");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        let commit = |dir: &Path, name: &str, msg: &str| {
+            std::fs::write(dir.join(name), msg).expect("write");
+            git(dir, &["add", "."]);
+            git(dir, &["commit", "--quiet", "-m", msg]);
+        };
+        git(
+            root.path(),
+            &["init", "--quiet", "--bare", "-b", "main", "origin.git"],
+        );
+        std::fs::create_dir(&work).expect("work");
+        init_git_for_test(&work);
+        git(&work, &["checkout", "--quiet", "-B", "main"]);
+        commit(&work, "base.txt", "Base");
+        git(
+            &work,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&work, &["push", "--quiet", "origin", "main"]);
+        git(
+            root.path(),
+            &["clone", "--quiet", origin.to_str().unwrap(), "other"],
+        );
+        git(&other, &["config", "user.name", "Other"]);
+        git(&other, &["config", "user.email", "other@example.com"]);
+
+        // A merge commit on main (the branch merged without fast-forward).
+        git(&work, &["checkout", "--quiet", "-b", "feature"]);
+        commit(&work, "feature.txt", "Feature");
+        git(&work, &["checkout", "--quiet", "main"]);
+        commit(&work, "main.txt", "Main moves");
+        // Without merge commits, the merge itself refuses...
+        let err = git_merge(&work, "feature", false).expect_err("not a fast-forward");
+        assert!(err.to_string().contains("rebase 'feature' first"), "{err}");
+        // ...and one made anyway is caught by the push.
+        git_merge(&work, "feature", true).expect("a merge commit is allowed");
+        let err = git_push(&work, false, false).expect_err("a merge commit must not be pushed");
+        let msg = err.to_string();
+        assert!(msg.contains("1 merge commit"), "{msg}");
+        assert!(msg.contains("Merge branch 'feature'"), "{msg}");
+        // With merge commits allowed, the push would let it through.
+        ensure_linear_on_latest(&work, "main", false, true).expect("merge commits allowed");
+
+        // Rebased into a straight line, it goes out.
+        git(&work, &["reset", "--quiet", "--hard", "HEAD~1"]);
+        git(&work, &["checkout", "--quiet", "feature"]);
+        git(&work, &["rebase", "--quiet", "main"]);
+        git(&work, &["checkout", "--quiet", "main"]);
+        git(&work, &["merge", "--quiet", "--ff-only", "feature"]);
+        git_push(&work, false, false).expect("a linear main is pushed");
+
+        // Someone else pushes first: main is no longer on the latest commit,
+        // which the push finds out by fetching.
+        git(&other, &["pull", "--quiet", "origin", "main"]);
+        commit(&other, "other.txt", "Other work");
+        git(&other, &["push", "--quiet", "origin", "main"]);
+        commit(&work, "late.txt", "Late");
+        let err = git_push(&work, false, false).expect_err("main is behind origin/main");
+        assert!(err.to_string().contains("behind origin/main"), "{err}");
+        git(&work, &["rebase", "--quiet", "origin/main"]);
+        git_push(&work, false, false).expect("rebased on the latest commit");
+
+        // A feature branch must sit on the latest base too, fetched first.
+        git(&work, &["checkout", "--quiet", "-b", "topic"]);
+        commit(&work, "topic.txt", "Topic");
+        git(&other, &["pull", "--quiet", "--rebase", "origin", "main"]);
+        commit(&other, "other2.txt", "More other work");
+        git(&other, &["push", "--quiet", "origin", "main"]);
+        let err = git_push(&work, false, false).expect_err("topic is behind origin/main");
+        assert!(err.to_string().contains("behind origin/main"), "{err}");
+        git(&work, &["rebase", "--quiet", "origin/main"]);
+        git_push(&work, false, false).expect("topic rebased on the latest base");
     }
 
     /// Two users' copies of `pgmoneta` side by side on disk — `origin` is

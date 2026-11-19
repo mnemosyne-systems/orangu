@@ -87,6 +87,10 @@ pub struct ClientAppConfiguration {
     pub prime: bool,
     pub auto_rebase: bool,
     pub auto_squash: bool,
+    /// `[orangu].merge_commit` — off (the default): `merge` only fast-forwards
+    /// (or rebases, through the forge) and `push` refuses to publish a merge
+    /// commit; on: merge commits are allowed.
+    pub merge_commit: bool,
     pub compile_workers: usize,
     pub terminal: String,
     pub platform: String,
@@ -477,6 +481,9 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         ),
         auto_squash: parse_feedback_bool(
             client.get("auto_squash").map(String::as_str).unwrap_or(""),
+        ),
+        merge_commit: parse_feedback_bool(
+            client.get("merge_commit").map(String::as_str).unwrap_or(""),
         ),
         semantic_budget_tokens,
         subagent_depth,

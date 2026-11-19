@@ -1713,6 +1713,7 @@ pub(crate) fn handle_command(
         virtual_width,
         auto_rebase,
         auto_squash,
+        merge_commit,
         compile_workers,
         compression,
         terminal,
@@ -2424,13 +2425,15 @@ pub(crate) fn handle_command(
         LocalCommand::Merge(None) => Ok(CommandOutcome::OutputError(
             merge_usage_message().to_string(),
         )),
-        LocalCommand::Merge(Some(branch)) => match merge_output(workspace, &branch, forge) {
-            Ok(_) => {
-                completion::flow::note_merge(&branch);
-                Ok(CommandOutcome::Quiet)
+        LocalCommand::Merge(Some(branch)) => {
+            match merge_output(workspace, &branch, forge, merge_commit) {
+                Ok(_) => {
+                    completion::flow::note_merge(&branch);
+                    Ok(CommandOutcome::Quiet)
+                }
+                Err(err) => Ok(local_command_error(err)),
             }
-            Err(err) => Ok(local_command_error(err)),
-        },
+        }
         LocalCommand::Branch(sub) => match sub {
             BranchSubcommand::List => match branch_list_output(workspace) {
                 Ok(output) => Ok(CommandOutcome::Output(output)),
@@ -2603,7 +2606,7 @@ pub(crate) fn handle_command(
             Ok(_) => Ok(CommandOutcome::Quiet),
             Err(err) => Ok(local_command_error(err)),
         },
-        LocalCommand::Push(force) => match push_output(workspace, force) {
+        LocalCommand::Push(force) => match push_output(workspace, force, merge_commit) {
             Ok(advice) => {
                 completion::flow::note_push();
                 match advice {
@@ -4122,6 +4125,7 @@ mod tests {
                     virtual_width: 512,
                     auto_rebase: false,
                     auto_squash: false,
+                    merge_commit: false,
                     compile_workers: 1,
                     compression: false,
                     terminal: "",
@@ -4180,6 +4184,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -4368,6 +4373,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -4431,6 +4437,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -4503,6 +4510,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -4563,6 +4571,7 @@ mod tests {
                     virtual_width: 512,
                     auto_rebase: false,
                     auto_squash: false,
+                    merge_commit: false,
                     compile_workers: 1,
                     compression: false,
                     terminal: "",
@@ -4651,6 +4660,7 @@ mod tests {
                     virtual_width: 512,
                     auto_rebase: false,
                     auto_squash: false,
+                    merge_commit: false,
                     compile_workers: 1,
                     compression: false,
                     terminal: "",
@@ -4762,6 +4772,7 @@ mod tests {
                     virtual_width: 512,
                     auto_rebase: false,
                     auto_squash: false,
+                    merge_commit: false,
                     compile_workers: 1,
                     compression: false,
                     terminal: "",
@@ -4837,6 +4848,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -4901,6 +4913,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -4969,6 +4982,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -5031,6 +5045,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -5094,6 +5109,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -5163,6 +5179,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -5230,6 +5247,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -5301,6 +5319,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -5356,6 +5375,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -5407,6 +5427,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",
@@ -5458,6 +5479,7 @@ mod tests {
                 virtual_width: 512,
                 auto_rebase: false,
                 auto_squash: false,
+                merge_commit: false,
                 compile_workers: 1,
                 compression: false,
                 terminal: "",

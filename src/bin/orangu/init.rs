@@ -180,6 +180,7 @@ pub async fn run_init() -> Result<()> {
     let feedback = prompt_bool("feedback", false)?;
     let auto_rebase = prompt_bool("auto_rebase", false)?;
     let auto_squash = prompt_bool("auto_squash", false)?;
+    let merge_commit = prompt_bool("merge_commit", false)?;
     let terminal = prompt_with_default("terminal", "")?;
     let platform = prompt_with_options("platform", DEFAULT_PLATFORM, PLATFORM_OPTIONS)?;
 
@@ -238,6 +239,9 @@ pub async fn run_init() -> Result<()> {
     }
     if auto_squash {
         client.push("auto_squash = on".to_string());
+    }
+    if merge_commit {
+        client.push("merge_commit = on".to_string());
     }
     if !terminal.is_empty() {
         client.push(format!("terminal = {terminal}"));

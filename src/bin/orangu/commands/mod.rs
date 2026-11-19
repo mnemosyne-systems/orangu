@@ -778,6 +778,7 @@ pub struct CommandContext<'a> {
     pub virtual_width: usize,
     pub auto_rebase: bool,
     pub auto_squash: bool,
+    pub merge_commit: bool,
     pub compile_workers: usize,
     pub compression: bool,
     pub terminal: &'a str,
