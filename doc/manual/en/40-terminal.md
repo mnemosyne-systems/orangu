@@ -75,7 +75,13 @@ A command is handled locally and never reaches the server, so it works while the
 Two groups of commands are refused rather than run, with a message saying which group they fall in:
 
 - Commands whose only effect is on the running session — `/model`, `/server`, `/theme <name>`, `/license <spdx>`, `/verbosity`, `/disconnect`, `/reload` — since a one-shot exits before the change could matter. (`/license` with no argument still reports; it is only *setting* one that a one-shot cannot keep.) Select the server and model in `orangu.conf`, or point `--config` at a different file.
-- Commands that need the terminal interface — `/review`, `/auto_review`, `/manual`, `/pending`, `/clear`, `/copy`, `/quit`, `/restart`, and the forms of `/workspace`, `/create_workspace`, and `/session` that switch tab or session. The reporting forms still work: a bare `/workspace` prints the active workspace, and a bare `/session` lists the stored sessions.
+- Commands that need the terminal interface — `/review`, `/manual`, `/pending`, `/clear`, `/copy`, `/quit`, `/restart`, and the forms of `/workspace`, `/create_workspace`, and `/session` that switch tab or session. The reporting forms still work: a bare `/workspace` prints the active workspace, and a bare `/session` lists the stored sessions.
+
+`/auto_review` runs unattended, the way a `/schedule` run does: it starts at once, draws nothing, and prints the report as Markdown on stdout. A rejected patch exits non-zero, so a CI job can gate on it:
+
+```text
+orangu -p "/auto_review" > review.md
+```
 
 `/create_patch` is not in either group: a one-shot has no stored review report, but it still resolves the conflicts of an in-progress merge, rebase, cherry-pick, or revert, which is what makes `orangu -p "/create_patch"` usable from a script that hits one.
 

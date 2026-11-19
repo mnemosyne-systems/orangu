@@ -39,14 +39,17 @@ use anyhow::{Result, anyhow};
 
 use crate::commands::{
     AfterTurn, CommandContext, CommandOutcome, CommandState, ExportTarget, LocalCommand,
-    McpSubcommand, current_terminal_width, parse_local_command, system_prompt,
+    McpSubcommand, ReviewLaunch, current_terminal_width, parse_local_command, system_prompt,
 };
 use crate::dispatch::{handle_command, run_after_turn, run_duplicates_scan};
 use crate::export;
 use crate::git::{Forge, ReviewReports, fetch_issue_details, fetch_pull_request_details};
+use crate::input::ViewportState;
 use crate::models::{
     coordinator_role_profile, detect_embeddings_server, is_active_connection_a_coordinator,
+    review_prompt_profile,
 };
+use crate::review::{ReviewChrome, auto_review_exit_output, run_auto_review_mode};
 use crate::stats::UsageStats;
 use orangu::{
     config::{ClientAppConfiguration, LlmConfiguration},
@@ -563,6 +566,10 @@ async fn run_local_command(input: &str, run: LocalRun<'_>) -> Result<Resolution>
         },
     )?;
 
+    if let CommandOutcome::AutoReview(launch) = outcome {
+        return run_headless_auto_review(launch, &run).await;
+    }
+
     run_outcome(
         outcome,
         input,
@@ -572,6 +579,67 @@ async fn run_local_command(input: &str, run: LocalRun<'_>) -> Result<Resolution>
         run.console,
     )
     .await
+}
+
+/// `/auto_review` with no terminal: the unattended run `/schedule` already
+/// uses, drawing nothing, with the report's Markdown on stdout. A rejected
+/// patch fails the run, so a CI job can gate on the exit code.
+async fn run_headless_auto_review(launch: ReviewLaunch, run: &LocalRun<'_>) -> Result<Resolution> {
+    crate::terminal::set_headless();
+    let endpoint = normalized_openai_endpoint(&run.profile.endpoint);
+    let http_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    let is_coordinator =
+        is_active_connection_a_coordinator(&http_client, run.config, run.server, Some(&endpoint))
+            .await;
+    let profile = review_prompt_profile(
+        run.config,
+        run.server,
+        &run.profile.model,
+        &endpoint,
+        is_coordinator,
+    )
+    .ok_or_else(|| anyhow!("unknown server '{}'", run.server))?;
+    // Nothing is drawn; the size only feeds the layout code the run shares
+    // with the terminal interface.
+    let mut viewport = ViewportState::new(run.config.width, 120, 40);
+    let chrome = ReviewChrome {
+        current_model: orangu::tui::display_model_name(is_coordinator, &run.profile.model),
+        prompt_branch: None,
+        pending_count: 0,
+        skills: run.skills,
+        word_wrap: run.config.word_wrap,
+    };
+    let state = run_auto_review_mode(
+        launch,
+        &profile,
+        &mut UsageStats::new(),
+        &mut viewport,
+        chrome,
+        run.workspace,
+        &run.config.terminal,
+        run.config.feedback,
+        run.config.compression,
+        run.config.diff_file_cap,
+        run.tools.compression_metrics.clone(),
+        run.tools.compression_store.clone(),
+        run.skills,
+        orangu::llm::SlotRegistry::default(),
+        run.tools.graph_store.clone(),
+        run.tools.graph_status.clone(),
+        true,
+        &mut |_| {},
+    )
+    .await?;
+
+    let (_, markdown) = auto_review_exit_output(&state);
+    run.console.block(&markdown);
+    let verdict = state.conclusion_verdict();
+    if verdict.contains("rejects") {
+        return Err(anyhow!("{verdict}"));
+    }
+    Ok(Resolution::Handled)
 }
 
 /// `-p` keeps no session on disk, so there is no directory for the per-session
@@ -666,7 +734,6 @@ fn terminal_only(command: &LocalCommand<'_>) -> bool {
         command,
         LocalCommand::Restart
             | LocalCommand::Review
-            | LocalCommand::AutoReview(_, _, _)
             | LocalCommand::Manual
             | LocalCommand::Clear
             | LocalCommand::Copy

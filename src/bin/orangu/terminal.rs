@@ -39,7 +39,22 @@ impl Drop for TerminalTitleGuard {
     }
 }
 
+/// Set by `orangu -p "/auto_review"`, which runs with no terminal: there are no
+/// keys to read and no window title to set, and stdout carries only the report.
+static HEADLESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_headless() {
+    HEADLESS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn headless() -> bool {
+    HEADLESS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn set_terminal_title(title: Option<&str>) {
+    if headless() {
+        return;
+    }
     match title {
         Some(title) => print!("\x1b]0;{title}\x07"),
         None => print!("\x1b]0;\x07"),
@@ -341,6 +356,9 @@ static TYPED_PASTE: std::sync::Mutex<std::collections::VecDeque<Event>> =
 
 /// `crossterm::event::poll` that also sees a paste still being typed out.
 pub(crate) fn poll_typed_event(timeout: std::time::Duration) -> std::io::Result<bool> {
+    if headless() {
+        return Ok(false);
+    }
     let queued = TYPED_PASTE.lock().is_ok_and(|queue| !queue.is_empty());
     if queued {
         return Ok(true);
