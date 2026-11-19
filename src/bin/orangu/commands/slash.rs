@@ -143,6 +143,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/agents" => Some(LocalCommand::Agents(None)),
         "/tasks" => Some(LocalCommand::Tasks(TasksSubcommand::List)),
         "/fork" => Some(LocalCommand::Fork(None)),
+        "/plan" => Some(LocalCommand::Plan),
         "/developer" => Some(LocalCommand::Mode(crate::mode::PromptMode::Developer)),
         "/committer" => Some(LocalCommand::Mode(crate::mode::PromptMode::Committer)),
         "/graph" => Some(LocalCommand::Graph),

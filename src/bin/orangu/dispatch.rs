@@ -2874,6 +2874,17 @@ pub(crate) fn handle_command(
                 "Nothing to compact: the conversation holds no stale tool output.".to_string()
             }))
         }
+        LocalCommand::Plan => {
+            let on = !tools.plan_mode();
+            tools.set_plan_mode(on);
+            orangu::tui::plan_badge::show(on);
+            Ok(CommandOutcome::Output(if on {
+                "Plan mode on: the model reads and searches, then proposes a plan for you                  to approve before it changes anything. /plan again turns it off."
+                    .to_string()
+            } else {
+                "Plan mode off: the model can change files again.".to_string()
+            }))
+        }
         LocalCommand::Copy => Ok(CommandOutcome::CopyLastResponse),
         LocalCommand::Quit => Ok(CommandOutcome::Quit),
         LocalCommand::PendingList => Ok(CommandOutcome::PendingList),

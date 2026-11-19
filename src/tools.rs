@@ -36,6 +36,32 @@ struct McpGrants {
     servers: std::collections::BTreeSet<String>,
 }
 
+/// The tool that ends plan mode once the user approves its plan.
+pub const PROPOSE_PLAN: &str = "propose_plan";
+
+/// Whether plan mode offers and runs tool `name`: the tools that only read,
+/// and the subagents, which inherit plan mode. MCP tools are left out:
+/// nothing says which of them only read.
+fn plan_mode_allows(name: &str) -> bool {
+    matches!(
+        name,
+        "show_file"
+            | "expand_context"
+            | "list_directory"
+            | "search_text"
+            | "fetch_url"
+            | "web_search"
+            | "browse"
+            | "use_skill"
+            | "graph_lookup"
+            | "graph_explain"
+            | "graph_path"
+            | "semantic_search"
+            | "run_agent"
+    ) || name == crate::subagents::EXPLORER.tool
+        || name == crate::subagents::WEB_RESEARCHER.tool
+}
+
 #[derive(Clone)]
 pub struct ToolExecutor {
     workspace: PathBuf,
@@ -43,6 +69,12 @@ pub struct ToolExecutor {
     tool_duration: Arc<Mutex<std::time::Duration>>,
     compression_enabled: bool,
     read_only: bool,
+    /// Plan mode (`/plan`): only reading tools are offered and run, until
+    /// the user approves a `propose_plan`. Shared by clones of the executor.
+    plan_mode: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether `propose_plan` is offered in plan mode: off for subagents,
+    /// which have nobody to approve a plan.
+    proposes_plans: bool,
     /// Whether the subagent tools (`explore_repository`, `write_tests`,
     /// `write_docs`) are offered. Off inside a subagent, unless a custom
     /// agent's `Agent` tool lets it nest (see [`Self::nested_under`]).
@@ -242,6 +274,8 @@ impl ToolExecutor {
             tool_duration: Arc::new(Mutex::new(std::time::Duration::ZERO)),
             compression_enabled,
             read_only: false,
+            plan_mode: Arc::default(),
+            proposes_plans: true,
             subagents: true,
             allowed_tools: None,
             denied_tools: None,
@@ -284,6 +318,31 @@ impl ToolExecutor {
             startable_agents: None,
             licence: Arc::new(Mutex::new(crate::license::Choice::default())),
         }
+    }
+
+    /// Whether plan mode is on.
+    pub fn plan_mode(&self) -> bool {
+        self.plan_mode.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Turns plan mode on or off, for this executor and its clones.
+    pub fn set_plan_mode(&self, on: bool) {
+        self.plan_mode
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Gives a subagent `parent`'s plan mode as it is now. It keeps it even
+    /// when the parent's plan is approved, and cannot propose plans itself.
+    pub fn with_plan_mode_of(mut self, parent: &ToolExecutor) -> Self {
+        self.plan_mode = Arc::new(std::sync::atomic::AtomicBool::new(parent.plan_mode()));
+        self.proposes_plans = false;
+        self
+    }
+
+    /// Whether `name` asks the user to approve a plan: `propose_plan`, in
+    /// plan mode.
+    pub fn requires_plan_approval(&self, name: &str) -> bool {
+        name == PROPOSE_PLAN && self.plan_mode() && self.proposes_plans
     }
 
     /// Attach already-initialized MCP services for this workspace.
@@ -900,6 +959,20 @@ impl ToolExecutor {
         if let Some(denied) = &self.denied_tools {
             defs.retain(|def| !crate::agents::custom::lists_tool(denied, &def.function.name));
         }
+        if self.plan_mode() {
+            defs.retain(|def| plan_mode_allows(&def.function.name));
+            if self.proposes_plans {
+                defs.push(tool(
+                    PROPOSE_PLAN,
+                    "Plan mode: once you have explored enough, show the user your                          implementation `plan` (Markdown: steps, files to change, how to                          verify). Editing tools return only after they approve it.",
+                    json!({
+                        "type": "object",
+                        "properties": {"plan": {"type": "string"}},
+                        "required": ["plan"]
+                    }),
+                ));
+            }
+        }
         defs
     }
 
@@ -1204,6 +1277,11 @@ impl ToolExecutor {
         {
             return Err(anyhow!("tool '{name}' is not available to this agent"));
         }
+        if self.plan_mode() && !plan_mode_allows(name) && name != PROPOSE_PLAN {
+            return Err(anyhow!(
+                "tool '{name}' is not available in plan mode: explore with reading tools,                  then call {PROPOSE_PLAN} and wait for the user's approval"
+            ));
+        }
         if let Some(hooks) = &self.agent_hooks
             && let Err(reason) = hooks.before(name, arguments, &self.workspace).await
         {
@@ -1275,6 +1353,7 @@ impl ToolExecutor {
             "graph_explain" => self.graph_explain(arguments),
             "graph_path" => self.graph_path(arguments),
             "semantic_search" => self.semantic_search(arguments).await,
+            PROPOSE_PLAN => Err(anyhow!("{PROPOSE_PLAN} is only available in plan mode")),
             _ if let Some(mcp) = self.mcp_for(name) => {
                 if self.mcp_unattended && mcp.requires_approval(name) {
                     Err(anyhow!(
@@ -3457,6 +3536,35 @@ mod file_lifecycle_tool_tests {
             .expect_err("too long");
         assert!(err.to_string().contains("limited"), "{err}");
         assert_eq!(fs::read_to_string(&file).unwrap(), "Replaced.\n");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_offers_and_runs_only_reading_tools() {
+        let workspace = tempfile::tempdir().unwrap();
+        let executor = ToolExecutor::new(workspace.path());
+        executor.set_plan_mode(true);
+        let names = tool_names(&executor);
+        assert!(names.contains(&"show_file".to_string()));
+        assert!(names.contains(&PROPOSE_PLAN.to_string()));
+        assert!(!names.contains(&"modify_file".to_string()));
+        assert!(!names.contains(&"run_shell_command".to_string()));
+        assert!(executor.requires_plan_approval(PROPOSE_PLAN));
+        let err = executor
+            .execute(
+                "create_file",
+                &args(&[("path", json!("b.txt")), ("content", json!("x"))]),
+            )
+            .await
+            .expect_err("plan mode");
+        assert!(err.to_string().contains("plan mode"), "{err}");
+        assert!(!workspace.path().join("b.txt").exists());
+
+        let child = ToolExecutor::new_for_subagent(workspace.path()).with_plan_mode_of(&executor);
+        executor.set_plan_mode(false);
+        assert!(child.plan_mode());
+        assert!(!tool_names(&child).contains(&PROPOSE_PLAN.to_string()));
+        assert!(tool_names(&executor).contains(&"modify_file".to_string()));
+        assert!(!tool_names(&executor).contains(&PROPOSE_PLAN.to_string()));
     }
 
     /// `disallowedTools` is a denylist: those tools are neither offered nor

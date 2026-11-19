@@ -710,8 +710,10 @@ fn spec_tools(spec: &SubagentSpec, parent: &ToolExecutor) -> (ToolExecutor, Stri
     if spec.tool == SSH.tool {
         let tools = ToolExecutor::new_for_subagent(workspace)
             .with_ssh_tools(parent.ssh())
-            .with_allowed_tools(SSH_SUBAGENT_TOOLS.iter().map(ToString::to_string).collect());
-        return (tools, String::new());
+            .with_allowed_tools(SSH_SUBAGENT_TOOLS.iter().map(ToString::to_string).collect())
+            .with_plan_mode_of(parent);
+        let note = plan_note(&tools);
+        return (tools, note);
     }
     let tools = if spec.writable {
         ToolExecutor::new_for_subagent(workspace)
@@ -720,12 +722,13 @@ fn spec_tools(spec: &SubagentSpec, parent: &ToolExecutor) -> (ToolExecutor, Stri
     } else {
         ToolExecutor::new_read_only(workspace)
     };
+    let tools = tools.with_plan_mode_of(parent);
     let (tools, skills) = if spec.writable && spec.tool != DOCUMENT_TOOL {
         attach_skills(tools, &[])
     } else {
         (tools, String::new())
     };
-    let additions = format!("{skills}{}", mcp_instructions(&tools));
+    let additions = format!("{skills}{}{}", mcp_instructions(&tools), plan_note(&tools));
     (tools, additions)
 }
 
@@ -739,7 +742,7 @@ async fn custom_tools(
     let workspace = parent.workspace();
     let mut prompt = String::new();
     let root = worktree.map_or_else(|| workspace.to_path_buf(), |worktree| worktree.workspace());
-    let mut executor = ToolExecutor::new_for_subagent(&root);
+    let mut executor = ToolExecutor::new_for_subagent(&root).with_plan_mode_of(parent);
     if worktree.is_none() {
         executor = executor.with_checkpoints(parent.checkpoints().clone());
     }
@@ -752,6 +755,9 @@ async fn custom_tools(
         ));
     }
     prompt.push_str(&restrictions);
+    if !agent.plans() {
+        prompt.push_str(&plan_note(&tools));
+    }
     if crate::agents::custom::SSH_TOOLS
         .iter()
         .any(|tool| agent.may_use(tool))
@@ -791,8 +797,21 @@ async fn custom_tools(
 fn fork_tools(parent: &ToolExecutor) -> ToolExecutor {
     let tools = ToolExecutor::new_for_subagent(parent.workspace())
         .with_subagent_mcp(parent.mcp())
-        .with_checkpoints(parent.checkpoints().clone());
+        .with_checkpoints(parent.checkpoints().clone())
+        .with_plan_mode_of(parent);
     attach_skills(tools, &[]).0
+}
+
+/// What a subagent's prompt says when it runs in plan mode.
+fn plan_note(tools: &ToolExecutor) -> String {
+    if tools.plan_mode() {
+        "
+
+You are planning: look, but change nothing."
+            .to_string()
+    } else {
+        String::new()
+    }
 }
 /// Gives `tools` the workspace's skills (read at each launch, so new ones
 /// apply) and returns what the subagent's prompt says about them: the

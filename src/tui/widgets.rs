@@ -381,6 +381,11 @@ fn status_line(
         left_visible_width += label.chars().count();
         spans.push(Span::styled(label, Style::default().fg(Color::DarkGray)));
     }
+    if crate::tui::plan_badge::shown() {
+        let label = "PLAN  ";
+        left_visible_width += label.chars().count();
+        spans.push(Span::styled(label, theme.warning));
+    }
     if let Some(left) = left_status.filter(|status| status.visible_width > 0) {
         left_visible_width += left.visible_width;
         if let Ok(mut text) = ansi_to_tui::IntoText::into_text(&left.rendered)

@@ -109,6 +109,10 @@ pub(crate) async fn wait_for_response(
                         state.pending_mcp_approval = None;
                     }
                     match choice {
+                        ApprovalChoice::Once if name == orangu::tools::PROPOSE_PLAN => {
+                            orangu::tui::plan_badge::show(false);
+                            ToolApproval::Allow
+                        }
                         ApprovalChoice::Once => ToolApproval::Allow,
                         ApprovalChoice::Tool => {
                             approval_tools.grant_mcp_tool(name);

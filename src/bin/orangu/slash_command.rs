@@ -89,6 +89,7 @@ pub enum SlashCommand {
     Agents,
     Tasks,
     Fork,
+    Plan,
     Developer,
     Committer,
     Graph,
@@ -187,6 +188,7 @@ impl SlashCommand {
                 "Lists this conversation's subagent tasks, shows one, or stops one"
             }
             SlashCommand::Fork => "Forks the conversation into a background subagent with a task",
+            SlashCommand::Plan => "Toggles plan mode: read-only until you approve a plan",
             SlashCommand::Developer => "Puts the prompt in developer mode (the default)",
             SlashCommand::Committer => "Puts the prompt in committer mode: the merge flow",
             SlashCommand::Graph => {

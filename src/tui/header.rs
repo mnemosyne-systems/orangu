@@ -254,6 +254,7 @@ pub fn help_text() -> &'static str {
 /agents [search words]                          List custom subagents (Claude Code format) from .claude/agents and .orangu/agents
 /tasks [<id>|stop <id>]                         List subagent tasks, show one task's report, or stop a background task
 /fork <task>                                     Fork the conversation into a background subagent that does <task>
+/plan                                           Toggle plan mode: the model only reads, then proposes a plan you approve before it edits
 /developer                                      Developer mode (the default)
 /committer                                      Committer mode: the merge flow
 /theme <name>                                   Set this session's UI theme (naming the configured one drops the override)

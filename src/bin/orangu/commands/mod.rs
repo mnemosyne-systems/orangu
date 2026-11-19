@@ -714,6 +714,9 @@ pub enum LocalCommand<'a> {
     /// `/fork <task>`: a background subagent that starts from the whole
     /// conversation.
     Fork(Option<Cow<'a, str>>),
+    /// `/plan`: plan mode on or off. In plan mode the model only reads, and
+    /// edits once the user approves its `propose_plan`.
+    Plan,
     /// `/developer` and `/committer`: what the prompt is for — writing code, or
     /// landing a reviewed pull request. Only the prompt's own suggestions
     /// change; every command stays available in both (see [`crate::mode`]).

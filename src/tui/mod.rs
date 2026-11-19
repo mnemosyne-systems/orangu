@@ -18,6 +18,7 @@ pub mod auto_review_native;
 pub mod context_gauge;
 pub mod header;
 mod helper;
+pub mod plan_badge;
 pub mod renderer;
 pub mod review;
 pub mod review_native;

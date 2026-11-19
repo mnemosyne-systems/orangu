@@ -67,6 +67,8 @@ pub struct McpApprovalRequest {
     pub expanded: bool,
     /// The reason being typed after `r`.
     pub reason: Option<String>,
+    /// The plan a `propose_plan` call asks the user to approve.
+    pub plan: Option<String>,
 }
 
 /// What a key did to the panel.
@@ -88,6 +90,14 @@ impl McpApprovalRequest {
     ) -> Self {
         let arguments = serde_json::to_string_pretty(&call.function.arguments)
             .unwrap_or_else(|_| "{}".to_string());
+        let plan = (call.function.name == orangu::tools::PROPOSE_PLAN).then(|| {
+            call.function
+                .arguments
+                .get("plan")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        });
         Self {
             decision,
             tool: call.function.name.clone(),
@@ -96,6 +106,7 @@ impl McpApprovalRequest {
             diff: proposed_diff(workspace, &call.function.arguments),
             expanded: false,
             reason: None,
+            plan,
         }
     }
 
@@ -106,6 +117,9 @@ impl McpApprovalRequest {
 
     /// The panel as Markdown, rendered under the live answer.
     pub fn panel(&self) -> String {
+        if let Some(plan) = &self.plan {
+            return self.plan_panel(plan);
+        }
         let mut text = format!("**MCP tool call needs approval:** `{}`", self.tool);
         if let Some(server) = &self.server {
             text.push_str(&format!(" on server `{server}`"));
@@ -151,6 +165,29 @@ impl McpApprovalRequest {
         text
     }
 
+    /// The panel of a plan waiting for approval: the plan in full.
+    fn plan_panel(&self, plan: &str) -> String {
+        let mut text = format!(
+            "**Plan ready for approval**
+
+{}
+
+",
+            plan.trim()
+        );
+        match &self.reason {
+            Some(reason) => text.push_str(&format!(
+                "Feedback for the model: {reason}▏
+
+`Enter` keep planning with this feedback · `Esc` back"
+            )),
+            None => text.push_str(
+                "`y` approve and leave plan mode · `n` keep planning · `r` keep planning with feedback",
+            ),
+        }
+        text
+    }
+
     /// The panel's answer to a key.
     pub fn key(&mut self, event: &Event) -> ApprovalKey {
         let Event::Key(KeyEvent {
@@ -190,8 +227,10 @@ impl McpApprovalRequest {
         }
         match code {
             KeyCode::Char('y' | 'Y') => ApprovalKey::Decided(ApprovalChoice::Once),
-            KeyCode::Char('t' | 'T') => ApprovalKey::Decided(ApprovalChoice::Tool),
-            KeyCode::Char('s' | 'S') if self.server.is_some() => {
+            KeyCode::Char('t' | 'T') if self.plan.is_none() => {
+                ApprovalKey::Decided(ApprovalChoice::Tool)
+            }
+            KeyCode::Char('s' | 'S') if self.server.is_some() && self.plan.is_none() => {
                 ApprovalKey::Decided(ApprovalChoice::Server)
             }
             KeyCode::Char('n' | 'N') => ApprovalKey::Decided(ApprovalChoice::Deny(None)),
@@ -199,7 +238,7 @@ impl McpApprovalRequest {
                 self.reason = Some(String::new());
                 ApprovalKey::Changed
             }
-            KeyCode::Char('e' | 'E') => {
+            KeyCode::Char('e' | 'E') if self.plan.is_none() => {
                 self.expanded = !self.expanded;
                 ApprovalKey::Changed
             }
@@ -327,6 +366,23 @@ mod tests {
     fn request(arguments: serde_json::Value, workspace: &Path) -> McpApprovalRequest {
         let (sender, _) = std::sync::mpsc::channel();
         McpApprovalRequest::new(sender, &call(arguments), Some("fs".to_string()), workspace)
+    }
+
+    #[test]
+    fn a_plan_is_approved_or_sent_back() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (sender, _) = std::sync::mpsc::channel();
+        let mut call = call(json!({"plan": "1. Edit src/lib.rs"}));
+        call.function.name = orangu::tools::PROPOSE_PLAN.to_string();
+        let mut panel = McpApprovalRequest::new(sender, &call, None, workspace.path());
+        assert!(panel.panel().contains("1. Edit src/lib.rs"));
+        assert_eq!(press(&mut panel, KeyCode::Char('t')), ApprovalKey::Ignored);
+        assert_eq!(
+            press(&mut panel, KeyCode::Char('y')),
+            ApprovalKey::Decided(ApprovalChoice::Once)
+        );
+        assert_eq!(press(&mut panel, KeyCode::Char('r')), ApprovalKey::Changed);
+        assert!(panel.panel().contains("Feedback for the model"));
     }
 
     #[test]

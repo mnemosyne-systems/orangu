@@ -1642,6 +1642,7 @@ async fn run() -> Result<()> {
         // The status line counts this tab's running background subagents.
         orangu::subagent_tasks::show_in_status_line(tools.tasks());
         orangu::tui::context_gauge::show(session.context_gauge());
+        orangu::tui::plan_badge::show(tools.plan_mode());
         // Finished background subagents: each report becomes a turn of the
         // model's own, through the same queue.
         for notification in tools.tasks().take_notifications() {

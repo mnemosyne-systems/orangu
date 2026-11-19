@@ -66,6 +66,7 @@ impl OranguHelper {
                 "/agents".to_string(),
                 "/tasks".to_string(),
                 "/fork".to_string(),
+                "/plan".to_string(),
                 "/cherry_pick".to_string(),
                 "/revert".to_string(),
                 "/commit".to_string(),

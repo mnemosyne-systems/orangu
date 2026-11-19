@@ -70,6 +70,24 @@ impl ToolApproval {
     }
 }
 
+/// What a message sent in plan mode tells the model.
+const PLAN_MODE_NOTE: &str = "[Plan mode: you can read and search but not change anything.      Explore, then call propose_plan with your plan and wait for the user's approval.]";
+
+/// What `propose_plan` returns once the user approves the plan.
+const PLAN_APPROVED: &str = "The user approved the plan. Plan mode is off: implement the plan now.";
+
+/// What `propose_plan` returns when the user keeps planning.
+fn plan_rejection(feedback: Option<&str>) -> String {
+    match feedback.map(str::trim).filter(|feedback| !feedback.is_empty()) {
+        Some(feedback) => format!(
+            "The user did not approve the plan and is still in plan mode. Their feedback:              {feedback}
+Revise the plan and propose it again."
+        ),
+        None => "The user did not approve the plan and is still in plan mode. Ask what to                  change, or revise the plan and propose it again."
+            .to_string(),
+    }
+}
+
 /// How many subagents of one turn run at the same time. Local inference
 /// shares one machine between them, so more would mostly queue.
 pub const MAX_PARALLEL_SUBAGENTS: usize = 4;
@@ -917,9 +935,17 @@ impl ChatSession {
             .1
             .clone()
             .with_id_slot(id_slot);
-        let tool_definitions = tools.definitions();
+        let mut tool_definitions = tools.definitions();
         let checkpoint = self.checkpoint();
-        self.messages.push(ChatMessage::user(user_input));
+        if tools.requires_plan_approval(crate::tools::PROPOSE_PLAN) {
+            self.messages.push(ChatMessage::user(&format!(
+                "{user_input}
+
+{PLAN_MODE_NOTE}"
+            )));
+        } else {
+            self.messages.push(ChatMessage::user(user_input));
+        }
 
         // `mut`: a server that rejects this session's pinned slot gets one
         // more attempt through a client pinned to a slot it does have — see
@@ -973,6 +999,19 @@ impl ChatSession {
                             let tool_call = &tool_calls[index];
                             index += 1;
                             on_tool_call(tool_call);
+                            if tools.requires_plan_approval(&tool_call.function.name) {
+                                let rendered = match on_mcp_approval(tool_call) {
+                                    ToolApproval::Allow => {
+                                        tools.set_plan_mode(false);
+                                        tool_definitions = tools.definitions();
+                                        PLAN_APPROVED.to_string()
+                                    }
+                                    ToolApproval::Deny(reason) => plan_rejection(reason.as_deref()),
+                                };
+                                self.messages
+                                    .push(ChatMessage::tool_result(&tool_call.id, &rendered));
+                                continue;
+                            }
                             let approval = if tools.requires_mcp_approval(&tool_call.function.name)
                             {
                                 on_mcp_approval(tool_call)
