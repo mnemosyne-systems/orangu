@@ -1,0 +1,6 @@
+**
+!out/src/**/*.js
+!media/**
+!package.json
+!README.md
+!LICENSE

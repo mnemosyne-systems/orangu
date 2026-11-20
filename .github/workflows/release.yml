@@ -247,3 +247,40 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.ref_name }}" "$VSIX" --clobber
+
+  vscode:
+    name: VS Code extension
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      # The extension carries the release's version, so VS Code sees a newer
+      # release as newer. Its version is MAJOR.MINOR.PATCH only, so a tag that
+      # is not one keeps the default. The integration tests start VS Code,
+      # which needs a display: xvfb-run gives it one.
+      - name: Test and pack the extension
+        working-directory: contrib/vscode
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          npm ci
+          version="${TAG#v}"
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            npm version --no-git-tag-version --allow-same-version "$version"
+          fi
+          npm run compile
+          npm run test:unit
+          xvfb-run -a npm run test:vscode
+          vsix="orangu-$TAG-vscode.vsix"
+          npm run package -- --out "../../$vsix"
+          echo "VSIX=$vsix" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "$VSIX" --clobber

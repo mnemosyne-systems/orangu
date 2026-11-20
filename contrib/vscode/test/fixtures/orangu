@@ -1,0 +1,3 @@
+#!/bin/sh
+# The stand-in orangu as a binary, for the tests that start it from VS Code.
+exec node "$(dirname "$0")/../../out/test/fixtures/fake-orangu.js" "$@"

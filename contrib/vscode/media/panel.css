@@ -1,0 +1,144 @@
+/* The orangu panel, in the colours and fonts of the VS Code theme. */
+
+html,
+body {
+    height: 100%;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 0;
+    padding: 6px 8px 8px;
+    box-sizing: border-box;
+    color: var(--vscode-foreground);
+    background: var(--vscode-sideBar-background);
+    font-family: var(--vscode-font-family);
+    font-size: var(--vscode-font-size);
+}
+
+#transcript {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+}
+
+#transcript:empty {
+    display: none;
+}
+
+.prompt,
+.answer {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+    border-radius: 4px;
+}
+
+.prompt {
+    background: var(--vscode-textBlockQuote-background);
+    border-left: 3px solid var(--vscode-textLink-foreground);
+}
+
+.answer {
+    font-family: var(--vscode-editor-font-family);
+    font-size: var(--vscode-editor-font-size);
+}
+
+#empty {
+    flex: 1 1 auto;
+    color: var(--vscode-descriptionForeground);
+}
+
+#empty[hidden],
+#attachment[hidden] {
+    display: none;
+}
+
+code {
+    font-family: var(--vscode-editor-font-family);
+}
+
+#attachment {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+}
+
+#label {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--vscode-editor-font-family);
+}
+
+textarea {
+    resize: vertical;
+    min-height: 3em;
+    padding: 4px 6px;
+    color: var(--vscode-input-foreground);
+    background: var(--vscode-input-background);
+    border: 1px solid var(--vscode-input-border, transparent);
+    font-family: inherit;
+    font-size: inherit;
+}
+
+textarea:focus {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
+}
+
+#buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+button {
+    padding: 3px 10px;
+    border: none;
+    border-radius: 2px;
+    color: var(--vscode-button-foreground);
+    background: var(--vscode-button-background);
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+}
+
+button:hover:not(:disabled) {
+    background: var(--vscode-button-hoverBackground);
+}
+
+button.secondary {
+    color: var(--vscode-button-secondaryForeground);
+    background: var(--vscode-button-secondaryBackground);
+}
+
+button.secondary:hover:not(:disabled) {
+    background: var(--vscode-button-secondaryHoverBackground);
+}
+
+button.link {
+    padding: 0;
+    color: inherit;
+    background: none;
+    text-decoration: underline;
+}
+
+button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+#status {
+    min-height: 1.4em;
+    color: var(--vscode-descriptionForeground);
+    overflow-wrap: anywhere;
+}

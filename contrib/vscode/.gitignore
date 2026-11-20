@@ -1,0 +1,6 @@
+node_modules/
+out/
+.vscode-test/
+*.vsix
+# Copied from the repository's root when the extension is packed.
+LICENSE

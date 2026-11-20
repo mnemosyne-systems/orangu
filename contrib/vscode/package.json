@@ -1,0 +1,176 @@
+{
+  "name": "orangu",
+  "displayName": "orangu",
+  "description": "orangu in VS Code: the full terminal interface, a prompt panel, and questions and reviews from the editor",
+  "version": "2.1.0",
+  "publisher": "mnemosyne-systems",
+  "license": "GPL-3.0-or-later",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mnemosyne-systems/orangu.git"
+  },
+  "homepage": "https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/53-ide.md",
+  "bugs": {
+    "url": "https://github.com/mnemosyne-systems/orangu/issues"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages",
+    "Other"
+  ],
+  "keywords": [
+    "orangu",
+    "llm",
+    "code review",
+    "agent"
+  ],
+  "main": "./out/src/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "orangu runs in the workspace folder and reads its orangu.conf, so it is only started in a trusted workspace."
+    },
+    "virtualWorkspaces": false
+  },
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "orangu.open",
+        "title": "Open orangu",
+        "category": "orangu",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "orangu.showPanel",
+        "title": "Show the orangu Panel",
+        "category": "orangu"
+      },
+      {
+        "command": "orangu.askAboutSelection",
+        "title": "Ask orangu About This Selection",
+        "category": "orangu"
+      },
+      {
+        "command": "orangu.reviewFile",
+        "title": "Review This File with orangu",
+        "category": "orangu"
+      },
+      {
+        "command": "orangu.reviewChanges",
+        "title": "Review Changes with orangu",
+        "category": "orangu",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "orangu.stop",
+        "title": "Stop",
+        "category": "orangu",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "orangu.clear",
+        "title": "Clear",
+        "category": "orangu",
+        "icon": "$(clear-all)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "orangu",
+          "title": "orangu",
+          "icon": "media/orangu.svg"
+        }
+      ]
+    },
+    "views": {
+      "orangu": [
+        {
+          "type": "webview",
+          "id": "orangu.panel",
+          "name": "orangu"
+        }
+      ]
+    },
+    "menus": {
+      "editor/context": [
+        {
+          "command": "orangu.askAboutSelection",
+          "when": "isWorkspaceTrusted && (resourceScheme == file || resourceScheme == vscode-remote)",
+          "group": "orangu@1"
+        },
+        {
+          "command": "orangu.reviewFile",
+          "when": "isWorkspaceTrusted && (resourceScheme == file || resourceScheme == vscode-remote)",
+          "group": "orangu@2"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "orangu.open",
+          "when": "view == orangu.panel",
+          "group": "navigation@1"
+        },
+        {
+          "command": "orangu.reviewChanges",
+          "when": "view == orangu.panel",
+          "group": "navigation@2"
+        },
+        {
+          "command": "orangu.clear",
+          "when": "view == orangu.panel",
+          "group": "navigation@3"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "orangu.askAboutSelection",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "orangu.reviewFile",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "orangu.stop",
+          "when": "orangu.running"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "orangu",
+      "properties": {
+        "orangu.path": {
+          "type": "string",
+          "default": "",
+          "scope": "machine-overridable",
+          "markdownDescription": "The path of the `orangu` binary, or the folder it is in. Empty means the first `orangu` on the `PATH`, then the one in `~/.cargo/bin`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test:unit": "node --test \"out/test/unit/*.test.js\"",
+    "test:vscode": "node out/test/integration/runTest.js",
+    "test": "npm run compile && npm run test:unit && npm run test:vscode",
+    "vscode:prepublish": "npm run compile",
+    "package": "node -e \"require('fs').copyFileSync('../../LICENSE', 'LICENSE')\" && vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.0",
+    "@types/vscode": "~1.95.0",
+    "@vscode/test-electron": "^2.4.1",
+    "@vscode/vsce": "^3.2.1",
+    "typescript": "^5.6.3"
+  }
+}
