@@ -201,6 +201,25 @@ impl CronSchedule {
     }
 }
 
+/// Split a crontab line into its five whitespace-separated time fields and the
+/// command remainder, treating runs of whitespace between fields as a single
+/// separator while preserving internal whitespace inside the command.
+fn split_crontab_line(line: &str) -> Option<([&str; 5], &str)> {
+    let mut fields = [""; 5];
+    let mut rest = line;
+    for slot in &mut fields {
+        rest = rest.trim_start();
+        let end = rest.find(char::is_whitespace)?;
+        *slot = &rest[..end];
+        rest = &rest[end..];
+    }
+    let command = rest.trim();
+    if command.is_empty() {
+        return None;
+    }
+    Some((fields, command))
+}
+
 /// Parse the whole schedule file: one job per line, `#` comments and blank
 /// lines skipped, unparseable lines collected rather than dropped.
 pub(crate) fn parse_crontab(content: &str) -> Crontab {
@@ -210,17 +229,14 @@ pub(crate) fn parse_crontab(content: &str) -> Crontab {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        // The command starts at the sixth whitespace-separated token.
-        let mut fields = trimmed.splitn(6, char::is_whitespace);
-        let expression: Vec<&str> = (&mut fields).take(5).collect();
-        let command = fields.next().map(str::trim).unwrap_or_default();
-        if expression.len() < 5 || command.is_empty() {
+        // The command starts after the fifth whitespace-separated time field.
+        let Some((expression, command)) = split_crontab_line(trimmed) else {
             crontab.invalid.push(InvalidLine {
                 line: trimmed.to_string(),
                 error: "expected 5 time fields and a command".to_string(),
             });
             continue;
-        }
+        };
         // `&&` chains the commands: each runs after the previous, and a
         // failure drops the rest of the chain.
         let commands: Vec<String> = command
@@ -497,6 +513,72 @@ not a cron line
         assert!(crontab.jobs.is_empty());
         assert_eq!(crontab.invalid.len(), 1);
         assert_eq!(crontab.invalid[0].error, "empty command in && chain");
+    }
+
+    #[test]
+    fn parse_crontab_handles_multiple_spaces_tabs_and_mixed_whitespace() {
+        let content = concat!(
+            "0  * * * * /export pr\n",
+            "30 6 * * * /statistics\n",
+            "0\t\t6\t*\t*\t1-5\t/statistics\n",
+            "0 \t 6   *   *   *   auto review immediate && export auto review\n",
+            "  \t 15  8  *  *  *  /diff\n",
+        );
+        let crontab = parse_crontab(content);
+        assert!(crontab.invalid.is_empty(), "{:?}", crontab.invalid);
+        assert_eq!(crontab.jobs.len(), 5);
+
+        let j0 = &crontab.jobs[0];
+        assert_eq!(j0.schedule, parse_cron("0 * * * *").unwrap());
+        assert_eq!(j0.commands, vec!["/export pr"]);
+
+        let j1 = &crontab.jobs[1];
+        assert_eq!(j1.schedule, parse_cron("30 6 * * *").unwrap());
+        assert_eq!(j1.commands, vec!["/statistics"]);
+
+        let j2 = &crontab.jobs[2];
+        assert_eq!(j2.schedule, parse_cron("0 6 * * 1-5").unwrap());
+        assert_eq!(j2.commands, vec!["/statistics"]);
+
+        let j3 = &crontab.jobs[3];
+        let chain = vec!["auto review immediate", "export auto review"];
+        assert_eq!(j3.schedule, parse_cron("0 6 * * *").unwrap());
+        assert_eq!(j3.commands, chain);
+
+        let j4 = &crontab.jobs[4];
+        assert_eq!(j4.schedule, parse_cron("15 8 * * *").unwrap());
+        assert_eq!(j4.commands, vec!["/diff"]);
+    }
+
+    #[test]
+    fn parse_crontab_preserves_internal_whitespace_in_commands() {
+        let crontab = parse_crontab(r#"0  6 * * * echo "hello   world""#);
+        assert!(crontab.invalid.is_empty(), "{:?}", crontab.invalid);
+        assert_eq!(crontab.jobs.len(), 1);
+        assert_eq!(crontab.jobs[0].commands, vec![r#"echo "hello   world""#]);
+
+        let crontab = parse_crontab("0\t6\t*\t*\t*   /note   two   gaps  ");
+        assert!(crontab.invalid.is_empty(), "{:?}", crontab.invalid);
+        assert_eq!(crontab.jobs.len(), 1);
+        assert_eq!(crontab.jobs[0].commands, vec!["/note   two   gaps"]);
+    }
+
+    #[test]
+    fn parse_crontab_rejects_missing_fields_and_missing_commands() {
+        let content = concat!(
+            "0  6 * * *\n",
+            "0\t6\t*\t*\t*   \n",
+            "0  6  *  *\n",
+            "61  6  *  *  *  /diff\n",
+        );
+        let crontab = parse_crontab(content);
+        let expected = "expected 5 time fields and a command";
+        assert!(crontab.jobs.is_empty());
+        assert_eq!(crontab.invalid.len(), 4);
+        assert_eq!(crontab.invalid[0].error, expected);
+        assert_eq!(crontab.invalid[1].error, expected);
+        assert_eq!(crontab.invalid[2].error, expected);
+        assert!(crontab.invalid[3].error.contains("outside 0-59"));
     }
 
     #[test]
