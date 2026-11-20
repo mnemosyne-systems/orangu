@@ -719,6 +719,7 @@ fn spec_tools(spec: &SubagentSpec, parent: &ToolExecutor) -> (ToolExecutor, Stri
         ToolExecutor::new_for_subagent(workspace)
             .with_subagent_mcp(parent.mcp())
             .with_checkpoints(parent.checkpoints().clone())
+            .with_diagnostics_of(parent)
     } else {
         ToolExecutor::new_read_only(workspace)
     };
@@ -742,7 +743,9 @@ async fn custom_tools(
     let workspace = parent.workspace();
     let mut prompt = String::new();
     let root = worktree.map_or_else(|| workspace.to_path_buf(), |worktree| worktree.workspace());
-    let mut executor = ToolExecutor::new_for_subagent(&root).with_plan_mode_of(parent);
+    let mut executor = ToolExecutor::new_for_subagent(&root)
+        .with_plan_mode_of(parent)
+        .with_diagnostics_of(parent);
     if worktree.is_none() {
         executor = executor.with_checkpoints(parent.checkpoints().clone());
     }
@@ -798,7 +801,8 @@ fn fork_tools(parent: &ToolExecutor) -> ToolExecutor {
     let tools = ToolExecutor::new_for_subagent(parent.workspace())
         .with_subagent_mcp(parent.mcp())
         .with_checkpoints(parent.checkpoints().clone())
-        .with_plan_mode_of(parent);
+        .with_plan_mode_of(parent)
+        .with_diagnostics_of(parent);
     attach_skills(tools, &[]).0
 }
 

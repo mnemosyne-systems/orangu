@@ -120,6 +120,8 @@ pub struct ClientAppConfiguration {
     pub web_search: Vec<crate::web_search::Engine>,
     /// `[orangu].ssh`: whether `use_ssh` is offered, and who approves hosts.
     pub ssh: SshMode,
+    /// `[orangu].diagnostics`, `diagnostics_command`, `diagnostics_timeout`.
+    pub diagnostics: crate::diagnostics::DiagnosticsConfig,
 }
 
 /// A configured Model Context Protocol server that is already running and
@@ -431,6 +433,20 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
     let theme = client.get("theme").cloned().unwrap_or_else(default_theme);
     let web_search = crate::web_search::parse_engines(client.get("web_search").map(String::as_str))
         .map_err(|err| anyhow!("invalid value for [{CLIENT_SECTION}].web_search: {err}"))?;
+    let diagnostics = crate::diagnostics::DiagnosticsConfig {
+        enabled: client
+            .get("diagnostics")
+            .is_none_or(|value| parse_feedback_bool(value)),
+        command: client
+            .get("diagnostics_command")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        timeout_seconds: parse_client_field(
+            &client,
+            "diagnostics_timeout",
+            crate::diagnostics::default_timeout_seconds,
+        )?,
+    };
     // `[orangu].model` is the general default model id; a server section's own
     // `model` takes precedence over it.
     let default_model = client
@@ -499,6 +515,7 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         theme,
         web_search,
         ssh,
+        diagnostics,
     })
 }
 

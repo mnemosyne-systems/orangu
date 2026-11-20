@@ -174,6 +174,8 @@ pub struct ToolExecutor {
     /// executor is in use: the next `create_file` reads it, and nothing has
     /// to be rebuilt for a choice made mid-conversation to take effect.
     pub licence: Arc<Mutex<crate::license::Choice>>,
+    /// Compiler checks after edits; `None` when `[orangu].diagnostics` is off.
+    diagnostics: Option<Arc<crate::diagnostics::Diagnostics>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -317,6 +319,7 @@ impl ToolExecutor {
             background_default: false,
             startable_agents: None,
             licence: Arc::new(Mutex::new(crate::license::Choice::default())),
+            diagnostics: None,
         }
     }
 
@@ -996,6 +999,31 @@ impl ToolExecutor {
         self
     }
 
+    /// Runs the workspace's checker after rounds that edit files.
+    pub fn with_diagnostics(mut self, config: crate::diagnostics::DiagnosticsConfig) -> Self {
+        self.diagnostics = config.enabled.then(|| {
+            Arc::new(crate::diagnostics::Diagnostics::new(
+                config,
+                &self.workspace,
+            ))
+        });
+        self
+    }
+
+    /// A subagent's own diagnostics, configured as `parent`'s are.
+    pub fn with_diagnostics_of(self, parent: &ToolExecutor) -> Self {
+        match &parent.diagnostics {
+            Some(diagnostics) => self.with_diagnostics(diagnostics.config().clone()),
+            None => self,
+        }
+    }
+
+    /// The checker's report on the files edited since the last one, if any
+    /// were (see [`crate::diagnostics`]).
+    pub async fn check_edits(&self) -> Option<String> {
+        self.diagnostics.as_ref()?.check_edits().await
+    }
+
     /// The SearXNG instance web searches go to, or `None` for no web search.
     pub fn with_web_search(mut self, engines: Vec<crate::web_search::Engine>) -> Self {
         self.web_engines = Arc::new(engines);
@@ -1369,6 +1397,11 @@ impl ToolExecutor {
             && let Ok(mut counts) = self.tool_counts.lock()
         {
             *counts.entry(name.to_string()).or_insert(0) += 1;
+        }
+        if result.is_ok()
+            && let Some(diagnostics) = &self.diagnostics
+        {
+            diagnostics.record(name, arguments);
         }
         if let Ok(mut d) = self.tool_duration.lock() {
             *d += start.elapsed();

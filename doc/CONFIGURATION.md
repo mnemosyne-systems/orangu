@@ -62,6 +62,14 @@ theme = classic
 | `auto_downsample_lines` | No | Line count above which an unbounded file read returns signatures instead of the whole file, with a note saying so. Defaults to `300`; `0` reads every file in full. Applies only while `compression` is on, and never to a read that asked for a `mode` or a line range |
 | `diff_file_cap` | No | Maximum number of files kept when a `git diff` is compressed. Defaults to `20` |
 
+#### Diagnostics
+
+| Key | Required | Description |
+| :-- | :-- | :-- |
+| `diagnostics` | No | After a round of tool calls that edited files, run the workspace's checker and show its errors to the model with that round's results. Defaults to `on`. Options: `on`, `true`, `1`, `off`, `false`, `0`. See **Diagnostics after edits** in the Configuration chapter of the manual |
+| `diagnostics_command` | No | Command to run instead of the detected checkers, through the shell, in the workspace. Its output is read as `file:line[:column]: message` lines. Unset by default |
+| `diagnostics_timeout` | No | Seconds a check may take before it is stopped and the round reported as unchecked. Defaults to `120` |
+
 #### Prompt
 
 | Key | Required | Description |

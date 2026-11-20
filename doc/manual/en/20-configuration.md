@@ -158,6 +158,32 @@ theme = classic
 | `diff_file_cap` | No | Maximum number of files kept when a `git diff` is compressed. Defaults to `20`. See the Compression chapter |
 | `world_state_max_bytes` | No | Ceiling on the `world_state_changes` fragment prepended to a turn when the working tree has changed, in bytes. Defaults to `8192`; `0` disables the cap. See [Workspace change budget](#workspace-change-budget) |
 | `semantic_budget_tokens` | No | Token budget for the code chunks `/search` injects into a turn. Hits are added in rank order until the next one would exceed it, so the cap bounds what semantic search costs in context rather than the number of results. Defaults to `16384`; the top hit is always kept |
+| `diagnostics` | No | After a round of tool calls that edited files, run the workspace's checker and show its errors to the model with that round's results. Defaults to `on`. Options: `on`, `true`, `1`, `off`, `false`, `0`. See [Diagnostics after edits](#diagnostics-after-edits) |
+| `diagnostics_command` | No | Command to run instead of the detected checkers, through the shell, in the workspace. Its output is read as `file:line[:column]: message` lines. Unset by default |
+| `diagnostics_timeout` | No | Seconds a check may take before it is stopped and the round reported as unchecked. Defaults to `120` |
+
+### Diagnostics after edits
+
+When a round of tool calls changes files, orangu runs the workspace's own
+checker once and adds its errors to the last tool result of that round, so the
+model sees what it broke before it moves on. Only checkers whose files were
+edited run:
+
+| Project | Edited files | Checker |
+| :-- | :-- | :-- |
+| `Cargo.toml` | `.rs`, `Cargo.toml` | `cargo check --all-targets` |
+| `go.mod` | `.go`, `go.mod` | `go vet ./...` |
+| `tsconfig.json` with a local `node_modules/.bin/tsc` | `.ts`, `.tsx`, `.mts`, `.cts` | `tsc --noEmit` |
+| any | `.py` | a syntax check of the edited files, without writing bytecode |
+
+Only errors are reported, errors in the edited files first, at most ten per
+check. When the errors are the same as after the previous round, a one-line
+note says so instead of repeating them. A checker that is not installed is
+skipped. Set `diagnostics_command` to use your own checker (for example
+`make check`), or `diagnostics = off` to turn the feature off.
+
+The first `cargo check` of a large workspace can take longer than
+`diagnostics_timeout`; later rounds are incremental.
 
 ### Workspace change budget
 

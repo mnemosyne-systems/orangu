@@ -1039,6 +1039,13 @@ impl ChatSession {
                             self.messages
                                 .push(ChatMessage::tool_result(&tool_call.id, &rendered));
                         }
+                        if let Some(report) = tools.check_edits().await
+                            && let Some(last) = self.messages.last_mut()
+                            && last.role == "tool"
+                        {
+                            last.content.push_str("\n\n");
+                            last.content.push_str(&report);
+                        }
                         on_tool_running(false);
                     }
                 },
@@ -1884,6 +1891,74 @@ data: [DONE]
             parallel_run(&tools, &mixed, 0),
             Some((1, BatchKind::ReadsOnly))
         );
+    }
+
+    /// A round that edits a file ends with one diagnostics report, on the
+    /// round's last result; a round without edits gets none.
+    #[tokio::test]
+    async fn a_round_that_edits_files_ends_with_a_diagnostics_report() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = crate::tools::ToolExecutor::new(workspace.path()).with_diagnostics(
+            crate::diagnostics::DiagnosticsConfig {
+                command: Some("echo 'notes.txt:1:1: error: checked'".to_string()),
+                ..Default::default()
+            },
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let server = serve_chat_responses(
+            listener,
+            vec![
+                r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call0","type":"function","function":{"name":"create_file","arguments":"{\"path\":\"notes.txt\",\"content\":\"hi\"}"}},{"index":1,"id":"call1","type":"function","function":{"name":"list_directory","arguments":"{}"}}]},"finish_reason":null}]}
+
+data: [DONE]
+
+"#
+                .to_string(),
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call2\",\"type\":\"function\",\"function\":{\"name\":\"list_directory\",\"arguments\":\"{}\"}}]},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n".to_string(),
+                crate::test_support::text_stream("done"),
+            ],
+        );
+
+        let mut session = ChatSession::new("system");
+        let answer = session
+            .prompt(
+                "write notes",
+                &test_profile(&endpoint),
+                &tools,
+                |_| {},
+                |_| {},
+                |_| {},
+                |_| {},
+                |_| crate::session::ToolApproval::Deny(None),
+            )
+            .await
+            .expect("turn completes");
+        assert_eq!(answer, "done");
+
+        let reported: Vec<(&str, bool)> = session
+            .messages()
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| {
+                (
+                    m.tool_call_id.as_deref().unwrap(),
+                    m.content.contains("[diagnostics]"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reported,
+            [("call0", false), ("call1", true), ("call2", false)]
+        );
+        let last = &session
+            .messages()
+            .iter()
+            .rfind(|m| m.tool_call_id.as_deref() == Some("call1"))
+            .unwrap()
+            .content;
+        assert!(last.contains("notes.txt:1:1: error: checked"), "{last}");
+        assert_eq!(server.join().expect("server").len(), 3);
     }
 
     /// Running out of rounds is a typed error. By default the turn is rolled
