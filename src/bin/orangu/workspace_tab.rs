@@ -46,6 +46,8 @@ pub(crate) struct TabServerConfig<'a> {
     pub(crate) prime: bool,
     /// `[orangu].web_search`: the engines behind `research_web`.
     pub(crate) web_search: &'a [orangu::web_search::Engine],
+    /// `[orangu].diagnostics`: the checker run after edits.
+    pub(crate) diagnostics: &'a orangu::diagnostics::DiagnosticsConfig,
     /// `[orangu].subagent_depth`: how deep subagents may nest.
     pub(crate) subagent_depth: usize,
     /// `[orangu].subagent_background`: subagents run in the background by
@@ -157,6 +159,7 @@ impl WorkspaceTab {
             slots,
             prime,
             web_search,
+            diagnostics,
             subagent_depth,
             subagent_background,
             ssh,
@@ -219,6 +222,7 @@ impl WorkspaceTab {
         .with_mcp(mcp.clone())
         .with_workspace_agents()
         .with_web_search(web_search.to_vec())
+        .with_diagnostics(diagnostics.clone())
         .with_ssh(orangu::ssh::SshSessions::for_mode(
             ssh,
             Some(crate::ssh_prompt::prompter()),

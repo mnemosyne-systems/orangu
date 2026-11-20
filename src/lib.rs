@@ -22,6 +22,7 @@ pub mod compression;
 pub mod compression_cache;
 pub mod config;
 pub mod context;
+pub mod diagnostics;
 pub mod diff;
 pub mod duplicates;
 pub mod embeddings;
