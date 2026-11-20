@@ -70,6 +70,12 @@ orangu -p "show git status"       # the natural-language form of a command
 orangu -p "/code-review auth"     # a skill, whose expansion goes to the model
 ```
 
+`-r <UUID>` together with `-p` continues a stored session: the prompt is sent with that session's conversation, and the conversation is saved back once it is answered, so the next `-r` run (or the terminal interface) picks up where it left off. Like `-r` on its own, it runs in the session's workspace unless `--workspace` names another. `-r` without a UUID opens a picker, so with `-p` it is an error.
+
+```text
+orangu -r 3f2a…c91 -p "Now fix the failing test"
+```
+
 A command is handled locally and never reaches the server, so it works while the model is unavailable. Command output goes to stdout and a failed command exits non-zero, which makes `-p` usable from scripts and from `~/.orangu/schedule`. For a prompt, the answer is streamed to stdout and the timings (total, time to first token, and the server's prompt/prefill/decode figures when it reports them) go to stderr, so `orangu -p "Hello"` tells a slow server from a slow prompt.
 
 Two groups of commands are refused rather than run, with a message saying which group they fall in:

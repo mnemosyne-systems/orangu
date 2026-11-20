@@ -512,6 +512,27 @@ async fn run() -> Result<()> {
     // a lasting change to someone else's terminal, and output where `-q`
     // promises none. `-t` is for the interface, so it stays with the interface.
     if let Some(prompt) = args.prompt.take() {
+        // `-r <UUID>` continues a stored session, in the workspace it was
+        // started in unless --workspace names one, as the interface does.
+        let resume = match args.resume.take() {
+            None => None,
+            Some(None) => return Err(anyhow!("-p resumes a session by UUID only: use -r <UUID>")),
+            Some(Some(uuid)) => {
+                // The answer is written back into this directory, so it must
+                // name a session, never a path.
+                Uuid::parse_str(&uuid).map_err(|_| anyhow!("'{uuid}' is not a session UUID"))?;
+                let dir = session_dir_path(&uuid)?;
+                if !dir.is_dir() {
+                    return Err(anyhow!("no stored session {uuid}"));
+                }
+                if args.workspace.is_none()
+                    && let Some(metadata) = load_session_metadata(&dir.join("metadata"))?
+                {
+                    args.workspace = Some(PathBuf::from(metadata.workspace));
+                }
+                Some(dir)
+            }
+        };
         return oneshot::run_prompt(
             &prompt,
             oneshot::OneshotContext {
@@ -521,6 +542,7 @@ async fn run() -> Result<()> {
                 role: None,
                 quiet: args.quiet,
             },
+            resume,
         )
         .await;
     }
