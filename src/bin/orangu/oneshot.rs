@@ -150,9 +150,30 @@ impl Console {
     }
 }
 
-pub(crate) async fn run_prompt(prompt: &str, context: OneshotContext) -> Result<()> {
+/// `resume` is a stored session's directory (`-r <UUID>`): the prompt continues
+/// that conversation, and the conversation is saved back when it is answered.
+pub(crate) async fn run_prompt(
+    prompt: &str,
+    context: OneshotContext,
+    resume: Option<PathBuf>,
+) -> Result<()> {
     let mut session = OneshotSession::new(context).await?;
-    session.run(prompt).await
+    let Some(dir) = resume else {
+        return session.run(prompt).await;
+    };
+    let messages_path = dir.join("messages");
+    let stored = crate::session_store::load_session_messages(&messages_path)?;
+    if !stored.is_empty() {
+        session.session.restore(stored);
+    }
+    session.run(prompt).await?;
+    crate::session_store::save_session_messages(&messages_path, session.session.messages())?;
+    let metadata_path = dir.join("metadata");
+    if let Some(mut metadata) = crate::session_store::load_session_metadata(&metadata_path)? {
+        metadata.last_updated_at = crate::session_store::current_unix_timestamp();
+        crate::session_store::save_session_metadata(&metadata_path, &metadata)?;
+    }
+    Ok(())
 }
 
 /// `--plain`: the conversation as plain lines, one prompt after another,
