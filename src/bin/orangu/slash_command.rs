@@ -84,6 +84,7 @@ pub enum SlashCommand {
     Statistics,
     Schedule,
     Build,
+    Test,
     Shell,
     Skills,
     Agents,
@@ -144,7 +145,9 @@ impl SlashCommand {
             SlashCommand::Branch => "Manages git branches",
             SlashCommand::Restore => "Restores working tree files",
             SlashCommand::AutoReview => "Runs an LLM-driven branch review",
-            SlashCommand::CreatePatch => "Fixes the latest review or merge conflicts",
+            SlashCommand::CreatePatch => {
+                "Fixes the latest review, merge conflicts or failing tests"
+            }
             SlashCommand::Duplicates => "Finds duplicated Rust/C functions",
             SlashCommand::Export => "Writes session or review to a PDF",
             SlashCommand::CreateFile => {
@@ -181,6 +184,7 @@ impl SlashCommand {
             }
             SlashCommand::Schedule => "Lists the cron-style scheduled jobs from ~/.orangu/schedule",
             SlashCommand::Build => "Builds the workspace project",
+            SlashCommand::Test => "Runs the workspace tests",
             SlashCommand::Shell => "Executes a shell command",
             SlashCommand::Skills => "Lists the discovered Agent Skills",
             SlashCommand::Agents => "Lists the custom subagents, optionally matching search words",

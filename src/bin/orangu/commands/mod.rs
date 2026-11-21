@@ -124,6 +124,8 @@ pub enum AfterTurn {
     /// Finish the in-progress rebase, merge, cherry-pick, or revert with its
     /// `--continue` — once Git reports no unmerged paths.
     FinishGitOperation,
+    /// Report which test files a `/create_patch tests` turn changed.
+    ReportTestEdits,
 }
 
 pub enum CommandOutcome {
@@ -594,6 +596,8 @@ pub enum LocalCommand<'a> {
     /// operation it also resolves every unmerged path, with or without a
     /// stored report.
     CreatePatch,
+    /// `/create_patch tests`: fix the failures of the last `/test` run.
+    CreatePatchTests,
     /// `/duplicates [<threshold>]`: scan the workspace for duplicated functions
     /// (across every language in [`orangu::duplicates::LANGUAGES`]) and print a
     /// similarity report. The optional argument overrides
@@ -685,6 +689,9 @@ pub enum LocalCommand<'a> {
     /// optionally narrowed to one backend-native target (a Makefile rule, a
     /// cargo binary, a Maven goal, ...). The profile defaults to `release`.
     Build(crate::build::BuildRequest),
+    /// `/test [<target>]`: run the project's tests with the runner matching
+    /// its build system, recording a failure for `/create_patch tests`.
+    Test(crate::test_run::TestRequest),
     /// `/shell <command>`: run a shell command in the workspace, streaming its
     /// output. `None` is a usage error (the command line is required).
     Shell(Option<Cow<'a, str>>),

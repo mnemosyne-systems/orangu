@@ -84,6 +84,9 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "build",
     "build project",
     "run build",
+    // --- test ---
+    "run tests",
+    "run the tests",
     // --- diff ---
     "diff",
     "show diff",
@@ -100,6 +103,7 @@ pub const NATURAL_LANGUAGE_BINDINGS: &[&str] = &[
     "auto review",
     // --- create patch ---
     "create patch",
+    "fix failing tests",
     "fix review findings",
     // --- export ---
     "export",
@@ -471,6 +475,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     if matches_ci(input, &["build", "build project", "run build"]) {
         return Some(LocalCommand::Build(crate::build::BuildRequest::default()));
     }
+    if matches_ci(input, &["run tests", "run the tests"]) {
+        return Some(LocalCommand::Test(crate::test_run::TestRequest::default()));
+    }
     if matches_ci(input, &["diff", "show diff", "git diff"]) {
         return Some(LocalCommand::Diff(None));
     }
@@ -505,6 +512,9 @@ pub fn parse_natural_language_command(input: &str) -> Option<LocalCommand<'_>> {
     }
     if matches_ci(input, &["create patch", "fix review findings"]) {
         return Some(LocalCommand::CreatePatch);
+    }
+    if matches_ci(input, &["fix failing tests"]) {
+        return Some(LocalCommand::CreatePatchTests);
     }
     // Checked before the more specific buffers: "export console" / "export
     // review" / "export auto review" select a buffer, while a bare "export"
