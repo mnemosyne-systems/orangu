@@ -47,6 +47,7 @@ mod slash_command;
 mod ssh_prompt;
 mod stats;
 mod terminal;
+mod test_run;
 mod wait;
 mod workflow;
 mod workspace_tab;

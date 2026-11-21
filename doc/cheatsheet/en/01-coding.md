@@ -27,6 +27,7 @@ form (`commit "..."`, `push`) works just as well.
 | `/infill <file>:<line>[:<column>]` | What the model would write at that place in the file; changes nothing. |
 | `/duplicates` | Structurally similar functions across 20+ languages, entirely local. |
 | `/build` `/shell cargo test` | Build with the detected toolchain; run anything inside the workspace. |
+| `/test` `/create_patch tests` | Run the matching test runner; have the model fix the failures, then `/test` again. |
 | `AGENTS.md` `SKILL.md` | Workspace memory and reusable skills, merged into the model's context. |
 
 ## Check and commit

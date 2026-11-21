@@ -1005,9 +1005,13 @@ pub(crate) fn create_patch_outcome(
     let report = latest_review_report(reports);
 
     if report.is_none() && conflicts.is_empty() {
+        if crate::test_run::load_failure(workspace).is_some() {
+            return create_test_patch_outcome(workspace);
+        }
         return CommandOutcome::OutputError(
-            "No review report or unresolved merge conflict is available. Run /review or \
-             /auto_review first, or use /create_patch while Git has unmerged paths."
+            "No review report, unresolved merge conflict or failing /test run is available. \
+             Run /review or /auto_review first, run /test, or use /create_patch while Git has \
+             unmerged paths."
                 .to_string(),
         );
     }
@@ -1031,6 +1035,33 @@ pub(crate) fn create_patch_outcome(
     }
 }
 
+/// `/create_patch tests`: a fix round for the last failing `/test` run.
+pub(crate) fn create_test_patch_outcome(workspace: &Path) -> CommandOutcome {
+    if let Some(repo_root) = discover_git_root(workspace) {
+        match git_unmerged_paths(&repo_root) {
+            Ok(paths) if !paths.is_empty() => {
+                return CommandOutcome::OutputError(
+                    "Git has unmerged paths; resolve them with /create_patch first, then run \
+                     /test again."
+                        .to_string(),
+                );
+            }
+            Ok(_) => {}
+            Err(err) => return local_command_error(err),
+        }
+    }
+    match crate::test_run::begin_patch_round(workspace) {
+        Ok(Some(failure)) => CommandOutcome::ModelPromptThen {
+            prompt: crate::test_run::patch_prompt(&failure),
+            then: AfterTurn::ReportTestEdits,
+        },
+        Ok(None) => CommandOutcome::OutputError(
+            "No failing /test run is recorded for this workspace. Run /test first.".to_string(),
+        ),
+        Err(err) => local_command_error(err),
+    }
+}
+
 /// Run the step a [`CommandOutcome::ModelPromptThen`] asked for, once the
 /// model's turn is over, given what the model answered. Returns the text to
 /// show for it.
@@ -1043,6 +1074,7 @@ pub(crate) fn run_after_turn(step: AfterTurn, workspace: &Path, answer: &str) ->
             report.push(finish_git_operation(workspace)?);
             Ok(report.join("\n"))
         }
+        AfterTurn::ReportTestEdits => Ok(crate::test_run::after_patch_report(workspace)),
     }
 }
 
@@ -2100,6 +2132,7 @@ pub(crate) fn handle_command(
             review_reports,
             tools.compression_store.as_ref(),
         )),
+        LocalCommand::CreatePatchTests => Ok(create_test_patch_outcome(workspace)),
         LocalCommand::Duplicates(threshold) => Ok(CommandOutcome::Duplicates(
             threshold.unwrap_or(orangu::duplicates::DEFAULT_THRESHOLD),
         )),
@@ -2796,6 +2829,15 @@ pub(crate) fn handle_command(
                 None,
             ))
         }
+        LocalCommand::Test(request) => {
+            let ws = workspace.to_path_buf();
+            Ok(CommandOutcome::Streaming(
+                Box::new(move |sink| {
+                    crate::test_run::test_output(&ws, &request, compile_workers, &sink)
+                }),
+                None,
+            ))
+        }
         LocalCommand::Shell(None) => Ok(CommandOutcome::OutputError(
             "Usage: /shell <command>".to_string(),
         )),
@@ -3483,7 +3525,7 @@ mod tests {
         ) {
             CommandOutcome::OutputError(message) => {
                 assert!(
-                    message.contains("Run /review or /auto_review first"),
+                    message.contains("Run /review or /auto_review first, run /test"),
                     "{message}"
                 );
             }

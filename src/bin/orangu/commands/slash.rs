@@ -78,6 +78,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/open_file" => Some(LocalCommand::OpenFile("")),
         "/show_file" => Some(LocalCommand::ShowFile(Cow::Borrowed(""))),
         "/build" => Some(LocalCommand::Build(crate::build::BuildRequest::default())),
+        "/test" => Some(LocalCommand::Test(crate::test_run::TestRequest::default())),
         "/shell" => Some(LocalCommand::Shell(None)),
         "/create_file" => Some(LocalCommand::CreateFile(None)),
         "/create_directory" => Some(LocalCommand::CreateDirectory(None)),
@@ -316,6 +317,13 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
             }
             if let Some(args) = input.strip_prefix("/build ") {
                 return crate::build::BuildRequest::parse(args).map(LocalCommand::Build);
+            }
+            if let Some(args) = input.strip_prefix("/test ") {
+                return crate::test_run::TestRequest::parse(args).map(LocalCommand::Test);
+            }
+            if let Some(args) = input.strip_prefix("/create_patch ") {
+                return matches!(args.trim(), "tests" | "test")
+                    .then_some(LocalCommand::CreatePatchTests);
             }
             if let Some(args) = input.strip_prefix("/shell ") {
                 let command = args.trim();

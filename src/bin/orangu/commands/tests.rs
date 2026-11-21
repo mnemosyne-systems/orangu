@@ -1228,6 +1228,38 @@ fn parses_create_patch_commands() {
             "expected {input:?} to parse as CreatePatch"
         );
     }
+    for input in [
+        "/create_patch tests",
+        "/create_patch test",
+        "/create_patch  tests ",
+        "fix failing tests",
+    ] {
+        assert!(
+            matches!(
+                parse_local_command(input),
+                Some(LocalCommand::CreatePatchTests)
+            ),
+            "expected {input:?} to parse as CreatePatchTests"
+        );
+    }
+    assert!(parse_local_command("/create_patch review").is_none());
+}
+
+#[test]
+fn parses_test_commands() {
+    let test_of = |input: &str| match parse_local_command(input) {
+        Some(LocalCommand::Test(request)) => Some(request),
+        _ => None,
+    };
+    for input in ["/test", "/test ", "run tests", "Run The Tests"] {
+        let request = test_of(input).unwrap_or_else(|| panic!("no test for {input:?}"));
+        assert_eq!(request.target, None, "for {input:?}");
+    }
+    assert_eq!(
+        test_of("/test  parser ").unwrap().target.as_deref(),
+        Some("parser")
+    );
+    assert!(parse_local_command("/test a b").is_none());
 }
 
 #[test]
