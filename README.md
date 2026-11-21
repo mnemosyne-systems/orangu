@@ -21,7 +21,7 @@ Every layer communicates over OpenAI-compatible APIs.
 - **Model Context Protocol (MCP)** - Seamless integration with Streamable HTTP MCP servers for extensible tooling and system integration.
 - **Text, Image, Video & Speech Generation** - Native serving of chat, completion, embedding, text-to-image models (`Qwen-Image` via `/v1/images/generations`), text-to-video with sound (`LTX-2.5` via `/v1/videos`), and text-to-speech (`Qwen3-TTS` via `/v1/audio/speech`).
 - **Offline Knowledge Graph & Search** - Incremental Tree-sitter symbol graphs (`/graph`) and semantic code retrieval (`/search`) powered by local embeddings.
-- **Built-in Build & Git Automation** - Full Git loop directly inside the prompt, plus `/build` detecting Cargo, CMake, Make, Go, Maven, and Python.
+- **Built-in Build & Git Automation** - Full Git loop directly inside the prompt, plus `/build` detecting Cargo, CMake, Make, Go, Maven, and Python, and `/test` running the matching test runner with a `/create_patch tests` fix loop.
 
 ---
 

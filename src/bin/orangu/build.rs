@@ -153,7 +153,7 @@ pub fn makefile_path(workspace: &Path) -> Option<std::path::PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn make_cmd(program: &str, args: &[&str], cwd: &Path) -> Command {
+pub(crate) fn make_cmd(program: &str, args: &[&str], cwd: &Path) -> Command {
     let mut cmd = Command::new(program);
     cmd.args(args);
     cmd.current_dir(cwd);
@@ -177,13 +177,13 @@ pub(crate) fn stream_pipe<R: Read>(pipe: R, sink: &BuildSink) {
     }
 }
 
-struct BuildSteps<'a> {
+pub(crate) struct BuildSteps<'a> {
     sink: &'a BuildSink,
     first: bool,
 }
 
 impl<'a> BuildSteps<'a> {
-    fn new(sink: &'a BuildSink) -> Self {
+    pub(crate) fn new(sink: &'a BuildSink) -> Self {
         Self { sink, first: true }
     }
 
@@ -191,7 +191,17 @@ impl<'a> BuildSteps<'a> {
         let _ = self.sink.send(line.into());
     }
 
-    fn run(&mut self, label: &str, mut command: Command) -> Result<()> {
+    fn run(&mut self, label: &str, command: Command) -> Result<()> {
+        if self.try_run(label, command)? {
+            Ok(())
+        } else {
+            Err(anyhow!("{label} failed"))
+        }
+    }
+
+    /// Like [`run`](Self::run), but a non-zero exit is `Ok(false)` rather than
+    /// an error, so only a command that could not be started is one.
+    pub(crate) fn try_run(&mut self, label: &str, mut command: Command) -> Result<bool> {
         if !self.first {
             self.emit("");
         }
@@ -224,11 +234,7 @@ impl<'a> BuildSteps<'a> {
         let status = child
             .wait()
             .with_context(|| format!("failed to wait for {label}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(anyhow!("{label} failed"))
-        }
+        Ok(status.success())
     }
 }
 

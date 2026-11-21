@@ -197,6 +197,7 @@ pub fn help_text() -> &'static str {
 /open_file <path>                               Open a workspace file in $EDITOR
 /show_file [--hash] [--author] <path> [<ref>]   Show a file; optional ref uses git show
 /build [debug|release] [<target>]               Build the project (default: release), optionally one target (a Makefile rule, cargo binary, Maven goal, ...; Tab completes discovered targets)
+/test [<target>]                                Run the project's tests with the runner matching its build system (cargo test, ctest, make check, meson test, mvn test, pytest, go test); a target narrows the run with that runner's own selector; a failure is kept for /create_patch tests
 /shell <command>                                Run a shell command in the workspace, streaming its output (Tab completes workspace files one path segment at a time)
 /export [console|review|auto review|duplicates|pr|issue|statistics] Export the output window (console), the last review report (review), the last auto-review report (auto review), a fresh duplicate-code report (duplicates), open pull requests (pr), open issues (issue), or persistent activity history (statistics) to a PDF in the workspace root
 /duplicates [<threshold>]                       Scan source functions (Rust, C/C++, Go, Python, JS/TS, and ~20 more languages) for duplicates; on a non-default branch only the functions it adds/changes are compared against the project; optional threshold is a percentage (default 80%)
@@ -211,7 +212,8 @@ pub fn help_text() -> &'static str {
 /comment <number> "<comment>"|<file>            Add a comment to a GitHub/GitLab issue; inline body, file from ~/.orangu/comments/, or `with [auto] review` to post the last /review or /auto_review report
 /comment all <file>                             Add the same comment to every open GitHub/GitLab pull request
 /create_file <path> [with <mode>] [containing <text>] Create a file (or stage an existing one), with optional permissions and content
-/create_patch                                   Apply fixes from the most recently completed /review or /auto_review; also resolve live Git merge/rebase/cherry-pick/revert conflicts, even without a review report
+/create_patch                                   Apply fixes from the most recently completed /review or /auto_review; also resolve live Git merge/rebase/cherry-pick/revert conflicts, even without a review report; falls back to the last failing /test run when neither exists
+/create_patch tests                             Have the model fix the failures of the last /test run, then flag any test files it changed; /test again to check (suggested for up to 3 rounds)
 /close -i <number>|-p <number>                  Close a GitHub/GitLab issue or pull request with gh/glab
 /commit <message>                               Commit all tracked changes with git commit -a -m
 /delete_directory <path>                        Delete an empty directory from the workspace

@@ -1113,6 +1113,43 @@ release build
 
 \newpage
 
+## /test
+
+Runs the workspace's tests with the runner that matches the build system `/build` detects, checked in the same order. Takes one optional **target**, passed to that runner's own test selector:
+
+- **Rust** (`Cargo.toml`) — `cargo test`; a target is a test-name filter (`cargo test <target>`).
+- **C/C++, CMake** — an incremental `make` in `build/`, then `ctest --output-on-failure` there; a target is a `ctest -R` regex.
+- **C/C++, Autotools** — `make check`; a target becomes `make check TESTS=<target>`.
+- **C/C++, Meson** — `meson test -C build --print-errorlogs`; a target is a test name.
+- **Java** (`pom.xml`) — `mvn test`; a target becomes `-Dtest=<target>`.
+- **Python** — `python -m pytest` (`python3` outside Windows); a target is a pytest node or path.
+- **Go** (`go.mod`) — `go test ./...`; a target is a package path, replacing `./...`.
+- **Plain Makefile** — the `check` rule, or `test` when there is no `check`; a target names the rule to run.
+
+CMake, Meson and Autotools need a configured build, so run `/build` once first; `/test` says so rather than configuring one itself. A non-zero `[orangu].compile_workers` is passed as the runner's job count, as for `/build`.
+
+**The fix loop.** When the run fails, orangu lists the failing tests it could read from the output (cargo, ctest, automake, Meson, surefire, pytest and `go test` formats) and keeps the failure under its per-workspace cache (`~/.orangu/workspace/<hash>/test/`). `/create_patch tests` then hands that failure to the model: the command, the failing tests, and the output around each failure plus its tail, within about 24 000 characters. The model is told to fix the code under test, and not to delete, skip or weaken a test or change an expected value unless the test itself is wrong, naming any test it does change. When its turn completes, orangu lists every test file the turn changed, so a "fix" that edits the test rather than the code is plain to see. Run `/test` again to check; a pass clears the record. Each round is one command at a time, never an automatic loop. After 3 rounds that leave the tests failing, `/test` stops suggesting another one and asks you to look yourself. A bare `/create_patch` with no review report and no conflict also picks up the recorded failure.
+
+**Examples**
+
+```text
+/test
+/test parser
+/test ./internal/codec
+/create_patch tests
+/test
+```
+
+Natural-language forms:
+
+```text
+run tests
+run the tests
+fix failing tests
+```
+
+\newpage
+
 ## /shell
 
 Runs a shell command in the workspace, streaming its output to the output window line by line as it is produced — long-running commands (a test suite, a script that tails a log) show output live rather than all at once when they finish.
@@ -1505,7 +1542,7 @@ auto review all
 
 Before the request is sent, review Markdown is reduced to actionable list findings, boilerplate and empty categories are dropped, and duplicates are removed. Findings have a 2,048-token initial budget. Any overflow is stored in session-scoped, category/path-grouped reverse-compression nodes of at most 768 tokens each. The initial prompt contains only the root index ID, and the model is told to expand only the branches relevant to the files it is fixing. This is selective exact retrieval, not a lossy summary, and it prevents reverse expansion from restoring a large report all at once.
 
-The command changes files and may stage them through the normal file tools, but it never commits or pushes. Existing unrelated working-tree changes are to be preserved. If no review has completed in this tab and Git has no unresolved paths, the command refuses and points at `/review` and `/auto_review` instead of sending an underspecified request to the model.
+The command changes files and may stage them through the normal file tools, but it never commits or pushes. Existing unrelated working-tree changes are to be preserved. If no review has completed in this tab and Git has no unresolved paths, it fixes the last failing `/test` run when one is recorded (see `/test`); otherwise it refuses and points at `/review`, `/auto_review` and `/test` instead of sending an underspecified request to the model. `/create_patch tests` goes straight to the test failure.
 
 The same command handles conflicts from an in-progress merge, rebase, cherry-pick, or revert. It asks Git for every unmerged path and gives the complete list directly to the model; conflict paths are never compressed. A live conflict is enough to run `/create_patch`; no review report is required. When a report and conflicts both exist, the model handles both in one pass. It is instructed to reconstruct the intended combined behavior from the base, both sides, surrounding code, and tests; and to explain, per conflict, what each side changed and why the resolution is right — that explanation is what you read. The model does not edit the conflicted files or run Git itself: it writes each resolution out as a block, and orangu applies it, stages the file, and continues the operation — see below.
 
