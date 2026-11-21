@@ -786,7 +786,7 @@ curl -s localhost:8100/v1/images/generations -H 'Content-Type: application/json'
 | `n` | `1` | pictures to make, `1` to `10`, in turn; a `seed` seeds the set, each one `seed + i` |
 | `output_format` | `image_format` (`png`) | `png`, `jpeg`, `gif`, `webp` (lossless) or `svg` (an SVG document carrying the picture as PNG); an attached picture defaults to its own format (the first one's, when there are several) |
 | `response_format` | `b64_json` | the only value — there are no files to return a `url` to |
-| `seed` | drawn | reproduces a picture on the same build; the reply reports the one used |
+| `seed` | `image_seed`, else drawn | reproduces a picture on the same build, model, steps, guidance and size; the reply reports the one used |
 | `steps` | `image_steps` | denoising steps |
 | `cfg_scale` | `image_cfg_scale` | classifier-free guidance; `1` runs the prompt alone, half the work |
 | `image` | — | a picture to start from — a `data:image/…;base64,…` URL or bare base64 of a PNG, JPEG, GIF, WebP or SVG — or an array of them. Resized to `size`. On a `qwen_image_2_1` server with a vision projector (`/props`' `image.vision`), the pictures are **edited** by the prompt instead: each read by the text encoder, in order (*picture 1*, *picture 2*, …), and kept wherever the prompt does not ask for a change. Only an edit reads several; any other model refuses more than one with `400` |
@@ -828,7 +828,8 @@ message: its text is the prompt, and the `image_url` parts of an
 array-shaped `content` (`{"type": "image_url", "image_url": {"url":
 "data:image/png;base64,…"}}`), in order, are the pictures to edit or
 start from — several only for an edit, as for `image` above. Every knob is
-the server's `image_*` default except `seed`. The assistant's `content` is
+the server's `image_*` default; a request's own `seed` still wins. The
+assistant's `content` is
 the picture as a markdown image over a `data:` URL, which a markdown-rendering
 chat client shows inline; `message.images` carries the same picture as
 `b64_json` with `mime`, `size`, `requested_size`, `seed`, `steps` and `generation_ms` for a
@@ -2129,8 +2130,8 @@ picture will come out, and how long it will take, before asking for one:
 | `vision` | the vision projector a `qwen_image_2_1` pipeline edits attached pictures with, or `null` — an attached picture is then a starting point |
 | `lora` | the adapter in the weights — `path`, and `steps`, the count a Lightning file's name says it was distilled for — or `null` for the base model |
 | `n_layer`, `n_head`, `head_dim`, `dim` | the transformer's shape |
-| `defaults` | what a request gets when it does not say: `size`, `steps`, `cfg_scale`, `negative_prompt`, `strength`, `format` — as they stand now |
-| `configured` | the same six as the server came up, from the configuration |
+| `defaults` | what a request gets when it does not say: `size`, `steps`, `cfg_scale`, `negative_prompt`, `strength`, `seed` (a decimal string, `null` when each picture draws one), `format` — as they stand now |
+| `configured` | the same seven as the server came up, from the configuration |
 | `token_passes_per_second`, `estimated_default_seconds` | the last measured rate at the defaults' size, and what a picture at the defaults costs at it — `null` before anything was measured |
 | `rate` | the model behind both: `encode` (seconds per picture), `linear_per_token_pass` and `attention_per_token_pass` (seconds per latent-token pass, attention's measured at `attention_tokens` tokens and growing with the count), `decode_per_pixel`, `edit_encode_per_token` (an edit's encode per reference latent token, `null` until an edit ran), and `step_share` (the share of steps that run the transformer — the step cache, `image_cache`, reuses the rest; `1` with it off). Seconds for any settings = `encode + steps × step_share × n × passes × (linear + attention × n / attention_tokens) + decode_per_pixel × pixels`, `n` the latent tokens (`width/16 × height/16`) and `passes` 2 under guidance, 1 without; an edit attends over `n + r` keys in place of `n`, `r` the reference's tokens. `null` before anything was measured |
 
@@ -2170,8 +2171,9 @@ otherwise gets, and so what a chat turn draws. The body is `{"image":
 {…}}` with any of `size` (`WIDTHxHEIGHT`, each side 16 to 16384, held
 capped to the model's `max_area`), `steps`,
 `cfg_scale` (`1` turns guidance off), `negative_prompt`, `strength`
-(0–1), `format` (`png`, `jpeg`, `gif`, `webp`, `svg`); keys left out keep
-their value, and `"reset": true` puts every one
+(0–1), `seed` (a number or a decimal string; `null` or `""` clears it, so
+each picture draws its own), `format` (`png`, `jpeg`, `gif`, `webp`,
+`svg`); keys left out keep their value, and `"reset": true` puts every one
 back to the configuration first. The answer is `GET /props`' document, so
 the caller sees what it set and what it now costs:
 

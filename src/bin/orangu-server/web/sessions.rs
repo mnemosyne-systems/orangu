@@ -56,6 +56,11 @@ pub struct SessionMessage {
     /// What answering took, for an assistant message the model wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<AnswerStats>,
+    /// The seed an image message was drawn from — `None` for text, video
+    /// and speech messages, and for `chat.json` written before this field
+    /// existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
     /// Files the user attached to this message. Kept (with their extracted
     /// text) so a later turn still has the document in context, and shown
     /// as chips under the message in the web UI. `#[serde(default)]` for
@@ -839,6 +844,32 @@ pub fn append_turn(
     generation_ms: Option<u64>,
     stats: Option<AnswerStats>,
 ) -> Result<()> {
+    append_turn_with_seed(
+        session,
+        user_message,
+        user_attachments,
+        assistant_message,
+        assistant_reasoning,
+        generation_ms,
+        stats,
+        None,
+    )
+}
+
+/// [`append_turn`], and for an image message the seed its picture was
+/// drawn from — kept on the message so the console can show it, and offer
+/// it back, after a reload.
+#[allow(clippy::too_many_arguments)]
+pub fn append_turn_with_seed(
+    session: &mut Session,
+    user_message: &str,
+    user_attachments: Vec<Attachment>,
+    assistant_message: &str,
+    assistant_reasoning: &str,
+    generation_ms: Option<u64>,
+    stats: Option<AnswerStats>,
+    seed: Option<u64>,
+) -> Result<()> {
     if session.title.is_empty() {
         // A file-only message (no typed text) still deserves a title —
         // fall back to the first attachment's name.
@@ -857,6 +888,7 @@ pub fn append_turn(
         content: user_message.to_string(),
         generation_ms: None,
         stats: None,
+        seed: None,
         attachments: user_attachments,
         reasoning: String::new(),
     });
@@ -865,6 +897,7 @@ pub fn append_turn(
         content: assistant_message.to_string(),
         generation_ms,
         stats,
+        seed,
         attachments: Vec::new(),
         reasoning: assistant_reasoning.to_string(),
     });
@@ -977,6 +1010,39 @@ mod tests {
             let loaded = load_session(&session.id).unwrap();
             assert_eq!(loaded.id, session.id);
             assert!(loaded.messages.is_empty());
+        });
+    }
+
+    #[test]
+    fn an_image_seed_is_kept_on_its_message() {
+        with_temp_home(|| {
+            let mut session = create_session().unwrap();
+            append_turn_with_seed(
+                &mut session,
+                "a cat",
+                Vec::new(),
+                "![a cat](cat.png)",
+                "",
+                Some(10),
+                None,
+                Some(42),
+            )
+            .unwrap();
+            let reloaded = load_session(&session.id).unwrap();
+            assert_eq!(reloaded.messages[0].seed, None);
+            assert_eq!(reloaded.messages[1].seed, Some(42));
+
+            // Written only when there is one.
+            let chat = fs::read_to_string(
+                session_chat_path(&Uuid::parse_str(&session.id).unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert!(chat.contains("\"seed\": 42"), "{chat}");
+
+            // A `chat.json` written before the field existed still loads.
+            let old: SessionMessage =
+                serde_json::from_str(r#"{"role":"assistant","content":"old"}"#).unwrap();
+            assert_eq!(old.seed, None);
         });
     }
 
@@ -1249,6 +1315,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 stats: None,
+                seed: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -1257,6 +1324,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 stats: None,
+                seed: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -1282,6 +1350,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 stats: None,
+                seed: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -1405,6 +1474,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 stats: None,
+                seed: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -1446,6 +1516,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 stats: None,
+                seed: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
@@ -1483,6 +1554,7 @@ mod tests {
                 content: "hi".to_string(),
                 generation_ms: None,
                 stats: None,
+                seed: None,
                 attachments: Vec::new(),
                 reasoning: String::new(),
             });
