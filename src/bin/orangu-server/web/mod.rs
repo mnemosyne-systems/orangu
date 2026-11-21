@@ -1495,7 +1495,7 @@ async fn send_image_message(
                     );
                     let html = render::render_markdown_to_html(&content, state.project_licence.as_ref());
                     let generation_ms = image.elapsed.as_millis() as u64;
-                    if let Err(err) = sessions::append_turn(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms), None) {
+                    if let Err(err) = sessions::append_turn_with_seed(&mut session, &user_message, user_attachments, &content, "", Some(generation_ms), None, Some(image.seed)) {
                         yield Ok(axum::response::sse::Event::default()
                             .data(json!({"type": "error", "message": err.to_string()}).to_string()));
                         break;

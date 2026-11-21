@@ -723,6 +723,7 @@ mod tests {
             cfg_scale: 2.5,
             negative_prompt: "blurry".into(),
             strength: 0.7,
+            seed: None,
             format: ImageFormat::Webp,
         };
         let request = build_request(&defaults, Variant::QwenImage, 1, params("a cat")).unwrap();
@@ -742,6 +743,61 @@ mod tests {
         assert_eq!((request.width, request.height), (768, 512));
         assert_eq!(request.steps, 4);
         assert_eq!(request.format, ImageFormat::Jpeg);
+    }
+
+    #[test]
+    fn a_seed_comes_from_the_request_or_the_defaults() {
+        let mut defaults = ImageDefaults {
+            seed: Some(42),
+            ..ImageDefaults::default()
+        };
+        // The chat path sends none: the configured seed is what draws.
+        assert_eq!(
+            build_request(&defaults, Variant::QwenImage, 1, params("a cat"))
+                .unwrap()
+                .seed,
+            Some(42)
+        );
+        // A request's own seed wins.
+        let mut p = params("a cat");
+        p.seed = Some(7);
+        assert_eq!(
+            build_request(&defaults, Variant::QwenImage, 1, p)
+                .unwrap()
+                .seed,
+            Some(7)
+        );
+        // No default and none asked for is still "draw one".
+        defaults.seed = None;
+        assert_eq!(
+            build_request(&defaults, Variant::QwenImage, 1, params("a cat"))
+                .unwrap()
+                .seed,
+            None
+        );
+    }
+
+    /// The console sends a seed as a string (a u64 does not survive JSON's
+    /// doubles), and an empty one as `null` to clear it.
+    #[allow(clippy::option_option)]
+    #[test]
+    fn a_seed_setting_is_a_number_a_string_or_null() {
+        let seed = |value: serde_json::Value| -> Option<Option<u64>> {
+            serde_json::from_value::<ImageSettings>(json!({ "seed": value }))
+                .unwrap()
+                .seed
+        };
+        assert_eq!(seed(json!(42)), Some(Some(42)));
+        assert_eq!(seed(json!("42")), Some(Some(42)));
+        assert_eq!(seed(json!("18446744073709551615")), Some(Some(u64::MAX)));
+        assert_eq!(seed(json!(null)), Some(None));
+        assert_eq!(seed(json!("")), Some(None));
+        assert_eq!(seed(json!(" 42 ")), Some(Some(42)));
+        // An absent key keeps what the server holds.
+        let settings: ImageSettings = serde_json::from_value(json!({"steps": 4})).unwrap();
+        assert_eq!(settings.seed, None);
+        assert!(serde_json::from_value::<ImageSettings>(json!({"seed": "x"})).is_err());
+        assert!(serde_json::from_value::<ImageSettings>(json!({"seed": -1})).is_err());
     }
 
     #[test]
@@ -860,7 +916,7 @@ mod tests {
         };
         let feature =
             crate::engine::image::vae::Feature::new(200, 400, 3, vec![0.0; 200 * 400 * 3]);
-        let jpeg = codec::encode(&feature, ImageFormat::Jpeg).unwrap();
+        let jpeg = codec::encode(&feature, ImageFormat::Jpeg, None).unwrap();
         let mut p = params("brighter");
         p.init = vec![("image/jpeg".into(), jpeg)];
         let request = build_request(&defaults, Variant::QwenImage, 1, p).unwrap();
@@ -870,7 +926,7 @@ mod tests {
 
         let feature =
             crate::engine::image::vae::Feature::new(600, 1200, 3, vec![0.0; 600 * 1200 * 3]);
-        let png = codec::encode(&feature, ImageFormat::Png).unwrap();
+        let png = codec::encode(&feature, ImageFormat::Png, None).unwrap();
         let mut p = params("brighter");
         p.init = vec![("image/png".into(), png)];
         let request = build_request(&defaults, Variant::QwenImage, 1, p).unwrap();
@@ -885,7 +941,7 @@ mod tests {
             3,
             vec![0.0; width * height * 3],
         );
-        codec::encode(&feature, format).unwrap()
+        codec::encode(&feature, format, None).unwrap()
     }
 
     #[test]
