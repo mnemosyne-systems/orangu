@@ -138,6 +138,7 @@ pub fn props_json(pipeline: &Pipeline) -> serde_json::Value {
             "cfg_scale": d.cfg_scale,
             "negative_prompt": d.negative_prompt,
             "strength": d.strength,
+            "seed": d.seed.map(|seed| seed.to_string()),
             "format": d.format.name(),
         })
     };
@@ -213,8 +214,40 @@ pub struct ImageSettings {
     pub negative_prompt: Option<String>,
     #[serde(default)]
     pub strength: Option<f32>,
+    #[allow(clippy::option_option)]
+    #[serde(default, deserialize_with = "deserialize_seed")]
+    pub seed: Option<Option<u64>>,
     #[serde(default)]
     pub format: Option<String>,
+}
+
+/// `null`, a number or a decimal string as [`ImageSettings::seed`].
+#[allow(clippy::option_option)]
+fn deserialize_seed<'de, D>(deserializer: D) -> Result<Option<Option<u64>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Seed {
+        Number(u64),
+        Text(String),
+    }
+    let value = Option::<Seed>::deserialize(deserializer)?;
+    match value {
+        None => Ok(Some(None)),
+        Some(Seed::Number(seed)) => Ok(Some(Some(seed))),
+        Some(Seed::Text(text)) => {
+            let text = text.trim();
+            if text.is_empty() {
+                Ok(Some(None))
+            } else {
+                text.parse::<u64>()
+                    .map(|seed| Some(Some(seed)))
+                    .map_err(serde::de::Error::custom)
+            }
+        }
+    }
 }
 
 /// The reason `size` is not a picture size.
@@ -264,6 +297,9 @@ pub fn apply_settings(pipeline: &Pipeline, settings: &ImageSettings) -> Result<(
             return Err("strength must be between 0 and 1".to_string());
         }
         d.strength = strength;
+    }
+    if let Some(seed) = settings.seed {
+        d.seed = seed;
     }
     if let Some(name) = settings.format.as_deref() {
         d.format = ImageFormat::parse(name)
@@ -414,7 +450,7 @@ pub fn build_request(
         capped_from,
         steps,
         cfg_scale,
-        seed: params.seed,
+        seed: params.seed.or(defaults.seed),
         format,
         init,
     })

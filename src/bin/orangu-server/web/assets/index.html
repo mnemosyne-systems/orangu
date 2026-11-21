@@ -310,6 +310,10 @@
           </span>
         </label>
         <label class="image-field">
+          <span>Seed <button type="button" class="info-btn" aria-label="What this setting does" data-tip="The number the picture is drawn from. The same seed — with the same model, build, steps, guidance and size — draws the same picture; a different one draws a different picture. Empty draws a new seed for every picture, and the caption under each picture shows the seed it used, so you can type it back here."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
+          <span class="image-controls"><input id="image-seed" type="text" inputmode="numeric" placeholder="random" spellcheck="false" autocomplete="off"></span>
+        </label>
+        <label class="image-field">
           <span>Guidance <button type="button" class="info-btn" aria-label="What this setting does" data-tip="Classifier-free guidance: how hard the picture is pushed towards the prompt and away from the negative prompt. Off under a Lightning adapter, which was trained without it; Qwen-Image's own setting is 4; Qwen-Image 2.1 is released to run with it off, and 6 is what stable-diffusion.cpp's examples use. Guidance doubles the work of every step."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg></button></span>
           <span class="image-controls">
             <select id="image-cfg">
