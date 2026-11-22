@@ -201,6 +201,7 @@ struct Clock {
 static CLOCK: std::sync::Mutex<Option<Clock>> = std::sync::Mutex::new(None);
 
 /// The process's user and system CPU seconds.
+#[cfg(target_os = "linux")]
 fn cpu_seconds() -> Option<f64> {
     let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
     // The command name may hold spaces; the fields count from after it.
@@ -210,6 +211,11 @@ fn cpu_seconds() -> Option<f64> {
     // SAFETY: sysconf has no preconditions.
     let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
     Some((utime + stime) / ticks)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cpu_seconds() -> Option<f64> {
+    None
 }
 
 /// A `/proc/meminfo` or `/proc/self/status` field, in bytes.

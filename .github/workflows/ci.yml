@@ -149,7 +149,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo test --bin orangu-server -- --nocapture \
+          cargo test --lib -- --nocapture \
             engine::backend::vulkan::tests::every_integer_dot_pipeline_builds \
             | tee kernels.log
           grep -q '^test result: ok\.' kernels.log
@@ -162,7 +162,7 @@ jobs:
           set -euo pipefail
           # Both filters after `--`: `cargo test` takes only one positional
           # test name, libtest takes several.
-          cargo test --bin orangu-server -- --nocapture \
+          cargo test --lib -- --nocapture \
             engine::backend::vulkan::tests::coop_tiles_are_vec4_only_where_component_stores_work \
             engine::backend::vulkan::tests::shared_vec4_whole_stores_survive_a_barrier \
             | tee probe.log
