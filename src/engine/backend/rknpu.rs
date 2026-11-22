@@ -131,6 +131,9 @@ use crate::engine::loader::QuantMatrix;
 use super::device::{DeviceCandidate, DeviceClass};
 use super::{Backend, CpuBackend, MatmulOp};
 
+mod dense;
+pub use dense::Dense;
+
 /// `RKNN_SUCC`. Every entry point returns this on success and a negative
 /// error code otherwise; none of the distinctions between those codes
 /// changes what this module does, which is decline the weight.

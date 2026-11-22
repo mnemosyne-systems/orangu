@@ -48,11 +48,14 @@
 //! is ([`crate::model`]). A block's input is the only activation kept; its
 //! intermediates are recomputed on the way back.
 
+use crate::accel;
 use crate::aligned::Aligned;
+use crate::gemm::View;
 use crate::model::{
     self, Rng, attention, attention_backward, grad_slice, matmul, matmul_add_dw, matmul_add_dx,
     silu,
 };
+use crate::stages::{Stage, time};
 use rayon::prelude::*;
 
 /// Everything needed to build and train one model.
@@ -933,6 +936,9 @@ struct LayerCache {
     out: Aligned,
 }
 
+/// Weights one generator draws at initialization.
+const INIT_CHUNK: usize = 1 << 16;
+
 /// A model: its shape, its layout, and one flat parameter buffer.
 pub struct Model {
     pub cfg: Config,
@@ -1028,9 +1034,20 @@ impl Model {
             } else {
                 0.02
             };
-            for v in slice.iter_mut() {
-                *v = rng.normal() * std;
-            }
+            // In chunks side by side, each drawn from its own generator
+            // seeded from the run's seed, the tensor and the chunk: the same
+            // weights however many threads draw them.
+            let tensor = rng.next_u64();
+            slice
+                .par_chunks_mut(INIT_CHUNK)
+                .enumerate()
+                .for_each(|(chunk, values)| {
+                    let mut rng =
+                        Rng::new(tensor ^ (chunk as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                    for v in values {
+                        *v = rng.normal() * std;
+                    }
+                });
         }
         Model {
             cfg,
@@ -1069,18 +1086,22 @@ impl Model {
         let mut pre = Aligned::zeros(t * r);
         matmul(&mut pre, &normed, self.tensor(m.down, r * w), t, w, r);
         let inv = 1.0 / hc as f32;
-        for v in pre.iter_mut() {
-            *v *= inv;
-        }
         let mut low = Aligned::zeros(t * r);
-        for (l, &p) in low.iter_mut().zip(pre.iter()) {
-            *l = silu(p);
-        }
+        pre.par_chunks_mut(r)
+            .zip(low.par_chunks_mut(r))
+            .for_each(|(pre, low)| {
+                for (p, l) in pre.iter_mut().zip(low) {
+                    *p *= inv;
+                    *l = silu(*p);
+                }
+            });
         let mut gate = Aligned::zeros(t * w);
         matmul(&mut gate, &low, self.tensor(m.up, w * r), t, r, w);
-        for v in gate.iter_mut() {
-            *v = sigmoid(*v);
-        }
+        gate.par_chunks_mut(w).for_each(|row| {
+            for v in row {
+                *v = sigmoid(*v);
+            }
+        });
         let mut out = Aligned::zeros(t * h);
         out.par_chunks_mut(h).enumerate().for_each(|(i, dst)| {
             for c in 0..hc {
@@ -1153,10 +1174,15 @@ impl Model {
         matmul_add_dx(&mut d_low, &d_gate_pre, self.tensor(m.up, w * r), t, r, w);
         // low = silu(pre), pre = (normed · down) / hc.
         let mut d_pre = Aligned::zeros(t * r);
-        for ((dp, &dl), &p) in d_pre.iter_mut().zip(d_low.iter()).zip(c.pre.iter()) {
-            let s = sigmoid(p);
-            *dp = dl * s * (1.0 + p * (1.0 - s)) * inv;
-        }
+        d_pre
+            .par_chunks_mut(r)
+            .zip(d_low.par_chunks(r).zip(c.pre.par_chunks(r)))
+            .for_each(|(d_pre, (d_low, pre))| {
+                for ((dp, &dl), &p) in d_pre.iter_mut().zip(d_low).zip(pre) {
+                    let s = sigmoid(p);
+                    *dp = dl * s * (1.0 + p * (1.0 - s)) * inv;
+                }
+            });
         matmul_add_dw(grad_slice(grads, m.down, r * w), &d_pre, &c.normed, t, w, r);
         matmul_add_dx(&mut d_normed, &d_pre, self.tensor(m.down, r * w), t, w, r);
         if let (Some(inj), Some(d_inj)) = (m.inject, d_inject) {
@@ -1190,12 +1216,16 @@ impl Model {
                 acc
             })
             .collect();
+        // Each column's sum over the tokens in order, the columns side by
+        // side.
         let dgamma = grad_slice(grads, m.norm, w);
-        for p in &partials {
-            for (o, v) in dgamma.iter_mut().zip(p.iter()) {
-                *o += v;
+        dgamma.par_chunks_mut(64).enumerate().for_each(|(at, out)| {
+            for p in &partials {
+                for (o, v) in out.iter_mut().zip(&p[at * 64..]) {
+                    *o += v;
+                }
             }
-        }
+        });
     }
 
     /// The out-mix: `sub` (`[t, hidden]`) added into every stream of `x`
@@ -1290,7 +1320,9 @@ impl Model {
             cfg.rope_base,
             false,
         );
-        let (selection, idx_loss, indexer) = self.indexer_forward(o, x, &q_rope, &k_rope, t);
+        let (selection, idx_loss, indexer) = time(Stage::Indexer, || {
+            self.indexer_forward(o, x, &q_rope, &k_rope, t)
+        });
         let (ctx, sel_probs) = match &selection {
             None => (attention(&q_rope, &k_rope, &v, &shape, t), Vec::new()),
             Some(sel) => {
@@ -1362,7 +1394,9 @@ impl Model {
                 (cfg.heads, cfg.kv_heads, hd),
             ),
         };
-        self.indexer_backward(o, x, &c.indexer, grads, t);
+        time(Stage::IndexerBackward, || {
+            self.indexer_backward(o, x, &c.indexer, grads, t)
+        });
         rope_partial(&mut d_q, cfg.heads, hd, cfg.rope_dim, cfg.rope_base, true);
         rope_partial(
             &mut d_k,
@@ -1494,6 +1528,7 @@ impl Model {
         let width = cfg.idx_top_k + r - 1;
         let selection = (t > width).then(|| {
             (0..t)
+                .into_par_iter()
                 .map(|i| {
                     let visible = i + 1;
                     let scores: Vec<f32> = (0..visible / r).map(|b| score(i, b)).collect();
@@ -1502,53 +1537,68 @@ impl Model {
                 .collect::<Vec<_>>()
         });
 
-        // The loss, against the full attention's mass per block.
+        // The loss, against the full attention's mass per block. Every query
+        // on its own; the loss's terms are then added in query order.
         let (heads, kv_heads, hd) = (cfg.heads, cfg.kv_heads, cfg.head_dim);
         let (qd, kvd, group) = (heads * hd, kv_heads * hd, heads / kv_heads);
         let scale = 1.0 / (hd as f32).sqrt();
+        let per_query: Vec<Option<QueryLoss>> = (0..t)
+            .into_par_iter()
+            .map(|i| {
+                let scored = (i + 1) / r;
+                if scored == 0 {
+                    return None;
+                }
+                let mut mass = vec![0.0f32; scored];
+                for hh in 0..heads {
+                    let kh = hh / group;
+                    let qv = &q_rope[i * qd + hh * hd..i * qd + (hh + 1) * hd];
+                    let logits: Vec<f32> = (0..=i)
+                        .map(|j| {
+                            qv.iter()
+                                .zip(&k_rope[j * kvd + kh * hd..j * kvd + (kh + 1) * hd])
+                                .map(|(a, b)| a * b)
+                                .sum::<f32>()
+                                * scale
+                        })
+                        .collect();
+                    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
+                    let sum: f32 = exps.iter().sum();
+                    for (b, m) in mass.iter_mut().enumerate() {
+                        for e in &exps[b * r..(b + 1) * r] {
+                            *m += e / sum / heads as f32;
+                        }
+                    }
+                }
+                let mass_sum: f32 = mass.iter().sum();
+                let tgt: Vec<f32> = mass
+                    .iter()
+                    .map(|m| m / mass_sum.max(f32::MIN_POSITIVE))
+                    .collect();
+                let s: Vec<f32> = (0..scored).map(|b| score(i, b)).collect();
+                let max = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = s.iter().map(|v| (v - max).exp()).sum();
+                let p: Vec<f32> = s.iter().map(|v| (v - max).exp() / sum).collect();
+                let terms: Vec<f64> = tgt
+                    .iter()
+                    .zip(&p)
+                    .filter(|&(&a, _)| a > 0.0)
+                    .map(|(&a, &b)| (a * (a.ln() - b.max(f32::MIN_POSITIVE).ln())) as f64)
+                    .collect();
+                Some((p, tgt, terms))
+            })
+            .collect();
         let mut pred = vec![Vec::new(); t];
         let mut target = vec![Vec::new(); t];
         let mut total = 0.0f64;
         let mut counted = 0usize;
-        for i in 0..t {
-            let scored = (i + 1) / r;
-            if scored == 0 {
+        for (i, query) in per_query.into_iter().enumerate() {
+            let Some((p, tgt, terms)) = query else {
                 continue;
-            }
-            let mut mass = vec![0.0f32; scored];
-            for hh in 0..heads {
-                let kh = hh / group;
-                let qv = &q_rope[i * qd + hh * hd..i * qd + (hh + 1) * hd];
-                let logits: Vec<f32> = (0..=i)
-                    .map(|j| {
-                        qv.iter()
-                            .zip(&k_rope[j * kvd + kh * hd..j * kvd + (kh + 1) * hd])
-                            .map(|(a, b)| a * b)
-                            .sum::<f32>()
-                            * scale
-                    })
-                    .collect();
-                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = logits.iter().map(|l| (l - max).exp()).sum();
-                for (b, m) in mass.iter_mut().enumerate() {
-                    for l in &logits[b * r..(b + 1) * r] {
-                        *m += (l - max).exp() / sum / heads as f32;
-                    }
-                }
-            }
-            let mass_sum: f32 = mass.iter().sum();
-            let tgt: Vec<f32> = mass
-                .iter()
-                .map(|m| m / mass_sum.max(f32::MIN_POSITIVE))
-                .collect();
-            let s: Vec<f32> = (0..scored).map(|b| score(i, b)).collect();
-            let max = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let sum: f32 = s.iter().map(|v| (v - max).exp()).sum();
-            let p: Vec<f32> = s.iter().map(|v| (v - max).exp() / sum).collect();
-            for (&a, &b) in tgt.iter().zip(&p) {
-                if a > 0.0 {
-                    total += (a * (a.ln() - b.max(f32::MIN_POSITIVE).ln())) as f64;
-                }
+            };
+            for term in terms {
+                total += term;
             }
             pred[i] = p;
             target[i] = tgt;
@@ -1930,89 +1980,112 @@ impl Model {
         let mut v = Aligned::zeros(t * vd);
         let mut q_len = Aligned::zeros(t * nk);
         let mut k_len = Aligned::zeros(t * nk);
-        for i in 0..t {
-            let row = &conv[i * ch..(i + 1) * ch];
-            for (j, &c) in row.iter().enumerate() {
-                let a = silu(c);
-                if j < kd {
-                    q[i * kd + j] = a;
-                } else if j < 2 * kd {
-                    k[i * kd + j - kd] = a;
-                } else {
-                    v[i * vd + j - 2 * kd] = a;
+        q.par_chunks_mut(kd)
+            .zip(k.par_chunks_mut(kd))
+            .zip(v.par_chunks_mut(vd))
+            .zip(q_len.par_chunks_mut(nk).zip(k_len.par_chunks_mut(nk)))
+            .zip(conv.par_chunks(ch))
+            .for_each(|((((q, k), v), (q_len, k_len)), row)| {
+                for (dst, &c) in q.iter_mut().zip(&row[..kd]) {
+                    *dst = silu(c);
                 }
-            }
-            for head in 0..nk {
-                let r = i * kd + head * dim..i * kd + (head + 1) * dim;
-                q_len[i * nk + head] = l2_normalize(&mut q[r.clone()], cfg.eps);
-                k_len[i * nk + head] = l2_normalize(&mut k[r.clone()], cfg.eps);
-                for v in &mut q[r] {
-                    *v *= scale;
+                for (dst, &c) in k.iter_mut().zip(&row[kd..2 * kd]) {
+                    *dst = silu(c);
                 }
-            }
-        }
+                for (dst, &c) in v.iter_mut().zip(&row[2 * kd..]) {
+                    *dst = silu(c);
+                }
+                for head in 0..nk {
+                    let r = head * dim..(head + 1) * dim;
+                    q_len[head] = l2_normalize(&mut q[r.clone()], cfg.eps);
+                    k_len[head] = l2_normalize(&mut k[r.clone()], cfg.eps);
+                    for v in &mut q[r] {
+                        *v *= scale;
+                    }
+                }
+            });
         let a_log = self.tensor(o.a_log, nv);
         let dt = self.tensor(o.dt, nv);
         let mut beta = Aligned::zeros(t * nv);
         let mut g = Aligned::zeros(t * nv);
         let mut decay = Aligned::zeros(t * nv);
-        for i in 0..t {
-            for hv in 0..nv {
-                let at = i * nv + hv;
-                beta[at] = sigmoid(braw[at]);
-                g[at] = alpha[at] + dt[hv];
-                decay[at] = (softplus(g[at]) * -a_log[hv].exp()).exp();
-            }
-        }
+        beta.par_chunks_mut(nv)
+            .zip(g.par_chunks_mut(nv).zip(decay.par_chunks_mut(nv)))
+            .zip(braw.par_chunks(nv).zip(alpha.par_chunks(nv)))
+            .for_each(|((beta, (g, decay)), (braw, alpha))| {
+                for hv in 0..nv {
+                    beta[hv] = sigmoid(braw[hv]);
+                    g[hv] = alpha[hv] + dt[hv];
+                    decay[hv] = (softplus(g[hv]) * -a_log[hv].exp()).exp();
+                }
+            });
 
-        // The recurrence, a value head at a time; the state is kept at every
-        // chunk boundary for the backward.
+        // The recurrence. A value column of a head's state never reads
+        // another, so each head runs as blocks of `cols` columns side by
+        // side; the state is kept at every chunk boundary for the backward.
         let chunk = cfg.chunk.max(1);
+        let cols = column_block(dim);
+        let blocks = dim / cols;
         let mut o_all = Aligned::zeros(t * vd);
         let mut checkpoints: Vec<Aligned> = (0..t.div_ceil(chunk))
             .map(|_| Aligned::zeros(nv * dim * dim))
             .collect();
-        let head_outputs: Vec<(Vec<f32>, Vec<Vec<f32>>)> = (0..nv)
+        let block_outputs: Vec<(Vec<f32>, Vec<Vec<f32>>)> = (0..nv * blocks)
             .into_par_iter()
-            .map(|hv| {
+            .map(|task| {
+                let (hv, a0) = (task / blocks, task % blocks * cols);
                 let hk = hv % nk;
-                let mut state = vec![0.0f32; dim * dim];
-                let mut out = vec![0.0f32; t * dim];
+                let mut state = vec![0.0f32; dim * cols];
+                let mut out = vec![0.0f32; t * cols];
                 let mut kept = Vec::new();
                 for i in 0..t {
                     if i % chunk == 0 {
                         kept.push(state.clone());
                     }
+                    let at_v = i * vd + hv * dim + a0;
                     delta_step(
                         &mut state,
                         &q[i * kd + hk * dim..i * kd + (hk + 1) * dim],
                         &k[i * kd + hk * dim..i * kd + (hk + 1) * dim],
-                        &v[i * vd + hv * dim..i * vd + (hv + 1) * dim],
+                        &v[at_v..at_v + cols],
                         beta[i * nv + hv],
                         decay[i * nv + hv],
-                        &mut out[i * dim..(i + 1) * dim],
+                        &mut out[i * cols..(i + 1) * cols],
                     );
                 }
                 (out, kept)
             })
             .collect();
-        for (hv, (out, kept)) in head_outputs.into_iter().enumerate() {
-            for i in 0..t {
-                o_all[i * vd + hv * dim..i * vd + (hv + 1) * dim]
-                    .copy_from_slice(&out[i * dim..(i + 1) * dim]);
+        o_all.par_chunks_mut(vd).enumerate().for_each(|(i, row)| {
+            for (task, (out, _)) in block_outputs.iter().enumerate() {
+                let at = task / blocks * dim + task % blocks * cols;
+                row[at..at + cols].copy_from_slice(&out[i * cols..(i + 1) * cols]);
             }
-            for (c, s) in kept.into_iter().enumerate() {
-                checkpoints[c][hv * dim * dim..(hv + 1) * dim * dim].copy_from_slice(&s);
-            }
-        }
+        });
+        checkpoints
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(c, checkpoint)| {
+                for (task, (_, kept)) in block_outputs.iter().enumerate() {
+                    let (hv, a0) = (task / blocks, task % blocks * cols);
+                    let head = &mut checkpoint[hv * dim * dim..(hv + 1) * dim * dim];
+                    for (row, src) in head.chunks_exact_mut(dim).zip(kept[c].chunks_exact(cols)) {
+                        row[a0..a0 + cols].copy_from_slice(src);
+                    }
+                }
+            });
 
         // The gated norm, per head, and the output projection.
         let (o_normed, o_rms) =
             model::rmsnorm_forward(&o_all, self.tensor(o.norm, dim), t * nv, dim, cfg.eps);
         let mut y = Aligned::zeros(t * vd);
-        for ((yv, &n), &zv) in y.iter_mut().zip(o_normed.iter()).zip(z.iter()) {
-            *yv = n * sigmoid(zv);
-        }
+        y.par_chunks_mut(vd)
+            .zip(o_normed.par_chunks(vd).zip(z.par_chunks(vd)))
+            .for_each(|(y, (o_normed, z))| {
+                for ((yv, &n), &zv) in y.iter_mut().zip(o_normed).zip(z) {
+                    *yv = n * sigmoid(zv);
+                }
+            });
         let mut out = Aligned::zeros(t * h);
         matmul(&mut out, &y, self.tensor(o.out, h * vd), t, vd, h);
         (
@@ -2062,11 +2135,18 @@ impl Model {
         matmul_add_dx(&mut d_y, d_out, self.tensor(o.out, h * vd), t, vd, h);
         let mut d_normed = Aligned::zeros(t * vd);
         let mut d_z = Aligned::zeros(t * vd);
-        for i in 0..t * vd {
-            let s = sigmoid(c.z[i]);
-            d_normed[i] = d_y[i] * s;
-            d_z[i] = d_y[i] * c.o_normed[i] * s * (1.0 - s);
-        }
+        d_normed
+            .par_chunks_mut(vd)
+            .zip(d_z.par_chunks_mut(vd))
+            .enumerate()
+            .for_each(|(i, (d_normed, d_z))| {
+                for e in 0..vd {
+                    let at = i * vd + e;
+                    let s = sigmoid(c.z[at]);
+                    d_normed[e] = d_y[at] * s;
+                    d_z[e] = d_y[at] * c.o_normed[at] * s * (1.0 - s);
+                }
+            });
         let mut d_o = Aligned::zeros(t * vd);
         model::rmsnorm_backward(
             &mut d_o,
@@ -2079,14 +2159,17 @@ impl Model {
             dim,
         );
 
-        // Back through time, a value head at a time.
+        // Back through time, a value head at a time, its column blocks side
+        // by side a chunk at a time; a block's share of each token's query,
+        // key, beta and decay gradient is added in block order.
         let chunk = cfg.chunk.max(1);
+        let cols = column_block(dim);
+        let blocks = dim / cols;
         let per_head: Vec<HeadGrads> = (0..nv)
             .into_par_iter()
             .map(|hv| {
                 let hk = hv % nk;
                 let at_q = |i: usize| i * kd + hk * dim..i * kd + (hk + 1) * dim;
-                let at_v = |i: usize| i * vd + hv * dim..i * vd + (hv + 1) * dim;
                 let mut gr = HeadGrads {
                     q: vec![0.0; t * dim],
                     k: vec![0.0; t * dim],
@@ -2094,43 +2177,95 @@ impl Model {
                     beta: vec![0.0; t],
                     decay: vec![0.0; t],
                 };
-                let mut g_state = vec![0.0f32; dim * dim];
+                // Each block's gradient of its state after the chunk, its
+                // states before each token of the chunk, and its share.
+                let size = dim * cols;
+                let mut works: Vec<BlockWork> = (0..blocks)
+                    .map(|_| BlockWork {
+                        g_state: vec![0.0; size],
+                        before: vec![0.0; chunk.min(t) * size],
+                        scratch: vec![0.0; STEP_SCRATCH * dim],
+                        share: HeadGrads {
+                            q: vec![0.0; chunk * dim],
+                            k: vec![0.0; chunk * dim],
+                            v: vec![0.0; chunk * cols],
+                            beta: vec![0.0; chunk],
+                            decay: vec![0.0; chunk],
+                        },
+                    })
+                    .collect();
                 for start in (0..t).step_by(chunk).rev() {
                     let end = (start + chunk).min(t);
-                    // The state before each token of the chunk.
-                    let mut before: Vec<Vec<f32>> = Vec::with_capacity(end - start);
-                    let mut state =
-                        c.checkpoints[start / chunk][hv * dim * dim..(hv + 1) * dim * dim].to_vec();
-                    let mut scratch = vec![0.0f32; dim];
-                    for i in start..end {
-                        before.push(state.clone());
-                        delta_step(
-                            &mut state,
-                            &c.q[at_q(i)],
-                            &c.k[at_q(i)],
-                            &c.v[at_v(i)],
-                            c.beta[i * nv + hv],
-                            c.decay[i * nv + hv],
-                            &mut scratch,
-                        );
-                        scratch.fill(0.0);
-                    }
-                    for i in (start..end).rev() {
-                        let (dq, dk, dv, db, dd) = delta_step_backward(
-                            &before[i - start],
-                            &c.q[at_q(i)],
-                            &c.k[at_q(i)],
-                            &c.v[at_v(i)],
-                            c.beta[i * nv + hv],
-                            c.decay[i * nv + hv],
-                            &d_o[at_v(i)],
-                            &mut g_state,
-                        );
-                        gr.q[i * dim..(i + 1) * dim].copy_from_slice(&dq);
-                        gr.k[i * dim..(i + 1) * dim].copy_from_slice(&dk);
-                        gr.v[i * dim..(i + 1) * dim].copy_from_slice(&dv);
-                        gr.beta[i] = db;
-                        gr.decay[i] = dd;
+                    let n = end - start;
+                    let checkpoint =
+                        &c.checkpoints[start / chunk][hv * dim * dim..(hv + 1) * dim * dim];
+                    works.par_iter_mut().enumerate().for_each(|(block, work)| {
+                        let a0 = block * cols;
+                        let at_v = |i: usize| i * vd + hv * dim + a0..i * vd + hv * dim + a0 + cols;
+                        let before = &mut work.before;
+                        for (dst, row) in before[..size]
+                            .chunks_exact_mut(cols)
+                            .zip(checkpoint.chunks_exact(dim))
+                        {
+                            dst.copy_from_slice(&row[a0..a0 + cols]);
+                        }
+                        let mut out = vec![0.0f32; cols];
+                        for r in 1..n {
+                            let i = start + r - 1;
+                            let (done, next) = before.split_at_mut(r * size);
+                            let next = &mut next[..size];
+                            next.copy_from_slice(&done[(r - 1) * size..]);
+                            out.fill(0.0);
+                            delta_step(
+                                next,
+                                &c.q[at_q(i)],
+                                &c.k[at_q(i)],
+                                &c.v[at_v(i)],
+                                c.beta[i * nv + hv],
+                                c.decay[i * nv + hv],
+                                &mut out,
+                            );
+                        }
+                        let share = &mut work.share;
+                        for r in (0..n).rev() {
+                            let i = start + r;
+                            let (db, dd) = delta_step_backward(
+                                &before[r * size..(r + 1) * size],
+                                &c.q[at_q(i)],
+                                &c.k[at_q(i)],
+                                &c.v[at_v(i)],
+                                c.beta[i * nv + hv],
+                                c.decay[i * nv + hv],
+                                &d_o[at_v(i)],
+                                &mut work.g_state,
+                                (
+                                    &mut share.q[r * dim..(r + 1) * dim],
+                                    &mut share.k[r * dim..(r + 1) * dim],
+                                    &mut share.v[r * cols..(r + 1) * cols],
+                                ),
+                                &mut work.scratch,
+                            );
+                            share.beta[r] = db;
+                            share.decay[r] = dd;
+                        }
+                    });
+                    for (block, work) in works.iter().enumerate() {
+                        let share = &work.share;
+                        for r in 0..n {
+                            let i = start + r;
+                            let span = i * dim..(i + 1) * dim;
+                            let own = r * dim..(r + 1) * dim;
+                            for (d, s) in gr.q[span.clone()].iter_mut().zip(&share.q[own.clone()]) {
+                                *d += s;
+                            }
+                            for (d, s) in gr.k[span].iter_mut().zip(&share.k[own]) {
+                                *d += s;
+                            }
+                            gr.v[i * dim + block * cols..i * dim + (block + 1) * cols]
+                                .copy_from_slice(&share.v[r * cols..(r + 1) * cols]);
+                            gr.beta[i] += share.beta[r];
+                            gr.decay[i] += share.decay[r];
+                        }
                     }
                 }
                 gr
@@ -2144,27 +2279,47 @@ impl Model {
         let mut d_v = Aligned::zeros(t * vd);
         let mut d_braw = Aligned::zeros(t * nv);
         let mut d_g = Aligned::zeros(t * nv);
-        let a_log = self.tensor(o.a_log, nv).to_vec();
-        let mut d_a_log = vec![0.0f32; nv];
-        for (hv, gr) in per_head.iter().enumerate() {
-            let hk = hv % nk;
-            let a = -a_log[hv].exp();
-            for i in 0..t {
-                for j in 0..dim {
-                    d_q[i * kd + hk * dim + j] += gr.q[i * dim + j];
-                    d_k[i * kd + hk * dim + j] += gr.k[i * dim + j];
-                    d_v[i * vd + hv * dim + j] = gr.v[i * dim + j];
+        let a_log = self.tensor(o.a_log, nv);
+        // A token at a time; each key head's sum over its value heads in
+        // head order.
+        d_q.par_chunks_mut(kd)
+            .zip(d_k.par_chunks_mut(kd))
+            .zip(d_v.par_chunks_mut(vd))
+            .zip(d_braw.par_chunks_mut(nv).zip(d_g.par_chunks_mut(nv)))
+            .enumerate()
+            .for_each(|(i, (((d_q, d_k), d_v), (d_braw, d_g)))| {
+                for (hv, gr) in per_head.iter().enumerate() {
+                    let hk = hv % nk;
+                    let a = -a_log[hv].exp();
+                    for j in 0..dim {
+                        d_q[hk * dim + j] += gr.q[i * dim + j];
+                        d_k[hk * dim + j] += gr.k[i * dim + j];
+                        d_v[hv * dim + j] = gr.v[i * dim + j];
+                    }
+                    let at = i * nv + hv;
+                    let b = c.beta[at];
+                    d_braw[hv] = gr.beta[i] * b * (1.0 - b);
+                    // decay = exp(softplus(g) · a).
+                    let dl = gr.decay[i] * c.decay[at];
+                    d_g[hv] = dl * a * softplus_grad(c.g[at]);
                 }
-                let at = i * nv + hv;
-                let b = c.beta[at];
-                d_braw[at] = gr.beta[i] * b * (1.0 - b);
-                // decay = exp(softplus(g) · a).
-                let dl = gr.decay[i] * c.decay[at];
-                d_g[at] = dl * a * softplus_grad(c.g[at]);
-                // a = −exp(a_log), so da/da_log = a.
-                d_a_log[hv] += dl * softplus(c.g[at]) * a;
-            }
-        }
+            });
+        // A head at a time, over the tokens in order: a = −exp(a_log), so
+        // da/da_log = a.
+        let d_a_log: Vec<f32> = per_head
+            .par_iter()
+            .enumerate()
+            .map(|(hv, gr)| {
+                let a = -a_log[hv].exp();
+                let mut sum = 0.0f32;
+                for i in 0..t {
+                    let at = i * nv + hv;
+                    let dl = gr.decay[i] * c.decay[at];
+                    sum += dl * softplus(c.g[at]) * a;
+                }
+                sum
+            })
+            .collect();
         for (dst, src) in grad_slice(grads, o.a_log, nv).iter_mut().zip(&d_a_log) {
             *dst += src;
         }
@@ -2180,7 +2335,7 @@ impl Model {
         // The normalizations, the silu and the convolution.
         let scale = 1.0 / (dim as f32).sqrt();
         let mut d_act = Aligned::zeros(t * ch);
-        for i in 0..t {
+        d_act.par_chunks_mut(ch).enumerate().for_each(|(i, d_act)| {
             for head in 0..nk {
                 let r = i * kd + head * dim..i * kd + (head + 1) * dim;
                 // q carries the scale after its normalization.
@@ -2191,39 +2346,58 @@ impl Model {
                     &qn,
                     c.q_len[i * nk + head],
                     cfg.eps,
-                    &mut d_act[i * ch + head * dim..i * ch + (head + 1) * dim],
+                    &mut d_act[head * dim..(head + 1) * dim],
                 );
                 l2_normalize_backward(
                     &d_k[r.clone()],
                     &c.k[r],
                     c.k_len[i * nk + head],
                     cfg.eps,
-                    &mut d_act[i * ch + kd + head * dim..i * ch + kd + (head + 1) * dim],
+                    &mut d_act[kd + head * dim..kd + (head + 1) * dim],
                 );
             }
-            d_act[i * ch + 2 * kd..(i + 1) * ch].copy_from_slice(&d_v[i * vd..(i + 1) * vd]);
-        }
+            d_act[2 * kd..].copy_from_slice(&d_v[i * vd..(i + 1) * vd]);
+        });
         let mut d_conv = Aligned::zeros(t * ch);
-        for ((dc, &da), &cv) in d_conv.iter_mut().zip(d_act.iter()).zip(c.conv.iter()) {
-            let s = sigmoid(cv);
-            *dc = da * s * (1.0 + cv * (1.0 - s));
-        }
+        d_conv
+            .par_chunks_mut(ch)
+            .zip(d_act.par_chunks(ch).zip(c.conv.par_chunks(ch)))
+            .for_each(|(d_conv, (d_act, conv))| {
+                for ((dc, &da), &cv) in d_conv.iter_mut().zip(d_act).zip(conv) {
+                    let s = sigmoid(cv);
+                    *dc = da * s * (1.0 + cv * (1.0 - s));
+                }
+            });
+        // Token `i` reads rows `i + 1 − kw ..= i` through taps `0..kw`. The
+        // input's gradient gathered a row at a time, from the later tokens
+        // in order; the kernel's a channel at a time, over the tokens in
+        // order.
         let kernel = self.tensor(o.conv, ch * kw);
         let mut d_mixed = Aligned::zeros(t * ch);
-        {
-            let d_kernel = grad_slice(grads, o.conv, ch * kw);
-            for i in 0..t {
-                for cc in 0..ch {
+        d_mixed
+            .par_chunks_mut(ch)
+            .enumerate()
+            .for_each(|(src, d_mixed)| {
+                for i in src..(src + kw).min(t) {
+                    let j = src + kw - 1 - i;
+                    for (cc, d) in d_mixed.iter_mut().enumerate() {
+                        *d += kernel[cc * kw + j] * d_conv[i * ch + cc];
+                    }
+                }
+            });
+        grad_slice(grads, o.conv, ch * kw)
+            .par_chunks_mut(kw)
+            .enumerate()
+            .for_each(|(cc, d_kernel)| {
+                for i in 0..t {
                     let g = d_conv[i * ch + cc];
-                    for j in 0..kw {
+                    for (j, d) in d_kernel.iter_mut().enumerate() {
                         if let Some(src) = (i + j + 1).checked_sub(kw) {
-                            d_mixed[src * ch + cc] += kernel[cc * kw + j] * g;
-                            d_kernel[cc * kw + j] += c.mixed[src * ch + cc] * g;
+                            *d += c.mixed[src * ch + cc] * g;
                         }
                     }
                 }
-            }
-        }
+            });
 
         // The four projections of the input.
         for (w_at, dy, n) in [
@@ -2253,26 +2427,26 @@ impl Model {
         );
         let mut probs = Aligned::zeros(t * ne);
         matmul(&mut probs, x, self.tensor(m.router, ne * h), t, h, ne);
-        let mut chosen: Vec<Vec<(usize, f32)>> = Vec::with_capacity(t);
-        let mut sums = vec![0.0f32; t];
-        for (i, row) in probs.chunks_mut(ne).enumerate() {
-            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for v in row.iter_mut() {
-                *v = (*v - max).exp();
-                sum += *v;
-            }
-            for v in row.iter_mut() {
-                *v /= sum;
-            }
-            let mut order: Vec<usize> = (0..ne).collect();
-            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
-            order.truncate(k);
-            let s: f32 = order.iter().map(|&e| row[e]).sum();
-            sums[i] = s;
-            let s = s.max(WEIGHT_FLOOR);
-            chosen.push(order.into_iter().map(|e| (e, row[e] / s)).collect());
-        }
+        let (chosen, sums): (Vec<Vec<(usize, f32)>>, Vec<f32>) = probs
+            .par_chunks_mut(ne)
+            .map(|row| {
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for v in row.iter_mut() {
+                    *v = (*v - max).exp();
+                    sum += *v;
+                }
+                for v in row.iter_mut() {
+                    *v /= sum;
+                }
+                let mut order: Vec<usize> = (0..ne).collect();
+                order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
+                order.truncate(k);
+                let sum: f32 = order.iter().map(|&e| row[e]).sum();
+                let s = sum.max(WEIGHT_FLOOR);
+                (order.into_iter().map(|e| (e, row[e] / s)).collect(), sum)
+            })
+            .unzip();
 
         // Each expert's tokens together, in expert order.
         let mut members: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
@@ -2281,55 +2455,56 @@ impl Model {
                 members[e].push((i, slot));
             }
         }
-        let experts: Vec<ExpertCache> = (0..ne)
-            .into_par_iter()
-            .map(|e| {
-                let rows = &members[e];
-                let m_n = rows.len();
-                let mut xin = Aligned::zeros(m_n * h);
-                for (r, &(i, _)) in rows.iter().enumerate() {
-                    xin[r * h..(r + 1) * h].copy_from_slice(&x[i * h..(i + 1) * h]);
-                }
-                let mut gate = Aligned::zeros(m_n * fe);
-                let mut up = Aligned::zeros(m_n * fe);
-                matmul(
-                    &mut gate,
-                    &xin,
-                    self.tensor(m.gate_exps + e * fe * h, fe * h),
-                    m_n,
-                    h,
-                    fe,
+        let experts: Vec<ExpertCache> = match accel::for_product(t * k, fe, h) {
+            // Divided between the card and the processor, side by side, in
+            // proportion to what each has been measured to manage.
+            Some(card) => {
+                let on_card =
+                    split_experts(&members, accel::card_share(accel::Split::ExpertsForward));
+                let mine: Vec<Vec<(usize, usize)>> = (0..ne)
+                    .map(|e| {
+                        if on_card[e] {
+                            members[e].clone()
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .collect();
+                let ((from_card, card_secs), (from_cpu, cpu_secs)) = rayon::join(
+                    || timed(|| self.experts_on_card(card, m, x, &mine)),
+                    || {
+                        timed(|| {
+                            (0..ne)
+                                .into_par_iter()
+                                .map(|e| {
+                                    (!on_card[e]).then(|| self.expert_forward(m, x, &members, e))
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                    },
                 );
-                matmul(
-                    &mut up,
-                    &xin,
-                    self.tensor(m.up_exps + e * fe * h, fe * h),
-                    m_n,
-                    h,
-                    fe,
+                let rows = |card: bool| {
+                    (0..ne)
+                        .filter(|&e| on_card[e] == card)
+                        .map(|e| members[e].len())
+                        .sum()
+                };
+                accel::measured(
+                    accel::Split::ExpertsForward,
+                    (rows(true), card_secs),
+                    (rows(false), cpu_secs),
                 );
-                let mut act = Aligned::zeros(m_n * fe);
-                for ((a, &g), &u) in act.iter_mut().zip(gate.iter()).zip(up.iter()) {
-                    *a = silu(g) * u;
-                }
-                let mut out = Aligned::zeros(m_n * h);
-                matmul(
-                    &mut out,
-                    &act,
-                    self.tensor(m.down_exps + e * h * fe, h * fe),
-                    m_n,
-                    fe,
-                    h,
-                );
-                ExpertCache {
-                    xin,
-                    gate,
-                    up,
-                    act,
-                    out,
-                }
-            })
-            .collect();
+                from_card
+                    .into_iter()
+                    .zip(from_cpu)
+                    .map(|(card, cpu)| cpu.unwrap_or(card))
+                    .collect()
+            }
+            None => (0..ne)
+                .into_par_iter()
+                .map(|e| self.expert_forward(m, x, &members, e))
+                .collect(),
+        };
 
         // The shared expert and its gate.
         let mut s_gate = Aligned::zeros(t * fs);
@@ -2337,9 +2512,14 @@ impl Model {
         matmul(&mut s_gate, x, self.tensor(m.gate_shexp, fs * h), t, h, fs);
         matmul(&mut s_up, x, self.tensor(m.up_shexp, fs * h), t, h, fs);
         let mut s_act = Aligned::zeros(t * fs);
-        for ((a, &g), &u) in s_act.iter_mut().zip(s_gate.iter()).zip(s_up.iter()) {
-            *a = silu(g) * u;
-        }
+        s_act
+            .par_chunks_mut(fs)
+            .zip(s_gate.par_chunks(fs).zip(s_up.par_chunks(fs)))
+            .for_each(|(act, (gate, up))| {
+                for ((a, &g), &u) in act.iter_mut().zip(gate).zip(up) {
+                    *a = silu(g) * u;
+                }
+            });
         let mut s_out = Aligned::zeros(t * h);
         matmul(
             &mut s_out,
@@ -2351,6 +2531,7 @@ impl Model {
         );
         let shared_w = self.tensor(m.shared_gate, h);
         let s_score: Vec<f32> = (0..t)
+            .into_par_iter()
             .map(|i| {
                 x[i * h..(i + 1) * h]
                     .iter()
@@ -2368,9 +2549,8 @@ impl Model {
                 position[i][slot] = r;
             }
         }
-        for i in 0..t {
+        out.par_chunks_mut(h).enumerate().for_each(|(i, dst)| {
             let g = sigmoid(s_score[i]);
-            let dst = &mut out[i * h..(i + 1) * h];
             for (d, &s) in dst.iter_mut().zip(&s_out[i * h..(i + 1) * h]) {
                 *d = g * s;
             }
@@ -2380,7 +2560,7 @@ impl Model {
                     *d += wgt * v;
                 }
             }
-        }
+        });
 
         // The load-balancing term: experts_count · Σ share · mean probability,
         // the share counted over every routing slot.
@@ -2442,77 +2622,132 @@ impl Model {
         // The shared expert and its gate.
         let mut d_s_out = Aligned::zeros(t * h);
         let mut d_score = vec![0.0f32; t];
-        for i in 0..t {
-            let g = sigmoid(c.s_score[i]);
-            let dy = &d_out[i * h..(i + 1) * h];
-            let so = &c.s_out[i * h..(i + 1) * h];
-            let mut dot = 0.0f32;
-            for j in 0..h {
-                d_s_out[i * h + j] = dy[j] * g;
-                dot += dy[j] * so[j];
-            }
-            d_score[i] = dot * g * (1.0 - g);
-        }
-        {
-            let shared_w = self.tensor(m.shared_gate, h).to_vec();
-            let d_w = grad_slice(grads, m.shared_gate, h);
-            for i in 0..t {
-                for j in 0..h {
-                    d_w[j] += d_score[i] * x[i * h + j];
-                    dx[i * h + j] += d_score[i] * shared_w[j];
-                }
-            }
-        }
-        swiglu_backward(
-            self,
-            (m.gate_shexp, m.up_shexp, m.down_shexp),
-            (h, fs),
-            x,
-            (&c.s_gate, &c.s_up, &c.s_act),
-            &d_s_out,
-            dx,
-            grads,
-            t,
-        );
-
-        // The routed experts: each expert's gradient from its own tokens,
-        // and the gradient of every chosen weight.
-        let mut d_weight = vec![vec![0.0f32; k]; t];
-        for (e, rows) in c.members.iter().enumerate() {
-            if rows.is_empty() {
-                continue;
-            }
-            let ec = &c.experts[e];
-            let m_n = rows.len();
-            let mut d_eout = Aligned::zeros(m_n * h);
-            for (r, &(i, slot)) in rows.iter().enumerate() {
-                let wgt = c.chosen[i][slot].1;
+        d_s_out
+            .par_chunks_mut(h)
+            .zip(d_score.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (d_s_out, d_score))| {
+                let g = sigmoid(c.s_score[i]);
                 let dy = &d_out[i * h..(i + 1) * h];
-                let eo = &ec.out[r * h..(r + 1) * h];
+                let so = &c.s_out[i * h..(i + 1) * h];
                 let mut dot = 0.0f32;
                 for j in 0..h {
-                    d_eout[r * h + j] = wgt * dy[j];
-                    dot += dy[j] * eo[j];
+                    d_s_out[j] = dy[j] * g;
+                    dot += dy[j] * so[j];
                 }
-                d_weight[i][slot] = dot;
-            }
-            let mut d_xin = Aligned::zeros(m_n * h);
-            swiglu_backward(
-                self,
-                (
-                    m.gate_exps + e * fe * h,
-                    m.up_exps + e * fe * h,
-                    m.down_exps + e * h * fe,
-                ),
-                (h, fe),
-                &ec.xin,
-                (&ec.gate, &ec.up, &ec.act),
-                &d_eout,
-                &mut d_xin,
+                *d_score = dot * g * (1.0 - g);
+            });
+        {
+            let shared_w = self.tensor(m.shared_gate, h);
+            // Each column's gradient summed over the tokens in order, and
+            // each token's input gradient on its own row.
+            grad_slice(grads, m.shared_gate, h)
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(j, d_w)| {
+                    for i in 0..t {
+                        *d_w += d_score[i] * x[i * h + j];
+                    }
+                });
+            dx.par_chunks_mut(h)
+                .zip(d_score.par_iter())
+                .for_each(|(dx, &score)| {
+                    for (d, &w) in dx.iter_mut().zip(shared_w) {
+                        *d += score * w;
+                    }
+                });
+        }
+        {
+            let [g_gate, g_up, g_down] = regions(
                 grads,
-                m_n,
+                [
+                    (m.gate_shexp, fs * h),
+                    (m.up_shexp, fs * h),
+                    (m.down_shexp, h * fs),
+                ],
             );
-            for (r, &(i, _)) in rows.iter().enumerate() {
+            swiglu_backward(
+                (
+                    self.tensor(m.gate_shexp, fs * h),
+                    self.tensor(m.up_shexp, fs * h),
+                    self.tensor(m.down_shexp, h * fs),
+                ),
+                (g_gate, g_up, g_down),
+                (h, fs),
+                x,
+                (&c.s_gate, &c.s_up, &c.s_act),
+                &d_s_out,
+                dx,
+                t,
+            );
+        }
+
+        // The routed experts, all at once: each writes only its own
+        // matrices' gradients. What they give back for their tokens — the
+        // input gradient and each chosen weight's gradient — is added in
+        // expert order afterwards, the order one expert at a time adds it.
+        let [g_gate, g_up, g_down] = regions(
+            grads,
+            [
+                (m.gate_exps, ne * fe * h),
+                (m.up_exps, ne * fe * h),
+                (m.down_exps, ne * h * fe),
+            ],
+        );
+        let chunks: Vec<(usize, ExpertGrads<'_>)> = g_gate
+            .chunks_mut(fe * h)
+            .zip(g_up.chunks_mut(fe * h))
+            .zip(g_down.chunks_mut(h * fe))
+            .map(|((a, b), d)| (a, b, d))
+            .enumerate()
+            .collect();
+        let given: Vec<Option<(Aligned, Vec<f32>)>> = match accel::for_product(t * k, fe, h) {
+            // Divided as the forward is, by its own measured rates.
+            Some(card) => {
+                let on_card =
+                    split_experts(&c.members, accel::card_share(accel::Split::ExpertsBackward));
+                let (card_chunks, cpu_chunks): (Vec<_>, Vec<_>) =
+                    chunks.into_iter().partition(|(e, _)| on_card[*e]);
+                let ((from_card, card_secs), (from_cpu, cpu_secs)) = rayon::join(
+                    || timed(|| self.experts_backward_on_card(card, m, c, d_out, card_chunks)),
+                    || {
+                        timed(|| {
+                            cpu_chunks
+                                .into_par_iter()
+                                .map(|(e, grads)| (e, self.expert_backward(m, c, d_out, e, grads)))
+                                .collect::<Vec<_>>()
+                        })
+                    },
+                );
+                let rows = |card: bool| {
+                    (0..ne)
+                        .filter(|&e| on_card[e] == card)
+                        .map(|e| c.members[e].len())
+                        .sum()
+                };
+                accel::measured(
+                    accel::Split::ExpertsBackward,
+                    (rows(true), card_secs),
+                    (rows(false), cpu_secs),
+                );
+                let mut given: Vec<Option<(Aligned, Vec<f32>)>> = (0..ne).map(|_| None).collect();
+                for (e, g) in from_card.into_iter().chain(from_cpu) {
+                    given[e] = g;
+                }
+                given
+            }
+            None => chunks
+                .into_par_iter()
+                .map(|(e, grads)| self.expert_backward(m, c, d_out, e, grads))
+                .collect(),
+        };
+        let mut d_weight = vec![vec![0.0f32; k]; t];
+        for (e, given) in given.iter().enumerate() {
+            let Some((d_xin, dots)) = given else {
+                continue;
+            };
+            for (r, &(i, slot)) in c.members[e].iter().enumerate() {
+                d_weight[i][slot] = dots[r];
                 for j in 0..h {
                     dx[i * h + j] += d_xin[r * h + j];
                 }
@@ -2550,32 +2785,435 @@ impl Model {
         matmul_add_dx(dx, &d_logits, self.tensor(m.router, ne * h), t, h, ne);
     }
 
+    /// One routed expert's forward on the processor, over its tokens.
+    fn expert_forward(
+        &self,
+        m: MoeOffsets,
+        x: &[f32],
+        members: &[Vec<(usize, usize)>],
+        e: usize,
+    ) -> ExpertCache {
+        let cfg = &self.cfg;
+        let (h, fe) = (cfg.hidden, cfg.expert_ffn);
+        let rows = &members[e];
+        let m_n = rows.len();
+        let mut xin = Aligned::zeros(m_n * h);
+        for (r, &(i, _)) in rows.iter().enumerate() {
+            xin[r * h..(r + 1) * h].copy_from_slice(&x[i * h..(i + 1) * h]);
+        }
+        let mut gate = Aligned::zeros(m_n * fe);
+        let mut up = Aligned::zeros(m_n * fe);
+        matmul(
+            &mut gate,
+            &xin,
+            self.tensor(m.gate_exps + e * fe * h, fe * h),
+            m_n,
+            h,
+            fe,
+        );
+        matmul(
+            &mut up,
+            &xin,
+            self.tensor(m.up_exps + e * fe * h, fe * h),
+            m_n,
+            h,
+            fe,
+        );
+        let mut act = Aligned::zeros(m_n * fe);
+        for ((a, &g), &u) in act.iter_mut().zip(gate.iter()).zip(up.iter()) {
+            *a = silu(g) * u;
+        }
+        let mut out = Aligned::zeros(m_n * h);
+        matmul(
+            &mut out,
+            &act,
+            self.tensor(m.down_exps + e * h * fe, h * fe),
+            m_n,
+            fe,
+            h,
+        );
+        ExpertCache {
+            xin,
+            gate,
+            up,
+            act,
+            out,
+        }
+    }
+
+    /// One routed expert's backward on the processor: adds into its own
+    /// matrices' gradients, and gives back its tokens' input gradient and
+    /// the gradients of their weights.
+    fn expert_backward(
+        &self,
+        m: MoeOffsets,
+        c: &MoeCache,
+        d_out: &[f32],
+        e: usize,
+        (g_gate, g_up, g_down): ExpertGrads<'_>,
+    ) -> Option<(Aligned, Vec<f32>)> {
+        let cfg = &self.cfg;
+        let (h, fe) = (cfg.hidden, cfg.expert_ffn);
+        let rows = &c.members[e];
+        if rows.is_empty() {
+            return None;
+        }
+        let ec = &c.experts[e];
+        let m_n = rows.len();
+        let mut d_eout = Aligned::zeros(m_n * h);
+        let mut dots = vec![0.0f32; m_n];
+        for (r, &(i, slot)) in rows.iter().enumerate() {
+            let wgt = c.chosen[i][slot].1;
+            let dy = &d_out[i * h..(i + 1) * h];
+            let eo = &ec.out[r * h..(r + 1) * h];
+            let mut dot = 0.0f32;
+            for j in 0..h {
+                d_eout[r * h + j] = wgt * dy[j];
+                dot += dy[j] * eo[j];
+            }
+            dots[r] = dot;
+        }
+        let mut d_xin = Aligned::zeros(m_n * h);
+        swiglu_backward(
+            (
+                self.tensor(m.gate_exps + e * fe * h, fe * h),
+                self.tensor(m.up_exps + e * fe * h, fe * h),
+                self.tensor(m.down_exps + e * h * fe, h * fe),
+            ),
+            (g_gate, g_up, g_down),
+            (h, fe),
+            &ec.xin,
+            (&ec.gate, &ec.up, &ec.act),
+            &d_eout,
+            &mut d_xin,
+            m_n,
+        );
+        Some((d_xin, dots))
+    }
+
+    /// The routed experts' forward on a card: every expert's tokens stacked
+    /// in expert order, and each of the three products one dispatch over
+    /// all the experts.
+    fn experts_on_card(
+        &self,
+        card: &accel::Accel,
+        m: MoeOffsets,
+        x: &[f32],
+        members: &[Vec<(usize, usize)>],
+    ) -> Vec<ExpertCache> {
+        let cfg = &self.cfg;
+        let (h, ne, fe) = (cfg.hidden, cfg.experts, cfg.expert_ffn);
+        let (starts, total) = stack_starts(members);
+        let order: Vec<usize> = members.iter().flatten().map(|&(i, _)| i).collect();
+        let mut xin = Aligned::zeros(total * h);
+        xin.par_chunks_mut(h)
+            .zip(order.par_iter())
+            .for_each(|(row, &i)| row.copy_from_slice(&x[i * h..(i + 1) * h]));
+        let parts = |a_width: usize, b_size: usize, c_width: usize, depth: usize| {
+            members
+                .iter()
+                .enumerate()
+                .filter(|(_, rows)| !rows.is_empty())
+                .map(|(e, rows)| accel::Part {
+                    a: starts[e] * a_width,
+                    rows: rows.len(),
+                    b: e * b_size,
+                    c: starts[e] * c_width,
+                    depth,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut gate = Aligned::zeros(total * fe);
+        let mut up = Aligned::zeros(total * fe);
+        let into = parts(h, fe * h, fe, h);
+        for (out, w) in [(&mut gate, m.gate_exps), (&mut up, m.up_exps)] {
+            card.grouped(
+                out,
+                View {
+                    data: &xin,
+                    row: h,
+                    col: 1,
+                },
+                View {
+                    data: self.tensor(w, ne * fe * h),
+                    row: 1,
+                    col: h,
+                },
+                fe,
+                &into,
+                false,
+                true,
+            );
+        }
+        let mut act = Aligned::zeros(total * fe);
+        act.par_chunks_mut(fe)
+            .zip(gate.par_chunks(fe).zip(up.par_chunks(fe)))
+            .for_each(|(act, (gate, up))| {
+                for ((a, &g), &u) in act.iter_mut().zip(gate).zip(up) {
+                    *a = silu(g) * u;
+                }
+            });
+        let mut out = Aligned::zeros(total * h);
+        card.grouped(
+            &mut out,
+            View {
+                data: &act,
+                row: fe,
+                col: 1,
+            },
+            View {
+                data: self.tensor(m.down_exps, ne * h * fe),
+                row: 1,
+                col: fe,
+            },
+            h,
+            &parts(fe, h * fe, h, fe),
+            false,
+            true,
+        );
+        let take = |all: &Aligned, width: usize, e: usize| {
+            Aligned::from_slice(&all[starts[e] * width..(starts[e] + members[e].len()) * width])
+        };
+        (0..ne)
+            .into_par_iter()
+            .map(|e| ExpertCache {
+                xin: take(&xin, h, e),
+                gate: take(&gate, fe, e),
+                up: take(&up, fe, e),
+                act: take(&act, fe, e),
+                out: take(&out, h, e),
+            })
+            .collect()
+    }
+
+    /// The routed experts' backward on a card, for the experts `grads`
+    /// names, stacked as [`Self::experts_on_card`] stacks them: adds each
+    /// one's matrices' gradients into the slices given for it, and gives
+    /// back each one's input gradient and the gradients of its tokens'
+    /// weights.
+    fn experts_backward_on_card(
+        &self,
+        card: &accel::Accel,
+        m: MoeOffsets,
+        c: &MoeCache,
+        d_out: &[f32],
+        mut grads: Vec<(usize, ExpertGrads<'_>)>,
+    ) -> Vec<(usize, Option<ExpertGiven>)> {
+        let cfg = &self.cfg;
+        let (h, ne, fe) = (cfg.hidden, cfg.experts, cfg.expert_ffn);
+        grads.retain(|(e, _)| !c.members[*e].is_empty());
+        let used: Vec<usize> = grads.iter().map(|(e, _)| *e).collect();
+        let mut mine: Vec<Vec<(usize, usize)>> = vec![Vec::new(); ne];
+        for &e in &used {
+            mine[e] = c.members[e].clone();
+        }
+        let (starts, total) = stack_starts(&mine);
+        let stack = |width: usize, of: &dyn Fn(&ExpertCache) -> &Aligned| {
+            let mut all = Aligned::zeros(total * width);
+            for &e in &used {
+                let at = starts[e] * width;
+                all[at..at + mine[e].len() * width].copy_from_slice(of(&c.experts[e]));
+            }
+            all
+        };
+        let xin = stack(h, &|ec| &ec.xin);
+        let gate = stack(fe, &|ec| &ec.gate);
+        let up = stack(fe, &|ec| &ec.up);
+        let act = stack(fe, &|ec| &ec.act);
+        let out = stack(h, &|ec| &ec.out);
+        // Each routed row's output gradient, and the dot its weight's
+        // gradient is.
+        let rows: Vec<(usize, usize)> = mine.iter().flatten().copied().collect();
+        let mut d_eout = Aligned::zeros(total * h);
+        let mut dots = vec![0.0f32; total];
+        d_eout
+            .par_chunks_mut(h)
+            .zip(dots.par_iter_mut())
+            .enumerate()
+            .for_each(|(r, (d, dot))| {
+                let (i, slot) = rows[r];
+                let wgt = c.chosen[i][slot].1;
+                let dy = &d_out[i * h..(i + 1) * h];
+                let eo = &out[r * h..(r + 1) * h];
+                let mut sum = 0.0f32;
+                for j in 0..h {
+                    d[j] = wgt * dy[j];
+                    sum += dy[j] * eo[j];
+                }
+                *dot = sum;
+            });
+        // Rows of a stack against an expert's matrix.
+        let by_rows = |a_width: usize, b_size: usize, c_width: usize, depth: usize| {
+            used.iter()
+                .map(|&e| accel::Part {
+                    a: starts[e] * a_width,
+                    rows: mine[e].len(),
+                    b: e * b_size,
+                    c: starts[e] * c_width,
+                    depth,
+                })
+                .collect::<Vec<_>>()
+        };
+        // An expert's matrix gradient, summed over its rows; the `i`th
+        // product's result is the `i`th used expert's.
+        let by_matrix = |a_width: usize, rows: usize, b_width: usize, c_size: usize| {
+            used.iter()
+                .enumerate()
+                .map(|(i, &e)| accel::Part {
+                    a: starts[e] * a_width,
+                    rows,
+                    b: starts[e] * b_width,
+                    c: i * c_size,
+                    depth: mine[e].len(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let add_into = |dst: &mut [f32], got: &[f32]| {
+            for (o, v) in dst.iter_mut().zip(got) {
+                *o += v;
+            }
+        };
+        // out = act · Dᵀ: into D and into act.
+        card.grouped_with(
+            used.len() * h * fe,
+            View {
+                data: &d_eout,
+                row: 1,
+                col: h,
+            },
+            View {
+                data: &act,
+                row: fe,
+                col: 1,
+            },
+            fe,
+            &by_matrix(h, h, fe, h * fe),
+            false,
+            &mut |i, got| add_into(grads[i].1.2, got),
+        );
+        let mut d_act = Aligned::zeros(total * fe);
+        card.grouped(
+            &mut d_act,
+            View {
+                data: &d_eout,
+                row: h,
+                col: 1,
+            },
+            View {
+                data: self.tensor(m.down_exps, ne * h * fe),
+                row: fe,
+                col: 1,
+            },
+            fe,
+            &by_rows(h, h * fe, fe, h),
+            false,
+            true,
+        );
+        let mut d_gate = Aligned::zeros(total * fe);
+        let mut d_up = Aligned::zeros(total * fe);
+        d_gate
+            .par_chunks_mut(fe)
+            .zip(d_up.par_chunks_mut(fe))
+            .zip(d_act.par_chunks(fe))
+            .zip(gate.par_chunks(fe).zip(up.par_chunks(fe)))
+            .for_each(|(((d_gate, d_up), d_act), (gate, up))| {
+                for i in 0..d_act.len() {
+                    let g = gate[i];
+                    let s = sigmoid(g);
+                    d_up[i] = d_act[i] * silu(g);
+                    d_gate[i] = d_act[i] * up[i] * s * (1.0 + g * (1.0 - s));
+                }
+            });
+        // gate = x · Gᵀ, up = x · Uᵀ: into G, U and x.
+        let mut d_xin = Aligned::zeros(total * h);
+        for (which, w_at, dy) in [(0, m.gate_exps, &d_gate), (1, m.up_exps, &d_up)] {
+            card.grouped_with(
+                used.len() * fe * h,
+                View {
+                    data: dy,
+                    row: 1,
+                    col: fe,
+                },
+                View {
+                    data: &xin,
+                    row: h,
+                    col: 1,
+                },
+                h,
+                &by_matrix(fe, fe, h, fe * h),
+                false,
+                &mut |i, got| {
+                    let dst: &mut [f32] = if which == 0 {
+                        grads[i].1.0
+                    } else {
+                        grads[i].1.1
+                    };
+                    add_into(dst, got)
+                },
+            );
+            card.grouped(
+                &mut d_xin,
+                View {
+                    data: dy,
+                    row: fe,
+                    col: 1,
+                },
+                View {
+                    data: self.tensor(w_at, ne * fe * h),
+                    row: h,
+                    col: 1,
+                },
+                h,
+                &by_rows(fe, fe * h, h, fe),
+                which == 1,
+                true,
+            );
+        }
+        used.iter()
+            .map(|&e| {
+                let (from, len) = (starts[e], mine[e].len());
+                (
+                    e,
+                    Some((
+                        Aligned::from_slice(&d_xin[from * h..(from + len) * h]),
+                        dots[from..from + len].to_vec(),
+                    )),
+                )
+            })
+            .collect()
+    }
+
     /// One block's forward, over the streams `x`.
     fn layer_forward(&self, l: usize, x: &[f32], tokens: &[u32], t: usize) -> LayerCache {
         let o = self.layout.layers[l];
         // The n-gram embedding first, on its block.
         let ple = match (self.cfg.ple.as_ref(), o.ple) {
-            (Some(p), Some(po)) => Some(self.ple_forward(p, po, x, tokens)),
+            (Some(p), Some(po)) => Some(time(Stage::Ple, || self.ple_forward(p, po, x, tokens))),
             _ => None,
         };
         let x: &[f32] = ple.as_ref().map_or(x, |c| &c.out);
-        let (attn_in, attn_mix) = self.mix(o.hc_attn, x, t);
+        let (attn_in, attn_mix) = time(Stage::HcMix, || self.mix(o.hc_attn, x, t));
         let (attn_out, mixer) = match o.mixer {
             TokenMixer::Full(f) => {
-                let (out, c) = self.attn_forward(f, &attn_in, t);
+                let (out, c) = time(Stage::FullAttention, || self.attn_forward(f, &attn_in, t));
                 (out, MixerCache::Full(c))
             }
             TokenMixer::Linear(lo) => {
-                let (out, c) = self.delta_forward(lo, &attn_in, t);
+                let (out, c) = time(Stage::DeltaRule, || self.delta_forward(lo, &attn_in, t));
                 (out, MixerCache::Linear(c))
             }
         };
         let mut mid = Aligned::from_slice(x);
-        self.combine(&mut mid, &attn_out, &attn_mix.inject, t);
-        let (ffn_in, ffn_mix) = self.mix(o.hc_ffn, &mid, t);
-        let (ffn_out, moe) = self.moe_forward(o.moe, &ffn_in, t);
-        let mut out = mid.clone();
-        self.combine(&mut out, &ffn_out, &ffn_mix.inject, t);
+        time(Stage::HcCombine, || {
+            self.combine(&mut mid, &attn_out, &attn_mix.inject, t)
+        });
+        let (ffn_in, ffn_mix) = time(Stage::HcMix, || self.mix(o.hc_ffn, &mid, t));
+        let (ffn_out, moe) = time(Stage::Moe, || self.moe_forward(o.moe, &ffn_in, t));
+        let out = time(Stage::HcCombine, || {
+            let mut out = mid.clone();
+            self.combine(&mut out, &ffn_out, &ffn_mix.inject, t);
+            out
+        });
         LayerCache {
             ple,
             attn_mix,
@@ -2608,56 +3246,70 @@ impl Model {
         let x_in: &[f32] = c.ple.as_ref().map_or(x, |p| &p.out);
 
         // The feed-forward's out-mix and the feed-forward.
-        let (d_ffn_out, d_ffn_inject) =
-            self.combine_backward(dout, &c.ffn_out, &c.ffn_mix.inject, t);
+        let (d_ffn_out, d_ffn_inject) = time(Stage::HcCombineBackward, || {
+            self.combine_backward(dout, &c.ffn_out, &c.ffn_mix.inject, t)
+        });
         let mut d_mid = Aligned::from_slice(dout);
         let mut d_ffn_in = Aligned::zeros(t * h);
-        self.moe_backward(
-            o.moe,
-            &c.ffn_in,
-            &c.moe,
-            &d_ffn_out,
-            &mut d_ffn_in,
-            grads,
-            t,
-        );
-        self.mix_backward(
-            o.hc_ffn,
-            &c.mid,
-            &c.ffn_mix,
-            &d_ffn_in,
-            Some(&d_ffn_inject),
-            &mut d_mid,
-            grads,
-            t,
-        );
+        time(Stage::MoeBackward, || {
+            self.moe_backward(
+                o.moe,
+                &c.ffn_in,
+                &c.moe,
+                &d_ffn_out,
+                &mut d_ffn_in,
+                grads,
+                t,
+            )
+        });
+        time(Stage::HcMixBackward, || {
+            self.mix_backward(
+                o.hc_ffn,
+                &c.mid,
+                &c.ffn_mix,
+                &d_ffn_in,
+                Some(&d_ffn_inject),
+                &mut d_mid,
+                grads,
+                t,
+            )
+        });
 
         // The token mixer's out-mix and the token mixer.
-        let (d_attn_out, d_attn_inject) =
-            self.combine_backward(&d_mid, &c.attn_out, &c.attn_mix.inject, t);
+        let (d_attn_out, d_attn_inject) = time(Stage::HcCombineBackward, || {
+            self.combine_backward(&d_mid, &c.attn_out, &c.attn_mix.inject, t)
+        });
         let mut dx = d_mid;
         let mut d_attn_in = Aligned::zeros(t * h);
         match (o.mixer, &c.mixer) {
             (TokenMixer::Full(f), MixerCache::Full(ac)) => {
-                self.attn_backward(f, &c.attn_in, ac, &d_attn_out, &mut d_attn_in, grads, t)
+                time(Stage::FullAttentionBackward, || {
+                    self.attn_backward(f, &c.attn_in, ac, &d_attn_out, &mut d_attn_in, grads, t)
+                })
             }
             (TokenMixer::Linear(lo), MixerCache::Linear(dc)) => {
-                self.delta_backward(lo, &c.attn_in, dc, &d_attn_out, &mut d_attn_in, grads, t)
+                time(Stage::DeltaRuleBackward, || {
+                    self.delta_backward(lo, &c.attn_in, dc, &d_attn_out, &mut d_attn_in, grads, t)
+                })
             }
             _ => unreachable!("a block's cache is of its own kind"),
         }
-        self.mix_backward(
-            o.hc_attn,
-            x_in,
-            &c.attn_mix,
-            &d_attn_in,
-            Some(&d_attn_inject),
-            &mut dx,
-            grads,
-            t,
-        );
+        time(Stage::HcMixBackward, || {
+            self.mix_backward(
+                o.hc_attn,
+                x_in,
+                &c.attn_mix,
+                &d_attn_in,
+                Some(&d_attn_inject),
+                &mut dx,
+                grads,
+                t,
+            )
+        });
         if let (Some(p), Some(po), Some(pc)) = (self.cfg.ple.as_ref(), o.ple, c.ple.as_ref()) {
-            self.ple_backward(p, po, x, pc, &mut dx, grads, t);
+            time(Stage::PleBackward, || {
+                self.ple_backward(p, po, x, pc, &mut dx, grads, t)
+            });
         }
         dx
     }
@@ -2668,13 +3320,16 @@ impl Model {
         let cfg = &self.cfg;
         let (t, h, hc, w) = (tokens.len(), cfg.hidden, cfg.hc, cfg.wide());
         let embd = self.tensor(self.layout.tok_embd, cfg.vocab * h);
-        let mut x = Aligned::zeros(t * w);
-        for (i, &tok) in tokens.iter().enumerate() {
-            let row = &embd[tok as usize * h..(tok as usize + 1) * h];
-            for s in 0..hc {
-                x[i * w + s * h..i * w + (s + 1) * h].copy_from_slice(row);
+        let mut x = time(Stage::Embed, || {
+            let mut x = Aligned::zeros(t * w);
+            for (i, &tok) in tokens.iter().enumerate() {
+                let row = &embd[tok as usize * h..(tok as usize + 1) * h];
+                for s in 0..hc {
+                    x[i * w + s * h..i * w + (s + 1) * h].copy_from_slice(row);
+                }
             }
-        }
+            x
+        });
         for l in 0..cfg.layers {
             x = self.layer_forward(l, &x, tokens, t).out;
         }
@@ -2826,28 +3481,31 @@ impl Model {
             }
             x = c.out;
         }
-        let (collapsed, head_mix) = self.mix(self.layout.head, &x, t);
+        let (collapsed, head_mix) = time(Stage::HcMix, || self.mix(self.layout.head, &x, t));
         let out_w = self.tensor(self.layout.output, cfg.vocab * h);
-        let mut logits = Aligned::zeros(t * cfg.vocab);
-        matmul(&mut logits, &collapsed, out_w, t, h, cfg.vocab);
-        let inv = 1.0 / t as f32;
-        let mut loss = 0.0f64;
         let want = grads.is_some();
-        for (row, &target) in logits.chunks_mut(cfg.vocab).zip(targets) {
-            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for v in row.iter_mut() {
-                *v = (*v - max).exp();
-                sum += *v;
-            }
-            loss -= ((row[target as usize] / sum).max(f32::MIN_POSITIVE) as f64).ln();
-            if want {
+        let (logits, loss) = time(Stage::OutputHead, || {
+            let mut logits = Aligned::zeros(t * cfg.vocab);
+            matmul(&mut logits, &collapsed, out_w, t, h, cfg.vocab);
+            let inv = 1.0 / t as f32;
+            let mut loss = 0.0f64;
+            for (row, &target) in logits.chunks_mut(cfg.vocab).zip(targets) {
+                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
                 for v in row.iter_mut() {
-                    *v *= inv / sum;
+                    *v = (*v - max).exp();
+                    sum += *v;
                 }
-                row[target as usize] -= inv;
+                loss -= ((row[target as usize] / sum).max(f32::MIN_POSITIVE) as f64).ln();
+                if want {
+                    for v in row.iter_mut() {
+                        *v *= inv / sum;
+                    }
+                    row[target as usize] -= inv;
+                }
             }
-        }
+            (logits, loss)
+        });
         let loss = Loss {
             ce: (loss / t as f64) as f32,
             aux,
@@ -2855,42 +3513,53 @@ impl Model {
         };
         let Some(grads) = grads else { return loss };
 
-        matmul_add_dw(
-            grad_slice(grads, self.layout.output, cfg.vocab * h),
-            &logits,
-            &collapsed,
-            t,
-            h,
-            cfg.vocab,
-        );
-        let mut d_collapsed = Aligned::zeros(t * h);
-        matmul_add_dx(&mut d_collapsed, &logits, out_w, t, h, cfg.vocab);
+        let d_collapsed = time(Stage::OutputHeadBackward, || {
+            matmul_add_dw(
+                grad_slice(grads, self.layout.output, cfg.vocab * h),
+                &logits,
+                &collapsed,
+                t,
+                h,
+                cfg.vocab,
+            );
+            let mut d_collapsed = Aligned::zeros(t * h);
+            matmul_add_dx(&mut d_collapsed, &logits, out_w, t, h, cfg.vocab);
+            d_collapsed
+        });
         let mut dx = Aligned::zeros(t * w);
-        self.mix_backward(
-            self.layout.head,
-            &x,
-            &head_mix,
-            &d_collapsed,
-            None,
-            &mut dx,
-            grads,
-            t,
-        );
+        time(Stage::HcMixBackward, || {
+            self.mix_backward(
+                self.layout.head,
+                &x,
+                &head_mix,
+                &d_collapsed,
+                None,
+                &mut dx,
+                grads,
+                t,
+            )
+        });
         for l in (0..cfg.layers).rev() {
             dx = self.layer_backward(l, &inputs[l], tokens, &dx, t, grads);
         }
-        let d_embd = grad_slice(grads, self.layout.tok_embd, cfg.vocab * h);
-        for (i, &tok) in tokens.iter().enumerate() {
-            let row = &mut d_embd[tok as usize * h..(tok as usize + 1) * h];
-            for s in 0..hc {
-                for j in 0..h {
-                    row[j] += dx[i * w + s * h + j];
+        time(Stage::EmbedBackward, || {
+            let d_embd = grad_slice(grads, self.layout.tok_embd, cfg.vocab * h);
+            for (i, &tok) in tokens.iter().enumerate() {
+                let row = &mut d_embd[tok as usize * h..(tok as usize + 1) * h];
+                for s in 0..hc {
+                    for j in 0..h {
+                        row[j] += dx[i * w + s * h + j];
+                    }
                 }
             }
-        }
+        });
         loss
     }
 }
+
+/// One query's share of the indexer loss: its predicted and target
+/// distributions over the blocks, and the loss's terms in block order.
+type QueryLoss = (Vec<f32>, Vec<f32>, Vec<f64>);
 
 /// The smallest sum the chosen experts' probabilities are divided by.
 const WEIGHT_FLOOR: f32 = 6.103_515_6e-5;
@@ -2944,36 +3613,106 @@ struct MoeCache {
     aux: f32,
 }
 
-/// A SwiGLU's backward: `out = (silu(x·G) ⊙ x·U)·D` with `(G, U, D)` at
-/// `offsets`, widths `(hidden, inner)`. Adds the gradient of `x` into `dx`
-/// and of the three matrices into `grads`.
+/// A SwiGLU's backward: `out = (silu(x·G) ⊙ x·U)·D` with the matrices
+/// `(G, U, D)` and their gradients `grads`, widths `(hidden, inner)`. Adds
+/// the gradient of `x` into `dx` and of the three matrices into `grads`.
 #[allow(clippy::too_many_arguments)]
 fn swiglu_backward(
-    model: &Model,
-    (g_at, u_at, d_at): (usize, usize, usize),
+    (w_gate, w_up, w_down): (&[f32], &[f32], &[f32]),
+    (g_gate, g_up, g_down): (&mut [f32], &mut [f32], &mut [f32]),
     (h, f): (usize, usize),
     x: &[f32],
     (gate, up, act): (&[f32], &[f32], &[f32]),
     d_out: &[f32],
     dx: &mut [f32],
-    grads: &mut [f32],
     t: usize,
 ) {
-    matmul_add_dw(grad_slice(grads, d_at, h * f), d_out, act, t, f, h);
+    matmul_add_dw(g_down, d_out, act, t, f, h);
     let mut d_act = Aligned::zeros(t * f);
-    matmul_add_dx(&mut d_act, d_out, model.tensor(d_at, h * f), t, f, h);
+    matmul_add_dx(&mut d_act, d_out, w_down, t, f, h);
     let mut d_gate = Aligned::zeros(t * f);
     let mut d_up = Aligned::zeros(t * f);
-    for i in 0..t * f {
-        let g = gate[i];
-        let s = sigmoid(g);
-        d_up[i] = d_act[i] * silu(g);
-        d_gate[i] = d_act[i] * up[i] * s * (1.0 + g * (1.0 - s));
+    d_gate
+        .par_chunks_mut(f)
+        .zip(d_up.par_chunks_mut(f))
+        .zip(d_act.par_chunks(f))
+        .zip(gate.par_chunks(f).zip(up.par_chunks(f)))
+        .for_each(|(((d_gate, d_up), d_act), (gate, up))| {
+            for i in 0..d_act.len() {
+                let g = gate[i];
+                let s = sigmoid(g);
+                d_up[i] = d_act[i] * silu(g);
+                d_gate[i] = d_act[i] * up[i] * s * (1.0 + g * (1.0 - s));
+            }
+        });
+    for (grad, w, dy) in [(g_gate, w_gate, &d_gate), (g_up, w_up, &d_up)] {
+        matmul_add_dw(grad, dy, x, t, h, f);
+        matmul_add_dx(dx, dy, w, t, h, f);
     }
-    for (w_at, dy) in [(g_at, &d_gate), (u_at, &d_up)] {
-        matmul_add_dw(grad_slice(grads, w_at, f * h), dy, x, t, h, f);
-        matmul_add_dx(dx, dy, model.tensor(w_at, f * h), t, h, f);
+}
+
+/// One routed expert's gate, up and down gradients.
+type ExpertGrads<'a> = (&'a mut [f32], &'a mut [f32], &'a mut [f32]);
+
+/// What a routed expert's backward gives back: its tokens' input gradient
+/// and the gradients of their weights.
+type ExpertGiven = (Aligned, Vec<f32>);
+
+/// `body`'s result and the seconds it took.
+fn timed<T>(body: impl FnOnce() -> T) -> (T, f64) {
+    let started = std::time::Instant::now();
+    let out = body();
+    (out, started.elapsed().as_secs_f64())
+}
+
+/// Which experts go to the card: from the first, until the card holds
+/// `share` of the routed rows.
+fn split_experts(members: &[Vec<(usize, usize)>], share: f64) -> Vec<bool> {
+    let total: usize = members.iter().map(Vec::len).sum();
+    let goal = (total as f64 * share).round() as usize;
+    let mut taken = 0;
+    members
+        .iter()
+        .map(|rows| {
+            let take = taken < goal;
+            if take {
+                taken += rows.len();
+            }
+            take
+        })
+        .collect()
+}
+
+/// Where each expert's rows start when every expert's tokens are stacked
+/// in expert order, and how many rows there are in all.
+fn stack_starts(members: &[Vec<(usize, usize)>]) -> (Vec<usize>, usize) {
+    let mut starts = Vec::with_capacity(members.len());
+    let mut total = 0;
+    for rows in members {
+        starts.push(total);
+        total += rows.len();
     }
+    (starts, total)
+}
+
+/// Disjoint mutable views of `grads` at `(offset, len)` each, in the order
+/// asked for. Ranges that overlap are a layout error.
+fn regions<const N: usize>(grads: &mut [f32], at: [(usize, usize); N]) -> [&mut [f32]; N] {
+    let mut order: [usize; N] = std::array::from_fn(|i| i);
+    order.sort_by_key(|&i| at[i].0);
+    let mut out: [Option<&mut [f32]>; N] = std::array::from_fn(|_| None);
+    let mut rest = grads;
+    let mut taken = 0;
+    for &i in &order {
+        let (offset, len) = at[i];
+        assert!(offset >= taken, "gradient regions overlap");
+        let (_, tail) = rest.split_at_mut(offset - taken);
+        let (region, tail) = tail.split_at_mut(len);
+        out[i] = Some(region);
+        rest = tail;
+        taken = offset + len;
+    }
+    out.map(|r| r.expect("every region is taken"))
 }
 
 /// [`rope_partial`] on one row at position `pos`.
@@ -3103,35 +3842,74 @@ fn attention_selected_backward(
     let t = selection.len();
     let (qd, kvd, group) = (heads * hd, kv_heads * hd, heads / kv_heads);
     let scale = 1.0 / (hd as f32).sqrt();
+    // By query: its own gradient, and each score's gradient `ds`, per head.
     let mut dq = Aligned::zeros(t * qd);
-    let mut dk = Aligned::zeros(t * kvd);
-    let mut dv = Aligned::zeros(t * kvd);
-    for i in 0..t {
-        for h in 0..heads {
-            let kh = h / group;
-            let p = &probs[i * heads + h];
+    let ds: Vec<Vec<Vec<f32>>> = dq
+        .par_chunks_mut(qd)
+        .enumerate()
+        .map(|(i, dq)| {
             let sel = &selection[i];
-            let dc = &d_ctx[i * qd + h * hd..i * qd + (h + 1) * hd];
-            let dp: Vec<f32> = sel
-                .iter()
-                .map(|&j| {
-                    dc.iter()
-                        .zip(&v[j * kvd + kh * hd..j * kvd + (kh + 1) * hd])
-                        .map(|(a, b)| a * b)
-                        .sum()
+            (0..heads)
+                .map(|h| {
+                    let kh = h / group;
+                    let p = &probs[i * heads + h];
+                    let dc = &d_ctx[i * qd + h * hd..i * qd + (h + 1) * hd];
+                    let dp: Vec<f32> = sel
+                        .iter()
+                        .map(|&j| {
+                            dc.iter()
+                                .zip(&v[j * kvd + kh * hd..j * kvd + (kh + 1) * hd])
+                                .map(|(a, b)| a * b)
+                                .sum()
+                        })
+                        .collect();
+                    let inner: f32 = p.iter().zip(&dp).map(|(a, b)| a * b).sum();
+                    let ds: Vec<f32> = p
+                        .iter()
+                        .zip(&dp)
+                        .map(|(&p, &dp)| p * (dp - inner) * scale)
+                        .collect();
+                    let row = &mut dq[h * hd..(h + 1) * hd];
+                    for (&j, &ds) in sel.iter().zip(&ds) {
+                        for d in 0..hd {
+                            row[d] += ds * k[j * kvd + kh * hd + d];
+                        }
+                    }
+                    ds
                 })
-                .collect();
-            let inner: f32 = p.iter().zip(&dp).map(|(a, b)| a * b).sum();
-            for (n, &j) in sel.iter().enumerate() {
-                let ds = p[n] * (dp[n] - inner) * scale;
-                for d in 0..hd {
-                    dv[j * kvd + kh * hd + d] += p[n] * dc[d];
-                    dq[i * qd + h * hd + d] += ds * k[j * kvd + kh * hd + d];
-                    dk[j * kvd + kh * hd + d] += ds * q[i * qd + h * hd + d];
-                }
-            }
+                .collect()
+        })
+        .collect();
+
+    // By key: every query that selected it, in query order, and within a
+    // query its heads in order — each element takes its terms in the order
+    // a single pass over the queries gives them.
+    let mut readers: Vec<Vec<(usize, usize)>> = vec![Vec::new(); t];
+    for (i, sel) in selection.iter().enumerate() {
+        for (n, &j) in sel.iter().enumerate() {
+            readers[j].push((i, n));
         }
     }
+    let mut dk = Aligned::zeros(t * kvd);
+    let mut dv = Aligned::zeros(t * kvd);
+    dk.par_chunks_mut(kvd)
+        .zip(dv.par_chunks_mut(kvd))
+        .zip(readers.par_iter())
+        .for_each(|((dk, dv), readers)| {
+            for &(i, n) in readers {
+                for h in 0..heads {
+                    let kh = h / group;
+                    let p = probs[i * heads + h][n];
+                    let ds = ds[i][h][n];
+                    let dc = &d_ctx[i * qd + h * hd..i * qd + (h + 1) * hd];
+                    let qv = &q[i * qd + h * hd..i * qd + (h + 1) * hd];
+                    for d in 0..hd {
+                        dv[kh * hd + d] += p * dc[d];
+                        dk[kh * hd + d] += ds * qv[d];
+                    }
+                }
+            }
+        });
     (dq, dk, dv)
 }
 
@@ -3243,7 +4021,8 @@ struct PleCache {
     out: Aligned,
 }
 
-/// One value head's gradients from the recurrence, a token at a time.
+/// One value head's gradients from the recurrence, a token at a time, or a
+/// column block's share of them over a chunk.
 struct HeadGrads {
     q: Vec<f32>,
     k: Vec<f32>,
@@ -3252,11 +4031,81 @@ struct HeadGrads {
     decay: Vec<f32>,
 }
 
-/// One token of one head's gated delta rule, on its `[dim, dim]` state `S`
-/// (row `b` the key index, column `a` the value index): `S ← decay·S`,
-/// `d ← beta·(v − kᵀS)`, `S ← S + k dᵀ`, `out ← qᵀS`. `out` arrives zeroed.
-/// The engine's `delta_head_step`, summed in the same order.
+/// The columns of a head's state one block holds: two AVX vectors, so a
+/// block's running sums stay in registers and its state in the first-level
+/// cache, and a head splits into several blocks. Any width runs, through the
+/// portable kernels, when the head is not a multiple of it.
+const BLOCK: usize = 16;
+
+fn column_block(dim: usize) -> usize {
+    if dim.is_multiple_of(BLOCK) {
+        BLOCK
+    } else {
+        dim
+    }
+}
+
+/// One block's working set in the delta rule's backward, kept across its
+/// chunks.
+struct BlockWork {
+    g_state: Vec<f32>,
+    before: Vec<f32>,
+    scratch: Vec<f32>,
+    share: HeadGrads,
+}
+
+/// `delta_step_backward`'s scratch, in floats per row of the state.
+const STEP_SCRATCH: usize = 24;
+
+/// Whether the vector kernels take a block `cols` wide over `rows` rows.
+#[inline]
+#[cfg_attr(
+    not(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    )),
+    allow(dead_code)
+)]
+fn vector_block(rows: usize, cols: usize) -> bool {
+    cfg!(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    )) && cols == BLOCK
+        && rows.is_multiple_of(8)
+}
+
+/// One token of one head's gated delta rule, on a `[k.len(), out.len()]`
+/// block of its state `S` (row `b` the key index, column `a` the value
+/// index): `S ← decay·S`, `d ← beta·(v − kᵀS)`, `S ← S + k dᵀ`,
+/// `out ← qᵀS`. `out` arrives zeroed.
 fn delta_step(
+    state: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: f32,
+    decay: f32,
+    out: &mut [f32],
+) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    ))]
+    if vector_block(k.len(), out.len()) {
+        // SAFETY: AVX2 and FMA are enabled for this build, and the block is
+        // BLOCK columns over k.len() rows, as the slices' lengths say.
+        unsafe { avx::step(state, q, k, v, beta, decay, out) };
+        return;
+    }
+    delta_step_portable(state, q, k, v, beta, decay, out);
+}
+
+/// [`delta_step`] for any block, summed in the engine's `delta_head_step`
+/// order.
+fn delta_step_portable(
     state: &mut [f32],
     q: &[f32],
     k: &[f32],
@@ -3282,10 +4131,12 @@ fn delta_step(
     }
 }
 
-/// [`delta_step`]'s backward, from the state before the step, the
-/// gradient of its output, and `g_state` — the gradient of the state after
-/// the step, which becomes that of the state before it. Returns the
-/// gradients of `q`, `k`, `v`, `beta` and `decay`.
+/// [`delta_step`]'s backward on a block of columns, from the block's state
+/// before the step, the gradient of its output, and `g_state` — the
+/// gradient of the block after the step, which becomes that of the block
+/// before it. Writes the block's share of the `q` and `k` gradients and its
+/// columns of `v`'s; returns its share of the `beta` and `decay` ones.
+/// `scratch` holds [`STEP_SCRATCH`] floats per row.
 #[allow(clippy::too_many_arguments)]
 fn delta_step_backward(
     before: &[f32],
@@ -3296,41 +4147,61 @@ fn delta_step_backward(
     decay: f32,
     d_out: &[f32],
     g_state: &mut [f32],
-) -> (Vec<f32>, Vec<f32>, Vec<f32>, f32, f32) {
-    let dim = q.len();
-    // The step's intermediates again: S1 = decay·S0, kᵀS1, d, S2.
-    let s1: Vec<f32> = before.iter().map(|s| s * decay).collect();
-    let mut sk = vec![0.0f32; dim];
-    for (row, &kb) in s1.chunks_exact(dim).zip(k) {
-        for (s, ska) in row.iter().zip(sk.iter_mut()) {
-            *ska += kb * s;
+    grads: (&mut [f32], &mut [f32], &mut [f32]),
+    scratch: &mut [f32],
+) -> (f32, f32) {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx2",
+        target_feature = "fma"
+    ))]
+    if vector_block(k.len(), v.len()) {
+        // SAFETY: as in `delta_step`; the scratch is STEP_SCRATCH floats a
+        // row.
+        return unsafe {
+            avx::step_backward(before, q, k, v, beta, decay, d_out, g_state, grads, scratch)
+        };
+    }
+    let _ = scratch;
+    delta_step_backward_portable(before, q, k, v, beta, decay, d_out, g_state, grads)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn delta_step_backward_portable(
+    before: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: f32,
+    decay: f32,
+    d_out: &[f32],
+    g_state: &mut [f32],
+    (dq, dk, dv): (&mut [f32], &mut [f32], &mut [f32]),
+) -> (f32, f32) {
+    let cols = v.len();
+    // The step's intermediates again: S1 = decay·S0, kᵀS1, d.
+    let mut sk = vec![0.0f32; cols];
+    for (row, &kb) in before.chunks_exact(cols).zip(k) {
+        for (&s0, ska) in row.iter().zip(sk.iter_mut()) {
+            *ska += kb * (s0 * decay);
         }
     }
     let d: Vec<f32> = v.iter().zip(&sk).map(|(&va, &s)| beta * (va - s)).collect();
-    let mut s2 = s1.clone();
-    for (row, &ki) in s2.chunks_exact_mut(dim).zip(k) {
-        for (s, &dj) in row.iter_mut().zip(&d) {
-            *s += ki * dj;
-        }
-    }
-    // out = qᵀS2.
-    let mut dq = vec![0.0f32; dim];
-    for (i, (row, g_row)) in s2
-        .chunks_exact(dim)
-        .zip(g_state.chunks_exact_mut(dim))
+    // out = qᵀS2, S2 = S1 + k dᵀ: into q, the state, and k and d.
+    let mut dd = vec![0.0f32; cols];
+    for (i, (row, g_row)) in before
+        .chunks_exact(cols)
+        .zip(g_state.chunks_exact_mut(cols))
         .enumerate()
     {
         let mut acc = 0.0f32;
-        for ((&s, g), &da) in row.iter().zip(g_row.iter_mut()).zip(d_out) {
-            acc += da * s;
-            *g += q[i] * da;
+        for ((&s0, &dj), &da) in row.iter().zip(&d).zip(d_out) {
+            acc += da * (s0 * decay + k[i] * dj);
         }
         dq[i] = acc;
-    }
-    // S2 = S1 + k dᵀ.
-    let mut dk = vec![0.0f32; dim];
-    let mut dd = vec![0.0f32; dim];
-    for (i, g_row) in g_state.chunks_exact(dim).enumerate() {
+        for (g, &da) in g_row.iter_mut().zip(d_out) {
+            *g += q[i] * da;
+        }
         let mut acc = 0.0f32;
         for ((&g, &dj), ddj) in g_row.iter().zip(&d).zip(dd.iter_mut()) {
             acc += g * dj;
@@ -3340,33 +4211,254 @@ fn delta_step_backward(
     }
     // d = beta·(v − kᵀS1).
     let mut d_beta = 0.0f32;
-    let mut dv = vec![0.0f32; dim];
-    let mut dsk = vec![0.0f32; dim];
-    for a in 0..dim {
+    let mut dsk = vec![0.0f32; cols];
+    for a in 0..cols {
         d_beta += dd[a] * (v[a] - sk[a]);
         dv[a] = beta * dd[a];
         dsk[a] = -beta * dd[a];
     }
-    // kᵀS1, into S1's gradient and k's.
-    for (b, (row, g_row)) in s1
-        .chunks_exact(dim)
-        .zip(g_state.chunks_exact_mut(dim))
+    // kᵀS1 into S1's gradient and k's, then S1 = decay·S0.
+    let mut d_decay = 0.0f32;
+    for (b, (row, g_row)) in before
+        .chunks_exact(cols)
+        .zip(g_state.chunks_exact_mut(cols))
         .enumerate()
     {
         let mut acc = 0.0f32;
-        for ((&s, g), &dska) in row.iter().zip(g_row.iter_mut()).zip(&dsk) {
-            acc += dska * s;
+        for ((&s0, g), &dska) in row.iter().zip(g_row.iter_mut()).zip(&dsk) {
+            acc += dska * (s0 * decay);
             *g += k[b] * dska;
         }
         dk[b] += acc;
+        for (g, &s0) in g_row.iter_mut().zip(row) {
+            d_decay += *g * s0;
+            *g *= decay;
+        }
     }
-    // S1 = decay·S0.
-    let mut d_decay = 0.0f32;
-    for (g, &s0) in g_state.iter_mut().zip(before) {
-        d_decay += *g * s0;
-        *g *= decay;
+    (d_beta, d_decay)
+}
+
+/// The delta rule's step and its backward on a block of [`BLOCK`] columns,
+/// two AVX vectors a row, with every running sum in a register.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx2",
+    target_feature = "fma"
+))]
+mod avx {
+    use core::arch::x86_64::*;
+
+    /// The eight lane sums of eight vectors, as one vector.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    fn sums8(v: &[__m256; 8]) -> __m256 {
+        let a = _mm256_hadd_ps(v[0], v[1]);
+        let b = _mm256_hadd_ps(v[2], v[3]);
+        let c = _mm256_hadd_ps(v[4], v[5]);
+        let d = _mm256_hadd_ps(v[6], v[7]);
+        let e = _mm256_hadd_ps(a, b);
+        let f = _mm256_hadd_ps(c, d);
+        _mm256_add_ps(
+            _mm256_permute2f128_ps(e, f, 0x20),
+            _mm256_permute2f128_ps(e, f, 0x31),
+        )
     }
-    (dq, dk, dv, d_beta, d_decay)
+
+    /// The sum of one vector's lanes.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    fn sum(v: __m256) -> f32 {
+        let h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+        _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps(h, h, 1)))
+    }
+
+    /// Writes the lane sums of `rows` vectors, stored eight floats each in
+    /// `parts`, into `out`; adds them when `add`.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn reduce_rows(parts: &[f32], out: &mut [f32], add: bool) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            for (group, dst) in parts
+                .as_chunks::<64>()
+                .0
+                .iter()
+                .zip(out.as_chunks_mut::<8>().0)
+            {
+                let p = group.as_ptr();
+                let v = [
+                    _mm256_loadu_ps(p),
+                    _mm256_loadu_ps(p.add(8)),
+                    _mm256_loadu_ps(p.add(16)),
+                    _mm256_loadu_ps(p.add(24)),
+                    _mm256_loadu_ps(p.add(32)),
+                    _mm256_loadu_ps(p.add(40)),
+                    _mm256_loadu_ps(p.add(48)),
+                    _mm256_loadu_ps(p.add(56)),
+                ];
+                let mut s = sums8(&v);
+                if add {
+                    s = _mm256_add_ps(s, _mm256_loadu_ps(dst.as_ptr()));
+                }
+                _mm256_storeu_ps(dst.as_mut_ptr(), s);
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn step(
+        state: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta: f32,
+        decay: f32,
+        out: &mut [f32],
+    ) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let rows = k.len();
+            debug_assert!(state.len() == rows * 16 && q.len() == rows && v.len() == 16);
+            let s = state.as_mut_ptr();
+            let dv = _mm256_set1_ps(decay);
+            let (mut sk0, mut sk1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            for (b, &kb) in k.iter().enumerate() {
+                let p = s.add(b * 16);
+                let s0 = _mm256_mul_ps(_mm256_loadu_ps(p), dv);
+                let s1 = _mm256_mul_ps(_mm256_loadu_ps(p.add(8)), dv);
+                _mm256_storeu_ps(p, s0);
+                _mm256_storeu_ps(p.add(8), s1);
+                let kv = _mm256_set1_ps(kb);
+                sk0 = _mm256_fmadd_ps(kv, s0, sk0);
+                sk1 = _mm256_fmadd_ps(kv, s1, sk1);
+            }
+            let bv = _mm256_set1_ps(beta);
+            let d0 = _mm256_mul_ps(bv, _mm256_sub_ps(_mm256_loadu_ps(v.as_ptr()), sk0));
+            let d1 = _mm256_mul_ps(bv, _mm256_sub_ps(_mm256_loadu_ps(v.as_ptr().add(8)), sk1));
+            let (mut o0, mut o1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            for b in 0..rows {
+                let p = s.add(b * 16);
+                let kv = _mm256_set1_ps(*k.get_unchecked(b));
+                let qv = _mm256_set1_ps(*q.get_unchecked(b));
+                let s0 = _mm256_fmadd_ps(kv, d0, _mm256_loadu_ps(p));
+                let s1 = _mm256_fmadd_ps(kv, d1, _mm256_loadu_ps(p.add(8)));
+                _mm256_storeu_ps(p, s0);
+                _mm256_storeu_ps(p.add(8), s1);
+                o0 = _mm256_fmadd_ps(qv, s0, o0);
+                o1 = _mm256_fmadd_ps(qv, s1, o1);
+            }
+            let o = out.as_mut_ptr();
+            _mm256_storeu_ps(o, _mm256_add_ps(_mm256_loadu_ps(o), o0));
+            _mm256_storeu_ps(o.add(8), _mm256_add_ps(_mm256_loadu_ps(o.add(8)), o1));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2,fma")]
+    pub(super) unsafe fn step_backward(
+        before: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        beta: f32,
+        decay: f32,
+        d_out: &[f32],
+        g_state: &mut [f32],
+        (dq, dk, dv): (&mut [f32], &mut [f32], &mut [f32]),
+        scratch: &mut [f32],
+    ) -> (f32, f32) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let rows = k.len();
+            debug_assert!(before.len() == rows * 16 && g_state.len() == rows * 16);
+            debug_assert!(scratch.len() >= rows * super::STEP_SCRATCH);
+            let (s, g) = (before.as_ptr(), g_state.as_mut_ptr());
+            let (q_parts, rest) = scratch.split_at_mut(rows * 8);
+            let (k_parts, rest) = rest.split_at_mut(rows * 8);
+            let k_more = &mut rest[..rows * 8];
+            let dv_ = _mm256_set1_ps(decay);
+
+            // S1 = decay·S0, kᵀS1.
+            let (mut sk0, mut sk1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            for (b, &kb) in k.iter().enumerate() {
+                let p = s.add(b * 16);
+                let kv = _mm256_set1_ps(kb);
+                sk0 = _mm256_fmadd_ps(kv, _mm256_mul_ps(_mm256_loadu_ps(p), dv_), sk0);
+                sk1 = _mm256_fmadd_ps(kv, _mm256_mul_ps(_mm256_loadu_ps(p.add(8)), dv_), sk1);
+            }
+            let bv = _mm256_set1_ps(beta);
+            let (v0, v1) = (
+                _mm256_loadu_ps(v.as_ptr()),
+                _mm256_loadu_ps(v.as_ptr().add(8)),
+            );
+            let d0 = _mm256_mul_ps(bv, _mm256_sub_ps(v0, sk0));
+            let d1 = _mm256_mul_ps(bv, _mm256_sub_ps(v1, sk1));
+            let (o0, o1) = (
+                _mm256_loadu_ps(d_out.as_ptr()),
+                _mm256_loadu_ps(d_out.as_ptr().add(8)),
+            );
+
+            // out = qᵀS2 with S2 = S1 + k dᵀ: into q, the state, and k and d.
+            let (mut dd0, mut dd1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            for b in 0..rows {
+                let p = s.add(b * 16);
+                let gp = g.add(b * 16);
+                let kv = _mm256_set1_ps(*k.get_unchecked(b));
+                let qv = _mm256_set1_ps(*q.get_unchecked(b));
+                let s20 = _mm256_fmadd_ps(kv, d0, _mm256_mul_ps(_mm256_loadu_ps(p), dv_));
+                let s21 = _mm256_fmadd_ps(kv, d1, _mm256_mul_ps(_mm256_loadu_ps(p.add(8)), dv_));
+                _mm256_storeu_ps(
+                    q_parts.as_mut_ptr().add(b * 8),
+                    _mm256_fmadd_ps(o1, s21, _mm256_mul_ps(o0, s20)),
+                );
+                let g0 = _mm256_fmadd_ps(qv, o0, _mm256_loadu_ps(gp));
+                let g1 = _mm256_fmadd_ps(qv, o1, _mm256_loadu_ps(gp.add(8)));
+                _mm256_storeu_ps(gp, g0);
+                _mm256_storeu_ps(gp.add(8), g1);
+                _mm256_storeu_ps(
+                    k_parts.as_mut_ptr().add(b * 8),
+                    _mm256_fmadd_ps(g1, d1, _mm256_mul_ps(g0, d0)),
+                );
+                dd0 = _mm256_fmadd_ps(kv, g0, dd0);
+                dd1 = _mm256_fmadd_ps(kv, g1, dd1);
+            }
+            reduce_rows(q_parts, dq, false);
+
+            // d = beta·(v − kᵀS1).
+            let d_beta = sum(_mm256_fmadd_ps(
+                dd1,
+                _mm256_sub_ps(v1, sk1),
+                _mm256_mul_ps(dd0, _mm256_sub_ps(v0, sk0)),
+            ));
+            _mm256_storeu_ps(dv.as_mut_ptr(), _mm256_mul_ps(bv, dd0));
+            _mm256_storeu_ps(dv.as_mut_ptr().add(8), _mm256_mul_ps(bv, dd1));
+            let nb = _mm256_set1_ps(-beta);
+            let (dsk0, dsk1) = (_mm256_mul_ps(nb, dd0), _mm256_mul_ps(nb, dd1));
+
+            // kᵀS1 into S1's gradient and k's, then S1 = decay·S0.
+            let (mut dec0, mut dec1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
+            for b in 0..rows {
+                let p = s.add(b * 16);
+                let gp = g.add(b * 16);
+                let kv = _mm256_set1_ps(*k.get_unchecked(b));
+                let (a0, a1) = (_mm256_loadu_ps(p), _mm256_loadu_ps(p.add(8)));
+                _mm256_storeu_ps(
+                    k_more.as_mut_ptr().add(b * 8),
+                    _mm256_mul_ps(dv_, _mm256_fmadd_ps(dsk1, a1, _mm256_mul_ps(dsk0, a0))),
+                );
+                let g0 = _mm256_fmadd_ps(kv, dsk0, _mm256_loadu_ps(gp));
+                let g1 = _mm256_fmadd_ps(kv, dsk1, _mm256_loadu_ps(gp.add(8)));
+                dec0 = _mm256_fmadd_ps(g0, a0, dec0);
+                dec1 = _mm256_fmadd_ps(g1, a1, dec1);
+                _mm256_storeu_ps(gp, _mm256_mul_ps(g0, dv_));
+                _mm256_storeu_ps(gp.add(8), _mm256_mul_ps(g1, dv_));
+            }
+            reduce_rows(k_parts, dk, false);
+            reduce_rows(k_more, dk, true);
+            (d_beta, sum(_mm256_add_ps(dec0, dec1)))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3525,6 +4617,118 @@ pub(crate) mod tests {
         );
         assert_eq!(ours, theirs);
         assert_eq!(out_ours, out_theirs);
+    }
+
+    /// The vector kernels give the portable ones' step and backward, to
+    /// rounding, on a block of [`BLOCK`] columns.
+    #[test]
+    fn the_vector_step_is_the_portable_one() {
+        let rows = 32;
+        let wave =
+            |n: usize, k: f32| -> Vec<f32> { (0..n).map(|i| (i as f32 * k).sin()).collect() };
+        let (q, k, v, d_out) = (
+            wave(rows, 0.7),
+            wave(rows, 1.3),
+            wave(BLOCK, 0.4),
+            wave(BLOCK, 0.9),
+        );
+        let close = |a: &[f32], b: &[f32]| {
+            for (x, y) in a.iter().zip(b) {
+                assert!((x - y).abs() <= 1e-5 * x.abs().max(1.0), "{x} vs {y}");
+            }
+        };
+        let start = wave(rows * BLOCK, 0.21);
+        let (mut fast, mut slow) = (start.clone(), start.clone());
+        let (mut out_fast, mut out_slow) = (vec![0.0; BLOCK], vec![0.0; BLOCK]);
+        delta_step(&mut fast, &q, &k, &v, 0.6, 0.9, &mut out_fast);
+        delta_step_portable(&mut slow, &q, &k, &v, 0.6, 0.9, &mut out_slow);
+        close(&fast, &slow);
+        close(&out_fast, &out_slow);
+
+        let mut g_fast = wave(rows * BLOCK, 0.33);
+        let mut g_slow = g_fast.clone();
+        let mut fast = (vec![0.0; rows], vec![0.0; rows], vec![0.0; BLOCK]);
+        let mut slow = fast.clone();
+        let mut scratch = vec![0.0; STEP_SCRATCH * rows];
+        let a = delta_step_backward(
+            &start,
+            &q,
+            &k,
+            &v,
+            0.6,
+            0.9,
+            &d_out,
+            &mut g_fast,
+            (&mut fast.0, &mut fast.1, &mut fast.2),
+            &mut scratch,
+        );
+        let b = delta_step_backward_portable(
+            &start,
+            &q,
+            &k,
+            &v,
+            0.6,
+            0.9,
+            &d_out,
+            &mut g_slow,
+            (&mut slow.0, &mut slow.1, &mut slow.2),
+        );
+        close(&[a.0, a.1], &[b.0, b.1]);
+        close(&g_fast, &g_slow);
+        close(&fast.0, &slow.0);
+        close(&fast.1, &slow.1);
+        close(&fast.2, &slow.2);
+    }
+
+    /// The whole model on the card — every product, routed experts
+    /// included — gives the processor's loss and gradients, to rounding.
+    #[test]
+    fn the_card_trains_what_the_processor_trains() {
+        if accel::card().is_none() {
+            println!("no card; skipping");
+            return;
+        }
+        let model = Model::new(
+            Config {
+                experts_used: 4,
+                ..tiny()
+            },
+            17,
+        );
+        let vocab = model.cfg.vocab as u32;
+        let tokens: Vec<u32> = (0..40).map(|i| (i * 7) % vocab).collect();
+        let targets: Vec<u32> = tokens.iter().map(|t| (t + 1) % vocab).collect();
+        let on = |name: &'static str| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .thread_name(move |i| format!("{name}-{i}"))
+                .build()
+                .unwrap();
+            pool.install(|| {
+                let mut g = Aligned::zeros(model.layout.total);
+                let loss = model.forward_backward(&tokens, &targets, Some(&mut g));
+                (loss.objective(), g.to_vec())
+            })
+        };
+        let (cpu_loss, cpu) = on(accel::FORCE_CPU);
+        let (card_loss, card) = on(accel::FORCE_CARD);
+        assert!(
+            (cpu_loss - card_loss).abs() <= 1e-4 * cpu_loss.abs(),
+            "{cpu_loss} vs {card_loss}"
+        );
+        let scale = cpu.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        for spec in &model.layout.specs {
+            for at in spec.offset..spec.offset + spec.len() {
+                assert!(
+                    (cpu[at] - card[at]).abs() <= 1e-3 * scale,
+                    "{}[{}]: processor {}, card {}",
+                    spec.name,
+                    at - spec.offset,
+                    cpu[at],
+                    card[at]
+                );
+            }
+        }
     }
 
     /// Where the delta rule's backward keeps its state changes nothing: a
@@ -3834,7 +5038,7 @@ pub(crate) mod tests {
                 continue;
             }
             for at in (spec.offset..spec.offset + spec.len()).step_by(3) {
-                let eps = 1e-3f32;
+                let eps = 3e-4f32;
                 let original = model.params[at];
                 model.params[at] = original + eps;
                 let up = along(&spec.name, model.forward_backward(&tokens, &targets, None));

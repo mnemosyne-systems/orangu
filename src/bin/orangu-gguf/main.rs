@@ -47,10 +47,13 @@ use std::{
     time::Instant,
 };
 
+mod accel;
 mod aligned;
 mod auto;
 mod choose;
 mod corpus;
+mod cotrain;
+mod gemm;
 mod gpu;
 mod hf;
 mod imatrix;
@@ -61,6 +64,7 @@ mod manifest;
 mod model;
 mod model4;
 mod node;
+mod npu;
 mod optimize;
 mod pack;
 mod quant;
@@ -306,6 +310,8 @@ fn main() -> Result<()> {
     }
 
     stages::init();
+    stages::machine();
+    stages::phase("start");
 
     if args.list_quantizations {
         for ftype in Ftype::ALL {
@@ -884,8 +890,8 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
     );
     println!("output      {}", ftype.name());
     // The devices this machine offers, in the order this tool would use
-    // them. Training runs on the CPU today — see GGUF.md, T6, for the
-    // measurement that says why.
+    // them. Training sends its large matrix products to the discrete card
+    // (`accel`) and runs the rest on the CPU.
     let devices = gpu::devices();
     let usable: Vec<String> = devices
         .iter()
@@ -1061,6 +1067,7 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
             wikipedia_source: wikipedia_source.as_deref(),
             output: &output,
         };
+        stages::phase("corpus, tokenizer and tokens ready");
         let written = match shape {
             Shape::Dense(size) => {
                 train_and_write::<Model>(&run, Config::from_size(size, vocabulary.len(), context))?
@@ -1263,7 +1270,9 @@ fn train_and_write<N: Trained>(run: &Run, cfg: N::Config) -> Result<u64> {
                 println!("replacing the finished checkpoint at step {reached}");
             }
             let network = N::create(cfg, manifest.seed);
+            stages::phase("model initialized");
             let optimizer = train::Optimizer::new(N::parameters(network.config()));
+            stages::phase("optimizer state allocated");
             (network, optimizer, 0)
         };
     let parameters = N::parameters(network.config());
@@ -1295,10 +1304,10 @@ fn train_and_write<N: Trained>(run: &Run, cfg: N::Config) -> Result<u64> {
             run.checkpoint,
             start_step,
         )?;
-        if options.checkpoint_every == 0 {
-            train::save(run.checkpoint, &network, &optimizer, steps)?;
-        }
     }
+    // The last checkpoint: on its own thread, beside the model file, since
+    // neither changes the weights.
+    let final_checkpoint = !manifest.export_only;
 
     // 5. The model file.
     let metadata = |ftype| {
@@ -1313,49 +1322,61 @@ fn train_and_write<N: Trained>(run: &Run, cfg: N::Config) -> Result<u64> {
         out.extend(network.architecture_metadata());
         out
     };
-    match &manifest.calibration {
-        None => export(
-            run.output,
-            &network,
-            run.vocabulary,
-            metadata(run.ftype),
-            run.ftype,
-            &manifest.chat_template,
-        ),
-        // Measured as BF16 in the work directory, then written at the
-        // manifest's format fitted to what it measured.
-        Some(text) => {
-            let full = run
-                .work
-                .join(format!("{}-{}-BF16.gguf", manifest.name, run.size));
-            export(
-                &full,
-                &network,
-                run.vocabulary,
-                metadata(Ftype::Bf16),
-                Ftype::Bf16,
-                &manifest.chat_template,
-            )?;
-            let measured = imatrix::measure(
-                &full,
-                text,
-                Some(&run.work.join("calibration.imatrix.gguf")),
-            )?;
-            let matrix = imatrix::Loaded::open(&measured)?;
-            convert(
-                Some(run.output),
-                &full,
-                run.ftype,
-                Some(&matrix),
-                &optimize::Options::default(),
-                false,
-                &Layout::default(),
-            )?;
-            Ok(fs::metadata(run.output)
-                .with_context(|| format!("reading {}", run.output.display()))?
-                .len())
+    std::thread::scope(|scope| {
+        let saver = final_checkpoint
+            .then(|| scope.spawn(|| train::save(run.checkpoint, &network, &optimizer, steps)));
+        let written = (|| -> Result<u64> {
+            match &manifest.calibration {
+                None => export(
+                    run.output,
+                    &network,
+                    run.vocabulary,
+                    metadata(run.ftype),
+                    run.ftype,
+                    &manifest.chat_template,
+                ),
+                // Measured as BF16 in the work directory, then written at the
+                // manifest's format fitted to what it measured.
+                Some(text) => {
+                    let full = run
+                        .work
+                        .join(format!("{}-{}-BF16.gguf", manifest.name, run.size));
+                    export(
+                        &full,
+                        &network,
+                        run.vocabulary,
+                        metadata(Ftype::Bf16),
+                        Ftype::Bf16,
+                        &manifest.chat_template,
+                    )?;
+                    let measured = imatrix::measure(
+                        &full,
+                        text,
+                        Some(&run.work.join("calibration.imatrix.gguf")),
+                    )?;
+                    let matrix = imatrix::Loaded::open(&measured)?;
+                    convert(
+                        Some(run.output),
+                        &full,
+                        run.ftype,
+                        Some(&matrix),
+                        &optimize::Options::default(),
+                        false,
+                        &Layout::default(),
+                    )?;
+                    Ok(fs::metadata(run.output)
+                        .with_context(|| format!("reading {}", run.output.display()))?
+                        .len())
+                }
+            }
+        })();
+        if let Some(saver) = saver {
+            saver
+                .join()
+                .map_err(|_| anyhow::anyhow!("the checkpoint writer panicked"))??;
         }
-    }
+        written
+    })
 }
 
 /// Writes a trained model out at `ftype`.
@@ -1409,7 +1430,7 @@ fn export<N: Trained>(
     );
 
     imatrix::require(ftype, &plans, None)?;
-    write::write(
+    let written = write::write(
         path,
         &metadata,
         &plans,
@@ -1427,7 +1448,13 @@ fn export<N: Trained>(
             );
             let _ = std::io::Write::flush(&mut std::io::stdout());
         },
-    )
+    )?;
+    println!();
+    stages::phase(&format!(
+        "model file written, {:.0} MB",
+        written as f64 / 1e6
+    ));
+    Ok(written)
 }
 
 /// The general and provenance keys of a trained model.

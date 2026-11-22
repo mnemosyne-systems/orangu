@@ -37,7 +37,10 @@
 //! that does not grow with the feed-forward width, which is what makes a
 //! long sequence fit at all.
 
+use crate::accel;
 use crate::aligned::Aligned;
+use crate::gemm;
+use crate::npu;
 use crate::stages::{Stage, time};
 use rayon::prelude::*;
 use std::f32::consts::PI;
@@ -1137,6 +1140,13 @@ fn tile_rows() -> usize {
     })
 }
 
+/// Whether the three matmuls below run through `rten_gemm`
+/// (`ORANGU_GGUF_GEMM=rten`) rather than the kernels here.
+fn library() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ORANGU_GGUF_GEMM").as_deref() == Ok("rten"))
+}
+
 /// `y[t, n] = x[t, k] . w[n, k]` — the row-major weight layout a GGUF
 /// matrix already has, so no transpose is ever materialized.
 pub fn matmul(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
@@ -1144,6 +1154,53 @@ pub fn matmul(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize)
     debug_assert_eq!(y.len(), t * n);
     debug_assert_eq!(x.len(), t * k);
     debug_assert_eq!(w.len(), n * k);
+    if let Some(card) = accel::for_product(t, n, k) {
+        let x = gemm::View {
+            data: x,
+            row: k,
+            col: 1,
+        };
+        let w = gemm::View {
+            data: w,
+            row: 1,
+            col: k,
+        };
+        card.gemm(y, x, w, t, n, k, false, true);
+        return;
+    }
+    let _timer = match npu::for_product(t, n, k) {
+        npu::Choice::Npu(device) => {
+            let x = gemm::View {
+                data: x,
+                row: k,
+                col: 1,
+            };
+            let w = gemm::View {
+                data: w,
+                row: 1,
+                col: k,
+            };
+            if npu::gemm(device, y, x, w, t, n, k, false) {
+                return;
+            }
+            None
+        }
+        npu::Choice::Cpu(timer) => timer,
+    };
+    if library() {
+        let x = gemm::View {
+            data: x,
+            row: k,
+            col: 1,
+        };
+        let w = gemm::View {
+            data: w,
+            row: 1,
+            col: k,
+        };
+        gemm::library(y, x, w, t, n, k, false);
+        return;
+    }
     y.par_chunks_mut(n * rows_per_tile)
         .zip(x.par_chunks(k * rows_per_tile))
         .for_each(|(out_tile, in_tile)| tile(out_tile, in_tile, w, k, n));
@@ -1570,6 +1627,53 @@ pub(crate) fn matmul_add_dx(dx: &mut [f32], dy: &[f32], w: &[f32], t: usize, k: 
     debug_assert_eq!(dx.len(), t * k);
     debug_assert_eq!(dy.len(), t * n);
     debug_assert_eq!(w.len(), n * k);
+    if let Some(card) = accel::for_product(t, k, n) {
+        let dy = gemm::View {
+            data: dy,
+            row: n,
+            col: 1,
+        };
+        let w = gemm::View {
+            data: w,
+            row: k,
+            col: 1,
+        };
+        card.gemm(dx, dy, w, t, k, n, true, true);
+        return;
+    }
+    let _timer = match npu::for_product(t, k, n) {
+        npu::Choice::Npu(device) => {
+            let dy = gemm::View {
+                data: dy,
+                row: n,
+                col: 1,
+            };
+            let w = gemm::View {
+                data: w,
+                row: k,
+                col: 1,
+            };
+            if npu::gemm(device, dx, dy, w, t, k, n, true) {
+                return;
+            }
+            None
+        }
+        npu::Choice::Cpu(timer) => timer,
+    };
+    if library() {
+        let dy = gemm::View {
+            data: dy,
+            row: n,
+            col: 1,
+        };
+        let w = gemm::View {
+            data: w,
+            row: k,
+            col: 1,
+        };
+        gemm::library(dx, dy, w, t, k, n, true);
+        return;
+    }
     let slab = slab_rows(k);
     let per_task = task_rows(t, k);
     dx.par_chunks_mut(k * per_task)
@@ -1672,7 +1776,7 @@ fn dx_block<const R: usize>(
         // accumulator exactly as it was, and a branch that almost never
         // takes is worse than the multiply it skips.
         for (&scalar, sums) in scalars.iter().zip(acc.iter_mut()) {
-            let g = f32x8::splat(scalar);
+            let g = splat8(scalar);
             sums[0] = w0.mul_add(g, sums[0]);
             sums[1] = w1.mul_add(g, sums[1]);
         }
@@ -1716,7 +1820,7 @@ fn dw_block_strided<const R: usize>(
         let x0 = load8(&cell[..LANES]);
         let x1 = load8(&cell[LANES..]);
         for (&scalar, sums) in scalars.iter().zip(acc.iter_mut()) {
-            let g = f32x8::splat(scalar);
+            let g = splat8(scalar);
             sums[0] = x0.mul_add(g, sums[0]);
             sums[1] = x1.mul_add(g, sums[1]);
         }
@@ -1738,6 +1842,53 @@ pub(crate) fn matmul_add_dw(dw: &mut [f32], dy: &[f32], x: &[f32], t: usize, k: 
     debug_assert_eq!(dw.len(), n * k);
     debug_assert_eq!(dy.len(), t * n);
     debug_assert_eq!(x.len(), t * k);
+    if let Some(card) = accel::for_product(n, k, t) {
+        let dy = gemm::View {
+            data: dy,
+            row: 1,
+            col: n,
+        };
+        let x = gemm::View {
+            data: x,
+            row: k,
+            col: 1,
+        };
+        card.gemm(dw, dy, x, n, k, t, true, false);
+        return;
+    }
+    let _timer = match npu::for_product(n, k, t) {
+        npu::Choice::Npu(device) => {
+            let dy = gemm::View {
+                data: dy,
+                row: 1,
+                col: n,
+            };
+            let x = gemm::View {
+                data: x,
+                row: k,
+                col: 1,
+            };
+            if npu::gemm(device, dw, dy, x, n, k, t, true) {
+                return;
+            }
+            None
+        }
+        npu::Choice::Cpu(timer) => timer,
+    };
+    if library() {
+        let dy = gemm::View {
+            data: dy,
+            row: 1,
+            col: n,
+        };
+        let x = gemm::View {
+            data: x,
+            row: k,
+            col: 1,
+        };
+        gemm::library(dw, dy, x, n, k, t, true);
+        return;
+    }
     let slab = slab_rows(k);
     let per_task = task_rows(n, k);
     let gather = dw_gather();
@@ -1841,7 +1992,7 @@ fn dw_block<const R: usize>(
         let x0 = load8(&cell[..LANES]);
         let x1 = load8(&cell[LANES..]);
         for (&scalar, sums) in scalars.iter().zip(acc.iter_mut()) {
-            let g = f32x8::splat(scalar);
+            let g = splat8(scalar);
             sums[0] = x0.mul_add(g, sums[0]);
             sums[1] = x1.mul_add(g, sums[1]);
         }
@@ -1858,6 +2009,30 @@ fn dw_block<const R: usize>(
 #[inline(always)]
 fn store8(out: &mut [f32], v: f32x8) {
     out[..LANES].copy_from_slice(&v.to_array());
+}
+
+/// Eight copies of `value`.
+///
+/// The broadcast instruction itself where the target has one. Built from
+/// an array — `f32x8::splat`, or eight lanes written out — the backward
+/// kernels' row loop compiles it to eight scalar stores and a reload, and
+/// that loop is then not unrolled, so its accumulators stay on the stack.
+#[inline(always)]
+fn splat8(value: f32) -> f32x8 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx"))]
+    {
+        // SAFETY: AVX is enabled for this build, and `f32x8` is 32 bytes
+        // of eight `f32` lanes, as `__m256` is.
+        unsafe {
+            core::mem::transmute::<core::arch::x86_64::__m256, f32x8>(
+                core::arch::x86_64::_mm256_set1_ps(value),
+            )
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx")))]
+    {
+        f32x8::splat(value)
+    }
 }
 
 /// Loads eight consecutive floats. `copy_from_slice` of exactly eight
@@ -2805,6 +2980,57 @@ mod tests {
                 "{name}  dx {plain_dx:>6.1} -> {blocked_dx:>6.1} ({:>4.2}x, {dx_error:.0e})   dw {plain_dw:>6.1} -> {blocked_dw:>6.1} ({:>4.2}x, {dw_error:.0e})",
                 blocked_dx / plain_dx,
                 blocked_dw / plain_dw,
+            );
+        }
+    }
+
+    /// The forward and both backward matmuls at the shapes a `qwen4exp`
+    /// smoke pass calls them with, in GFLOP/s on the whole pool.
+    ///
+    ///   cargo test --release --bin orangu-gguf qwen4exp_matmul_shapes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn qwen4exp_matmul_shapes() {
+        let shapes: [(&str, usize, usize, usize); 11] = [
+            ("expert gate/up", 256, 768, 512),
+            ("expert down   ", 256, 512, 768),
+            ("shared gate/up", 1024, 768, 512),
+            ("attn q joint  ", 1024, 768, 1536),
+            ("delta qkv     ", 1024, 768, 2048),
+            ("router        ", 1024, 768, 16),
+            ("delta beta    ", 1024, 768, 8),
+            ("hc inject     ", 1024, 1536, 2),
+            ("hc down       ", 1024, 1536, 64),
+            ("hc up         ", 1024, 64, 1536),
+            ("output head   ", 1024, 768, 8192),
+        ];
+        for (name, t, k, n) in shapes {
+            let x: Vec<f32> = (0..t * k).map(|i| ((i % 17) as f32 - 8.0) * 0.01).collect();
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.01)
+                .collect();
+            let dy: Vec<f32> = (0..t * n)
+                .map(|i| ((i % 29) as f32 - 14.0) * 0.01)
+                .collect();
+            let flop = 2.0 * t as f64 * k as f64 * n as f64;
+            let passes = 20;
+            let time = |f: &mut dyn FnMut()| {
+                f();
+                let start = std::time::Instant::now();
+                for _ in 0..passes {
+                    f();
+                }
+                let seconds = start.elapsed().as_secs_f64() / passes as f64;
+                (flop / seconds / 1e9, seconds * 1e3)
+            };
+            let mut y = vec![0f32; t * n];
+            let mut dx = vec![0f32; t * k];
+            let mut dw = vec![0f32; n * k];
+            let (fwd, fwd_ms) = time(&mut || matmul(&mut y, &x, &w, t, k, n));
+            let (bdx, bdx_ms) = time(&mut || matmul_add_dx(&mut dx, &dy, &w, t, k, n));
+            let (bdw, bdw_ms) = time(&mut || matmul_add_dw(&mut dw, &dy, &x, t, k, n));
+            println!(
+                "{name} t {t:>4} k {k:>4} n {n:>4}  forward {fwd:>6.1} ({fwd_ms:>6.2} ms)  dx {bdx:>6.1} ({bdx_ms:>6.2} ms)  dw {bdw:>6.1} ({bdw_ms:>6.2} ms)"
             );
         }
     }

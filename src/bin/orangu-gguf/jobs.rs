@@ -143,7 +143,17 @@ impl Bytes {
         self.u64(v.len() as u64);
         self.raw(v.as_bytes());
     }
-    fn tokens(&mut self, v: &[u32]) {
+    /// A length and the bytes.
+    pub fn blob(&mut self, v: &[u8]) {
+        self.u64(v.len() as u64);
+        self.raw(v);
+    }
+    /// A count and the floats.
+    pub fn floats(&mut self, v: &[f32]) {
+        self.u64(v.len() as u64);
+        self.raw(bytemuck::cast_slice(v));
+    }
+    pub fn tokens(&mut self, v: &[u32]) {
         self.u64(v.len() as u64);
         for t in v {
             self.0.extend_from_slice(&t.to_le_bytes());
@@ -162,7 +172,7 @@ impl<'a> Reader<'a> {
         self.0 = rest;
         Ok(head)
     }
-    fn u64(&mut self) -> Result<u64> {
+    pub fn u64(&mut self) -> Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into()?))
     }
     fn f64(&mut self) -> Result<f64> {
@@ -182,7 +192,23 @@ impl<'a> Reader<'a> {
         let n = self.len(1)?;
         Ok(String::from_utf8(self.take(n)?.to_vec())?)
     }
-    fn tokens(&mut self) -> Result<Vec<u32>> {
+    /// What [`Bytes::blob`] wrote.
+    pub fn blob(&mut self) -> Result<&'a [u8]> {
+        let n = self.len(1)?;
+        self.take(n)
+    }
+    /// What [`Bytes::floats`] wrote.
+    pub fn floats(&mut self) -> Result<Vec<f32>> {
+        let n = self.len(4)?;
+        Ok(self
+            .take(n * 4)?
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect())
+    }
+    pub fn tokens(&mut self) -> Result<Vec<u32>> {
         let n = self.len(4)?;
         Ok(self
             .take(n * 4)?
@@ -335,6 +361,7 @@ pub enum Session {
     Imatrix(Measurer),
     Perplexity(Scorer),
     Quantize(Box<Source>),
+    Train(Box<dyn crate::cotrain::Trainee>),
 }
 
 /// A source model a node encodes rows of, and the last tensor it read,
@@ -411,6 +438,20 @@ pub fn call(link: &mut Claimed, name: &str, data: Vec<u8>) -> Result<Vec<u8>> {
 /// A node's answer to one [`Message::Job`].
 pub fn serve(session: &mut Session, name: &str, data: &[u8]) -> Result<Vec<u8>> {
     let mut r = Reader(data);
+    if let Some(job) = name.strip_prefix("train-") {
+        let mut held = match std::mem::take(session) {
+            Session::Train(t) => Some(t),
+            other => {
+                *session = other;
+                None
+            }
+        };
+        let answer = crate::cotrain::serve(&mut held, job, &mut r);
+        if let Some(t) = held {
+            *session = Session::Train(t);
+        }
+        return answer;
+    }
     match name {
         "open" => {
             let job = r.string()?;
@@ -814,7 +855,8 @@ mod tests {
         let model = model4::Model::new(model4::tests::tiny(), 5);
         model4::tests::write_f32(&model, &path);
         let vocab = model.cfg.vocab;
-        let windows: Vec<Vec<u32>> = (0..7)
+        // Enough windows that a node slow to open the model still gets some.
+        let windows: Vec<Vec<u32>> = (0..28)
             .map(|w| (0..16).map(|i| ((w * 7 + i * 3) % vocab) as u32).collect())
             .collect();
         let scorer = Scorer::open(&path).unwrap();
@@ -822,12 +864,14 @@ mod tests {
         open.string("perplexity");
         ModelRef::of(&path).unwrap().encode(&mut open);
         open.u64(16);
-        let workers: Vec<_> = (0..2)
-            .map(|_| Worker::start(settings(0)).unwrap().1)
-            .collect();
         let top = settings(0);
         let at = |nodes: usize| -> (Tally, Report) {
-            let found: Vec<_> = workers[..nodes - 1]
+            // Fresh workers each time: a released worker frees itself on its
+            // own thread, after the top has moved on.
+            let workers: Vec<_> = (0..nodes - 1)
+                .map(|_| Worker::start(settings(0)).unwrap().1)
+                .collect();
+            let found: Vec<_> = workers
                 .iter()
                 .map(|addr| {
                     orangu::workers::channel::probe(
@@ -867,7 +911,7 @@ mod tests {
             (tally, report)
         };
         let (one, _) = at(1);
-        assert_eq!(one.count, 7 * 7);
+        assert_eq!(one.count, 28 * 7);
         for nodes in [2, 3] {
             let (many, report) = at(nodes);
             assert_eq!(

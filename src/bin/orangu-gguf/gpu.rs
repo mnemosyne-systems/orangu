@@ -63,7 +63,7 @@ fn classify(kind: wgpu::DeviceType) -> Class {
     }
 }
 
-fn instance() -> wgpu::Instance {
+pub fn instance() -> wgpu::Instance {
     wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -95,12 +95,9 @@ pub fn devices() -> Vec<Device> {
     found
 }
 
-/// A device and the one pipeline this module runs on it.
-///
-/// Not on the training path — see the module comment and `GGUF.md`'s T6
-/// for the measurement that keeps it off. It is kept, and kept tested,
-/// because the device policy above is a requirement and because the
-/// numbers a real implementation has to beat came from exactly this code.
+/// A device and the one naive pipeline this module runs on it: the whole
+/// cost of upload, dispatch and read-back, for measuring. Training's
+/// products run through `accel`.
 #[allow(dead_code)]
 pub struct Gpu {
     pub device: Device,

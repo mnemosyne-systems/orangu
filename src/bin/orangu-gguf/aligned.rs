@@ -35,6 +35,7 @@
 //! vector load is inside the allocation.
 
 use bytemuck::{Pod, Zeroable};
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 
@@ -148,7 +149,21 @@ impl Aligned {
         let lines = len.div_ceil(Line::FLOATS);
         let mut buffer = take(lines).unwrap_or_else(|| Vec::with_capacity(lines));
         buffer.clear();
-        buffer.resize(lines, Line([0.0; Line::FLOATS]));
+        if lines < PARALLEL_LINES {
+            buffer.resize(lines, Line([0.0; Line::FLOATS]));
+        } else {
+            // A model's parameters, gradients and moments run to
+            // gigabytes: zeroed by every core, not one.
+            buffer.spare_capacity_mut()[..lines]
+                .par_chunks_mut(PARALLEL_LINES)
+                .for_each(|chunk| {
+                    for line in chunk {
+                        line.write(Line([0.0; Line::FLOATS]));
+                    }
+                });
+            // SAFETY: the first `lines` elements were just written.
+            unsafe { buffer.set_len(lines) };
+        }
         Aligned { lines: buffer, len }
     }
 
@@ -160,6 +175,9 @@ impl Aligned {
         out
     }
 }
+
+/// Lines past which [`Aligned::zeros`] fills in parallel.
+const PARALLEL_LINES: usize = 1 << 16;
 
 impl Drop for Aligned {
     fn drop(&mut self) {

@@ -53,7 +53,7 @@ pub const DEFAULT_PORT: u16 = 8401;
 pub const DEFAULT_SERVER_PORT: u16 = 8400;
 
 /// The jobs a gguf node takes.
-pub const CAPABILITIES: [&str; 3] = ["imatrix", "perplexity", "quantize"];
+pub const CAPABILITIES: [&str; 4] = ["imatrix", "perplexity", "quantize", "train"];
 
 /// The busiest a node may be and still be claimed.
 pub const MAX_LOAD: f32 = 0.8;
@@ -728,7 +728,9 @@ mod tests {
         );
         let found = found_at(&s, addr);
         assert!(claim(&s, "b", std::slice::from_ref(&found), "imatrix").is_empty());
-        assert_eq!(claim(&s, "a", &[found], "imatrix").len(), 1);
+        // Held until the check: dropping the claim releases the worker.
+        let claimed = claim(&s, "a", &[found], "imatrix");
+        assert_eq!(claimed.len(), 1);
         assert_eq!(worker.working_for().as_deref(), Some("a"));
     }
 }

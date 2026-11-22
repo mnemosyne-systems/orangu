@@ -432,12 +432,14 @@ mod tests {
             })
             .collect();
 
-        let workers: Vec<_> = (0..2)
-            .map(|_| Worker::start(settings()).unwrap().1)
-            .collect();
         let hash = orangu::workers::channel::channel_hash("spread", Some("s"));
         for nodes in [2, 3] {
-            let found: Vec<_> = workers[..nodes - 1]
+            // Fresh workers each time: a released worker frees itself on its
+            // own thread, after the top has moved on.
+            let workers: Vec<_> = (0..nodes - 1)
+                .map(|_| Worker::start(settings()).unwrap().1)
+                .collect();
+            let found: Vec<_> = workers
                 .iter()
                 .map(|addr| orangu::workers::channel::probe(*addr, &hash, None).unwrap())
                 .collect();

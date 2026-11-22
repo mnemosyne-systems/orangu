@@ -288,7 +288,88 @@ impl Drop for Reporter {
     }
 }
 
-/// Runs training to completion, checkpointing as it goes.
+/// How many of a batch's sequences run at once: as many as the memory
+/// available holds a gradient buffer for, past the first, with a quarter
+/// again for each one's activations. Half of what is free is spent, and
+/// all of the batch where the free memory cannot be read.
+fn sequences_at_once(batch: usize, parameters: usize) -> usize {
+    let per = parameters as u64 * 4 * 5 / 4;
+    match available_memory() {
+        Some(free) => (1 + (free / 2 / per.max(1)) as usize).clamp(1, batch.max(1)),
+        None => batch.max(1),
+    }
+}
+
+/// One step's gradient into `grads`, which is zero on the way in: each of
+/// `windows` (`sequence + 1` tokens) passed from zero and the results added
+/// in window order, so the sum is the same however many run at once.
+/// `at_once` of them run side by side, the first of a step straight into
+/// `grads` and the others into `spare`. `counted` is called after each.
+/// Returns each window's loss, in order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn batch_gradient<N: Network>(
+    model: &N,
+    windows: &[Vec<u32>],
+    sequence: usize,
+    grads: &mut [f32],
+    spare: &mut [Aligned],
+    at_once: usize,
+    counted: &(dyn Fn() + Sync),
+) -> Vec<f32> {
+    let mut losses = Vec::with_capacity(windows.len());
+    let mut next = 0;
+    while next < windows.len() {
+        let direct = next == 0;
+        let room = (spare.len() + usize::from(direct)).min(at_once).max(1);
+        let group = &windows[next..(next + room).min(windows.len())];
+        let used = group.len() - usize::from(direct);
+        let mut targets: Vec<&mut [f32]> = Vec::with_capacity(group.len());
+        if direct {
+            targets.push(&mut grads[..]);
+        }
+        for buffer in spare[..used].iter_mut() {
+            buffer.fill(0.0);
+            targets.push(&mut buffer[..]);
+        }
+        losses.extend(
+            targets
+                .par_iter_mut()
+                .zip(group.par_iter())
+                .map(|(target, window)| {
+                    let loss = model.pass(&window[..sequence], &window[1..], Some(&mut **target));
+                    counted();
+                    loss
+                })
+                .collect::<Vec<f32>>(),
+        );
+        drop(targets);
+        time(Stage::GradientFold, || {
+            for buffer in &spare[..used] {
+                grads
+                    .par_chunks_mut(1 << 16)
+                    .zip(buffer.par_chunks(1 << 16))
+                    .for_each(|(sum, part)| {
+                        for (s, p) in sum.iter_mut().zip(part) {
+                            *s += p;
+                        }
+                    });
+            }
+        });
+        next += group.len();
+    }
+    losses
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in bytes.
+fn available_memory() -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
+    let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kib * 1024)
+}
+
+/// Runs training to completion, checkpointing every `checkpoint_every` steps
+/// as it goes; the last step's checkpoint is left to the caller.
 pub fn run<N: Network>(
     model: &mut N,
     optimizer: &mut Optimizer,
@@ -308,7 +389,22 @@ pub fn run<N: Network>(
     let validation_start = total - ((total as f64 * VALIDATION_SHARE) as usize).max(need);
     let train_limit = validation_start - need;
 
-    let mut grads = Aligned::zeros(model.specs().iter().map(TensorSpec::len).sum());
+    let len: usize = model.specs().iter().map(TensorSpec::len).sum();
+    let mut grads = Aligned::zeros(len);
+    let at_once = sequences_at_once(options.batch, len);
+    // One buffer for each sequence that runs beside the first; always one
+    // when there is more than one sequence, so a step can make progress.
+    let mut spare: Vec<Aligned> = (0..at_once
+        .saturating_sub(1)
+        .max(usize::from(options.batch > 1)))
+        .map(|_| Aligned::zeros(len))
+        .collect();
+    if at_once > 1 {
+        println!(
+            "{at_once} of the batch's {} sequences run at once",
+            options.batch
+        );
+    }
     let mut rng = Rng::new(options.seed ^ 0x5EED_0000 ^ start_step);
     let started = Instant::now();
     let status = Arc::new(Mutex::new(Status {
@@ -332,20 +428,97 @@ pub fn run<N: Network>(
 
     // The steps that are reported on are the ones asked for; anything
     // before the loop is setup, not a step.
+    if let Some(card) = crate::accel::card() {
+        println!("large matrix products on {}", card.device.name);
+    }
+    if let Some(npu) = crate::npu::npu() {
+        println!(
+            "matrix products shared with the NPU ({} cores) where it measures faster",
+            npu.cores()
+        );
+    }
+    // The channel's gguf nodes free to train take sequences of every step.
+    let mut links = crate::jobs::claim_for("train");
+    let names: Vec<String> = std::iter::once(crate::jobs::HERE.to_string())
+        .chain(links.iter().map(|l| l.found.name.clone()))
+        .collect();
+    let mut by_node = vec![0usize; names.len()];
+    // Copies a card kept of any earlier weights at these addresses are not
+    // these.
+    crate::accel::weights_changed();
     stages::reset();
+    stages::phase("training starts");
+    // The step whose checkpoint is still to be written.
+    let mut pending: Option<u64> = None;
     for step in start_step..options.steps {
         time(Stage::GradientZero, || grads.fill(0.0));
+        // The step's gradient is each sequence's own, taken from zero, added
+        // up in sequence order: the same sum however many run at once.
+        let starts: Vec<usize> = (0..options.batch)
+            .map(|_| (rng.next_u64() % train_limit as u64) as usize)
+            .collect();
+        let windows: Vec<Vec<u32>> = starts.iter().map(|&at| tokens.window(at, need)).collect();
+        // A checkpoint the last step asked for is written while this one
+        // computes its gradient, which only reads the weights; the update
+        // below waits for it.
+        let (losses, saved) = std::thread::scope(|scope| {
+            let (reading, moments) = (&*model, &*optimizer);
+            let saver = pending
+                .take()
+                .map(|at| scope.spawn(move || save(checkpoint, reading, moments, at)));
+            // Counted per sequence rather than per step: at the sizes where a
+            // step takes minutes, a step is too coarse a thing to measure a
+            // rate with.
+            let counted = || {
+                let mut status = status.lock().unwrap_or_else(|e| e.into_inner());
+                status.tokens += options.sequence as u64;
+                status.total += options.sequence as u64;
+            };
+            let losses = if links.is_empty() {
+                Ok(batch_gradient(
+                    reading,
+                    &windows,
+                    options.sequence,
+                    &mut grads,
+                    &mut spare,
+                    at_once,
+                    &counted,
+                ))
+            } else {
+                let present: Vec<String> = links.iter().map(|l| l.found.name.clone()).collect();
+                crate::cotrain::step(
+                    reading,
+                    &mut links,
+                    &windows,
+                    options.sequence,
+                    &mut grads,
+                    &mut spare,
+                    at_once,
+                    &counted,
+                )
+                .map(|(losses, ran)| {
+                    by_node[0] += ran[0];
+                    for (name, count) in present.iter().zip(&ran[1..]) {
+                        if let Some(at) = names.iter().position(|n| n == name) {
+                            by_node[at] += count;
+                        }
+                    }
+                    losses
+                })
+            };
+            let saved = saver.map(|s| {
+                s.join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("the checkpoint writer panicked")))
+            });
+            (losses, saved)
+        });
+        if let Some(saved) = saved {
+            saved?;
+        }
+        let losses = losses?;
         let mut loss = 0.0f32;
-        for _ in 0..options.batch {
-            let at = (rng.next_u64() % train_limit as u64) as usize;
-            let window = tokens.window(at, need);
-            loss += model.pass(&window[..options.sequence], &window[1..], Some(&mut grads));
-            // Counted per sequence rather than per step: at the sizes where
-            // a step takes minutes, a step is too coarse a thing to measure
-            // a rate with.
-            let mut status = status.lock().unwrap_or_else(|e| e.into_inner());
-            status.tokens += options.sequence as u64;
-            status.total += options.sequence as u64;
+        for l in losses {
+            loss += l;
         }
         loss /= options.batch as f32;
 
@@ -371,7 +544,9 @@ pub fn run<N: Network>(
             )
         });
 
+        crate::accel::weights_changed();
         let done = step + 1;
+        stages::phase(&format!("step {done} done, loss {loss:.4}"));
         {
             let mut status = status.lock().unwrap_or_else(|e| e.into_inner());
             status.done = done;
@@ -388,10 +563,13 @@ pub fn run<N: Network>(
             status.tokens = 0;
             status.window = Instant::now();
         }
+        // The last step's checkpoint is the caller's, written beside the
+        // model file.
         if options.checkpoint_every > 0
-            && (done % options.checkpoint_every == 0 || done == options.steps)
+            && done % options.checkpoint_every == 0
+            && done < options.steps
         {
-            save(checkpoint, model, optimizer, done)?;
+            pending = Some(done);
         }
     }
 
@@ -406,7 +584,15 @@ pub fn run<N: Network>(
         "{}",
         status.line(started, options.steps, start_step, status.done)
     );
+    if names.len() > 1 {
+        for (name, count) in names.iter().zip(&by_node) {
+            println!("train: {name} ran {count} sequences");
+        }
+    }
     print!("{}", stages::report(started.elapsed().as_secs_f64()));
+    if at_once > 1 && stages::enabled() {
+        println!("(stage times add up over the {at_once} sequences that run at once)");
+    }
     Ok(())
 }
 
@@ -428,7 +614,7 @@ pub fn validate<N: Network>(model: &N, tokens: &Tokens, start: usize, options: &
 
 /// A model the loop trains: its tensors, its parameters, one pass, and its
 /// shape as a checkpoint carries it.
-pub trait Network: Sized {
+pub trait Network: Sized + Sync {
     type Config: Clone + PartialEq + std::fmt::Debug;
     /// The checkpoint's version field: which model it holds.
     const KIND: u32;
@@ -517,6 +703,11 @@ pub fn save<N: Network>(path: &Path, model: &N, optimizer: &Optimizer, step: u64
     }
     fs::rename(&temporary, path)
         .with_context(|| format!("renaming {} into place", temporary.display()))?;
+    let written = fs::metadata(path).map_or(0, |m| m.len());
+    stages::phase(&format!(
+        "checkpoint at step {step} written, {:.0} MB",
+        written as f64 / 1e6
+    ));
     Ok(())
 }
 
@@ -624,6 +815,12 @@ fn read_config(input: &mut impl Read) -> Result<Config> {
 
 fn write_floats(out: &mut impl Write, values: &[f32]) -> Result<()> {
     out.write_all(&(values.len() as u64).to_le_bytes())?;
+    // A little-endian float's bytes are its file bytes: written where they
+    // lie.
+    if cfg!(target_endian = "little") {
+        out.write_all(bytemuck::cast_slice(values))?;
+        return Ok(());
+    }
     // Chunked rather than one allocation the size of the model.
     let mut buffer = Vec::with_capacity(1 << 20);
     for chunk in values.chunks(1 << 18) {
@@ -698,6 +895,53 @@ pub fn format_rate(tokens_per_second: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step's gradient and losses are the same, to the bit, whether its
+    /// sequences run one at a time or several at once.
+    #[test]
+    fn a_step_is_the_same_however_many_sequences_run_at_once() {
+        let model = crate::model4::Model::new(crate::model4::tests::tiny(), 3);
+        let vocab = model.cfg.vocab;
+        let sequence = 24;
+        let windows: Vec<Vec<u32>> = (0..4)
+            .map(|w| {
+                (0..=sequence)
+                    .map(|i| ((w * 13 + i * 7 + i * i) % vocab) as u32)
+                    .collect()
+            })
+            .collect();
+        let len: usize = model.specs().iter().map(TensorSpec::len).sum();
+        let step = |at_once: usize| {
+            let mut grads = Aligned::zeros(len);
+            let mut spare: Vec<Aligned> = (0..at_once.saturating_sub(1).max(1))
+                .map(|_| Aligned::zeros(len))
+                .collect();
+            let losses = batch_gradient(
+                &model,
+                &windows,
+                sequence,
+                &mut grads,
+                &mut spare,
+                at_once,
+                &|| {},
+            );
+            (grads.to_vec(), losses)
+        };
+        let (one, losses) = step(1);
+        assert!(one.iter().any(|g| *g != 0.0));
+        for at_once in 2..=4 {
+            let (many, many_losses) = step(at_once);
+            assert_eq!(
+                many.iter().map(|g| g.to_bits()).collect::<Vec<_>>(),
+                one.iter().map(|g| g.to_bits()).collect::<Vec<_>>(),
+                "{at_once} at once"
+            );
+            assert_eq!(
+                many_losses.iter().map(|l| l.to_bits()).collect::<Vec<_>>(),
+                losses.iter().map(|l| l.to_bits()).collect::<Vec<_>>()
+            );
+        }
+    }
 
     fn options(steps: u64) -> Options {
         Options {

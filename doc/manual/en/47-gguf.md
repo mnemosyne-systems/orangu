@@ -987,8 +987,8 @@ channel 'lab': 3 nodes
 
 kind    name                         address                state        load  does
 server  10.0.0.5:8400                10.0.0.5:8400          free           3%  serves unsloth/Qwen3-8B-GGUF Q4_K_M
-gguf    10.0.0.6:8401                10.0.0.6:8401          free           0%  imatrix, perplexity, quantize
-gguf    10.0.0.7:8401                10.0.0.7:8401          working      100%  imatrix, perplexity, quantize
+gguf    10.0.0.6:8401                10.0.0.6:8401          free           0%  imatrix, perplexity, quantize, train
+gguf    10.0.0.7:8401                10.0.0.7:8401          working      100%  imatrix, perplexity, quantize, train
 ```
 
 A gguf node is claimed by the rules a server's workers are: a top about to
@@ -1037,6 +1037,23 @@ round trip and bandwidth are timed when the run starts.
 
 At the end, the run prints how many tensors of each type were divided and
 how many pieces each node encoded.
+
+**Training** divides each step's sequences. At the start of every step the
+top sends each claimed node the model's configuration and parameters; each
+node then takes the step's sequences one at a time, and the top takes as
+many at once as it runs side by side alone, so a faster node runs more of
+them. A sequence's gradient is computed from zero
+and sent back whole, and the step's gradient is the sum of the sequences'
+gradients in sequence order, alone or divided. On nodes with the same kind
+of CPU and with every product on the CPU, one, two or three nodes therefore
+write the same checkpoints and the same model. A node that is lost has its
+sequence run on the top, and the run continues without it. Each step moves
+the parameters to every node and one gradient back per sequence a node
+runs. When no sequence is left to start, the top also runs the ones the
+nodes are still at; a node whose sequence the top finishes first is
+released with a `train: … released` line, so a node whose link or
+processor costs more than it gives leaves the run after one step. At the
+end the run prints how many sequences each node ran.
 
 `--perplexity TEXT` with `-m MODEL` prints the perplexity of the model over
 the text: windows of 512 tokens, each scored from its middle on, on the

@@ -33,8 +33,13 @@
 //! ```
 //!
 //! prints a table at the end of the run: seconds in each stage, its share,
-//! and how many times it was entered.
+//! and how many times it was entered. It also prints a line as each phase
+//! of a run ends — setup, every step, the checkpoint, the model file — with
+//! the time since the run started, how many cores were busy since the line
+//! before, and the memory in use, so a run on another machine can be read
+//! from its log alone.
 
+use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -62,6 +67,23 @@ pub enum Stage {
     GradientZero,
     GradientNorm,
     Optimizer,
+    Ple,
+    PleBackward,
+    HcMix,
+    HcMixBackward,
+    HcCombine,
+    HcCombineBackward,
+    FullAttention,
+    FullAttentionBackward,
+    Indexer,
+    IndexerBackward,
+    DeltaRule,
+    DeltaRuleBackward,
+    Moe,
+    MoeBackward,
+    OutputHead,
+    OutputHeadBackward,
+    GradientFold,
 }
 
 impl Stage {
@@ -86,6 +108,23 @@ impl Stage {
         Stage::GradientZero,
         Stage::GradientNorm,
         Stage::Optimizer,
+        Stage::Ple,
+        Stage::PleBackward,
+        Stage::HcMix,
+        Stage::HcMixBackward,
+        Stage::HcCombine,
+        Stage::HcCombineBackward,
+        Stage::FullAttention,
+        Stage::FullAttentionBackward,
+        Stage::Indexer,
+        Stage::IndexerBackward,
+        Stage::DeltaRule,
+        Stage::DeltaRuleBackward,
+        Stage::Moe,
+        Stage::MoeBackward,
+        Stage::OutputHead,
+        Stage::OutputHeadBackward,
+        Stage::GradientFold,
     ];
 
     pub fn name(self) -> &'static str {
@@ -110,11 +149,28 @@ impl Stage {
             Stage::GradientZero => "gradient zero",
             Stage::GradientNorm => "gradient norm",
             Stage::Optimizer => "optimizer",
+            Stage::Ple => "ple",
+            Stage::PleBackward => "ple backward",
+            Stage::HcMix => "hc mix",
+            Stage::HcMixBackward => "hc mix backward",
+            Stage::HcCombine => "hc combine",
+            Stage::HcCombineBackward => "hc combine bwd",
+            Stage::FullAttention => "full attention",
+            Stage::FullAttentionBackward => "full attn backward",
+            Stage::Indexer => "indexer",
+            Stage::IndexerBackward => "indexer backward",
+            Stage::DeltaRule => "delta rule",
+            Stage::DeltaRuleBackward => "delta rule bwd",
+            Stage::Moe => "moe",
+            Stage::MoeBackward => "moe backward",
+            Stage::OutputHead => "output head",
+            Stage::OutputHeadBackward => "output head bwd",
+            Stage::GradientFold => "gradient fold",
         }
     }
 }
 
-const COUNT: usize = 20;
+const COUNT: usize = 37;
 
 static NANOS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
 static CALLS: [AtomicU64; COUNT] = [const { AtomicU64::new(0) }; COUNT];
@@ -134,19 +190,156 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// When the run started, and the process's CPU seconds at the last phase
+/// line and when it was printed.
+struct Clock {
+    start: Instant,
+    last: Instant,
+    cpu: f64,
+}
+
+static CLOCK: std::sync::Mutex<Option<Clock>> = std::sync::Mutex::new(None);
+
+/// The process's user and system CPU seconds.
+fn cpu_seconds() -> Option<f64> {
+    let stat = std::fs::read_to_string("/proc/self/stat").ok()?;
+    // The command name may hold spaces; the fields count from after it.
+    let fields: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let utime: f64 = fields.get(11)?.parse().ok()?;
+    let stime: f64 = fields.get(12)?.parse().ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    Some((utime + stime) / ticks)
+}
+
+/// A `/proc/meminfo` or `/proc/self/status` field, in bytes.
+fn kib_field(path: &str, key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let line = text.lines().find(|l| l.starts_with(key))?;
+    Some(line.split_whitespace().nth(1)?.parse::<u64>().ok()? * 1024)
+}
+
+fn gib(bytes: Option<u64>) -> String {
+    bytes.map_or_else(
+        || "?".into(),
+        |b| format!("{:.1} GiB", b as f64 / (1u64 << 30) as f64),
+    )
+}
+
+/// One line about the machine, at the start of a run.
+pub fn machine() {
+    if !enabled() {
+        return;
+    }
+    let mut simd = Vec::new();
+    #[cfg(target_arch = "x86_64")]
+    {
+        for (name, on) in [
+            ("sse4.2", std::arch::is_x86_feature_detected!("sse4.2")),
+            ("avx2", std::arch::is_x86_feature_detected!("avx2")),
+            ("fma", std::arch::is_x86_feature_detected!("fma")),
+            ("avx512f", std::arch::is_x86_feature_detected!("avx512f")),
+        ] {
+            if on {
+                simd.push(name);
+            }
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        for (name, on) in [
+            ("neon", std::arch::is_aarch64_feature_detected!("neon")),
+            (
+                "dotprod",
+                std::arch::is_aarch64_feature_detected!("dotprod"),
+            ),
+            ("fp16", std::arch::is_aarch64_feature_detected!("fp16")),
+            ("sve", std::arch::is_aarch64_feature_detected!("sve")),
+        ] {
+            if on {
+                simd.push(name);
+            }
+        }
+    }
+    let mut built = Vec::new();
+    for (name, on) in [
+        ("avx2", cfg!(target_feature = "avx2")),
+        ("fma", cfg!(target_feature = "fma")),
+        ("neon", cfg!(target_feature = "neon")),
+    ] {
+        if on {
+            built.push(name);
+        }
+    }
+    println!(
+        "machine: {} with {} cores, {} threads in the pool; cpu has {}; built for {}; memory {} of which {} available",
+        std::env::consts::ARCH,
+        std::thread::available_parallelism().map_or(0, |n| n.get()),
+        rayon::current_num_threads(),
+        simd.join(" "),
+        if built.is_empty() {
+            "the baseline".to_string()
+        } else {
+            built.join(" ")
+        },
+        gib(kib_field("/proc/meminfo", "MemTotal:")),
+        gib(kib_field("/proc/meminfo", "MemAvailable:")),
+    );
+}
+
+/// Prints `[seconds] what` with the cores busy since the last such line and
+/// the memory in use, when the instrument is on.
+pub fn phase(what: &str) {
+    if !enabled() {
+        return;
+    }
+    let now = Instant::now();
+    let cpu = cpu_seconds().unwrap_or(0.0);
+    let mut clock = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let c = clock.get_or_insert(Clock {
+        start: now,
+        last: now,
+        cpu,
+    });
+    let wall = now.duration_since(c.last).as_secs_f64();
+    let busy = if wall > 0.0 {
+        (cpu - c.cpu) / wall
+    } else {
+        0.0
+    };
+    println!(
+        "[{:>9.1}s] {what}  ({wall:.1} s, {busy:.1} cores busy, resident {}, available {})",
+        now.duration_since(c.start).as_secs_f64(),
+        gib(kib_field("/proc/self/status", "VmRSS:")),
+        gib(kib_field("/proc/meminfo", "MemAvailable:")),
+    );
+    c.last = now;
+    c.cpu = cpu;
+}
+
+thread_local! {
+    /// Time charged so far to stages run inside the current one, on this
+    /// thread.
+    static INNER: Cell<u64> = const { Cell::new(0) };
+}
+
 /// Runs `body`, charging its elapsed time to `stage`.
 ///
 /// Elapsed, not CPU: the point is to catch a stage that is slow *because*
-/// it is narrow, and CPU time cannot see that at all.
+/// it is narrow, and CPU time cannot see that at all. A stage timed inside
+/// another on the same thread is charged to itself only, and taken out of
+/// the one around it, so the stages add up to the pass however they nest.
 #[inline]
 pub fn time<T>(stage: Stage, body: impl FnOnce() -> T) -> T {
     if !enabled() {
         return body();
     }
+    let outer = INNER.with(|inner| inner.replace(0));
     let started = Instant::now();
     let out = body();
     let elapsed = started.elapsed().as_nanos() as u64;
-    NANOS[stage as usize].fetch_add(elapsed, Ordering::Relaxed);
+    let nested = INNER.with(|inner| inner.replace(outer + elapsed));
+    NANOS[stage as usize].fetch_add(elapsed.saturating_sub(nested), Ordering::Relaxed);
     CALLS[stage as usize].fetch_add(1, Ordering::Relaxed);
     out
 }

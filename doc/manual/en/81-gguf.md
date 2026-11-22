@@ -306,6 +306,27 @@ half a percent of samples and 5.4% of the clock. Read the two together —
 the profiler says which code, the table says whether it is slow because it
 is *slow* or slow because it is *narrow*.
 
+### Devices
+
+Training runs on every processor core and shares its matrix products with
+the accelerators the machine has:
+
+- **A discrete graphics card** takes the large products, and the routed
+  experts of a mixture-of-experts layer are divided between it and the
+  processor in proportion to the speed each side measures.
+- **A Rockchip NPU** multiplies in fp16 with fp32 sums, each operand
+  scaled by a power of two so small gradients keep their precision. Each
+  product shape is timed on the NPU and on the processor, and from then on
+  runs on whichever was faster.
+
+| Variable | Effect |
+|---|---|
+| `ORANGU_GGUF_DEVICE=cpu` | Keep every product on the processor. |
+| `ORANGU_GGUF_CARD_MIN_MFLOP` | Smallest product sent to the card, in MFLOP. |
+| `ORANGU_GGUF_CARD_RESIDENT_MIB` | Card memory for weights kept between products. |
+| `ORANGU_GGUF_NPU_MIN_MFLOP` | Smallest product offered to the NPU, in MFLOP. |
+| `ORANGU_NPU_WEIGHTS_GB` | NPU memory for product buffers, in GiB. |
+
 ## The writer's invariant
 
 Every tensor's data offset follows from the types and shapes alone, so the
