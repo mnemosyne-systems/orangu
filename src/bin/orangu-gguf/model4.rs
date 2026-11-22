@@ -2545,9 +2545,9 @@ impl Model {
             .map(|(hv, gr)| {
                 let a = -a_log[hv].exp();
                 let mut sum = 0.0f32;
-                for i in 0..t {
+                for (i, &decay_i) in gr.decay.iter().enumerate().take(t) {
                     let at = i * nv + hv;
-                    let dl = gr.decay[i] * c.decay[at];
+                    let dl = decay_i * c.decay[at];
                     sum += dl * softplus(c.g[at]) * a;
                 }
                 sum

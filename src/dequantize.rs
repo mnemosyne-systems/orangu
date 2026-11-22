@@ -818,6 +818,10 @@ pub fn unpack_block_pq2_0_scalar(qs: &[u8], w: &mut [i8; QK_PRISM]) {
 /// per token, and the scalar form above decoded them at 0.2 tok/s with
 /// 87% of the profile in the unpack — the kernel was not multiplying, it
 /// was shifting bytes one at a time.
+///
+/// # Safety
+///
+/// The CPU must support NEON, which every `aarch64` CPU does.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 pub unsafe fn unpack_block_pq2_0_neon(qs: &[u8], w: &mut [i8; QK_PRISM]) {

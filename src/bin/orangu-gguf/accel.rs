@@ -85,8 +85,8 @@ const DEPTH: u32 = 16u;
 
 // [term][row] and [term][column], so the inner loop reads four
 // consecutive floats of each.
-var<workgroup> ta: array<vec4<f32>, 256>;
-var<workgroup> tb: array<vec4<f32>, 256>;
+var<workgroup> ta: array<f32, 1024>;
+var<workgroup> tb: array<f32, 1024>;
 var<workgroup> mine: Group;
 
 @compute @workgroup_size(16, 16)
@@ -119,7 +119,7 @@ fn main(
             let term = first + q;
             var v = 0.0;
             if (row < g.rows && term < g.depth) { v = a[g.a + row * dims.a_row + term * dims.a_col]; }
-            ta[q * 16u + r / 4u][r % 4u] = v;
+            ta[q * 64u + r] = v;
 
             var j: u32; var s: u32;
             if (dims.b_row == 1u) { j = flat / DEPTH; s = flat % DEPTH; }
@@ -128,12 +128,14 @@ fn main(
             let term_b = first + s;
             var u = 0.0;
             if (col < dims.n && term_b < g.depth) { u = b[g.b + term_b * dims.b_row + col * dims.b_col]; }
-            tb[s * 16u + j / 4u][j % 4u] = u;
+            tb[s * 64u + j] = u;
         }
         workgroupBarrier();
         for (var q = 0u; q < DEPTH; q = q + 1u) {
-            let av = ta[q * 16u + local.y];
-            let bv = tb[q * 16u + local.x];
+            let base_a = q * 64u + local.y * 4u;
+            let av = vec4<f32>(ta[base_a], ta[base_a + 1u], ta[base_a + 2u], ta[base_a + 3u]);
+            let base_b = q * 64u + local.x * 4u;
+            let bv = vec4<f32>(tb[base_b], tb[base_b + 1u], tb[base_b + 2u], tb[base_b + 3u]);
             acc0 = fma(vec4<f32>(av.x), bv, acc0);
             acc1 = fma(vec4<f32>(av.y), bv, acc1);
             acc2 = fma(vec4<f32>(av.z), bv, acc2);
@@ -707,6 +709,27 @@ pub fn for_product(m: usize, n: usize, p: usize) -> Option<&'static Accel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gemm_wgsl_is_valid() {
+        let module = naga::front::wgsl::parse_str(GEMM_WGSL).expect("valid WGSL");
+        let info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("validates");
+        let mut out = String::new();
+        let options = naga::back::msl::Options {
+            lang_version: (2, 4),
+            ..Default::default()
+        };
+        let pipeline = naga::back::msl::PipelineOptions::default();
+        let mut writer = naga::back::msl::Writer::new(&mut out);
+        writer
+            .write(&module, &info, &options, &pipeline)
+            .expect("Metal translation");
+    }
 
     fn wave(n: usize, k: f32) -> Vec<f32> {
         (0..n).map(|i| (i as f32 * k).sin()).collect()

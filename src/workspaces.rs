@@ -69,9 +69,17 @@ pub fn normalize_path(path: &Path) -> PathBuf {
             Component::Prefix(prefix) => result.push(prefix.as_os_str()),
             Component::RootDir => result.push(Path::new("/")),
             Component::CurDir => {}
-            Component::ParentDir => {
-                result.pop();
-            }
+            Component::ParentDir => match result.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    result.pop();
+                }
+                Some(Component::RootDir) => {}
+                _ => {
+                    if !path.has_root() {
+                        result.push("..");
+                    }
+                }
+            },
             Component::Normal(part) => result.push(part),
         }
     }
@@ -300,9 +308,58 @@ impl<W: WorkspacePath> WorkspaceManager<W> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Workspace, WorkspaceManager, WorkspacePath, WorkspacePlacement, resolve_workspace_root,
+        Workspace, WorkspaceManager, WorkspacePath, WorkspacePlacement, normalize_path,
+        resolve_workspace_root,
     };
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn normalize_path_preserves_leading_parent_components() {
+        assert_eq!(
+            normalize_path(Path::new("../foo")),
+            Path::new("..").join("foo")
+        );
+        assert_eq!(
+            normalize_path(Path::new("../../bar")),
+            Path::new("..").join("..").join("bar")
+        );
+        assert_eq!(
+            normalize_path(Path::new("a/../../b")),
+            Path::new("..").join("b")
+        );
+        assert_eq!(
+            normalize_path(Path::new("a/b/../c")),
+            Path::new("a").join("c")
+        );
+        assert_eq!(normalize_path(Path::new("a/../b")), PathBuf::from("b"));
+        assert_eq!(normalize_path(Path::new("a/./b")), Path::new("a").join("b"));
+        assert_eq!(normalize_path(Path::new("./foo")), PathBuf::from("foo"));
+        assert_eq!(normalize_path(Path::new("..")), PathBuf::from(".."));
+        assert_eq!(
+            normalize_path(Path::new("../..")),
+            Path::new("..").join("..")
+        );
+    }
+
+    #[test]
+    fn normalize_path_handles_rooted_paths() {
+        assert_eq!(
+            normalize_path(Path::new("/a/../../b")),
+            Path::new("/").join("b")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/../../foo")),
+            Path::new("/").join("foo")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/a/b/../c")),
+            Path::new("/").join("a").join("c")
+        );
+        assert_eq!(
+            normalize_path(Path::new("/a/../b")),
+            Path::new("/").join("b")
+        );
+    }
 
     #[test]
     fn resolve_workspace_root_defaults_to_the_current_directory() {

@@ -1592,6 +1592,10 @@ fn gelu_slice(x: &mut [f32]) {
 /// Clamped so an input far outside the range this ever sees cannot overflow
 /// the exponent arithmetic into a `NaN`. `tanh` saturates long before the
 /// clamp bites, so the bound costs nothing real.
+///
+/// # Safety
+///
+/// The CPU must support NEON, which every `aarch64` CPU does.
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub unsafe fn exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
