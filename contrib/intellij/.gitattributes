@@ -1,0 +1,5 @@
+# The Gradle wrapper, as Gradle writes it: the batch file keeps its CRLF
+# line endings, and the jar is binary.
+gradlew text eol=lf
+*.bat text eol=crlf
+*.jar binary
