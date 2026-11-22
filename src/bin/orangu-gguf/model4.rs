@@ -45,8 +45,9 @@
 //! `qwen_hybrid`), so a file trained here is served as it was trained.
 //! Everything is `f32` on the CPU, and each operation's backward is written
 //! beside its forward and held to finite differences, as the dense block's
-//! is ([`crate::model`]). A block's input is the only activation kept; its
-//! intermediates are recomputed on the way back.
+//! is ([`crate::model`]). A block's intermediates are kept for its backward
+//! while the process's activation budget has room, and recomputed from the
+//! block's input otherwise.
 
 use crate::accel;
 use crate::aligned::Aligned;
@@ -934,6 +935,227 @@ struct LayerCache {
     moe: MoeCache,
     ffn_out: Aligned,
     out: Aligned,
+}
+
+/// Bytes a cache holds on the heap.
+trait Held {
+    fn held(&self) -> usize;
+}
+
+impl Held for Aligned {
+    fn held(&self) -> usize {
+        self.len() * 4
+    }
+}
+
+impl Held for Vec<f32> {
+    fn held(&self) -> usize {
+        self.capacity() * 4
+    }
+}
+
+impl Held for Vec<usize> {
+    fn held(&self) -> usize {
+        self.capacity() * std::mem::size_of::<usize>()
+    }
+}
+
+impl<T: Copy> Held for Vec<Vec<T>> {
+    fn held(&self) -> usize {
+        self.capacity() * std::mem::size_of::<Vec<T>>()
+            + self
+                .iter()
+                .map(|v| v.capacity() * std::mem::size_of::<T>())
+                .sum::<usize>()
+    }
+}
+
+impl<T: Held> Held for Option<T> {
+    fn held(&self) -> usize {
+        self.as_ref().map_or(0, Held::held)
+    }
+}
+
+impl Held for MixCache {
+    fn held(&self) -> usize {
+        [
+            &self.normed,
+            &self.scales,
+            &self.pre,
+            &self.low,
+            &self.gate,
+            &self.inject,
+        ]
+        .iter()
+        .map(|a| a.held())
+        .sum()
+    }
+}
+
+impl Held for AttnCache {
+    fn held(&self) -> usize {
+        [
+            &self.q_pre,
+            &self.k_pre,
+            &self.q_rms,
+            &self.k_rms,
+            &self.q_rope,
+            &self.k_rope,
+            &self.v,
+            &self.ctx,
+            &self.q_gate,
+            &self.gated,
+        ]
+        .iter()
+        .map(|a| a.held())
+        .sum::<usize>()
+            + self.selection.held()
+            + self.sel_probs.held()
+            + self.indexer.held()
+    }
+}
+
+impl Held for DeltaCache {
+    fn held(&self) -> usize {
+        [
+            &self.mixed,
+            &self.conv,
+            &self.q_len,
+            &self.k_len,
+            &self.q,
+            &self.k,
+            &self.v,
+            &self.beta,
+            &self.g,
+            &self.decay,
+            &self.o,
+            &self.o_rms,
+            &self.o_normed,
+            &self.z,
+            &self.y,
+        ]
+        .iter()
+        .map(|a| a.held())
+        .sum::<usize>()
+            + self.checkpoints.iter().map(Held::held).sum::<usize>()
+    }
+}
+
+impl Held for IndexerCache {
+    fn held(&self) -> usize {
+        [
+            &self.pooled,
+            &self.pooled_rms,
+            &self.blocks,
+            &self.q_raw,
+            &self.q_rms,
+            &self.queries,
+        ]
+        .iter()
+        .map(|a| a.held())
+        .sum::<usize>()
+            + self.pred.held()
+            + self.target.held()
+    }
+}
+
+impl Held for PleCache {
+    fn held(&self) -> usize {
+        [
+            &self.embd,
+            &self.key,
+            &self.value,
+            &self.key_n,
+            &self.key_s,
+            &self.query,
+            &self.query_s,
+            &self.gated,
+            &self.normed,
+            &self.normed_s,
+            &self.conv,
+            &self.out,
+        ]
+        .iter()
+        .map(|a| a.held())
+        .sum::<usize>()
+            + self.rows.held()
+            + self.score.held()
+    }
+}
+
+impl Held for MoeCache {
+    fn held(&self) -> usize {
+        [
+            &self.probs,
+            &self.s_gate,
+            &self.s_up,
+            &self.s_act,
+            &self.s_out,
+        ]
+        .iter()
+        .map(|a| a.held())
+        .sum::<usize>()
+            + self.chosen.held()
+            + self.sums.held()
+            + self.members.held()
+            + self
+                .experts
+                .iter()
+                .map(|e| e.xin.held() + e.gate.held() + e.up.held() + e.act.held() + e.out.held())
+                .sum::<usize>()
+            + self.s_score.held()
+            + self.share.held()
+    }
+}
+
+impl Held for LayerCache {
+    fn held(&self) -> usize {
+        self.ple.held()
+            + self.attn_mix.held()
+            + self.attn_in.held()
+            + self.attn_out.held()
+            + match &self.mixer {
+                MixerCache::Full(c) => c.held(),
+                MixerCache::Linear(c) => c.held(),
+            }
+            + self.mid.held()
+            + self.ffn_mix.held()
+            + self.ffn_in.held()
+            + self.moe.held()
+            + self.ffn_out.held()
+            + self.out.held()
+    }
+}
+
+/// Bytes of block intermediates every pass in the process holds for its
+/// backward, against [`model::activation_budget`].
+static KEPT_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A block's intermediates, counted against the budget until dropped.
+struct Kept {
+    cache: LayerCache,
+    bytes: usize,
+}
+
+impl Kept {
+    /// `cache` kept when the budget has room for it.
+    fn new(cache: LayerCache) -> Option<Kept> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let bytes = cache.held();
+        let limit = model::activation_budget();
+        KEPT_BYTES
+            .try_update(Relaxed, Relaxed, |k| {
+                (k + bytes <= limit).then_some(k + bytes)
+            })
+            .ok()?;
+        Some(Kept { cache, bytes })
+    }
+}
+
+impl Drop for Kept {
+    fn drop(&mut self) {
+        KEPT_BYTES.fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// Weights one generator draws at initialization.
@@ -3231,6 +3453,7 @@ impl Model {
 
     /// One block's backward: the gradient of its input streams, and its
     /// parameter gradients added into `grads`.
+    #[allow(clippy::too_many_arguments)]
     fn layer_backward(
         &self,
         l: usize,
@@ -3239,10 +3462,20 @@ impl Model {
         dout: &[f32],
         t: usize,
         grads: &mut [f32],
+        kept: Option<&LayerCache>,
     ) -> Aligned {
         let h = self.cfg.hidden;
         let o = self.layout.layers[l];
-        let c = self.layer_forward(l, x, tokens, t);
+        // The forward's own intermediates when they were kept, else the
+        // same arithmetic again.
+        let rebuilt;
+        let c = match kept {
+            Some(c) => c,
+            None => {
+                rebuilt = self.layer_forward(l, x, tokens, t);
+                &rebuilt
+            }
+        };
         let x_in: &[f32] = c.ple.as_ref().map_or(x, |p| &p.out);
 
         // The feed-forward's out-mix and the feed-forward.
@@ -3472,14 +3705,18 @@ impl Model {
         let mut inputs: Vec<Aligned> = Vec::with_capacity(cfg.layers + 1);
         let mut aux = 0.0f32;
         let mut idx = 0.0f32;
+        // A block's intermediates are kept for its backward while the
+        // process's budget for them has room; the rest are recomputed.
+        let mut kept: Vec<Option<Kept>> = Vec::with_capacity(cfg.layers);
         for l in 0..cfg.layers {
             inputs.push(x.clone());
-            let c = self.layer_forward(l, &x, tokens, t);
+            let mut c = self.layer_forward(l, &x, tokens, t);
             aux += c.moe.aux;
             if let MixerCache::Full(ac) = &c.mixer {
                 idx += ac.idx_loss;
             }
-            x = c.out;
+            x = std::mem::take(&mut c.out);
+            kept.push(if grads.is_some() { Kept::new(c) } else { None });
         }
         let (collapsed, head_mix) = time(Stage::HcMix, || self.mix(self.layout.head, &x, t));
         let out_w = self.tensor(self.layout.output, cfg.vocab * h);
@@ -3540,7 +3777,16 @@ impl Model {
             )
         });
         for l in (0..cfg.layers).rev() {
-            dx = self.layer_backward(l, &inputs[l], tokens, &dx, t, grads);
+            let cache = kept.pop().flatten();
+            dx = self.layer_backward(
+                l,
+                &inputs[l],
+                tokens,
+                &dx,
+                t,
+                grads,
+                cache.as_ref().map(|k| &k.cache),
+            );
         }
         time(Stage::EmbedBackward, || {
             let d_embd = grad_slice(grads, self.layout.tok_embd, cfg.vocab * h);
@@ -4749,6 +4995,29 @@ pub(crate) mod tests {
         let reference = grads(100);
         assert_eq!(grads(1), reference);
         assert_eq!(grads(3), reference);
+    }
+
+    /// Kept intermediates and recomputed ones give the same gradients, bit
+    /// for bit.
+    #[test]
+    fn kept_intermediates_change_nothing() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let tokens: Vec<u32> = vec![1, 5, 2, 9, 4, 4, 7, 3, 2, 8];
+        let targets: Vec<u32> = vec![5, 2, 9, 4, 4, 7, 3, 2, 8, 1];
+        let model = Model::new(tiny(), 11);
+        let grads = || {
+            let mut g = Aligned::zeros(model.layout.total);
+            let loss = model
+                .forward_backward(&tokens, &targets, Some(&mut g))
+                .objective();
+            (loss, g.to_vec())
+        };
+        let kept = grads();
+        // A budget already spent keeps nothing.
+        KEPT_BYTES.fetch_add(usize::MAX / 2, Relaxed);
+        let recomputed = grads();
+        KEPT_BYTES.fetch_sub(usize::MAX / 2, Relaxed);
+        assert_eq!(kept, recomputed);
     }
 
     /// Every element of the delta rule's own parameters against a central

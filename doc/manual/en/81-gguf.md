@@ -326,6 +326,7 @@ the accelerators the machine has:
 | `ORANGU_GGUF_CARD_RESIDENT_MIB` | Card memory for weights kept between products. |
 | `ORANGU_GGUF_NPU_MIN_MFLOP` | Smallest product offered to the NPU, in MFLOP. |
 | `ORANGU_NPU_WEIGHTS_GB` | NPU memory for product buffers, in GiB. |
+| `ORANGU_GGUF_CACHE_MIB` | Memory for block intermediates kept from the forward pass for the backward, in MiB, shared by the sequences that run at once; blocks past it are recomputed. `0` recomputes every block. The default is a quarter of the memory free at the start. |
 
 ## The writer's invariant
 

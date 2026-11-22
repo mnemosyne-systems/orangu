@@ -475,6 +475,7 @@ pub fn run<N: Network>(
                 status.total += options.sequence as u64;
             };
             let losses = if links.is_empty() {
+                by_node[0] += windows.len();
                 Ok(batch_gradient(
                     reading,
                     &windows,

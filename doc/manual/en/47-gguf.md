@@ -1054,9 +1054,9 @@ how many pieces each node encoded.
 
 **Training** divides each step's sequences. At the start of every step the
 top sends each claimed node the model's configuration and parameters; each
-node then takes the step's sequences one at a time, and the top takes as
-many at once as it runs side by side alone, so a faster node runs more of
-them. A sequence's gradient is computed from zero
+node then takes the step's sequences one at a time, and the top takes its
+share of those still to start, up to as many as it runs side by side
+alone, so a faster node runs more of them. A sequence's gradient is computed from zero
 and sent back whole, and the step's gradient is the sum of the sequences'
 gradients in sequence order, alone or divided. On nodes with the same kind
 of CPU and with every product on the CPU, one, two or three nodes therefore
@@ -1064,10 +1064,19 @@ write the same checkpoints and the same model. A node that is lost has its
 sequence run on the top, and the run continues without it. Each step moves
 the parameters to every node and one gradient back per sequence a node
 runs. When no sequence is left to start, the top also runs the ones the
-nodes are still at; a node whose sequence the top finishes first is
-released with a `train: … released` line, so a node whose link or
+nodes are still at; a node whose sequence the top finishes first, or that
+ran none of the step's sequences, is released with a `train: … released`
+line, so a node whose link or
 processor costs more than it gives leaves the run after one step. At the
 end the run prints how many sequences each node ran.
+
+Every step, the top prints `train:` lines on standard error: the time the
+parameters took to reach each node and the rate, each sequence a node ran
+with its pass time and the gradient's transfer time, the sequences the top
+ran and how long they took, and the sequences it also runs because a node
+is still at them. A `--worker` prints its own side: the model it opened,
+the parameters received, each pass with its time and loss, and each
+gradient sent.
 
 `--perplexity TEXT` with `-m MODEL` prints the perplexity of the model over
 the text: windows of 512 tokens, each scored from its middle on, on the

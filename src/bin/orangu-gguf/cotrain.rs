@@ -16,11 +16,13 @@
 //! A training step's sequences spread over the channel's gguf nodes.
 //!
 //! Every step, each claimed node is sent the model's parameters, then takes
-//! sequences one at a time from the step's list, while this node takes as
-//! many at once as it runs side by side: a faster node takes more of them.
+//! sequences one at a time from the step's list, while this node takes its
+//! share of what is left, up to as many as it runs side by side: a faster
+//! node takes more of them.
 //! Once the list is empty this node also runs the sequences the others are
-//! still at; a node it beats to one is released, so a node that costs more
-//! in transfer than it gives in compute does not stay in the run. Each sequence's gradient is computed
+//! still at; a node it beats to one, or that ran none, is released, so a
+//! node that costs more in transfer than it gives in compute does not stay
+//! in the run. Each sequence's gradient is computed
 //! from zero and comes back whole; the step's gradient is their sum in
 //! sequence order, exactly as on one machine, so the weights a run
 //! produces do not depend on how many nodes took part. A node that is lost
@@ -28,6 +30,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{Result, anyhow, bail};
 use rayon::prelude::*;
@@ -46,6 +49,8 @@ const PIECE: usize = 32 << 20;
 pub trait Trainee: Send {
     fn kind(&self) -> u32;
     fn config(&self) -> Vec<u8>;
+    /// Parameters, as many as the gradient has.
+    fn len(&self) -> usize;
     /// Writes `values` into the parameters from `offset`.
     fn load(&mut self, offset: usize, values: &[f32]) -> Result<()>;
     /// Runs one window, keeping its gradient; returns its loss.
@@ -67,6 +72,9 @@ impl<N: Network + Send> Trainee for Held<N> {
         let mut out = Vec::new();
         N::write_config(&mut out, self.model.config()).expect("a Vec takes every write");
         out
+    }
+    fn len(&self) -> usize {
+        self.grads.len()
     }
     fn load(&mut self, offset: usize, values: &[f32]) -> Result<()> {
         let (params, _) = self.model.parts();
@@ -108,6 +116,11 @@ pub fn trainee(kind: u32, config: &[u8]) -> Result<Box<dyn Trainee>> {
     }
 }
 
+/// When the step this node is in last started: the parameters' first
+/// piece, or the end of a pass.
+static SINCE: std::sync::LazyLock<Mutex<Instant>> =
+    std::sync::LazyLock::new(|| Mutex::new(Instant::now()));
+
 /// A node's answer to a training job: `open` (kind and config), `weights`
 /// (an offset and floats), `pass` (a window and the sequence length; the
 /// loss back), `gradient` (an offset and a count; the floats back).
@@ -125,6 +138,10 @@ pub fn serve(
                 .is_some_and(|t| t.kind() == kind && t.config() == config)
             {
                 *held = Some(trainee(kind, config)?);
+                eprintln!(
+                    "train: a model of kind {kind} opened, {} parameters",
+                    held.as_ref().map_or(0, |t| t.len())
+                );
             }
             Ok(Vec::new())
         }
@@ -134,7 +151,17 @@ pub fn serve(
                 .ok_or_else(|| anyhow!("no model is open to train"))?;
             let offset = r.u64()? as usize;
             let values = r.floats()?;
+            if offset == 0 {
+                *SINCE.lock().unwrap() = Instant::now();
+            }
             t.load(offset, &values)?;
+            if offset + values.len() == t.len() {
+                eprintln!(
+                    "train: parameters received, {:.0} MB in {:.1} s after the first piece",
+                    t.len() as f64 * 4.0 / 1e6,
+                    SINCE.lock().unwrap().elapsed().as_secs_f64()
+                );
+            }
             Ok(Vec::new())
         }
         "pass" => {
@@ -153,7 +180,14 @@ pub fn serve(
             std::thread::sleep(std::time::Duration::from_millis(
                 tests::REMOTE_PAUSE_MS.load(std::sync::atomic::Ordering::Relaxed),
             ));
-            Ok(t.run(&window, sequence).to_le_bytes().to_vec())
+            let began = Instant::now();
+            let loss = t.run(&window, sequence);
+            eprintln!(
+                "train: a sequence of {sequence} tokens ran in {:.1} s, loss {loss:.4}",
+                began.elapsed().as_secs_f64()
+            );
+            *SINCE.lock().unwrap() = Instant::now();
+            Ok(loss.to_le_bytes().to_vec())
         }
         "gradient" => {
             let t = held
@@ -161,7 +195,15 @@ pub fn serve(
                 .ok_or_else(|| anyhow!("no model is open to train"))?;
             let offset = r.u64()? as usize;
             let count = r.u64()? as usize;
-            Ok(bytemuck::cast_slice(t.gradient(offset, count)?).to_vec())
+            let piece = bytemuck::cast_slice(t.gradient(offset, count)?).to_vec();
+            if offset + count == t.len() {
+                eprintln!(
+                    "train: gradient sent, {:.0} MB in {:.1} s after the pass",
+                    t.len() as f64 * 4.0 / 1e6,
+                    SINCE.lock().unwrap().elapsed().as_secs_f64()
+                );
+            }
+            Ok(piece)
         }
         other => bail!("a gguf node does not take train-{other}"),
     }
@@ -185,17 +227,21 @@ fn send_model<N: Network>(link: &mut Claimed, model: &N) -> Result<()> {
     Ok(())
 }
 
-/// Runs `window` on `link` and brings its gradient back in `grads`.
+/// Runs `window` on `link` and brings its gradient back in `grads`, with
+/// the seconds the pass and the gradient's transfer took.
 fn remote_pass(
     link: &mut Claimed,
     window: &[u32],
     sequence: usize,
     mut grads: Aligned,
-) -> Result<(f32, Aligned)> {
+) -> Result<(f32, Aligned, f64, f64)> {
     let mut w = Bytes::default();
     w.tokens(window);
     w.u64(sequence as u64);
+    let began = Instant::now();
     let loss = call(link, "train-pass", w.0)?;
+    let passed = began.elapsed().as_secs_f64();
+    let began = Instant::now();
     let loss = f32::from_le_bytes(
         loss.as_slice()
             .try_into()
@@ -213,14 +259,14 @@ fn remote_pass(
             *g = f32::from_le_bytes(*b);
         }
     }
-    Ok((loss, grads))
+    Ok((loss, grads, passed, began.elapsed().as_secs_f64()))
 }
 
 struct Shared {
     next: usize,
     retry: Vec<usize>,
     /// Windows a node is at, with the node's index in the links.
-    running: Vec<(usize, usize)>,
+    running: Vec<(usize, usize, Instant)>,
     /// Windows this node also runs because their node is still at them.
     again: Vec<usize>,
     pending: BTreeMap<usize, (f32, Aligned)>,
@@ -238,11 +284,12 @@ impl Shared {
 
 /// One step's gradient into `grads` (zero on the way in), each of `windows`
 /// run here or on one of `links` and the results added in window order.
-/// This node runs up to `at_once` windows side by side in buffers from
-/// `spare`; once none is left to start, it runs the windows the nodes are
-/// still at, and a node it finishes one before is released. `counted` is
-/// called after each window. Lost and released links are removed. Returns
-/// each window's loss, in order, and how many windows each node ran.
+/// This node runs its share of the windows still to start, up to `at_once`
+/// side by side, in buffers from `spare`; once none is left to start, it
+/// runs the windows the nodes are still at, and a node it finishes one
+/// before, or that ran none, is released. `counted` is called after each
+/// window. Lost and released links are removed. Returns each window's loss,
+/// in order, and how many windows each node ran.
 #[allow(clippy::too_many_arguments)]
 pub fn step<N: Network>(
     model: &N,
@@ -290,22 +337,23 @@ pub fn step<N: Network>(
             }
         }?;
         if let Some(l) = link {
-            s.running.push((i, l));
+            s.running.push((i, l, Instant::now()));
         }
         Some(i)
     };
     // Adds every result that is next in order; a window's gradient is taken
     // as it is when it is the first. A window already in is dropped
-    // (`None`); otherwise the links still at it are returned.
-    let deliver = |i: usize, loss: f32, part: Aligned| -> Option<Vec<usize>> {
+    // (`None`); otherwise the links still at it are returned, with when
+    // they started it.
+    let deliver = |i: usize, loss: f32, part: Aligned| -> Option<Vec<(usize, Instant)>> {
         let mut s = shared.lock().unwrap();
-        let overtaken: Vec<usize> = s
+        let overtaken: Vec<(usize, Instant)> = s
             .running
             .iter()
-            .filter(|&&(w, _)| w == i)
-            .map(|&(_, l)| l)
+            .filter(|&&(w, _, _)| w == i)
+            .map(|&(_, l, at)| (l, at))
             .collect();
-        s.running.retain(|&(w, _)| w != i);
+        s.running.retain(|&(w, _, _)| w != i);
         if s.done(i) {
             s.pool.push(part);
             return None;
@@ -334,24 +382,44 @@ pub fn step<N: Network>(
         }
         Some(overtaken)
     };
+    let names: Vec<String> = links.iter().map(|l| l.found.name.clone()).collect();
+    let mb = |floats: usize| floats as f64 * 4.0 / 1e6;
     let mut ran = vec![0usize; links.len() + 1];
     let lost = Mutex::new(vec![false; links.len()]);
-    let mut slow = vec![false; links.len()];
+    // Per link beaten to a window: how long it had been at it, and how long
+    // it took here.
+    let mut slow: Vec<Option<(f64, f64)>> = vec![None; links.len()];
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for (l, link) in links.iter_mut().enumerate() {
             let (pick, deliver, buffer, shared, lost) = (&pick, &deliver, &buffer, &shared, &lost);
             handles.push(scope.spawn(move || {
                 let mut count = 0;
+                let name = link.found.name.clone();
+                let began = Instant::now();
                 if let Err(e) = send_model(link, model) {
-                    eprintln!("train: {} left out: {e:#}", link.found.name);
+                    eprintln!("train: {name} left out: {e:#}");
                     lost.lock().unwrap()[l] = true;
                     return count;
                 }
+                let secs = began.elapsed().as_secs_f64();
+                eprintln!(
+                    "train: {name}: parameters sent, {:.0} MB in {secs:.1} s ({:.0} MB/s)",
+                    mb(len),
+                    mb(len) / secs.max(1e-9)
+                );
                 while let Some(i) = pick(Some(l)) {
                     match remote_pass(link, &windows[i], sequence, buffer()) {
-                        Ok((loss, part)) => {
-                            if deliver(i, loss, part).is_some() {
+                        Ok((loss, part, passed, fetched)) => {
+                            let used = deliver(i, loss, part).is_some();
+                            eprintln!(
+                                "train: {name}: sequence {i} ran in {passed:.1} s there, \
+                                 gradient {:.0} MB back in {fetched:.1} s ({:.0} MB/s){}",
+                                mb(len),
+                                mb(len) / fetched.max(1e-9),
+                                if used { "" } else { "; already done here" }
+                            );
+                            if used {
                                 count += 1;
                             }
                         }
@@ -361,7 +429,7 @@ pub fn step<N: Network>(
                                 link.found.name
                             );
                             let mut s = shared.lock().unwrap();
-                            s.running.retain(|&(w, _)| w != i);
+                            s.running.retain(|&(w, _, _)| w != i);
                             if !s.done(i) {
                                 s.retry.push(i);
                             }
@@ -375,18 +443,33 @@ pub fn step<N: Network>(
         }
         let mut local = 0;
         loop {
-            let mut group: Vec<usize> = std::iter::from_fn(|| pick(None))
-                .take(at_once.max(1))
-                .collect();
+            // This node's share of what is still to start, so the nodes
+            // still in the step have some left when they are ready.
+            let live = handles.iter().filter(|h| !h.is_finished()).count();
+            let unstarted = {
+                let s = shared.lock().unwrap();
+                windows.len() - s.next + s.retry.len()
+            };
+            let share = unstarted.div_ceil(live + 1).clamp(1, at_once.max(1));
+            let mut group: Vec<usize> = std::iter::from_fn(|| pick(None)).take(share).collect();
             if group.is_empty() {
                 let mut s = shared.lock().unwrap();
                 let ahead: Vec<usize> = s
                     .running
                     .iter()
-                    .map(|&(w, _)| w)
+                    .map(|&(w, _, _)| w)
                     .filter(|&w| !s.again.contains(&w) && !s.done(w))
                     .take(at_once.max(1))
                     .collect();
+                for &w in &ahead {
+                    if let Some(&(_, l, at)) = s.running.iter().find(|r| r.0 == w) {
+                        eprintln!(
+                            "train: sequence {w} runs here too; {} has been at it {:.1} s",
+                            names[l],
+                            at.elapsed().as_secs_f64()
+                        );
+                    }
+                }
                 s.again.extend(&ahead);
                 group = ahead;
             }
@@ -404,6 +487,7 @@ pub fn step<N: Network>(
             std::thread::sleep(std::time::Duration::from_millis(
                 tests::LOCAL_PAUSE_MS.load(std::sync::atomic::Ordering::Relaxed),
             ));
+            let began = Instant::now();
             let mut parts: Vec<Aligned> = group.iter().map(|_| buffer()).collect();
             let losses: Vec<f32> = parts
                 .par_iter_mut()
@@ -417,11 +501,16 @@ pub fn step<N: Network>(
                     )
                 })
                 .collect();
+            eprintln!(
+                "train: this node ran sequences {group:?} in {:.1} s",
+                began.elapsed().as_secs_f64()
+            );
             for ((&i, loss), part) in group.iter().zip(losses).zip(parts) {
                 if let Some(overtaken) = deliver(i, loss, part) {
                     local += 1;
-                    for l in overtaken {
-                        slow[l] = true;
+                    let here = began.elapsed().as_secs_f64();
+                    for (l, at) in overtaken {
+                        slow[l] = Some((at.elapsed().as_secs_f64(), here));
                     }
                 }
             }
@@ -435,13 +524,22 @@ pub fn step<N: Network>(
     let mut at = 0;
     links.retain(|link| {
         at += 1;
-        if slow[at - 1] && !lost[at - 1] {
-            eprintln!(
-                "train: {} released: a sequence it was running finished here first",
-                link.found.name
-            );
+        let idle = ran[at] == 0;
+        let reason = if lost[at - 1] {
+            None
+        } else if let Some((there, here)) = slow[at - 1] {
+            Some(format!(
+                "a sequence it had been at for {there:.1} s took {here:.1} s here"
+            ))
+        } else if idle {
+            Some("the step's sequences were all taken before it was ready".to_string())
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            eprintln!("train: {} released: {reason}", link.found.name);
         }
-        !lost[at - 1] && !slow[at - 1]
+        !lost[at - 1] && slow[at - 1].is_none() && !idle
     });
     let mut s = shared.into_inner().unwrap();
     s.pool.truncate(keep);
