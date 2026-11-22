@@ -287,9 +287,10 @@ impl Shared {
 /// This node runs its share of the windows still to start, up to `at_once`
 /// side by side, in buffers from `spare`; once none is left to start, it
 /// runs the windows the nodes are still at, and a node it finishes one
-/// before, or that ran none, is released. `counted` is called after each
-/// window. Lost and released links are removed. Returns each window's loss,
-/// in order, and how many windows each node ran.
+/// before (its connection cut, its pass not waited for), or that ran none,
+/// is released. `counted` is called after each window. Lost and released
+/// links are removed. Returns each window's loss, in order, and how many
+/// windows each node ran.
 #[allow(clippy::too_many_arguments)]
 pub fn step<N: Network>(
     model: &N,
@@ -383,6 +384,11 @@ pub fn step<N: Network>(
         Some(overtaken)
     };
     let names: Vec<String> = links.iter().map(|l| l.found.name.clone()).collect();
+    // Each link's socket, to cut a link this node has overtaken.
+    let sockets: Vec<_> = links.iter().map(|l| l.link.tcp.clone()).collect();
+    let cut: Vec<std::sync::atomic::AtomicBool> = (0..links.len())
+        .map(|_| std::sync::atomic::AtomicBool::new(false))
+        .collect();
     let mb = |floats: usize| floats as f64 * 4.0 / 1e6;
     let mut ran = vec![0usize; links.len() + 1];
     let lost = Mutex::new(vec![false; links.len()]);
@@ -392,7 +398,8 @@ pub fn step<N: Network>(
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for (l, link) in links.iter_mut().enumerate() {
-            let (pick, deliver, buffer, shared, lost) = (&pick, &deliver, &buffer, &shared, &lost);
+            let (pick, deliver, buffer, shared, lost, cut) =
+                (&pick, &deliver, &buffer, &shared, &lost, &cut);
             handles.push(scope.spawn(move || {
                 let mut count = 0;
                 let name = link.found.name.clone();
@@ -422,6 +429,10 @@ pub fn step<N: Network>(
                             if used {
                                 count += 1;
                             }
+                        }
+                        Err(_) if cut[l].load(std::sync::atomic::Ordering::Relaxed) => {
+                            shared.lock().unwrap().running.retain(|&(w, _, _)| w != i);
+                            return count;
                         }
                         Err(e) => {
                             eprintln!(
@@ -511,6 +522,10 @@ pub fn step<N: Network>(
                     let here = began.elapsed().as_secs_f64();
                     for (l, at) in overtaken {
                         slow[l] = Some((at.elapsed().as_secs_f64(), here));
+                        // Its pass is not waited for: the link is cut, and
+                        // its thread ends when its read fails.
+                        cut[l].store(true, std::sync::atomic::Ordering::Relaxed);
+                        let _ = sockets[l].shutdown(std::net::Shutdown::Both);
                     }
                 }
             }
@@ -670,6 +685,7 @@ pub(crate) mod tests {
         assert_eq!(links.len(), 1);
         let mut grads = Aligned::zeros(len);
         let mut spare = vec![Aligned::zeros(len)];
+        let began = std::time::Instant::now();
         let (got, ran) = step(
             &model,
             &mut links,
@@ -681,6 +697,10 @@ pub(crate) mod tests {
             &|| {},
         )
         .unwrap();
+        assert!(
+            began.elapsed() < std::time::Duration::from_millis(1500),
+            "the step waited for the slow node's pass"
+        );
         REMOTE_PAUSE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
         LOCAL_PAUSE_MS.store(0, std::sync::atomic::Ordering::Relaxed);
         assert!(links.is_empty(), "the slow node was kept");

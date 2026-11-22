@@ -322,7 +322,7 @@ pub fn claim(settings: &Settings, own: &str, found: &[Found], job: &str) -> Vec<
                 found: f.clone(),
                 link,
             }),
-            Err(e) => log::info!("orangu-gguf: workers: {} not claimed: {e:#}", f.addr),
+            Err(e) => eprintln!("orangu-gguf: workers: {} not claimed: {e:#}", f.addr),
         }
     }
     out
@@ -563,13 +563,13 @@ impl Worker {
             *held = Some(top.clone());
         }
         *self.lease.lock().unwrap() = None;
-        log::info!("orangu-gguf: worker: claimed by {top}");
+        eprintln!("orangu-gguf: worker: claimed by {top}");
         if write_message(&mut *split.writer, 0, &Message::Ready).is_ok() {
             let _ = split.tcp.set_read_timeout(None);
             self.work(&mut split);
         }
         *self.top.lock().unwrap() = None;
-        log::info!("orangu-gguf: worker: released by {top}");
+        eprintln!("orangu-gguf: worker: released by {top}");
     }
 
     /// Another top this node is committed or promised to, against `top`.
