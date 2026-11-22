@@ -64,6 +64,7 @@ mod score;
 mod tuning_profile;
 use orangu::profiling::profile;
 mod report;
+mod retrieval;
 mod shell;
 mod storage;
 mod sweep;
@@ -251,6 +252,14 @@ struct Args {
     /// KL mode: compare the server's teacher-forced distributions with this reference, saving it first if absent.
     #[arg(long, value_name = "PATH")]
     kl: Option<PathBuf>,
+
+    /// Retrieval mode: score semantic /search on these cases (YAML) against /v1/embeddings.
+    #[arg(long, value_name = "PATH")]
+    retrieval: Option<PathBuf>,
+
+    /// The checkout `--retrieval` indexes and searches.
+    #[arg(long, default_value = ".", value_name = "DIR")]
+    retrieval_workspace: PathBuf,
 
     /// Positions per `--kl` pass: 1 runs decode steps, more runs verify passes.
     #[arg(long, default_value_t = 1, value_name = "N")]
@@ -1477,6 +1486,10 @@ fn run(args: &Args) -> anyhow::Result<()> {
     }
     if args.sweep.is_some() {
         return run_sweep(args);
+    }
+    // A quality score of /search, not a throughput row: no history or report.
+    if let Some(cases) = &args.retrieval {
+        return retrieval::run_retrieval(args, cases);
     }
 
     let client = reqwest::blocking::Client::builder()

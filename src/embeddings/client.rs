@@ -61,13 +61,27 @@ struct EmbeddingData {
 impl EmbeddingClient {
     /// Build a client from the server profile serving the `embeddings` role.
     pub fn from_profile(profile: &LlmConfiguration) -> Result<Self> {
+        Self::new(
+            &profile.endpoint,
+            &profile.model,
+            profile.api_key.clone(),
+            profile.request_timeout_seconds,
+        )
+    }
+
+    pub fn new(
+        endpoint: &str,
+        model: &str,
+        api_key: Option<String>,
+        timeout_seconds: u64,
+    ) -> Result<Self> {
         Ok(Self {
             http_client: Client::builder()
-                .timeout(Duration::from_secs(profile.request_timeout_seconds))
+                .timeout(Duration::from_secs(timeout_seconds))
                 .build()?,
-            endpoint: normalized_openai_endpoint(&profile.endpoint),
-            model: profile.model.clone(),
-            api_key: profile.api_key.clone(),
+            endpoint: normalized_openai_endpoint(endpoint),
+            model: model.to_string(),
+            api_key,
         })
     }
 

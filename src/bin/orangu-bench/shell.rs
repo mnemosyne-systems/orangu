@@ -56,14 +56,14 @@ _orangu_bench() {
             COMPREPLY=( $(compgen -W "all 0.0.0.0 127.0.0.1" -- "$cur") )
             return 0
             ;;
-        --url|--depths|--pp|--pp-continue|--pg|--streams|--streams-depth|--interference|--chat|--chat-fixture|--chat-record|--chat-workspace|--kl|--kl-rows|--kl-top|--kl-max|--kl-min-top1|--ppl-baseline|--ppl-max-increase|--kl-tokens|--kl-text|--perplexity|--ppl-ctx|--ppl-chunks|--hellaswag|--winogrande|--score-tasks|--score-rows|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--startup|--startup-gap|--startup-evict|--sweep|--sweep-cmd|--tune|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
+        --url|--depths|--pp|--pp-continue|--pg|--streams|--streams-depth|--interference|--chat|--chat-fixture|--chat-record|--chat-workspace|--retrieval|--retrieval-workspace|--kl|--kl-rows|--kl-top|--kl-max|--kl-min-top1|--ppl-baseline|--ppl-max-increase|--kl-tokens|--kl-text|--perplexity|--ppl-ctx|--ppl-chunks|--hellaswag|--winogrande|--score-tasks|--score-rows|--shared-prefix|--shared-prefix-tokens|--prefix-scan|--pp-continue-base|--embed|--image|--image-steps|--image-cfg|--image-prompt|--gen|--curve|--bucket|--reps|--timeout|--model|--label|--storage-probe|--storage-span|--storage-ramp|--download-probe|--download-file|--download-seconds|--cap|--chart-scale|--chart-y-label|--chart-x-label|--chart-panels|--flamegraph-pid|--flamegraph-freq|--flamegraph-layers|--flamegraph-duration|--startup|--startup-gap|--startup-evict|--sweep|--sweep-cmd|--tune|--sweep-env|--sweep-start-timeout|--port|--delay|--temperature|--workers)
             return 0
             ;;
     esac
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-depth --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --chat-fixed --chat-record --chat-workspace --kl --kl-rows --kl-top --kl-max --kl-min-top1 --ppl-baseline --ppl-max-increase --kl-tokens --kl-text --perplexity --ppl-ctx --ppl-chunks --hellaswag --winogrande --score-tasks --score-rows --shared-prefix --shared-prefix-tokens \
+            "--url --depths --pp --pp-continue --pg --decode-cpu --streams --streams-depth --streams-echo --streams-warm --shared-prefix-cold --interference --chat --chat-fixture --chat-fixed --chat-record --chat-workspace --retrieval --retrieval-workspace --kl --kl-rows --kl-top --kl-max --kl-min-top1 --ppl-baseline --ppl-max-increase --kl-tokens --kl-text --perplexity --ppl-ctx --ppl-chunks --hellaswag --winogrande --score-tasks --score-rows --shared-prefix --shared-prefix-tokens \
              --prefix-scan --pp-continue-base --embed --image --image-steps --image-cfg --image-prompt --image-init --gen --curve --bucket --reps --drop-model-cache --no-warmup --fail-on-regression --sweep-as-given --streamed --write-profile --tune --per-rep \
              --timeout --model --json --history --label --chart --chart-only --table --storage-probe --storage-file \
              --storage-span --storage-ramp --download-probe --download-file --download-seconds --download-dir --cap --chart-png --chart-scale --chart-y-label --chart-x-label --chart-panels --chart-grid --chart-overlay \
@@ -107,6 +107,8 @@ _orangu_bench() {
         '--chat-fixed[Send each turn'"'"'s recorded replies instead of the model'"'"'s]' \
         '--chat-record[Write the session --chat runs as a fixture]:file:_files' \
         '--chat-workspace[The checkout whose files answer read_file and search while recording]:directory:_files -/' \
+        '--retrieval[Score semantic /search on these cases]:file:_files' \
+        '--retrieval-workspace[The checkout --retrieval indexes and searches]:directory:_files -/' \
         '--kl[Compare teacher-forced distributions with this reference]:file:_files' \
         '--kl-rows[Positions per --kl pass]:n:' \
         '--kl-top[Candidates --kl keeps per position]:n:' \
@@ -230,6 +232,8 @@ complete -c orangu-bench -l chat-fixture           -r -d 'The conversation --cha
 complete -c orangu-bench -l chat-fixed                 -d 'Send each turn'"'"'s recorded replies instead of the model'"'"'s'
 complete -c orangu-bench -l chat-record             -r -d 'Write the session --chat runs as a fixture'
 complete -c orangu-bench -l chat-workspace          -r -d 'The checkout whose files answer read_file and search while recording'
+complete -c orangu-bench -l retrieval              -r -d 'Score semantic /search on these cases'
+complete -c orangu-bench -l retrieval-workspace    -r -d 'The checkout --retrieval indexes and searches'
 complete -c orangu-bench -l kl                     -r -d 'Compare teacher-forced distributions with this reference'
 complete -c orangu-bench -l kl-rows                -r -d 'Positions per --kl pass'
 complete -c orangu-bench -l kl-top                 -r -d 'Candidates --kl keeps per position'
@@ -362,6 +366,8 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         @('--chat-fixed', 'Send each turn''s recorded replies instead of the model''s'),
         @('--chat-record', 'Write the session --chat runs as a fixture'),
         @('--chat-workspace', 'The checkout whose files answer read_file and search while recording'),
+        @('--retrieval', 'Score semantic /search on these cases'),
+        @('--retrieval-workspace', 'The checkout --retrieval indexes and searches'),
         @('--kl', 'Compare teacher-forced distributions with this reference'),
         @('--kl-rows', 'Positions per --kl pass'),
         @('--kl-top', 'Candidates --kl keeps per position'),
@@ -470,7 +476,7 @@ Register-ArgumentCompleter -Native -CommandName 'orangu-bench' -ScriptBlock {
         { $_ -in '--history', '--chart', '--table', '--storage-file', '--download-dir', '--flamegraph', '--image-init', '--compare-profiles', '--bundle', '--read-bundle', '--render-profile', '--report' } { return }
         '--flamegraph-call-graph' { return Offer @('fp', 'dwarf') }
         '--host' { return Offer @('all', '0.0.0.0', '127.0.0.1') }
-        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--streams-depth', '--interference', '--chat', '--chat-fixture', '--chat-record', '--chat-workspace', '--kl', '--kl-rows', '--kl-top', '--kl-max', '--kl-min-top1', '--ppl-baseline', '--ppl-max-increase', '--kl-tokens', '--kl-text', '--perplexity', '--ppl-ctx', '--ppl-chunks', '--hellaswag', '--winogrande', '--score-tasks', '--score-rows', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--startup', '--startup-gap', '--startup-evict', '--sweep', '--sweep-cmd', '--tune', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
+        { $_ -in '--url', '--depths', '--pp', '--pp-continue', '--pg', '--streams', '--streams-depth', '--interference', '--chat', '--chat-fixture', '--chat-record', '--chat-workspace', '--retrieval', '--retrieval-workspace', '--kl', '--kl-rows', '--kl-top', '--kl-max', '--kl-min-top1', '--ppl-baseline', '--ppl-max-increase', '--kl-tokens', '--kl-text', '--perplexity', '--ppl-ctx', '--ppl-chunks', '--hellaswag', '--winogrande', '--score-tasks', '--score-rows', '--shared-prefix', '--shared-prefix-tokens', '--prefix-scan', '--pp-continue-base', '--embed', '--gen', '--curve', '--bucket', '--reps', '--timeout', '--model', '--label', '--storage-probe', '--storage-span', '--storage-ramp', '--download-probe', '--download-file', '--download-seconds', '--cap', '--chart-scale', '--chart-y-label', '--chart-x-label', '--chart-panels', '--flamegraph-pid', '--flamegraph-freq', '--flamegraph-layers', '--flamegraph-duration', '--startup', '--startup-gap', '--startup-evict', '--sweep', '--sweep-cmd', '--tune', '--sweep-env', '--sweep-start-timeout', '--port', '--delay', '--temperature', '--workers' } { return }
     }
 
     if ($wordToComplete.StartsWith('-')) {

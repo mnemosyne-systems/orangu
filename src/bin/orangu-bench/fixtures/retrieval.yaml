@@ -1,0 +1,84 @@
+# Retrieval cases for `orangu-bench --retrieval`, against this repository.
+# Each query is something a developer would type into /search; `expect` lists
+# the workspace-relative files that answer it.
+cases:
+  - query: how is a cron expression parsed for scheduled commands
+    expect: [src/bin/orangu/schedule.rs]
+  - query: redact API keys and passwords before text reaches the model
+    expect: [src/bin/orangu/review/secrets.rs]
+  - query: which tokens the sampler is still allowed to pick under a grammar
+    expect: [src/bin/orangu-server/engine/constraint.rs, src/bin/orangu-server/engine/grammar.rs]
+  - query: turn a JSON schema into GBNF rules
+    expect: [src/bin/orangu-server/engine/json_schema.rs, src/bin/orangu-server/engine/schema_text.rs]
+  - query: recover structured tool calls from generated model text
+    expect: [src/bin/orangu-server/engine/tool_calls.rs]
+  - query: what to drop when a conversation no longer fits the context window
+    expect: [src/bin/orangu-server/engine/context_shift.rs]
+  - query: repetition penalty then temperature and top-k sampling
+    expect: [src/bin/orangu-server/engine/sampling.rs]
+  - query: byte pair encoding tokenizer merges
+    expect: [src/bin/orangu-server/engine/tokenizer.rs]
+  - query: render the model's own jinja chat template
+    expect: [src/bin/orangu-server/engine/chat_template.rs]
+  - query: read metadata key value pairs from a GGUF file
+    expect: [src/gguf.rs, src/bin/orangu-server/engine/loader.rs]
+  - query: dequantize quantized weight blocks to f32
+    expect: [src/bin/orangu-server/engine/quant.rs]
+  - query: KV cache pages shared between two requests with reference counts
+    expect: [src/bin/orangu-server/engine/kv_pool.rs]
+  - query: reuse a recently finished request's prompt cache for a new request
+    expect: [src/bin/orangu-server/engine/prefix_cache.rs]
+  - query: bound how many requests generate concurrently
+    expect: [src/bin/orangu-server/engine/scheduler.rs]
+  - query: proxy reads the model field and starts the right backend server
+    expect: [src/bin/orangu-coordinator/proxy.rs]
+  - query: stop restarting a server profile that keeps crashing
+    expect: [src/bin/orangu-coordinator/crashes.rs]
+  - query: mutual authentication between parent and worker with a shared secret
+    expect: [src/bin/orangu-server/workers/auth.rs]
+  - query: divide a model's layers between a node and its workers
+    expect: [src/bin/orangu-server/workers/plan.rs, src/bin/orangu-server/workers/pipeline.rs]
+  - query: refuse to fetch URLs that point at private or local network addresses
+    expect: [src/bin/orangu-server/http/public_net.rs]
+  - query: anthropic message batches API
+    expect: [src/bin/orangu-server/http/anthropic/batches.rs]
+  - query: post an event to a registered webhook URL
+    expect: [src/bin/orangu-server/http/anthropic/webhooks.rs]
+  - query: rank embedded code chunks by cosine similarity to the query
+    expect: [src/embeddings/index.rs]
+  - query: split a source file into chunks for embedding
+    expect: [src/embeddings/chunk.rs]
+  - query: save files before the agent writes them so undo can restore them
+    expect: [src/checkpoints.rs]
+  - query: show compiler errors after the agent edits files
+    expect: [src/diagnostics.rs]
+  - query: find copy-pasted code across languages
+    expect: [src/duplicates.rs]
+  - query: ssh login trying agent keys then key files then a password
+    expect: [src/ssh/auth.rs]
+  - query: known_hosts entries with wildcard host patterns
+    expect: [src/ssh/known_hosts.rs]
+  - query: temporary git worktree for an isolated subagent
+    expect: [src/subagent_worktree.rs]
+  - query: model context protocol client over streamable HTTP
+    expect: [src/mcp.rs]
+  - query: extract tables from a PDF page
+    expect: [src/pdf/tables.rs]
+  - query: draw a mermaid diagram as SVG
+    expect: [src/bin/orangu-server/web/mermaid.rs]
+  - query: where web console chat sessions are saved on disk
+    expect: [src/bin/orangu-server/web/sessions.rs]
+  - query: attach a file to the prompt with an @ mention
+    expect: [src/bin/orangu/mentions.rs]
+  - query: run the project's tests and remember the last failure
+    expect: [src/bin/orangu/test_run.rs]
+  - query: answer git credential prompts inside the terminal UI
+    expect: [src/bin/orangu/askpass.rs]
+  - query: select text with the mouse in the terminal UI
+    expect: [src/tui/selection.rs]
+  - query: what the server does when the GPU disappears
+    expect: [src/bin/orangu-server/device_lost.rs]
+  - query: detect whether an endpoint is a coordinator proxy
+    expect: [src/llm/coordinator.rs]
+  - query: make sure child processes die with their parent
+    expect: [src/child.rs]
