@@ -52,6 +52,22 @@ pub const DEFAULT_PORT: u16 = 8401;
 /// `[workers].server_port` names none.
 pub const DEFAULT_SERVER_PORT: u16 = 8400;
 
+/// `[workers].host` for every interface, as `orangu-server` spells it;
+/// `*` is the same.
+pub const HOST_ALL: &str = "all";
+pub const HOST_ALL_ALIAS: &str = "*";
+
+/// `host` as `bind` takes it: [`HOST_ALL`] and [`HOST_ALL_ALIAS`], in any
+/// case, are `0.0.0.0`; anything else is passed on as written.
+pub fn resolve_bind_host(host: &str) -> &str {
+    let host = host.trim();
+    if host.eq_ignore_ascii_case(HOST_ALL) || host == HOST_ALL_ALIAS {
+        "0.0.0.0"
+    } else {
+        host
+    }
+}
+
 /// The jobs a gguf node takes.
 pub const CAPABILITIES: [&str; 4] = ["imatrix", "perplexity", "quantize", "train"];
 
@@ -84,11 +100,7 @@ impl Settings {
     /// `~/.orangu/orangu-gguf.conf` that exists. `None` when there is no
     /// file, or it names no channel.
     pub fn load(path: Option<&Path>) -> Result<Option<Self>> {
-        let path = match path {
-            Some(p) => Some(p.to_path_buf()),
-            None => default_paths().into_iter().find(|p| p.is_file()),
-        };
-        let Some(path) = path else {
+        let Some(path) = find_config(path) else {
             return Ok(None);
         };
         let text = std::fs::read_to_string(&path)
@@ -153,7 +165,10 @@ impl Settings {
         Ok(Some(Settings {
             name,
             secret: get("secret"),
-            host: get("host").unwrap_or_else(|| "0.0.0.0".to_string()),
+            host: get("host").map_or_else(
+                || "0.0.0.0".to_string(),
+                |h| resolve_bind_host(&h).to_string(),
+            ),
             port: port("port", DEFAULT_PORT)?,
             server_port: port("server_port", DEFAULT_SERVER_PORT)?,
             networks,
@@ -174,6 +189,28 @@ static CONFIG: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new()
 /// Remembers `--config` for [`Settings::load_configured`].
 pub fn configure(path: Option<PathBuf>) {
     let _ = CONFIG.set(path);
+}
+
+/// `path`, or the first of `./orangu-gguf.conf` and
+/// `~/.orangu/orangu-gguf.conf` that exists.
+fn find_config(path: Option<&Path>) -> Option<PathBuf> {
+    match path {
+        Some(p) => Some(p.to_path_buf()),
+        None => default_paths().into_iter().find(|p| p.is_file()),
+    }
+}
+
+/// The `orangu-gguf.conf` of this run: `--config`, or the default one
+/// that exists.
+pub fn config_path() -> Option<PathBuf> {
+    find_config(CONFIG.get().and_then(|p| p.as_deref()))
+}
+
+/// `[orangu-gguf].models` of `text`, when it names one.
+pub fn models_of(text: &str) -> Option<String> {
+    let sections = orangu::config::parse_ini_sections(text).ok()?;
+    let models = sections.get("orangu-gguf")?.get("models")?.trim();
+    (!models.is_empty()).then(|| models.to_string())
 }
 
 fn default_paths() -> Vec<PathBuf> {
@@ -663,6 +700,31 @@ mod tests {
         assert!(s.scan);
         assert!(Settings::parse("[workers]\nport = 1\n").unwrap().is_none());
         assert!(Settings::parse("[other]\nname = x\n").unwrap().is_none());
+    }
+
+    /// `[orangu-gguf]` leads the file and names the models directory;
+    /// `[workers]` beside it is read as before.
+    #[test]
+    fn orangu_gguf_leads_the_file() {
+        let text = "[orangu-gguf]\nmodels = /data/models\n\n[workers]\nname = lab\n";
+        assert_eq!(models_of(text).as_deref(), Some("/data/models"));
+        assert_eq!(Settings::parse(text).unwrap().unwrap().name, "lab");
+        assert_eq!(models_of("[orangu-gguf]\nmodels =\n"), None);
+        assert_eq!(models_of("[workers]\nname = lab\n"), None);
+    }
+
+    /// `all` and `*` listen everywhere, as they do for `orangu-server`.
+    #[test]
+    fn all_and_star_are_every_interface() {
+        for value in ["all", "ALL", " All ", "*", " * "] {
+            let s = Settings::parse(&format!("[workers]\nname = n\nhost = {value}\n"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(s.host, "0.0.0.0", "host = {value}");
+        }
+        for value in ["127.0.0.1", "192.168.1.10", "::1"] {
+            assert_eq!(resolve_bind_host(value), value);
+        }
     }
 
     /// A gguf worker answers the channel's probe as a gguf node that can

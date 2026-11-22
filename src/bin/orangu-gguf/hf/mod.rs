@@ -372,24 +372,34 @@ fn wanted(path: &str) -> bool {
             || path == "merges.txt")
 }
 
-/// The models directory `orangu-server` serves from: `[orangu-server].models`
-/// in `./orangu-server.conf`, else `~/.orangu/orangu-server.conf` — the
-/// same files, in the same order, the server reads.
+/// The models directory: `[orangu-gguf].models` in this run's
+/// `orangu-gguf.conf`, else the one `orangu-server` serves from —
+/// `[orangu-server].models` in `./orangu-server.conf`, else
+/// `~/.orangu/orangu-server.conf`, the same files, in the same order, the
+/// server reads.
 pub fn models_dir() -> Option<PathBuf> {
     let home = home::home_dir();
-    let candidates = [
-        Some(PathBuf::from("orangu-server.conf")),
-        home.as_ref()
-            .map(|h| h.join(".orangu").join("orangu-server.conf")),
-    ];
-    let conf = candidates.into_iter().flatten().find(|p| p.is_file())?;
-    let text = std::fs::read_to_string(conf).ok()?;
-    let sections = orangu::config::parse_ini_sections(&text).ok()?;
-    let models = sections
-        .get("orangu-server")?
-        .get("models")?
-        .trim()
-        .to_string();
+    let own = crate::node::config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| crate::node::models_of(&text));
+    let models = match own {
+        Some(models) => models,
+        None => {
+            let candidates = [
+                Some(PathBuf::from("orangu-server.conf")),
+                home.as_ref()
+                    .map(|h| h.join(".orangu").join("orangu-server.conf")),
+            ];
+            let conf = candidates.into_iter().flatten().find(|p| p.is_file())?;
+            let text = std::fs::read_to_string(conf).ok()?;
+            let sections = orangu::config::parse_ini_sections(&text).ok()?;
+            sections
+                .get("orangu-server")?
+                .get("models")?
+                .trim()
+                .to_string()
+        }
+    };
     match (models.strip_prefix("~/"), home) {
         (Some(rest), Some(home)) => Some(home.join(rest)),
         _ => Some(PathBuf::from(models)),

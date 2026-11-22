@@ -415,7 +415,7 @@ orangu-gguf -m ./my-model-BF16.gguf -q q4_k_m
 | `--allow-requantize` | Accept a quantized source |
 | `--worker` | Join the `[workers]` channel as a gguf node; see [Several machines](#several-machines) |
 | `--channel` | List the channel's nodes, servers and gguf nodes |
-| `--config FILE` | Read `[workers]` from this file instead of `orangu-gguf.conf` |
+| `--config FILE` | Read this file instead of `orangu-gguf.conf` |
 | `--perplexity TEXT` | Print the perplexity of the `-m` model over the text, divided over the channel's gguf nodes when there are any |
 | `-s`, `--shell-completions` | Print the shell completion script and exit |
 
@@ -455,8 +455,9 @@ GGUF file does. Name the repository:
 orangu-gguf -m Qwen/Qwen3-0.6B -q bf16
 ```
 
-It is looked for in the models directory `orangu-server` serves from
-(`[orangu-server].models` in `orangu-server.conf`) and downloaded there when
+It is looked for in the models directory — `[orangu-gguf].models` in
+`orangu-gguf.conf`, else the one `orangu-server` serves from
+(`[orangu-server].models` in `orangu-server.conf`) — and downloaded there when
 it is not, in the same layout `orangu-server download` uses, so a second
 conversion of the same model fetches nothing. A local checkpoint directory
 works too: `orangu-gguf -m ./Qwen3-0.6B -q bf16`.
@@ -951,20 +952,33 @@ models, and **gguf nodes**, which take a share of building a model file.
 Both answer the same probe, so each kind finds the other.
 
 The settings live in `orangu-gguf.conf` — `./orangu-gguf.conf`, then
-`~/.orangu/orangu-gguf.conf`, or the file `--config` names — in a
-`[workers]` section spelled as the server's:
+`~/.orangu/orangu-gguf.conf`, or the file `--config` names. It leads with
+an `[orangu-gguf]` section, as `orangu-server.conf` leads with
+`[orangu-server]`, followed by a `[workers]` section spelled as the
+server's:
 
 ```ini
+[orangu-gguf]
+models = /data/models
+
 [workers]
 name = lab
 secret = a-long-shared-secret
 ```
 
+`[orangu-gguf]`:
+
+| Key | Default | Meaning |
+|:---|:---|:---|
+| `models` | `[orangu-server].models` | The models directory checkpoints are found in and downloaded to |
+
+`[workers]`:
+
 | Key | Default | Meaning |
 |:---|:---|:---|
 | `name` | *(none)* | The channel. Without it `orangu-gguf` joins none |
 | `secret` | *(none)* | The channel's shared secret, as the servers have it |
-| `host` | `0.0.0.0` | The address `--worker` listens on |
+| `host` | `0.0.0.0` | The address `--worker` listens on; `all` and `*` are every interface |
 | `port` | `8401` | The port `--worker` listens on, and gguf nodes are looked for on |
 | `server_port` | `8400` | The port the channel's servers listen on |
 | `network` | this machine's networks | The IPv4 networks to look on, `10.0.0.0/24,…` |
