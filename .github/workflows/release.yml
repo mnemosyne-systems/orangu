@@ -284,3 +284,39 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.ref_name }}" "$VSIX" --clobber
+
+  intellij:
+    name: IntelliJ plugin
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # The plugin carries the release's version, so the IDE sees a newer
+      # release as newer. A tag that is not MAJOR.MINOR.PATCH keeps the
+      # default. The tests run inside the IDE the plugin is built against,
+      # which the build downloads; they need no display.
+      - name: Test and build the plugin
+        working-directory: contrib/intellij
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          properties=()
+          if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            properties+=("-PpluginVersion=$version")
+          fi
+          ./gradlew --console=plain "${properties[@]}" test buildPlugin
+          zip="orangu-$TAG-intellij.zip"
+          cp build/distributions/orangu-*.zip "../../$zip"
+          echo "ZIP=$zip" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.ref_name }}" "$ZIP" --clobber

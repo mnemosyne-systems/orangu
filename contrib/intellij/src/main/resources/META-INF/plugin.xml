@@ -1,0 +1,67 @@
+<!--
+  Copyright (C) 2026 The orangu community
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program. If not, see <https://www.gnu.org/licenses/>.
+-->
+<idea-plugin>
+    <id>ai.mnemosyne-systems.orangu</id>
+    <name>orangu</name>
+    <vendor url="https://github.com/mnemosyne-systems/orangu">mnemosyne-systems</vendor>
+    <description><![CDATA[
+        <p>orangu, the coding agent, inside the IDE.</p>
+        <ul>
+            <li>An orangu tool window: each prompt runs <code>orangu -p</code> in the project and the answer streams in.</li>
+            <li><b>Open orangu</b> starts orangu's own interface in the IDE's terminal, with <code>/review</code>,
+                <code>/auto_review</code> and a conversation that is kept.</li>
+            <li>Right click in the editor to ask about a selection, or to review the file with <code>/auto_review</code>.</li>
+            <li><b>Review Changes with orangu</b> runs <code>/auto_review</code> on the branch.</li>
+        </ul>
+        <p>The plugin runs the <code>orangu</code> binary, so the server, model, tools and skills all come from
+            <code>orangu.conf</code>.</p>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>org.jetbrains.plugins.terminal</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <toolWindow id="orangu" anchor="right" icon="/icons/orangu.svg"
+                    factoryClass="ai.mnemosyne_systems.orangu.OranguToolWindowFactory"/>
+        <applicationConfigurable parentId="tools" id="ai.mnemosyne-systems.orangu" displayName="orangu"
+                                 instance="ai.mnemosyne_systems.orangu.OranguConfigurable"/>
+        <notificationGroup id="orangu" displayType="BALLOON"/>
+    </extensions>
+
+    <actions>
+        <group id="orangu.ToolsMenu" text="orangu" popup="false">
+            <add-to-group group-id="ToolsMenu" anchor="last"/>
+            <separator/>
+            <action id="orangu.Open" class="ai.mnemosyne_systems.orangu.OpenOranguAction"
+                    text="Open orangu" icon="/icons/orangu.svg"
+                    description="Start orangu in the terminal, in the project folder"/>
+            <action id="orangu.ReviewChanges" class="ai.mnemosyne_systems.orangu.ReviewChangesAction"
+                    text="Review Changes with orangu"
+                    description="Run orangu's /auto_review on everything the branch changes"/>
+        </group>
+        <group id="orangu.EditorPopup" text="orangu" popup="false">
+            <add-to-group group-id="EditorPopupMenu" anchor="last"/>
+            <separator/>
+            <action id="orangu.AskAboutSelection" class="ai.mnemosyne_systems.orangu.AskAboutSelectionAction"
+                    text="Ask orangu About This Selection"
+                    description="Attach the selection to the next prompt in the orangu tool window"/>
+            <action id="orangu.ReviewFile" class="ai.mnemosyne_systems.orangu.ReviewFileAction"
+                    text="Review This File with orangu"
+                    description="Run orangu's /auto_review on this file"/>
+        </group>
+    </actions>
+</idea-plugin>

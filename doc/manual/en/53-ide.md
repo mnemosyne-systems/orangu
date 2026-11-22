@@ -229,3 +229,120 @@ npm run package
 it; on Linux without a display, run it under `xvfb-run -a`. `npm run
 package` writes the `.vsix`. To try a change, open `contrib/vscode` in VS
 Code and press **F5**.
+
+## IntelliJ
+
+The IntelliJ plugin works in every JetBrains IDE from 2024.3 on: IntelliJ
+IDEA, RustRover, CLion, PyCharm, GoLand, WebStorm and the others, on Linux,
+macOS and Windows. It only uses the base platform and the terminal that
+every one of them has. Its source is in `contrib/intellij`.
+
+### Installing
+
+Every release has the plugin as `orangu-<version>-intellij.zip` beside the
+binary archives. Install it with **Settings > Plugins**, the gear menu at
+the top, **Install Plugin from Disk...**, picking the `.zip` as it is.
+
+The plugin needs `orangu` itself:
+
+- `orangu` from the archive of the same release, on the `PATH`, in
+  `~/.cargo/bin` (where `cargo install --path .` puts it), or wherever
+  **Settings > Tools > orangu** says.
+- An `orangu.conf` that `orangu` can find: in the project folder, or in
+  `~/.orangu/`. Run `orangu --init` once to write one.
+
+### What it adds
+
+| Where | What it does |
+|:---|:---|
+| **orangu** tool window, on the right | A prompt box and the answers |
+| **Tools > Open orangu** (also in the tool window) | Starts `orangu` in the IDE's terminal, in the project folder: the full interface, with `/review`, `/auto_review` and a conversation that is kept |
+| **Right click in the editor > Ask orangu About This Selection** | Attaches the selection to the next prompt in the tool window |
+| **Right click in the editor > Review This File with orangu** | Runs `/auto_review` on the file in the editor |
+| **Tools > Review Changes with orangu** (also in the tool window) | Runs `/auto_review` on the changes on the branch |
+| **Settings > Tools > orangu** | The path of `orangu` |
+
+### The tool window
+
+Type a prompt and press **Enter** (or **Ask**). **Shift+Enter** starts a
+new line. It runs as
+
+```
+orangu -w <workspace> -p "<prompt>"
+```
+
+and the answer streams in as `orangu` writes it. The line under the buttons
+shows what `orangu` is doing (the server it talks to, the tools it calls)
+and, at the end, how the run went. **Stop** ends the run and everything it
+started, and **Clear** empties the window.
+
+Anything `orangu -p` takes works here: a question, a request to change
+code, a command such as `/status`, `/log` or `/diff`, or a skill. A prompt
+stands on its own; nothing is remembered from the one before it. For a
+conversation, and for `/review`, which needs the terminal, press
+**Open orangu**. `orangu` is the terminal tab's program, so the tab closes
+when you quit it. Pressing **Open orangu** again while it runs shows the
+same tab rather than starting a second `orangu`.
+
+### Asking about code
+
+**Ask orangu About This Selection** attaches the selection (or, with
+nothing selected, the line the caret is on) to the next prompt. The tool
+window shows it as `src/parser.rs:12-14` with a **Remove** button, and
+fills the prompt box with *Explain what this code does.* when it is empty.
+Change the question and press **Enter**: the model gets the question, the
+file and the lines, and the code itself, and can open the rest of the file
+with its own tools.
+
+### Reviews
+
+**Review This File with orangu** runs `orangu -p "/auto_review <file>"`,
+the same review as in the terminal, with its report in the tool window.
+On `main` or `master` it reviews the whole file; on any other branch, the
+file's changes against the default branch, so a file the branch does not
+change is refused with `orangu`'s own message. `orangu` reads the file
+from disk, so a file with unsaved changes is reviewed as it was last
+saved, which the tool window points out.
+
+The file is passed relative to the workspace, escaped the same way as in
+VS Code: a path such as `app/[id]/page.tsx` is sent as a pattern that
+matches only it, and a space as `?`.
+
+**Review Changes with orangu** runs `orangu -p "/auto_review"` on
+everything the branch changes. Both need a Git repository and a branch
+that is up to date with the default branch, as in the terminal. A review
+that rejects the changes ends as failed, with the verdict on the status
+line.
+
+### The workspace
+
+`orangu` runs in the project's folder, also for a file in one of its
+modules. A file in a content root outside the project folder runs in that
+root, and a file outside all of them runs in the project's folder. That
+folder is also where `orangu` looks for `orangu.conf` first.
+
+### Settings
+
+**Settings > Tools > orangu** has one setting, **orangu binary**: the path
+of the `orangu` binary, or the folder it is in. Left empty, the plugin uses
+the first `orangu` on the `PATH`, then the one in `~/.cargo/bin`. A path
+that is set but does not exist is reported rather than replaced by another
+binary. The setting belongs to the machine, so it is not synced with the
+IDE's other settings.
+
+### Building it
+
+`contrib/intellij` builds with Gradle (the wrapper is in the folder) and a
+JDK 21:
+
+```sh
+cd contrib/intellij
+./gradlew test
+./gradlew buildPlugin
+```
+
+The first build downloads the IDE it builds against. `./gradlew test` runs
+the plugin's tests inside it, and `./gradlew buildPlugin` writes the `.zip`
+to `build/distributions`. `./gradlew runIde` starts an IDE with the plugin
+in it, to try a change, and `./gradlew verifyPlugin` checks it against the
+current IDE releases.
