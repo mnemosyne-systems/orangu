@@ -27,6 +27,7 @@
 
 pub mod chunk;
 pub mod client;
+pub mod eval;
 pub mod index;
 pub mod sketch;
 pub mod source;

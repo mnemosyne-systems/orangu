@@ -569,6 +569,34 @@ runs of one build on one device are the floor to compare against: a device
 whose sums run in a different order from run to run does not reach zero
 against itself.
 
+### Retrieval mode (`--retrieval`) — does `/search` find the right files?
+
+`--retrieval PATH` builds (or updates) the same embedding index `/search`
+uses for `--retrieval-workspace`, through `--url`'s `/v1/embeddings`, then
+runs every query in the case file and reports where its expected files land
+in the top 10. Each query is ranked twice: by cosine similarity alone, and
+with the knowledge graph's call-edge expansion `/search` adds on top.
+
+```sh
+orangu-bench --url http://127.0.0.1:8101 --retrieval src/bin/orangu-bench/fixtures/retrieval.yaml
+```
+
+A case is a query and the workspace-relative files that answer it; a path
+ending in `/` matches every file under it:
+
+```yaml
+cases:
+  - query: turn a JSON schema into GBNF rules
+    expect: [src/bin/orangu-server/engine/json_schema.rs]
+```
+
+Scores are per file, not per chunk: `hit@1` is the share of queries whose
+first file is an expected one, `R@5` and `R@10` the share of expected files
+in the first 5 and 10, and `MRR` the mean of one over the first expected
+file's rank. The bundled fixture is written against this repository. Change
+the embedding model, the chunking, or the ranking, and compare the two runs.
+`--json` prints every case's ranks as well.
+
 ### Scoring modes — how good are the model's predictions?
 
 Throughput says how fast a model runs, and `--kl` says whether a change moved its
@@ -1532,6 +1560,8 @@ Options:
       --chat-fixed                     Send each turn's recorded replies instead of the model's, so every build sees the same prompts
       --chat-record <PATH>             Write the session `--chat` runs, the model's replies and tool results included, as a fixture
       --chat-workspace <DIR>           The checkout whose files answer read_file and search while recording
+      --retrieval <PATH>               Retrieval mode: score semantic /search on these cases (YAML) against /v1/embeddings
+      --retrieval-workspace <DIR>      The checkout `--retrieval` indexes and searches [default: .]
       --kl <PATH>                      KL mode: compare the server's teacher-forced distributions with this reference, saving it first if absent
       --kl-rows <N>                    Positions per `--kl` pass: 1 runs decode steps, more runs verify passes [default: 1]
       --kl-top <N>                     Candidates `--kl` keeps per position [default: 256]
