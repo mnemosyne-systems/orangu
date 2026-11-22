@@ -4985,6 +4985,16 @@ impl RecurrentLayerState {
         }
     }
 
+    /// The rolling window [`Self::conv_step`] reads, `[conv_channels,
+    /// d_conv - 1]` channel-major and oldest first — for an architecture
+    /// whose taps also vary per token (`engine::arch::inkling2`'s dynamic
+    /// key/value convolutions) and so read the window themselves before
+    /// the step slides it.
+    pub fn conv_window(&mut self) -> &[f32] {
+        self.ensure_host();
+        &self.conv_history
+    }
+
     /// One timestep of causal depthwise conv1d: convolves `input`
     /// (`[conv_channels]`) against `kernel` (`[conv_channels, d_conv]`,
     /// channel-major — ggml's own `ssm_conv1d.weight` element order, `{

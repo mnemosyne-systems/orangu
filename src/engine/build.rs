@@ -27,6 +27,7 @@ use crate::engine::arch::dflash::DFlashModel;
 use crate::engine::arch::gemma::GemmaModel;
 use crate::engine::arch::glm5::Glm5Model;
 use crate::engine::arch::inkling::InklingModel;
+use crate::engine::arch::inkling2::Inkling2Model;
 use crate::engine::arch::kimi3::Kimi3Model;
 use crate::engine::arch::llama::LlamaModel;
 use crate::engine::arch::mistral::MistralModel;
@@ -132,6 +133,9 @@ pub fn model(loaded: &LoadedModel, backend: &Arc<dyn Backend>) -> Result<Arc<dyn
         ),
         ArchFamily::Inkling => Arc::new(
             InklingModel::load_with_backend(loaded, backend.clone()).context("building model")?,
+        ),
+        ArchFamily::Inkling2 => Arc::new(
+            Inkling2Model::load_with_backend(loaded, backend.clone()).context("building model")?,
         ),
         ArchFamily::NemotronHMoe => Arc::new(
             NemotronModel::load_with_backend(loaded, backend.clone()).context("building model")?,

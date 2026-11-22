@@ -305,6 +305,12 @@ fn split_pattern_for_pre(pre: &str) -> (&'static str, bool) {
     if GPT4O_PRE_TYPES.contains(&pre) {
         return (SPLIT_PATTERN_GPT4O, false);
     }
+    if pre == "inkling2" {
+        // Inkling's vocabulary and split, but upstream's arm sets
+        // `ignore_merges`: a whole pre-token that is itself in the
+        // vocabulary is taken as one token without running the merges.
+        return (SPLIT_PATTERN_GPT4O, true);
+    }
     if BAILINGMOE_PRE_TYPES.contains(&pre) {
         return (SPLIT_PATTERN_BAILINGMOE, false);
     }
@@ -2139,6 +2145,15 @@ mod tests {
         assert_eq!(pattern, super::SPLIT_PATTERN_GPT4O);
         assert!(!ignore_merges);
         assert_ne!(pattern, super::SPLIT_PATTERN);
+    }
+
+    /// `inkling2` keeps Inkling's split but, unlike it, ignores merges for a
+    /// pre-token the vocabulary already holds whole.
+    #[test]
+    fn inkling2_uses_the_gpt4o_split_and_ignores_merges() {
+        let (pattern, ignore_merges) = super::split_pattern_for_pre("inkling2");
+        assert_eq!(pattern, super::SPLIT_PATTERN_GPT4O);
+        assert!(ignore_merges);
     }
 
     /// The Ling/Bailing vocabs (`bailingmoe`, `bailingmoe2`,

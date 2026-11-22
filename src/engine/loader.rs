@@ -198,6 +198,13 @@ pub enum ArchFamily {
     /// temperature), and sigmoid-routed experts share their normalization
     /// with the always-on shared experts. See `engine::arch::inkling`.
     Inkling,
+    /// Inkling 2 (`inkling2`, `inkling2_loop`) — Inkling's rotation-free
+    /// attention (relative bias, short convolutions) with block attention
+    /// residuals in place of the plain residual stream, L2-clipped queries
+    /// and keys, a per-query attention sink, SiTU experts and, on the loop
+    /// variant, a core of layers run several times. See
+    /// `engine::arch::inkling2`.
+    Inkling2,
     /// Ling 3.0 (`bailingmoe3`) — three-in-four Kimi Delta Attention
     /// layers alternating with gated, **rotated** absorbed multi-head
     /// latent attention (the pair `engine::arch::kda` shares with
@@ -387,6 +394,9 @@ const MUSE_SPARK_ARCHITECTURES: &[&str] = &["muse-spark"];
 /// shipped alongside is a separate `clip`-architecture model and is not
 /// this.
 const INKLING_ARCHITECTURES: &[&str] = &["inkling"];
+/// `inkling2` and `inkling2_loop` (e.g. `unsloth/Inkling-2-Mini-GGUF`) —
+/// see [`ArchFamily::Inkling2`] and `engine::arch::inkling2`.
+const INKLING2_ARCHITECTURES: &[&str] = &["inkling2", "inkling2_loop"];
 /// `nemotron_h_moe` (e.g. `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-
 /// GGUF`) — see [`ArchFamily::NemotronHMoe`] and `engine::arch::nemotron`.
 /// `nemotron_h` is the dense sibling — the same one-sub-layer-per-block
@@ -530,6 +540,9 @@ pub fn resolve_arch_family(architecture: &str) -> Result<ArchFamily> {
     if INKLING_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::Inkling);
     }
+    if INKLING2_ARCHITECTURES.contains(&architecture) {
+        return Ok(ArchFamily::Inkling2);
+    }
     if NEMOTRON_ARCHITECTURES.contains(&architecture) {
         return Ok(ArchFamily::NemotronHMoe);
     }
@@ -601,6 +614,7 @@ fn supported_architecture_names() -> Vec<&'static str> {
         .chain(MUSE_ARCHITECTURES)
         .chain(MUSE_SPARK_ARCHITECTURES)
         .chain(INKLING_ARCHITECTURES)
+        .chain(INKLING2_ARCHITECTURES)
         .chain(NEMOTRON_ARCHITECTURES)
         .chain(BAILINGMOE3_ARCHITECTURES)
         .chain(QWEN_IMAGE_ARCHITECTURES)
@@ -2591,6 +2605,17 @@ fn metadata_u64(gguf: &GgufFile, key: &str) -> Option<u64> {
         .and_then(|(_, v)| v.as_u64())
 }
 
+/// [`metadata_u64`], or an array's first element.
+fn metadata_u64_or_first(gguf: &GgufFile, key: &str) -> Option<u64> {
+    gguf.metadata
+        .iter()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| match v {
+            GgufValue::Array(items) => items.first().and_then(GgufValue::as_u64),
+            v => v.as_u64(),
+        })
+}
+
 fn metadata_f32(gguf: &GgufFile, key: &str) -> Option<f32> {
     gguf.metadata.iter().find_map(|(k, v)| {
         (k == key).then_some(v).and_then(|v| match v {
@@ -2609,8 +2634,12 @@ fn required_u64(gguf: &GgufFile, architecture: &str, suffix: &str) -> Result<u64
 fn read_model_config(gguf: &GgufFile, architecture: &str) -> Result<ModelConfig> {
     let n_embd = required_u64(gguf, architecture, "embedding_length")? as usize;
     let n_layer = required_u64(gguf, architecture, "block_count")? as usize;
-    let n_head = required_u64(gguf, architecture, "attention.head_count")? as usize;
-    let n_head_kv = metadata_u64(gguf, &format!("{architecture}.attention.head_count_kv"))
+    // A per-layer array (`inkling2`) reads as its first layer's value, as
+    // upstream's `n_head()` does; the architecture reads the rest itself.
+    let n_head = metadata_u64_or_first(gguf, &format!("{architecture}.attention.head_count"))
+        .ok_or_else(|| anyhow!("GGUF file is missing {architecture}.attention.head_count"))?
+        as usize;
+    let n_head_kv = metadata_u64_or_first(gguf, &format!("{architecture}.attention.head_count_kv"))
         .map(|v| v as usize)
         .unwrap_or(n_head);
     let n_ctx_train = required_u64(gguf, architecture, "context_length")? as usize;
@@ -3133,6 +3162,7 @@ mod tests {
             (ArchFamily::Muse, "muse-glimmer"),
             (ArchFamily::MuseSpark, "muse-spark"),
             (ArchFamily::Inkling, "inkling"),
+            (ArchFamily::Inkling2, "inkling2"),
             (ArchFamily::NemotronHMoe, "nemotron_h_moe"),
             (ArchFamily::BailingMoe3, "bailingmoe3"),
             (ArchFamily::QwenImage, "qwen_image"),
@@ -3163,6 +3193,7 @@ mod tests {
                 ArchFamily::Muse => "Muse",
                 ArchFamily::MuseSpark => "MuseSpark",
                 ArchFamily::Inkling => "Inkling",
+                ArchFamily::Inkling2 => "Inkling2",
                 ArchFamily::NemotronHMoe => "NemotronHMoe",
                 ArchFamily::BailingMoe3 => "BailingMoe3",
                 ArchFamily::QwenImage => "QwenImage",

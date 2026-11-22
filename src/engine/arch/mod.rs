@@ -39,7 +39,9 @@
 //! full-attention layers), `inkling` (Inkling: no rotation at all — a
 //! learned relative-position bias plus causal short convolutions — over
 //! sigmoid-routed experts that share their normalization with the shared
-//! ones), `nemotron` (Nemotron-H: blocks that are a *single* sub-layer each
+//! ones), `inkling2` (Inkling 2: the same rotation-free attention behind
+//! block attention residuals, clipped queries and keys, a per-query sink,
+//! SiTU experts and an optionally looped core), `nemotron` (Nemotron-H: blocks that are a *single* sub-layer each
 //! — a selective state-space mixer, an unrotated attention, or a squared-
 //! ReLU mixture-of-experts FFN — rather than the usual attention-plus-FFN
 //! pair), `bailingmoe` (Ling 3.0: the same three-in-four delta-net /
@@ -64,6 +66,7 @@ pub mod granite;
 pub mod hyper;
 pub mod indexer;
 pub mod inkling;
+pub mod inkling2;
 pub mod kda;
 pub mod kimi3;
 pub mod llama;
