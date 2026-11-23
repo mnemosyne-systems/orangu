@@ -5,7 +5,7 @@ OpenAI-compatible API, its own native endpoints and a web console. It is the
 inference engine itself: GGUF loading, tokenization, the forward pass, sampling
 and request scheduling are all implemented here in Rust. It serves text, chat
 and embedding models, plus text-to-image, text-to-video and text-to-speech
-models, for twenty-four servable architecture families.
+models, for twenty-five servable architecture families.
 
 It is also the machine's model inventory tool. `system`, `suggest`, `list`,
 `show`, `plan`, `download`, `delete` and `refresh` answer the questions that

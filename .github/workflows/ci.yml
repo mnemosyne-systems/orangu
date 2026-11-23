@@ -82,10 +82,14 @@ jobs:
   # is a compile-and-behaviour gate; anything that would have it download or
   # cache multi-gigabyte weights belongs on a developer machine, behind
   # `--ignored` and `ORANGU_TEST_MODEL`.
+  #
+  # The limit covers a build with nothing cached. `rust-cache` saves only
+  # after a job that succeeds, so a limit a cold Windows build cannot meet
+  # leaves every later run cold as well.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     strategy:
       # One platform failing should not hide whether the other two pass —
       # that is the whole point of testing on three.

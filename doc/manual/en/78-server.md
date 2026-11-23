@@ -84,7 +84,7 @@ dependency on any C or C++ inference library.
 - `engine/tensor.rs` — the handful of numeric ops (matmul, RMSNorm,
   softmax, RoPE, SwiGLU/GEGLU) a forward pass needs, on plain `f32`
   slices — not a general ND-array library.
-- `engine/arch/{mod,llama,gemma,phi,mistral,muse,muse_spark,inkling,nemotron,qwen35moe,qwen35,qwen3next,qwen4exp,deepseek4,deepseek41,glm,kimi3,dflash}.rs` — one
+- `engine/arch/{mod,llama,gemma,phi,mistral,muse,muse_spark,inkling,inkling2,nemotron,qwen35moe,qwen35,qwen3next,qwen4exp,deepseek4,deepseek41,glm,kimi3,dflash}.rs` — one
   `ModelForward` implementor per architecture family.
 - `engine/backend/{mod,cpu,vulkan,vulkan_shaders,metal,cuda,opencl,rocm}.rs`
   — the `Backend` trait and its six implementors; see below.
@@ -2262,6 +2262,17 @@ mod`), so adding a family is additive rather than a rewrite:
   routed to the same `GPT4O_PRE_TYPES` arm `muse-glimmer` uses, and the
   `mmproj-*.gguf` shipped beside it is a separate `clip` model that is not
   loaded.
+
+- `inkling2.rs` — `inkling2` and `inkling2_loop` (Inkling 2), e.g.
+  `unsloth/Inkling-2-Mini-GGUF`. `inkling.rs`'s rotation-free attention on a
+  different network: block attention residuals in place of the running
+  residual, queries and keys clipped to a norm rather than normed, a
+  per-`(token, head)` attention sink, an output gate, input-dependent taps
+  on the full-attention layers' key/value convolutions, SiTU experts, and a
+  final logit softcap. On the files with a looped core, every pass has its
+  own KV and convolution state, so the cache holds
+  `n_layer + (passes - 1) * (core_end - core_start)` layer slots. The module
+  doc lists both tensor layouts the loop's message queries come in.
 
 - `phi.rs` — `phi3`, covering both Phi-3 and Phi-4-mini (e.g.
   `unsloth/Phi-4-mini-instruct-GGUF`), confirmed against upstream

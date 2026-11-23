@@ -1,7 +1,7 @@
 # The inference engine: a contributor's map
 
-`orangu-server` carries twenty architecture modules across twenty-four servable
-architecture families — twenty-one language models, two diffusion
+`orangu-server` carries twenty-three architecture modules across twenty-five
+servable architecture families — twenty-two language models, two diffusion
 transformers, one for pictures and one for video, and one speech model, each
 of the last three with a module of its own outside `engine::arch` — and six
 device backends.
@@ -233,11 +233,13 @@ Architectures, by what they are rather than by name:
 | :-- | :-- |
 | `llama` | plain GQA + RoPE + RMSNorm + SwiGLU — the baseline |
 | `mistral`, `phi` | the same family with their own tensor layouts |
+| `granite` | that baseline with embedding, residual, logit and attention scales |
 | `gemma` | QK-norm, per-layer sliding/full attention, cross-layer KV sharing, per-layer embeddings, GEGLU, logit softcapping, optional MoE |
 | `qwen_hybrid` | shared trunk: full attention alternating with gated-DeltaNet |
 | `qwen35`, `qwen35moe`, `qwen3next` | thin modules over that trunk — dense, MoE, and a different MoE layout |
 | `qwen4exp` | that trunk's two sub-layers on a four-stream hyper-connection residual, with indexer-selected block-sparse attention and an n-gram-hash per-layer embedding |
 | `deepseek4` | multi-head latent attention, block-compressed KV, routed experts |
+| `deepseek41` | that block with compressed keys and indexer choices shared across layers, and an n-gram-hash Engram embedding |
 | `dsa` | shared trunk: latent attention restricted to what a sparse-attention indexer picks, then dense-lead / shared-expert MoE |
 | `glm`, `mistral_large4` | thin loaders onto that trunk — GLM-5 as declared, and Mistral Large 4 with SSMax, NoPE layers, shared key/value rows, learned rotary frequencies and a logit softcap |
 | `ffn` | shared FFN: dense SwiGLU for the leading layers, routed + shared-expert SwiGLU after (or `swiglu_oai` on all three, with per-expert scales) |
@@ -249,14 +251,15 @@ Architectures, by what they are rather than by name:
 | `indexer` | shared selection: the lightning indexer, over single positions or over pools of them |
 | `glm5` | that pair of half-layers, on that residual, choosing what to attend with that indexer |
 | `inkling`, `muse` | their own attention or framing variants |
+| `inkling2` | `inkling`'s rotation-free attention on block attention residuals, with clipped queries and keys, an attention sink, SiTU experts and an optional looped core |
 | `muse_spark` | `muse`'s attention in front of a latent mixture of experts, on a norm-preserving (`alpha`/`beta`) residual |
 | `nemotron` | one sub-layer per block, rectangular SSM state, gate-less squared-ReLU FFN — routed (`nemotron_h_moe`) or dense (`nemotron_h`) |
 | `dflash` | not a servable model — a draft sidecar that resolves to its target |
 
-Twenty-seven modules above, twenty architecture modules: `qwen_hybrid`, `kda`,
+Thirty modules above, twenty-three architecture modules: `qwen_hybrid`, `kda`,
 `hyper`, `indexer`, `dsa`, `ffn` and `position` are shared parts, not
 architectures of their own.
-Twenty-five `ArchFamily` variants, twenty-four *servable* families: `dflash` is a
+Twenty-six `ArchFamily` variants, twenty-five *servable* families: `dflash` is a
 module and a variant but resolves to the model it drafts for rather than
 serving itself, and `QwenImage`, `Ltxv` and `Qwen3Tts` are variants whose
 modules live outside `engine::arch` altogether (below). Those are the two

@@ -5249,7 +5249,7 @@ that apply to all of them.
 ## Scope
 
 Text-in/text-out GGUF chat, completion, and embedding models — and one
-text-to-image model, one text-to-video model and one text-to-speech model — for twenty-four
+text-to-image model, one text-to-video model and one text-to-speech model — for twenty-five
 servable architecture families: Llama-style (`general.architecture` one of `llama`,
 `qwen2`, `qwen3`, `mistral`, `qwen3vl` — Qwen3-VL's text backbone,
 _text-only_ input — and `qwen2vl`, Qwen2.5-VL's, the same way; and
@@ -5321,7 +5321,12 @@ nothing at all: position arrives through a learned per-head
 relative-position bias and a causal short convolution on the key/value
 projections and on each sub-layer's output, layers alternate
 sliding-window and full attention, and the routed experts share their
-weight normalization with two always-on shared ones), and Nemotron-H
+weight normalization with two always-on shared ones), and Inkling 2
+(`inkling2` and `inkling2_loop`, e.g. `unsloth/Inkling-2-Mini-GGUF` —
+Inkling's rotation-free attention with block attention residuals in place of
+the plain residual stream, norm-clipped queries and keys, a per-query
+attention sink, SiTU experts and, in the loop variant, a core of layers run
+several times), and Nemotron-H
 (`nemotron_h_moe`, e.g.
 `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` — a hybrid whose
 blocks are a _single_ sub-layer each rather than the usual
@@ -5830,6 +5835,16 @@ line into the system block and never reads the `enable_thinking` flag — so
 Not implemented for this model: parsing its JSON tool invocations back
 into `tool_calls` (a `<|content_invoke_tool_json|>` body
 reaches you as its literal JSON).
+
+Inkling 2 (`inkling2` and `inkling2_loop`, e.g.
+`unsloth/Inkling-2-Mini-GGUF`) rotates nothing either, and takes position
+from the same two places. What reaches a sub-layer is an attention over
+depth: the outputs of the earlier blocks and the current stream, mixed by a
+learned query. A file with a looped core keeps separate key/value and
+convolution state for every pass, so its cache holds more layer slots than
+the file has layers. Matrix products run on the selected backend and the
+attention loop runs on the host. The vision projector shipped beside the
+text weights is not loaded.
 
 Nemotron-H (`nemotron_h_moe` and the dense `nemotron_h`, e.g.
 `bartowski/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF` and
