@@ -533,17 +533,98 @@ pub struct Part {
     pub depth: usize,
 }
 
-/// The card training's products go to, chosen once: the discrete card, or
-/// none. `ORANGU_GGUF_DEVICE=cpu` keeps everything on the processor.
+/// The card training's products go to, chosen once: the discrete card;
+/// without one, the integrated GPU when it runs a product faster than the
+/// processor does; or none. `ORANGU_GGUF_DEVICE=cpu` keeps everything on
+/// the processor.
 pub fn card() -> Option<&'static Accel> {
     static CARD: std::sync::OnceLock<Option<Accel>> = std::sync::OnceLock::new();
     CARD.get_or_init(|| {
         if std::env::var("ORANGU_GGUF_DEVICE").as_deref() == Ok("cpu") {
             return None;
         }
-        Accel::open(Class::Discrete)
+        if let Some(card) = Accel::open(Class::Discrete) {
+            return Some(card);
+        }
+        let devices = gpu::devices();
+        let integrated = devices.iter().find(|d| d.class == Class::Integrated);
+        let accel = match integrated.map(|d| Accel::on(d.clone())) {
+            Some(Ok(accel)) => Some(accel),
+            Some(Err(e)) => {
+                eprintln!("orangu-gguf: the integrated GPU does not come up: {e:#}");
+                return None;
+            }
+            None => None,
+        };
+        let Some(accel) = accel else {
+            let seen: Vec<String> = devices
+                .iter()
+                .map(|d| format!("{} ({:?})", d.name, d.class))
+                .collect();
+            eprintln!(
+                "orangu-gguf: no discrete or integrated GPU comes up; adapters seen: {}",
+                if seen.is_empty() {
+                    "none".to_string()
+                } else {
+                    seen.join(", ")
+                }
+            );
+            return None;
+        };
+        let (gpu, cpu) = rates(&accel);
+        let used = gpu > cpu;
+        eprintln!(
+            "orangu-gguf: the integrated GPU {} runs a {}x{}x{} product at {gpu:.0} GFLOP/s, \
+             the processor at {cpu:.0}; {}",
+            accel.device.name,
+            PROBE.0,
+            PROBE.1,
+            PROBE.2,
+            if used {
+                "products go to it"
+            } else {
+                "it is not used"
+            }
+        );
+        used.then_some(accel)
     })
     .as_ref()
+}
+
+/// The product [`rates`] times: the size of training's larger ones.
+const PROBE: (usize, usize, usize) = (1024, 768, 512);
+
+/// GFLOP/s of the card and of the processor on [`PROBE`], the operands
+/// sent to the card each time, after one untimed run of each.
+fn rates(accel: &Accel) -> (f64, f64) {
+    let (m, n, p) = PROBE;
+    let a: Vec<f32> = (0..m * p).map(|i| (i as f32 * 0.37).sin()).collect();
+    let b: Vec<f32> = (0..p * n).map(|i| (i as f32 * 0.91).sin()).collect();
+    let (av, bv) = (
+        View {
+            data: &a,
+            row: p,
+            col: 1,
+        },
+        View {
+            data: &b,
+            row: n,
+            col: 1,
+        },
+    );
+    let mut c = vec![0f32; m * n];
+    let flop = 2.0 * (m * n * p) as f64;
+    let mut rate = |run: &mut dyn FnMut(&mut [f32])| {
+        run(&mut c);
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            run(&mut c);
+        }
+        3.0 * flop / started.elapsed().as_secs_f64() / 1e9
+    };
+    let gpu = rate(&mut |c| accel.gemm(c, av, bv, m, n, p, false, false));
+    let cpu = rate(&mut |c| crate::gemm::library(c, av, bv, m, n, p, false));
+    (gpu, cpu)
 }
 
 /// Work one call divides between the card and the processor.

@@ -63,6 +63,18 @@ pub fn npu() -> Option<&'static Dense> {
             Err(why) => {
                 if why != NO_RKNPU {
                     eprintln!("orangu-gguf: the NPU is not used: {why}");
+                } else if let Some(noe) = orangu::npu::detect_npu() {
+                    eprintln!(
+                        "orangu-gguf: the NPU ({} {}) is not used: it runs int8 graphs \
+                         compiled with their weights fixed, and training's weights change \
+                         every step",
+                        noe.vendor, noe.target
+                    );
+                } else if std::path::Path::new("/dev/aipu").exists() {
+                    eprintln!(
+                        "orangu-gguf: /dev/aipu is present but its runtime (libnoe) does not \
+                         load or refuses a context; ORANGU_NPU_LIB names the library"
+                    );
                 }
                 None
             }

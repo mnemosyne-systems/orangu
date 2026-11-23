@@ -2863,11 +2863,9 @@ impl Model {
                 let g = sigmoid(c.s_score[i]);
                 let dy = &d_out[i * h..(i + 1) * h];
                 let so = &c.s_out[i * h..(i + 1) * h];
-                let mut dot = 0.0f32;
-                for j in 0..h {
-                    d_s_out[j] = dy[j] * g;
-                    dot += dy[j] * so[j];
-                }
+                let gv = V8::splat(g);
+                vector::map(d_s_out, [dy], |[y]| y * gv);
+                let dot = vector::sum([dy, so], |[y, o]| y * o);
                 *d_score = dot * g * (1.0 - g);
             });
         {
@@ -2875,11 +2873,13 @@ impl Model {
             // Each column's gradient summed over the tokens in order, and
             // each token's input gradient on its own row.
             grad_slice(grads, m.shared_gate, h)
-                .par_iter_mut()
+                .par_chunks_mut(GAMMA_BLOCK)
                 .enumerate()
-                .for_each(|(j, d_w)| {
-                    for i in 0..t {
-                        *d_w += d_score[i] * x[i * h + j];
+                .for_each(|(block, d_w)| {
+                    let col = block * GAMMA_BLOCK;
+                    for (i, &score) in d_score.iter().enumerate() {
+                        let (score, at) = (V8::splat(score), i * h + col);
+                        vector::update(d_w, [&x[at..at + d_w.len()]], |o, [v]| o + score * v);
                     }
                 });
             dx.par_chunks_mut(h)
@@ -2974,18 +2974,34 @@ impl Model {
                 .map(|(e, grads)| self.expert_backward(m, c, d_out, e, grads))
                 .collect(),
         };
-        let mut d_weight = vec![vec![0.0f32; k]; t];
-        for (e, given) in given.iter().enumerate() {
-            let Some((d_xin, dots)) = given else {
-                continue;
-            };
-            for (r, &(i, slot)) in c.members[e].iter().enumerate() {
-                d_weight[i][slot] = dots[r];
-                for j in 0..h {
-                    dx[i * h + j] += d_xin[r * h + j];
-                }
+        // Each token's row in each of its experts' lists, then each token's
+        // share added in expert order, the tokens side by side.
+        let mut row_in = vec![vec![0usize; k]; t];
+        for rows in &c.members {
+            for (r, &(i, slot)) in rows.iter().enumerate() {
+                row_in[i][slot] = r;
             }
         }
+        let mut d_weight = vec![vec![0.0f32; k]; t];
+        dx.par_chunks_mut(h)
+            .zip(d_weight.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (dx, d_weight))| {
+                let mut picks: Vec<(usize, usize)> = c.chosen[i]
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &(e, _))| (e, slot))
+                    .collect();
+                picks.sort_unstable();
+                for (e, slot) in picks {
+                    let Some((d_xin, dots)) = &given[e] else {
+                        continue;
+                    };
+                    let r = row_in[i][slot];
+                    d_weight[slot] = dots[r];
+                    vector::update(dx, [&d_xin[r * h..(r + 1) * h]], |o, [v]| o + v);
+                }
+            });
 
         // The router: through the renormalized weights, the balancing term,
         // and the softmax.
@@ -4470,6 +4486,22 @@ fn delta_step_backward_portable(
 mod block {
     use crate::vector::V8;
 
+    /// Running sums kept four rows apart, so consecutive rows' multiply-adds
+    /// do not wait on each other; folded `(0 + 1) + (2 + 3)`.
+    #[derive(Clone, Copy)]
+    struct Four([V8; 4]);
+
+    impl Four {
+        #[inline(always)]
+        fn new() -> Four {
+            Four([V8::splat(0.0); 4])
+        }
+        #[inline(always)]
+        fn total(self) -> V8 {
+            (self.0[0] + self.0[1]) + (self.0[2] + self.0[3])
+        }
+    }
+
     /// Writes the lane sums of `rows` vectors, stored eight floats each in
     /// `parts`, into `out`; adds them when `add`.
     fn reduce_rows(parts: &[f32], out: &mut [f32], add: bool) {
@@ -4498,40 +4530,46 @@ mod block {
     ) {
         let rows = k.len();
         assert!(state.len() == rows * 16 && q.len() == rows && v.len() == 16 && out.len() == 16);
-        let zero = V8::splat(0.0);
         let dv = V8::splat(decay);
-        let (mut sk0, mut sk1) = (zero, zero);
-        for (b, &kb) in k.iter().enumerate() {
-            // SAFETY: row `b` of `rows` rows of 16.
-            unsafe {
-                let s0 = V8::at(state, b * 16) * dv;
-                let s1 = V8::at(state, b * 16 + 8) * dv;
-                s0.put(state, b * 16);
-                s1.put(state, b * 16 + 8);
-                let kv = V8::splat(kb);
-                sk0 = kv.mul_add(s0, sk0);
-                sk1 = kv.mul_add(s1, sk1);
+        let (mut sk0, mut sk1) = (Four::new(), Four::new());
+        for b4 in (0..rows).step_by(4) {
+            for j in 0..4 {
+                let b = b4 + j;
+                // SAFETY: row `b` of `rows` rows of 16, `rows` a multiple
+                // of eight.
+                unsafe {
+                    let s0 = V8::at(state, b * 16) * dv;
+                    let s1 = V8::at(state, b * 16 + 8) * dv;
+                    s0.put(state, b * 16);
+                    s1.put(state, b * 16 + 8);
+                    let kv = V8::splat(*k.get_unchecked(b));
+                    sk0.0[j] = kv.mul_add(s0, sk0.0[j]);
+                    sk1.0[j] = kv.mul_add(s1, sk1.0[j]);
+                }
             }
         }
         let bv = V8::splat(beta);
-        let d0 = bv * (V8::load(v) - sk0);
-        let d1 = bv * (V8::load(&v[8..]) - sk1);
-        let (mut o0, mut o1) = (zero, zero);
-        for (b, (&kb, &qb)) in k.iter().zip(q).enumerate() {
-            // SAFETY: as above.
-            unsafe {
-                let kv = V8::splat(kb);
-                let qv = V8::splat(qb);
-                let s0 = kv.mul_add(d0, V8::at(state, b * 16));
-                let s1 = kv.mul_add(d1, V8::at(state, b * 16 + 8));
-                s0.put(state, b * 16);
-                s1.put(state, b * 16 + 8);
-                o0 = qv.mul_add(s0, o0);
-                o1 = qv.mul_add(s1, o1);
+        let d0 = bv * (V8::load(v) - sk0.total());
+        let d1 = bv * (V8::load(&v[8..]) - sk1.total());
+        let (mut o0, mut o1) = (Four::new(), Four::new());
+        for b4 in (0..rows).step_by(4) {
+            for j in 0..4 {
+                let b = b4 + j;
+                // SAFETY: as above.
+                unsafe {
+                    let kv = V8::splat(*k.get_unchecked(b));
+                    let qv = V8::splat(*q.get_unchecked(b));
+                    let s0 = kv.mul_add(d0, V8::at(state, b * 16));
+                    let s1 = kv.mul_add(d1, V8::at(state, b * 16 + 8));
+                    s0.put(state, b * 16);
+                    s1.put(state, b * 16 + 8);
+                    o0.0[j] = qv.mul_add(s0, o0.0[j]);
+                    o1.0[j] = qv.mul_add(s1, o1.0[j]);
+                }
             }
         }
-        (V8::load(out) + o0).store(out);
-        (V8::load(&out[8..]) + o1).store(&mut out[8..]);
+        (V8::load(out) + o0.total()).store(out);
+        (V8::load(&out[8..]) + o1.total()).store(&mut out[8..]);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4554,19 +4592,23 @@ mod block {
         let (q_parts, rest) = scratch.split_at_mut(rows * 8);
         let (k_parts, rest) = rest.split_at_mut(rows * 8);
         let k_more = &mut rest[..rows * 8];
-        let zero = V8::splat(0.0);
         let dc = V8::splat(decay);
 
         // S1 = decay·S0, kᵀS1.
-        let (mut sk0, mut sk1) = (zero, zero);
-        for (b, &kb) in k.iter().enumerate() {
-            // SAFETY: row `b` of `rows` rows of 16.
-            unsafe {
-                let kv = V8::splat(kb);
-                sk0 = kv.mul_add(V8::at(before, b * 16) * dc, sk0);
-                sk1 = kv.mul_add(V8::at(before, b * 16 + 8) * dc, sk1);
+        let (mut sk0, mut sk1) = (Four::new(), Four::new());
+        for b4 in (0..rows).step_by(4) {
+            for j in 0..4 {
+                let b = b4 + j;
+                // SAFETY: row `b` of `rows` rows of 16, `rows` a multiple
+                // of eight.
+                unsafe {
+                    let kv = V8::splat(*k.get_unchecked(b));
+                    sk0.0[j] = kv.mul_add(V8::at(before, b * 16) * dc, sk0.0[j]);
+                    sk1.0[j] = kv.mul_add(V8::at(before, b * 16 + 8) * dc, sk1.0[j]);
+                }
             }
         }
+        let (sk0, sk1) = (sk0.total(), sk1.total());
         let bv = V8::splat(beta);
         let (v0, v1) = (V8::load(v), V8::load(&v[8..]));
         let d0 = bv * (v0 - sk0);
@@ -4574,24 +4616,28 @@ mod block {
         let (o0, o1) = (V8::load(d_out), V8::load(&d_out[8..]));
 
         // out = qᵀS2 with S2 = S1 + k dᵀ: into q, the state, and k and d.
-        let (mut dd0, mut dd1) = (zero, zero);
-        for (b, (&kb, &qb)) in k.iter().zip(q).enumerate() {
-            // SAFETY: row `b` of the state and of the eight-a-row parts.
-            unsafe {
-                let kv = V8::splat(kb);
-                let qv = V8::splat(qb);
-                let s20 = kv.mul_add(d0, V8::at(before, b * 16) * dc);
-                let s21 = kv.mul_add(d1, V8::at(before, b * 16 + 8) * dc);
-                o1.mul_add(s21, o0 * s20).put(q_parts, b * 8);
-                let g0 = qv.mul_add(o0, V8::at(g_state, b * 16));
-                let g1 = qv.mul_add(o1, V8::at(g_state, b * 16 + 8));
-                g0.put(g_state, b * 16);
-                g1.put(g_state, b * 16 + 8);
-                g1.mul_add(d1, g0 * d0).put(k_parts, b * 8);
-                dd0 = kv.mul_add(g0, dd0);
-                dd1 = kv.mul_add(g1, dd1);
+        let (mut dd0, mut dd1) = (Four::new(), Four::new());
+        for b4 in (0..rows).step_by(4) {
+            for j in 0..4 {
+                let b = b4 + j;
+                // SAFETY: row `b` of the state and of the eight-a-row parts.
+                unsafe {
+                    let kv = V8::splat(*k.get_unchecked(b));
+                    let qv = V8::splat(*q.get_unchecked(b));
+                    let s20 = kv.mul_add(d0, V8::at(before, b * 16) * dc);
+                    let s21 = kv.mul_add(d1, V8::at(before, b * 16 + 8) * dc);
+                    o1.mul_add(s21, o0 * s20).put(q_parts, b * 8);
+                    let g0 = qv.mul_add(o0, V8::at(g_state, b * 16));
+                    let g1 = qv.mul_add(o1, V8::at(g_state, b * 16 + 8));
+                    g0.put(g_state, b * 16);
+                    g1.put(g_state, b * 16 + 8);
+                    g1.mul_add(d1, g0 * d0).put(k_parts, b * 8);
+                    dd0.0[j] = kv.mul_add(g0, dd0.0[j]);
+                    dd1.0[j] = kv.mul_add(g1, dd1.0[j]);
+                }
             }
         }
+        let (dd0, dd1) = (dd0.total(), dd1.total());
         reduce_rows(q_parts, dq, false);
 
         // d = beta·(v − kᵀS1).
@@ -4602,24 +4648,27 @@ mod block {
         let (dsk0, dsk1) = (nb * dd0, nb * dd1);
 
         // kᵀS1 into S1's gradient and k's, then S1 = decay·S0.
-        let (mut dec0, mut dec1) = (zero, zero);
-        for (b, &kb) in k.iter().enumerate() {
-            // SAFETY: as above.
-            unsafe {
-                let kv = V8::splat(kb);
-                let (a0, a1) = (V8::at(before, b * 16), V8::at(before, b * 16 + 8));
-                (dc * dsk1.mul_add(a1, dsk0 * a0)).put(k_more, b * 8);
-                let g0 = kv.mul_add(dsk0, V8::at(g_state, b * 16));
-                let g1 = kv.mul_add(dsk1, V8::at(g_state, b * 16 + 8));
-                dec0 = g0.mul_add(a0, dec0);
-                dec1 = g1.mul_add(a1, dec1);
-                (g0 * dc).put(g_state, b * 16);
-                (g1 * dc).put(g_state, b * 16 + 8);
+        let (mut dec0, mut dec1) = (Four::new(), Four::new());
+        for b4 in (0..rows).step_by(4) {
+            for j in 0..4 {
+                let b = b4 + j;
+                // SAFETY: as above.
+                unsafe {
+                    let kv = V8::splat(*k.get_unchecked(b));
+                    let (a0, a1) = (V8::at(before, b * 16), V8::at(before, b * 16 + 8));
+                    (dc * dsk1.mul_add(a1, dsk0 * a0)).put(k_more, b * 8);
+                    let g0 = kv.mul_add(dsk0, V8::at(g_state, b * 16));
+                    let g1 = kv.mul_add(dsk1, V8::at(g_state, b * 16 + 8));
+                    dec0.0[j] = g0.mul_add(a0, dec0.0[j]);
+                    dec1.0[j] = g1.mul_add(a1, dec1.0[j]);
+                    (g0 * dc).put(g_state, b * 16);
+                    (g1 * dc).put(g_state, b * 16 + 8);
+                }
             }
         }
         reduce_rows(k_parts, dk, false);
         reduce_rows(k_more, dk, true);
-        (d_beta, (dec0 + dec1).sum())
+        (d_beta, (dec0.total() + dec1.total()).sum())
     }
 }
 

@@ -314,10 +314,18 @@ the accelerators the machine has:
 - **A discrete graphics card** takes the large products, and the routed
   experts of a mixture-of-experts layer are divided between it and the
   processor in proportion to the speed each side measures.
+- **An integrated GPU**, on a machine without a discrete card, takes the
+  card's place when it runs a product faster than the processor does. One
+  product is timed on each at the start, and a line reports both rates and
+  the choice. When no GPU comes up, a line names the adapters that were
+  seen, or the error the integrated one gave.
 - **A Rockchip NPU** multiplies in fp16 with fp32 sums, each operand
   scaled by a power of two so small gradients keep their precision. Each
   product shape is timed on the NPU and on the processor, and from then on
   runs on whichever was faster.
+- **A CIX (Zhouyi) NPU** runs int8 graphs compiled with their weights
+  fixed. Training's weights change every step, so it is not used, and a
+  line at the start says so.
 
 | Variable | Effect |
 |---|---|
