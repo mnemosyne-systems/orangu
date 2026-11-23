@@ -245,6 +245,7 @@ its own.
 | `vision` | No | The vision projector (`mmproj-*.gguf`) a `qwen_image_2_1` model reads attached pictures with. Defaults to the one beside the text encoder; `none` draws over attached pictures instead |
 | `image_lora` | No | Adapter applied to the picture transformer: `auto` (the default: the Lightning adapter under `models`), `none` (the base model), or the path of a `.safetensors` adapter |
 | `image_lora_merge` | No | Fold the adapter into the weights at startup instead of applying it in `f32` on every pass. Defaults to `yes` |
+| `text_lora` | No | A `peft` LoRA merged into the chat model's weights at startup: the `adapter_model.safetensors` file or the directory holding it, absolute or under `models`. The merge is cached under `models/orangu-merged/`. Defaults to `none` |
 | `image_weights` | No | How a `qwen_image_2_1` transformer's linears are held: `auto` (the default: per-row `int8` when the transformer runs on the CPU and total memory is at least three times the 7 GB copy), `int8`, or `file` (the file's K-quants, no copy) |
 | `vae_precision` | No | The VAE's convolutions: `int8` (the default, as `Q6_K` on the `int8` kernel) or `f32` (as stored, exact) |
 | `image_cache` | No | Whether a step may reuse the last transformer pass instead of running one: `easy` (the default, threshold `0.08`), `easy:<threshold>`, or `off` |

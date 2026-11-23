@@ -1249,6 +1249,11 @@ impl QuantMatrix {
         self.bytes.clone()
     }
 
+    /// Where [`Self::raw_bytes`] starts inside [`Self::shared_bytes`].
+    pub fn byte_start(&self) -> usize {
+        self.start
+    }
+
     pub fn from_encoded_rows(
         bytes: Vec<u8>,
         ggml_type: u32,
@@ -1860,6 +1865,26 @@ impl LoadedModel {
     /// [`Self::set_layer_devices`] must; a model built earlier keeps the
     /// weights it was built over.
     pub fn replace_tensor(&mut self, name: &str, ggml_type: u32, bytes: TensorBytes) -> Result<()> {
+        let len = bytes.len();
+        self.replace_tensor_range(name, ggml_type, bytes, 0, len)
+    }
+
+    /// [`Self::replace_tensor`] over `len` bytes at `start` of `bytes` — a
+    /// tensor inside a shared mapping, such as a cached merge
+    /// (`engine::image::lora::MergedCache`).
+    pub fn replace_tensor_range(
+        &mut self,
+        name: &str,
+        ggml_type: u32,
+        bytes: TensorBytes,
+        start: usize,
+        len: usize,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            start.checked_add(len).is_some_and(|end| end <= bytes.len()),
+            "{name}: range {start}+{len} is outside its {} bytes",
+            bytes.len()
+        );
         let tensor = self
             .tensors
             .get_mut(name)
@@ -1868,15 +1893,14 @@ impl LoadedModel {
         let elements: u64 = tensor.dims.iter().product();
         let rows = elements as usize / ncols.max(1);
         let expected = crate::quantize::row_bytes(ggml_type, ncols) * rows;
-        if expected == 0 || bytes.len() != expected {
+        if expected == 0 || len != expected {
             anyhow::bail!(
-                "{name}: {} bytes for {rows} rows of {ncols} as type {ggml_type}, expected {expected}",
-                bytes.len()
+                "{name}: {len} bytes for {rows} rows of {ncols} as type {ggml_type}, expected {expected}"
             );
         }
         tensor.ggml_type = ggml_type;
-        tensor.start = 0;
-        tensor.len = bytes.len();
+        tensor.start = start;
+        tensor.len = len;
         tensor.bytes = bytes;
         Ok(())
     }
