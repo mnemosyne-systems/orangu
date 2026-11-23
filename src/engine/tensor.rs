@@ -1622,9 +1622,12 @@ pub unsafe fn exp_neon(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64
 /// per generated token. They are written to the same recipe deliberately: a
 /// second approximation would be a second set of numerics for a model to be
 /// subtly different under, and the tests hold both to the same scalar form.
+///
+/// # Safety
+/// The CPU has AVX2 and FMA.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
+pub unsafe fn exp_avx2(x: std::arch::x86_64::__m256) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
     {
         let x = _mm256_min_ps(

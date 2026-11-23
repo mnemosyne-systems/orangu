@@ -34,7 +34,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use half::f16;
-use orangu::engine::backend::rknpu::Dense;
+use orangu::engine::backend::rknpu::{Dense, NO_RKNPU};
 use rayon::prelude::*;
 
 use crate::gemm::View;
@@ -58,7 +58,15 @@ pub fn npu() -> Option<&'static Dense> {
         if std::env::var("ORANGU_GGUF_DEVICE").as_deref() == Ok("cpu") {
             return None;
         }
-        Dense::open()
+        match Dense::try_open() {
+            Ok(dense) => Some(dense),
+            Err(why) => {
+                if why != NO_RKNPU {
+                    eprintln!("orangu-gguf: the NPU is not used: {why}");
+                }
+                None
+            }
+        }
     })
     .as_ref()
 }
@@ -404,7 +412,10 @@ mod tests {
     #[test]
     fn the_device_product_is_the_plain_loop() {
         let Some(device) = npu() else {
-            println!("no NPU; skipping");
+            println!(
+                "no NPU ({}); skipping",
+                Dense::try_open().err().unwrap_or_default()
+            );
             return;
         };
         let (m, n, p) = (64, 96, 200);

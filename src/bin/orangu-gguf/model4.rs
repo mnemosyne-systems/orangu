@@ -57,6 +57,7 @@ use crate::model::{
     silu,
 };
 use crate::stages::{Stage, time};
+use crate::vector::{self, V8};
 use rayon::prelude::*;
 
 /// Everything needed to build and train one model.
@@ -838,6 +839,9 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// Columns of a norm's gain gradient summed by one task.
+const GAMMA_BLOCK: usize = 64;
+
 /// An in-mix's intermediates, for its backward.
 #[derive(Default)]
 struct MixCache {
@@ -1297,40 +1301,37 @@ impl Model {
             .enumerate()
             .for_each(|(row, ((out, scale), xs))| {
                 let c = row % hc;
-                let mean = xs.iter().map(|v| v * v).sum::<f32>() / h as f32;
+                let mean = vector::sum([xs], |[v]| v * v) / h as f32;
                 let s = 1.0 / (mean + cfg.eps).sqrt();
                 *scale = s;
-                let g = &gamma[c * h..(c + 1) * h];
-                for ((o, &v), &gv) in out.iter_mut().zip(xs).zip(g) {
-                    *o = v * s * gv;
-                }
+                let (g, s) = (&gamma[c * h..(c + 1) * h], V8::splat(s));
+                vector::map(out, [xs, g], |[v, g]| v * s * g);
             });
         let mut pre = Aligned::zeros(t * r);
         matmul(&mut pre, &normed, self.tensor(m.down, r * w), t, w, r);
         let inv = 1.0 / hc as f32;
+        let iv = V8::splat(inv);
         let mut low = Aligned::zeros(t * r);
         pre.par_chunks_mut(r)
             .zip(low.par_chunks_mut(r))
             .for_each(|(pre, low)| {
-                for (p, l) in pre.iter_mut().zip(low) {
-                    *p *= inv;
-                    *l = silu(*p);
-                }
+                vector::update(pre, [], |p, []| p * iv);
+                vector::map(low, [pre], |[p]| p * p.sigmoid());
             });
         let mut gate = Aligned::zeros(t * w);
         matmul(&mut gate, &low, self.tensor(m.up, w * r), t, r, w);
-        gate.par_chunks_mut(w).for_each(|row| {
-            for v in row {
-                *v = sigmoid(*v);
-            }
-        });
+        gate.par_chunks_mut(w)
+            .for_each(|row| vector::update(row, [], |v, []| v.sigmoid()));
         let mut out = Aligned::zeros(t * h);
+        let (gates, norms): (&[f32], &[f32]) = (&gate, &normed);
         out.par_chunks_mut(h).enumerate().for_each(|(i, dst)| {
             for c in 0..hc {
                 let at = i * w + c * h;
-                for j in 0..h {
-                    dst[j] += gate[at + j] * normed[at + j] * inv;
-                }
+                vector::update(
+                    dst,
+                    [&gates[at..at + h], &norms[at..at + h]],
+                    |d, [g, n]| (g * n).mul_add(iv, d),
+                );
             }
         });
         let mut inject = Aligned::zeros(0);
@@ -1368,10 +1369,12 @@ impl Model {
     ) {
         let cfg = &self.cfg;
         let (h, hc, w, r) = (cfg.hidden, cfg.hc, cfg.wide(), cfg.hc_rank);
-        let inv = 1.0 / hc as f32;
+        let iv = V8::splat(1.0 / hc as f32);
+        let one = V8::splat(1.0);
         // out = mean over streams of gate ⊙ normed.
         let mut d_normed = Aligned::zeros(t * w);
         let mut d_gate_pre = Aligned::zeros(t * w);
+        let (gates, norms): (&[f32], &[f32]) = (&c.gate, &c.normed);
         d_normed
             .par_chunks_mut(w)
             .zip(d_gate_pre.par_chunks_mut(w))
@@ -1379,15 +1382,14 @@ impl Model {
             .for_each(|(i, (dn, dg))| {
                 let dy = &d_out[i * h..(i + 1) * h];
                 for s in 0..hc {
-                    for (j, &dyj) in dy.iter().enumerate() {
-                        let at = s * h + j;
-                        let g = c.gate[i * w + at];
-                        let n = c.normed[i * w + at];
-                        let d = dyj * inv;
-                        dn[at] = d * g;
-                        // Through the sigmoid.
-                        dg[at] = d * n * g * (1.0 - g);
-                    }
+                    let row = i * w + s * h..i * w + (s + 1) * h;
+                    let (g, n) = (&gates[row.clone()], &norms[row]);
+                    let span = s * h..(s + 1) * h;
+                    vector::map(&mut dn[span.clone()], [dy, g], |[y, g]| y * iv * g);
+                    // Through the sigmoid.
+                    vector::map(&mut dg[span], [dy, g, n], |[y, g, n]| {
+                        y * iv * n * g * (one - g)
+                    });
                 }
             });
         // gate = sigmoid(low · up).
@@ -1400,10 +1402,10 @@ impl Model {
             .par_chunks_mut(r)
             .zip(d_low.par_chunks(r).zip(c.pre.par_chunks(r)))
             .for_each(|(d_pre, (d_low, pre))| {
-                for ((dp, &dl), &p) in d_pre.iter_mut().zip(d_low).zip(pre) {
-                    let s = sigmoid(p);
-                    *dp = dl * s * (1.0 + p * (1.0 - s)) * inv;
-                }
+                vector::map(d_pre, [d_low, pre], |[dl, p]| {
+                    let s = p.sigmoid();
+                    dl * s * (one + p * (one - s)) * iv
+                });
             });
         matmul_add_dw(grad_slice(grads, m.down, r * w), &d_pre, &c.normed, t, w, r);
         matmul_add_dx(&mut d_normed, &d_pre, self.tensor(m.down, r * w), t, w, r);
@@ -1413,41 +1415,51 @@ impl Model {
         }
         // The grouped norm: each stream normed alone, one gamma across all.
         let gamma = self.tensor(m.norm, w);
-        let partials: Vec<Aligned> = dx
-            .par_chunks_mut(w)
+        dx.par_chunks_mut(w)
             .zip(d_normed.par_chunks(w))
             .zip(x.par_chunks(w))
             .zip(c.scales.par_chunks(hc))
-            .map(|(((dx_row, dn_row), x_row), scales)| {
-                let mut acc = Aligned::zeros(w);
-                for s in 0..hc {
+            .for_each(|(((dx_row, dn_row), x_row), scales)| {
+                for (s, &sc) in scales.iter().enumerate() {
                     let range = s * h..(s + 1) * h;
                     let (xs, dn, g) = (
                         &x_row[range.clone()],
                         &dn_row[range.clone()],
                         &gamma[range.clone()],
                     );
-                    let sc = scales[s];
-                    let inner: f32 = (0..h).map(|j| g[j] * dn[j] * xs[j]).sum();
-                    let coeff = sc * sc * sc * inner / h as f32;
-                    for j in 0..h {
-                        dx_row[s * h + j] += sc * g[j] * dn[j] - coeff * xs[j];
-                        acc[s * h + j] += dn[j] * xs[j] * sc;
-                    }
+                    let inner = vector::sum([g, dn, xs], |[g, d, x]| g * d * x);
+                    let coeff = V8::splat(sc * sc * sc * inner / h as f32);
+                    let sc = V8::splat(sc);
+                    vector::update(&mut dx_row[range], [g, dn, xs], |o, [g, d, x]| {
+                        o + (sc * g * d - coeff * x)
+                    });
                 }
-                acc
-            })
-            .collect();
-        // Each column's sum over the tokens in order, the columns side by
-        // side.
+            });
+        // Each column's sum over the tokens in order, blocks of columns
+        // side by side, each block split where the streams meet.
         let dgamma = grad_slice(grads, m.norm, w);
-        dgamma.par_chunks_mut(64).enumerate().for_each(|(at, out)| {
-            for p in &partials {
-                for (o, v) in out.iter_mut().zip(&p[at * 64..]) {
-                    *o += v;
+        let (dn_all, scales) = (&d_normed[..], &c.scales[..]);
+        dgamma
+            .par_chunks_mut(GAMMA_BLOCK)
+            .enumerate()
+            .for_each(|(block, out)| {
+                let col = block * GAMMA_BLOCK;
+                let mut a = 0;
+                while a < out.len() {
+                    let s = (col + a) / h;
+                    let b = ((s + 1) * h - col).min(out.len());
+                    for i in 0..t {
+                        let sc = V8::splat(scales[i * hc + s]);
+                        let at = i * w + col;
+                        vector::update(
+                            &mut out[a..b],
+                            [&dn_all[at + a..at + b], &x[at + a..at + b]],
+                            |o, [d, x]| o + d * x * sc,
+                        );
+                    }
+                    a = b;
                 }
-            }
-        });
+            });
     }
 
     /// The out-mix: `sub` (`[t, hidden]`) added into every stream of `x`
@@ -1457,11 +1469,12 @@ impl Model {
         x.par_chunks_mut(self.cfg.wide())
             .enumerate()
             .for_each(|(i, row)| {
+                let sub = &sub[i * h..(i + 1) * h];
                 for s in 0..hc {
-                    let wgt = 2.0 * sigmoid(inject[i * hc + s] / hc as f32);
-                    for j in 0..h {
-                        row[s * h + j] += wgt * sub[i * h + j];
-                    }
+                    let wgt = V8::splat(2.0 * sigmoid(inject[i * hc + s] / hc as f32));
+                    vector::update(&mut row[s * h..(s + 1) * h], [sub], |o, [v]| {
+                        wgt.mul_add(v, o)
+                    });
                 }
             });
         let _ = t;
@@ -1485,15 +1498,13 @@ impl Model {
             .zip(d_inject.par_chunks_mut(hc))
             .enumerate()
             .for_each(|(i, (ds, di))| {
+                let sub = &sub[i * h..(i + 1) * h];
                 for s in 0..hc {
                     let sg = sigmoid(inject[i * hc + s] / hc as f32);
-                    let wgt = 2.0 * sg;
+                    let wgt = V8::splat(2.0 * sg);
                     let row = &dx[i * w + s * h..i * w + (s + 1) * h];
-                    let mut dot = 0.0f32;
-                    for j in 0..h {
-                        ds[j] += wgt * row[j];
-                        dot += row[j] * sub[i * h + j];
-                    }
+                    vector::update(ds, [row], |o, [v]| wgt.mul_add(v, o));
+                    let dot = vector::sum([row, sub], |[v, u]| v * u);
                     di[s] = dot * 2.0 * sg * (1.0 - sg) / hc as f32;
                 }
             });
@@ -4277,7 +4288,7 @@ struct HeadGrads {
     decay: Vec<f32>,
 }
 
-/// The columns of a head's state one block holds: two AVX vectors, so a
+/// The columns of a head's state one block holds: two eight-lane vectors, so a
 /// block's running sums stay in registers and its state in the first-level
 /// cache, and a head splits into several blocks. Any width runs, through the
 /// portable kernels, when the head is not a multiple of it.
@@ -4305,21 +4316,8 @@ const STEP_SCRATCH: usize = 24;
 
 /// Whether the vector kernels take a block `cols` wide over `rows` rows.
 #[inline]
-#[cfg_attr(
-    not(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    )),
-    allow(dead_code)
-)]
 fn vector_block(rows: usize, cols: usize) -> bool {
-    cfg!(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    )) && cols == BLOCK
-        && rows.is_multiple_of(8)
+    cols == BLOCK && rows.is_multiple_of(8)
 }
 
 /// One token of one head's gated delta rule, on a `[k.len(), out.len()]`
@@ -4335,15 +4333,8 @@ fn delta_step(
     decay: f32,
     out: &mut [f32],
 ) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    ))]
     if vector_block(k.len(), out.len()) {
-        // SAFETY: AVX2 and FMA are enabled for this build, and the block is
-        // BLOCK columns over k.len() rows, as the slices' lengths say.
-        unsafe { avx::step(state, q, k, v, beta, decay, out) };
+        block::step(state, q, k, v, beta, decay, out);
         return;
     }
     delta_step_portable(state, q, k, v, beta, decay, out);
@@ -4396,19 +4387,9 @@ fn delta_step_backward(
     grads: (&mut [f32], &mut [f32], &mut [f32]),
     scratch: &mut [f32],
 ) -> (f32, f32) {
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "fma"
-    ))]
     if vector_block(k.len(), v.len()) {
-        // SAFETY: as in `delta_step`; the scratch is STEP_SCRATCH floats a
-        // row.
-        return unsafe {
-            avx::step_backward(before, q, k, v, beta, decay, d_out, g_state, grads, scratch)
-        };
+        return block::step_backward(before, q, k, v, beta, decay, d_out, g_state, grads, scratch);
     }
-    let _ = scratch;
     delta_step_backward_portable(before, q, k, v, beta, decay, d_out, g_state, grads)
 }
 
@@ -4485,75 +4466,28 @@ fn delta_step_backward_portable(
 }
 
 /// The delta rule's step and its backward on a block of [`BLOCK`] columns,
-/// two AVX vectors a row, with every running sum in a register.
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "fma"
-))]
-mod avx {
-    use core::arch::x86_64::*;
-
-    /// The eight lane sums of eight vectors, as one vector.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
-    fn sums8(v: &[__m256; 8]) -> __m256 {
-        let a = _mm256_hadd_ps(v[0], v[1]);
-        let b = _mm256_hadd_ps(v[2], v[3]);
-        let c = _mm256_hadd_ps(v[4], v[5]);
-        let d = _mm256_hadd_ps(v[6], v[7]);
-        let e = _mm256_hadd_ps(a, b);
-        let f = _mm256_hadd_ps(c, d);
-        _mm256_add_ps(
-            _mm256_permute2f128_ps(e, f, 0x20),
-            _mm256_permute2f128_ps(e, f, 0x31),
-        )
-    }
-
-    /// The sum of one vector's lanes.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
-    fn sum(v: __m256) -> f32 {
-        let h = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
-        let h = _mm_add_ps(h, _mm_movehl_ps(h, h));
-        _mm_cvtss_f32(_mm_add_ss(h, _mm_shuffle_ps(h, h, 1)))
-    }
+/// two eight-lane vectors a row, with every running sum in a register.
+mod block {
+    use crate::vector::V8;
 
     /// Writes the lane sums of `rows` vectors, stored eight floats each in
     /// `parts`, into `out`; adds them when `add`.
-    #[inline]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn reduce_rows(parts: &[f32], out: &mut [f32], add: bool) {
-        // SAFETY: the caller's contract.
-        unsafe {
-            for (group, dst) in parts
-                .as_chunks::<64>()
-                .0
-                .iter()
-                .zip(out.as_chunks_mut::<8>().0)
-            {
-                let p = group.as_ptr();
-                let v = [
-                    _mm256_loadu_ps(p),
-                    _mm256_loadu_ps(p.add(8)),
-                    _mm256_loadu_ps(p.add(16)),
-                    _mm256_loadu_ps(p.add(24)),
-                    _mm256_loadu_ps(p.add(32)),
-                    _mm256_loadu_ps(p.add(40)),
-                    _mm256_loadu_ps(p.add(48)),
-                    _mm256_loadu_ps(p.add(56)),
-                ];
-                let mut s = sums8(&v);
-                if add {
-                    s = _mm256_add_ps(s, _mm256_loadu_ps(dst.as_ptr()));
-                }
-                _mm256_storeu_ps(dst.as_mut_ptr(), s);
+    fn reduce_rows(parts: &[f32], out: &mut [f32], add: bool) {
+        for (group, dst) in parts
+            .as_chunks::<64>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<8>().0)
+        {
+            let mut s = V8::sums8(std::array::from_fn(|i| V8::load(&group[i * 8..])));
+            if add {
+                s = s + V8::load(dst);
             }
+            s.store(dst);
         }
     }
 
-    #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn step(
+    pub(super) fn step(
         state: &mut [f32],
         q: &[f32],
         k: &[f32],
@@ -4562,47 +4496,46 @@ mod avx {
         decay: f32,
         out: &mut [f32],
     ) {
-        // SAFETY: the caller's contract.
-        unsafe {
-            let rows = k.len();
-            debug_assert!(state.len() == rows * 16 && q.len() == rows && v.len() == 16);
-            let s = state.as_mut_ptr();
-            let dv = _mm256_set1_ps(decay);
-            let (mut sk0, mut sk1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
-            for (b, &kb) in k.iter().enumerate() {
-                let p = s.add(b * 16);
-                let s0 = _mm256_mul_ps(_mm256_loadu_ps(p), dv);
-                let s1 = _mm256_mul_ps(_mm256_loadu_ps(p.add(8)), dv);
-                _mm256_storeu_ps(p, s0);
-                _mm256_storeu_ps(p.add(8), s1);
-                let kv = _mm256_set1_ps(kb);
-                sk0 = _mm256_fmadd_ps(kv, s0, sk0);
-                sk1 = _mm256_fmadd_ps(kv, s1, sk1);
+        let rows = k.len();
+        assert!(state.len() == rows * 16 && q.len() == rows && v.len() == 16 && out.len() == 16);
+        let zero = V8::splat(0.0);
+        let dv = V8::splat(decay);
+        let (mut sk0, mut sk1) = (zero, zero);
+        for (b, &kb) in k.iter().enumerate() {
+            // SAFETY: row `b` of `rows` rows of 16.
+            unsafe {
+                let s0 = V8::at(state, b * 16) * dv;
+                let s1 = V8::at(state, b * 16 + 8) * dv;
+                s0.put(state, b * 16);
+                s1.put(state, b * 16 + 8);
+                let kv = V8::splat(kb);
+                sk0 = kv.mul_add(s0, sk0);
+                sk1 = kv.mul_add(s1, sk1);
             }
-            let bv = _mm256_set1_ps(beta);
-            let d0 = _mm256_mul_ps(bv, _mm256_sub_ps(_mm256_loadu_ps(v.as_ptr()), sk0));
-            let d1 = _mm256_mul_ps(bv, _mm256_sub_ps(_mm256_loadu_ps(v.as_ptr().add(8)), sk1));
-            let (mut o0, mut o1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
-            for b in 0..rows {
-                let p = s.add(b * 16);
-                let kv = _mm256_set1_ps(*k.get_unchecked(b));
-                let qv = _mm256_set1_ps(*q.get_unchecked(b));
-                let s0 = _mm256_fmadd_ps(kv, d0, _mm256_loadu_ps(p));
-                let s1 = _mm256_fmadd_ps(kv, d1, _mm256_loadu_ps(p.add(8)));
-                _mm256_storeu_ps(p, s0);
-                _mm256_storeu_ps(p.add(8), s1);
-                o0 = _mm256_fmadd_ps(qv, s0, o0);
-                o1 = _mm256_fmadd_ps(qv, s1, o1);
-            }
-            let o = out.as_mut_ptr();
-            _mm256_storeu_ps(o, _mm256_add_ps(_mm256_loadu_ps(o), o0));
-            _mm256_storeu_ps(o.add(8), _mm256_add_ps(_mm256_loadu_ps(o.add(8)), o1));
         }
+        let bv = V8::splat(beta);
+        let d0 = bv * (V8::load(v) - sk0);
+        let d1 = bv * (V8::load(&v[8..]) - sk1);
+        let (mut o0, mut o1) = (zero, zero);
+        for (b, (&kb, &qb)) in k.iter().zip(q).enumerate() {
+            // SAFETY: as above.
+            unsafe {
+                let kv = V8::splat(kb);
+                let qv = V8::splat(qb);
+                let s0 = kv.mul_add(d0, V8::at(state, b * 16));
+                let s1 = kv.mul_add(d1, V8::at(state, b * 16 + 8));
+                s0.put(state, b * 16);
+                s1.put(state, b * 16 + 8);
+                o0 = qv.mul_add(s0, o0);
+                o1 = qv.mul_add(s1, o1);
+            }
+        }
+        (V8::load(out) + o0).store(out);
+        (V8::load(&out[8..]) + o1).store(&mut out[8..]);
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[target_feature(enable = "avx2,fma")]
-    pub(super) unsafe fn step_backward(
+    pub(super) fn step_backward(
         before: &[f32],
         q: &[f32],
         k: &[f32],
@@ -4614,96 +4547,79 @@ mod avx {
         (dq, dk, dv): (&mut [f32], &mut [f32], &mut [f32]),
         scratch: &mut [f32],
     ) -> (f32, f32) {
-        // SAFETY: the caller's contract.
-        unsafe {
-            let rows = k.len();
-            debug_assert!(before.len() == rows * 16 && g_state.len() == rows * 16);
-            debug_assert!(scratch.len() >= rows * super::STEP_SCRATCH);
-            let (s, g) = (before.as_ptr(), g_state.as_mut_ptr());
-            let (q_parts, rest) = scratch.split_at_mut(rows * 8);
-            let (k_parts, rest) = rest.split_at_mut(rows * 8);
-            let k_more = &mut rest[..rows * 8];
-            let dv_ = _mm256_set1_ps(decay);
+        let rows = k.len();
+        assert!(before.len() == rows * 16 && g_state.len() == rows * 16 && q.len() == rows);
+        assert!(scratch.len() >= rows * super::STEP_SCRATCH && dq.len() >= rows);
+        assert!(dk.len() >= rows && dv.len() >= 16 && v.len() >= 16 && d_out.len() >= 16);
+        let (q_parts, rest) = scratch.split_at_mut(rows * 8);
+        let (k_parts, rest) = rest.split_at_mut(rows * 8);
+        let k_more = &mut rest[..rows * 8];
+        let zero = V8::splat(0.0);
+        let dc = V8::splat(decay);
 
-            // S1 = decay·S0, kᵀS1.
-            let (mut sk0, mut sk1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
-            for (b, &kb) in k.iter().enumerate() {
-                let p = s.add(b * 16);
-                let kv = _mm256_set1_ps(kb);
-                sk0 = _mm256_fmadd_ps(kv, _mm256_mul_ps(_mm256_loadu_ps(p), dv_), sk0);
-                sk1 = _mm256_fmadd_ps(kv, _mm256_mul_ps(_mm256_loadu_ps(p.add(8)), dv_), sk1);
+        // S1 = decay·S0, kᵀS1.
+        let (mut sk0, mut sk1) = (zero, zero);
+        for (b, &kb) in k.iter().enumerate() {
+            // SAFETY: row `b` of `rows` rows of 16.
+            unsafe {
+                let kv = V8::splat(kb);
+                sk0 = kv.mul_add(V8::at(before, b * 16) * dc, sk0);
+                sk1 = kv.mul_add(V8::at(before, b * 16 + 8) * dc, sk1);
             }
-            let bv = _mm256_set1_ps(beta);
-            let (v0, v1) = (
-                _mm256_loadu_ps(v.as_ptr()),
-                _mm256_loadu_ps(v.as_ptr().add(8)),
-            );
-            let d0 = _mm256_mul_ps(bv, _mm256_sub_ps(v0, sk0));
-            let d1 = _mm256_mul_ps(bv, _mm256_sub_ps(v1, sk1));
-            let (o0, o1) = (
-                _mm256_loadu_ps(d_out.as_ptr()),
-                _mm256_loadu_ps(d_out.as_ptr().add(8)),
-            );
-
-            // out = qᵀS2 with S2 = S1 + k dᵀ: into q, the state, and k and d.
-            let (mut dd0, mut dd1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
-            for b in 0..rows {
-                let p = s.add(b * 16);
-                let gp = g.add(b * 16);
-                let kv = _mm256_set1_ps(*k.get_unchecked(b));
-                let qv = _mm256_set1_ps(*q.get_unchecked(b));
-                let s20 = _mm256_fmadd_ps(kv, d0, _mm256_mul_ps(_mm256_loadu_ps(p), dv_));
-                let s21 = _mm256_fmadd_ps(kv, d1, _mm256_mul_ps(_mm256_loadu_ps(p.add(8)), dv_));
-                _mm256_storeu_ps(
-                    q_parts.as_mut_ptr().add(b * 8),
-                    _mm256_fmadd_ps(o1, s21, _mm256_mul_ps(o0, s20)),
-                );
-                let g0 = _mm256_fmadd_ps(qv, o0, _mm256_loadu_ps(gp));
-                let g1 = _mm256_fmadd_ps(qv, o1, _mm256_loadu_ps(gp.add(8)));
-                _mm256_storeu_ps(gp, g0);
-                _mm256_storeu_ps(gp.add(8), g1);
-                _mm256_storeu_ps(
-                    k_parts.as_mut_ptr().add(b * 8),
-                    _mm256_fmadd_ps(g1, d1, _mm256_mul_ps(g0, d0)),
-                );
-                dd0 = _mm256_fmadd_ps(kv, g0, dd0);
-                dd1 = _mm256_fmadd_ps(kv, g1, dd1);
-            }
-            reduce_rows(q_parts, dq, false);
-
-            // d = beta·(v − kᵀS1).
-            let d_beta = sum(_mm256_fmadd_ps(
-                dd1,
-                _mm256_sub_ps(v1, sk1),
-                _mm256_mul_ps(dd0, _mm256_sub_ps(v0, sk0)),
-            ));
-            _mm256_storeu_ps(dv.as_mut_ptr(), _mm256_mul_ps(bv, dd0));
-            _mm256_storeu_ps(dv.as_mut_ptr().add(8), _mm256_mul_ps(bv, dd1));
-            let nb = _mm256_set1_ps(-beta);
-            let (dsk0, dsk1) = (_mm256_mul_ps(nb, dd0), _mm256_mul_ps(nb, dd1));
-
-            // kᵀS1 into S1's gradient and k's, then S1 = decay·S0.
-            let (mut dec0, mut dec1) = (_mm256_setzero_ps(), _mm256_setzero_ps());
-            for b in 0..rows {
-                let p = s.add(b * 16);
-                let gp = g.add(b * 16);
-                let kv = _mm256_set1_ps(*k.get_unchecked(b));
-                let (a0, a1) = (_mm256_loadu_ps(p), _mm256_loadu_ps(p.add(8)));
-                _mm256_storeu_ps(
-                    k_more.as_mut_ptr().add(b * 8),
-                    _mm256_mul_ps(dv_, _mm256_fmadd_ps(dsk1, a1, _mm256_mul_ps(dsk0, a0))),
-                );
-                let g0 = _mm256_fmadd_ps(kv, dsk0, _mm256_loadu_ps(gp));
-                let g1 = _mm256_fmadd_ps(kv, dsk1, _mm256_loadu_ps(gp.add(8)));
-                dec0 = _mm256_fmadd_ps(g0, a0, dec0);
-                dec1 = _mm256_fmadd_ps(g1, a1, dec1);
-                _mm256_storeu_ps(gp, _mm256_mul_ps(g0, dv_));
-                _mm256_storeu_ps(gp.add(8), _mm256_mul_ps(g1, dv_));
-            }
-            reduce_rows(k_parts, dk, false);
-            reduce_rows(k_more, dk, true);
-            (d_beta, sum(_mm256_add_ps(dec0, dec1)))
         }
+        let bv = V8::splat(beta);
+        let (v0, v1) = (V8::load(v), V8::load(&v[8..]));
+        let d0 = bv * (v0 - sk0);
+        let d1 = bv * (v1 - sk1);
+        let (o0, o1) = (V8::load(d_out), V8::load(&d_out[8..]));
+
+        // out = qᵀS2 with S2 = S1 + k dᵀ: into q, the state, and k and d.
+        let (mut dd0, mut dd1) = (zero, zero);
+        for (b, (&kb, &qb)) in k.iter().zip(q).enumerate() {
+            // SAFETY: row `b` of the state and of the eight-a-row parts.
+            unsafe {
+                let kv = V8::splat(kb);
+                let qv = V8::splat(qb);
+                let s20 = kv.mul_add(d0, V8::at(before, b * 16) * dc);
+                let s21 = kv.mul_add(d1, V8::at(before, b * 16 + 8) * dc);
+                o1.mul_add(s21, o0 * s20).put(q_parts, b * 8);
+                let g0 = qv.mul_add(o0, V8::at(g_state, b * 16));
+                let g1 = qv.mul_add(o1, V8::at(g_state, b * 16 + 8));
+                g0.put(g_state, b * 16);
+                g1.put(g_state, b * 16 + 8);
+                g1.mul_add(d1, g0 * d0).put(k_parts, b * 8);
+                dd0 = kv.mul_add(g0, dd0);
+                dd1 = kv.mul_add(g1, dd1);
+            }
+        }
+        reduce_rows(q_parts, dq, false);
+
+        // d = beta·(v − kᵀS1).
+        let d_beta = dd1.mul_add(v1 - sk1, dd0 * (v0 - sk0)).sum();
+        (bv * dd0).store(dv);
+        (bv * dd1).store(&mut dv[8..]);
+        let nb = V8::splat(-beta);
+        let (dsk0, dsk1) = (nb * dd0, nb * dd1);
+
+        // kᵀS1 into S1's gradient and k's, then S1 = decay·S0.
+        let (mut dec0, mut dec1) = (zero, zero);
+        for (b, &kb) in k.iter().enumerate() {
+            // SAFETY: as above.
+            unsafe {
+                let kv = V8::splat(kb);
+                let (a0, a1) = (V8::at(before, b * 16), V8::at(before, b * 16 + 8));
+                (dc * dsk1.mul_add(a1, dsk0 * a0)).put(k_more, b * 8);
+                let g0 = kv.mul_add(dsk0, V8::at(g_state, b * 16));
+                let g1 = kv.mul_add(dsk1, V8::at(g_state, b * 16 + 8));
+                dec0 = g0.mul_add(a0, dec0);
+                dec1 = g1.mul_add(a1, dec1);
+                (g0 * dc).put(g_state, b * 16);
+                (g1 * dc).put(g_state, b * 16 + 8);
+            }
+        }
+        reduce_rows(k_parts, dk, false);
+        reduce_rows(k_more, dk, true);
+        (d_beta, (dec0 + dec1).sum())
     }
 }
 

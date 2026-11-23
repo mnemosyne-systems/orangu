@@ -87,6 +87,9 @@ struct Shape {
 /// `(m, k, n)`.
 type ShapeKey = (usize, usize, usize);
 
+/// [`Dense::try_open`]'s reason on a machine without an RKNPU.
+pub const NO_RKNPU: &str = "no RKNPU in /sys/bus/platform/devices";
+
 /// The RKNPU as a device for dense fp16 products.
 pub struct Dense {
     _library: Arc<Library>,
@@ -112,11 +115,24 @@ impl Dense {
     /// opened, the runtime does not load, or a first product disagrees with
     /// the host.
     pub fn open() -> Option<Self> {
-        let info = rknpu_info()?;
+        Self::try_open().ok()
+    }
+
+    /// [`Dense::open`], with the reason when there is no device.
+    pub fn try_open() -> Result<Self, String> {
+        let info = rknpu_info().ok_or(NO_RKNPU)?;
         if !device_node_is_openable(&info) {
-            return None;
+            let node = info
+                .render_node
+                .as_ref()
+                .map_or_else(String::new, |n| n.display().to_string());
+            return Err(format!(
+                "{node} cannot be opened for reading and writing (is this user in the render group?)"
+            ));
         }
-        let (library, api, _) = open_runtime()?;
+        let (library, api, _) = open_runtime().ok_or(
+            "librknnrt.so does not load or lacks the matmul API (is the RKNN runtime installed?)",
+        )?;
         // SAFETY: the signature matches `rknn_matmul_api.h`.
         let core_mask = unsafe {
             library
@@ -141,7 +157,11 @@ impl Dense {
             .map(|i| ((i % 13) as f32 - 6.0) * 0.125)
             .collect();
         let b: Vec<f32> = (0..k * n).map(|i| ((i % 7) as f32 - 3.0) * 0.25).collect();
-        dense.agrees(m, k, n, &a, &b).then_some(dense)
+        if dense.agrees(m, k, n, &a, &b) {
+            Ok(dense)
+        } else {
+            Err("a first product on the NPU did not match the host".into())
+        }
     }
 
     /// NPU cores products are spread over.

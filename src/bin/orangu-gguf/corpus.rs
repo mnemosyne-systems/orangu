@@ -30,6 +30,10 @@
 //! interrupted halfway resumes by re-running the same command, and a corpus
 //! can be inspected, edited, or deleted with ordinary tools between runs.
 //!
+//! A PDF is a source too, named alone (`url` ending in `.pdf`, local or
+//! remote) or found inside another source: its text is extracted once and
+//! kept beside the corpus, so later stages and later runs read the text.
+//!
 //! Compressed files are read through: a `.gz` or `.bz2` beside the source
 //! is decompressed on the way in, and what decides whether it is training
 //! text is the name *underneath* the compression — `main.rs.gz` is Rust,
@@ -150,6 +154,9 @@ pub enum Source {
     Directory,
     /// An archive: unpacked into the corpus.
     Archive,
+    /// A PDF: fetched into the corpus when remote, read where it is when
+    /// local; its text is what is trained on.
+    Document,
 }
 
 /// Decides what a source is by looking at it.
@@ -165,6 +172,9 @@ pub fn classify(url: &str) -> Source {
 
     if ARCHIVES.iter().any(|ext| lower.ends_with(ext)) {
         return Source::Archive;
+    }
+    if lower.ends_with(".pdf") {
+        return Source::Document;
     }
     if looks_remote {
         return Source::Git;
@@ -214,6 +224,7 @@ pub fn fetch_all(manifest: &Manifest, dir: &Path, jobs: usize) -> Result<Vec<Pat
                         Ok((path, "directory"))
                     }
                     Source::Archive => unpack(repo, dir, &dest),
+                    Source::Document => document(repo, &dest),
                 }?;
                 let (path, what) = outcome;
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -250,6 +261,57 @@ fn clone(repo: &Repository, dest: &Path) -> Result<(PathBuf, &'static str)> {
     Ok((dest.to_path_buf(), "cloned"))
 }
 
+/// `url` downloaded to `path` through a `.partial` file, so an interrupted
+/// download is not taken for a whole one.
+fn download(url: &str, path: &Path) -> Result<()> {
+    let temporary = path.with_extension("partial");
+    // A client of its own rather than `reqwest::blocking::get`, whose
+    // default 30-second timeout covers the *whole* request and would abort
+    // any file that takes longer than that to arrive.
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("orangu-gguf/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(None)
+        .build()
+        .context("building the HTTP client")?;
+    let mut response = client
+        .get(url)
+        .send()
+        .and_then(|r| r.error_for_status())
+        .with_context(|| format!("fetching {url}"))?;
+    let mut out =
+        File::create(&temporary).with_context(|| format!("creating {}", temporary.display()))?;
+    std::io::copy(&mut response, &mut out)?;
+    drop(out);
+    fs::rename(&temporary, path)?;
+    Ok(())
+}
+
+/// A PDF source: a remote one downloaded into `dest`, a local one walked
+/// where it is.
+fn document(repo: &Repository, dest: &Path) -> Result<(PathBuf, &'static str)> {
+    let url = repo.url.trim();
+    if !url.contains("://") {
+        let path = PathBuf::from(url);
+        if !path.is_file() {
+            bail!("{url} is not a file");
+        }
+        return Ok((path, "document"));
+    }
+    let name = url
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or("document.pdf");
+    let path = dest.join(name);
+    if path.is_file() {
+        return Ok((dest.to_path_buf(), "already downloaded"));
+    }
+    fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    download(url, &path)?;
+    Ok((dest.to_path_buf(), "downloaded"))
+}
+
 /// Fetches an archive if it is remote, then unpacks it into `dest`.
 fn unpack(repo: &Repository, dir: &Path, dest: &Path) -> Result<(PathBuf, &'static str)> {
     if dest.is_dir() {
@@ -264,27 +326,7 @@ fn unpack(repo: &Repository, dir: &Path, dest: &Path) -> Result<(PathBuf, &'stat
         let name = url.rsplit('/').next().unwrap_or("archive");
         let downloaded = dir.join(format!("{}-{name}", repo.slug()));
         if !downloaded.exists() {
-            let temporary = downloaded.with_extension("partial");
-            // A client of its own rather than `reqwest::blocking::get`,
-            // whose default 30-second timeout covers the *whole* request
-            // and would abort any archive that takes longer than that to
-            // arrive — which is most of them.
-            let client = reqwest::blocking::Client::builder()
-                .user_agent(concat!("orangu-gguf/", env!("CARGO_PKG_VERSION")))
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .timeout(None)
-                .build()
-                .context("building the HTTP client")?;
-            let mut response = client
-                .get(url)
-                .send()
-                .and_then(|r| r.error_for_status())
-                .with_context(|| format!("fetching {url}"))?;
-            let mut out = File::create(&temporary)
-                .with_context(|| format!("creating {}", temporary.display()))?;
-            std::io::copy(&mut response, &mut out)?;
-            drop(out);
-            fs::rename(&temporary, &downloaded)?;
+            download(url, &downloaded)?;
         }
         downloaded
     } else {
@@ -403,8 +445,15 @@ pub fn scan(roots: &[Root]) -> (Vec<PathBuf>, ScanReport) {
                 report.skipped_extension += 1;
                 continue;
             }
+            // A PDF's size on disk says little about its text, and a
+            // manual runs to megabytes: the cap is for source files.
+            let cap = if is_pdf(entry.path()) {
+                u64::MAX
+            } else {
+                max_file_bytes
+            };
             match entry.metadata() {
-                Ok(md) if md.len() <= max_file_bytes && md.len() > 0 => {
+                Ok(md) if md.len() <= cap && md.len() > 0 => {
                     report.kept += 1;
                     files.push(entry.into_path());
                 }
@@ -452,7 +501,7 @@ fn wanted_name(path: &Path) -> bool {
         Some(n) => uncompressed_name(n),
         None => return false,
     };
-    if KEEP_NAMES.contains(&name) {
+    if KEEP_NAMES.contains(&name) || is_pdf(Path::new(name)) {
         return true;
     }
     // A minified or bundled artefact is source-shaped but is not source.
@@ -470,11 +519,143 @@ fn wanted_name(path: &Path) -> bool {
 /// not something to hand an unbounded allocation to.
 const MAX_DECOMPRESSED: u64 = 64 << 20;
 
+/// Whether `path` names a PDF.
+fn is_pdf(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
+/// Where extracted PDF text is kept, when set.
+static PDF_TEXT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Keeps the text extracted from PDFs under `dir`, so each is extracted
+/// once across the stages and runs that read it.
+pub fn keep_pdf_text(dir: PathBuf) {
+    let _ = PDF_TEXT.set(dir);
+}
+
+/// Pages without their running heads and page numbers: a last line that is
+/// only digits, and a first line that heads three or more pages of a
+/// document of ten or more (a chapter's title repeated over its pages).
+fn without_furniture(pages: &[String]) -> Vec<String> {
+    let first = |page: &str| -> Option<String> {
+        page.lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(str::to_string)
+    };
+    let mut heads: std::collections::HashMap<String, usize> = Default::default();
+    for page in pages {
+        if let Some(line) = first(page) {
+            *heads.entry(line).or_default() += 1;
+        }
+    }
+    let common = |line: &str| pages.len() >= 10 && heads.get(line).copied().unwrap_or(0) >= 3;
+    pages
+        .iter()
+        .map(|page| {
+            let mut lines: Vec<&str> = page.lines().collect();
+            while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                lines.pop();
+            }
+            if lines.last().is_some_and(|l| {
+                !l.trim().is_empty() && l.trim().bytes().all(|b| b.is_ascii_digit())
+            }) {
+                lines.pop();
+            }
+            if let Some(at) = lines.iter().position(|l| !l.trim().is_empty())
+                && common(lines[at].trim())
+            {
+                lines.remove(at);
+            }
+            lines.join("\n")
+        })
+        .collect()
+}
+
+/// A page's text as training text: a run of leader dots (a table of
+/// contents' `Title ........ 12`) becomes one space, and NULs are dropped.
+fn plain_page(page: &str) -> String {
+    let mut out = String::with_capacity(page.len());
+    let mut dots = 0usize;
+    for c in page.chars() {
+        if c == '.' {
+            dots += 1;
+            continue;
+        }
+        if dots >= 4 {
+            out.push(' ');
+        } else {
+            out.extend(std::iter::repeat_n('.', dots));
+        }
+        dots = 0;
+        if c != '\0' {
+            out.push(c);
+        }
+    }
+    if dots >= 4 {
+        out.push(' ');
+    } else {
+        out.extend(std::iter::repeat_n('.', dots));
+    }
+    out
+}
+
+/// A PDF's text: from the kept copy when its size and time still match,
+/// else extracted (and kept). `None` when it has no text to extract.
+fn pdf_text(path: &Path) -> Option<String> {
+    pdf_text_in(path, PDF_TEXT.get().map(PathBuf::as_path))
+}
+
+/// [`pdf_text`] with the text kept under `dir`.
+fn pdf_text_in(path: &Path, dir: Option<&Path>) -> Option<String> {
+    let kept = dir.and_then(|dir| {
+        let md = fs::metadata(path).ok()?;
+        let modified = md
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let full = fs::canonicalize(path).ok()?;
+        let mut hash = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(&(full, md.len(), modified), &mut hash);
+        let name = format!("{:016x}.txt", std::hash::Hasher::finish(&hash));
+        Some(dir.join(name))
+    });
+    if let Some(text) = kept.as_ref().and_then(|k| fs::read_to_string(k).ok()) {
+        return (!text.trim().is_empty()).then_some(text);
+    }
+    let bytes = fs::read(path).ok()?;
+    let text = match orangu::pdf::extract_pages(&bytes) {
+        Ok(pages) => without_furniture(&pages)
+            .iter()
+            .map(|page| plain_page(page))
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        Err(e) => {
+            eprintln!("corpus: {} has no text: {e:#}", path.display());
+            String::new()
+        }
+    };
+    if let Some(kept) = kept {
+        let _ = fs::create_dir_all(kept.parent().unwrap_or(Path::new(".")));
+        let temporary = kept.with_extension("partial");
+        if fs::write(&temporary, &text).is_ok() {
+            let _ = fs::rename(&temporary, &kept);
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
 /// Reads one file as training text, or `None` if it is not UTF-8 text.
 ///
 /// A stray NUL rules a file out even when the bytes happen to decode: it is
 /// the reliable marker of a binary that was given a source extension.
 pub fn read_document(path: &Path) -> Option<String> {
+    if is_pdf(path) {
+        return pdf_text(path);
+    }
     let name = path.file_name()?.to_str()?;
     let bytes = match compression(name) {
         None => fs::read(path).ok()?,
@@ -648,5 +829,46 @@ mod tests {
         let (kept, report) = scan(&[Root::generated(dir.path().to_path_buf())]);
         assert_eq!(kept.len(), 1);
         assert_eq!(report.skipped_large, 0);
+    }
+    /// A PDF is a source alone or inside another, whatever its size, and
+    /// is read as its text, which is kept and read back from then on.
+    #[test]
+    fn a_pdf_is_read_as_its_text() {
+        assert_eq!(classify("https://example.com/manual.pdf"), Source::Document);
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            classify(dir.path().join("Manual.PDF").to_str().unwrap()),
+            Source::Document
+        );
+        let pdf = dir.path().join("manual.pdf");
+        fs::write(
+            &pdf,
+            orangu::pdf::encode_text("manual", "SELECT relname FROM pg_class;").unwrap(),
+        )
+        .unwrap();
+        let (files, _) = scan(&[Root::repository(dir.path().to_path_buf(), 16)]);
+        assert_eq!(files, vec![pdf.clone()]);
+        let text = read_document(&pdf).unwrap();
+        assert!(text.contains("SELECT relname FROM pg_class;"), "{text:?}");
+        assert_eq!(
+            plain_page("1.2. Views ........ 12 and..."),
+            "1.2. Views   12 and..."
+        );
+        let mut pages: Vec<String> = (0..20)
+            .map(|i| format!("Functions\nbody {i}\n {}\n", 100 + i))
+            .collect();
+        pages.push("Index\nlast\n".to_string());
+        let clean = without_furniture(&pages);
+        assert_eq!(clean[0], "body 0");
+        assert_eq!(clean[20], "Index\nlast");
+
+        let kept = dir.path().join("kept");
+        assert_eq!(
+            pdf_text_in(&pdf, Some(&kept)).as_deref(),
+            Some(text.as_str())
+        );
+        let copy = fs::read_dir(&kept).unwrap().next().unwrap().unwrap().path();
+        fs::write(&copy, "kept text").unwrap();
+        assert_eq!(pdf_text_in(&pdf, Some(&kept)).as_deref(), Some("kept text"));
     }
 }

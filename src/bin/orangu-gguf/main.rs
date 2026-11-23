@@ -74,6 +74,7 @@ mod speed;
 mod spread;
 mod stages;
 mod train;
+mod vector;
 mod vocab;
 mod wikipedia;
 mod write;
@@ -152,7 +153,7 @@ Options:
     help_template = HELP
 )]
 struct Args {
-    /// JSON manifest describing the model and the repositories to train on.
+    /// JSON or YAML manifest describing the model and what to train on.
     #[arg(value_name = "MANIFEST")]
     manifest: Option<PathBuf>,
 
@@ -911,7 +912,9 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
     // without a second flag that could disagree with the manifest.
     let recorder = start_profile(args, shape.key())?;
     let outcome = (|| -> Result<()> {
-        // 1. The corpus.
+        // 1. The corpus. A PDF's text is extracted once, into the work
+        // directory.
+        corpus::keep_pdf_text(work.join("pdf-text"));
         let mut roots: Vec<corpus::Root> = if manifest.offline {
             vec![corpus::Root::repository(
                 corpus_dir.clone(),

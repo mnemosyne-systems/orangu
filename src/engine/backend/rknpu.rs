@@ -132,7 +132,7 @@ use super::device::{DeviceCandidate, DeviceClass};
 use super::{Backend, CpuBackend, MatmulOp};
 
 mod dense;
-pub use dense::Dense;
+pub use dense::{Dense, NO_RKNPU};
 
 /// `RKNN_SUCC`. Every entry point returns this on success and a negative
 /// error code otherwise; none of the distinctions between those codes

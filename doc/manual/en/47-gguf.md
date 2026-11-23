@@ -70,6 +70,9 @@ Reproducible means bit-for-bit, and it does not depend on the machine's
 parallel width: the same manifest and the same `seed` write the same file
 on one core or on thirty-two.
 
+A manifest is JSON, or YAML when its name ends in `.yaml` or `.yml`; the
+keys are the same in both.
+
 The smallest useful manifest is the material and nothing else, because
 every other field has a default:
 
@@ -206,7 +209,7 @@ under:
 
 | Field | Meaning |
 |:---|:---|
-| `url` | The source — a Git remote, a local repository, a directory of files, or an archive |
+| `url` | The source — a Git remote, a local repository, a directory of files, an archive, or a PDF |
 | `license` | The SPDX identifier the source is under. Required |
 | `branch` | A branch or tag to clone instead of the default. Git sources only |
 
@@ -219,6 +222,21 @@ it is by looking rather than assuming:
 | a local path containing `.git` | the same clone, which Git makes nearly free by hard-linking |
 | a local directory | **read where it is** — a corpus directory can be tens of gigabytes, and copying it to look at it would be absurd |
 | `*.tar.gz`, `*.tgz`, `*.tar.bz2`, `*.tar`, `*.zip` | unpacked into the work directory, downloading it first if it is remote |
+| `*.pdf` | its text is trained on; a remote one is downloaded into the work directory, a local one is read where it is |
+
+A PDF inside a source is read as its text too, whatever its size on disk
+(`max_file_size` is for source files). Each PDF's text is extracted once
+and kept under `pdf-text/` in the work directory; a PDF with no text layer
+(a scan) is reported and left out. A manual in YAML:
+
+```yaml
+name: postgresql
+repositories:
+  - url: https://www.postgresql.org/files/documentation/pdf/19/postgresql-19-US.pdf
+    license: PostgreSQL
+  - url: https://github.com/postgres/postgres
+    license: PostgreSQL
+```
 
 Files inside a source may be compressed: a `.gz` or `.bz2` is read
 through, and what decides whether it is training text is the name
@@ -1123,6 +1141,7 @@ Every stage lands on disk, so a run that stops can be picked up:
 ~/.orangu/gguf/<manifest>/
   corpus/            one directory per cloned repository
   wikipedia/         article text, one shard per file
+  pdf-text/          the text of each PDF read, extracted once
   tokenizer.json     the trained vocabulary and merge table
   tokens.bin         the packed token stream
   checkpoint.bin     weights, optimizer state, and the step reached

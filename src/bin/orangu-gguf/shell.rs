@@ -15,7 +15,7 @@
 
 //! Hand-written shell completion scripts, mirroring `orangu`'s and
 //! `orangu-server`'s own `-s`/`--shell-completions`. The positional
-//! `MANIFEST` completes `.json` files, `-m`/`--model` `.gguf` files, and
+//! `MANIFEST` completes `.json`, `.yaml` and `.yml` files, `-m`/`--model` `.gguf` files, and
 //! `-q`/`--quantization` the weight formats — those by shelling back out to
 //! `orangu-gguf --list-quantizations` itself and reading its first column,
 //! the same trick `orangu-server`'s scripts use for models, so the list
@@ -80,7 +80,7 @@ _orangu_gguf() {
         return 0
     fi
 
-    COMPREPLY=( $(compgen -f -X '!*.json' -- "$cur") $(compgen -d -- "$cur") )
+    COMPREPLY=( $(compgen -f -X '!*.json' -- "$cur") $(compgen -f -X '!*.yaml' -- "$cur") $(compgen -f -X '!*.yml' -- "$cur") $(compgen -d -- "$cur") )
     compopt -o filenames 2>/dev/null
 }
 
@@ -142,7 +142,7 @@ _orangu_gguf() {
         '(-s --shell-completions)'{-s,--shell-completions}'[Print shell completion script for the detected shell and exit]' \
         '(-h --help)'{-h,--help}'[Print help]' \
         '(-V --version)'{-V,--version}'[Print version]' \
-        '1:manifest:_files -g "*.json"'
+        '1:manifest:_files -g "*.(json|yaml|yml)"'
 }
 
 _orangu_gguf "$@"
@@ -162,8 +162,8 @@ function __orangu_gguf_quantizations
     orangu-gguf --list-quantizations 2>/dev/null | awk '{print $1}'
 end
 
-# The positional MANIFEST: a JSON file.
-complete -c orangu-gguf -n '__fish_is_first_arg' -k -a '(__fish_complete_suffix .json)'
+# The positional MANIFEST: a JSON or YAML file.
+complete -c orangu-gguf -n '__fish_is_first_arg' -k -a '(__fish_complete_suffix .json; __fish_complete_suffix .yaml; __fish_complete_suffix .yml)'
 complete -c orangu-gguf -s m -l model              -r -k -a '(__fish_complete_suffix .gguf)' -d 'Convert this GGUF file, checkpoint directory or HF repo instead of training'
 complete -c orangu-gguf -o ts -l training-size     -x -d 'Training size for this run, overriding the manifest'
 complete -c orangu-gguf -s q -l quantization       -x -a '(__orangu_gguf_quantizations)' -d 'Weight format written, overriding the manifest'

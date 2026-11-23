@@ -194,12 +194,14 @@ impl Default for Aligned {
 impl Deref for Aligned {
     type Target = [f32];
 
+    #[inline(always)]
     fn deref(&self) -> &[f32] {
         &bytemuck::cast_slice(&self.lines)[..self.len]
     }
 }
 
 impl DerefMut for Aligned {
+    #[inline(always)]
     fn deref_mut(&mut self) -> &mut [f32] {
         &mut bytemuck::cast_slice_mut(&mut self.lines)[..self.len]
     }

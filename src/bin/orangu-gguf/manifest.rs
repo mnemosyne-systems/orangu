@@ -327,11 +327,29 @@ impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
         let text = fs::read_to_string(path)
             .with_context(|| format!("reading the manifest {}", path.display()))?;
-        Self::parse(&text).with_context(|| format!("in the manifest {}", path.display()))
+        let yaml = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("yaml") || e.eq_ignore_ascii_case("yml"));
+        let parsed = if yaml {
+            Self::parse_yaml(&text)
+        } else {
+            Self::parse(&text)
+        };
+        parsed.with_context(|| format!("in the manifest {}", path.display()))
+    }
+
+    /// A manifest written in YAML: the same keys as the JSON one.
+    pub fn parse_yaml(text: &str) -> Result<Self> {
+        let value: serde_json::Value = serde_yaml::from_str(text)?;
+        Self::from_value(value)
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let value: serde_json::Value = serde_json::from_str(text)?;
+        Self::from_value(serde_json::from_str(text)?)
+    }
+
+    fn from_value(value: serde_json::Value) -> Result<Self> {
         if value.is_array() {
             bail!(
                 "the manifest is a bare list — every setting of a run lives in it too, \
@@ -886,6 +904,20 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("listed twice"), "{err}");
+    }
+
+    /// A YAML manifest is the JSON one in another spelling.
+    #[test]
+    fn a_yaml_manifest_reads_as_its_json() {
+        let yaml = Manifest::parse_yaml(
+            "name: pg\nbatch: 4\nrepositories:\n  - url: https://example.com/postgresql.pdf\n    license: PostgreSQL\n",
+        )
+        .unwrap();
+        let json = Manifest::parse(
+            r#"{"name": "pg", "batch": 4, "repositories": [{"url": "https://example.com/postgresql.pdf", "license": "PostgreSQL"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(format!("{yaml:?}"), format!("{json:?}"));
     }
 
     #[test]
