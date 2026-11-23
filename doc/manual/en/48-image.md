@@ -462,6 +462,7 @@ not say otherwise. Each row has an **(i)** that explains it on hover.
 | :-- | :-- | :-- |
 | **Size** | 256 × 256 up to 3840 × 2160 (HD, Full HD, QHD and 4K UHD, landscape and portrait), or *Other…* for any `WIDTHxHEIGHT` | Any size is drawn: one that is not a multiple of the model's unit (32 pixels for Qwen-Image 2.1 and MiniMax-H3-Image, 16 for the others) is drawn a few pixels bigger and cropped back, so 1920 × 1080 is 1920 × 1080. A preset larger than the served model draws is greyed, and names the size it would come out at; see **Sizes** below. 1024 × 1024 is the default; 2048 × 2048 is 2.1's native size, and hours on a CPU. 512 × 512 is a preview in minutes |
 | **Steps** | 4, 8, 20, 40, 50, or a number | The time is linear in them. Qwen-Image 2.1 is made for 40, and 20 is a usable draft. For 2512, the 8-step adapter is made for 8, the 4-step file for 4, and the base model without an adapter needs 50. FLUX.2 [klein] base is made for 50, a distilled [klein] for 4, MOSS-Image for 50, MiniMax-H3-Image for 6 |
+| **Seed** | a number, or empty | The number a picture is drawn from. The same seed draws the same picture again — but only with the same build, model, steps, guidance and size; change any of those and the seed alone does not bring it back. Empty (the default) draws a new one per picture, and the caption under each picture shows the seed it used |
 | **Guidance** | Off, 4, 6, or a number | Classifier-free guidance pushes the picture towards the prompt and away from the negative one; it doubles the work of every step. Qwen-Image 2.1 is released to run with it off (stable-diffusion.cpp's examples use 6). For 2512: off under a Lightning adapter, which was trained without it, and 4 for the base model. FLUX.2 [klein] base: 4; a distilled [klein]: off; MOSS-Image: 3; MiniMax-H3-Image: off |
 | **Negative prompt** | text | What the picture is pushed away from — *blurry, text, extra limbs*. Read only when guidance is on |
 | **Strength** | 0 – 1 | For a picture started from an attached one (not an edit — see **Editing a picture**): how much of the schedule to run over it. 1 ignores the attachment's content and keeps only its size; 0 returns it unchanged; 0.6 keeps the composition and redraws the rest |
@@ -493,9 +494,12 @@ The usual rhythm on a slow machine: set **512 × 512** and **20 steps**,
 Save, and send the prompt for a draft in a few minutes; when the
 composition is right, set **1024 × 1024** and **40 steps** and send it
 again for the picture. (With Qwen-Image 2512 and its adapter: 512 × 512
-at 4 steps, then 1024 × 1024 at 8.) A seed is drawn per picture and shown in its
-caption; the API takes a `seed` to draw the same one again at another
-size.
+at 4 steps, then 1024 × 1024 at 8.) A seed is drawn per picture unless
+**Seed** holds one, and every caption shows the seed it used; type it back
+under **Seed** (or send `seed` to the API) to draw the same picture
+again — with the same build, model, steps, guidance and size. A PNG also
+carries the seed, steps and size as `tEXt` metadata, so a file saved out
+of the console still says how it was made.
 
 ### Drawing
 

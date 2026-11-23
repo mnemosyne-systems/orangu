@@ -3077,6 +3077,7 @@
   const imageSizeCustom = document.getElementById("image-size-custom");
   const imageSteps = document.getElementById("image-steps");
   const imageStepsCustom = document.getElementById("image-steps-custom");
+  const imageSeed = document.getElementById("image-seed");
   const imageCfg = document.getElementById("image-cfg");
   const imageCfgCustom = document.getElementById("image-cfg-custom");
   const imageNegative = document.getElementById("image-negative");
@@ -3128,6 +3129,8 @@
     selectWithCustom(imageSize, imageSizeCustom, d.size);
     selectWithCustom(imageSteps, imageStepsCustom, d.steps);
     selectWithCustom(imageCfg, imageCfgCustom, d.cfg_scale);
+    // A string, so a u64 seed is handed back exactly as the server gave it.
+    imageSeed.value = d.seed == null ? "" : String(d.seed);
     imageNegative.value = d.negative_prompt.trim();
     imageStrength.value = d.strength;
     imageStrengthValue.textContent = Number(d.strength).toFixed(2);
@@ -3138,12 +3141,16 @@
   // What the form says now, as `POST /api/props`' `image` object.
   function imageFormSettings() {
     const cfg = Number(customValue(imageCfg, imageCfgCustom));
+    const seed = imageSeed.value.trim();
     return {
       size: customValue(imageSize, imageSizeCustom),
       steps: Number(customValue(imageSteps, imageStepsCustom)),
       cfg_scale: Number.isFinite(cfg) ? cfg : 1,
       negative_prompt: imageNegative.value.trim() || " ",
       strength: Number(imageStrength.value),
+      // Empty is "draw a new one" — sent as null so it also clears a seed
+      // set in the configuration. A string keeps a u64 exact in transit.
+      seed: seed === "" ? null : seed,
       format: imageFormat.value,
     };
   }
@@ -3254,6 +3261,7 @@
       Math.abs(f.cfg_scale - d.cfg_scale) > 1e-6 ||
       f.negative_prompt.trim() !== d.negative_prompt.trim() ||
       Math.abs(f.strength - d.strength) > 1e-6 ||
+      (f.seed == null ? "" : String(f.seed)) !== (d.seed == null ? "" : String(d.seed)) ||
       f.format !== (d.format || "png")
     );
   }

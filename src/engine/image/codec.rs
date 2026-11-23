@@ -284,10 +284,27 @@ fn rasterize_svg(bytes: &[u8]) -> Result<image::RgbaImage> {
         .ok_or_else(|| anyhow!("the rasterized SVG has the wrong size"))
 }
 
+/// What a generated picture records about itself: the seed it was drawn
+/// from, the steps run, and the size it came out at.
+#[derive(Debug, Clone, Copy)]
+pub struct PictureMetadata {
+    pub seed: u64,
+    pub steps: usize,
+    pub width: usize,
+    pub height: usize,
+}
+
 /// Encodes an RGB or RGBA `[-1, 1]` feature as `format`. Alpha is kept by
 /// every format that has it (PNG, GIF, WebP, and SVG's embedded PNG) and
-/// composited on white for JPEG, which has none.
-pub fn encode(picture: &Feature, format: ImageFormat) -> Result<Vec<u8>> {
+/// composited on white for JPEG, which has none. For PNG, `metadata` is
+/// also recorded as `tEXt` chunks (`seed`, `steps`, `size`) so a picture
+/// copied out of a session still says how it was drawn; the other formats
+/// carry no metadata.
+pub fn encode(
+    picture: &Feature,
+    format: ImageFormat,
+    metadata: Option<&PictureMetadata>,
+) -> Result<Vec<u8>> {
     ensure!(
         picture.channels == 3 || picture.channels == 4,
         "a picture has 3 or 4 channels, not {}",
@@ -312,9 +329,15 @@ pub fn encode(picture: &Feature, format: ImageFormat) -> Result<Vec<u8>> {
     };
     let mut out = Cursor::new(Vec::new());
     match format {
-        ImageFormat::Png => img
-            .write_to(&mut out, image::ImageFormat::Png)
-            .context("encoding PNG")?,
+        ImageFormat::Png => {
+            img.write_to(&mut out, image::ImageFormat::Png)
+                .context("encoding PNG")?;
+            let png = out.into_inner();
+            return match metadata {
+                Some(metadata) => add_png_metadata(png, metadata),
+                None => Ok(png),
+            };
+        }
         ImageFormat::Jpeg => {
             let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92);
             encoder
@@ -363,6 +386,58 @@ pub fn encode(picture: &Feature, format: ImageFormat) -> Result<Vec<u8>> {
     Ok(out.into_inner())
 }
 
+/// Inserts `metadata` as `tEXt` chunks right after the PNG's `IHDR`, where
+/// the format allows them. The image bytes are otherwise untouched.
+fn add_png_metadata(png: Vec<u8>, metadata: &PictureMetadata) -> Result<Vec<u8>> {
+    // Signature (8 bytes) and IHDR (4 length + 4 type + 13 data + 4 CRC).
+    const SIGNATURE: usize = 8;
+    const IHDR: usize = 25;
+    ensure!(
+        png.len() >= SIGNATURE + IHDR && png.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "the encoded PNG has no IHDR"
+    );
+    let mut out = Vec::with_capacity(png.len() + 160);
+    out.extend_from_slice(&png[..SIGNATURE + IHDR]);
+    write_text_chunk(&mut out, "Software", "orangu-server");
+    write_text_chunk(&mut out, "seed", &metadata.seed.to_string());
+    write_text_chunk(&mut out, "steps", &metadata.steps.to_string());
+    write_text_chunk(
+        &mut out,
+        "size",
+        &format!("{}x{}", metadata.width, metadata.height),
+    );
+    out.extend_from_slice(&png[SIGNATURE + IHDR..]);
+    Ok(out)
+}
+
+/// One PNG `tEXt` chunk: keyword, NUL, text, with the chunk's own CRC.
+fn write_text_chunk(out: &mut Vec<u8>, keyword: &str, text: &str) {
+    let mut data = Vec::with_capacity(keyword.len() + 1 + text.len());
+    data.extend_from_slice(keyword.as_bytes());
+    data.push(0);
+    data.extend_from_slice(text.as_bytes());
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    let crc_start = out.len();
+    out.extend_from_slice(b"tEXt");
+    out.extend_from_slice(&data);
+    let crc = crc32(&out[crc_start..]);
+    out.extend_from_slice(&crc.to_be_bytes());
+}
+
+/// PNG's CRC-32 (reflected polynomial `0xEDB88320`), over a chunk's type
+/// and data.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for &byte in bytes {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 /// A picture's RGB with its alpha composited on white — the JPEG a
 /// transparent picture becomes, as [`decode_to_feature`] reads one.
 fn on_white(img: &image::DynamicImage) -> image::RgbImage {
@@ -398,6 +473,58 @@ pub fn fit_generation_size(
 mod tests {
     use super::*;
 
+    /// The `tEXt` chunks a PNG carries, by keyword.
+    fn png_text_chunks(png: &[u8]) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let mut pos = 8;
+        while pos + 8 <= png.len() {
+            let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+            let kind = &png[pos + 4..pos + 8];
+            let data = &png[pos + 8..pos + 8 + len];
+            if kind == b"tEXt"
+                && let Some(nul) = data.iter().position(|&b| b == 0)
+            {
+                out.insert(
+                    String::from_utf8_lossy(&data[..nul]).into_owned(),
+                    String::from_utf8_lossy(&data[nul + 1..]).into_owned(),
+                );
+            }
+            if kind == b"IEND" {
+                break;
+            }
+            pos += 12 + len;
+        }
+        out
+    }
+
+    #[test]
+    fn a_png_records_the_seed_steps_and_size() {
+        let feature = Feature::new(8, 8, 3, vec![0.0; 8 * 8 * 3]);
+        let metadata = PictureMetadata {
+            seed: 42,
+            steps: 4,
+            width: 512,
+            height: 256,
+        };
+        let bytes = encode(&feature, ImageFormat::Png, Some(&metadata)).unwrap();
+        assert_eq!(dimensions(&bytes).unwrap(), (8, 8));
+        let chunks = png_text_chunks(&bytes);
+        assert_eq!(chunks.get("seed").map(String::as_str), Some("42"));
+        assert_eq!(chunks.get("steps").map(String::as_str), Some("4"));
+        assert_eq!(chunks.get("size").map(String::as_str), Some("512x256"));
+        assert_eq!(
+            chunks.get("Software").map(String::as_str),
+            Some("orangu-server")
+        );
+        // Still a PNG the decoder reads.
+        assert_eq!(decode_to_feature(&bytes, 8, 8).unwrap().width, 8);
+
+        // Without metadata, none is written — and the file is still a PNG.
+        let plain = encode(&feature, ImageFormat::Png, None).unwrap();
+        assert!(png_text_chunks(&plain).is_empty());
+        assert_eq!(dimensions(&plain).unwrap(), (8, 8));
+    }
+
     #[test]
     fn png_and_jpeg_round_trip_through_the_feature_layout() {
         // A 16x16 gradient: red across, green down, in [-1, 1].
@@ -417,7 +544,7 @@ mod tests {
             ImageFormat::Webp,
             ImageFormat::Svg,
         ] {
-            let bytes = encode(&feature, format).unwrap();
+            let bytes = encode(&feature, format, None).unwrap();
             assert_eq!(dimensions(&bytes).unwrap(), (16, 16), "{format:?}");
             let back = decode_to_feature(&bytes, 16, 16).unwrap();
             assert_eq!((back.height, back.width, back.channels), (16, 16, 3));
@@ -438,22 +565,22 @@ mod tests {
             assert!(worst < tolerance, "{format:?}: worst error {worst}");
         }
         assert!(
-            encode(&feature, ImageFormat::Png)
+            encode(&feature, ImageFormat::Png, None)
                 .unwrap()
                 .starts_with(b"\x89PNG")
         );
         assert!(
-            encode(&feature, ImageFormat::Jpeg)
+            encode(&feature, ImageFormat::Jpeg, None)
                 .unwrap()
                 .starts_with(&[0xFF, 0xD8])
         );
         assert!(
-            encode(&feature, ImageFormat::Gif)
+            encode(&feature, ImageFormat::Gif, None)
                 .unwrap()
                 .starts_with(b"GIF8")
         );
         assert!(
-            encode(&feature, ImageFormat::Webp)
+            encode(&feature, ImageFormat::Webp, None)
                 .unwrap()
                 .starts_with(b"RIFF")
         );
@@ -472,7 +599,7 @@ mod tests {
         }
         let feature = Feature::new(8, 8, 4, data);
         for format in [ImageFormat::Png, ImageFormat::Webp] {
-            let bytes = encode(&feature, format).unwrap();
+            let bytes = encode(&feature, format, None).unwrap();
             let back = decode_to_rgba_feature(&bytes, 8, 8).unwrap();
             assert_eq!(back.data, feature.data, "{format:?}");
             // Composited, the transparent half is white.
@@ -480,15 +607,16 @@ mod tests {
             assert_eq!(&rgb.data[..3], &[-1.0, -1.0, -1.0]);
             assert_eq!(&rgb.data[7 * 3..8 * 3], &[1.0, 1.0, 1.0]);
         }
-        let jpeg = decode_to_feature(&encode(&feature, ImageFormat::Jpeg).unwrap(), 8, 8).unwrap();
+        let jpeg =
+            decode_to_feature(&encode(&feature, ImageFormat::Jpeg, None).unwrap(), 8, 8).unwrap();
         assert!(
             jpeg.data[7 * 3] > 0.8,
             "the transparent half is white in a JPEG"
         );
         // A picture without alpha reads back fully opaque.
         let opaque = Feature::new(1, 1, 3, vec![0.0, 0.0, 0.0]);
-        let back =
-            decode_to_rgba_feature(&encode(&opaque, ImageFormat::Png).unwrap(), 1, 1).unwrap();
+        let back = decode_to_rgba_feature(&encode(&opaque, ImageFormat::Png, None).unwrap(), 1, 1)
+            .unwrap();
         assert_eq!(back.data[3], 1.0);
     }
 
@@ -509,7 +637,7 @@ mod tests {
     #[test]
     fn an_svg_result_carries_the_picture_and_reads_back() {
         let f = Feature::new(8, 8, 3, vec![1.0; 8 * 8 * 3]);
-        let svg = encode(&f, ImageFormat::Svg).unwrap();
+        let svg = encode(&f, ImageFormat::Svg, None).unwrap();
         let text = std::str::from_utf8(&svg).unwrap();
         assert!(
             text.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\"")
@@ -529,7 +657,7 @@ mod tests {
     #[test]
     fn decoding_resizes_to_the_requested_size() {
         let feature = Feature::new(4, 4, 3, vec![0.0; 48]);
-        let bytes = encode(&feature, ImageFormat::Png).unwrap();
+        let bytes = encode(&feature, ImageFormat::Png, None).unwrap();
         let back = decode_to_feature(&bytes, 8, 16).unwrap();
         assert_eq!((back.width, back.height), (8, 16));
     }

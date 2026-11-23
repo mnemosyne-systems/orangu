@@ -847,6 +847,9 @@ pub struct ImageDefaults {
     pub cfg_scale: f32,
     pub negative_prompt: String,
     pub strength: f32,
+    /// The seed a picture is drawn from when the request names none —
+    /// `None` draws one, as every request did before the key existed.
+    pub seed: Option<u64>,
     /// The container a picture comes back in when the request names none
     /// and no attachment sets it.
     pub format: ImageFormat,
@@ -864,6 +867,7 @@ impl Default for ImageDefaults {
             cfg_scale: 4.0,
             negative_prompt: " ".to_string(),
             strength: 0.6,
+            seed: None,
             format: ImageFormat::Png,
         }
     }
@@ -2609,7 +2613,16 @@ impl Pipeline {
         picture = fit_to_request(picture, request.width, request.height, unit)?;
         let vae_done = decode_started.elapsed();
         let convs = vae::take_conv_clock();
-        let bytes = codec::encode(&picture, request.format)?;
+        let bytes = codec::encode(
+            &picture,
+            request.format,
+            Some(&codec::PictureMetadata {
+                seed,
+                steps: steps_to_run,
+                width: request.width,
+                height: request.height,
+            }),
+        )?;
         timings.decode = decode_started.elapsed();
         log::info!(
             "orangu-server: [image] decode {:.1}s: convolutions {:.1}s (im2col {:.1}s over \
