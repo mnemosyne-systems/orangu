@@ -1184,6 +1184,8 @@ pub(crate) struct ImageKeys {
     pub cfg_scale: Option<f32>,
     pub negative_prompt: Option<String>,
     pub strength: Option<f32>,
+    /// `image_seed`, when one was given (Enter draws a new one each time).
+    pub seed: Option<u64>,
     /// `image_format`, when not `png`.
     pub format: Option<String>,
     /// `image_reference_size`, when not `source`.
@@ -1237,6 +1239,9 @@ impl ImageKeys {
         }
         if let Some(strength) = self.strength {
             out.push_str(&format!("image_strength = {strength}\n"));
+        }
+        if let Some(seed) = self.seed {
+            out.push_str(&format!("image_seed = {seed}\n"));
         }
         if let Some(format) = &self.format {
             out.push_str(&format!("image_format = {format}\n"));
@@ -1536,6 +1541,16 @@ fn prompt_image_keys(
                 _ => Err(anyhow!("expected a number between 0 and 1")),
             },
         )?;
+    // Empty (the default) draws a new seed per picture, which is what the
+    // server does without the key; a seed written here makes every picture
+    // reproducible until it is changed.
+    let seed = prompt_checked("image_seed", "", |value| {
+        if value.is_empty() || value.parse::<u64>().is_ok() {
+            Ok(())
+        } else {
+            Err(anyhow!("expected a whole number from 0 to {}", u64::MAX))
+        }
+    })?;
     let format = prompt_checked(
         "image_format (png, jpeg, gif, webp or svg)",
         defaults.format.name(),
@@ -1578,6 +1593,9 @@ fn prompt_image_keys(
             .filter(|prompt| !prompt.is_empty() && prompt != defaults.negative_prompt.trim()),
         strength: Some(strength.parse::<f32>().expect("checked"))
             .filter(|strength| *strength != defaults.strength),
+        seed: Some(seed)
+            .filter(|seed| !seed.is_empty())
+            .map(|seed| seed.parse::<u64>().expect("checked")),
         format: crate::engine::image::ImageFormat::parse(&format)
             .filter(|format| *format != defaults.format)
             .map(|format| format.name().to_string()),
@@ -2287,9 +2305,9 @@ mod tests {
     }
 
     /// The picture keys land in the file only where something other than
-    /// the default was typed — Enter through all seven writes nothing, the
-    /// same rule `role` and the `[web]` booleans follow — and in the order
-    /// they were asked.
+    /// the default was typed — Enter through every prompt writes nothing,
+    /// the same rule `role` and the `[web]` booleans follow — and in the
+    /// order they were asked.
     #[test]
     fn image_keys_are_written_only_when_they_differ_from_the_defaults() {
         assert_eq!(ImageKeys::default().render(), "");
@@ -2304,6 +2322,7 @@ mod tests {
             cfg_scale: None,
             negative_prompt: Some("blurry".to_string()),
             strength: Some(0.8),
+            seed: Some(42),
             format: Some("webp".to_string()),
             vision: Some("none".to_string()),
             image_weights: Some("int8".to_string()),
@@ -2315,7 +2334,7 @@ mod tests {
             "vision = none\nvae = /srv/vae/qwen_image_vae.safetensors\nvae_precision = f32\n\
              image_weights = int8\nimage_cache = off\nimage_size = 512x512\n\
              image_steps = 20\nimage_negative_prompt = blurry\nimage_strength = 0.8\n\
-             image_format = webp\nimage_reference_size = output\n"
+             image_seed = 42\nimage_format = webp\nimage_reference_size = output\n"
         );
         let keys = ImageKeys {
             image_lora: Some("lightx2v/Qwen-Image-2512-Lightning:x-8steps.safetensors".to_string()),

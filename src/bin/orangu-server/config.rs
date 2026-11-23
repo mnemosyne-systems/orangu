@@ -1951,9 +1951,9 @@ impl ServerConfiguration {
 }
 
 /// `[orangu-server].image_size`, `image_steps`, `image_cfg_scale`,
-/// `image_negative_prompt` and `image_strength` — each optional, each
-/// checked here so a typo is a startup error rather than a picture that
-/// silently came out at the default.
+/// `image_negative_prompt`, `image_strength`, `image_seed` and
+/// `image_format`, each optional, each checked here so a typo is a startup
+/// error rather than a picture that silently came out at the default.
 fn parse_image_defaults(
     section: &HashMap<String, String>,
 ) -> Result<crate::engine::image::ImageDefaults> {
@@ -2013,6 +2013,21 @@ fn parse_image_defaults(
                     value.trim()
                 )
             })?;
+    }
+    if let Some(value) = section.get("image_seed") {
+        let value = value.trim();
+        image.seed = if value.is_empty() {
+            None
+        } else {
+            Some(value.parse::<u64>().map_err(|_| {
+                anyhow!(
+                    "invalid value for [{SERVER_SECTION}].image_seed: '{}' (expected an integer \
+                     from 0 to {})",
+                    value,
+                    u64::MAX
+                )
+            })?)
+        };
     }
     if let Some(value) = section.get("image_format") {
         image.format = crate::engine::image::ImageFormat::parse(value).ok_or_else(|| {
@@ -3005,6 +3020,7 @@ mod tests {
         section.insert("image_cfg_scale".to_string(), "1".to_string());
         section.insert("image_negative_prompt".to_string(), "blurry".to_string());
         section.insert("image_strength".to_string(), "0.8".to_string());
+        section.insert("image_seed".to_string(), "42".to_string());
         section.insert("image_format".to_string(), "webp".to_string());
         let image = parse_image_defaults(&section).unwrap();
         assert_eq!((image.width, image.height), (512, 256));
@@ -3012,16 +3028,19 @@ mod tests {
         assert_eq!(image.cfg_scale, 1.0);
         assert_eq!(image.negative_prompt, "blurry");
         assert_eq!(image.strength, 0.8);
+        assert_eq!(image.seed, Some(42));
         assert_eq!(image.format, crate::engine::image::ImageFormat::Webp);
 
         let defaults = parse_image_defaults(&HashMap::new()).unwrap();
         assert_eq!((defaults.width, defaults.height), (1024, 1024));
         assert_eq!(defaults.steps, 50);
+        assert_eq!(defaults.seed, None);
 
         for (key, value) in [
             ("image_steps", "0"),
             ("image_cfg_scale", "-1"),
             ("image_strength", "2"),
+            ("image_seed", "-1"),
             ("image_size", "8x8"),
             ("image_format", "bmp"),
         ] {
@@ -3036,6 +3055,11 @@ mod tests {
         section.insert("image_size".to_string(), "1920x1080".to_string());
         let image = parse_image_defaults(&section).unwrap();
         assert_eq!((image.width, image.height), (1920, 1080));
+
+        // An empty seed is no seed: a picture draws its own.
+        let mut section = HashMap::new();
+        section.insert("image_seed".to_string(), String::new());
+        assert_eq!(parse_image_defaults(&section).unwrap().seed, None);
     }
 
     /// A hand-edited `.ini` gets every spelling of a switch a person might
