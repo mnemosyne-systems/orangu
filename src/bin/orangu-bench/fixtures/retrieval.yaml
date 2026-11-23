@@ -7,35 +7,35 @@ cases:
   - query: redact API keys and passwords before text reaches the model
     expect: [src/bin/orangu/review/secrets.rs]
   - query: which tokens the sampler is still allowed to pick under a grammar
-    expect: [src/bin/orangu-server/engine/constraint.rs, src/bin/orangu-server/engine/grammar.rs]
+    expect: [src/engine/constraint.rs, src/engine/grammar.rs]
   - query: turn a JSON schema into GBNF rules
-    expect: [src/bin/orangu-server/engine/json_schema.rs, src/bin/orangu-server/engine/schema_text.rs]
+    expect: [src/engine/json_schema.rs, src/engine/schema_text.rs]
   - query: recover structured tool calls from generated model text
-    expect: [src/bin/orangu-server/engine/tool_calls.rs]
+    expect: [src/engine/tool_calls.rs]
   - query: what to drop when a conversation no longer fits the context window
-    expect: [src/bin/orangu-server/engine/context_shift.rs]
+    expect: [src/engine/context_shift.rs]
   - query: repetition penalty then temperature and top-k sampling
-    expect: [src/bin/orangu-server/engine/sampling.rs]
+    expect: [src/engine/sampling.rs]
   - query: byte pair encoding tokenizer merges
-    expect: [src/bin/orangu-server/engine/tokenizer.rs]
+    expect: [src/engine/tokenizer.rs]
   - query: render the model's own jinja chat template
-    expect: [src/bin/orangu-server/engine/chat_template.rs]
+    expect: [src/engine/chat_template.rs]
   - query: read metadata key value pairs from a GGUF file
-    expect: [src/gguf.rs, src/bin/orangu-server/engine/loader.rs]
+    expect: [src/gguf.rs, src/engine/loader.rs]
   - query: dequantize quantized weight blocks to f32
-    expect: [src/bin/orangu-server/engine/quant.rs]
+    expect: [src/dequantize.rs]
   - query: KV cache pages shared between two requests with reference counts
-    expect: [src/bin/orangu-server/engine/kv_pool.rs]
+    expect: [src/engine/kv_pool.rs]
   - query: reuse a recently finished request's prompt cache for a new request
-    expect: [src/bin/orangu-server/engine/prefix_cache.rs]
+    expect: [src/engine/prefix_cache.rs]
   - query: bound how many requests generate concurrently
-    expect: [src/bin/orangu-server/engine/scheduler.rs]
+    expect: [src/engine/scheduler.rs]
   - query: proxy reads the model field and starts the right backend server
     expect: [src/bin/orangu-coordinator/proxy.rs]
   - query: stop restarting a server profile that keeps crashing
     expect: [src/bin/orangu-coordinator/crashes.rs]
   - query: mutual authentication between parent and worker with a shared secret
-    expect: [src/bin/orangu-server/workers/auth.rs]
+    expect: [src/workers/auth.rs]
   - query: divide a model's layers between a node and its workers
     expect: [src/bin/orangu-server/workers/plan.rs, src/bin/orangu-server/workers/pipeline.rs]
   - query: refuse to fetch URLs that point at private or local network addresses
@@ -77,7 +77,7 @@ cases:
   - query: select text with the mouse in the terminal UI
     expect: [src/tui/selection.rs]
   - query: what the server does when the GPU disappears
-    expect: [src/bin/orangu-server/device_lost.rs]
+    expect: [src/device_lost.rs]
   - query: detect whether an endpoint is a coordinator proxy
     expect: [src/llm/coordinator.rs]
   - query: make sure child processes die with their parent

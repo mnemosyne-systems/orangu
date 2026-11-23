@@ -232,10 +232,7 @@ impl Inkling2Model {
                 Some(values) => (0..n_layer)
                     .map(|i| values.get(i).copied().unwrap_or(default as u64) as usize)
                     .collect(),
-                None => vec![
-                    loaded.metadata_u64(key).map_or(default, |v| v as usize);
-                    n_layer
-                ],
+                None => vec![loaded.metadata_u64(key).map_or(default, |v| v as usize); n_layer],
             }
         };
         let n_head_per_layer = per_layer("attention.head_count", config.n_head);
@@ -281,7 +278,9 @@ impl Inkling2Model {
             .metadata_f32("expert_weights_scale")
             .filter(|s| *s != 0.0)
             .unwrap_or(1.0);
-        let softcap = loaded.metadata_f32("final_logit_softcapping").unwrap_or(0.0);
+        let softcap = loaded
+            .metadata_f32("final_logit_softcapping")
+            .unwrap_or(0.0);
         let n_expert = required("expert_count")? as usize;
         let n_expert_used = required("expert_used_count")? as usize;
         let unpadded_vocab = first_u64(loaded, &["vocab_size_unpadded", "unpadded_vocab_size"])
@@ -994,9 +993,10 @@ impl Inkling2Model {
                 let width = extent.min(n_keys);
                 let coeffs = &r[(t * n_head + h) * n_rel..(t * n_head + h + 1) * n_rel];
                 bias.clear();
-                bias.extend((0..width).map(|d| {
-                    tensor::dot(&layer.rel_bias[d * n_rel..(d + 1) * n_rel], coeffs)
-                }));
+                bias.extend(
+                    (0..width)
+                        .map(|d| tensor::dot(&layer.rel_bias[d * n_rel..(d + 1) * n_rel], coeffs)),
+                );
 
                 let qv = &q[t * q_dim + h * head_dim..t * q_dim + (h + 1) * head_dim];
                 let kv_head = h / group;
@@ -1284,7 +1284,16 @@ impl Inkling2Model {
                     }
                     for ip in core.start..core.end {
                         if pass == 0 {
-                            self.layer(backend, seqs, ip, ip, &mut cur, &mut blocks, None, n_tokens);
+                            self.layer(
+                                backend,
+                                seqs,
+                                ip,
+                                ip,
+                                &mut cur,
+                                &mut blocks,
+                                None,
+                                n_tokens,
+                            );
                             continue;
                         }
                         let slot = n_phys + (pass - 1) * n_core + (ip - core.start);
@@ -1464,11 +1473,7 @@ impl ModelForward for Inkling2Model {
         anyhow::ensure!(!tokens.is_empty(), "forward called with no tokens");
         let n_embd = self.config.n_embd;
         let x = self.run_layers(&mut Seqs::One { cache, start_pos }, tokens)?;
-        Ok(self.project_logits(
-            self.backend.as_ref(),
-            &x[(tokens.len() - 1) * n_embd..],
-            1,
-        ))
+        Ok(self.project_logits(self.backend.as_ref(), &x[(tokens.len() - 1) * n_embd..], 1))
     }
 
     fn batches_decode(&self) -> bool {
@@ -1563,7 +1568,8 @@ mod tests {
         assert_eq!(situ(0.0, 5.0, 4.0, 25.0), 0.0);
         let g = 0.5f32;
         let u = -1.5f32;
-        let expected = 4.0 * (g / 4.0).tanh() * (1.0 / (1.0 + (-g).exp())) * 25.0 * (u / 25.0).tanh();
+        let expected =
+            4.0 * (g / 4.0).tanh() * (1.0 / (1.0 + (-g).exp())) * 25.0 * (u / 25.0).tanh();
         assert!((situ(g, u, 4.0, 25.0) - expected).abs() < 1e-6);
     }
 }
