@@ -2830,6 +2830,77 @@ voice's reference codes to `ref.wav` and speaks one sentence to
 `speech.wav` with the real weights, for listening. There is no
 captured-tensor fixture from the reference.
 
+### Text adapters (`engine::text_lora`)
+
+`[orangu-server].text_lora` (`config::ServerConfiguration::text_lora`,
+`None` for an absent, empty or `none` key) is handled in `main::prepare`
+right after `weights_source.load()` and before anything else touches the
+weights: `apply_text_lora` resolves the spec (`text_lora::resolve`: a file,
+or a directory holding `adapter_model.safetensors`, as given or under
+`models`), opens it against `loaded.config`, and merges it into the
+`LoadedModel`. Placement, residency and every architecture's constructor
+then read the merged tensors through `LoadedModel::matrix` as if the file
+had held them.
+
+It merges rather than applying the adapter per pass. A per-pass hook would
+have to sit on every route a weight takes into a matmul — each backend's
+`matmul`, `matmul_batch` and decode variants, the fused CPU kernels, the
+GPU backends that upload `raw_bytes` and dequantize on the shader, and
+`QuantMatrix::adjacent_pair`, which joins Q, K and V into one matmul when
+they are adjacent in the file — and missing one is a wrong answer, not an
+error. Rewriting the tensors before the model is built needs none of
+that, runs at the base model's speed, and works on every backend. Swapping
+adapters per request is therefore not possible without that hook;
+`text_lora` is one adapter per process.
+
+`TextLora::open` reads the `safetensors` with `orangu::safetensors`,
+pairing `<base>.lora_A.weight` with `<base>.lora_B.weight` (the kohya
+`lora_down`/`lora_up` spellings too) and refusing any other tensor name
+except a kohya `<base>.alpha`: that is what turns `peft`'s
+`lora_embedding_A`, DoRA's `lora_magnitude_vector` and `modules_to_save`
+copies into an error instead of a silently partial adapter. The scale is
+the kohya alpha over the rank if present, else `adapter_config.json`'s
+`lora_alpha / r` (`/ √r` under `use_rslora`), else 1; a config with a
+non-empty `rank_pattern` or `alpha_pattern`, or `use_dora`, is refused.
+
+`gguf_name` maps the checkpoint linear to its GGUF tensor: any prefix up
+to `layers.<n>.` (so `base_model.model.model.`, and the
+`language_model.model.` of a multimodal checkpoint, map alike), then
+`self_attn.{q,k,v,o}_proj` to `blk.<n>.attn_{q,k,v,output}.weight`,
+`mlp.{gate,up,down}_proj` to `blk.<n>.ffn_{gate,up,down}.weight`, and
+`lm_head` to `output.weight` — the names `orangu-gguf`'s converters and
+llama.cpp's write. A name it does not know is an error.
+
+One correction is needed for `llama`, `granite` and `mistral3`. Their
+converters regroup each head's Q and K rows from the checkpoint's
+half-split rotary order into the pairwise order the engine rotates in
+(`orangu-gguf`'s `Transform::PermuteRotary`, `ModelConfig::n_head` heads
+for Q and `n_head_kv` for K). The adapter is in checkpoint order, so
+`TextLora::open` applies the same permutation to the up projection's rows
+— enough on its own, since `P · (B·A) = (P·B) · A` — or the update would be
+added to the wrong rows. Other architectures are converted unpermuted
+and need nothing.
+
+`TextLora::merge` checks every pair's shape against `LoadedModel::matrix`
+first, so a mismatched or missing tensor fails before any work, then
+reuses the image adapter's machinery: `LoraPair::merge_into` for each
+tensor (dequantize, add `scale · B·A`, re-encode with `orangu::quantize`,
+an error for a type with no encoder) and `image::lora::MergedCache` for
+the cache, keyed by the model file and the adapter file. A complete cache
+hit is mapped and nothing is merged. After a fresh merge the cache is
+flushed and reopened, and the tensors are swapped to the mapped copies
+so the heap copies are freed; a failed write is a warning and the heap
+copies stay. The swap is `LoadedModel::replace_tensor_range`, the
+`replace_tensor` variant that points a tensor at a range inside a shared
+mapping, with `QuantMatrix::byte_start` giving that range for a cached
+matrix.
+
+The tests in `text_lora.rs` cover the name mapping, the scale and the
+refused configurations, the rotary permutation's identity with the
+permuted product, and opening a `peft` directory for `llama` (permuted)
+and `qwen3` (not). The merge itself is `LoraPair::merge_into`, tested in
+`image::lora`.
+
 ### Constrained decoding (`engine::constraint`, `engine::sampling::Constraint`)
 
 `JsonPrefix` is a byte-level recogniser for **prefixes** of valid JSON. At

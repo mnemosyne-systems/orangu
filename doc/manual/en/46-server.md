@@ -2089,6 +2089,7 @@ shown.
 | `vision_tokens`         | `280`                                      | the most prompt tokens one chat picture becomes, `70` to `1120`; a larger picture is read at a smaller size |
 | `image_lora`            | `auto`                                     | the adapter applied to the picture transformer: `auto` the Lightning file under `models` (fetched with the model; a picture in 8 unguided steps), `none` the base model, or a `.safetensors` (or 4-step variant, rougher)                                                                                                                                                                                                                                                                            |
 | `image_lora_merge`      | `yes`                                      | fold the adapter into the weights at startup (a few minutes once, then no cost per pass); `no` applies it in `f32` every pass                                                                                                                                                                                                                                                                                                                                                                        |
+| `text_lora`             | `none`                                     | a `peft` LoRA merged into the chat model's weights at startup: `adapter_model.safetensors` or the directory holding it, absolute or under `models`; attention and feed-forward projections and `lm_head`, cached under `models/orangu-merged/` |
 | `image_weights`         | `auto`                                     | how a `qwen_image_2_1` transformer's linears are held: `auto` per-row `int8` on the 8 × 8 `int8` tile (`i8mm`, `dotprod` or `AVX2`) when the transformer runs on the CPU and total memory is at least three times the 7 GB copy, `int8` whenever it runs on the CPU, `file` the file's K-quants (no copy); a transformer on a GPU keeps the file's; ~1.4–1.9× a step                                                                                                                                 |
 | `vae_precision`         | `int8`                                     | the VAE's convolutions as `Q6_K` on the `int8` kernel (3–4× faster decode), or `f32` as stored (exact); an `ltxv` model's video VAE follows it too                                                                                                                                                                                                                                                                                                                                                   |
 | `image_cache`           | `easy`                                     | whether a step may reuse the last transformer pass rather than run one (EasyCache): `easy` (the default, threshold 0.08) or `easy:<threshold>` a step whose predicted change since the last pass stays under the threshold takes the last two passes' residual extrapolated to it, and `off` runs every step; at 0.08 about 2.4× a 40-step 1024² picture and 3.6× a 512² edit, the picture close to the uncached one but not identical; 0.05 is closer at 2×, 0.1 and above start to ghost lettering |
@@ -2289,6 +2290,71 @@ does not do it.
 A reply reports what was dropped, as `context_dropped_tokens` in `usage` and
 `timings`, and the log has a line for each shift. `prompt_tokens` counts what was
 left of the prompt after the cut, and the two together are what the client sent.
+
+### Your own fine-tune: `text_lora`
+
+A LoRA is a small set of extra weights, trained on top of a base model,
+that changes how it writes: your codebase's style, a house format for
+answers, a domain's vocabulary. `text_lora` takes one trained with
+Hugging Face `peft` and merges it into the chat model's weights at
+startup, so the server answers as the fine-tuned model at the base
+model's speed.
+
+```ini
+[orangu-server]
+model = Qwen/Qwen3-1.7B-GGUF:Q8_0
+text_lora = adapters/my-codebase
+```
+
+The value is the directory `peft` saved (`model.save_pretrained(...)`
+writes `adapter_model.safetensors` and `adapter_config.json` there), or
+the `.safetensors` file itself, absolute or relative to `models`. The
+adapter must have been trained on the **same base model** the GGUF was
+converted from; one trained on another model fails at startup on a shape
+mismatch or a missing tensor. `text_lora = none`, or no key, runs the base
+model.
+
+At startup the adapter is read, matched to the model's tensors and merged:
+
+```
+[text] LoRA …/adapters/my-codebase/adapter_model.safetensors (196 linears, merged in …s)
+```
+
+Each adapted linear is dequantized, the adapter's product added, and
+encoded again in the weight's own type (`Q4_K` stays `Q4_K`). The merged
+tensors are written under `<models>/orangu-merged/`, keyed by both files'
+path, size and modification time, so the next start maps them instead of
+merging again:
+
+```
+[text] LoRA …/adapters/my-codebase/adapter_model.safetensors (196 linears, merge read from cache in …s)
+```
+
+Changing either file, or replacing it with a new download, invalidates
+the entry. Delete `orangu-merged/` to reclaim the space; it is rebuilt on
+the next start. The first merge holds the merged weights in memory until
+they are written, so it needs about as much free memory as the adapted
+tensors take in the file. Merging rounds the weights a second time: the
+answers are the fine-tune's, within the quantization's precision, not a
+bit-exact copy of the `peft` model.
+
+What is adapted: the attention projections (`q_proj`, `k_proj`, `v_proj`,
+`o_proj`), the feed-forward ones (`gate_proj`, `up_proj`, `down_proj`) and
+`lm_head` — the `target_modules` a `peft` run usually names. The scale is
+`lora_alpha / r` from `adapter_config.json` (`lora_alpha / √r` with
+`use_rslora`). Anything that cannot be merged exactly is refused at
+startup with the reason, rather than half-applied:
+
+- embedding adapters (`embed_tokens` in `target_modules`), DoRA
+  (`use_dora`) and `modules_to_save`;
+- per-module ranks or alphas (`rank_pattern`, `alpha_pattern`);
+- a linear the GGUF fuses with others, such as Phi-3's single `qkv_proj`;
+- `lm_head` on a model whose output layer shares the embedding table;
+- weights in a type orangu has no encoder for.
+
+The adapter applies to the served chat model only: not to a
+`draft_model`, and not on `[workers]` nodes, which load their layers
+themselves. One adapter is served at a time; switching is a restart.
 
 ### Speculative decoding (`draft_model`)
 

@@ -71,6 +71,7 @@ pub mod slot_store;
 pub mod step_probe;
 pub mod teacher;
 pub mod tensor;
+pub mod text_lora;
 pub mod text_stop;
 pub mod tokenizer;
 pub mod tool_calls;

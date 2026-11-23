@@ -965,6 +965,42 @@ impl ModelSource {
     }
 }
 
+/// Merges `[orangu-server].text_lora` into the chat model's weights, before
+/// any architecture is built over them.
+fn apply_text_lora(
+    loaded: &mut LoadedModel,
+    models_dir: &Path,
+    model: &Path,
+    spec: &str,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let path = engine::text_lora::resolve(models_dir, spec)?;
+    let lora = engine::text_lora::TextLora::open(&path, &loaded.config)
+        .with_context(|| format!("text_lora {}", path.display()))?;
+    let merged = lora
+        .merge(
+            loaded,
+            Some(engine::text_lora::CacheKey {
+                models_dir,
+                model,
+                lora: &path,
+            }),
+        )
+        .with_context(|| format!("text_lora {}", path.display()))?;
+    log::info!(
+        "orangu-server: [text] LoRA {} ({} linears, {} in {:.1}s)",
+        path.display(),
+        merged.tensors,
+        if merged.from_cache {
+            "merge read from cache"
+        } else {
+            "merged"
+        },
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 /// Resolves a model spec — whatever was passed on the command line, or read
 /// from `[orangu-server].model` — to the model it names.
 ///
@@ -1410,6 +1446,9 @@ fn prepare(args: Args) -> Result<Prepared> {
     // can read a weight through an explicit route.
     engine::expert_read::set_read_size(conf.read_size);
     let mut loaded = weights_source.load().context("loading model weights")?;
+    if let Some(spec) = &conf.text_lora {
+        apply_text_lora(&mut loaded, &conf.models, weights_source.path(), spec)?;
+    }
     // Before the first device comes up, because bringing one up compiles the
     // attention shaders against whichever storage this names — the choice
     // cannot be revisited afterwards without rebuilding them.

@@ -373,6 +373,7 @@ pub fn bundled_configuration(
         vae: None,
         image_lora: ImageLora::Auto,
         image_lora_merge: true,
+        text_lora: None,
         vae_precision: crate::engine::image::vae::VaePrecision::default(),
         image_weights: crate::engine::image::transformer21::ImageWeights::default(),
         prompt_weights: crate::engine::prompt_weights::PromptWeights::default(),
@@ -845,6 +846,10 @@ pub struct ServerConfiguration {
     /// then no cost per pass) or applied in `f32` on every pass (`no`:
     /// exact, 13–28% of a pass on the CPU).
     pub image_lora_merge: bool,
+    /// `[orangu-server].text_lora`: a `peft` adapter merged into the chat
+    /// model's weights at startup (`engine::text_lora`); `None` runs the
+    /// base model.
+    pub text_lora: Option<String>,
     /// `[orangu-server].vae_precision`: `int8` (the default — the VAE's
     /// convolutions as `Q6_K` weights against `int8` activations on the
     /// transformer's kernel, about three times faster on an `i8mm` core) or
@@ -1584,6 +1589,11 @@ pub fn load_server_configuration(
         Some(value) => parse_bool(SERVER_SECTION, "image_lora_merge", value)?,
         None => true,
     };
+    let text_lora = section
+        .get("text_lora")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && *value != "none")
+        .map(str::to_string);
     let vae_precision = match section.get("vae_precision") {
         Some(value) => crate::engine::image::vae::VaePrecision::parse(value).ok_or_else(|| {
             anyhow!(
@@ -1856,6 +1866,7 @@ pub fn load_server_configuration(
         vae,
         image_lora,
         image_lora_merge,
+        text_lora,
         vae_precision,
         image_weights,
         prompt_weights,
@@ -3174,6 +3185,12 @@ mod tests {
         assert_eq!((other.steps, other.cfg_scale), (50, 4.0));
 
         assert_eq!(load("image_lora = none").image_lora, ImageLora::None);
+        assert_eq!(load("").text_lora, None);
+        assert_eq!(load("text_lora = none").text_lora, None);
+        assert_eq!(
+            load("text_lora = lora/mine").text_lora.as_deref(),
+            Some("lora/mine")
+        );
         assert_eq!(load("image_lora = auto").image_lora, ImageLora::Auto);
         assert_eq!(
             load("image_lora = lora/style.safetensors").image_lora,
