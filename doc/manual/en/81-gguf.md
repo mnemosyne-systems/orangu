@@ -315,9 +315,15 @@ the accelerators the machine has:
   experts of a mixture-of-experts layer are divided between it and the
   processor in proportion to the speed each side measures.
 - **An integrated GPU**, on a machine without a discrete card, takes the
-  card's place when it runs a product faster than the processor does. One
-  product is timed on each at the start, and a line reports both rates and
-  the choice. When no GPU comes up, a line names the adapters that were
+  card's place when it runs a product faster than the processor does. The
+  GPU has two product kernels, one staging its operands through workgroup
+  memory and one reading them directly. At the start one product is timed
+  with each kernel and on the processor, and so is the fixed cost of one
+  call. A line reports every rate, the call cost and the choice, and the
+  faster kernel is the one used. An integrated GPU slower than the
+  processor, but at least a quarter of its rate, takes a share of the
+  mixture-of-experts layers instead, divided as for a discrete card, while
+  every other product stays on the processor. When no GPU comes up, a line names the adapters that were
   seen, or the error the integrated one gave.
 - **A Rockchip NPU** multiplies in fp16 with fp32 sums, each operand
   scaled by a power of two so small gradients keep their precision. Each
@@ -330,6 +336,7 @@ the accelerators the machine has:
 | Variable | Effect |
 |---|---|
 | `ORANGU_GGUF_DEVICE=cpu` | Keep every product on the processor. |
+| `ORANGU_GGUF_DEVICE=integrated` | Pass over a discrete card, so the integrated GPU is the one probed and used. |
 | `ORANGU_GGUF_CARD_MIN_MFLOP` | Smallest product sent to the card, in MFLOP. |
 | `ORANGU_GGUF_CARD_RESIDENT_MIB` | Card memory for weights kept between products. |
 | `ORANGU_GGUF_NPU_MIN_MFLOP` | Smallest product offered to the NPU, in MFLOP. |

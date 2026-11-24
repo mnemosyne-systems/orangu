@@ -1150,7 +1150,6 @@ fn library() -> bool {
 /// `y[t, n] = x[t, k] . w[n, k]` — the row-major weight layout a GGUF
 /// matrix already has, so no transpose is ever materialized.
 pub fn matmul(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
-    let rows_per_tile = tile_rows();
     debug_assert_eq!(y.len(), t * n);
     debug_assert_eq!(x.len(), t * k);
     debug_assert_eq!(w.len(), n * k);
@@ -1201,13 +1200,20 @@ pub fn matmul(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize)
         gemm::library(y, x, w, t, n, k, false);
         return;
     }
+    matmul_on_cpu(y, x, w, t, k, n);
+}
+
+/// [`matmul`] on the processor, whatever the devices: the kernels the
+/// processor runs a forward product with.
+pub(crate) fn matmul_on_cpu(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
     if n >= PANEL && packed_forward() {
         forward_packed(y, x, w, t, k, n);
-        return;
+    } else {
+        let rows_per_tile = tile_rows();
+        y.par_chunks_mut(n * rows_per_tile)
+            .zip(x.par_chunks(k * rows_per_tile))
+            .for_each(|(out_tile, in_tile)| tile(out_tile, in_tile, w, k, n));
     }
-    y.par_chunks_mut(n * rows_per_tile)
-        .zip(x.par_chunks(k * rows_per_tile))
-        .for_each(|(out_tile, in_tile)| tile(out_tile, in_tile, w, k, n));
 }
 
 /// Whether [`matmul`] takes [`forward_packed`] for products at least one
@@ -1650,14 +1656,28 @@ fn matmul_residual(
         });
 }
 
-/// Output rows whose accumulators are held in registers at once.
+/// The most output rows whose accumulators are held in registers at once.
 ///
-/// Four rows of two vectors each is eight accumulator registers, which
-/// leaves room in the sixteen this target has for the two operand vectors
-/// and the broadcast — and it makes the inner loop six loads for eight
-/// fused multiply-adds, against the two loads *and a store* per multiply
-/// that an `axpy` chain costs.
-const ACC_ROWS: usize = 4;
+/// Six rows of two vectors each is twelve accumulator registers, which
+/// with the two operand vectors and the broadcast fills the sixteen AVX2
+/// has — and it makes the inner loop eight loads for twelve fused
+/// multiply-adds, against the two loads *and a store* per multiply that an
+/// `axpy` chain costs.
+const ACC_ROWS: usize = 6;
+
+/// Output rows the backward kernels hold at once: [`ACC_ROWS`], or four
+/// with `ORANGU_GGUF_ACC_ROWS=4`. Either sums every output in the same
+/// order, so the choice changes speed only.
+fn acc_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("ORANGU_GGUF_ACC_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|r| (1..=ACC_ROWS).contains(r))
+            .unwrap_or(ACC_ROWS)
+    })
+}
 
 /// Floats of the contracted dimension accumulated at once: sixteen, which
 /// is exactly one cache line.
@@ -1870,7 +1890,7 @@ pub(crate) fn matmul_add_dx(dx: &mut [f32], dy: &[f32], w: &[f32], t: usize, k: 
                 // That is what makes a task worth more than four rows.
                 let mut row = 0;
                 while row < task_rows {
-                    let rows = ACC_ROWS.min(task_rows - row);
+                    let rows = acc_rows().min(task_rows - row);
                     let dx_tile = &mut dx_task[row * k..(row + rows) * k];
                     let dy_tile = &dy_task[row * n..(row + rows) * n];
                     for o in first..last {
@@ -1883,6 +1903,8 @@ pub(crate) fn matmul_add_dx(dx: &mut [f32], dy: &[f32], w: &[f32], t: usize, k: 
                     let mut j = 0;
                     while j + ACC_LANES <= k {
                         match rows {
+                            6 => dx_block::<6>(dx_tile, column, w, k, first, last, j),
+                            5 => dx_block::<5>(dx_tile, column, w, k, first, last, j),
                             4 => dx_block::<4>(dx_tile, column, w, k, first, last, j),
                             3 => dx_block::<3>(dx_tile, column, w, k, first, last, j),
                             2 => dx_block::<2>(dx_tile, column, w, k, first, last, j),
@@ -2088,7 +2110,7 @@ pub(crate) fn matmul_add_dw(dw: &mut [f32], dy: &[f32], x: &[f32], t: usize, k: 
                 let last = (first + slab).min(t);
                 let mut row = 0;
                 while row < task_rows {
-                    let rows = ACC_ROWS.min(task_rows - row);
+                    let rows = acc_rows().min(task_rows - row);
                     let out = base + row;
                     let dw_tile = &mut dw_task[row * k..(row + rows) * k];
                     if gather {
@@ -2102,10 +2124,18 @@ pub(crate) fn matmul_add_dw(dw: &mut [f32], dy: &[f32], x: &[f32], t: usize, k: 
                     let mut j = 0;
                     while j + ACC_LANES <= k {
                         match (gather, rows) {
+                            (true, 6) => dw_block::<6>(dw_tile, column, x, k, first, last, j),
+                            (true, 5) => dw_block::<5>(dw_tile, column, x, k, first, last, j),
                             (true, 4) => dw_block::<4>(dw_tile, column, x, k, first, last, j),
                             (true, 3) => dw_block::<3>(dw_tile, column, x, k, first, last, j),
                             (true, 2) => dw_block::<2>(dw_tile, column, x, k, first, last, j),
                             (true, _) => dw_block::<1>(dw_tile, column, x, k, first, last, j),
+                            (false, 6) => {
+                                dw_block_strided::<6>(dw_tile, dy, x, k, n, out, first, last, j)
+                            }
+                            (false, 5) => {
+                                dw_block_strided::<5>(dw_tile, dy, x, k, n, out, first, last, j)
+                            }
                             (false, 4) => {
                                 dw_block_strided::<4>(dw_tile, dy, x, k, n, out, first, last, j)
                             }

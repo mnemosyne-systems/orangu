@@ -625,18 +625,46 @@ pub struct Part {
     pub depth: usize,
 }
 
+/// What the chosen card does.
+#[derive(Clone, Copy, PartialEq)]
+enum Role {
+    /// Takes the large products.
+    Products,
+    /// Takes its measured share of divided work only.
+    Helper,
+}
+
+/// An integrated GPU at least this fraction of the processor's rate helps
+/// with divided work: its share is in proportion to its rate, so a slower
+/// side still takes rows off the processor.
+const HELPER_MIN: f64 = 0.25;
+
 /// The card training's products go to, chosen once: the discrete card;
 /// without one, the integrated GPU when it runs a product faster than the
 /// processor does; or none. `ORANGU_GGUF_DEVICE=cpu` keeps everything on
-/// the processor.
+/// the processor, and `ORANGU_GGUF_DEVICE=integrated` passes over a
+/// discrete card.
 pub fn card() -> Option<&'static Accel> {
-    static CARD: std::sync::OnceLock<Option<Accel>> = std::sync::OnceLock::new();
+    chosen()
+        .filter(|(_, role)| *role == Role::Products)
+        .map(|(a, _)| a)
+}
+
+/// The card divided work goes to: [`card`], or an integrated GPU too slow
+/// for whole products but fast enough to take a share.
+pub fn helper() -> Option<&'static Accel> {
+    chosen().map(|(a, _)| a)
+}
+
+fn chosen() -> Option<&'static (Accel, Role)> {
+    static CARD: std::sync::OnceLock<Option<(Accel, Role)>> = std::sync::OnceLock::new();
     CARD.get_or_init(|| {
         if std::env::var("ORANGU_GGUF_DEVICE").as_deref() == Ok("cpu") {
             return None;
         }
-        if let Some(card) = Accel::open(Class::Discrete) {
-            return Some(card);
+        let integrated_only = std::env::var("ORANGU_GGUF_DEVICE").as_deref() == Ok("integrated");
+        if !integrated_only && let Some(card) = Accel::open(Class::Discrete) {
+            return Some((card, Role::Products));
         }
         let devices = gpu::devices();
         let integrated = devices.iter().find(|d| d.class == Class::Integrated);
@@ -672,7 +700,13 @@ pub fn card() -> Option<&'static Accel> {
             .fold((0, 0.0), |b, (i, r)| if r > b.1 { (i, r) } else { b });
         accel.kernel.store(best, Ordering::Relaxed);
         let cpu = probe.cpu;
-        let used = gpu > cpu;
+        let role = if gpu > cpu {
+            Some(Role::Products)
+        } else if gpu >= HELPER_MIN * cpu {
+            Some(Role::Helper)
+        } else {
+            None
+        };
         let kernels: Vec<String> = accel
             .kernels
             .iter()
@@ -688,13 +722,13 @@ pub fn card() -> Option<&'static Accel> {
             PROBE.2,
             kernels.join(", "),
             probe.fixed_ms,
-            if used {
-                "products go to it"
-            } else {
-                "it is not used"
+            match role {
+                Some(Role::Products) => "products go to it",
+                Some(Role::Helper) => "it takes a measured share of the mixture-of-experts layers",
+                None => "it is not used",
             }
         );
-        used.then_some(accel)
+        role.map(|role| (accel, role))
     })
     .as_ref()
 }
@@ -712,7 +746,8 @@ struct Probe {
     fixed_ms: f64,
 }
 
-/// GFLOP/s of each of the card's kernels and of the processor on [`PROBE`],
+/// GFLOP/s of each of the card's kernels and of the processor's training
+/// kernel on [`PROBE`],
 /// the operands sent to the card each time, after one untimed run of each;
 /// and the time of a product too small to cost anything but the call.
 fn rates(accel: &Accel) -> Probe {
@@ -746,7 +781,10 @@ fn rates(accel: &Accel) -> Probe {
         accel.kernel.store(i, Ordering::Relaxed);
         kernels.push(rate(&mut |c| accel.gemm(c, av, bv, m, n, p, false, false)));
     }
-    let cpu = rate(&mut |c| crate::gemm::library(c, av, bv, m, n, p, false));
+    // The processor's side is the kernel training runs it with, on a
+    // weight of the same size laid out as training lays one out.
+    let w: Vec<f32> = (0..n * p).map(|i| (i as f32 * 0.53).sin()).collect();
+    let cpu = rate(&mut |c| crate::model::matmul_on_cpu(c, &a, &w, m, p, n));
     let small = View {
         data: &a,
         row: 8,
@@ -819,6 +857,21 @@ const CARD_MIN_SIDE: usize = 128;
 
 /// The card, when a `[m, n]` product over `p` terms is worth sending to it.
 pub fn for_product(m: usize, n: usize, p: usize) -> Option<&'static Accel> {
+    for_card(m, n, p, card)
+}
+
+/// The card a divided product's share goes to: [`for_product`]'s, or the
+/// [`helper`].
+pub fn for_split(m: usize, n: usize, p: usize) -> Option<&'static Accel> {
+    for_card(m, n, p, helper)
+}
+
+fn for_card(
+    m: usize,
+    n: usize,
+    p: usize,
+    card: fn() -> Option<&'static Accel>,
+) -> Option<&'static Accel> {
     // A test runs a model in a pool of its own and names where its products
     // go, without touching the tests beside it.
     #[cfg(test)]

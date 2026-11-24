@@ -2688,7 +2688,7 @@ impl Model {
                 members[e].push((i, slot));
             }
         }
-        let experts: Vec<ExpertCache> = match accel::for_product(t * k, fe, h) {
+        let experts: Vec<ExpertCache> = match accel::for_split(t * k, fe, h) {
             // Divided between the card and the processor, side by side, in
             // proportion to what each has been measured to manage.
             Some(card) => {
@@ -2934,7 +2934,7 @@ impl Model {
             .map(|((a, b), d)| (a, b, d))
             .enumerate()
             .collect();
-        let given: Vec<Option<(Aligned, Vec<f32>)>> = match accel::for_product(t * k, fe, h) {
+        let given: Vec<Option<(Aligned, Vec<f32>)>> = match accel::for_split(t * k, fe, h) {
             // Divided as the forward is, by its own measured rates.
             Some(card) => {
                 let on_card =
