@@ -591,6 +591,7 @@ pub fn run<N: Network>(
         }
     }
     print!("{}", stages::report(started.elapsed().as_secs_f64()));
+    eprint!("{}", crate::accel::balance_report());
     if at_once > 1 && stages::enabled() {
         println!("(stage times add up over the {at_once} sequences that run at once)");
     }

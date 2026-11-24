@@ -313,14 +313,17 @@ the accelerators the machine has:
 
 - **A discrete graphics card** takes the large products, and the routed
   experts of a mixture-of-experts layer are divided between it and the
-  processor in proportion to the speed each side measures.
+  processor in proportion to the speed each side measures. At the end
+  of a run a line for the forward and one for the backward report their
+  calls, each side's rate and the card's share.
 - **An integrated GPU**, on a machine without a discrete card, takes the
   card's place when it runs a product faster than the processor does. The
-  GPU has three product kernels: one stages its operands through
+  GPU has three kinds of product kernel: one stages its operands through
   workgroup memory, one reads them directly a float at a time, and one
-  reads them four floats at a time. The last needs offsets, strides and
+  reads them four floats at a time; the last two each come with a 32 and a
+  64 output tile per workgroup. The four-float kernel needs offsets, strides and
   depths that are multiples of four, and a product without them takes the
-  faster of the other two. At the start one product is timed with each
+  fastest of the others. At the start one product is timed with each
   kernel and on the processor, and so is the fixed cost of one call. A
   line reports every rate, the call cost and the choice, and the fastest
   kernel is the one used. An integrated GPU slower than the
@@ -340,6 +343,7 @@ the accelerators the machine has:
 |---|---|
 | `ORANGU_GGUF_DEVICE=cpu` | Keep every product on the processor. |
 | `ORANGU_GGUF_DEVICE=integrated` | Pass over a discrete card, so the integrated GPU is the one probed and used. |
+| `ORANGU_GGUF_CARD_SHARE=0.4` | Give the card this fraction of the routed experts of every mixture-of-experts layer, instead of a share from the measured rates; `0` measures. |
 | `ORANGU_GGUF_CARD_MIN_MFLOP` | Smallest product sent to the card, in MFLOP. |
 | `ORANGU_GGUF_CARD_RESIDENT_MIB` | Card memory for weights kept between products. |
 | `ORANGU_GGUF_NPU_MIN_MFLOP` | Smallest product offered to the NPU, in MFLOP. |

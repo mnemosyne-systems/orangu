@@ -314,12 +314,34 @@ struct Kernel {
 
 /// The kernels a card runs products with: name, source, the output tile
 /// one workgroup covers, and whether it needs aligned calls. The first is
-/// used unless the probe picks another.
-const KERNELS: [(&str, &str, usize, bool); 3] = [
+/// used unless the probe picks another. The direct and vector kernels come
+/// in two workgroup sizes, a thread to each 4x4 block of the tile.
+const KERNELS: [(&str, &str, usize, bool); 5] = [
     ("tiled", GEMM_WGSL, 64, false),
     ("direct", GEMM_DIRECT_WGSL, 32, false),
+    ("direct wide", GEMM_DIRECT_WGSL, 64, false),
     ("vector", GEMM_VECTOR_WGSL, 32, true),
+    ("vector wide", GEMM_VECTOR_WGSL, 64, true),
 ];
+
+/// `source` for an output tile of `tile`: the direct and vector kernels are
+/// written for a 32 tile of 8x8 threads, and a wider one takes a thread to
+/// each 4x4 block of it.
+fn kernel_source(source: &'static str, tile: usize) -> Cow<'static, str> {
+    let written = "const TILE: u32 = 32u;";
+    if tile == 32 || !source.contains(written) {
+        return Cow::Borrowed(source);
+    }
+    let threads = tile / 4;
+    Cow::Owned(
+        source
+            .replace(written, &format!("const TILE: u32 = {tile}u;"))
+            .replace(
+                "@workgroup_size(8, 8)",
+                &format!("@workgroup_size({threads}, {threads})"),
+            ),
+    )
+}
 
 /// A buffer kept for reuse, grown when a call needs more.
 struct Slot {
@@ -401,7 +423,7 @@ impl Accel {
             .map(|&(name, source, tile, aligned)| {
                 let shader = gpu.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some(name),
-                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
+                    source: wgpu::ShaderSource::Wgsl(kernel_source(source, tile)),
                 });
                 let pipeline = gpu.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some(name),
@@ -926,34 +948,97 @@ pub enum Split {
     ExpertsBackward,
 }
 
-/// Rows a second each side has managed on each kind of divided work.
-static RATES: Mutex<[(f64, f64); 2]> = Mutex::new([(0.0, 0.0); 2]);
+/// What each kind of divided work has measured: rows a second on each side,
+/// rows a second over the whole call, and how many calls ran.
+#[derive(Clone, Copy)]
+struct Balance {
+    card: f64,
+    cpu: f64,
+    divided: f64,
+    calls: u64,
+}
 
-/// The card's share of `split`'s rows: in proportion to the two sides'
-/// measured rates, half until both have been measured, and never so small
-/// that a side stops being measured.
+const UNMEASURED: Balance = Balance {
+    card: 0.0,
+    cpu: 0.0,
+    divided: 0.0,
+    calls: 0,
+};
+
+static BALANCE: Mutex<[Balance; 2]> = Mutex::new([UNMEASURED; 2]);
+
+fn balance() -> std::sync::MutexGuard<'static, [Balance; 2]> {
+    BALANCE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The card's share of `split`'s rows: `ORANGU_GGUF_CARD_SHARE` when set,
+/// else in proportion to the two sides' measured rates, half until both
+/// have been measured, and never so small that a side stops being measured.
 pub fn card_share(split: Split) -> f64 {
-    let (card, cpu) = RATES.lock().unwrap_or_else(|e| e.into_inner())[split as usize];
-    if card <= 0.0 || cpu <= 0.0 {
+    static FIXED: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    let fixed = *FIXED.get_or_init(|| {
+        std::env::var("ORANGU_GGUF_CARD_SHARE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(|v| v.min(1.0))
+    });
+    if let Some(share) = fixed {
+        return share;
+    }
+    let b = balance()[split as usize];
+    if b.card <= 0.0 || b.cpu <= 0.0 {
         return 0.5;
     }
-    (card / (card + cpu)).clamp(0.1, 0.9)
+    (b.card / (b.card + b.cpu)).clamp(0.1, 0.9)
+}
+
+fn mix(rate: &mut f64, now: f64) {
+    *rate = if *rate > 0.0 {
+        0.7 * *rate + 0.3 * now
+    } else {
+        now
+    };
 }
 
 /// What one divided call measured on each side.
 pub fn measured(split: Split, card: (usize, f64), cpu: (usize, f64)) {
-    let mut rates = RATES.lock().unwrap_or_else(|e| e.into_inner());
-    let slot = &mut rates[split as usize];
-    for ((rows, seconds), rate) in [(card, &mut slot.0), (cpu, &mut slot.1)] {
+    let mut all = balance();
+    let b = &mut all[split as usize];
+    b.calls += 1;
+    for ((rows, seconds), rate) in [(card, &mut b.card), (cpu, &mut b.cpu)] {
         if rows > 0 && seconds > 0.0 {
-            let now = rows as f64 / seconds;
-            *rate = if *rate > 0.0 {
-                0.7 * *rate + 0.3 * now
-            } else {
-                now
-            };
+            mix(rate, rows as f64 / seconds);
         }
     }
+    let seconds = card.1.max(cpu.1);
+    if seconds > 0.0 {
+        mix(&mut b.divided, (card.0 + cpu.0) as f64 / seconds);
+    }
+}
+
+/// One line for each kind of divided work that ran: its calls, the rate
+/// of each side and of the whole call, and the card's share.
+pub fn balance_report() -> String {
+    let mut out = String::new();
+    for (split, name) in [
+        (Split::ExpertsForward, "mixture-of-experts forward"),
+        (Split::ExpertsBackward, "mixture-of-experts backward"),
+    ] {
+        let b = balance()[split as usize];
+        if b.calls == 0 {
+            continue;
+        }
+        out.push_str(&format!(
+            "orangu-gguf: {name}: {} calls divided at {:.0} rows/s, the card at {:.0}, the processor at {:.0}, the card's share {:.0}%\n",
+            b.calls,
+            b.divided,
+            b.card,
+            b.cpu,
+            100.0 * card_share(split)
+        ));
+    }
+    out
 }
 
 /// Threads named so send every product to the card, or none.
@@ -1017,8 +1102,8 @@ mod tests {
 
     #[test]
     fn gemm_wgsl_is_valid() {
-        for (_, source, _, _) in KERNELS {
-            valid(source);
+        for (_, source, tile, _) in KERNELS {
+            valid(&kernel_source(source, tile));
         }
     }
 
