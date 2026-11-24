@@ -1201,9 +1201,186 @@ pub fn matmul(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize)
         gemm::library(y, x, w, t, n, k, false);
         return;
     }
+    if n >= PANEL && packed_forward() {
+        forward_packed(y, x, w, t, k, n);
+        return;
+    }
     y.par_chunks_mut(n * rows_per_tile)
         .zip(x.par_chunks(k * rows_per_tile))
         .for_each(|(out_tile, in_tile)| tile(out_tile, in_tile, w, k, n));
+}
+
+/// Whether [`matmul`] takes [`forward_packed`] for products at least one
+/// panel wide; narrower ones keep the dot-product tiles. `ORANGU_GGUF_PACKED=0`
+/// selects the tiles for every product.
+fn packed_forward() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ORANGU_GGUF_PACKED").as_deref() != Ok("0"))
+}
+
+/// Columns of `w` one packed panel holds: two vectors.
+const PANEL: usize = 2 * LANES;
+
+/// Token rows one register tile holds: six rows of two vectors is twelve
+/// accumulators, which with the two panel vectors and the broadcast fills
+/// the sixteen registers of AVX2 (and half of NEON's thirty-two pairs).
+const MICRO_ROWS: usize = 6;
+
+/// Token rows one task of [`forward_packed`] owns.
+const TASK_ROWS: usize = 8 * MICRO_ROWS;
+
+/// Panels one task of [`forward_packed`] owns: four panels of a 768-wide
+/// input are 192 KiB, which a second-level cache holds beside the task's
+/// rows.
+const TASK_PANELS: usize = 4;
+
+/// `w[n, k]` rearranged into panels of [`PANEL`] columns, each `[k, PANEL]`,
+/// so the inner loop reads one contiguous line per step of `k`. Columns
+/// past `n` in the last panel are left as they are: their outputs are
+/// never stored.
+fn pack_panels(packed: &mut Vec<f32>, w: &[f32], k: usize, n: usize) {
+    let panels = n.div_ceil(PANEL);
+    if packed.len() < panels * k * PANEL {
+        packed.resize(panels * k * PANEL, 0.0);
+    }
+    packed[..panels * k * PANEL]
+        .par_chunks_mut(k * PANEL)
+        .enumerate()
+        .for_each(|(p, panel)| {
+            let first = p * PANEL;
+            for (c, row) in w[first * k..(first + PANEL).min(n) * k]
+                .chunks_exact(k)
+                .enumerate()
+            {
+                for (cell, &value) in panel[c..].iter_mut().step_by(PANEL).zip(row) {
+                    *cell = value;
+                }
+            }
+        });
+}
+
+/// `R` token rows against one panel: one fused multiply-add chain per
+/// output, over `k` in order, from zero.
+///
+/// # Safety
+///
+/// `x` holds `R` rows of `k` floats `k` apart, and `panel` holds `k * PANEL`.
+#[inline(always)]
+unsafe fn micro<const R: usize>(x: *const f32, k: usize, panel: *const f32) -> [[f32x8; 2]; R] {
+    let mut acc = [[f32x8::ZERO; 2]; R];
+    for i in 0..k {
+        // SAFETY: `i < k`, and the caller sized both operands.
+        let (b0, b1) = unsafe {
+            let at = panel.add(i * PANEL);
+            (
+                load8(std::slice::from_raw_parts(at, LANES)),
+                load8(std::slice::from_raw_parts(at.add(LANES), LANES)),
+            )
+        };
+        for (r, sums) in acc.iter_mut().enumerate() {
+            // SAFETY: row `r < R` of `x` has `k` floats.
+            let a = splat8(unsafe { *x.add(r * k + i) });
+            sums[0] = b0.mul_add(a, sums[0]);
+            sums[1] = b1.mul_add(a, sums[1]);
+        }
+    }
+    acc
+}
+
+/// A pointer tasks write disjoint blocks of the output through.
+#[derive(Clone, Copy)]
+struct Out(*mut f32);
+// SAFETY: every task of `forward_packed` writes its own rows and columns.
+unsafe impl Send for Out {}
+// SAFETY: as above.
+unsafe impl Sync for Out {}
+
+/// One register tile of [`forward_packed`]: rows `row..row + R`, columns
+/// `first..first + cols`.
+///
+/// # Safety
+///
+/// As [`micro`], and `y` is `[t, n]` with the tile inside it.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+unsafe fn store_tile<const R: usize>(
+    y: Out,
+    x: &[f32],
+    k: usize,
+    n: usize,
+    panel: &[f32],
+    row: usize,
+    first: usize,
+    cols: usize,
+) {
+    // SAFETY: the caller's bounds.
+    let acc = unsafe { micro::<R>(x[row * k..].as_ptr(), k, panel.as_ptr()) };
+    for (r, sums) in acc.iter().enumerate() {
+        // SAFETY: row `row + r` and columns `first..first + cols` are in `y`.
+        let out = unsafe { std::slice::from_raw_parts_mut(y.0.add((row + r) * n + first), cols) };
+        if cols == PANEL {
+            store8(&mut out[..LANES], sums[0]);
+            store8(&mut out[LANES..], sums[1]);
+        } else {
+            let lanes = [sums[0].to_array(), sums[1].to_array()];
+            for (c, value) in out.iter_mut().enumerate() {
+                *value = lanes[c / LANES][c % LANES];
+            }
+        }
+    }
+}
+
+/// `y[t, n] = x[t, k] . w[n, k]` with `w` packed into panels and each
+/// output one fused chain over `k` in order, so the result does not depend
+/// on the thread count, the task split or the processor.
+///
+/// Tasks are blocks of [`TASK_ROWS`] tokens by [`TASK_PANELS`] panels: a
+/// task's panels stay in the second-level cache while every register tile
+/// of its rows passes over them, so the weights are read `t / TASK_ROWS`
+/// times rather than once per handful of tokens.
+fn forward_packed(y: &mut [f32], x: &[f32], w: &[f32], t: usize, k: usize, n: usize) {
+    thread_local! {
+        static PACKED: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    // Taken rather than borrowed: a rayon worker waiting on the packing
+    // below can run another product on this thread.
+    let mut packed = PACKED.with(|p| p.take());
+    pack_panels(&mut packed, w, k, n);
+    let panels = n.div_ceil(PANEL);
+    let row_blocks = t.div_ceil(TASK_ROWS);
+    let panel_blocks = panels.div_ceil(TASK_PANELS);
+    let out = Out(y.as_mut_ptr());
+    let packed_ref = &packed;
+    (0..row_blocks * panel_blocks)
+        .into_par_iter()
+        .for_each(move |task| {
+            let out = out;
+            let rows =
+                (task / panel_blocks) * TASK_ROWS..((task / panel_blocks + 1) * TASK_ROWS).min(t);
+            let block = task % panel_blocks;
+            for p in block * TASK_PANELS..((block + 1) * TASK_PANELS).min(panels) {
+                let panel = &packed_ref[p * k * PANEL..(p + 1) * k * PANEL];
+                let first = p * PANEL;
+                let cols = PANEL.min(n - first);
+                let mut row = rows.start;
+                // SAFETY: rows and columns stay inside `y[t, n]` and `x[t, k]`.
+                unsafe {
+                    while row + MICRO_ROWS <= rows.end {
+                        store_tile::<MICRO_ROWS>(out, x, k, n, panel, row, first, cols);
+                        row += MICRO_ROWS;
+                    }
+                    match rows.end - row {
+                        5 => store_tile::<5>(out, x, k, n, panel, row, first, cols),
+                        4 => store_tile::<4>(out, x, k, n, panel, row, first, cols),
+                        3 => store_tile::<3>(out, x, k, n, panel, row, first, cols),
+                        2 => store_tile::<2>(out, x, k, n, panel, row, first, cols),
+                        1 => store_tile::<1>(out, x, k, n, panel, row, first, cols),
+                        _ => {}
+                    }
+                }
+            }
+        });
+    PACKED.with(|p| p.replace(packed));
 }
 
 /// `R` token rows against one weight row, two accumulators each.
@@ -3414,6 +3591,42 @@ mod tests {
                 spec.name,
                 at - spec.offset
             );
+        }
+    }
+
+    /// The packed forward is one fused multiply-add chain per output, over
+    /// the input in order: bits, at shapes that leave partial register
+    /// tiles, partial panels and partial tasks.
+    #[test]
+    fn the_packed_forward_is_one_chain_per_output() {
+        for (t, k, n) in [
+            (1, 1, 1),
+            (7, 5, 17),
+            (13, 37, 21),
+            (53, 64, 70),
+            (97, 33, 129),
+        ] {
+            let x: Vec<f32> = (0..t * k)
+                .map(|i| ((i * 7 % 19) as f32 - 9.0) * 0.137)
+                .collect();
+            let w: Vec<f32> = (0..n * k)
+                .map(|i| ((i * 5 % 23) as f32 - 11.0) * 0.071)
+                .collect();
+            let mut y = vec![f32::NAN; t * n];
+            forward_packed(&mut y, &x, &w, t, k, n);
+            for r in 0..t {
+                for o in 0..n {
+                    let mut sum = 0f32;
+                    for i in 0..k {
+                        sum = w[o * k + i].mul_add(x[r * k + i], sum);
+                    }
+                    assert_eq!(
+                        y[r * n + o].to_bits(),
+                        sum.to_bits(),
+                        "t {t} k {k} n {n} at ({r}, {o})"
+                    );
+                }
+            }
         }
     }
 

@@ -159,6 +159,83 @@ fn main(
 }
 "#;
 
+/// The same product without workgroup memory: each thread reads its four
+/// rows of `a` and four columns of `b` from the buffers and sums a 4x4
+/// block. A GPU whose workgroup memory is ordinary cached memory pays for
+/// the staging and the barriers of [`GEMM_WGSL`] and saves no reads.
+const GEMM_DIRECT_WGSL: &str = r#"
+struct Dims {
+    n: u32, add: u32, pad1: u32, pad2: u32,
+    a_row: u32, a_col: u32, b_row: u32, b_col: u32,
+};
+
+struct Group {
+    a: u32, rows: u32, b: u32, c: u32,
+    depth: u32, pad0: u32, pad1: u32, pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read>       a: array<f32>;
+@group(0) @binding(1) var<storage, read>       b: array<f32>;
+@group(0) @binding(2) var<storage, read_write> c: array<f32>;
+@group(0) @binding(3) var<uniform>          dims: Dims;
+@group(0) @binding(4) var<storage, read>  groups: array<Group>;
+
+const TILE: u32 = 32u;
+
+@compute @workgroup_size(8, 8)
+fn main(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_id) local: vec3<u32>,
+) {
+    let g = groups[group.z];
+    let row = group.y * TILE + local.y * 4u;
+    let col = group.x * TILE + local.x * 4u;
+    if (row >= g.rows || col >= dims.n) { return; }
+    // Rows and columns past the edge read the last one and are not stored.
+    let last_row = g.rows - 1u;
+    let last_col = dims.n - 1u;
+    let pa = vec4<u32>(row, min(row + 1u, last_row), min(row + 2u, last_row), min(row + 3u, last_row)) * dims.a_row + vec4<u32>(g.a);
+    let pb = vec4<u32>(col, min(col + 1u, last_col), min(col + 2u, last_col), min(col + 3u, last_col)) * dims.b_col + vec4<u32>(g.b);
+    var acc0 = vec4<f32>(0.0);
+    var acc1 = vec4<f32>(0.0);
+    var acc2 = vec4<f32>(0.0);
+    var acc3 = vec4<f32>(0.0);
+    for (var q = 0u; q < g.depth; q = q + 1u) {
+        let ta = pa + vec4<u32>(q * dims.a_col);
+        let tb = pb + vec4<u32>(q * dims.b_row);
+        let bv = vec4<f32>(b[tb.x], b[tb.y], b[tb.z], b[tb.w]);
+        acc0 = fma(vec4<f32>(a[ta.x]), bv, acc0);
+        acc1 = fma(vec4<f32>(a[ta.y]), bv, acc1);
+        acc2 = fma(vec4<f32>(a[ta.z]), bv, acc2);
+        acc3 = fma(vec4<f32>(a[ta.w]), bv, acc3);
+    }
+    var accs = array<vec4<f32>, 4>(acc0, acc1, acc2, acc3);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        if (row + i >= g.rows) { break; }
+        for (var j = 0u; j < 4u; j = j + 1u) {
+            if (col + j < dims.n) {
+                let at = g.c + (row + i) * dims.n + col + j;
+                if (dims.add == 1u) { c[at] = c[at] + accs[i][j]; } else { c[at] = accs[i][j]; }
+            }
+        }
+    }
+}
+"#;
+
+/// A product kernel: its pipeline, its bindings and the output tile one
+/// workgroup covers.
+struct Kernel {
+    name: &'static str,
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    tile: usize,
+}
+
+/// The kernels a card runs products with: name, source and the output tile
+/// one workgroup covers. The first is used unless the probe picks another.
+const KERNELS: [(&str, &str, usize); 2] =
+    [("tiled", GEMM_WGSL, 64), ("direct", GEMM_DIRECT_WGSL, 32)];
+
 /// A buffer kept for reuse, grown when a call needs more.
 struct Slot {
     buffer: wgpu::Buffer,
@@ -181,8 +258,9 @@ pub struct Accel {
     pub device: gpu::Device,
     gpu: wgpu::Device,
     queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
-    layout: wgpu::BindGroupLayout,
+    kernels: Vec<Kernel>,
+    /// Which of `kernels` products run with.
+    kernel: std::sync::atomic::AtomicUsize,
     /// Free sets of buffers; a call takes one and gives it back, so calls
     /// from several threads never share one.
     free: Mutex<Vec<Buffers>>,
@@ -230,25 +308,36 @@ impl Accel {
             ..Default::default()
         }))
         .context("creating the compute device")?;
-        let shader = gpu.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gemm"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(GEMM_WGSL)),
-        });
-        let pipeline = gpu.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("gemm"),
-            layout: None,
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let layout = pipeline.get_bind_group_layout(0);
+        let kernels = KERNELS
+            .iter()
+            .map(|&(name, source, tile)| {
+                let shader = gpu.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(name),
+                    source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
+                });
+                let pipeline = gpu.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(name),
+                    layout: None,
+                    module: &shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache: None,
+                });
+                let layout = pipeline.get_bind_group_layout(0);
+                Kernel {
+                    name,
+                    pipeline,
+                    layout,
+                    tile,
+                }
+            })
+            .collect();
         Ok(Accel {
             device,
             gpu,
             queue,
-            pipeline,
-            layout,
+            kernels,
+            kernel: std::sync::atomic::AtomicUsize::new(0),
             free: Mutex::new(Vec::new()),
             kept: Mutex::new(HashMap::new()),
             kept_bytes: AtomicU64::new(0),
@@ -460,9 +549,10 @@ impl Accel {
                 .write_buffer(&sb.buffer, 0, bytemuck::cast_slice(b.data));
         }
         let b_buffer = kept.as_ref().map_or(&sb.buffer, |k| &k.buffer);
+        let kernel = &self.kernels[self.kernel.load(Ordering::Relaxed)];
         let bind = self.gpu.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &self.layout,
+            layout: &kernel.layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -494,11 +584,11 @@ impl Accel {
                 label: None,
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
+            pass.set_pipeline(&kernel.pipeline);
             pass.set_bind_group(0, &bind, &[]);
             pass.dispatch_workgroups(
-                n.div_ceil(64) as u32,
-                tall.div_ceil(64) as u32,
+                n.div_ceil(kernel.tile) as u32,
+                tall.div_ceil(kernel.tile) as u32,
                 parts.len() as u32,
             );
         }
@@ -573,15 +663,31 @@ pub fn card() -> Option<&'static Accel> {
             );
             return None;
         };
-        let (gpu, cpu) = rates(&accel);
+        let probe = rates(&accel);
+        let (best, gpu) = probe
+            .kernels
+            .iter()
+            .copied()
+            .enumerate()
+            .fold((0, 0.0), |b, (i, r)| if r > b.1 { (i, r) } else { b });
+        accel.kernel.store(best, Ordering::Relaxed);
+        let cpu = probe.cpu;
         let used = gpu > cpu;
+        let kernels: Vec<String> = accel
+            .kernels
+            .iter()
+            .zip(&probe.kernels)
+            .map(|(k, r)| format!("{r:.0} GFLOP/s {}", k.name))
+            .collect();
         eprintln!(
-            "orangu-gguf: the integrated GPU {} runs a {}x{}x{} product at {gpu:.0} GFLOP/s, \
-             the processor at {cpu:.0}; {}",
+            "orangu-gguf: the integrated GPU {} runs a {}x{}x{} product at {}, {:.2} ms a call \
+             fixed; the processor at {cpu:.0}; {}",
             accel.device.name,
             PROBE.0,
             PROBE.1,
             PROBE.2,
+            kernels.join(", "),
+            probe.fixed_ms,
             if used {
                 "products go to it"
             } else {
@@ -596,9 +702,20 @@ pub fn card() -> Option<&'static Accel> {
 /// The product [`rates`] times: the size of training's larger ones.
 const PROBE: (usize, usize, usize) = (1024, 768, 512);
 
-/// GFLOP/s of the card and of the processor on [`PROBE`], the operands
-/// sent to the card each time, after one untimed run of each.
-fn rates(accel: &Accel) -> (f64, f64) {
+/// What [`rates`] measures.
+struct Probe {
+    /// GFLOP/s of each of the card's kernels.
+    kernels: Vec<f64>,
+    /// GFLOP/s of the processor.
+    cpu: f64,
+    /// Milliseconds an 8x8x8 product takes on the card: the cost of a call.
+    fixed_ms: f64,
+}
+
+/// GFLOP/s of each of the card's kernels and of the processor on [`PROBE`],
+/// the operands sent to the card each time, after one untimed run of each;
+/// and the time of a product too small to cost anything but the call.
+fn rates(accel: &Accel) -> Probe {
     let (m, n, p) = PROBE;
     let a: Vec<f32> = (0..m * p).map(|i| (i as f32 * 0.37).sin()).collect();
     let b: Vec<f32> = (0..p * n).map(|i| (i as f32 * 0.91).sin()).collect();
@@ -624,9 +741,29 @@ fn rates(accel: &Accel) -> (f64, f64) {
         }
         3.0 * flop / started.elapsed().as_secs_f64() / 1e9
     };
-    let gpu = rate(&mut |c| accel.gemm(c, av, bv, m, n, p, false, false));
+    let mut kernels = Vec::new();
+    for i in 0..accel.kernels.len() {
+        accel.kernel.store(i, Ordering::Relaxed);
+        kernels.push(rate(&mut |c| accel.gemm(c, av, bv, m, n, p, false, false)));
+    }
     let cpu = rate(&mut |c| crate::gemm::library(c, av, bv, m, n, p, false));
-    (gpu, cpu)
+    let small = View {
+        data: &a,
+        row: 8,
+        col: 1,
+    };
+    let mut tiny = [0f32; 64];
+    accel.gemm(&mut tiny, small, small, 8, 8, 8, false, false);
+    let started = std::time::Instant::now();
+    for _ in 0..8 {
+        accel.gemm(&mut tiny, small, small, 8, 8, 8, false, false);
+    }
+    let fixed_ms = started.elapsed().as_secs_f64() * 1e3 / 8.0;
+    Probe {
+        kernels,
+        cpu,
+        fixed_ms,
+    }
 }
 
 /// Work one call divides between the card and the processor.
@@ -712,7 +849,13 @@ mod tests {
 
     #[test]
     fn gemm_wgsl_is_valid() {
-        let module = naga::front::wgsl::parse_str(GEMM_WGSL).expect("valid WGSL");
+        for (_, source, _) in KERNELS {
+            valid(source);
+        }
+    }
+
+    fn valid(source: &str) {
+        let module = naga::front::wgsl::parse_str(source).expect("valid WGSL");
         let info = naga::valid::Validator::new(
             naga::valid::ValidationFlags::all(),
             naga::valid::Capabilities::all(),
@@ -744,7 +887,12 @@ mod tests {
             println!("no card; skipping");
             return;
         };
-        for &(m, n, p) in &[(1, 1, 1), (7, 70, 19), (130, 65, 300)] {
+        let shapes = [(1, 1, 1), (7, 70, 19), (130, 65, 300)];
+        for (kernel, &(m, n, p)) in
+            (0..accel.kernels.len()).flat_map(|k| shapes.iter().map(move |s| (k, s)))
+        {
+            accel.kernel.store(kernel, Ordering::Relaxed);
+            let name = accel.kernels[kernel].name;
             let a = wave(m * p, 0.37);
             let b = wave(p * n, 0.91);
             for (av, bv) in [
@@ -780,7 +928,7 @@ mod tests {
                 for (i, (x, y)) in want.iter().zip(&got).enumerate() {
                     assert!(
                         (x - y).abs() <= 1e-3 * x.abs().max(1.0),
-                        "{m}x{n}x{p} at {i}: {x} vs {y}"
+                        "{name} {m}x{n}x{p} at {i}: {x} vs {y}"
                     );
                 }
             }
