@@ -346,3 +346,160 @@ the plugin's tests inside it, and `./gradlew buildPlugin` writes the `.zip`
 to `build/distributions`. `./gradlew runIde` starts an IDE with the plugin
 in it, to try a change, and `./gradlew verifyPlugin` checks it against the
 current IDE releases.
+
+## Emacs
+
+The Emacs package works in Emacs 28.1 and later, in a terminal or a window,
+and needs nothing that is not part of Emacs; `markdown-mode`, when it is
+installed, formats the answers in `orangu-chat`. Its source is in
+`contrib/emacs`.
+
+### Installing
+
+From a copy of the repository:
+
+```sh
+cd contrib/emacs
+make install
+```
+
+This installs the package into `~/.emacs.d/elpa/orangu`, in place of
+any version already there, and `make uninstall` removes it. Restart Emacs, and the commands are there: start with
+`M-x orangu`. Every release also has the package as
+`orangu-<version>-emacs.tar` beside the binary archives, for
+`M-x package-install-file`.
+
+To have every command under a key, and **orangu** in the **Tools** menu and
+the context menu, put this in the init file:
+
+```elisp
+(global-set-key (kbd "C-c o") 'orangu-command-map)
+(orangu-mode 1)
+```
+
+The package needs `orangu` itself:
+
+- `orangu` from the archive of the same release, on the `PATH`, in
+  `~/.cargo/bin` (where `cargo install --path .` puts it), or wherever
+  `orangu-path` says.
+- An `orangu.conf` that `orangu` can find: in the project, or in
+  `~/.orangu/`. Run `orangu --init` once to write one.
+
+Git is needed to show and to undo what `orangu` changed.
+
+### What it adds
+
+| Command | Key | What it does |
+|:---|:---|:---|
+| `orangu` | `C-c o o` | The orangu panel: a place for the prompt, and the answers |
+| `orangu-implement` | `C-c o i` | Has `orangu` write or change code, and shows the diff |
+| `orangu-show-changes` | `C-c o v` | What the last run changed, as a diff |
+| `orangu-undo-changes` | `C-c o u` | Undoes what the last run changed |
+| `orangu-ask-about-selection` | `C-c o a` | Attaches the region to the next prompt in the panel |
+| `orangu-review-file` | `C-c o f` | Runs `/auto_review` on the file |
+| `orangu-review-changes` | `C-c o r` | Runs `/auto_review` on the changes on the branch |
+| `orangu-chat` | `C-c o c` | A conversation that is kept |
+| `orangu-open` | `C-c o t` | Starts the full interface in a terminal inside Emacs |
+| `orangu-stop` | `C-c o k` | Stops the run, and everything it started |
+
+### Implementing code
+
+`orangu-implement` asks what to implement and sends it to `orangu`, which
+writes the files with its own tools. With a region, the model gets the
+file, the lines and the code; without one, it gets the file and the line
+point is on; and with a prefix argument (`C-u`), only the instruction.
+
+Before it runs, the unsaved buffers of the workspace are saved, as
+`orangu-save-buffers` says. When it is done, buffers whose files changed
+are read again. A buffer with unsaved changes of its own is left as it is,
+and the panel names it.
+
+In a Git repository the panel lists the files that changed, and the diff
+is shown below it. `C-c C-c` in the diff goes to the code, and `C-c C-k`
+undoes all of it, after asking. To undo one hunk, use `C-u C-c C-a` on it.
+Only what changed during the run is in the diff: changes you had not
+committed, and files Git does not track, are part of the state it is
+compared with and are put back as they were. The repository itself is only
+read. When a file has changed since, undoing it all is refused and nothing
+is undone.
+
+The diff is of every prompt that changes files, from the panel and the
+conversation as well as from `orangu-implement`, and it is kept until
+another one changes something. These are not part of it: files that Git
+ignores, untracked files over 1 MiB, every untracked file when there are
+more than 5000, and what is in a submodule. What you save yourself while
+`orangu` runs is in it.
+
+### The panel
+
+Type a prompt at the end and press **RET**. `C-j` (or **Shift+RET**) starts
+a new line, and `M-p` and `M-n` go through the prompts typed before. It
+runs as
+
+```
+orangu -w <workspace> -p "<prompt>"
+```
+
+and the answer streams in as `orangu` writes it. The header line shows what
+`orangu` is doing (the server it talks to, the tools it calls) and, at the
+end, how the run went. `C-c C-k` ends the run and everything it started,
+and `C-c C-l` empties the panel. There is one panel for each workspace.
+
+Anything `orangu -p` takes works here: a question, a request to change
+code, a command such as `/status`, `/log` or `/diff`, or a skill. A prompt
+stands on its own; nothing is remembered from the one before it.
+
+### Conversations
+
+`orangu-chat` runs `orangu --plain` in a buffer, where what was said is
+remembered and an MCP tool that needs approval asks for it. `C-j` starts a
+new line. What an answer changed is read again and can be shown and undone
+as above.
+
+With `markdown-mode` installed, answers are shown as Markdown: headings,
+emphasis, lists and code blocks, with the code highlighted in its own mode
+and the markup hidden. The text in the buffer stays as the model wrote it,
+so what is copied is Markdown. Without `markdown-mode`, or with
+`orangu-chat-markdown` turned off, answers are plain text.
+
+`orangu-open` starts the full interface, for `/review` and everything else
+that needs a terminal. It uses `eat` or `vterm` when one of them is
+installed, and else `term`, which is part of Emacs; `orangu-terminal`
+chooses one. Both commands show what is open already for the workspace
+rather than starting a second `orangu`. Emacs has no terminal on Windows,
+so `orangu-open` refuses there.
+
+### Asking about code
+
+`orangu-ask-about-selection` attaches the region (or, with none, the line
+point is on) to the next prompt. The panel shows it as `src/parser.rs:12-14`
+with a **Remove** button, and fills the prompt with *Explain what this code
+does.* when it is empty. Change the question and press **RET**: the model
+gets the question, the file and the lines, and the code itself, and can
+open the rest of the file with its own tools.
+
+### Reviews
+
+`orangu-review-file` runs `orangu -p "/auto_review <file>"` and
+`orangu-review-changes` runs `orangu -p "/auto_review"`, with the report in
+the panel. They behave as they do in VS Code, and the file is passed the
+same way. `orangu` reads the file from disk, so one with unsaved changes is
+reviewed as it was last saved, which the panel points out.
+
+### The workspace
+
+`orangu` runs in the project (as `project.el` has it) of the current
+buffer, or else in the Git repository it is in, or else in its folder. That
+folder is also where `orangu` looks for `orangu.conf` first. A file on
+another machine, over TRAMP, has no workspace `orangu` can run in.
+
+### Settings
+
+`M-x customize-group RET orangu` has these:
+
+| Setting | What it is |
+|:---|:---|
+| `orangu-path` | The path of the `orangu` binary, or the folder it is in. `nil` means the first `orangu` on the `PATH`, then the one in `~/.cargo/bin`. A path that is set but does not exist is reported rather than replaced by another binary. |
+| `orangu-save-buffers` | What to do with unsaved buffers before `orangu` runs: ask about each, save them, or leave them |
+| `orangu-show-changes` | Whether the diff is shown after `orangu-implement` |
+| `orangu-terminal` | The terminal `orangu-open` uses |
