@@ -316,11 +316,14 @@ the accelerators the machine has:
   processor in proportion to the speed each side measures.
 - **An integrated GPU**, on a machine without a discrete card, takes the
   card's place when it runs a product faster than the processor does. The
-  GPU has two product kernels, one staging its operands through workgroup
-  memory and one reading them directly. At the start one product is timed
-  with each kernel and on the processor, and so is the fixed cost of one
-  call. A line reports every rate, the call cost and the choice, and the
-  faster kernel is the one used. An integrated GPU slower than the
+  GPU has three product kernels: one stages its operands through
+  workgroup memory, one reads them directly a float at a time, and one
+  reads them four floats at a time. The last needs offsets, strides and
+  depths that are multiples of four, and a product without them takes the
+  faster of the other two. At the start one product is timed with each
+  kernel and on the processor, and so is the fixed cost of one call. A
+  line reports every rate, the call cost and the choice, and the fastest
+  kernel is the one used. An integrated GPU slower than the
   processor, but at least a quarter of its rate, takes a share of the
   mixture-of-experts layers instead, divided as for a discrete card, while
   every other product stays on the processor. When no GPU comes up, a line names the adapters that were

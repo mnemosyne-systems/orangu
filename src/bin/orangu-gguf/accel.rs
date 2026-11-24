@@ -222,19 +222,104 @@ fn main(
 }
 "#;
 
-/// A product kernel: its pipeline, its bindings and the output tile one
-/// workgroup covers.
+/// [`GEMM_DIRECT_WGSL`] reading four floats at a time: each thread steps
+/// the sum four terms at once, loading `a` and `b` as vectors along
+/// whichever side each is contiguous, and writes `c` four columns at a
+/// time. Every offset, stride and depth a call names is a multiple of
+/// four; [`Accel::aligned`] decides whether a call may use it.
+const GEMM_VECTOR_WGSL: &str = r#"
+struct Dims {
+    n: u32, add: u32, pad1: u32, pad2: u32,
+    a_row: u32, a_col: u32, b_row: u32, b_col: u32,
+};
+
+struct Group {
+    a: u32, rows: u32, b: u32, c: u32,
+    depth: u32, pad0: u32, pad1: u32, pad2: u32,
+};
+
+@group(0) @binding(0) var<storage, read>       a: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       b: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> c: array<vec4<f32>>;
+@group(0) @binding(3) var<uniform>          dims: Dims;
+@group(0) @binding(4) var<storage, read>  groups: array<Group>;
+
+const TILE: u32 = 32u;
+
+@compute @workgroup_size(8, 8)
+fn main(
+    @builtin(workgroup_id) group: vec3<u32>,
+    @builtin(local_invocation_id) local: vec3<u32>,
+) {
+    let g = groups[group.z];
+    let row = group.y * TILE + local.y * 4u;
+    let col = group.x * TILE + local.x * 4u;
+    if (row >= g.rows || col >= dims.n) { return; }
+    // Rows past the edge read the last one, or past it, and are not stored.
+    let last_row = g.rows - 1u;
+    let rows = vec4<u32>(row, min(row + 1u, last_row), min(row + 2u, last_row), min(row + 3u, last_row));
+    var acc0 = vec4<f32>(0.0);
+    var acc1 = vec4<f32>(0.0);
+    var acc2 = vec4<f32>(0.0);
+    var acc3 = vec4<f32>(0.0);
+    for (var q = 0u; q < g.depth; q = q + 4u) {
+        // Column s of `am` is rows row..row+3 at term q+s; column s of `bm`
+        // is columns col..col+3 at term q+s.
+        var am: mat4x4<f32>;
+        if (dims.a_col == 1u) {
+            let at = (rows * dims.a_row + vec4<u32>(g.a + q)) / 4u;
+            am = transpose(mat4x4<f32>(a[at.x], a[at.y], a[at.z], a[at.w]));
+        } else {
+            let at = (g.a + row + q * dims.a_col) / 4u;
+            let step = dims.a_col / 4u;
+            am = mat4x4<f32>(a[at], a[at + step], a[at + 2u * step], a[at + 3u * step]);
+        }
+        var bm: mat4x4<f32>;
+        if (dims.b_row == 1u) {
+            let cols = vec4<u32>(col, col + 1u, col + 2u, col + 3u);
+            let at = (cols * dims.b_col + vec4<u32>(g.b + q)) / 4u;
+            bm = transpose(mat4x4<f32>(b[at.x], b[at.y], b[at.z], b[at.w]));
+        } else {
+            let at = (g.b + q * dims.b_row + col) / 4u;
+            let step = dims.b_row / 4u;
+            bm = mat4x4<f32>(b[at], b[at + step], b[at + 2u * step], b[at + 3u * step]);
+        }
+        for (var s = 0u; s < 4u; s = s + 1u) {
+            let av = am[s];
+            let bv = bm[s];
+            acc0 = fma(vec4<f32>(av.x), bv, acc0);
+            acc1 = fma(vec4<f32>(av.y), bv, acc1);
+            acc2 = fma(vec4<f32>(av.z), bv, acc2);
+            acc3 = fma(vec4<f32>(av.w), bv, acc3);
+        }
+    }
+    var accs = array<vec4<f32>, 4>(acc0, acc1, acc2, acc3);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        if (row + i >= g.rows) { break; }
+        let at = (g.c + (row + i) * dims.n + col) / 4u;
+        if (dims.add == 1u) { c[at] = c[at] + accs[i]; } else { c[at] = accs[i]; }
+    }
+}
+"#;
+
+/// A product kernel: its pipeline, its bindings, the output tile one
+/// workgroup covers, and whether it needs [`Accel::aligned`] calls.
 struct Kernel {
     name: &'static str,
     pipeline: wgpu::ComputePipeline,
     layout: wgpu::BindGroupLayout,
     tile: usize,
+    aligned: bool,
 }
 
-/// The kernels a card runs products with: name, source and the output tile
-/// one workgroup covers. The first is used unless the probe picks another.
-const KERNELS: [(&str, &str, usize); 2] =
-    [("tiled", GEMM_WGSL, 64), ("direct", GEMM_DIRECT_WGSL, 32)];
+/// The kernels a card runs products with: name, source, the output tile
+/// one workgroup covers, and whether it needs aligned calls. The first is
+/// used unless the probe picks another.
+const KERNELS: [(&str, &str, usize, bool); 3] = [
+    ("tiled", GEMM_WGSL, 64, false),
+    ("direct", GEMM_DIRECT_WGSL, 32, false),
+    ("vector", GEMM_VECTOR_WGSL, 32, true),
+];
 
 /// A buffer kept for reuse, grown when a call needs more.
 struct Slot {
@@ -261,6 +346,9 @@ pub struct Accel {
     kernels: Vec<Kernel>,
     /// Which of `kernels` products run with.
     kernel: std::sync::atomic::AtomicUsize,
+    /// Which runs a call `kernel` cannot: the faster of those that take
+    /// any call.
+    fallback: std::sync::atomic::AtomicUsize,
     /// Free sets of buffers; a call takes one and gives it back, so calls
     /// from several threads never share one.
     free: Mutex<Vec<Buffers>>,
@@ -310,7 +398,7 @@ impl Accel {
         .context("creating the compute device")?;
         let kernels = KERNELS
             .iter()
-            .map(|&(name, source, tile)| {
+            .map(|&(name, source, tile, aligned)| {
                 let shader = gpu.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some(name),
                     source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(source)),
@@ -329,6 +417,7 @@ impl Accel {
                     pipeline,
                     layout,
                     tile,
+                    aligned,
                 }
             })
             .collect();
@@ -338,11 +427,26 @@ impl Accel {
             queue,
             kernels,
             kernel: std::sync::atomic::AtomicUsize::new(0),
+            fallback: std::sync::atomic::AtomicUsize::new(0),
             free: Mutex::new(Vec::new()),
             kept: Mutex::new(HashMap::new()),
             kept_bytes: AtomicU64::new(0),
             budget: resident_budget(),
         })
+    }
+
+    /// Whether a call may use an aligned kernel: every offset, the depths,
+    /// `n` and the strides of the side that is not contiguous are
+    /// multiples of four, and each operand is contiguous along one side.
+    fn aligned(a: View<'_>, b: View<'_>, n: usize, parts: &[Part]) -> bool {
+        let four = |v: usize| v.is_multiple_of(4);
+        let side = |v: View<'_>| (v.col == 1 && four(v.row)) || (v.row == 1 && four(v.col));
+        four(n)
+            && side(a)
+            && side(b)
+            && parts
+                .iter()
+                .all(|g| four(g.a) && four(g.b) && four(g.c) && four(g.depth))
     }
 
     /// `b`'s copy on the card, written when the weights changed since,
@@ -363,7 +467,7 @@ impl Accel {
                     let k = Arc::new(Kept {
                         buffer: self.gpu.create_buffer(&wgpu::BufferDescriptor {
                             label: Some("kept weights"),
-                            size: bytes.max(4),
+                            size: bytes.next_multiple_of(16).max(16),
                             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
                             mapped_at_creation: false,
                         }),
@@ -549,7 +653,10 @@ impl Accel {
                 .write_buffer(&sb.buffer, 0, bytemuck::cast_slice(b.data));
         }
         let b_buffer = kept.as_ref().map_or(&sb.buffer, |k| &k.buffer);
-        let kernel = &self.kernels[self.kernel.load(Ordering::Relaxed)];
+        let mut kernel = &self.kernels[self.kernel.load(Ordering::Relaxed)];
+        if kernel.aligned && !Self::aligned(a, b, n, parts) {
+            kernel = &self.kernels[self.fallback.load(Ordering::Relaxed)];
+        }
         let bind = self.gpu.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &kernel.layout,
@@ -699,6 +806,14 @@ fn chosen() -> Option<&'static (Accel, Role)> {
             .enumerate()
             .fold((0, 0.0), |b, (i, r)| if r > b.1 { (i, r) } else { b });
         accel.kernel.store(best, Ordering::Relaxed);
+        let fallback = probe
+            .kernels
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !accel.kernels[*i].aligned)
+            .fold((0, 0.0), |b, (i, &r)| if r > b.1 { (i, r) } else { b })
+            .0;
+        accel.fallback.store(fallback, Ordering::Relaxed);
         let cpu = probe.cpu;
         let role = if gpu > cpu {
             Some(Role::Products)
@@ -902,7 +1017,7 @@ mod tests {
 
     #[test]
     fn gemm_wgsl_is_valid() {
-        for (_, source, _) in KERNELS {
+        for (_, source, _, _) in KERNELS {
             valid(source);
         }
     }
@@ -940,11 +1055,20 @@ mod tests {
             println!("no card; skipping");
             return;
         };
-        let shapes = [(1, 1, 1), (7, 70, 19), (130, 65, 300)];
+        // The last two are aligned in both stride orders, so the vector
+        // kernel runs them rather than falling back.
+        let shapes = [
+            (1, 1, 1),
+            (7, 70, 19),
+            (130, 65, 300),
+            (130, 68, 300),
+            (128, 64, 96),
+        ];
         for (kernel, &(m, n, p)) in
             (0..accel.kernels.len()).flat_map(|k| shapes.iter().map(move |s| (k, s)))
         {
             accel.kernel.store(kernel, Ordering::Relaxed);
+            accel.fallback.store(0, Ordering::Relaxed);
             let name = accel.kernels[kernel].name;
             let a = wave(m * p, 0.37);
             let b = wave(p * n, 0.91);
