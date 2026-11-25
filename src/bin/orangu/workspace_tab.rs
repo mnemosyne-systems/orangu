@@ -55,6 +55,8 @@ pub(crate) struct TabServerConfig<'a> {
     pub(crate) subagent_background: bool,
     /// `[orangu].ssh`: whether `use_ssh` is offered, and who approves hosts.
     pub(crate) ssh: orangu::config::SshMode,
+    /// `[orangu].knowledge`: knowledge bundles besides the usual places.
+    pub(crate) knowledge: &'a [PathBuf],
 }
 
 /// Everything that belongs to one workspace tab. The run loop reads and mutates
@@ -163,6 +165,7 @@ impl WorkspaceTab {
             subagent_depth,
             subagent_background,
             ssh,
+            knowledge,
         } = server_config;
         let workspace_created = if !workspace.exists() {
             std::fs::create_dir_all(&workspace)
@@ -252,6 +255,9 @@ impl WorkspaceTab {
         let skills = orangu::skills::SkillRegistry::discover(&workspace);
         // Skills load through `use_skill`, user skills included.
         let tools = tools.with_skills(std::sync::Arc::new(skills.clone()));
+        let tools = tools.with_knowledge(std::sync::Arc::new(
+            orangu::knowledge::KnowledgeRegistry::discover(&workspace, knowledge),
+        ));
         let session_hist_path = session_dir.join("history");
         let session_messages_path = session_dir.join("messages");
         let session_metadata_path = session_dir.join("metadata");

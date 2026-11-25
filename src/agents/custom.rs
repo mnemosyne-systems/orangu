@@ -96,6 +96,7 @@ const ORANGU_TOOLS: &[&str] = &[
     "web_search",
     "browse",
     "use_skill",
+    "knowledge",
     "ssh_login",
     "ssh_copy",
     "ssh_logout",
@@ -461,6 +462,7 @@ fn reads_only(tool: &str) -> bool {
             | "web_search"
             | "browse"
             | "use_skill"
+            | "knowledge"
     )
 }
 

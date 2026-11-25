@@ -253,6 +253,7 @@ pub fn help_text() -> &'static str {
 /statistics [total]                             Show persistent, cross-session activity history and a daily heatmap for this workspace, or every workspace (total)
 /schedule                                       List the cron-style scheduled jobs from ~/.orangu/schedule with their next run times (UTC)
 /skills                                         List discovered Agent Skills; invoke one with /skill-name
+/knowledge [stale|deprecated|unverified]        List knowledge bundles (OKF), or the concepts in them that are stale, deprecated or unverified
 /agents [search words]                          List custom subagents (Claude Code format) from .claude/agents and .orangu/agents
 /tasks [<id>|stop <id>]                         List subagent tasks, show one task's report, or stop a background task
 /fork <task>                                     Fork the conversation into a background subagent that does <task>

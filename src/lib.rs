@@ -41,6 +41,7 @@ pub mod git_index;
 pub mod graph;
 pub mod hardware;
 pub mod iq_grids;
+pub mod knowledge;
 pub mod license;
 pub mod llm;
 pub mod logging;

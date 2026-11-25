@@ -87,6 +87,7 @@ pub enum SlashCommand {
     Test,
     Shell,
     Skills,
+    Knowledge,
     Agents,
     Tasks,
     Fork,
@@ -187,6 +188,9 @@ impl SlashCommand {
             SlashCommand::Test => "Runs the workspace tests",
             SlashCommand::Shell => "Executes a shell command",
             SlashCommand::Skills => "Lists the discovered Agent Skills",
+            SlashCommand::Knowledge => {
+                "Lists the knowledge bundles, or what in them is stale, deprecated or unverified"
+            }
             SlashCommand::Agents => "Lists the custom subagents, optionally matching search words",
             SlashCommand::Tasks => {
                 "Lists this conversation's subagent tasks, shows one, or stops one"

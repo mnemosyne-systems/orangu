@@ -347,6 +347,9 @@ impl OneshotSession {
         let skills = orangu::skills::SkillRegistry::discover(&workspace);
         // Skills load through `use_skill`, user skills included.
         let tools = tools.with_skills(std::sync::Arc::new(skills.clone()));
+        let tools = tools.with_knowledge(std::sync::Arc::new(
+            orangu::knowledge::KnowledgeRegistry::discover(&workspace, &config.knowledge),
+        ));
 
         // The same system prompt the interactive client builds for a tab.
         let mut system = system_prompt(&profile, None).to_string();

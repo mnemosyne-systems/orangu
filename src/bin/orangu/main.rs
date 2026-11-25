@@ -691,6 +691,7 @@ async fn run() -> Result<()> {
             subagent_depth: config.subagent_depth,
             subagent_background: config.subagent_background,
             ssh: config.ssh,
+            knowledge: &config.knowledge,
             slots: slot_registry.clone(),
         },
     )
@@ -751,6 +752,7 @@ async fn run() -> Result<()> {
                         subagent_depth: config.subagent_depth,
                         subagent_background: config.subagent_background,
                         ssh: config.ssh,
+                        knowledge: &config.knowledge,
                         slots: slot_registry.clone(),
                     },
                 )
@@ -1105,6 +1107,7 @@ async fn run() -> Result<()> {
                             subagent_depth: config.subagent_depth,
                             subagent_background: config.subagent_background,
                             ssh: config.ssh,
+                            knowledge: &config.knowledge,
                             slots: slot_registry.clone(),
                         },
                     )
@@ -1933,6 +1936,7 @@ async fn run() -> Result<()> {
                         subagent_depth: config.subagent_depth,
                         subagent_background: config.subagent_background,
                         ssh: config.ssh,
+                        knowledge: &config.knowledge,
                         slots: slot_registry.clone(),
                     },
                 )
@@ -2002,6 +2006,7 @@ async fn run() -> Result<()> {
                             subagent_depth: config.subagent_depth,
                             subagent_background: config.subagent_background,
                             ssh: config.ssh,
+                            knowledge: &config.knowledge,
                             slots: slot_registry.clone(),
                         },
                     )
