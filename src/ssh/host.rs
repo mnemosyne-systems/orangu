@@ -272,15 +272,58 @@ fn include(
     }
 }
 
+/// Splits an `Include` argument list on whitespace outside double quotes.
+/// An unclosed quote is noted and skipped so its fragments are not
+/// reinterpreted as independent paths.
+fn include_tokens(value: &str, notes: &mut Vec<String>) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+
+    for ch in value.chars() {
+        if in_quotes {
+            if ch == '"' {
+                in_quotes = false;
+            } else {
+                token.push(ch);
+            }
+        } else if ch.is_whitespace() {
+            if has_token {
+                if !token.is_empty() {
+                    tokens.push(std::mem::take(&mut token));
+                }
+                has_token = false;
+            }
+        } else if ch == '"' {
+            in_quotes = true;
+            has_token = true;
+        } else {
+            token.push(ch);
+            has_token = true;
+        }
+    }
+
+    if in_quotes {
+        notes.push(format!(
+            "Include {value} has an unclosed quote, which is not read."
+        ));
+    } else if has_token && !token.is_empty() {
+        tokens.push(token);
+    }
+
+    tokens
+}
+
 /// The files an `Include` names: a relative path is under `directory`, `~/`
 /// is the home directory, and a file name may hold `*`, `?` or `[...]`, whose
 /// matches are read in order. A missing file is skipped, as `ssh` does.
 fn include_paths(value: &str, directory: &Path, notes: &mut Vec<String>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    for word in value.split_whitespace().map(|word| word.trim_matches('"')) {
+    for word in include_tokens(value, notes) {
         let path = match word.strip_prefix("~/") {
             Some(rest) => home::home_dir().unwrap_or_default().join(rest),
-            None => directory.join(word),
+            None => directory.join(&word),
         };
         let is_pattern = |text: &str| text.contains(['*', '?', '[']);
         let (Some(parent), Some(name)) = (path.parent(), path.file_name().and_then(|n| n.to_str()))
@@ -557,6 +600,66 @@ mod tests {
         let absolute = directory.path().join("elsewhere/conf");
         std::fs::write(&paths.config, format!("Include={}\n", absolute.display())).unwrap();
         assert_eq!(resolve("build", &paths).unwrap().label(), "deploy@build:22");
+    }
+
+    #[test]
+    fn an_include_with_quoted_spaces_is_read() {
+        let (directory, paths) = paths("Include \"conf.d/work hosts.conf\"\n");
+        write(
+            &directory,
+            "conf.d/work hosts.conf",
+            "Host build\n  User deploy\n",
+        );
+        let target = resolve("build", &paths).unwrap();
+        assert_eq!(target.label(), "deploy@build:22");
+        assert!(target.notes.is_empty(), "{:?}", target.notes);
+    }
+
+    #[test]
+    fn multiple_includes_with_mixed_quoting_are_read() {
+        let (directory, paths) = paths("Include \"conf.d/work hosts.conf\" conf.d/defaults.conf\n");
+        write(
+            &directory,
+            "conf.d/work hosts.conf",
+            "Host build\n  User deploy\n",
+        );
+        write(
+            &directory,
+            "conf.d/defaults.conf",
+            "Host build\n  HostName b.example.com\n  Port 2222\n",
+        );
+        let target = resolve("build", &paths).unwrap();
+        assert_eq!(target.label(), "deploy@b.example.com:2222");
+        assert!(target.notes.is_empty(), "{:?}", target.notes);
+    }
+
+    #[test]
+    fn a_quoted_glob_include_with_spaces_is_read() {
+        let (directory, paths) = paths("Include \"conf.d/team configs/*.conf\"\n");
+        write(
+            &directory,
+            "conf.d/team configs/01-prod.conf",
+            "Host build\n  User deploy\n  Port 2222\n",
+        );
+        let target = resolve("build", &paths).unwrap();
+        assert_eq!(target.label(), "deploy@build:2222");
+        assert!(target.notes.is_empty(), "{:?}", target.notes);
+    }
+
+    #[test]
+    fn an_unclosed_quote_in_include_is_skipped_with_a_note() {
+        let (directory, paths) = paths("Include \"conf.d/work hosts.conf\n");
+        write(&directory, "hosts.conf", "Host build\n  User leaked\n");
+        let target = resolve("build", &paths).unwrap();
+        assert_ne!(target.user, "leaked");
+        assert!(
+            target
+                .notes
+                .iter()
+                .any(|note| note.contains("unclosed quote")),
+            "{:?}",
+            target.notes
+        );
     }
 
     /// As common as a config gets, and the parser alone refuses it.
