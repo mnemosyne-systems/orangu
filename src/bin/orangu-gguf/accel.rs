@@ -873,6 +873,10 @@ fn chosen() -> Option<&'static (Accel, Role)> {
 /// The product [`rates`] times: the size of training's larger ones.
 const PROBE: (usize, usize, usize) = (1024, 768, 512);
 
+/// Timed runs of each kernel and of the processor in [`rates`]; the best
+/// of them counts.
+const PROBE_ROUNDS: usize = 4;
+
 /// What [`rates`] measures.
 struct Probe {
     /// GFLOP/s of each of the card's kernels.
@@ -884,8 +888,8 @@ struct Probe {
 }
 
 /// GFLOP/s of each of the card's kernels and of the processor's training
-/// kernel on [`PROBE`],
-/// the operands sent to the card each time, after one untimed run of each;
+/// kernel on [`PROBE`], the operands sent to the card each time: the best
+/// of [`PROBE_ROUNDS`] runs each, after one untimed run;
 /// and the time of a product too small to cost anything but the call.
 fn rates(accel: &Accel) -> Probe {
     let (m, n, p) = PROBE;
@@ -905,23 +909,34 @@ fn rates(accel: &Accel) -> Probe {
     );
     let mut c = vec![0f32; m * n];
     let flop = 2.0 * (m * n * p) as f64;
-    let mut rate = |run: &mut dyn FnMut(&mut [f32])| {
-        run(&mut c);
+    // One untimed run each, then rounds that time every kernel once in
+    // turn, keeping each one's best: a clock that dips or ramps during one
+    // round costs that round, not the kernel timed in it.
+    let once = |run: &mut dyn FnMut(&mut [f32]), c: &mut [f32]| {
         let started = std::time::Instant::now();
-        for _ in 0..3 {
-            run(&mut c);
-        }
-        3.0 * flop / started.elapsed().as_secs_f64() / 1e9
+        run(c);
+        flop / started.elapsed().as_secs_f64() / 1e9
     };
-    let mut kernels = Vec::new();
+    let gemm = |c: &mut [f32]| accel.gemm(c, av, bv, m, n, p, false, false);
     for i in 0..accel.kernels.len() {
         accel.kernel.store(i, Ordering::Relaxed);
-        kernels.push(rate(&mut |c| accel.gemm(c, av, bv, m, n, p, false, false)));
+        gemm(&mut c);
+    }
+    let mut kernels = vec![0f64; accel.kernels.len()];
+    for _ in 0..PROBE_ROUNDS {
+        for (i, best) in kernels.iter_mut().enumerate() {
+            accel.kernel.store(i, Ordering::Relaxed);
+            *best = best.max(once(&mut |c| gemm(c), &mut c));
+        }
     }
     // The processor's side is the kernel training runs it with, on a
     // weight of the same size laid out as training lays one out.
     let w: Vec<f32> = (0..n * p).map(|i| (i as f32 * 0.53).sin()).collect();
-    let cpu = rate(&mut |c| crate::model::matmul_on_cpu(c, &a, &w, m, p, n));
+    let mut cpu_run = |c: &mut [f32]| crate::model::matmul_on_cpu(c, &a, &w, m, p, n);
+    cpu_run(&mut c);
+    let cpu = (0..PROBE_ROUNDS)
+        .map(|_| once(&mut cpu_run, &mut c))
+        .fold(0f64, f64::max);
     let small = View {
         data: &a,
         row: 8,
@@ -990,7 +1005,7 @@ pub fn card_share(split: Split) -> f64 {
     if b.card <= 0.0 || b.cpu <= 0.0 {
         return 0.5;
     }
-    (b.card / (b.card + b.cpu)).clamp(0.1, 0.9)
+    (b.card / (b.card + b.cpu)).clamp(0.02, 0.9)
 }
 
 fn mix(rate: &mut f64, now: f64) {

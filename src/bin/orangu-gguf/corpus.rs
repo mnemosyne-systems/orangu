@@ -607,32 +607,80 @@ fn pdf_text(path: &Path) -> Option<String> {
     pdf_text_in(path, PDF_TEXT.get().map(PathBuf::as_path))
 }
 
+/// Where `path`'s extracted text is kept under `dir`: named by the file's
+/// full path, size and time, so an edited PDF is extracted again.
+fn kept_path(path: &Path, dir: &Path) -> Option<PathBuf> {
+    let md = fs::metadata(path).ok()?;
+    let modified = md
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    let full = fs::canonicalize(path).ok()?;
+    let mut hash = std::hash::DefaultHasher::new();
+    std::hash::Hash::hash(&(full, md.len(), modified), &mut hash);
+    let name = format!("{:016x}.txt", std::hash::Hasher::finish(&hash));
+    Some(dir.join(name))
+}
+
+/// Extracts the text of every PDF in `files` that has none kept yet, the
+/// documents side by side, and reports each one and the whole: pages, text
+/// and seconds, so a slow document can be named.
+pub fn extract_pdfs(files: &[PathBuf]) {
+    let pdfs: Vec<&PathBuf> = files.iter().filter(|f| is_pdf(f)).collect();
+    if pdfs.is_empty() {
+        return;
+    }
+    let dir = PDF_TEXT.get().map(PathBuf::as_path);
+    let fresh: Vec<&PathBuf> = pdfs
+        .iter()
+        .copied()
+        .filter(|f| {
+            !dir.and_then(|d| kept_path(f, d))
+                .is_some_and(|k| k.is_file())
+        })
+        .collect();
+    let started = std::time::Instant::now();
+    let text: u64 = fresh
+        .par_iter()
+        .map(|f| pdf_text(f).map_or(0, |t| t.len() as u64))
+        .sum();
+    println!(
+        "corpus: {} PDFs, {} extracted ({:.1} MiB of text) in {:.1} s, {} kept from earlier runs",
+        pdfs.len(),
+        fresh.len(),
+        text as f64 / (1 << 20) as f64,
+        started.elapsed().as_secs_f64(),
+        pdfs.len() - fresh.len()
+    );
+}
+
 /// [`pdf_text`] with the text kept under `dir`.
 fn pdf_text_in(path: &Path, dir: Option<&Path>) -> Option<String> {
-    let kept = dir.and_then(|dir| {
-        let md = fs::metadata(path).ok()?;
-        let modified = md
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_nanos();
-        let full = fs::canonicalize(path).ok()?;
-        let mut hash = std::hash::DefaultHasher::new();
-        std::hash::Hash::hash(&(full, md.len(), modified), &mut hash);
-        let name = format!("{:016x}.txt", std::hash::Hasher::finish(&hash));
-        Some(dir.join(name))
-    });
+    let kept = dir.and_then(|dir| kept_path(path, dir));
     if let Some(text) = kept.as_ref().and_then(|k| fs::read_to_string(k).ok()) {
         return (!text.trim().is_empty()).then_some(text);
     }
+    let started = std::time::Instant::now();
     let bytes = fs::read(path).ok()?;
     let text = match orangu::pdf::extract_pages(&bytes) {
-        Ok(pages) => without_furniture(&pages)
-            .iter()
-            .map(|page| plain_page(page))
-            .collect::<Vec<_>>()
-            .join("\n\n"),
+        Ok(pages) => {
+            let text = without_furniture(&pages)
+                .iter()
+                .map(|page| plain_page(page))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            println!(
+                "corpus: {}: {} pages, {:.1} MiB of PDF, {:.1} MiB of text in {:.1} s",
+                path.display(),
+                pages.len(),
+                bytes.len() as f64 / (1 << 20) as f64,
+                text.len() as f64 / (1 << 20) as f64,
+                started.elapsed().as_secs_f64()
+            );
+            text
+        }
         Err(e) => {
             eprintln!("corpus: {} has no text: {e:#}", path.display());
             String::new()

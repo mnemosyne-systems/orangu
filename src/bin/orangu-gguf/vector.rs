@@ -350,6 +350,15 @@ impl std::ops::Neg for V8 {
     }
 }
 
+/// `row` replaced by `exp(row - max(row))`, and their sum: a softmax's
+/// numerators and denominator, the exponentials eight at a time.
+pub fn exp_shifted(row: &mut [f32]) -> f32 {
+    let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let shift = V8::splat(max);
+    update(row, [], |v, []| (v - shift).exp());
+    sum([&*row], |[v]| v)
+}
+
 /// Runs `f` over eight-float blocks of `N` inputs and one output, the
 /// shorter tail padded with zeros.
 #[inline(always)]

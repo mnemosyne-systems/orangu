@@ -37,7 +37,7 @@
 # quantization of that size inside it — which is the shape a published GGUF
 # repository has, and which makes `list` show the three files as three rows
 # of one model rather than as three unrelated models. A `smoke` build and a
-# `2b` build are different models and get different repositories.
+# `1b` build are different models and get different repositories.
 #
 # Usage:
 #   ./install.sh                    every *.gguf here and in ./smoke/

@@ -83,8 +83,6 @@ use manifest::Manifest;
 use model::{Config, Model};
 use quant::Ftype;
 
-/// The architecture written into every model this tool trains.
-///
 /// The help text, with the two-letter short options in the column they
 /// belong in. `{about-with-newline}`, `{usage-heading}`, `{usage}` and
 /// `{positionals}` are filled in by the parser; the options are not.
@@ -912,6 +910,9 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
     // without a second flag that could disagree with the manifest.
     let recorder = start_profile(args, shape.key())?;
     let outcome = (|| -> Result<()> {
+        // The channel is searched for nodes to share the steps while the
+        // corpus, the tokenizer and the model are made ready.
+        jobs::claim_ahead("train");
         // 1. The corpus. A PDF's text is extracted once, into the work
         // directory.
         corpus::keep_pdf_text(work.join("pdf-text"));
@@ -975,6 +976,11 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
         if files.is_empty() {
             bail!("the corpus has no files to train on");
         }
+        stages::phase("corpus walked");
+        if !vocab_path.exists() || !tokens_path.exists() || manifest.rebuild {
+            corpus::extract_pdfs(&files);
+            stages::phase("PDF text extracted");
+        }
 
         // 2. The tokenizer.
         let vocabulary = if vocab_path.exists() && !manifest.rebuild {
@@ -985,21 +991,29 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
                 "tokenizer: sampling up to {} of corpus text",
                 bytes(manifest.tokenizer_sample)
             );
+            let started = std::time::Instant::now();
             let sample = pack::sample(&files, manifest.tokenizer_sample);
             let sampled: u64 = sample.iter().map(|s| s.len() as u64).sum();
             println!(
-                "tokenizer: training {} tokens on {} from {} documents",
+                "tokenizer: training {} tokens on {} from {} documents, read in {:.1} s",
                 manifest.vocab_size,
                 bytes(sampled),
-                sample.len()
+                sample.len(),
+                started.elapsed().as_secs_f64()
             );
+            let started = std::time::Instant::now();
             let vocabulary =
                 vocab::train(sample.into_iter(), manifest.vocab_size, &|done, total| {
                     print!("\r  merges {done}/{total}");
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                 })?;
             println!();
+            println!(
+                "tokenizer: merges learned in {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
             vocabulary.save(&vocab_path)?;
+            stages::phase("tokenizer trained");
             vocabulary
         };
         println!("tokenizer: {} tokens", vocabulary.len());
@@ -1008,6 +1022,7 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
 
         // 3. The packed token stream.
         if !tokens_path.exists() || manifest.rebuild {
+            let started = std::time::Instant::now();
             let report = pack::pack(&files, &encoder, &tokens_path, &|report, seen| {
                 print!(
                     "\r  packing {}/{} files, {} tokens",
@@ -1018,8 +1033,12 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
                 let _ = std::io::Write::flush(&mut std::io::stdout());
             })?;
             println!(
-                "\npacked: {} documents, {} tokens ({} duplicates, {} unreadable)",
-                report.documents, report.tokens, report.duplicates, report.unreadable
+                "\npacked: {} documents, {} tokens ({} duplicates, {} unreadable) in {:.1} s",
+                report.documents,
+                report.tokens,
+                report.duplicates,
+                report.unreadable,
+                started.elapsed().as_secs_f64()
             );
         } else {
             println!("packed: reusing {}", tokens_path.display());

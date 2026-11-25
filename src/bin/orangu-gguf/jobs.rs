@@ -717,6 +717,30 @@ pub fn run<T: Send>(
 /// The gguf nodes of the channel this machine is configured for, claimed
 /// for `job`; none without a channel.
 pub fn claim_for(job: &str) -> Vec<Claimed> {
+    let ahead = AHEAD.lock().unwrap_or_else(|e| e.into_inner()).take();
+    match ahead {
+        Some((started, handle)) if started == job => {
+            return handle.join().unwrap_or_default();
+        }
+        Some(other) => *AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(other),
+        None => {}
+    }
+    claim_now(job)
+}
+
+/// A [`claim_for`] started ahead of the job that needs it, by its job name.
+type Ahead = (&'static str, std::thread::JoinHandle<Vec<Claimed>>);
+static AHEAD: std::sync::Mutex<Option<Ahead>> = std::sync::Mutex::new(None);
+
+/// Starts searching the channel for `job`'s nodes on a thread of its own,
+/// so the search runs while the job prepares; [`claim_for`] then waits only
+/// for what is left of it.
+pub fn claim_ahead(job: &'static str) {
+    let handle = std::thread::spawn(move || claim_now(job));
+    *AHEAD.lock().unwrap_or_else(|e| e.into_inner()) = Some((job, handle));
+}
+
+fn claim_now(job: &str) -> Vec<Claimed> {
     let Ok(Some(settings)) = crate::node::Settings::load_configured() else {
         return Vec::new();
     };

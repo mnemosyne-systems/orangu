@@ -3,7 +3,7 @@
   "license": "Apache-2.0",
   "description": "Trained on the Mnemosyne Systems open source projects, the Linux kernel, PostgreSQL, Quarkus, WildFly, the most-starred open source C, Rust and Java projects on GitHub, and English Wikipedia.",
 
-  "training_size": "2b",
+  "training_size": "1b",
   "context_size": "256k",
   "quantization": "bf16",
 

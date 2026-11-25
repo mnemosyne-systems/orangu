@@ -1737,22 +1737,16 @@ impl Model {
         );
         let (mut queries, q_rms) =
             model::rmsnorm_forward(&q_raw, self.tensor(o.idx_q_norm, d), t * nh, d, cfg.eps);
-        for i in 0..t {
-            rope_at(
-                &mut queries[i * nh * d..(i + 1) * nh * d],
-                d,
-                cfg.rope_dim,
-                cfg.rope_base,
-                i,
-                false,
-            );
-        }
+        queries
+            .par_chunks_mut(nh * d)
+            .enumerate()
+            .for_each(|(i, row)| rope_at(row, d, cfg.rope_dim, cfg.rope_base, i, false));
         let score = |i: usize, b: usize| -> f32 {
             (0..nh)
                 .map(|hh| {
                     let qv = &queries[i * nh * d + hh * d..i * nh * d + (hh + 1) * d];
                     let kv = &blocks[b * d..(b + 1) * d];
-                    qv.iter().zip(kv).map(|(a, c)| a * c).sum::<f32>().max(0.0)
+                    vector::sum([qv, kv], |[a, c]| a * c).max(0.0)
                 })
                 .sum()
         };
@@ -1783,25 +1777,17 @@ impl Model {
                     return None;
                 }
                 let mut mass = vec![0.0f32; scored];
+                let mut exps = vec![0.0f32; i + 1];
                 for hh in 0..heads {
                     let kh = hh / group;
                     let qv = &q_rope[i * qd + hh * hd..i * qd + (hh + 1) * hd];
-                    let logits: Vec<f32> = (0..=i)
-                        .map(|j| {
-                            qv.iter()
-                                .zip(&k_rope[j * kvd + kh * hd..j * kvd + (kh + 1) * hd])
-                                .map(|(a, b)| a * b)
-                                .sum::<f32>()
-                                * scale
-                        })
-                        .collect();
-                    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let exps: Vec<f32> = logits.iter().map(|l| (l - max).exp()).collect();
-                    let sum: f32 = exps.iter().sum();
+                    for (j, l) in exps.iter_mut().enumerate() {
+                        let kv = &k_rope[j * kvd + kh * hd..j * kvd + (kh + 1) * hd];
+                        *l = vector::sum([qv, kv], |[a, b]| a * b) * scale;
+                    }
+                    let share = 1.0 / (vector::exp_shifted(&mut exps) * heads as f32);
                     for (b, m) in mass.iter_mut().enumerate() {
-                        for e in &exps[b * r..(b + 1) * r] {
-                            *m += e / sum / heads as f32;
-                        }
+                        *m += vector::sum([&exps[b * r..(b + 1) * r]], |[e]| e) * share;
                     }
                 }
                 let mass_sum: f32 = mass.iter().sum();
@@ -1809,10 +1795,9 @@ impl Model {
                     .iter()
                     .map(|m| m / mass_sum.max(f32::MIN_POSITIVE))
                     .collect();
-                let s: Vec<f32> = (0..scored).map(|b| score(i, b)).collect();
-                let max = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let sum: f32 = s.iter().map(|v| (v - max).exp()).sum();
-                let p: Vec<f32> = s.iter().map(|v| (v - max).exp() / sum).collect();
+                let mut p: Vec<f32> = (0..scored).map(|b| score(i, b)).collect();
+                let sum = V8::splat(vector::exp_shifted(&mut p));
+                vector::update(&mut p, [], |v, []| v / sum);
                 let terms: Vec<f64> = tgt
                     .iter()
                     .zip(&p)
@@ -1877,32 +1862,52 @@ impl Model {
         let unit = cfg.idx_coef / c.counted as f32;
         let mut d_queries = Aligned::zeros(t * nh * d);
         let mut d_blocks = Aligned::zeros(n_blocks * d);
-        for i in 0..t {
-            for (b, (&p, &tg)) in c.pred[i].iter().zip(&c.target[i]).enumerate() {
-                let ds = unit * (p - tg);
-                for hh in 0..nh {
-                    let at = i * nh * d + hh * d;
-                    let qv = &c.queries[at..at + d];
+        // Each query's own gradient, the queries side by side, and which of
+        // its scores passed the ReLU.
+        let passed: Vec<Vec<bool>> = d_queries
+            .par_chunks_mut(nh * d)
+            .enumerate()
+            .map(|(i, dq)| {
+                let mut passed = vec![false; c.pred[i].len() * nh];
+                for (b, (&p, &tg)) in c.pred[i].iter().zip(&c.target[i]).enumerate() {
+                    let ds = V8::splat(unit * (p - tg));
                     let kv = &c.blocks[b * d..(b + 1) * d];
-                    if qv.iter().zip(kv).map(|(a, b)| a * b).sum::<f32>() > 0.0 {
-                        for j in 0..d {
-                            d_queries[at + j] += ds * kv[j];
-                            d_blocks[b * d + j] += ds * qv[j];
+                    for hh in 0..nh {
+                        let at = i * nh * d + hh * d;
+                        let qv = &c.queries[at..at + d];
+                        if vector::sum([qv, kv], |[a, k]| a * k) > 0.0 {
+                            passed[b * nh + hh] = true;
+                            vector::update(&mut dq[hh * d..(hh + 1) * d], [kv], |o, [k]| {
+                                ds.mul_add(k, o)
+                            });
                         }
                     }
                 }
+                passed
+            })
+            .collect();
+        // Each block's gradient, the blocks side by side, its terms in
+        // query order and within a query in head order.
+        d_blocks.par_chunks_mut(d).enumerate().for_each(|(b, db)| {
+            for (i, ((pred, target), passed)) in
+                c.pred.iter().zip(&c.target).zip(&passed).enumerate()
+            {
+                let (Some(&p), Some(&tg)) = (pred.get(b), target.get(b)) else {
+                    continue;
+                };
+                let ds = V8::splat(unit * (p - tg));
+                for hh in 0..nh {
+                    if passed[b * nh + hh] {
+                        let at = i * nh * d + hh * d;
+                        vector::update(db, [&c.queries[at..at + d]], |o, [q]| ds.mul_add(q, o));
+                    }
+                }
             }
-        }
-        for i in 0..t {
-            rope_at(
-                &mut d_queries[i * nh * d..(i + 1) * nh * d],
-                d,
-                cfg.rope_dim,
-                cfg.rope_base,
-                i,
-                true,
-            );
-        }
+        });
+        d_queries
+            .par_chunks_mut(nh * d)
+            .enumerate()
+            .for_each(|(i, row)| rope_at(row, d, cfg.rope_dim, cfg.rope_base, i, true));
         let mut d_q_raw = Aligned::zeros(t * nh * d);
         model::rmsnorm_backward(
             &mut d_q_raw,
@@ -2416,7 +2421,8 @@ impl Model {
                 let mut works: Vec<BlockWork> = (0..blocks)
                     .map(|_| BlockWork {
                         g_state: vec![0.0; size],
-                        before: vec![0.0; chunk.min(t) * size],
+                        marks: vec![0.0; chunk.min(t).div_ceil(SEGMENT) * size],
+                        segment: vec![0.0; SEGMENT * size],
                         scratch: vec![0.0; STEP_SCRATCH * dim],
                         share: HeadGrads {
                             q: vec![0.0; chunk * dim],
@@ -2435,51 +2441,74 @@ impl Model {
                     works.par_iter_mut().enumerate().for_each(|(block, work)| {
                         let a0 = block * cols;
                         let at_v = |i: usize| i * vd + hv * dim + a0..i * vd + hv * dim + a0 + cols;
-                        let before = &mut work.before;
-                        for (dst, row) in before[..size]
+                        let (marks, segment) = (&mut work.marks, &mut work.segment);
+                        for (dst, row) in marks[..size]
                             .chunks_exact_mut(cols)
                             .zip(checkpoint.chunks_exact(dim))
                         {
                             dst.copy_from_slice(&row[a0..a0 + cols]);
                         }
                         let mut out = vec![0.0f32; cols];
-                        for r in 1..n {
-                            let i = start + r - 1;
-                            let (done, next) = before.split_at_mut(r * size);
-                            let next = &mut next[..size];
-                            next.copy_from_slice(&done[(r - 1) * size..]);
-                            out.fill(0.0);
-                            delta_step(
-                                next,
-                                &c.q[at_q(i)],
-                                &c.k[at_q(i)],
-                                &c.v[at_v(i)],
-                                c.beta[i * nv + hv],
-                                c.decay[i * nv + hv],
-                                &mut out,
-                            );
+                        // The state before token `r` of the chunk, from the one
+                        // before token `r - 1`.
+                        let advance =
+                            |prev: &[f32], next: &mut [f32], r: usize, out: &mut [f32]| {
+                                let i = start + r - 1;
+                                delta_advance(
+                                    prev,
+                                    next,
+                                    &c.q[at_q(i)],
+                                    &c.k[at_q(i)],
+                                    &c.v[at_v(i)],
+                                    c.beta[i * nv + hv],
+                                    c.decay[i * nv + hv],
+                                    out,
+                                );
+                            };
+                        // The marks: the states before every SEGMENT-th token,
+                        // stepped through two of the segment's slots.
+                        let last_mark = (n - 1) / SEGMENT * SEGMENT;
+                        segment[..size].copy_from_slice(&marks[..size]);
+                        for r in 1..=last_mark {
+                            let (prev, next) = slots(segment, size, (r - 1) % 2, r % 2);
+                            advance(prev, next, r, &mut out);
+                            if r % SEGMENT == 0 {
+                                marks[r / SEGMENT * size..(r / SEGMENT + 1) * size]
+                                    .copy_from_slice(next);
+                            }
                         }
+                        // Then a segment at a time from the last: its states
+                        // from its mark, and the backward through them.
                         let share = &mut work.share;
-                        for r in (0..n).rev() {
-                            let i = start + r;
-                            let (db, dd) = delta_step_backward(
-                                &before[r * size..(r + 1) * size],
-                                &c.q[at_q(i)],
-                                &c.k[at_q(i)],
-                                &c.v[at_v(i)],
-                                c.beta[i * nv + hv],
-                                c.decay[i * nv + hv],
-                                &d_o[at_v(i)],
-                                &mut work.g_state,
-                                (
-                                    &mut share.q[r * dim..(r + 1) * dim],
-                                    &mut share.k[r * dim..(r + 1) * dim],
-                                    &mut share.v[r * cols..(r + 1) * cols],
-                                ),
-                                &mut work.scratch,
-                            );
-                            share.beta[r] = db;
-                            share.decay[r] = dd;
+                        for m in (0..n.div_ceil(SEGMENT)).rev() {
+                            let first = m * SEGMENT;
+                            let end = (first + SEGMENT).min(n);
+                            segment[..size].copy_from_slice(&marks[m * size..(m + 1) * size]);
+                            for r in first + 1..end {
+                                let (prev, next) = slots(segment, size, r - 1 - first, r - first);
+                                advance(prev, next, r, &mut out);
+                            }
+                            for r in (first..end).rev() {
+                                let i = start + r;
+                                let (db, dd) = delta_step_backward(
+                                    &segment[(r - first) * size..(r - first + 1) * size],
+                                    &c.q[at_q(i)],
+                                    &c.k[at_q(i)],
+                                    &c.v[at_v(i)],
+                                    c.beta[i * nv + hv],
+                                    c.decay[i * nv + hv],
+                                    &d_o[at_v(i)],
+                                    &mut work.g_state,
+                                    (
+                                        &mut share.q[r * dim..(r + 1) * dim],
+                                        &mut share.k[r * dim..(r + 1) * dim],
+                                        &mut share.v[r * cols..(r + 1) * cols],
+                                    ),
+                                    &mut work.scratch,
+                                );
+                                share.beta[r] = db;
+                                share.decay[r] = dd;
+                            }
                         }
                     });
                     for (block, work) in works.iter().enumerate() {
@@ -2663,15 +2692,8 @@ impl Model {
         let (chosen, sums): (Vec<Vec<(usize, f32)>>, Vec<f32>) = probs
             .par_chunks_mut(ne)
             .map(|row| {
-                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for v in row.iter_mut() {
-                    *v = (*v - max).exp();
-                    sum += *v;
-                }
-                for v in row.iter_mut() {
-                    *v /= sum;
-                }
+                let sum = V8::splat(vector::exp_shifted(row));
+                vector::update(row, [], |v, []| v / sum);
                 let mut order: Vec<usize> = (0..ne).collect();
                 order.sort_by(|&a, &b| row[b].total_cmp(&row[a]));
                 order.truncate(k);
@@ -2749,9 +2771,7 @@ impl Model {
             .par_chunks_mut(fs)
             .zip(s_gate.par_chunks(fs).zip(s_up.par_chunks(fs)))
             .for_each(|(act, (gate, up))| {
-                for ((a, &g), &u) in act.iter_mut().zip(gate).zip(up) {
-                    *a = silu(g) * u;
-                }
+                vector::map(act, [gate, up], |[g, u]| g * g.sigmoid() * u);
             });
         let mut s_out = Aligned::zeros(t * h);
         matmul(
@@ -3069,9 +3089,7 @@ impl Model {
             fe,
         );
         let mut act = Aligned::zeros(m_n * fe);
-        for ((a, &g), &u) in act.iter_mut().zip(gate.iter()).zip(up.iter()) {
-            *a = silu(g) * u;
-        }
+        vector::map(&mut act, [&gate, &up], |[g, u]| g * g.sigmoid() * u);
         let mut out = Aligned::zeros(m_n * h);
         matmul(
             &mut out,
@@ -3198,9 +3216,7 @@ impl Model {
         act.par_chunks_mut(fe)
             .zip(gate.par_chunks(fe).zip(up.par_chunks(fe)))
             .for_each(|(act, (gate, up))| {
-                for ((a, &g), &u) in act.iter_mut().zip(gate).zip(up) {
-                    *a = silu(g) * u;
-                }
+                vector::map(act, [gate, up], |[g, u]| g * g.sigmoid() * u);
             });
         let mut out = Aligned::zeros(total * h);
         card.grouped(
@@ -3752,22 +3768,22 @@ impl Model {
             let mut logits = Aligned::zeros(t * cfg.vocab);
             matmul(&mut logits, &collapsed, out_w, t, h, cfg.vocab);
             let inv = 1.0 / t as f32;
-            let mut loss = 0.0f64;
-            for (row, &target) in logits.chunks_mut(cfg.vocab).zip(targets) {
-                let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0.0f32;
-                for v in row.iter_mut() {
-                    *v = (*v - max).exp();
-                    sum += *v;
-                }
-                loss -= ((row[target as usize] / sum).max(f32::MIN_POSITIVE) as f64).ln();
-                if want {
-                    for v in row.iter_mut() {
-                        *v *= inv / sum;
+            // Each row's softmax side by side; the losses summed in row order.
+            let losses: Vec<f64> = logits
+                .par_chunks_mut(cfg.vocab)
+                .zip(targets.par_iter())
+                .map(|(row, &target)| {
+                    let sum = vector::exp_shifted(row);
+                    let loss = ((row[target as usize] / sum).max(f32::MIN_POSITIVE) as f64).ln();
+                    if want {
+                        let scale = V8::splat(inv / sum);
+                        vector::update(row, [], |v, []| v * scale);
+                        row[target as usize] -= inv;
                     }
-                    row[target as usize] -= inv;
-                }
-            }
+                    loss
+                })
+                .collect();
+            let loss = -losses.iter().sum::<f64>();
             (logits, loss)
         });
         let loss = Loss {
@@ -4053,9 +4069,12 @@ fn attention_selected(
     let t = selection.len();
     let (qd, kvd, group) = (heads * hd, kv_heads * hd, heads / kv_heads);
     let scale = 1.0 / (hd as f32).sqrt();
-    let rows: Vec<(Vec<f32>, Vec<f32>)> = (0..t * heads)
-        .into_par_iter()
-        .map(|th| {
+    // A query head per task, written straight into its slot of `ctx`.
+    let mut ctx = Aligned::zeros(t * qd);
+    let probs: Vec<Vec<f32>> = ctx
+        .par_chunks_mut(hd)
+        .enumerate()
+        .map(|(th, out)| {
             let (i, h) = (th / heads, th % heads);
             let kh = h / group;
             let qv = &q[i * qd + h * hd..i * qd + (h + 1) * hd];
@@ -4063,41 +4082,25 @@ fn attention_selected(
             let mut p: Vec<f32> = sel
                 .iter()
                 .map(|&j| {
-                    qv.iter()
-                        .zip(&k[j * kvd + kh * hd..j * kvd + (kh + 1) * hd])
-                        .map(|(a, b)| a * b)
-                        .sum::<f32>()
-                        * scale
+                    vector::sum(
+                        [qv, &k[j * kvd + kh * hd..j * kvd + (kh + 1) * hd]],
+                        |[a, b]| a * b,
+                    ) * scale
                 })
                 .collect();
-            let max = p.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0.0f32;
-            for x in p.iter_mut() {
-                *x = (*x - max).exp();
-                sum += *x;
-            }
-            for x in p.iter_mut() {
-                *x /= sum;
-            }
-            let mut out = vec![0.0f32; hd];
+            let sum = V8::splat(vector::exp_shifted(&mut p));
+            vector::update(&mut p, [], |v, []| v / sum);
             for (&j, &pj) in sel.iter().zip(&p) {
-                for (o, &vv) in out
-                    .iter_mut()
-                    .zip(&v[j * kvd + kh * hd..j * kvd + (kh + 1) * hd])
-                {
-                    *o += pj * vv;
-                }
+                let pj = V8::splat(pj);
+                vector::update(
+                    out,
+                    [&v[j * kvd + kh * hd..j * kvd + (kh + 1) * hd]],
+                    |o, [vv]| pj.mul_add(vv, o),
+                );
             }
-            (out, p)
+            p
         })
         .collect();
-    let mut ctx = Aligned::zeros(t * qd);
-    let mut probs = Vec::with_capacity(t * heads);
-    for (th, (out, p)) in rows.into_iter().enumerate() {
-        let (i, h) = (th / heads, th % heads);
-        ctx[i * qd + h * hd..i * qd + (h + 1) * hd].copy_from_slice(&out);
-        probs.push(p);
-    }
     (ctx, probs)
 }
 
@@ -4130,23 +4133,24 @@ fn attention_selected_backward(
                     let dp: Vec<f32> = sel
                         .iter()
                         .map(|&j| {
-                            dc.iter()
-                                .zip(&v[j * kvd + kh * hd..j * kvd + (kh + 1) * hd])
-                                .map(|(a, b)| a * b)
-                                .sum()
+                            vector::sum(
+                                [dc, &v[j * kvd + kh * hd..j * kvd + (kh + 1) * hd]],
+                                |[a, b]| a * b,
+                            )
                         })
                         .collect();
-                    let inner: f32 = p.iter().zip(&dp).map(|(a, b)| a * b).sum();
-                    let ds: Vec<f32> = p
-                        .iter()
-                        .zip(&dp)
-                        .map(|(&p, &dp)| p * (dp - inner) * scale)
-                        .collect();
+                    let inner = V8::splat(vector::sum([p, &dp], |[a, b]| a * b));
+                    let mut ds = vec![0.0f32; p.len()];
+                    let sc = V8::splat(scale);
+                    vector::map(&mut ds, [p, &dp], |[p, dp]| p * (dp - inner) * sc);
                     let row = &mut dq[h * hd..(h + 1) * hd];
-                    for (&j, &ds) in sel.iter().zip(&ds) {
-                        for d in 0..hd {
-                            row[d] += ds * k[j * kvd + kh * hd + d];
-                        }
+                    for (&j, &d) in sel.iter().zip(&ds) {
+                        let d = V8::splat(d);
+                        vector::update(
+                            row,
+                            [&k[j * kvd + kh * hd..j * kvd + (kh + 1) * hd]],
+                            |o, [kk]| d.mul_add(kk, o),
+                        );
                     }
                     ds
                 })
@@ -4172,14 +4176,13 @@ fn attention_selected_backward(
             for &(i, n) in readers {
                 for h in 0..heads {
                     let kh = h / group;
-                    let p = probs[i * heads + h][n];
-                    let ds = ds[i][h][n];
+                    let p = V8::splat(probs[i * heads + h][n]);
+                    let ds = V8::splat(ds[i][h][n]);
                     let dc = &d_ctx[i * qd + h * hd..i * qd + (h + 1) * hd];
                     let qv = &q[i * qd + h * hd..i * qd + (h + 1) * hd];
-                    for d in 0..hd {
-                        dv[kh * hd + d] += p * dc[d];
-                        dk[kh * hd + d] += ds * qv[d];
-                    }
+                    let span = kh * hd..(kh + 1) * hd;
+                    vector::update(&mut dv[span.clone()], [dc], |o, [d]| p.mul_add(d, o));
+                    vector::update(&mut dk[span], [qv], |o, [qq]| ds.mul_add(qq, o));
                 }
             }
         });
@@ -4322,9 +4325,30 @@ fn column_block(dim: usize) -> usize {
 /// chunks.
 struct BlockWork {
     g_state: Vec<f32>,
-    before: Vec<f32>,
+    /// The block's state before every [`SEGMENT`]th token of the chunk.
+    marks: Vec<f32>,
+    /// Its states before each token of one segment.
+    segment: Vec<f32>,
     scratch: Vec<f32>,
     share: HeadGrads,
+}
+
+/// Tokens whose states the delta rule's backward holds at once: the states
+/// of a whole chunk would fill a core's second-level cache, and every
+/// backward step would then read its state from memory. A segment's are
+/// recomputed from the state marked before it, just before they are used.
+const SEGMENT: usize = 8;
+
+/// Slot `from` of `buffer` (slots `size` long) to read, and slot `to` to
+/// write.
+fn slots(buffer: &mut [f32], size: usize, from: usize, to: usize) -> (&[f32], &mut [f32]) {
+    if from < to {
+        let (low, high) = buffer.split_at_mut(to * size);
+        (&low[from * size..(from + 1) * size], &mut high[..size])
+    } else {
+        let (low, high) = buffer.split_at_mut(from * size);
+        (&high[..size], &mut low[to * size..(to + 1) * size])
+    }
 }
 
 /// `delta_step_backward`'s scratch, in floats per row of the state.
@@ -4354,6 +4378,28 @@ fn delta_step(
         return;
     }
     delta_step_portable(state, q, k, v, beta, decay, out);
+}
+
+/// The state after one token of [`delta_step`], from `prev` into `next`,
+/// without its output: what a backward pass recomputes between checkpoints.
+#[allow(clippy::too_many_arguments)]
+fn delta_advance(
+    prev: &[f32],
+    next: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    beta: f32,
+    decay: f32,
+    out: &mut [f32],
+) {
+    if vector_block(k.len(), out.len()) {
+        block::advance(prev, next, k, v, beta, decay);
+        return;
+    }
+    next.copy_from_slice(prev);
+    out.fill(0.0);
+    delta_step_portable(next, q, k, v, beta, decay, out);
 }
 
 /// [`delta_step`] for any block, summed in the engine's `delta_head_step`
@@ -4570,6 +4616,47 @@ mod block {
         }
         (V8::load(out) + o0.total()).store(out);
         (V8::load(&out[8..]) + o1.total()).store(&mut out[8..]);
+    }
+
+    /// [`step`]'s new state, read from `prev` and written to `next`, with
+    /// no output: the same roundings, `prev·decay` once and then fused with
+    /// `k·d`, so `next` is the state [`step`] leaves.
+    pub(super) fn advance(
+        prev: &[f32],
+        next: &mut [f32],
+        k: &[f32],
+        v: &[f32],
+        beta: f32,
+        decay: f32,
+    ) {
+        let rows = k.len();
+        assert!(prev.len() == rows * 16 && next.len() == rows * 16 && v.len() == 16);
+        let dv = V8::splat(decay);
+        let (mut sk0, mut sk1) = (Four::new(), Four::new());
+        for b4 in (0..rows).step_by(4) {
+            for j in 0..4 {
+                let b = b4 + j;
+                // SAFETY: row `b` of `rows` rows of 16, `rows` a multiple
+                // of eight.
+                unsafe {
+                    let kv = V8::splat(*k.get_unchecked(b));
+                    sk0.0[j] = kv.mul_add(V8::at(prev, b * 16) * dv, sk0.0[j]);
+                    sk1.0[j] = kv.mul_add(V8::at(prev, b * 16 + 8) * dv, sk1.0[j]);
+                }
+            }
+        }
+        let bv = V8::splat(beta);
+        let d0 = bv * (V8::load(v) - sk0.total());
+        let d1 = bv * (V8::load(&v[8..]) - sk1.total());
+        for b in 0..rows {
+            // SAFETY: as above.
+            unsafe {
+                let kv = V8::splat(*k.get_unchecked(b));
+                kv.mul_add(d0, V8::at(prev, b * 16) * dv).put(next, b * 16);
+                kv.mul_add(d1, V8::at(prev, b * 16 + 8) * dv)
+                    .put(next, b * 16 + 8);
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4830,6 +4917,24 @@ pub(crate) mod tests {
         assert_eq!(out_ours, out_theirs);
     }
 
+    /// Advancing a state out of place leaves, bit for bit, the state a
+    /// step in place does, on the vector block and on any other.
+    #[test]
+    fn advancing_a_state_is_stepping_it() {
+        let wave =
+            |n: usize, k: f32| -> Vec<f32> { (0..n).map(|i| (i as f32 * k).sin()).collect() };
+        for (rows, cols) in [(32, BLOCK), (5, 3)] {
+            let (q, k, v) = (wave(rows, 0.7), wave(rows, 1.3), wave(cols, 0.4));
+            let prev = wave(rows * cols, 0.21);
+            let mut stepped = prev.clone();
+            let mut out = vec![0.0; cols];
+            delta_step(&mut stepped, &q, &k, &v, 0.6, 0.9, &mut out);
+            let mut next = vec![f32::NAN; rows * cols];
+            delta_advance(&prev, &mut next, &q, &k, &v, 0.6, 0.9, &mut out);
+            assert_eq!(next, stepped, "{rows}x{cols}");
+        }
+    }
+
     /// The vector kernels give the portable ones' step and backward, to
     /// rounding, on a block of [`BLOCK`] columns.
     #[test]
@@ -5027,6 +5132,25 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// The delta rule's chunks and the segments its backward recomputes
+    /// move where states are kept, never what they are: a chunk spanning
+    /// several segments gives the gradient of short chunks, bit for bit.
+    #[test]
+    fn the_gradient_does_not_depend_on_the_chunk() {
+        let tokens: Vec<u32> = (0..24).map(|i| (i * 7 % 11) as u32).collect();
+        let targets: Vec<u32> = (0..24).map(|i| (i * 5 % 11) as u32).collect();
+        let gradient = |chunk: usize| {
+            let model = Model::new(Config { chunk, ..tiny() }, 9);
+            let mut grads = Aligned::zeros(model.layout.total);
+            model.forward_backward(&tokens, &targets, Some(&mut grads));
+            grads.to_vec()
+        };
+        let short = gradient(3);
+        assert!(short.iter().any(|g| *g != 0.0));
+        assert_eq!(gradient(20), short);
+        assert_eq!(gradient(SEGMENT), short);
     }
 
     /// Every element of the router, the shared gate and the experts against

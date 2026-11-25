@@ -58,6 +58,66 @@ out:
 orangu-server ./my-model-smoke-BF16.gguf
 ```
 
+## Supported formats
+
+Every format `orangu-gguf` reads or writes, in one place. The sections
+after this one say how each is used.
+
+### What a model is trained on
+
+The manifest itself is JSON or YAML. Each source it names is one of:
+
+| Source | How it is named |
+|:---|:---|
+| A Git repository | a remote (`https://…`, `git@…`) or a local path containing `.git` |
+| A directory of files | a local path |
+| An archive | `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tbz`, `.tar`, `.zip`, local or remote |
+| A PDF | a `.pdf` path or URL |
+
+Inside a source, these files are trained on:
+
+| Kind | Files |
+|:---|:---|
+| Documents | `.pdf` (its text layer), `.md`, `.rst`, `.adoc`, `.txt`, `.html` |
+| Source code | `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hpp`, `.cs`, `.go`, `.hs`, `.java`, `.js`, `.jsx`, `.mjs`, `.ts`, `.tsx`, `.kt`, `.lua`, `.ml`, `.php`, `.pl`, `.py`, `.r`, `.rb`, `.rs`, `.scala`, `.swift`, `.zig`, `.sql`, `.css` |
+| Scripts and configuration | `.sh`, `.bash`, `.zsh`, `.vim`, `.toml`, `.yaml`, `.yml` |
+| Files known by name | `Makefile`, `makefile`, `Dockerfile`, `CMakeLists.txt`, `README`, `LICENSE`, `COPYING` |
+| Compressed | any of the above as `.gz` or `.bz2`, judged by the name underneath |
+
+Extensions are matched without regard to case. Left out, and counted in
+the corpus line: other file types; minified and bundled files (`.min.`,
+`.bundle.`) and lock files (`.lock`); files that are not UTF-8 or contain
+a NUL byte; files over `max_file_size` (PDFs excepted); PDFs without a
+text layer (scans); and generated or vendored trees (`.git`, `.hg`,
+`.svn`, `.venv`, `__pycache__`, `build`, `dist`, `node_modules`, `out`,
+`target`, `third_party`, `vendor`).
+
+### What is converted
+
+| Input | Accepted |
+|:---|:---|
+| GGUF | one file, or a shard set named by its first shard; F32, F16 or BF16 weights, or quantized ones with `--allow-requantize` |
+| Hugging Face checkpoint | `*.safetensors` weights in F32, F16, BF16, or FP8 (`F8_E4M3`, `F8_E5M2`) with their scales, one file or a shard set with `model.safetensors.index.json`, beside `config.json`, `tokenizer.json` and `tokenizer_config.json`; a local directory or a repository name |
+| A listed model | a name or `NR` from `orangu-server list` |
+
+The architectures a checkpoint may be are listed under
+[Converting a Hugging Face checkpoint](#converting-a-hugging-face-checkpoint).
+
+### Importance matrices and calibration text
+
+| Input | Accepted |
+|:---|:---|
+| `--imatrix` | a GGUF importance matrix (`*.imatrix.gguf`), the older binary format (`*.imatrix`, `*.dat`), or a Hugging Face repository that publishes either |
+| `--calibration` | a UTF-8 text file |
+
+### What is written
+
+| Output | Format |
+|:---|:---|
+| Model | GGUF, one file or shards cut by `--split-max-size` or `--split-max-tensors`; any weight format in [Weight formats](#weight-formats), and `orangu-gguf --list-quantizations` lists them |
+| Importance matrix | GGUF, from `--imatrix-out` |
+| Training checkpoint | `checkpoint.bin` in the work directory, read back to resume |
+
 ## The manifest
 
 The manifest is the whole build. Every setting of a run lives in it, the
@@ -153,7 +213,7 @@ outcome than a parse failure.
 | `export_only` | `false` | Write the model from the checkpoint without training further |
 
 `log_every` is in **seconds**, unlike `eval_every` and `checkpoint_every`.
-A step is seconds at `tiny` and minutes at `2b`, so a count of steps is a
+A step is seconds at `tiny` and minutes at `1b`, so a count of steps is a
 different amount of output at every size — and it is worst at the size that
 runs for days, which is the one somebody is watching to see that it is
 still alive. A run prints a line a minute:
@@ -163,7 +223,7 @@ step 47/200  loss 7.6696  lr 9.23e-4  |g| 1.687  2.4k tok/s  elapsed 0d:0h:0m:20
 ```
 
 The interval is wall-clock and holds *inside* a step as well as between
-them — at `0.5b` and `2b` one step is minutes, and a line that waited for a
+them — at the larger sizes one step is minutes, and a line that waited for a
 step boundary would not arrive on any schedule you could predict. Those
 lines name the step in flight and carry the last finished step's numbers:
 
@@ -236,6 +296,40 @@ repositories:
     license: PostgreSQL
   - url: https://github.com/postgres/postgres
     license: PostgreSQL
+```
+
+#### Training from PDF files
+
+A model can be trained from PDF files alone. Put them in a directory and
+name the directory as the source:
+
+```json
+{
+  "name": "standards",
+  "vocab_size": 8192,
+  "allow_any_license": true,
+  "repositories": [
+    { "url": "/data/train", "license": "LicenseRef-Proprietary" }
+  ]
+}
+```
+
+Every `*.pdf` under the directory is found, however deep, and its text is
+what the tokenizer and the model learn from. Plain text and source files
+in the same directory are trained on beside them. Documents such as
+standards, specifications and books are seldom under an OSI-approved
+licence, so a manifest that trains on them sets `allow_any_license`.
+
+The PDFs are extracted side by side, and the pages of each one side by
+side, before the tokenizer is trained. The text is kept, so a later run
+starts from it, and a PDF that changes is extracted again. Running
+headers, page numbers and the leader dots of a table of contents are left
+out. Each PDF reports a line as it is extracted, and one line sums up the
+step:
+
+```
+corpus: /data/train/manual.pdf: <pages> pages, <MiB> MiB of PDF, <MiB> MiB of text in <s> s
+corpus: <n> PDFs, <n> extracted (<MiB> MiB of text) in <s> s, <n> kept from earlier runs
 ```
 
 Files inside a source may be compressed: a `.gz` or `.bz2` is read
@@ -389,8 +483,8 @@ Expect the real corpus to take a while and a fair amount of disk: the Linux
 kernel alone is over a gigabyte of source at `--depth 1`, and the whole set
 is several. It is also worth being honest about its scale — it is a corpus
 of hundreds of millions of tokens, which is a real training set for
-`smoke` and `0.5b`, and short of the budget the `2b` size wants from a
-single pass (see **Sizes** below).
+`smoke`, and short of the budget the `1b` size wants from a single pass
+(see **Sizes** below).
 
 ## The command line
 
@@ -487,6 +581,13 @@ serves it by that name; `-o` writes it elsewhere.
 `-m` takes, in this order: a model file; a model `orangu-server list`
 shows, by `MODEL` name or `NR`; a checkpoint directory; a Hugging Face
 repository.
+
+An FP8 checkpoint converts too. Each `F8_E4M3` or `F8_E5M2` weight is read
+multiplied by its scales: a `weight_scale_inv` of one scale per block, or a
+`weight_scale` of one scale for the weight, one per row, or one per block.
+The activation scales (`input_scale`) only matter when running in FP8 and
+are not written. The file is written in the weight format `-q` asks for, as
+from any other checkpoint.
 
 Architectures converted:
 

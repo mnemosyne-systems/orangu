@@ -327,8 +327,8 @@ pub(crate) fn batch_gradient<N: Network>(
         if direct {
             targets.push(&mut grads[..]);
         }
+        // The spare buffers are zero: allocated so, and left so by the fold.
         for buffer in spare[..used].iter_mut() {
-            buffer.fill(0.0);
             targets.push(&mut buffer[..]);
         }
         losses.extend(
@@ -343,17 +343,32 @@ pub(crate) fn batch_gradient<N: Network>(
                 .collect::<Vec<f32>>(),
         );
         drop(targets);
+        // One pass: each piece of the sum takes the buffers' pieces in
+        // window order, and each buffer's piece is zeroed as it is read.
         time(Stage::GradientFold, || {
-            for buffer in &spare[..used] {
-                grads
-                    .par_chunks_mut(1 << 16)
-                    .zip(buffer.par_chunks(1 << 16))
-                    .for_each(|(sum, part)| {
-                        for (s, p) in sum.iter_mut().zip(part) {
-                            *s += p;
-                        }
-                    });
+            const PIECE: usize = 1 << 14;
+            let mut pieces: Vec<Vec<&mut [f32]>> = grads
+                .chunks_mut(PIECE)
+                .map(|sum| {
+                    let mut piece = Vec::with_capacity(used + 1);
+                    piece.push(sum);
+                    piece
+                })
+                .collect();
+            for buffer in spare[..used].iter_mut() {
+                for (piece, part) in pieces.iter_mut().zip(buffer.chunks_mut(PIECE)) {
+                    piece.push(part);
+                }
             }
+            pieces.into_par_iter().for_each(|mut piece| {
+                let (sum, parts) = piece.split_first_mut().expect("the sum is first");
+                for part in parts.iter_mut() {
+                    for (s, p) in sum.iter_mut().zip(part.iter_mut()) {
+                        *s += *p;
+                        *p = 0.0;
+                    }
+                }
+            });
         });
         next += group.len();
     }
@@ -431,14 +446,17 @@ pub fn run<N: Network>(
     if let Some(card) = crate::accel::card() {
         println!("large matrix products on {}", card.device.name);
     }
+    stages::phase("graphics devices ready");
     if let Some(npu) = crate::npu::npu() {
         println!(
             "matrix products shared with the NPU ({} cores) where it measures faster",
             npu.cores()
         );
     }
+    stages::phase("NPU checked");
     // The channel's gguf nodes free to train take sequences of every step.
     let mut links = crate::jobs::claim_for("train");
+    stages::phase("channel checked");
     let names: Vec<String> = std::iter::once(crate::jobs::HERE.to_string())
         .chain(links.iter().map(|l| l.found.name.clone()))
         .collect();

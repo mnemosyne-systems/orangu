@@ -323,8 +323,9 @@ the accelerators the machine has:
   reads them four floats at a time; the last two each come with a 32 and a
   64 output tile per workgroup. The four-float kernel needs offsets, strides and
   depths that are multiples of four, and a product without them takes the
-  fastest of the others. At the start one product is timed with each
-  kernel and on the processor, and so is the fixed cost of one call. A
+  fastest of the others. At the start one product is timed four times
+  with each kernel, in turn, and on the processor, the best of each
+  counting, and so is the fixed cost of one call. A
   line reports every rate, the call cost and the choice, and the fastest
   kernel is the one used. An integrated GPU slower than the
   processor, but at least a quarter of its rate, takes a share of the

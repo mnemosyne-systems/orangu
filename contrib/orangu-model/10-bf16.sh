@@ -21,11 +21,12 @@
 # script. Anything passed here is handed straight to `orangu-gguf`, so a
 # one-off override still works:
 #
-#   ./10-bf16.sh -ts 0.5b
+#   ./10-bf16.sh -ts smoke
 #
-# This is the long one. `2b` is weeks of continuous CPU compute and wants
-# ~32 GB of memory for the weights, their gradients and the optimizer's two
-# moments; the corpus clone alone is several gigabytes of disk.
+# This is the long one. `1b` is days or longer of continuous compute and
+# wants ~17 GB of memory for the weights, their gradients and the
+# optimizer's two moments; the corpus clone alone is several gigabytes of
+# disk.
 #
 # It is safe to interrupt: a checkpoint is written every 200 steps, and
 # `"resume": true` in the manifest continues from it.

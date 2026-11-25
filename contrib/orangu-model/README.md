@@ -132,9 +132,9 @@ there is a `models--<org>--<name>` directory on its path:
 
 ```
 NR  MODEL                               QUANT   SIZE       SUPPORTED
- 1  mnemosynesystems/orangu-smoke-GGUF  BF16    14.77 MiB  Yes (qwen3)
- 2  mnemosynesystems/orangu-smoke-GGUF  Q4_K_M   4.99 MiB  Yes (qwen3)
- 3  mnemosynesystems/orangu-smoke-GGUF  Q6_K     6.21 MiB  Yes (qwen3)
+ 1  mnemosynesystems/orangu-smoke-GGUF  BF16    <size>     Yes (qwen4exp)
+ 2  mnemosynesystems/orangu-smoke-GGUF  Q4_K_M  <size>     Yes (qwen4exp)
+ 3  mnemosynesystems/orangu-smoke-GGUF  Q6_K    <size>     Yes (qwen4exp)
 ```
 
 ```sh
@@ -142,7 +142,7 @@ orangu-server --model mnemosynesystems/orangu-smoke-GGUF:Q4_K_M
 ```
 
 One repository per *training size*, with every quantization of that size
-inside it, so a `smoke` build and a `2b` build never land in the same one.
+inside it, so a `smoke` build and a `1b` build never land in the same one.
 `ORANGU_MODEL_ORG` and `ORANGU_MODEL_NAME` change the two halves of the
 name; `./install.sh a.gguf b.gguf` installs only what you name.
 
@@ -174,7 +174,7 @@ and its default.
 
 ```json
 {
-  "training_size": "0.5b",
+  "training_size": "smoke",
   "context_size": "32k",
   "epochs": 3,
   "repositories": [ ... ]
@@ -185,7 +185,7 @@ Anything passed to a script is handed straight to `orangu-gguf`, so a
 one-off override still works without editing anything:
 
 ```sh
-./10-bf16.sh -ts 0.5b        # try the smaller size before committing
+./10-bf16.sh -ts smoke       # try the smaller size before committing
 ./20-q6_k.sh path/to/other-BF16.gguf
 ```
 
@@ -208,12 +208,14 @@ everything in `smoke/` so it never collides with the real run.
   `PowerToys`) are a gigabyte or more of source on their own — and English
   Wikipedia adds whatever `max_bytes` says (8 GiB by default). The first
   run is also the slow one: `jobs` clones at a time, over the network. A
-  `2b` checkpoint is another ~32 GB, and it is rewritten every 200 steps.
+  `1b` checkpoint is another ~13 GB, and it is rewritten every 200 steps.
 - **Memory.** Training holds four numbers per parameter: the weight, its
-  gradient, and the optimizer's two moments. That is ~32 GB for `2b`
-  before activations, and ~8 GB for `0.5b`.
-- **Time.** Everything runs on the CPU in 32-bit floating point. `smoke` is
-  minutes. `0.5b` is days. `2b` is weeks.
+  gradient, and the optimizer's two moments. That is ~17 GB for `1b`
+  before activations and the gradients of the sequences run side by side,
+  and ~4 GB for `smoke`.
+- **Time.** Training runs in 32-bit floating point on every core, and on
+  the graphics cards and NPU the machine has. `smoke` is minutes. `1b` is
+  days or longer, depending on the machine.
 - **Re-running a stage.** A finished run leaves a checkpoint, and the next
   run replaces it and says so. Only an *unfinished* one stops a run, so
   `00-smoke.sh` can be run as often as you like without cleaning up first.
@@ -225,10 +227,10 @@ everything in `smoke/` so it never collides with the real run.
 ### A word on the token budget
 
 A model is only as good as the data it saw, and the rule of thumb is at
-least 20 tokens of training data per parameter — ~40B tokens for `2b`.
+least 20 tokens of training data per parameter — ~21B tokens for `1b`.
 This corpus is several billion tokens with Wikipedia in it — the sixty-six
 repositories are most of that, and Wikipedia the rest. That makes it a real
-training set for `smoke` and `0.5b`, and still short of what `2b` wants
-from a single pass; raise `epochs`, or widen `corpus.json` further, before
-reading much into a `2b` result. `orangu-gguf` prints the exact token count after packing, so
+training set for `smoke`, and still short of what `1b` wants from a single
+pass; raise `epochs`, or widen `corpus.json` further, before reading much
+into a `1b` result. `orangu-gguf` prints the exact token count after packing, so
 the first run tells you where you actually stand.

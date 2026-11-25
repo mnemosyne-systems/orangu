@@ -356,27 +356,32 @@ pub fn step<N: Network>(
             .collect();
         s.running.retain(|&(w, _, _)| w != i);
         if s.done(i) {
+            // Back to the pool zero, as every buffer in it is.
+            let mut part = part;
+            part.par_chunks_mut(1 << 16).for_each(|c| c.fill(0.0));
             s.pool.push(part);
             return None;
         }
         counted();
         s.pending.insert(i, (loss, part));
         let mut sum = grads.lock().unwrap();
-        while let Some((loss, part)) = {
+        while let Some((loss, mut part)) = {
             let at = s.losses.len();
             s.pending.remove(&at)
         } {
             let first = s.losses.is_empty();
+            // Added in, and left zero for the pool.
             sum.par_chunks_mut(1 << 16)
-                .zip(part.par_chunks(1 << 16))
+                .zip(part.par_chunks_mut(1 << 16))
                 .for_each(|(sum, part)| {
                     if first {
                         sum.copy_from_slice(part);
                     } else {
-                        for (s, p) in sum.iter_mut().zip(part) {
+                        for (s, p) in sum.iter_mut().zip(part.iter()) {
                             *s += p;
                         }
                     }
+                    part.fill(0.0);
                 });
             s.losses.push(loss);
             s.pool.push(part);
@@ -504,7 +509,7 @@ pub fn step<N: Network>(
                 .par_iter_mut()
                 .zip(group.par_iter())
                 .map(|(part, &i)| {
-                    part.fill(0.0);
+                    // Zero: every buffer the pool holds is.
                     model.pass(
                         &windows[i][..sequence],
                         &windows[i][1..],
