@@ -678,7 +678,10 @@ pub(crate) mod tests {
                 "{nodes} nodes: the gradient differs"
             );
         }
-        REMOTE_PAUSE_MS.store(2000, std::sync::atomic::Ordering::Relaxed);
+        // The slow node's pass is several times what the whole step takes
+        // here even on a slow machine, so finishing before it is a property
+        // of the step and not of the machine's speed.
+        REMOTE_PAUSE_MS.store(6000, std::sync::atomic::Ordering::Relaxed);
         let addr = Worker::start(settings()).unwrap().1;
         let found = orangu::workers::channel::probe(
             addr,
@@ -703,7 +706,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         assert!(
-            began.elapsed() < std::time::Duration::from_millis(1500),
+            began.elapsed() < std::time::Duration::from_millis(4500),
             "the step waited for the slow node's pass"
         );
         REMOTE_PAUSE_MS.store(0, std::sync::atomic::Ordering::Relaxed);

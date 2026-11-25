@@ -806,9 +806,18 @@ mod tests {
             &[Root::repository(dir.path().to_path_buf(), 1024)],
             &exclude,
         );
+        // By components, so the test reads the same on every platform's
+        // separator.
         let names: Vec<String> = files
             .iter()
-            .map(|f| f.strip_prefix(dir.path()).unwrap().display().to_string())
+            .map(|f| {
+                f.strip_prefix(dir.path())
+                    .unwrap()
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
             .collect();
         assert_eq!(names, ["docs/a.md", "docs/old/c.rs", "keep.md"]);
         assert_eq!(report.excluded, 2);
