@@ -1937,7 +1937,12 @@ pub(crate) fn auto_review_finding_body(line: &str) -> Option<String> {
 /// like `verdict handling is wrong ...` stays a finding.
 pub(crate) fn auto_review_header_rest<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     let cleaned = line.trim_start_matches(['#', '*', '_', '`', ' ']);
-    if cleaned.len() < name.len() || !cleaned[..name.len()].eq_ignore_ascii_case(name) {
+    // `get`, not `[..]`: the line is model output and may start with a
+    // multi-byte character, where the byte offset is not a char boundary.
+    if !cleaned
+        .get(..name.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(name))
+    {
         return None;
     }
     let rest = cleaned[name.len()..]
@@ -3864,6 +3869,20 @@ mod tests {
             findings,
             vec!["42: unwrap may panic (added on the hot path)".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_auto_review_category_response_reads_non_ascii_findings() {
+        use crate::review::parse_auto_review_category_response;
+
+        // Byte 7 (the length of "verdict") falls inside `字`, which used to
+        // panic while checking whether the line is a header.
+        let (approved, findings) = parse_auto_review_category_response(
+            "VERDICT: REJECT\nFINDINGS:\n- 文字列の境界で落ちる\n",
+            80,
+        );
+        assert_eq!(approved, Some(false));
+        assert_eq!(findings, vec!["文字列の境界で落ちる".to_string()]);
     }
 
     #[test]

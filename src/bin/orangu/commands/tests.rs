@@ -2778,3 +2778,35 @@ fn parses_undo_and_rewind_forms() {
         Some(LocalCommand::Rewind(RewindSubcommand::Usage))
     ));
 }
+
+#[test]
+fn non_ascii_prompts_are_left_for_the_model() {
+    // Each of these puts a multi-byte character across the byte offset of
+    // some natural-language prefix, which used to panic.
+    for prompt in [
+        "日本語のテキストを説明して",
+        "这个函数是做什么的",
+        "Erkläre mir bitte diese Funktion",
+        "Что делает этот код?",
+        "¿Qué hace este archivo?",
+        "🙂 what does this do",
+    ] {
+        assert!(parse_local_command(prompt).is_none(), "{prompt:?}");
+    }
+}
+
+#[test]
+fn strip_ascii_affixes_handle_non_ascii_input() {
+    assert_eq!(
+        strip_ascii_prefix("日本語のテキスト", "diff against "),
+        None
+    );
+    assert_eq!(strip_ascii_suffix("日本語のテキスト", " please"), None);
+    assert_eq!(
+        strip_ascii_prefix("Diff against 機能", "diff against "),
+        Some("機能")
+    );
+    assert_eq!(strip_ascii_suffix("説明 PLEASE", " please"), Some("説明"));
+    assert_eq!(strip_ascii_prefix("ab", "abc"), None);
+    assert_eq!(strip_ascii_suffix("ab", "abc"), None);
+}
