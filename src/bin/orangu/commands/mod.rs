@@ -713,6 +713,9 @@ pub enum LocalCommand<'a> {
     PendingList,
     PendingDelete(Option<usize>),
     Skills,
+    /// `/knowledge [stale|deprecated|unverified]`: the knowledge bundles, or
+    /// the concepts in them that need a look.
+    Knowledge(orangu::knowledge::Report),
     /// `/agents [search words]`: the custom subagents `run_agent` can start.
     Agents(Option<Cow<'a, str>>),
     /// `/tasks`, `/tasks <id>`, `/tasks stop <id>`: this conversation's

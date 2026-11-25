@@ -42,6 +42,7 @@ jobs:
           20-configuration.md:configuration.html:Configuration
           31-workspaces.md:workspaces.html:Workspaces
           32-skills.md:skills.html:Skills
+          33-knowledge.md:knowledge.html:Knowledge
           40-terminal.md:terminal.html:Terminal Interface
           41-core_tools.md:core-tools.html:Core Tools
           42-git_tools.md:git-tools.html:Git Tools

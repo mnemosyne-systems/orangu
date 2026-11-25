@@ -483,6 +483,9 @@ async fn run_persisted_inner(
     .with_subagent_depth(config.subagent_depth);
     let skills = SkillRegistry::discover(workspace);
     let tools = tools.with_skills(std::sync::Arc::new(skills.clone()));
+    let tools = tools.with_knowledge(std::sync::Arc::new(
+        orangu::knowledge::KnowledgeRegistry::discover(workspace, &config.knowledge),
+    ));
     let mut system = build_workspace_system_prompt(&profile, &skills, workspace, None);
     if !mcp.instructions().is_empty() {
         system.push_str("\n\n");

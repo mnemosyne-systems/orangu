@@ -122,6 +122,10 @@ pub struct ClientAppConfiguration {
     pub ssh: SshMode,
     /// `[orangu].diagnostics`, `diagnostics_command`, `diagnostics_timeout`.
     pub diagnostics: crate::diagnostics::DiagnosticsConfig,
+    /// `[orangu].knowledge`: knowledge bundles to read besides the ones in
+    /// `~/.orangu/knowledge/` and `<workspace>/.orangu/knowledge/`; a
+    /// relative path is from the workspace (see [`crate::knowledge`]).
+    pub knowledge: Vec<std::path::PathBuf>,
 }
 
 /// A configured Model Context Protocol server that is already running and
@@ -412,6 +416,17 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
     let subagent_background = parse_client_field(&client, "subagent_background", || false)?;
     let ssh = parse_client_field(&client, "ssh", SshMode::default)?;
     let compact_at = parse_client_field(&client, "compact_at", || DEFAULT_COMPACT_AT)?;
+    let knowledge = client
+        .get("knowledge")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+                .map(home_path)
+                .collect()
+        })
+        .unwrap_or_default();
     if compact_at > 100 {
         return Err(anyhow!(
             "invalid value for [{CLIENT_SECTION}].compact_at: {compact_at} (0 to 100)"
@@ -516,7 +531,18 @@ pub fn load_client_configuration(path: &Path) -> Result<ClientAppConfiguration> 
         web_search,
         ssh,
         diagnostics,
+        knowledge,
     })
+}
+
+/// `path` with a leading `~` meaning the home directory.
+fn home_path(path: &str) -> std::path::PathBuf {
+    match (path.strip_prefix('~'), home::home_dir()) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
+            home.join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => std::path::PathBuf::from(path),
+    }
 }
 
 /// Remove and parse the sections reserved for running HTTP MCP servers before the
@@ -1191,6 +1217,28 @@ mod tests {
         assert_eq!(load("compact_at = 70").unwrap().compact_at, 70);
         assert!(load("compact_at = 101").is_err());
         assert!(load("compact_at = high").is_err());
+    }
+
+    #[test]
+    fn knowledge_is_a_list_of_paths_and_empty_by_default() {
+        let load = |extra: &str| {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            writeln!(
+                file,
+                "[orangu]\nserver = main\n{extra}\n[main]\nendpoint = http://localhost:8100/v1\nmodel = model\n"
+            )
+            .unwrap();
+            load_client_configuration(file.path()).unwrap()
+        };
+        assert!(load("").knowledge.is_empty());
+        let home = home::home_dir().unwrap();
+        assert_eq!(
+            load("knowledge = docs/kb, ~/bundles/retail ,").knowledge,
+            [
+                std::path::PathBuf::from("docs/kb"),
+                home.join("bundles/retail")
+            ]
+        );
     }
 
     #[test]

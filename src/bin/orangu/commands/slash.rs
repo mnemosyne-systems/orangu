@@ -141,6 +141,7 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
         "/quit" => Some(LocalCommand::Quit),
         "/pending" => Some(LocalCommand::PendingList),
         "/skills" => Some(LocalCommand::Skills),
+        "/knowledge" => Some(LocalCommand::Knowledge(orangu::knowledge::Report::Bundles)),
         "/agents" => Some(LocalCommand::Agents(None)),
         "/tasks" => Some(LocalCommand::Tasks(TasksSubcommand::List)),
         "/fork" => Some(LocalCommand::Fork(None)),
@@ -472,6 +473,9 @@ pub fn parse_slash_command(input: &str) -> Option<LocalCommand<'_>> {
                     [id] => TasksSubcommand::Show(Cow::Borrowed(id)),
                     _ => TasksSubcommand::List,
                 }));
+            }
+            if let Some(view) = input.strip_prefix("/knowledge ") {
+                return orangu::knowledge::Report::parse(view.trim()).map(LocalCommand::Knowledge);
             }
             if let Some(query) = input.strip_prefix("/agents ") {
                 let query = query.trim();

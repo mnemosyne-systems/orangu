@@ -1844,6 +1844,26 @@ fn parses_tasks_commands() {
 }
 
 #[test]
+fn parses_knowledge_commands() {
+    use orangu::knowledge::Report;
+    for (input, report) in [
+        ("/knowledge", Report::Bundles),
+        ("/knowledge stale", Report::Stale),
+        ("/knowledge  deprecated", Report::Deprecated),
+        ("/knowledge unverified", Report::Unverified),
+    ] {
+        assert!(
+            matches!(parse_local_command(input), Some(LocalCommand::Knowledge(r)) if r == report),
+            "{input}"
+        );
+    }
+    assert!(!matches!(
+        parse_local_command("/knowledge fresh"),
+        Some(LocalCommand::Knowledge(_))
+    ));
+}
+
+#[test]
 fn parses_agents_commands() {
     assert!(matches!(
         parse_local_command("/agents"),

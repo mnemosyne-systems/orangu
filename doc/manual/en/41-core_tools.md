@@ -62,6 +62,22 @@ Invoke the bundled debugging skill:
 
 \newpage
 
+## /knowledge
+
+Lists the knowledge bundles (Open Knowledge Format) and how many of their
+concepts are stale, deprecated, unverified or drafts. `/knowledge stale`,
+`/knowledge deprecated` and `/knowledge unverified` list those concepts. See
+the Knowledge chapter.
+
+**Examples**
+
+```text
+/knowledge
+/knowledge stale
+```
+
+\newpage
+
 ## /agents
 
 Lists the custom subagents: Markdown agent files in the format Claude Code

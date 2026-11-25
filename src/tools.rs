@@ -53,6 +53,7 @@ fn plan_mode_allows(name: &str) -> bool {
             | "web_search"
             | "browse"
             | "use_skill"
+            | "knowledge"
             | "graph_lookup"
             | "graph_explain"
             | "graph_path"
@@ -166,6 +167,8 @@ pub struct ToolExecutor {
     agent_hooks: Option<Arc<crate::agents::agent_hooks::AgentHooks>>,
     /// Skills a subagent can load with `use_skill`.
     skills: Option<Arc<crate::skills::SkillRegistry>>,
+    /// The knowledge bundles the `knowledge` tool reads.
+    knowledge: Option<Arc<crate::knowledge::KnowledgeRegistry>>,
     /// The licence generated files are written under — `/license`'s answer
     /// for this session, or [`crate::license::Choice::Auto`] to follow what
     /// the workspace declares.
@@ -314,6 +317,7 @@ impl ToolExecutor {
             checkpoints,
             agent_hooks: None,
             skills: None,
+            knowledge: None,
             depth: 0,
             max_depth: crate::config::default_subagent_depth(),
             background_default: false,
@@ -446,6 +450,18 @@ impl ToolExecutor {
     pub fn with_skills(mut self, skills: Arc<crate::skills::SkillRegistry>) -> Self {
         self.skills = (!skills.all().is_empty()).then_some(skills);
         self
+    }
+
+    /// Offers `knowledge`, which reads `knowledge`'s bundles, when there are
+    /// any. An empty registry is kept too, for what `/knowledge` reports.
+    pub fn with_knowledge(mut self, knowledge: Arc<crate::knowledge::KnowledgeRegistry>) -> Self {
+        self.knowledge = Some(knowledge);
+        self
+    }
+
+    /// The knowledge bundles, for `/knowledge`.
+    pub fn knowledge(&self) -> Option<&crate::knowledge::KnowledgeRegistry> {
+        self.knowledge.as_deref()
     }
 
     /// Adds the MCP services a custom agent defines itself.
@@ -925,6 +941,22 @@ impl ToolExecutor {
                 }),
             ));
         }
+        if let Some(knowledge) = self.knowledge.as_ref().filter(|k| !k.is_empty()) {
+            defs.push(tool(
+                "knowledge",
+                &knowledge.tool_description(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["list", "search", "read"]},
+                        "bundle": {"type": "string"},
+                        "path": {"type": "string"},
+                        "query": {"type": "string"}
+                    },
+                    "required": ["action"]
+                }),
+            ));
+        }
         if self.memory_file.is_some() {
             defs.push(tool(
                 "save_memory",
@@ -1099,6 +1131,7 @@ impl ToolExecutor {
                 | "fetch_url"
                 | "web_search"
                 | "use_skill"
+                | "knowledge"
         )
     }
 
@@ -1372,6 +1405,7 @@ impl ToolExecutor {
                 }
             }
             "use_skill" => self.use_skill(arguments),
+            "knowledge" => self.knowledge_tool(arguments),
             "ssh_login" | "ssh_copy" | "ssh_logout" => self.ssh_tool(name, arguments).await,
             "list_directory" => self.list_directory(arguments).await,
             "fetch_url" => self.fetch_url(arguments).await,
@@ -1756,6 +1790,30 @@ impl ToolExecutor {
             .and_then(Value::as_str)
             .unwrap_or_default();
         Ok(skill.render_activation(arguments))
+    }
+
+    fn knowledge_tool(&self, arguments: &Map<String, Value>) -> Result<String> {
+        let knowledge = self
+            .knowledge
+            .as_ref()
+            .filter(|knowledge| !knowledge.is_empty())
+            .ok_or_else(|| anyhow!("no knowledge bundles are available here"))?;
+        let argument = |name: &str| arguments.get(name).and_then(Value::as_str);
+        let now = chrono::Utc::now();
+        match argument("action").map(str::trim) {
+            Some("list") => knowledge.list(argument("bundle"), argument("path")),
+            Some("search") => knowledge.search(
+                argument("bundle"),
+                argument("query").unwrap_or_default(),
+                now,
+            ),
+            Some("read") => knowledge.read(
+                argument("bundle"),
+                argument("path").ok_or_else(|| anyhow!("read needs the concept's 'path'"))?,
+                now,
+            ),
+            _ => Err(anyhow!("'action' must be list, search or read")),
+        }
     }
 
     fn save_memory(&self, arguments: &Map<String, Value>) -> Result<String> {
@@ -3410,6 +3468,59 @@ mod file_lifecycle_tool_tests {
                 .await;
         });
         base
+    }
+
+    /// `knowledge` is offered only when there are bundles, lists them in its
+    /// description, reads them, and is open to plan mode.
+    #[tokio::test]
+    async fn knowledge_is_offered_with_bundles_and_reads_them() {
+        use crate::knowledge::{BundleSource, KnowledgeRegistry};
+        let workspace = tempfile::tempdir().unwrap();
+        let bundle = workspace.path().join("retail");
+        std::fs::create_dir_all(bundle.join("metrics")).unwrap();
+        std::fs::write(
+            bundle.join("index.md"),
+            "---\ntitle: Retail\ndescription: Sales and margin.\n---\n",
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join("metrics/revenue.md"),
+            "---\ntype: Metric\ntitle: Revenue\n---\nNet of discounts.\n",
+        )
+        .unwrap();
+
+        let empty = ToolExecutor::new(workspace.path())
+            .with_knowledge(Arc::new(KnowledgeRegistry::default()));
+        assert!(!tool_names(&empty).contains(&"knowledge".to_string()));
+
+        let executor = ToolExecutor::new(workspace.path()).with_knowledge(Arc::new(
+            KnowledgeRegistry::from_roots([(bundle, BundleSource::Project)]),
+        ));
+        let definition = executor
+            .definitions()
+            .into_iter()
+            .find(|def| def.function.name == "knowledge")
+            .expect("knowledge is offered");
+        assert!(
+            definition
+                .function
+                .description
+                .ends_with("- retail: Retail (Sales and margin.)")
+        );
+        let read = executor
+            .execute(
+                "knowledge",
+                &json!({"action": "read", "path": "metrics/revenue"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            )
+            .await
+            .unwrap();
+        assert!(read.contains("Trust: unverified, stable\n"));
+        assert!(read.ends_with("---\nNet of discounts."));
+        assert!(plan_mode_allows("knowledge"));
+        assert!(executor.parallel_safe("knowledge"));
     }
 
     /// The main agent gets `research_web` only with engines, and never

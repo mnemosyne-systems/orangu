@@ -1774,6 +1774,13 @@ pub(crate) fn handle_command(
             }
             Ok(CommandOutcome::Output(out))
         }
+        LocalCommand::Knowledge(report) => Ok(CommandOutcome::Output(
+            tools
+                .knowledge()
+                .cloned()
+                .unwrap_or_default()
+                .report(report, chrono::Utc::now()),
+        )),
         LocalCommand::Tasks(subcommand) => Ok(tasks_command(tools.tasks(), &subcommand)),
         LocalCommand::Fork(task) => Ok(
             match orangu::subagents::fork(
