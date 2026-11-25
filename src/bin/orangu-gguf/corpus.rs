@@ -135,6 +135,56 @@ pub struct ScanReport {
     pub kept: usize,
     pub skipped_extension: usize,
     pub skipped_large: usize,
+    pub excluded: usize,
+}
+
+/// The manifest's `exclude` patterns: those without a `/` matched against a
+/// file's name, the others against its path inside its source, where `*`
+/// stops at a `/` and `**` crosses them.
+#[derive(Default)]
+pub struct Exclude {
+    names: Option<globset::GlobSet>,
+    paths: Option<globset::GlobSet>,
+}
+
+impl Exclude {
+    pub fn new(patterns: &[String]) -> Result<Self> {
+        let mut names = globset::GlobSetBuilder::new();
+        let mut paths = globset::GlobSetBuilder::new();
+        let (mut any_name, mut any_path) = (false, false);
+        for pattern in patterns {
+            let glob = globset::GlobBuilder::new(pattern.trim_start_matches("./"))
+                .literal_separator(true)
+                .build()
+                .with_context(|| format!("the exclude pattern {pattern:?}"))?;
+            if pattern.contains('/') {
+                paths.add(glob);
+                any_path = true;
+            } else {
+                names.add(glob);
+                any_name = true;
+            }
+        }
+        Ok(Exclude {
+            names: any_name.then(|| names.build()).transpose()?,
+            paths: any_path.then(|| paths.build()).transpose()?,
+        })
+    }
+
+    /// Whether `path`, found under `root`, is left out.
+    fn matches(&self, root: &Path, path: &Path) -> bool {
+        let by_name = self
+            .names
+            .as_ref()
+            .zip(path.file_name())
+            .is_some_and(|(set, name)| set.is_match(name));
+        by_name
+            || self
+                .paths
+                .as_ref()
+                .zip(path.strip_prefix(root).ok())
+                .is_some_and(|(set, inside)| set.is_match(inside))
+    }
 }
 
 /// The archive shapes a source can arrive as. Extension first, because a
@@ -421,7 +471,7 @@ fn safe_join(root: &Path, entry: &Path) -> Option<PathBuf> {
 
 /// Every file under `roots` worth reading, and what was left out.
 /// Every file under `roots` worth reading, and what was left out.
-pub fn scan(roots: &[Root]) -> (Vec<PathBuf>, ScanReport) {
+pub fn scan(roots: &[Root], exclude: &Exclude) -> (Vec<PathBuf>, ScanReport) {
     let mut files = Vec::new();
     let mut report = ScanReport::default();
 
@@ -439,6 +489,10 @@ pub fn scan(roots: &[Root]) -> (Vec<PathBuf>, ScanReport) {
             });
         for entry in walk.filter_map(|e| e.ok()) {
             if !entry.file_type().is_file() {
+                continue;
+            }
+            if exclude.matches(&root.path, entry.path()) {
+                report.excluded += 1;
                 continue;
             }
             if !wanted_name(entry.path()) {
@@ -732,6 +786,35 @@ pub fn read_document(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    /// A pattern without a `/` leaves out a name anywhere, one with a `/` a
+    /// path inside the source, and what they leave out is counted.
+    #[test]
+    fn excluded_files_are_left_out_and_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("docs/old")).unwrap();
+        for name in [
+            "train.sh",
+            "keep.md",
+            "docs/a.md",
+            "docs/old/b.md",
+            "docs/old/c.rs",
+        ] {
+            fs::write(dir.path().join(name), "text").unwrap();
+        }
+        let exclude = Exclude::new(&["*.sh".into(), "./docs/old/*.md".into()]).unwrap();
+        let (files, report) = scan(
+            &[Root::repository(dir.path().to_path_buf(), 1024)],
+            &exclude,
+        );
+        let names: Vec<String> = files
+            .iter()
+            .map(|f| f.strip_prefix(dir.path()).unwrap().display().to_string())
+            .collect();
+        assert_eq!(names, ["docs/a.md", "docs/old/c.rs", "keep.md"]);
+        assert_eq!(report.excluded, 2);
+        assert!(Exclude::new(&["[".into()]).is_err());
+    }
+
     /// A source is what it turns out to be, not what its name suggests.
     #[test]
     fn sources_are_classified_by_looking() {
@@ -856,7 +939,10 @@ mod tests {
         fs::write(dir.path().join("keep.rs"), "fn main() {}").unwrap();
         fs::write(dir.path().join("huge.rs"), vec![b'x'; 4096]).unwrap();
 
-        let (files, report) = scan(&[Root::repository(dir.path().to_path_buf(), 1024)]);
+        let (files, report) = scan(
+            &[Root::repository(dir.path().to_path_buf(), 1024)],
+            &Exclude::default(),
+        );
         assert_eq!(files.len(), 1, "{files:?}");
         assert!(files[0].ends_with("keep.rs"));
         assert_eq!(report.skipped_large, 1);
@@ -870,11 +956,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("enwiki-0.txt"), vec![b'a'; 64 * 1024]).unwrap();
 
-        let (capped, report) = scan(&[Root::repository(dir.path().to_path_buf(), 1024)]);
+        let (capped, report) = scan(
+            &[Root::repository(dir.path().to_path_buf(), 1024)],
+            &Exclude::default(),
+        );
         assert!(capped.is_empty());
         assert_eq!(report.skipped_large, 1);
 
-        let (kept, report) = scan(&[Root::generated(dir.path().to_path_buf())]);
+        let (kept, report) = scan(
+            &[Root::generated(dir.path().to_path_buf())],
+            &Exclude::default(),
+        );
         assert_eq!(kept.len(), 1);
         assert_eq!(report.skipped_large, 0);
     }
@@ -894,7 +986,10 @@ mod tests {
             orangu::pdf::encode_text("manual", "SELECT relname FROM pg_class;").unwrap(),
         )
         .unwrap();
-        let (files, _) = scan(&[Root::repository(dir.path().to_path_buf(), 16)]);
+        let (files, _) = scan(
+            &[Root::repository(dir.path().to_path_buf(), 16)],
+            &Exclude::default(),
+        );
         assert_eq!(files, vec![pdf.clone()]);
         let text = read_document(&pdf).unwrap();
         assert!(text.contains("SELECT relname FROM pg_class;"), "{text:?}");

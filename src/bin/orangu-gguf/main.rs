@@ -968,10 +968,10 @@ fn build(args: &Args, manifest_path: &Path) -> Result<()> {
             }
             roots.push(corpus::Root::generated(dir));
         }
-        let (files, report) = corpus::scan(&roots);
+        let (files, report) = corpus::scan(&roots, &corpus::Exclude::new(&manifest.exclude)?);
         println!(
-            "\ncorpus: {} files ({} skipped by name, {} too large)",
-            report.kept, report.skipped_extension, report.skipped_large
+            "\ncorpus: {} files ({} skipped by name, {} too large, {} excluded)",
+            report.kept, report.skipped_extension, report.skipped_large, report.excluded
         );
         if files.is_empty() {
             bail!("the corpus has no files to train on");

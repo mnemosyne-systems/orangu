@@ -316,6 +316,12 @@ pub struct Manifest {
     /// [`Manifest::excluded`].
     pub repositories: Vec<Repository>,
 
+    /// Glob patterns of files left out of every source: one without a `/`
+    /// matches a file's name wherever it is, one with a `/` its path inside
+    /// the source.
+    #[serde(default)]
+    pub exclude: Vec<String>,
+
     /// Repositories left out of the corpus because their licence is not an
     /// OSI-approved one. Reported by the run rather than dropped quietly.
     #[serde(skip)]
@@ -407,6 +413,8 @@ impl Manifest {
         if self.epochs <= 0.0 && self.steps.is_none() {
             bail!("epochs has to be positive when steps is not given");
         }
+
+        crate::corpus::Exclude::new(&self.exclude)?;
 
         let mut seen: BTreeSet<String> = BTreeSet::new();
         for repo in &self.repositories {

@@ -273,6 +273,19 @@ under:
 | `license` | The SPDX identifier the source is under. Required |
 | `branch` | A branch or tag to clone instead of the default. Git sources only |
 
+Files a source holds can be left out with `exclude`, a list of glob
+patterns beside `repositories`. A pattern without a `/` matches a file's
+name wherever it is (`*.sh`, `CHANGELOG*`); one with a `/` matches its
+path inside the source, where `*` stops at a `/` and `**` crosses any
+number of them (`docs/old/*.md`, `tests/**`). The corpus line counts what
+was excluded, beside what was skipped by name and by size:
+
+```yaml
+exclude:
+  - "*.sh"
+  - "vendor/**"
+```
+
 **A source is not always a repository**, and `orangu-gguf` works out which
 it is by looking rather than assuming:
 
