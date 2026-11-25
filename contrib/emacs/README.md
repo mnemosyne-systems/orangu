@@ -7,7 +7,7 @@ own: it runs the `orangu` binary, which talks to `orangu-server` or
 the terminal, it can do here.
 
 The *IDE* chapter of the manual
-([`doc/manual/en/53-ide.md`](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/53-ide.md))
+([`doc/manual/en/54-ide.md`](https://github.com/mnemosyne-systems/orangu/blob/main/doc/manual/en/54-ide.md))
 is the user guide; this file is also about the source.
 
 ## What it adds

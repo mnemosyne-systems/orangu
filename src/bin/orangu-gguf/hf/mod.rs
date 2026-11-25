@@ -36,6 +36,7 @@ mod phi;
 mod qwen35;
 mod qwen4;
 pub mod tokenizer;
+mod whisper;
 
 use anyhow::{Context, Result, anyhow, bail};
 use orangu::gguf::GgufValue;
@@ -483,6 +484,15 @@ fn read_config(dir: &Path) -> Result<Value> {
             top.insert(k.clone(), v.clone());
         }
     }
+    // Kept apart, for a conversion that reads a setting only it carries.
+    let generation_path = dir.join("generation_config.json");
+    if let Ok(text) = std::fs::read_to_string(&generation_path)
+        && let Some(top) = config.as_object_mut()
+    {
+        let generation: Value = serde_json::from_str(&text)
+            .with_context(|| format!("parsing {}", generation_path.display()))?;
+        top.insert("generation_config".into(), generation);
+    }
     Ok(config)
 }
 
@@ -510,6 +520,9 @@ fn plan(config: &Value, weights: &SafeTensorsSet) -> Result<Conversion> {
         return Ok(conversion);
     }
     if let Some(conversion) = qwen4::plan(hf, config, weights)? {
+        return Ok(conversion);
+    }
+    if let Some(conversion) = whisper::plan(hf, config, weights)? {
         return Ok(conversion);
     }
     bail!("{hf} is not an architecture this tool converts")
