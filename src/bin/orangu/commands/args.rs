@@ -238,22 +238,19 @@ fn parse_comment_body(rest: &str) -> Option<CommentBody<'_>> {
     }
 }
 
+// The cut is a byte offset, which can fall inside a multi-byte character of
+// the input (`テ`, `ä`, ...). `get` gives `None` there instead of panicking,
+// and an ASCII prefix or suffix cannot match at such an offset anyway.
 pub fn strip_ascii_suffix<'a>(input: &'a str, suffix: &str) -> Option<&'a str> {
-    if input.len() >= suffix.len()
-        && input[input.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-    {
-        Some(&input[..input.len() - suffix.len()])
-    } else {
-        None
-    }
+    let split = input.len().checked_sub(suffix.len())?;
+    let tail = input.get(split..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &input[..split])
 }
 
 pub fn strip_ascii_prefix<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
-    if input.len() >= prefix.len() && input[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&input[prefix.len()..])
-    } else {
-        None
-    }
+    let head = input.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &input[prefix.len()..])
 }
 
 pub fn quote_shell_argument(argument: &str) -> String {
