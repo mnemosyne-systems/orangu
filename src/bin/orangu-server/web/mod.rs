@@ -1384,20 +1384,28 @@ async fn send_message(
                         .data(json!({"type": "done", "html": html, "reasoning_html": reasoning_html, "content": full, "reasoning": reasoning, "truncated": truncated, "generation_ms": generation_ms, "stats": answer_stats, "route": turn_route(&stats, routed_to.as_deref()), "versions": session.turn_versions.len(), "active_version": session.active_version}).to_string()));
                     break;
                 }
-                StreamEvent::Overloaded => {
+                event @ (StreamEvent::Overloaded
+                | StreamEvent::Error(_)
+                | StreamEvent::NoRoom(_)) => {
                     yield Ok(axum::response::sse::Event::default()
-                        .data(serde_json::json!({"error": crate::http::OVERLOADED_MESSAGE}).to_string()));
-                    break;
-                }
-                StreamEvent::Error(err) | StreamEvent::NoRoom(err) => {
-                    yield Ok(axum::response::sse::Event::default()
-                        .data(json!({"type": "error", "message": err}).to_string()));
+                        .data(stream_error_data(&event)));
                     break;
                 }
             }
         }
     };
     axum::response::sse::Sse::new(stream).into_response()
+}
+
+/// Serializes terminal `StreamEvent` failures in the `{"type": "error", "message": ...}`
+/// shape expected by `app.js`'s SSE reader.
+fn stream_error_data(event: &StreamEvent) -> String {
+    let message = match event {
+        StreamEvent::Overloaded => crate::http::OVERLOADED_MESSAGE,
+        StreamEvent::Error(err) | StreamEvent::NoRoom(err) => err.as_str(),
+        _ => unreachable!("stream_error_data only accepts terminal error events"),
+    };
+    json!({"type": "error", "message": message}).to_string()
 }
 
 /// A picture's size as its caption gives it: `1920x1080`, or for one the
@@ -2089,5 +2097,20 @@ mod tests {
     #[test]
     fn the_first_delta_is_the_whole_render() {
         assert_eq!(super::html_delta("", "<p>Hi</p>"), (0, "<p>Hi</p>"));
+    }
+
+    #[test]
+    fn overloaded_stream_event_uses_web_error_payload() {
+        for (event, expected_msg) in [
+            (StreamEvent::Overloaded, crate::http::OVERLOADED_MESSAGE),
+            (StreamEvent::Error("boom".to_string()), "boom"),
+            (StreamEvent::NoRoom("full".to_string()), "full"),
+        ] {
+            let raw = super::stream_error_data(&event);
+            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+            assert_eq!(parsed["type"], "error");
+            assert_eq!(parsed["message"], expected_msg);
+            assert!(parsed.get("error").is_none());
+        }
     }
 }
