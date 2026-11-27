@@ -232,15 +232,20 @@ impl OpenAiClient {
         }
 
         let mut pending_lines = Vec::new();
-        let mut line_buffer = String::new();
+        // Bytes, decoded a whole line at a time: a chunk can end inside a
+        // multi-byte character, and decoding it on its own would turn both
+        // halves into replacement characters. A `\n` byte is never part of
+        // one, so every line is whole.
+        let mut line_buffer: Vec<u8> = Vec::new();
         let mut content = String::new();
         let mut tool_calls = Vec::new();
 
         while let Some(chunk) = resp.chunk().await? {
-            line_buffer.push_str(&String::from_utf8_lossy(&chunk));
+            line_buffer.extend_from_slice(&chunk);
 
-            while let Some(newline_index) = line_buffer.find('\n') {
-                let mut line = line_buffer.drain(..=newline_index).collect::<String>();
+            while let Some(newline_index) = line_buffer.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = line_buffer.drain(..=newline_index).collect();
+                let mut line = String::from_utf8_lossy(&raw).into_owned();
                 if line.ends_with('\n') {
                     line.pop();
                 }
@@ -877,6 +882,80 @@ mod tests {
             .expect("client")
             .with_id_slot(Some(3));
         assert_eq!(client.id_slot, Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_character_split_across_chunks_arrives_whole() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        let body = crate::test_support::text_stream("日本語");
+        // The first chunk ends after the first of the three bytes of `本`.
+        let split = body.find('本').expect("in the body") + 1;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let body_start = loop {
+                let read = stream.read(&mut buffer).expect("read request");
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..body_start]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            while request.len() < body_start + length {
+                let read = stream.read(&mut buffer).expect("read body");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).expect("write head");
+            stream
+                .write_all(&body.as_bytes()[..split])
+                .expect("write first chunk");
+            stream.flush().expect("flush");
+            std::thread::sleep(Duration::from_millis(100));
+            stream
+                .write_all(&body.as_bytes()[split..])
+                .expect("write second chunk");
+        });
+
+        let profile = LlmConfiguration {
+            endpoint,
+            model: "model".to_string(),
+            role: "all".to_string(),
+            api_key: None,
+            request_timeout_seconds: 5,
+            max_tool_rounds: 10,
+            review_max_tokens: 512,
+            review_confidence_threshold: 80,
+            security_confidence_threshold: 50,
+            review_sanitize: Default::default(),
+            review_sanitize_timeout: 1_800,
+            review_sanitize_alloc_failures: 8,
+            code_max_tokens: 0,
+            system_prompt: "".to_string(),
+            model_verbosity: None,
+        };
+        let response = OpenAiClient::from_profile(&profile)
+            .expect("client")
+            .chat(&[ChatMessage::user("hi")], &[], |_| {}, |_| {})
+            .await
+            .expect("chat");
+        server.join().expect("server");
+        match response {
+            LlmResponse::Text(text) => assert_eq!(text, "日本語"),
+            LlmResponse::ToolCalls(_) => panic!("expected text"),
+        }
     }
 
     #[test]
