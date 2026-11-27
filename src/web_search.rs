@@ -315,7 +315,9 @@ fn decode_entities(text: &str) -> String {
     while let Some(start) = rest.find('&') {
         out.push_str(&rest[..start]);
         rest = &rest[start..];
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+        // Looked for in the bytes: the twelfth byte can fall inside a
+        // multi-byte character, and `;` is never part of one.
+        let Some(end) = rest.bytes().take(12).position(|b| b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -598,6 +600,15 @@ mod tests {
             html_text("A <b>bold</b>\n  &amp; &lt;tag&gt; don&#x27;t&#39;s&nbsp;x &#169; &bogus;"),
             "A bold & <tag> don't's x © &bogus;"
         );
+    }
+
+    #[test]
+    fn html_text_decodes_entities_next_to_multi_byte_text() {
+        // Twelve bytes on from the `&` used to land inside a character here.
+        assert_eq!(html_text("Q&amp;A 日本語"), "Q&A 日本語");
+        assert_eq!(html_text("&amp;日本語のテキスト"), "&日本語のテキスト");
+        assert_eq!(html_text("AT&Tのサービス"), "AT&Tのサービス");
+        assert_eq!(html_text("&#x65E5;本語"), "日本語");
     }
 
     #[test]
