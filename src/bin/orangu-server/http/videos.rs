@@ -629,10 +629,11 @@ pub fn ranged_response(
             } else {
                 a.parse().ok()?
             };
+            let last = total.checked_sub(1)?;
             let end: usize = if a.is_empty() || b.is_empty() {
-                total.checked_sub(1)?
+                last
             } else {
-                b.parse::<usize>().ok()?.min(total - 1)
+                b.parse::<usize>().ok()?.min(last)
             };
             (start <= end && end < total).then_some((start, end))
         });
@@ -734,5 +735,15 @@ mod tests {
         let r = mp4_response(b"0123456789", &h);
         assert_eq!(r.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(r.headers()[header::CONTENT_RANGE], "bytes 2-4/10");
+    }
+
+    #[test]
+    fn range_request_on_empty_body_does_not_underflow() {
+        for spec in ["bytes=0-10", "bytes=0-", "bytes=-5"] {
+            let mut h = HeaderMap::new();
+            h.insert(header::RANGE, spec.parse().unwrap());
+            let r = ranged_response(b"", &h, "video/mp4");
+            assert_eq!(r.status(), StatusCode::OK, "range={spec}");
+        }
     }
 }
