@@ -188,7 +188,13 @@ impl Repo {
     pub fn is_tracked(&self, path: &Path) -> bool {
         run(
             &self.root,
-            ["ls-files", "--error-unmatch", "--", &path_arg(path)],
+            [
+                LITERAL,
+                "ls-files",
+                "--error-unmatch",
+                "--",
+                &path_arg(path),
+            ],
         )
         .is_ok()
     }
@@ -197,7 +203,7 @@ impl Repo {
     /// itself an object Git knows about, so "tracked" for one means "has
     /// tracked content".
     pub fn holds_tracked_files(&self, path: &Path) -> bool {
-        run(&self.root, ["ls-files", "--", &path_arg(path)])
+        run(&self.root, [LITERAL, "ls-files", "--", &path_arg(path)])
             .map(|out| !out.is_empty())
             .unwrap_or(false)
     }
@@ -215,7 +221,7 @@ impl Repo {
             return GitOutcome::skipped(self, "ignored");
         }
         self.stage(
-            ["add", "--", &path_arg(path)],
+            [LITERAL, "add", "--", &path_arg(path)],
             format!("git add {}", self.show(path)),
         )
     }
@@ -248,7 +254,7 @@ impl Repo {
     /// to be wanted.
     pub fn rm(&self, path: &Path) -> GitOutcome {
         self.stage(
-            ["rm", "-f", "--", &path_arg(path)],
+            [LITERAL, "rm", "-f", "--", &path_arg(path)],
             format!("git rm -f {}", self.show(path)),
         )
     }
@@ -284,6 +290,13 @@ impl Repo {
         }
     }
 }
+
+/// Put before a Git command that takes pathspecs (`add`, `rm`, `ls-files`),
+/// so a path is read as a name and not as a pattern: as a pattern
+/// `pages/[id].tsx` would also match `pages/i.tsx` and `pages/d.tsx`, and
+/// `git rm` would delete those too. `mv` and `check-ignore` read their paths
+/// literally already, and `check-ignore` refuses the option.
+const LITERAL: &str = "--literal-pathspecs";
 
 /// Paths are handed to Git as absolute strings (it accepts them anywhere a
 /// pathspec is expected), so nothing depends on what the process's current
@@ -421,6 +434,29 @@ mod tests {
         assert!(outcome.staged, "{outcome:?}");
         assert!(!path.exists());
         assert!(staged_paths(dir.path()).contains("D\ttracked.txt"));
+    }
+
+    /// A file name is not a pattern: `a[1].txt` names only itself, although
+    /// as a Git pathspec it would also match `a1.txt`.
+    #[test]
+    fn brackets_in_a_file_name_match_only_that_file() {
+        let dir = repo_with_a_commit();
+        let root = dir.path();
+        fs::write(root.join("a[1].txt"), "a\n").expect("write");
+        fs::write(root.join("a1.txt"), "1\n").expect("write");
+        run(root, ["add", "--", "a1.txt"]).expect("add");
+        run(root, ["commit", "-q", "-m", "a1"]).expect("commit");
+        let repo = discover(root).expect("repo");
+
+        assert!(!repo.is_tracked(&root.join("a[1].txt")));
+        assert!(repo.add(&root.join("a[1].txt")).staged);
+        run(root, ["commit", "-q", "-m", "brackets"]).expect("commit");
+
+        let outcome = repo.rm(&root.join("a[1].txt"));
+
+        assert!(outcome.staged, "{outcome:?}");
+        assert!(root.join("a1.txt").exists(), "a1.txt was removed too");
+        assert_eq!(staged_paths(root), "D\ta[1].txt");
     }
 
     #[test]
