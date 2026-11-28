@@ -52,6 +52,10 @@ This installs the package into `~/.emacs.d/elpa/orangu`. Restart Emacs,
 and it is there. `make uninstall` removes it, and `make clean` removes what
 a build leaves in this directory.
 
+`make compile` byte-compiles the package the way a release does, with a
+warning taken as an error, and `make test` runs the tests in `test/`. They
+need no orangu, and run on every pull request.
+
 ## What is here
 
 | Path | What it is |
@@ -62,3 +66,4 @@ a build leaves in this directory.
 | `orangu-terminal.el` | The full interface in a terminal, and the conversation |
 | `orangu-run.el` | One run of orangu, with its output streamed and its escapes removed, and stopping it |
 | `orangu-core.el` | Finding orangu and its workspace, the command lines, and the prompts |
+| `test/` | The tests, and a script that stands in for orangu in them |

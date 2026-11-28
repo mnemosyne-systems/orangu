@@ -80,7 +80,7 @@ DIRECTORY itself.  DIRECTORY defaults to `default-directory'."
                   (abbreviate-file-name directory)))
     (directory-file-name
      (expand-file-name
-      (or (when-let ((project (project-current nil directory)))
+      (or (when-let* ((project (project-current nil directory)))
             (project-root project))
           (locate-dominating-file directory ".git")
           directory)))))

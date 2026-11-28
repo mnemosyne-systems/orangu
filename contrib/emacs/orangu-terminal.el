@@ -215,7 +215,7 @@ it comes again at the end."
     (orangu-changes-sync-buffers orangu-workspace)
     (when orangu-chat--changes
       (with-demoted-errors "orangu cannot tell what changed: %S"
-        (when-let ((files (orangu-changes-end orangu-chat--changes)))
+        (when-let* ((files (orangu-changes-end orangu-chat--changes)))
           (message "%s: %s" (orangu-changes-summary files)
                    (mapconcat #'car files ", ")))))))
 

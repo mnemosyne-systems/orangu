@@ -178,6 +178,25 @@ jobs:
           fi
           rm -f probe.log
 
+  # The Emacs package, compiled the way a release compiles it (a warning is
+  # an error) and tested, on the oldest Emacs it supports, on the one
+  # ubuntu-latest has for the release job, and on the newest. Otherwise a
+  # warning that a newer Emacs adds is first seen when it breaks a release.
+  emacs:
+    name: emacs (${{ matrix.emacs }})
+    runs-on: ubuntu-latest
+    container: silex/emacs:${{ matrix.emacs }}-ci
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs: ['28.1', '29.4', '31.1']
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compile and test
+        working-directory: contrib/emacs
+        run: make test
+
   # `cargo audit` reads the committed `Cargo.lock` and `.cargo/audit.toml`, so
   # this job reaches exactly the verdict a local `cargo audit` does.
   #

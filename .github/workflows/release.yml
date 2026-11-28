@@ -347,7 +347,7 @@ jobs:
           else
             version="$(sed -n 's/^;; Version: //p' orangu.el)"
           fi
-          emacs -Q --batch -L . --eval '(setq byte-compile-error-on-warn t)' -f batch-byte-compile ./*.el
+          make compile
           folder="orangu-$version"
           mkdir "$folder"
           cp ./*.el README.md ../../LICENSE "$folder"
