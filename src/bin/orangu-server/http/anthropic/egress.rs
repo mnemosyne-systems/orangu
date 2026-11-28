@@ -329,7 +329,7 @@ async fn read_body<S: AsyncRead + Unpin>(
                 }
                 return Ok(body);
             }
-            if body.len() + size > MAX_BODY {
+            if size > MAX_BODY.saturating_sub(body.len()) {
                 return Err(std::io::Error::other("a request body too large"));
             }
             read_exact_more(stream, &mut have, size + 2).await?;
@@ -590,6 +590,18 @@ mod tests {
         let mut wire: &[u8] = b"4\r\nWiki\r\n5;x=1\r\npedia\r\n0\r\n\r\n";
         let body = read_body(&mut wire, &headers, Vec::new()).await.unwrap();
         assert_eq!(body, b"Wikipedia");
+    }
+
+    /// An oversized chunk that would overflow `body.len() + size` is rejected without panicking.
+    #[tokio::test]
+    async fn a_chunk_size_overflow_is_rejected() {
+        let headers = vec![("Transfer-Encoding".to_string(), b"chunked".to_vec())];
+        let payload = format!("1\r\na\r\n{:x}\r\n", usize::MAX);
+        let mut wire = payload.as_bytes();
+        let err = read_body(&mut wire, &headers, Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "a request body too large");
     }
 
     /// The authority issues a certificate a TLS server can present.
