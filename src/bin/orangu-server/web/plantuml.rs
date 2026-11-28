@@ -1731,11 +1731,13 @@ fn clean_id(value: &str) -> String {
 
 fn clean_label(value: &str) -> String {
     let mut value = value.trim();
-    if (value.starts_with('"') && value.ends_with('"'))
-        || (value.starts_with('[') && value.ends_with(']'))
-        || (value.starts_with('(') && value.ends_with(')'))
+    if let Some(inner) = value
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('[').and_then(|s| s.strip_suffix(']')))
+        .or_else(|| value.strip_prefix('(').and_then(|s| s.strip_suffix(')')))
     {
-        value = &value[1..value.len() - 1];
+        value = inner;
     }
     value
         .trim()
@@ -2067,6 +2069,16 @@ mod tests {
         let svg = asset_svg(&diagram.light);
         assert!(!svg.contains("<script>"));
         assert!(svg.contains("&lt;/text&gt;"));
+    }
+
+    #[test]
+    fn single_quote_label_does_not_panic() {
+        assert_eq!(clean_label("\""), "\"");
+        assert_eq!(clean_label(" \" "), "\"");
+        assert_eq!(clean_label("\"\""), "");
+        let diagram = render("@startuml\ntitle \"\nA -> B: \"\n@enduml").expect("renders safely");
+        let svg = asset_svg(&diagram.light);
+        assert!(svg.contains("<svg "));
     }
 
     #[test]
