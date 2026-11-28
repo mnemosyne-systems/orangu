@@ -6,7 +6,7 @@ it runs the `orangu` binary, which talks to `orangu-server` or
 `orangu-coordinator` the way `orangu.conf` says. Whatever orangu can do
 in the terminal, it can do here.
 
-The *IDE* chapter of the manual ([`doc/manual/en/53-ide.md`](../../doc/manual/en/53-ide.md))
+The *IDE* chapter of the manual ([`doc/manual/en/54-ide.md`](../../doc/manual/en/54-ide.md))
 is the user guide; this file is about the source.
 
 It is built on the VisualStudio.Extensibility SDK, so it runs out of

@@ -582,6 +582,17 @@ enum Command {
         #[arg(short = 'y', long)]
         yes: bool,
     },
+    /// Transcribe a WAV file with a Whisper GGUF (proof of concept).
+    #[command(hide = true)]
+    Transcribe {
+        /// A path to a whisper .gguf file.
+        model: PathBuf,
+        /// A WAV file to transcribe.
+        audio: PathBuf,
+        /// The spoken language (`en`, `de`, ...); detected when omitted.
+        #[arg(long)]
+        language: Option<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -616,6 +627,7 @@ impl Command {
             Command::Refresh { .. } => "refresh",
             Command::Bundle { .. } => "bundle",
             Command::Prune { .. } => "prune",
+            Command::Transcribe { .. } => "transcribe",
         }
     }
 }
@@ -5857,7 +5869,36 @@ fn run_command(
             yes,
         }),
         Command::Prune { identifier, yes } => prune::run(identifier, yes),
+        Command::Transcribe {
+            model,
+            audio,
+            language,
+        } => transcribe(&model, &audio, language.as_deref()),
     }
+}
+
+/// `transcribe`: one WAV file through a Whisper model on the CPU, the text
+/// on stdout and the timings on stderr.
+fn transcribe(model: &Path, audio: &Path, language: Option<&str>) -> Result<()> {
+    let started = std::time::Instant::now();
+    let whisper = engine::transcribe::Whisper::load(model, Arc::new(engine::backend::CpuBackend))?;
+    let loaded = started.elapsed();
+    let bytes = std::fs::read(audio).with_context(|| format!("reading {}", audio.display()))?;
+    let samples = engine::transcribe::wav::decode(&bytes)
+        .with_context(|| format!("decoding {}", audio.display()))?;
+    let t = whisper.transcribe(&samples, language)?;
+    println!("{}", t.text);
+    eprintln!(
+        "language {}, {:.1}s of audio; load {:.2}s, mel {:.2}s, encode {:.2}s, decode {:.2}s ({} tokens)",
+        t.language,
+        t.seconds,
+        loaded.as_secs_f32(),
+        t.timings.mel.as_secs_f32(),
+        t.timings.encode.as_secs_f32(),
+        t.timings.decode.as_secs_f32(),
+        t.timings.tokens
+    );
+    Ok(())
 }
 
 /// Display order for `list`. Indices always refer to the canonical,

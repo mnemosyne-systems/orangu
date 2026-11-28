@@ -76,6 +76,7 @@ pub mod text_stop;
 pub mod tokenizer;
 pub mod tool_calls;
 pub mod tool_learn;
+pub mod transcribe;
 pub mod vecdot;
 pub mod video;
 pub mod vision;
