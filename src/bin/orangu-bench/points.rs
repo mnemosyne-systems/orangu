@@ -68,7 +68,8 @@ pub fn expand(spec: &str) -> anyhow::Result<Vec<u32>> {
 
     // A leading `-` cannot start a range (there are no negative token counts),
     // so the separator is looked for after the first character.
-    let Some(dash) = spec[1..].find('-').map(|i| i + 1) else {
+    let after_first = spec.chars().next().map_or(0, char::len_utf8);
+    let Some(dash) = spec[after_first..].find('-').map(|i| after_first + i) else {
         return Ok(vec![number(spec)?]);
     };
     let first = number(&spec[..dash])?;
@@ -116,13 +117,16 @@ pub fn expand(spec: &str) -> anyhow::Result<Vec<u32>> {
                  lose its `*2`?"
             );
         }
-        value = match step {
-            Step::Add(n) => value.saturating_add(n),
-            Step::Multiply(n) => value.saturating_mul(n),
+        let Some(next) = (match step {
+            Step::Add(n) => value.checked_add(n),
+            Step::Multiply(n) => value.checked_mul(n),
+        }) else {
+            break;
         };
-        if value > last {
+        if next > last {
             break;
         }
+        value = next;
     }
     Ok(out)
 }
@@ -206,5 +210,28 @@ mod tests {
         assert!(err.to_string().contains("more than"), "{err}");
         // Right up to the cap is still allowed.
         assert_eq!(expand("1-256").unwrap().len(), 256);
+    }
+
+    #[test]
+    fn non_ascii_prefix_returns_error_instead_of_panicking() {
+        for bad in ["—128", "–128-256", "µ10"] {
+            let err = expand(bad).expect_err(&format!("accepted {bad:?}"));
+            assert!(
+                err.to_string().contains("is not a number"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn range_ending_at_u32_max_stops_cleanly() {
+        assert_eq!(
+            expand("4294967294-4294967295").unwrap(),
+            vec![u32::MAX - 1, u32::MAX]
+        );
+        assert_eq!(
+            expand("4294967290-4294967295*2").unwrap(),
+            vec![4_294_967_290]
+        );
     }
 }
