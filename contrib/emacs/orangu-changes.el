@@ -51,7 +51,7 @@ orangu reads the files on disk."
   "Return the buffers visiting files in WORKSPACE."
   (let ((root (file-name-as-directory workspace)))
     (cl-remove-if-not (lambda (buffer)
-                        (when-let ((file (buffer-file-name buffer)))
+                        (when-let* ((file (buffer-file-name buffer)))
                           (and (not (file-remote-p file))
                                (file-in-directory-p file root))))
                       (buffer-list))))
@@ -129,7 +129,7 @@ FILES is a list of (PATH ADDED REMOVED); the counts are nil for a binary."
 (defun orangu-changes-begin (workspace)
   "Take a snapshot of WORKSPACE, and return it for `orangu-changes-end'.
 Return nil when WORKSPACE is not in a Git repository."
-  (when-let ((root (and (executable-find "git")
+  (when-let* ((root (and (executable-find "git")
                         (ignore-errors
                           (orangu-changes--line
                            (orangu-changes--git workspace nil nil
@@ -206,7 +206,7 @@ CHANGES is the caller's to discard.  This may be called again later."
   (let ((root (orangu-changes-root changes))
         (environment (orangu-changes-environment changes)))
     (orangu-changes--git root environment nil "add" "-u")
-    (when-let ((untracked (orangu-changes--untracked root environment)))
+    (when-let* ((untracked (orangu-changes--untracked root environment)))
       (orangu-changes--git root environment
                            (mapconcat (lambda (path) (concat path "\0")) untracked "")
                            "update-index" "-z" "--add" "--stdin"))
@@ -223,7 +223,7 @@ ENVIRONMENT names the snapshot's index."
        (lambda (path)
          ;; A repository inside this one is listed as a folder.
          (unless (string-suffix-p "/" path)
-           (when-let ((attributes (file-attributes
+           (when-let* ((attributes (file-attributes
                                    (expand-file-name (decode-coding-string path 'utf-8)
                                                      root))))
              (and (not (eq t (file-attribute-type attributes)))
